@@ -1,0 +1,21 @@
+name: Model account
+description: Register a model account (Anthropic/OpenAI) for the worker fleet
+title: "<account-handle>"
+body:
+  - type: textarea
+    id: spec
+    attributes:
+      label: Account spec (YAML)
+      description: No secrets here — the token lives only in the secret named by secret_ref.
+      value: |
+        provider: anthropic
+        models: [opus, sonnet, haiku, fable]
+        tier:
+          weekly_limit: ""
+          five_hour_limit: ""
+        reset_schedule: ""
+        max_concurrent_workers: 1
+        secret_ref: ACCT_HANDLE_TOKEN
+        notes: ""
+    validations:
+      required: true
