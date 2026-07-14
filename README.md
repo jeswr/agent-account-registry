@@ -29,24 +29,28 @@ notes: "..."
 The **token value** for each account is stored ONLY as a repository/organization **secret** named by
 `secret_ref` — never in the issue body, never in a comment, never in a public repo.
 
-## Reaction-based claim / release (the cross-codebase mutex)
+## Lease-based claim / release (the cross-codebase mutex)
 
-To **claim** a worker slot on an account, a dispatcher adds a **🚀 reaction** to that account's issue.
-The **count of 🚀 reactions = the number of active workers** on the account. If
-`count >= max_concurrent_workers`, the account is **full** and must be skipped. To **release**, the
-worker removes its 🚀 reaction on completion.
+> A GPT-5.6 review showed that **reaction-counting cannot be a mutex** — GitHub allows only one
+> reaction of a given type per identity, so many same-bot workers all see one 🚀 and all believe they
+> own a slot. Replaced with a **compare-and-swap lease ledger** (`scripts/select-and-claim.py`).
 
-Because reactions are visible to any repo the automation identity can reach, this is a **single mutex
-shared across every codebase** — two repos cannot together exceed an account's cap.
+A single JSON ledger `data/leases.json` records every active lease:
 
-Every claim also leaves a **claim-receipt comment**:
-
-```text
-CLAIM repo=<owner/repo> run=<run-id> package=<pkg> role=<role> model=<model> at=<iso8601>
+```json
+{"leases": [{"account": "acct01", "claim_id": "<uuid>", "holder": "<owner/repo@run>",
+             "package": "sparq-core", "role": "impl", "model": "terra",
+             "issued_at": 0, "expires_at": 0}]}
 ```
 
-Receipts are the audit trail and let the groomer **reclaim stale claims** (a 🚀 with a receipt whose
-run has ended/failed is removed, freeing the slot).
+**Claim** = a compare-and-swap: read the file **and its blob SHA**, reclaim expired leases, and if an
+eligible account (serving a model in the requested chain, under `max_concurrent_workers`,
+cache-affinity-preferred) has a free slot, append a lease with a **unique `claim_id` + `expires_at`**,
+then `PUT` the file with the read SHA. A concurrent writer changed the SHA → the `PUT` is rejected
+(409) → retry. Because every codebase CAS-updates the **same** ledger, capacity is enforced globally
+without reaction counting. **Release** and **heartbeat** are keyed by the unique `claim_id`
+(idempotent). The groomer **reclaims** leases past `expires_at` (a dead/cancelled worker frees its
+slot automatically — no receipt-guessing).
 
 ## Selection logic (`select-and-claim`)
 
