@@ -1,0 +1,14 @@
+name: Set up new account
+description: Register a new model account via web sign-in (maintainer only)
+title: "set up new account: <openai|anthropic>"
+labels: []
+body:
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options: [anthropic, openai]
+    validations: {required: true}
+  - type: markdown
+    attributes:
+      value: "After creating this issue, add the **`set-up-account`** label. The broker will comment a sign-in URL; sign in and the token is captured + stored as a secret automatically."

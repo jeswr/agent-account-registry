@@ -77,3 +77,20 @@ a rolling `data/cache-affinity.json`), never in the public repos.
 - Tokens: only in GitHub secrets (encrypted at rest, masked in logs).
 - Account metadata + selection logic: only in this private repo.
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
+
+## Registering a new account (web-login broker)
+
+You don't paste tokens manually. Instead:
+
+1. Open a **"set up new account"** issue (there's a template) and add the **`set-up-account`** label.
+2. The `set-up-account` workflow (trust-gated to the maintainer) runs the provider's device/OAuth
+   login and **comments a sign-in URL + one-time code** on the issue.
+3. Sign in with the account you want to register. The broker captures the resulting token, stores it
+   as the account **secret** (`ACCTNN_TOKEN`) on the token-target repo, registers the account issue,
+   and closes the request. **The token is never printed** — only written to a mode-600 file and set
+   as a secret.
+
+Providers: **OpenAI** via `codex login --device-auth` (native device flow); **Anthropic** via
+`claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_ADMIN_TOKEN` (a
+fine-grained PAT with Secrets:write on the token-target repo) — until it's set, the broker still
+surfaces the URL but reports that the secret couldn't be stored.
