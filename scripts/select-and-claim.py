@@ -95,6 +95,20 @@ def _write_ledger(repo, leases, sha, message):
     return r.returncode == 0  # non-zero (e.g. 409 SHA conflict) → caller retries
 
 
+def reclaim(repo, now, retries=6):
+    """CAS-remove expired leases from the ledger so crashed/cancelled workers free their slot.
+    Returns the number reclaimed, 0 if none, or -1 if the CAS kept conflicting."""
+    for _ in range(retries):
+        leases, sha = _read_ledger(repo)
+        live = reclaim_expired(leases, now)
+        n = len(leases) - len(live)
+        if n == 0:
+            return 0
+        if _write_ledger(repo, live, sha, f"reclaim {n} expired lease(s)"):
+            return n
+    return -1
+
+
 # ---- self-test ----------------------------------------------------------------------------------
 def _self_test():
     ok = True
@@ -130,14 +144,20 @@ def _self_test():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--reclaim", action="store_true", help="CAS-remove expired leases (cron)")
     ap.add_argument("--repo", default="jeswr/agent-account-registry")
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
+    if args.reclaim:
+        import time
+        n = reclaim(args.repo, int(time.time()))
+        print(f"reclaimed {n} expired lease(s)" if n >= 0 else "reclaim: CAS kept conflicting")
+        return 0 if n >= 0 else 1
     # Live claim/release needs the account catalog (read from the account issues) + a CAS retry loop;
     # that wires in with the dispatch engine (Phase 3). This module ships the tested allocation core +
-    # CAS I/O now.
-    print("select-and-claim: allocation core ready; live claim/release wires in with dispatch (Phase 3).")
+    # CAS I/O + reclaim now.
+    print("select-and-claim: allocation core + reclaim ready; live claim/release wires in with dispatch (Phase 3).")
     return 0
 
 
