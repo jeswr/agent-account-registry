@@ -109,6 +109,66 @@ def reclaim(repo, now, retries=6):
     return -1
 
 
+# ---- account catalog + live claim / release ----------------------------------------------------
+def _parse_account(body):
+    d = {"models": [], "max_concurrent_workers": 1}
+    for line in (body or "").splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if k == "models":
+            d["models"] = [x.strip() for x in v.strip("[]").split(",") if x.strip()]
+        elif k == "max_concurrent_workers":
+            d[k] = int(v) if v.isdigit() else 1
+        elif k in ("secret_ref", "provider", "harness"):
+            d[k] = v
+    return d
+
+
+def read_accounts(repo):
+    """The account catalog from the open account issues (title=handle, YAML body, status:available)."""
+    out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
+                "--json", "title,body,labels"]).stdout
+    accounts = []
+    for it in json.loads(out or "[]"):
+        a = _parse_account(it.get("body"))
+        a["handle"] = it["title"].strip()
+        a["available"] = any(lb["name"] == "status:available" for lb in it.get("labels", []))
+        if a["handle"] and a["models"]:
+            accounts.append(a)
+    return accounts
+
+
+def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6):
+    """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free / conflict)."""
+    import uuid
+    accounts = read_accounts(repo)
+    for _ in range(retries):
+        leases, sha = _read_ledger(repo)
+        acct = choose_account(accounts, leases, model_chain, package, role, now)
+        if acct is None:
+            return None
+        a = next(x for x in accounts if x["handle"] == acct)
+        model = next((m for m in model_chain if m in a["models"]), model_chain[0])
+        cid = uuid.uuid4().hex
+        live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
+        if _write_ledger(repo, live, sha, f"claim {cid[:8]} {acct} {package}/{role}"):
+            return {"account": acct, "secret_ref": a.get("secret_ref"), "model": model, "claim_id": cid}
+    return None  # CAS kept conflicting
+
+
+def release(repo, claim_id, now, retries=6):
+    for _ in range(retries):
+        leases, sha = _read_ledger(repo)
+        live = apply_release(leases, claim_id, now)
+        if len(live) == len(leases):
+            return True
+        if _write_ledger(repo, live, sha, f"release {claim_id[:8]}"):
+            return True
+    return False
+
+
 # ---- self-test ----------------------------------------------------------------------------------
 def _self_test():
     ok = True
@@ -137,6 +197,9 @@ def _self_test():
     check("release removes", apply_release(live, "CID", now), [])
     check("none free", choose_account([{"handle": "a", "models": ["x"], "max_concurrent_workers": 0}],
                                       [], ["x"], "p", "r", now), None)
+    pa = _parse_account("provider: openai\nmodels: [terra, gpt]\nmax_concurrent_workers: 2\nsecret_ref: ACCT01_TOKEN")
+    check("parse account", (pa["models"], pa["max_concurrent_workers"], pa["secret_ref"]),
+          (["terra", "gpt"], 2, "ACCT01_TOKEN"))
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -145,19 +208,30 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--reclaim", action="store_true", help="CAS-remove expired leases (cron)")
+    ap.add_argument("--claim", action="store_true", help="claim a lease")
+    ap.add_argument("--release", metavar="CLAIM_ID", help="release a lease by claim id")
+    ap.add_argument("--package", default="")
+    ap.add_argument("--role", default="")
+    ap.add_argument("--models", default="", help="comma-separated model fallback chain")
+    ap.add_argument("--holder", default="", help="owner/repo@run identifier")
     ap.add_argument("--repo", default="jeswr/agent-account-registry")
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
+    import time
     if args.reclaim:
-        import time
         n = reclaim(args.repo, int(time.time()))
         print(f"reclaimed {n} expired lease(s)" if n >= 0 else "reclaim: CAS kept conflicting")
         return 0 if n >= 0 else 1
-    # Live claim/release needs the account catalog (read from the account issues) + a CAS retry loop;
-    # that wires in with the dispatch engine (Phase 3). This module ships the tested allocation core +
-    # CAS I/O + reclaim now.
-    print("select-and-claim: allocation core + reclaim ready; live claim/release wires in with dispatch (Phase 3).")
+    if args.claim:
+        chain = [m for m in args.models.split(",") if m.strip()]
+        res = claim(args.repo, args.package, args.role, chain, args.holder, int(time.time()))
+        print(json.dumps(res) if res else "none-free")
+        return 0 if res else 3
+    if args.release:
+        print("released" if release(args.repo, args.release, int(time.time())) else "release-failed")
+        return 0
+    print("select-and-claim: allocation core + reclaim + live claim/release ready (wires into dispatch, Phase 3).")
     return 0
 
 
