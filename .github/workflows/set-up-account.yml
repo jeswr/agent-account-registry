@@ -1,10 +1,12 @@
-# [OPUS-4.8] Web-login broker: create a "set up new account" issue → get a sign-in URL in a
-# comment → sign in → the captured token is stored as the account secret + the account is registered.
+# [OPUS-4.8] Web-login broker (review-hardened S5): a maintainer opens a "set up new account" issue
+# labelled `set-up-account`; the broker posts a sign-in URL/code, captures the token, and stores it.
 #
-# REQUIRES the automation identity: secrets.REGISTRY_ADMIN_TOKEN — a fine-grained PAT (or App token)
-# with: Secrets:write on the token-target repo (sparq-org/sparq, per token-placement option A) and
-# Issues:write on this registry. The default GITHUB_TOKEN cannot write secrets. Until it is set, the
-# workflow surfaces the sign-in URL but the final secret-store step no-ops with a clear message.
+# Hardening vs the GPT-5.6 review: actor AND author must be admin/maintain; REGISTRY_ADMIN_TOKEN is
+# required BEFORE any login (no capturing a credential we can't store); actions are SHA-pinned and the
+# CLI is version-pinned with no curl-to-shell; enrollments are serialized; provider is structured
+# (a provider:* label, no silent default); the target-repo secret uses REGISTRY_ADMIN_TOKEN while
+# registry operations use github.token (fine-grained PATs cannot span two owners); the token is never
+# echoed (only `gh secret set < file`); an always() step shreds all auth state.
 name: set-up-account
 on:
   issues:
@@ -14,85 +16,111 @@ permissions:
   issues: write
   contents: read
 
+concurrency:
+  group: set-up-account
+  cancel-in-progress: false
+
 jobs:
   login:
-    # Only run on the trigger label AND only for a maintainer-authored issue (trust safeguard).
-    if: >-
-      github.event.label.name == 'set-up-account' &&
-      github.event.issue.user.login == github.repository_owner
+    if: github.event.label.name == 'set-up-account'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      TARGET_REPO: sparq-org/sparq        # where account token secrets live (option A)
+      TARGET_REPO: sparq-org/sparq
       LOGIN_DIR: ${{ runner.temp }}/login
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Determine provider + handle
-        id: meta
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BODY: ${{ github.event.issue.body }}
-          TITLE: ${{ github.event.issue.title }}
+      - name: Trust gate — actor AND author must be admin/maintain
         run: |
-          prov=$(printf '%s\n%s' "$TITLE" "$BODY" | grep -oiE 'openai|anthropic' | head -1 | tr 'A-Z' 'a-z')
-          [ -n "$prov" ] || prov=anthropic
-          # next free ACCTNN handle by scanning existing account issues
+          for u in "${{ github.actor }}" "${{ github.event.issue.user.login }}"; do
+            perm=$(gh api "repos/${{ github.repository }}/collaborators/$u/permission" --jq .permission 2>/dev/null || echo none)
+            case "$perm" in
+              admin|maintain) ;;
+              *) echo "::error::$u lacks admin/maintain (got '$perm') — refusing"; exit 1 ;;
+            esac
+          done
+
+      - name: Preflight — require REGISTRY_ADMIN_TOKEN before any login
+        env:
+          ADMIN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
+        run: |
+          if [ -z "${ADMIN:-}" ]; then
+            gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
+              --body "❌ REGISTRY_ADMIN_TOKEN is not set, so a captured token could not be stored. Refusing to start login. Add the fine-grained PAT (Secrets:write on $TARGET_REPO) as \`REGISTRY_ADMIN_TOKEN\`, then re-apply the label." || true
+            exit 1
+          fi
+
+      - name: Determine provider (structured — no silent default)
+        id: meta
+        run: |
+          prov=""
+          for lb in ${{ join(github.event.issue.labels.*.name, ' ') }}; do
+            case "$lb" in provider:openai) prov=openai;; provider:anthropic) prov=anthropic;; esac
+          done
+          if [ -z "$prov" ]; then
+            gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
+              --body "❌ Add a \`provider:openai\` or \`provider:anthropic\` label, then re-apply \`set-up-account\`." || true
+            exit 1
+          fi
           n=$(gh issue list -R "${{ github.repository }}" --state all --json title \
                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]|max // 0' 2>/dev/null || echo 0)
           printf 'provider=%s\n' "$prov" >> "$GITHUB_OUTPUT"
           printf 'handle=acct%02d\n' "$((n+1))" >> "$GITHUB_OUTPUT"
           printf 'secret=ACCT%02d_TOKEN\n' "$((n+1))" >> "$GITHUB_OUTPUT"
 
-      - name: Install provider CLI
+      - name: Checkout (pinned)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install provider CLI (version-pinned, fail on error)
         run: |
+          set -e
           if [ "${{ steps.meta.outputs.provider }}" = "openai" ]; then
-            npm i -g @openai/codex >/dev/null 2>&1 || curl -fsSL https://codex.sh/install | sh || true
+            npm i -g @openai/codex@0.144.1
           else
-            npm i -g @anthropic-ai/claude-code >/dev/null 2>&1 || true
+            npm i -g @anthropic-ai/claude-code@2.1.177
           fi
 
-      - name: Run device login + post sign-in URL, then capture token
+      - name: Device login + post sign-in, capture token
         id: login
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           bash scripts/account-login.sh "${{ steps.meta.outputs.provider }}" "$LOGIN_DIR" 780 &
           BR=$!
-          # wait for the sign-in instructions, post them to the issue
           for _ in $(seq 1 40); do [ -s "$LOGIN_DIR/signin.txt" ] && break; sleep 2; done
           if [ -s "$LOGIN_DIR/signin.txt" ]; then
             gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "$(printf '### Sign in to register this account\n\n```\n%s\n```\n\n_Only continue if you started this. The account token will be captured and stored as a secret; nothing is printed here._' "$(cat "$LOGIN_DIR/signin.txt")")"
+              --body "$(printf '### Sign in to register this account\n\n```\n%s\n```\n\n_Only continue if you started this. The token is captured and stored as a secret; it is never printed._' "$(cat "$LOGIN_DIR/signin.txt")")"
           fi
-          wait "$BR" && echo "status=ok" >> "$GITHUB_OUTPUT" || echo "status=fail" >> "$GITHUB_OUTPUT"
+          if wait "$BR"; then echo "status=ok" >> "$GITHUB_OUTPUT"; else echo "status=fail" >> "$GITHUB_OUTPUT"; fi
 
-      - name: Store token as the account secret (needs REGISTRY_ADMIN_TOKEN)
+      - name: Store token (target secret via ADMIN) + register (github.token)
         if: steps.login.outputs.status == 'ok'
         env:
           ADMIN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
         run: |
-          if [ -z "${ADMIN:-}" ]; then
-            gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "✅ Sign-in captured, but **REGISTRY_ADMIN_TOKEN is not set** so the token can't be stored as a secret. Add a fine-grained PAT (Secrets:write on $TARGET_REPO) as \`REGISTRY_ADMIN_TOKEN\`, then re-run." || true
-            exit 0
-          fi
+          set -euo pipefail
+          # target-repo secret write needs the admin PAT; never echo the token — gh reads the file.
           GH_TOKEN="$ADMIN" gh secret set "${{ steps.meta.outputs.secret }}" -R "$TARGET_REPO" < "$LOGIN_DIR/token"
-          # register the account metadata issue (no token) + label available
-          GH_TOKEN="$ADMIN" gh issue create -R "${{ github.repository }}" \
+          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
+          harness=$([ "${{ steps.meta.outputs.provider }}" = openai ] && echo codex || echo claude)
+          # registry issue + comment use the workflow's own github.token (same-owner)
+          gh issue create -R "${{ github.repository }}" \
             --title "${{ steps.meta.outputs.handle }}" \
-            --label "provider:${{ steps.meta.outputs.provider == 'openai' && 'openai' || 'anthropic' }}" \
-            --label status:available \
-            --body "$(printf 'provider: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nnotes: registered via set-up-account broker\n' "${{ steps.meta.outputs.provider }}" "${{ steps.meta.outputs.secret }}")"
+            --label "provider:${{ steps.meta.outputs.provider }}" --label status:available \
+            --body "$(printf 'provider: %s\nharness: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nnotes: registered via set-up-account broker\n' "${{ steps.meta.outputs.provider }}" "$harness" "$fmt" "${{ steps.meta.outputs.secret }}")"
           gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-            --body "✅ Account **${{ steps.meta.outputs.handle }}** registered (secret \`${{ steps.meta.outputs.secret }}\` on $TARGET_REPO). Closing." || true
+            --body "✅ Account **${{ steps.meta.outputs.handle }}** registered (secret \`${{ steps.meta.outputs.secret }}\` on $TARGET_REPO, format \`$fmt\`). Closing." || true
           gh issue close "${{ github.event.issue.number }}" -R "${{ github.repository }}" || true
 
       - name: Report failure
         if: steps.login.outputs.status != 'ok'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-            --body "⚠️ Sign-in did not complete in time (device code expires ~15 min). Re-apply the \`set-up-account\` label to try again." || true
+            --body "⚠️ Sign-in did not complete in time (device code expires ~15 min). Re-apply \`set-up-account\` to retry." || true
+
+      - name: Cleanup auth state (always)
+        if: always()
+        run: |
+          pkill -f 'codex login' 2>/dev/null || true
+          pkill -f 'claude setup-token' 2>/dev/null || true
+          rm -rf "$LOGIN_DIR" 2>/dev/null || true
