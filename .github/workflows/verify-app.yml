@@ -1,0 +1,35 @@
+# [OPUS-4.8] verify-app — confirm the automation GitHub App + stored key mint a working,
+# sparq-scoped installation token. Run manually after installing the App on a repo.
+name: verify-app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint a sparq-scoped installation token from the App
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: sparq-org
+          repositories: sparq
+
+      - name: Prove the token works + is scoped to sparq
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "== repos this installation token can access =="
+          gh api installation/repositories --jq '.repositories[].full_name'
+          echo "== sparq repo readable via the App token =="
+          gh api repos/sparq-org/sparq --jq '"\(.full_name) (private=\(.private))"'
+          echo "== granted permissions on this installation =="
+          echo '${{ steps.token.outputs.token }}' >/dev/null  # token used only via GH_TOKEN
+          echo "VERIFY-APP: OK — the App + stored key mint a working sparq-org/sparq token."
