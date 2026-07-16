@@ -1,0 +1,26 @@
+# [GPT-5.6] REG-1 per-repository worker policy.
+# PRIVATE. This file contains account names and spend posture, but NEVER tokens or secret values.
+#
+# Schema for every [repos."owner/name"] row (all fields are required):
+#   enabled                = bool
+#   routing                = string  # relative role -> model_chain + agent table in the target repo
+#   account_pool           = [string, ...]
+#   max_concurrent         = positive integer
+#   worker_timeout_minutes = positive integer
+#   gate_profile           = "none" | "lint-only" | "crate-scoped" | "workspace"
+#   arm_auto_merge         = bool
+#   max_attempts           = positive integer
+#   dispatch               = "cron" | "cron+doorbell"
+#   trust                  = "collaborators"
+
+[repos."sparq-org/sparq"]
+enabled = true
+routing = "orchestration/routing.toml"
+account_pool = ["acct01", "acct02"]
+max_concurrent = 2
+worker_timeout_minutes = 90
+gate_profile = "crate-scoped"
+arm_auto_merge = true
+max_attempts = 2
+dispatch = "cron"
+trust = "collaborators"
