@@ -180,6 +180,16 @@ PY
       ) || rc=$?
       ;;
   esac
+  if [[ "$rc" -ne 0 ]]; then
+    # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
+    # model output/credential) so failures are debuggable without leaking secrets.
+    local cls=other
+    if grep -qiE '429|529|overloaded|rate.?limit|too many requests' "$model_log"; then cls=rate-limit
+    elif grep -qiE '401|403|unauthorized|authenticat|invalid.*(key|credential|token)|expired|oauth|forbidden|not logged in|please run.*login' "$model_log"; then cls=auth
+    elif grep -qiE 'ENOENT|command not found|no such file|cannot find' "$model_log"; then cls=setup
+    fi
+    printf '::error::worker-live: model-exit-class=%s (raw model output withheld to protect credentials)\n' "$cls"
+  fi
   [[ "$rc" -eq 0 ]] || die "headless $harness model exited non-zero (output withheld to protect credentials)"
   [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'model created commits; worker requires edits only'
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'model modified forbidden .beads state'
