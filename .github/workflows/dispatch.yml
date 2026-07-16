@@ -1,0 +1,323 @@
+# [GPT-5.6] REG-4 privilege-separated dispatcher. PLAN executes protected public-target planner
+# code with no permissions or secrets; CLAIM treats its artifact as hostile data before mutation.
+name: dispatch
+
+on:
+  workflow_dispatch:
+# Cron is enabled ONLY after the REG-4 canary passes; keep this block commented out until then.
+# schedule:
+#   - cron: '*/10 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: registry-dispatcher
+  cancel-in-progress: false
+
+env:
+  # Public discovery manifest only. CLAIM requires this set to exactly match enabled policy rows.
+  DISPATCH_TARGET_REPOS: '["sparq-org/sparq"]'
+
+jobs:
+  plan:
+    name: PLAN (unprivileged, secret-free)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - name: Clone protected public targets without credentials
+        env:
+          TARGET_REPOS: ${{ env.DISPATCH_TARGET_REPOS }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dispatch-targets"
+          python3 - "$RUNNER_TEMP/dispatch-targets/repos.txt" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          targets = json.loads(os.environ["TARGET_REPOS"])
+          if (not isinstance(targets, list) or not targets
+                  or len(set(targets)) != len(targets)
+                  or any(not isinstance(repo, str) or not re.fullmatch(
+                      r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo
+                  ) for repo in targets)):
+              raise SystemExit("public target manifest must be a non-empty unique owner/repo list")
+          Path(sys.argv[1]).write_text("\n".join(targets) + "\n", encoding="utf-8")
+          PY
+          index=0
+          while IFS= read -r repo; do
+            target="$RUNNER_TEMP/dispatch-targets/$index"
+            git clone --depth 1 "https://github.com/$repo.git" "$target"
+            [[ -f "$target/scripts/ready-issues.py" && ! -L "$target/scripts/ready-issues.py" ]]
+            [[ -f "$target/scripts/dispatch-plan.py" && ! -L "$target/scripts/dispatch-plan.py" ]]
+            python3 "$target/scripts/ready-issues.py" --self-test
+            python3 "$target/scripts/dispatch-plan.py" --self-test
+            index=$((index + 1))
+          done < "$RUNNER_TEMP/dispatch-targets/repos.txt"
+
+      - name: Build and schema-check the ready-issue plan
+        env:
+          TARGET_ROOT: ${{ runner.temp }}/dispatch-targets
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP/plan.json" <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+          from datetime import datetime, timezone
+
+          repos_path, plan_path = sys.argv[1:]
+          root = Path(os.environ["TARGET_ROOT"])
+          repos = Path(repos_path).read_text(encoding="utf-8").splitlines()
+          trusted_associations = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+          def api(path):
+              request = Request(
+                  "https://api.github.com" + path,
+                  headers={"Accept": "application/vnd.github+json", "User-Agent": "reg4-plan"},
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                  raise SystemExit(f"public GitHub API read failed for {path.split('?')[0]}") from exc
+
+          def paginated(path):
+              items = []
+              for page in range(1, 11):
+                  separator = "&" if "?" in path else "?"
+                  result = api(f"{path}{separator}per_page=100&page={page}")
+                  if not isinstance(result, list):
+                      raise SystemExit("public GitHub API returned a non-list page")
+                  items.extend(result)
+                  if len(result) < 100:
+                      return items
+              raise SystemExit("refusing a target snapshot at or above 1000 entries")
+
+          def load_dispatch(path):
+              spec = importlib.util.spec_from_file_location("target_dispatch_plan", path)
+              if spec is None or spec.loader is None:
+                  raise SystemExit("cannot load target dispatch-plan.py")
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          def label_names(issue):
+              labels = issue.get("labels")
+              if not isinstance(labels, list):
+                  raise SystemExit("target issue labels are malformed")
+              names = []
+              for label in labels:
+                  name = label.get("name") if isinstance(label, dict) else None
+                  if not isinstance(name, str) or not name:
+                      raise SystemExit("target issue carries a malformed label")
+                  names.append(name)
+              return sorted(set(names))
+
+          def trusted(issue):
+              author = issue.get("user", {}).get("login")
+              association = str(issue.get("author_association", "")).upper()
+              return (
+                  isinstance(author, str)
+                  and (author.endswith("[bot]") or association in trusted_associations)
+              )
+
+          def linked_open_prs(repo):
+              linked = set()
+              for pull in paginated(f"/repos/{repo}/pulls?state=open"):
+                  if not isinstance(pull, dict):
+                      raise SystemExit("target pull-request entry is malformed")
+                  head = pull.get("head", {}).get("ref", "")
+                  body = pull.get("body") or ""
+                  if not isinstance(head, str) or not isinstance(body, str):
+                      raise SystemExit("target pull-request fields are malformed")
+                  linked.update(int(number) for number in re.findall(
+                      r"(?:^|/)issue-([1-9][0-9]*)-", head
+                  ))
+                  linked.update(int(number) for number in re.findall(
+                      r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9][0-9]*)\b", body
+                  ))
+              return linked
+
+          repositories = []
+          for index, repo in enumerate(repos):
+              target = root / str(index)
+              dispatch = load_dispatch(target / "scripts" / "dispatch-plan.py")
+              raw = [
+                  issue for issue in paginated(f"/repos/{repo}/issues?state=open")
+                  if isinstance(issue, dict) and "pull_request" not in issue
+              ]
+              if len(raw) >= 1000:
+                  raise SystemExit("target issue snapshot may be truncated")
+              open_numbers = {
+                  issue.get("number") for issue in raw
+                  if isinstance(issue.get("number"), int)
+              }
+              details = {}
+              readiness_input = []
+              for issue in raw:
+                  number = issue.get("number")
+                  body = issue.get("body") or ""
+                  if (not isinstance(number, int) or number <= 0 or not isinstance(body, str)):
+                      raise SystemExit("target issue fields are malformed")
+                  labels = label_names(issue)
+                  blockers = re.findall(r"[Bb]locked-by:\s*#([0-9]+)", body)
+                  readiness_input.append({
+                      "number": number,
+                      "state": "OPEN",
+                      "labels": labels,
+                      "open_blockers": sum(int(blocker) in open_numbers for blocker in blockers),
+                  })
+                  details[number] = (issue, labels, body)
+
+              ready = dispatch.compute_ready(readiness_input)
+              linked = linked_open_prs(repo)
+              ready = [
+                  issue for issue in ready
+                  if issue["number"] not in linked and trusted(details[issue["number"]][0])
+              ]
+              rows = dispatch.plan_dispatch(ready, dispatch._routing_doc())
+              items = []
+              for row in rows:
+                  number = row.get("number")
+                  issue, labels, body = details[number]
+                  author = issue.get("user", {}).get("login")
+                  if row.get("role") is None or row.get("agent") is None or not row.get("model_chain"):
+                      raise SystemExit(f"target planner left {repo}#{number} unresolved")
+                  items.append({
+                      **row,
+                      "labels": labels,
+                      "author": author,
+                      "body_sha": hashlib.sha256(body.encode()).hexdigest(),
+                  })
+              target_sha = subprocess.run(
+                  ["git", "-C", str(target), "rev-parse", "HEAD"],
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              ).stdout.strip()
+              if not re.fullmatch(r"[0-9a-f]{40}", target_sha):
+                  raise SystemExit("target checkout returned an unsafe commit sha")
+              repositories.append({"target_repo": repo, "target_sha": target_sha, "items": items})
+
+          document = {
+              "schema": "registry-dispatch-plan/v1",
+              "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "repositories": repositories,
+          }
+
+          # PLAN cannot read private registry helpers, so it performs its own complete structural
+          # check here. CLAIM repeats a stricter independent check before any mutation.
+          if set(document) != {"schema", "generated_at", "repositories"}:
+              raise SystemExit("plan schema top-level fields are invalid")
+          if document["schema"] != "registry-dispatch-plan/v1":
+              raise SystemExit("plan schema version is invalid")
+          for repository in document["repositories"]:
+              if set(repository) != {"target_repo", "target_sha", "items"}:
+                  raise SystemExit("plan repository fields are invalid")
+              if (not isinstance(repository["target_repo"], str) or not re.fullmatch(
+                      r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*",
+                      repository["target_repo"],
+              ) or not isinstance(repository["target_sha"], str) or not re.fullmatch(
+                      r"[0-9a-f]{40}", repository["target_sha"],
+              )):
+                  raise SystemExit("plan repository identity is invalid")
+              prior = None
+              for item in repository["items"]:
+                  expected = {
+                      "number", "priority", "package", "role", "model_chain", "agent",
+                      "escalate", "labels", "author", "body_sha",
+                  }
+                  if set(item) != expected:
+                      raise SystemExit("plan item fields are invalid")
+                  if (not isinstance(item["number"], int) or isinstance(item["number"], bool)
+                          or item["number"] <= 0
+                          or not isinstance(item["priority"], int)
+                          or isinstance(item["priority"], bool)
+                          or item["priority"] not in range(5)):
+                      raise SystemExit("plan item number/priority is invalid")
+                  if (not isinstance(item["package"], str) or not re.fullmatch(
+                          r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*|__global__)", item["package"]
+                  ) or any(not isinstance(item[field], str) or not re.fullmatch(
+                          r"[A-Za-z0-9][A-Za-z0-9_.-]*", item[field]
+                  ) for field in ("role", "agent"))):
+                      raise SystemExit("plan item route strings are invalid")
+                  if (not isinstance(item["model_chain"], list) or not item["model_chain"]
+                          or item["model_chain"] != list(dict.fromkeys(item["model_chain"]))
+                          or any(not isinstance(model, str) or not re.fullmatch(
+                              r"[A-Za-z0-9][A-Za-z0-9_.-]*", model
+                          ) for model in item["model_chain"])
+                          or not isinstance(item["escalate"], bool)):
+                      raise SystemExit("plan item model route is invalid")
+                  if (not isinstance(item["labels"], list) or not item["labels"]
+                          or item["labels"] != sorted(set(item["labels"]))
+                          or any(not isinstance(label, str) or not label or "\n" in label or "\r" in label
+                                 for label in item["labels"])
+                          or not isinstance(item["author"], str) or not re.fullmatch(
+                              r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?", item["author"]
+                          ) or not isinstance(item["body_sha"], str) or not re.fullmatch(
+                              r"[0-9a-f]{64}", item["body_sha"]
+                          )):
+                      raise SystemExit("plan item issue snapshot is invalid")
+                  order = (item["priority"], item["number"])
+                  if prior is not None and order < prior:
+                      raise SystemExit("plan items are not in priority order")
+                  prior = order
+          Path(plan_path).write_text(
+              json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print(f"PLAN complete: {sum(len(repo['items']) for repo in repositories)} item(s)")
+          PY
+
+      - name: Upload immutable plan artifact (pinned)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dispatch-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/plan.json
+          if-no-files-found: error
+          retention-days: 1
+
+  claim:
+    name: CLAIM (validate, lease, launch)
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: write
+      issues: read
+    steps:
+      - name: Download PLAN artifact (pinned)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dispatch-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: plan
+
+      - name: Checkout private registry helpers (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Strictly validate, CAS claim, and dispatch live workers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          printf '::add-mask::%s\n' "$GH_TOKEN"
+          python3 registry/scripts/dispatch-claim.py \
+            --plan plan/plan.json \
+            --policy-file registry/policy/repos.toml \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --workflow-ref "$WORKFLOW_REF"

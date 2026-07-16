@@ -22,6 +22,10 @@ import sys
 LEDGER_PATH = "data/leases.json"
 
 
+class LeaseIOError(RuntimeError):
+    """A fail-closed ledger/catalog error that never includes credential material."""
+
+
 # ---- pure allocation core (unit-tested) ---------------------------------------------------------
 def reclaim_expired(leases, now):
     """Drop leases whose expiry has passed (conservative reclamation)."""
@@ -72,17 +76,49 @@ def apply_release(leases, claim_id, now):
     return [x for x in reclaim_expired(leases, now) if x.get("claim_id") != claim_id]
 
 
+def holder_key(holder):
+    """Stable target-issue identity for duplicate suppression across dispatcher/run attempts."""
+    if not isinstance(holder, str) or not holder:
+        return ""
+    return holder.split("@", 1)[0]
+
+
+def partition_available(leases, holder_prefix, package):
+    """Whether a repository-scoped package/global partition is free in the active ledger."""
+    scoped = [
+        lease for lease in leases
+        if str(lease.get("holder", "")).startswith(holder_prefix)
+    ]
+    if package == "__global__":
+        return not scoped
+    return not any(lease.get("package") in {package, "__global__"} for lease in scoped)
+
+
 # ---- GitHub CAS I/O -----------------------------------------------------------------------------
 def _read_ledger(repo):
     """Return (leases_list, blob_sha or None)."""
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/{LEDGER_PATH}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        if "HTTP 404" in result.stderr:
+            return [], None  # file absent → first write creates it
+        raise LeaseIOError("lease ledger read failed")
     try:
-        out = subprocess.run(["gh", "api", f"repos/{repo}/contents/{LEDGER_PATH}"],
-                             capture_output=True, text=True, check=True).stdout
-        meta = json.loads(out)
+        meta = json.loads(result.stdout)
         content = json.loads(base64.b64decode(meta["content"]).decode() or '{"leases":[]}')
-        return content.get("leases", []), meta["sha"]
-    except subprocess.CalledProcessError:
-        return [], None  # file absent → first write creates it
+        leases = content.get("leases")
+        if not isinstance(leases, list) or any(not isinstance(item, dict) for item in leases):
+            raise ValueError("leases must be a list of objects")
+        sha = meta["sha"]
+        if not isinstance(sha, str) or not sha:
+            raise ValueError("blob sha is missing")
+        return leases, sha
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise LeaseIOError("lease ledger is malformed") from exc
 
 
 def _write_ledger(repo, leases, sha, message):
@@ -110,6 +146,13 @@ def reclaim(repo, now, retries=6):
 
 
 # ---- account catalog + live claim / release ----------------------------------------------------
+def _run(args):
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise LeaseIOError("registry account catalog read failed")
+    return result
+
+
 def _parse_account(body):
     d = {"models": [], "max_concurrent_workers": 1}
     for line in (body or "").splitlines():
@@ -141,7 +184,7 @@ def read_accounts(repo):
 
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
-          account_pool=None):
+          account_pool=None, holder_prefix="", max_holder_concurrent=None):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free / conflict)."""
     import uuid
     accounts = read_accounts(repo)
@@ -150,7 +193,21 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         accounts = [account for account in accounts if account["handle"] in allowed]
     for _ in range(retries):
         leases, sha = _read_ledger(repo)
-        acct = choose_account(accounts, leases, model_chain, package, role, now)
+        live = reclaim_expired(leases, now)
+        key = holder_key(holder)
+        if key and any(holder_key(lease.get("holder")) == key for lease in live):
+            return None
+        if holder_prefix and not partition_available(live, holder_prefix, package):
+            return None
+        if max_holder_concurrent is not None:
+            if max_holder_concurrent <= 0 or not holder_prefix:
+                return None
+            active_holders = sum(
+                1 for lease in live if str(lease.get("holder", "")).startswith(holder_prefix)
+            )
+            if active_holders >= max_holder_concurrent:
+                return None
+        acct = choose_account(accounts, live, model_chain, package, role, now)
         if acct is None:
             return None
         a = next(x for x in accounts if x["handle"] == acct)
@@ -168,6 +225,34 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
                 "claim_id": cid,
             }
     return None  # CAS kept conflicting
+
+
+def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
+    """Return one active lease plus its current account metadata, or None if it is not adoptable."""
+    leases, _sha = _read_ledger(repo)
+    matches = [
+        lease for lease in reclaim_expired(leases, now)
+        if lease.get("claim_id") == claim_id
+    ]
+    if len(matches) != 1:
+        return None
+    lease = matches[0]
+    if expected_holder_prefix and not str(lease.get("holder", "")).startswith(expected_holder_prefix):
+        return None
+    accounts = [
+        account for account in read_accounts(repo)
+        if account.get("handle") == lease.get("account") and account.get("available")
+    ]
+    if len(accounts) != 1 or lease.get("model") not in accounts[0].get("models", []):
+        return None
+    account = accounts[0]
+    return {
+        **lease,
+        "secret_ref": account.get("secret_ref"),
+        "provider": account.get("provider"),
+        "harness": account.get("harness"),
+        "credential_format": account.get("credential_format"),
+    }
 
 
 def release(repo, claim_id, now, retries=6):
@@ -207,6 +292,14 @@ def _self_test():
     live, _lease = apply_claim([], "acct02", "run1", "pkg", "impl", "fable", now, 100, "CID")
     check("claim adds", len(live), 1)
     check("release removes", apply_release(live, "CID", now), [])
+    check("holder key ignores run identity", holder_key("owner/repo#7@run.1"), "owner/repo#7")
+    scoped = [make_lease("acct01", "owner/repo#1@run", "crate-a", "impl", "terra", now, 100)]
+    check("package partition blocks duplicate", partition_available(scoped, "owner/repo#", "crate-a"),
+          False)
+    check("package partition permits sibling", partition_available(scoped, "owner/repo#", "crate-b"),
+          True)
+    check("global partition serializes", partition_available(scoped, "owner/repo#", "__global__"),
+          False)
     check("none free", choose_account([{"handle": "a", "models": ["x"], "max_concurrent_workers": 0}],
                                       [], ["x"], "p", "r", now), None)
     pa = _parse_account("provider: openai\nmodels: [terra, gpt]\nmax_concurrent_workers: 2\n"
@@ -223,6 +316,7 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--reclaim", action="store_true", help="CAS-remove expired leases (cron)")
     ap.add_argument("--claim", action="store_true", help="claim a lease")
+    ap.add_argument("--inspect", metavar="CLAIM_ID", help="inspect an active lease for worker adoption")
     ap.add_argument("--release", metavar="CLAIM_ID", help="release a lease by claim id")
     ap.add_argument("--package", default="")
     ap.add_argument("--role", default="")
@@ -230,6 +324,12 @@ def main():
     ap.add_argument("--account-pool", default="",
                     help="comma-separated allow-list from the resolved repository policy")
     ap.add_argument("--holder", default="", help="owner/repo@run identifier")
+    ap.add_argument("--holder-prefix", default="",
+                    help="prefix used with --max-holder-concurrent for repository caps")
+    ap.add_argument("--max-holder-concurrent", type=int,
+                    help="CAS-enforced concurrent lease cap for --holder-prefix")
+    ap.add_argument("--expected-holder-prefix", default="",
+                    help="required holder prefix when inspecting a dispatcher claim")
     ap.add_argument("--ttl", type=int, default=3600, help="lease lifetime in seconds")
     ap.add_argument("--repo", default="jeswr/agent-account-registry")
     args = ap.parse_args()
@@ -248,8 +348,13 @@ def main():
                   file=sys.stderr)
             return 2
         res = claim(args.repo, args.package, args.role, chain, args.holder, int(time.time()),
-                    ttl=args.ttl, account_pool=pool)
+                    ttl=args.ttl, account_pool=pool, holder_prefix=args.holder_prefix,
+                    max_holder_concurrent=args.max_holder_concurrent)
         print(json.dumps(res) if res else "none-free")
+        return 0 if res else 3
+    if args.inspect:
+        res = inspect_claim(args.repo, args.inspect, int(time.time()), args.expected_holder_prefix)
+        print(json.dumps(res) if res else "not-adoptable")
         return 0 if res else 3
     if args.release:
         released = release(args.repo, args.release, int(time.time()))
