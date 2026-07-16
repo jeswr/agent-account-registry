@@ -527,12 +527,16 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token-dry.outputs.token || steps.app-token-live.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
+          APP_SLUG: ${{ steps.app-token-dry.outputs.app-slug || steps.app-token-live.outputs.app-slug }}
         run: |
           set -euo pipefail
           [[ -n "$GH_TOKEN" ]] || { echo '::error::target App token was not minted'; exit 1; }
+          [[ -n "$APP_SLUG" ]] || { echo '::error::app slug was not resolved'; exit 1; }
           printf '::add-mask::%s\n' "$GH_TOKEN"
           gh api "repos/$TARGET_REPO" > "$RUNNER_TEMP/target.json"
-          gh api user > "$RUNNER_TEMP/app-user.json"
+          # An App INSTALLATION token cannot call /user; resolve the bot identity via the
+          # public /users/<slug>[bot] endpoint instead. [OPUS-4.8] canary fix.
+          gh api "/users/${APP_SLUG}[bot]" > "$RUNNER_TEMP/app-user.json"
           python3 - "$RUNNER_TEMP/target.json" "$RUNNER_TEMP/app-user.json" <<'PY'
           import json
           import os
