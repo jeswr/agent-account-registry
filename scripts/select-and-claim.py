@@ -121,7 +121,7 @@ def _parse_account(body):
             d["models"] = [x.strip() for x in v.strip("[]").split(",") if x.strip()]
         elif k == "max_concurrent_workers":
             d[k] = int(v) if v.isdigit() else 1
-        elif k in ("secret_ref", "provider", "harness"):
+        elif k in ("secret_ref", "provider", "harness", "credential_format"):
             d[k] = v
     return d
 
@@ -140,10 +140,14 @@ def read_accounts(repo):
     return accounts
 
 
-def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6):
+def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
+          account_pool=None):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free / conflict)."""
     import uuid
     accounts = read_accounts(repo)
+    if account_pool is not None:
+        allowed = set(account_pool)
+        accounts = [account for account in accounts if account["handle"] in allowed]
     for _ in range(retries):
         leases, sha = _read_ledger(repo)
         acct = choose_account(accounts, leases, model_chain, package, role, now)
@@ -154,7 +158,15 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6):
         cid = uuid.uuid4().hex
         live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
         if _write_ledger(repo, live, sha, f"claim {cid[:8]} {acct} {package}/{role}"):
-            return {"account": acct, "secret_ref": a.get("secret_ref"), "model": model, "claim_id": cid}
+            return {
+                "account": acct,
+                "secret_ref": a.get("secret_ref"),
+                "provider": a.get("provider"),
+                "harness": a.get("harness"),
+                "credential_format": a.get("credential_format"),
+                "model": model,
+                "claim_id": cid,
+            }
     return None  # CAS kept conflicting
 
 
@@ -197,9 +209,11 @@ def _self_test():
     check("release removes", apply_release(live, "CID", now), [])
     check("none free", choose_account([{"handle": "a", "models": ["x"], "max_concurrent_workers": 0}],
                                       [], ["x"], "p", "r", now), None)
-    pa = _parse_account("provider: openai\nmodels: [terra, gpt]\nmax_concurrent_workers: 2\nsecret_ref: ACCT01_TOKEN")
-    check("parse account", (pa["models"], pa["max_concurrent_workers"], pa["secret_ref"]),
-          (["terra", "gpt"], 2, "ACCT01_TOKEN"))
+    pa = _parse_account("provider: openai\nmodels: [terra, gpt]\nmax_concurrent_workers: 2\n"
+                        "secret_ref: ACCT01_TOKEN\ncredential_format: codex-auth-json")
+    check("parse account", (pa["models"], pa["max_concurrent_workers"], pa["secret_ref"],
+                            pa["credential_format"]),
+          (["terra", "gpt"], 2, "ACCT01_TOKEN", "codex-auth-json"))
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -213,7 +227,10 @@ def main():
     ap.add_argument("--package", default="")
     ap.add_argument("--role", default="")
     ap.add_argument("--models", default="", help="comma-separated model fallback chain")
+    ap.add_argument("--account-pool", default="",
+                    help="comma-separated allow-list from the resolved repository policy")
     ap.add_argument("--holder", default="", help="owner/repo@run identifier")
+    ap.add_argument("--ttl", type=int, default=3600, help="lease lifetime in seconds")
     ap.add_argument("--repo", default="jeswr/agent-account-registry")
     args = ap.parse_args()
     if args.self_test:
@@ -224,13 +241,20 @@ def main():
         print(f"reclaimed {n} expired lease(s)" if n >= 0 else "reclaim: CAS kept conflicting")
         return 0 if n >= 0 else 1
     if args.claim:
-        chain = [m for m in args.models.split(",") if m.strip()]
-        res = claim(args.repo, args.package, args.role, chain, args.holder, int(time.time()))
+        chain = [m.strip() for m in args.models.split(",") if m.strip()]
+        pool = [a.strip() for a in args.account_pool.split(",") if a.strip()]
+        if not chain or not pool or args.ttl <= 0:
+            print("claim requires non-empty --models/--account-pool and positive --ttl",
+                  file=sys.stderr)
+            return 2
+        res = claim(args.repo, args.package, args.role, chain, args.holder, int(time.time()),
+                    ttl=args.ttl, account_pool=pool)
         print(json.dumps(res) if res else "none-free")
         return 0 if res else 3
     if args.release:
-        print("released" if release(args.repo, args.release, int(time.time())) else "release-failed")
-        return 0
+        released = release(args.repo, args.release, int(time.time()))
+        print("released" if released else "release-failed")
+        return 0 if released else 1
     print("select-and-claim: allocation core + reclaim + live claim/release ready (wires into dispatch, Phase 3).")
     return 0
 
