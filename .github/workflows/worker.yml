@@ -1,6 +1,7 @@
 # [GPT-5.6] Private-registry worker. Dry-run remains the default; REG-3's live path claims a CAS
 # lease, revalidates trust, runs one routed model attempt, gates it, and opens an UNARMED target PR.
 name: worker
+run-name: worker claim=${{ inputs.claim_id || 'self' }}
 
 on:
   workflow_dispatch:
