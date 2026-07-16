@@ -1,0 +1,343 @@
+# [GPT-5.6] REG-2 private-registry worker plumbing. Manual dry-run only: policy + target-scoped
+# App token + isolated selected-account environment. REG-3 owns all live model/PR behavior.
+name: worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Target owner/repository allowed by policy/repos.toml
+        required: true
+        type: string
+      issue_number:
+        description: Existing target issue used to resolve routing labels
+        required: true
+        type: string
+      account:
+        description: Selected registry account handle (for example, acct02)
+        required: true
+        type: string
+      dry_run:
+        description: REG-2 supports dry-run only; false fails closed until REG-3
+        required: true
+        default: true
+        type: boolean
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: Resolve policy without worker secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      target_owner: ${{ steps.inputs.outputs.target_owner }}
+      target_name: ${{ steps.inputs.outputs.target_name }}
+      provider: ${{ steps.account.outputs.provider }}
+      harness: ${{ steps.account.outputs.harness }}
+      model: ${{ steps.account.outputs.model }}
+      provider_model: ${{ steps.account.outputs.provider_model }}
+      credential_format: ${{ steps.account.outputs.credential_format }}
+      secret_ref: ${{ steps.account.outputs.secret_ref }}
+      agent: ${{ steps.account.outputs.agent }}
+      gate_profile: ${{ steps.account.outputs.gate_profile }}
+      worker_timeout_minutes: ${{ steps.account.outputs.worker_timeout_minutes }}
+    steps:
+      - name: Validate dispatch inputs
+        id: inputs
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          ACCOUNT: ${{ inputs.account }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          target = os.environ["TARGET_REPO"]
+          issue = os.environ["ISSUE_NUMBER"]
+          account = os.environ["ACCOUNT"]
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", target):
+              raise SystemExit("target_repo must be a safe owner/repository name")
+          if not re.fullmatch(r"[1-9][0-9]*", issue):
+              raise SystemExit("issue_number must be a positive integer")
+          if not re.fullmatch(r"acct[0-9]{2,}", account):
+              raise SystemExit("account must be an acctNN registry handle")
+          owner, name = target.split("/", 1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"target_owner={owner}\n")
+              output.write(f"target_name={name}\n")
+          PY
+
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Checkout public target for routing data (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target-routing
+          persist-credentials: false
+
+      - name: Resolve issue routing through registry policy
+        id: policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$TARGET_REPO/issues/$ISSUE_NUMBER" > "$RUNNER_TEMP/issue.json"
+          python3 - "$RUNNER_TEMP/issue.json" > "$RUNNER_TEMP/labels" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              issue = json.load(handle)
+          if "pull_request" in issue:
+              raise SystemExit("issue_number identifies a pull request, not an issue")
+          for label in issue.get("labels", []):
+              name = label.get("name") if isinstance(label, dict) else None
+              if isinstance(name, str) and name:
+                  print(name)
+          PY
+          args=(
+            --target-repo "$TARGET_REPO"
+            --policy-file registry/policy/repos.toml
+            --target-root target-routing
+          )
+          while IFS= read -r label; do
+            args+=(--label "$label")
+          done < "$RUNNER_TEMP/labels"
+          python3 registry/scripts/policy-resolve.py "${args[@]}" > "$RUNNER_TEMP/policy.json"
+          python3 -m json.tool "$RUNNER_TEMP/policy.json" >/dev/null
+
+      - name: Validate selected account against resolved policy
+        id: account
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCOUNT: ${{ inputs.account }}
+        run: |
+          set -euo pipefail
+          gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 500 \
+            --json title,body,labels > "$RUNNER_TEMP/accounts.json"
+          python3 - \
+            "$GITHUB_WORKSPACE/registry/scripts/select-and-claim.py" \
+            "$RUNNER_TEMP/policy.json" \
+            "$RUNNER_TEMP/accounts.json" <<'PY'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import tomllib
+
+          allocator_path, policy_path, accounts_path = sys.argv[1:]
+          with open(policy_path, encoding="utf-8") as handle:
+              policy = json.load(handle)
+          target_root = Path(os.environ["GITHUB_WORKSPACE"], "target-routing").resolve()
+          routing_path = Path(target_root, policy["routing"]).resolve()
+          try:
+              routing_path.relative_to(target_root)
+          except ValueError as exc:
+              raise SystemExit("resolved routing path escaped the target checkout") from exc
+          with open(routing_path, "rb") as handle:
+              routing = tomllib.load(handle)
+          with open(accounts_path, encoding="utf-8") as handle:
+              catalog = json.load(handle)
+
+          spec = importlib.util.spec_from_file_location("select_and_claim", allocator_path)
+          if spec is None or spec.loader is None:
+              raise SystemExit("cannot load registry account parser")
+          allocator = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(allocator)
+
+          account_name = os.environ["ACCOUNT"]
+          matches = [item for item in catalog if item.get("title", "").strip() == account_name]
+          if len(matches) != 1:
+              raise SystemExit(f"selected account {account_name} is missing or ambiguous")
+          item = matches[0]
+          labels = {label.get("name") for label in item.get("labels", []) if isinstance(label, dict)}
+          if "status:available" not in labels:
+              raise SystemExit(f"selected account {account_name} is not available")
+          if account_name not in policy["account_pool"]:
+              raise SystemExit(f"selected account {account_name} is outside the resolved account pool")
+
+          account = allocator._parse_account(item.get("body"))
+          models = account.get("models", [])
+          model = next((candidate for candidate in policy["model_chain"] if candidate in models), None)
+          if model is None:
+              raise SystemExit(f"selected account {account_name} cannot serve the resolved model chain")
+          model_meta = routing.get("models", {}).get(model)
+          if not isinstance(model_meta, dict):
+              raise SystemExit(f"selected model {model} has no routing metadata")
+
+          provider = model_meta.get("provider")
+          harness = model_meta.get("harness")
+          credential_format = model_meta.get("credential_format")
+          provider_model = model_meta.get("provider_model")
+          if (provider, harness) not in {("openai", "codex"), ("anthropic", "claude")}:
+              raise SystemExit("resolved model has an unsupported provider/harness pair")
+          if account.get("provider") != provider:
+              raise SystemExit("selected account provider does not match the resolved model")
+          if account.get("harness") and account["harness"] != harness:
+              raise SystemExit("selected account harness does not match the resolved model")
+          if credential_format not in {
+              "codex-auth-json", "claude-credentials-json", "claude-oauth-token", "anthropic-api-key"
+          }:
+              raise SystemExit("resolved model has an unsupported credential format")
+          if not isinstance(provider_model, str) or not provider_model:
+              raise SystemExit("resolved model has no concrete provider model")
+          secret_ref = account.get("secret_ref")
+          if not isinstance(secret_ref, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", secret_ref):
+              raise SystemExit(f"selected account {account_name} has no safe secret_ref")
+          expected_secret_ref = f"{account_name.upper()}_TOKEN"
+          if secret_ref != expected_secret_ref:
+              raise SystemExit(
+                  f"selected account {account_name} must use its own {expected_secret_ref} credential"
+              )
+
+          values = {
+              "provider": provider,
+              "harness": harness,
+              "model": model,
+              "provider_model": provider_model,
+              "credential_format": credential_format,
+              "secret_ref": secret_ref,
+              "agent": policy["agent"],
+              "gate_profile": policy["gate_profile"],
+              "worker_timeout_minutes": str(policy["worker_timeout_minutes"]),
+          }
+          for key, value in values.items():
+              if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+                  raise SystemExit(f"unsafe or missing resolved value: {key}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          print(
+              f"policy resolved: model={model}, harness={harness}, "
+              f"gate={policy['gate_profile']}, account={account_name}"
+          )
+          PY
+
+  worker:
+    name: Prove target token and worker environment
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(needs.resolve.outputs.worker_timeout_minutes) }}
+    permissions:
+      contents: read
+    concurrency:
+      group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Mint dry-run target-scoped App token (contents read only)
+        id: app-token-dry
+        if: ${{ inputs.dry_run }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: read
+
+      - name: Mint REG-3 target-scoped App token (disabled in dry-run)
+        id: app-token-live
+        if: ${{ !inputs.dry_run }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Prove App token can read exactly the target repository
+        env:
+          GH_TOKEN: ${{ steps.app-token-dry.outputs.token || steps.app-token-live.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]] || { echo '::error::target App token was not minted'; exit 1; }
+          printf '::add-mask::%s\n' "$GH_TOKEN"
+          full_name=$(gh api "repos/$TARGET_REPO" --jq .full_name)
+          [[ "$full_name" == "$TARGET_REPO" ]] || { echo '::error::App token read the wrong target'; exit 1; }
+          printf 'target token read verified for %s\n' "$TARGET_REPO"
+
+      - name: Checkout target with the App token (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target
+          token: ${{ steps.app-token-dry.outputs.token || steps.app-token-live.outputs.token }}
+          persist-credentials: false
+
+      - name: Prepare isolated selected-account environment
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_ACCOUNT: ${{ inputs.account }}
+          WORKER_ACCOUNT_CREDENTIAL: ${{ secrets[needs.resolve.outputs.secret_ref] }}
+          WORKER_PROVIDER: ${{ needs.resolve.outputs.provider }}
+          WORKER_HARNESS: ${{ needs.resolve.outputs.harness }}
+          WORKER_CREDENTIAL_FORMAT: ${{ needs.resolve.outputs.credential_format }}
+        run: bash registry/scripts/worker-prep.sh
+
+      - name: Confirm REG-2 dry-run boundary
+        if: ${{ inputs.dry_run }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          EXPECTED_HARNESS: ${{ needs.resolve.outputs.harness }}
+        run: |
+          set -euo pipefail
+          [[ "$HOME" == "$WORKER_ROOT/home" ]]
+          [[ -x "$WORKER_ROOT/cli/node_modules/.bin/$EXPECTED_HARNESS" ]]
+          printf 'DRY-RUN complete: policy, target token, checkout, and worker-prep passed.\n'
+          printf 'No model was run and no pull request was opened.\n'
+
+      - name: Run model (REG-3 placeholder, disabled by REG-2)
+        if: ${{ !inputs.dry_run }}
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          HARNESS: ${{ needs.resolve.outputs.harness }}
+          MODEL: ${{ needs.resolve.outputs.provider_model }}
+          AGENT: ${{ needs.resolve.outputs.agent }}
+        run: |
+          echo '::error::REG-2 is dry-run only; the live model harness is enabled by REG-3.'
+          exit 1
+
+      - name: Open pull request (REG-3 placeholder, disabled by REG-2)
+        if: ${{ !inputs.dry_run }}
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
+        run: |
+          echo '::error::REG-2 is dry-run only; PR creation is enabled by REG-3.'
+          exit 1
+
+      - name: Cleanup isolated worker state
+        if: ${{ always() }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: rm -rf -- "$WORKER_ROOT"
