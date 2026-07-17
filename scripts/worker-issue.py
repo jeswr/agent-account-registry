@@ -338,6 +338,11 @@ def main():
     followup.add_argument("--spec-file", required=True, help="JSONL of {title, body, labels} the model wrote")
 
     subparsers.add_parser("self-test")
+    # --self-test flag alias: every OTHER registry suite script exposes the flag form, and the
+    # pr-gate `gate` check + worker-live.sh registry-selftest gate invoke suites uniformly with
+    # --self-test; without this alias the required gate fails red on every registry PR.
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        sys.argv[1] = "self-test"
     args = parser.parse_args()
 
     try:

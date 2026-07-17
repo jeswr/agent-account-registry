@@ -37,7 +37,13 @@ concurrency:
 
 env:
   # Public discovery manifest only. CLAIM requires this set to exactly match enabled policy rows.
-  DISPATCH_TARGET_REPOS: '["sparq-org/sparq"]'
+  # jeswr/agent-account-registry is onboarded as a SECOND self-managed target (its own pipeline);
+  # its issues flow triage -> ready -> worker -> draft PR -> cross-provider review -> arm exactly
+  # like sparq. The registry App must be installed on the jeswr owner (the registry worker/review
+  # canary runs reaching the model stage confirm it is); CLAIM mints a PER-OWNER token map so the
+  # registry-owner disarm/needs-user/deferred-label mutations use the jeswr-scoped token, not the
+  # sparq-org one (defects #1,#5 — the single-token mint 404-looped every registry mutation).
+  DISPATCH_TARGET_REPOS: '["sparq-org/sparq", "jeswr/agent-account-registry"]'
 
 jobs:
   plan:
@@ -580,12 +586,18 @@ jobs:
           path: registry
           persist-credentials: false
 
-      # The deferred-retry label flips, review needs-user escalations, and missed-fix markers are
-      # TARGET mutations, so CLAIM mints its own target-scoped App token. Single-target
-      # assumption: the mint covers the first (only) manifest entry; extend to a loop if the
-      # manifest ever grows. A mint failure only skips those paths (issue dispatch continues).
-      - name: Resolve target owner for the App token
-        id: target
+      # The deferred-retry label flips, review needs-user escalations, missed-fix markers, and the
+      # armed-SHA-mismatch DISARMS (issue #42) are TARGET mutations, so CLAIM mints its own
+      # target-scoped App token(s). PER-OWNER MINT (defects #1,#5): the manifest now has two
+      # DISTINCT owners (sparq-org, jeswr), so a single token scoped to targets[0]=sparq-org would
+      # 404 every jeswr-owned registry disarm/needs-user/deferred-flip and defer it forever — the
+      # exact issue-#42 disarm window the sweep exists to close would have no automated retraction
+      # on the trust-surface repo. We mint one App token per distinct owner and hand CLAIM a
+      # {owner: token} JSON map (_target_token resolves per repo owner). Each mint is
+      # continue-on-error: a missing install for one owner only skips THAT owner's mutation paths;
+      # the other owner's dispatch + the issue dispatch for both continue.
+      - name: Resolve distinct target owners (per-owner token mint)
+        id: owners
         env:
           TARGET_REPOS: ${{ env.DISPATCH_TARGET_REPOS }}
         run: |
@@ -596,26 +608,71 @@ jobs:
           import re
 
           targets = json.loads(os.environ["TARGET_REPOS"])
-          repo = targets[0]
-          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo):
-              raise SystemExit("unsafe target repo in the manifest")
-          owner, name = repo.split("/", 1)
+          safe = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
+          owners = {}
+          for repo in targets:
+              if not safe.fullmatch(repo):
+                  raise SystemExit("unsafe target repo in the manifest")
+              owner, name = repo.split("/", 1)
+              owners.setdefault(owner, name)   # one representative repo per owner is enough
+          # The mint steps below are static (two known owners); assert the manifest owners are
+          # exactly {sparq-org, jeswr} so a manifest change fails LOUD here instead of silently
+          # dropping a new owner's token (which would reintroduce the wrong-owner-token bug).
+          if set(owners) != {"sparq-org", "jeswr"}:
+              raise SystemExit(f"unexpected target owners {sorted(owners)}; add a mint step")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"owner={owner}\n")
-              output.write(f"name={name}\n")
+              output.write(f"sparq_name={owners['sparq-org']}\n")
+              output.write(f"jeswr_name={owners['jeswr']}\n")
           PY
 
-      - name: Mint target-scoped App token (issue/PR mutations only)
-        id: app-token
+      - name: Mint sparq-org target-scoped App token (issue/PR mutations only)
+        id: app-token-sparq
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
-          owner: ${{ steps.target.outputs.owner }}
-          repositories: ${{ steps.target.outputs.name }}
+          owner: sparq-org
+          repositories: ${{ steps.owners.outputs.sparq_name }}
           permission-issues: write
           permission-pull-requests: write
+
+      - name: Mint jeswr target-scoped App token (issue/PR mutations only)
+        id: app-token-jeswr
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: ${{ steps.owners.outputs.jeswr_name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      # Assemble the {owner: token} JSON map from whichever mints succeeded. A masked, single-line
+      # step output; missing owners are simply absent (their mutations defer, never wrong-owner).
+      - name: Assemble the per-owner target token map
+        id: token-map
+        env:
+          SPARQ_TOKEN: ${{ steps.app-token-sparq.outputs.token }}
+          JESWR_TOKEN: ${{ steps.app-token-jeswr.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ -z "${SPARQ_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$SPARQ_TOKEN"
+          [[ -z "${JESWR_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$JESWR_TOKEN"
+          python3 - <<'PY'
+          import json
+          import os
+
+          tokens = {}
+          if os.environ.get("SPARQ_TOKEN"):
+              tokens["sparq-org"] = os.environ["SPARQ_TOKEN"]
+          if os.environ.get("JESWR_TOKEN"):
+              tokens["jeswr"] = os.environ["JESWR_TOKEN"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              # Compact single-line JSON — GITHUB_OUTPUT is line-based; the tokens are masked above.
+              output.write(f"tokens={json.dumps(tokens, separators=(',', ':'))}\n")
+          PY
 
       # Least-exposure filter (audit-2026-07-17): only this tiny inline step ever sees the full
       # secrets map; the probe step below receives ONLY the ACCT_* worker-token subset via a file.
@@ -668,8 +725,11 @@ jobs:
       - name: Strictly validate, CAS claim, and dispatch live workers + review/fix runs
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          BOT_LOGIN: ${{ steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}
+          # Per-owner target App-token map (defects #1,#5): _target_token(repo) resolves the token
+          # for repo's OWNER. Same App across owners, so the bot slug is identical; take it from
+          # whichever mint succeeded.
+          TARGET_GH_TOKENS: ${{ steps.token-map.outputs.tokens }}
+          BOT_LOGIN: ${{ (steps.app-token-sparq.outputs.app-slug || steps.app-token-jeswr.outputs.app-slug) && format('{0}[bot]', steps.app-token-sparq.outputs.app-slug || steps.app-token-jeswr.outputs.app-slug) || '' }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
           # Privacy routing (locked decision 22c): a maintainer-set ALERT_REPO (+ ALERT_TOKEN
@@ -685,7 +745,14 @@ jobs:
         run: |
           set -euo pipefail
           printf '::add-mask::%s\n' "$GH_TOKEN"
-          [[ -z "$TARGET_GH_TOKEN" ]] || printf '::add-mask::%s\n' "$TARGET_GH_TOKEN"
+          # Re-mask each per-owner token value defensively (already masked at mint assembly).
+          python3 - <<'PY'
+          import json
+          import os
+          for tok in json.loads(os.environ.get("TARGET_GH_TOKENS", "{}") or "{}").values():
+              if tok:
+                  print(f"::add-mask::{tok}")
+          PY
           python3 registry/scripts/dispatch-claim.py \
             --plan plan/plan.json \
             --policy-file registry/policy/repos.toml \

@@ -39,3 +39,57 @@ trust = "collaborators"
 max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total (see header)
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
 cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade
+
+# [OPUS-4.8] The registry as a SECOND self-managed target — its OWN pipeline drains its own
+# ~19 open from:agent issues (triage -> ready -> worker -> draft PR -> cross-provider review ->
+# arm) exactly like sparq. This repo IS the orchestration trust plane, so it runs conservatively:
+# a SMALL max_concurrent, the SHARED account_pool, sparq-style routing (impl -> fable chain, docs
+# -> haiku, review cross-provider), and a python/actions gate profile (the crate-scoped cargo gate
+# does not fit a python repo). Its routing.toml (orchestration/routing.toml, in THIS repo) marks
+# every orchestration area (dispatch/worker/set-up-account/review-loop/groom) as a soundness
+# surface (escalate=true) so those routes run on Opus and, on chain-exhaustion, escalate to a
+# human — AND the review lane's arm-side classifier reads those same match_labels keywords so an
+# approved trust-surface PR is HUMAN-armed, never auto-armed (defect #3).
+[repos."jeswr/agent-account-registry"]
+enabled = true
+routing = "orchestration/routing.toml"   # THIS repo's own routing (self-managed target)
+account_pool = ["acct01", "acct02", "acct03", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct06", "acct07"]
+max_concurrent = 3            # SMALL: the trust plane drains slowly + conservatively
+worker_timeout_minutes = 30   # python self-tests + actionlint are fast (no cargo build)
+gate_profile = "registry-selftest"  # python --self-test suite + bash -n + actionlint (see worker-live.sh)
+arm_auto_merge = true         # allow_auto_merge is enabled live (B1); the FINAL arm click on a
+                              # gate-weakening trust-surface diff is still a human's (security_paths
+                              # below, enforced at arm time — review stays automated)
+require_usage = true          # hold (fail-closed) if the usage probe is unavailable
+usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH windows
+max_attempts = 3
+dispatch = "cron"
+trust = "collaborators"
+max_review_rounds = 3
+review_queue_ttl_minutes = 30
+cross_provider_fallback = false
+# [OPUS-4.8] B3 / defects #2,#4: the ACTIVE, WIRED trust-surface FILE control. A worker PR whose
+# diff touches ANY of these gate-weakening / orchestration-control paths routes its ARM to a HUMAN
+# even for a benign-labelled PR (area:docs/haiku etc.). CONSUMED by review-fix.yml: the review-
+# outcome + ready-and-arm steps pass this list to worker-pr.trust_surface_paths_touched, and
+# ready-and-arm re-derives the live PR diff (renamed paths included) before ever undrafting/arming.
+# The automated cross-provider review still runs — only the final arm click is a human's here.
+security_paths = [
+  "scripts/dispatch-claim.py",
+  "scripts/worker-live.sh",
+  "scripts/worker-pr.py",
+  "scripts/worker-issue.py",
+  "scripts/select-and-claim.py",
+  "scripts/groom.py",
+  "scripts/broker-refresh.py",
+  "scripts/account-usage.py",
+  "scripts/policy-resolve.py",
+  "scripts/route-resolve.py",
+  "scripts/ready-issues.py",
+  "scripts/dispatch-plan.py",
+  "scripts/triage.py",
+  "policy/",
+  "orchestration/",
+  ".github/workflows/",
+  ".claude/agents/",
+]

@@ -66,6 +66,33 @@ WORKER_HEAD_RE = re.compile(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+")
 # groom's parked-PR marker ("Human attention required"). Either stands the loop down.
 HUMAN_OWNED_LABELS = ("review:needs-user", "needs:user")
 SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
+# [OPUS-4.8] B3 / defect #2,#4: the trust-surface FILE paths. A worker PR whose diff touches ANY
+# of these gate-weakening / orchestration-control files must NOT auto-arm regardless of its issue
+# labels — the cross-provider review still runs (automated), but the final arm click is a HUMAN's.
+# This is the ACTIVE, WIRED FILE-level control (previously the policy-row `security_paths` was
+# unwired config). Prefix-matched against every PR-diff path; a trailing `/` marks a directory
+# subtree, a bare path is an exact-or-descendant match. review-fix.yml passes the resolved list
+# from the target policy row; this constant is the built-in fail-closed default when no list is
+# supplied (so the guard is never silently absent).
+DEFAULT_TRUST_SURFACE_PATHS = (
+    "scripts/dispatch-claim.py",
+    "scripts/worker-live.sh",
+    "scripts/worker-pr.py",
+    "scripts/worker-issue.py",
+    "scripts/select-and-claim.py",
+    "scripts/groom.py",
+    "scripts/policy-resolve.py",
+    "scripts/route-resolve.py",
+    "scripts/ready-issues.py",
+    "scripts/dispatch-plan.py",
+    "scripts/triage.py",
+    "scripts/broker-refresh.py",
+    "scripts/account-usage.py",
+    ".github/workflows/",
+    "policy/",
+    "orchestration/",
+    ".claude/agents/",
+)
 VERDICTS = {"approve", "request_changes"}
 SEVERITIES = {"blocker", "major", "minor", "nit"}
 MAX_ISSUES = 10
@@ -294,11 +321,48 @@ def replace_reviewed_sha(body, sha):
     return body + "\n\n" + marker + "\n"
 
 
-def security_flagged(labels):
-    """Security surfaces never auto-arm: substring keywords mirror routing match_labels; trust:*
-    is a prefix namespace."""
-    return (any(keyword in label for label in labels for keyword in SECURITY_KEYWORDS)
+def security_flagged(labels, extra_keywords=()):
+    """Security surfaces never auto-arm: substring keywords mirror routing match_labels; trust:* is
+    a prefix namespace. `extra_keywords` (defect #3) lets the caller inject the TARGET routing's
+    own `match_labels` keywords so a per-target trust surface (e.g. the registry's area:worker /
+    area:dispatch / area:set-up-account) is flagged too — the built-in SECURITY_KEYWORDS alone did
+    not cover the registry's trust areas, so its ready issues classified as non-security and would
+    auto-arm."""
+    keywords = tuple(SECURITY_KEYWORDS) + tuple(extra_keywords)
+    return (any(keyword in label for label in labels for keyword in keywords)
             or any(label.startswith("trust:") for label in labels))
+
+
+def _norm_path(path):
+    norm = str(path).strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.lstrip("/")
+
+
+def trust_surface_paths_touched(diff_files, surface_paths=DEFAULT_TRUST_SURFACE_PATHS):
+    """[OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Returns the
+    sorted subset of `diff_files` that touch a gate-weakening / orchestration-control path, so the
+    ARM path can withhold auto-arm and route to a HUMAN. A path in `surface_paths` ending in `/`
+    matches that directory subtree; a bare path matches itself or any descendant. Hostile-tolerant:
+    non-string/empty entries are ignored (a poisoned diff-file list can only DEMOTE to human-arm,
+    never silently approve). This is what `policy/repos.toml`'s `security_paths` NOW drives —
+    review-fix.yml resolves the row's list and passes it here."""
+    surfaces = [_norm_path(p) for p in surface_paths if isinstance(p, str) and p.strip()]
+    touched = set()
+    for raw in diff_files:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        path = _norm_path(raw)
+        for surface in surfaces:
+            if surface.endswith("/"):
+                if path == surface.rstrip("/") or path.startswith(surface):
+                    touched.add(path)
+                    break
+            elif path == surface or path.startswith(surface + "/"):
+                touched.add(path)
+                break
+    return sorted(touched)
 
 
 def human_owned(labels):
@@ -449,6 +513,30 @@ def _paginated_comments(repo, pr_number):
     if not isinstance(pages, list):
         raise WorkerPrError("GitHub API returned malformed comments")
     return [item for page in pages if isinstance(page, list) for item in page]
+
+
+def _pr_changed_files(repo, pr_number):
+    """[OPUS-4.8] B3: the LIVE changed-file paths of a PR (paginated). Used by ready_and_arm's
+    trust-surface re-derivation so the arm gate keys on the actual diff (renamed paths included),
+    not a planning-time snapshot. Malformed entries are dropped (fail closed toward human arm)."""
+    pages = _gh_json([
+        "api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_number}/files?per_page=100",
+    ])
+    if not isinstance(pages, list):
+        raise WorkerPrError("GitHub API returned malformed PR files")
+    files = []
+    for page in pages:
+        if not isinstance(page, list):
+            continue
+        for entry in page:
+            name = entry.get("filename") if isinstance(entry, dict) else None
+            if isinstance(name, str) and name.strip():
+                files.append(name)
+            # A rename also exposes the old path — both sides must be checked.
+            prev = entry.get("previous_filename") if isinstance(entry, dict) else None
+            if isinstance(prev, str) and prev.strip():
+                files.append(prev)
+    return files
 
 
 def _write_outputs(values):
@@ -847,7 +935,7 @@ def disarm(repo, pr_number, when):
 
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
-                  reviewer_account, arm, issue=None):
+                  reviewer_account, arm, issue=None, surface_paths=None):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval).
 
@@ -856,7 +944,15 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     same PROVENANCE_SALT. Liveness (crash-window hardening): `gh pr ready` un-drafts the PR, so if
     the subsequent `merge --auto` fails the draft state is restored (`gh pr ready --undo`) — the
     PR stays visible to the sweep for a bounded re-review instead of stalling non-draft/unarmed
-    forever; if even the undo fails, this escalates to review:needs-user (never silent)."""
+    forever; if even the undo fails, this escalates to review:needs-user (never silent).
+
+    [OPUS-4.8] B3 / defects #2,#4: DEFENSE-IN-DEPTH trust-surface arm gate re-derived on LIVE
+    data. Even if the upstream review-outcome decided `arm`, this — the last mutation before the
+    latch — re-reads the PR's changed files from the API at the reviewed head and, if ANY touches
+    a gate-weakening / orchestration-control path (renamed paths included, since the check is live
+    against the actual diff, not the planning-time list), WITHHOLDS auto-arm and escalates to a
+    human (review:needs-user). The PR is NOT undrafted/armed; the automated review already ran, the
+    final arm click is a human's for gate-weakening paths regardless of issue labels."""
     if reviewer_provider == impl_provider:
         raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
@@ -874,6 +970,20 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         _write_outputs({"armed": False, "head_moved": True})
         print("live head advanced past the reviewed sha; returned to review:needs")
         return
+    if arm:
+        # Live trust-surface re-derivation BEFORE any undraft/latch (renamed-path safe).
+        surfaces = tuple(surface_paths) if surface_paths else DEFAULT_TRUST_SURFACE_PATHS
+        live_files = _pr_changed_files(repo, pr_number)
+        hits = trust_surface_paths_touched(live_files, surfaces)
+        if hits:
+            alert_repo, alert_token = _alert_route()
+            needs_user(repo, pr_number,
+                       "trust-surface change approved by cross-provider review; human arm "
+                       f"required (diff touches: {', '.join(hits[:8])})",
+                       issue=issue, alert_repo=alert_repo, alert_token=alert_token)
+            _write_outputs({"armed": False, "head_moved": False, "trust_surface": True})
+            print("trust-surface diff: withheld auto-arm; escalated to human (review:needs-user)")
+            return
     _run_gh(["pr", "ready", str(pr_number), "-R", repo])
     if arm:
         merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto"],
@@ -911,6 +1021,17 @@ def review_outcome(args):
         document = json.load(handle)
     has_blockers = validate_verdict(document, diff_files)  # raises => verdict VOID, step fails
     post_findings(args.repo, args.pr, args.verdict_file, args.round)
+    # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
+    # the PR's own diff file set (the same list the reviewer just used). ANY gate-weakening /
+    # orchestration-control path forces the security posture — the review stays automated, but an
+    # approved PR that touches one is HUMAN-armed (needs-user), never auto-armed. The surface list
+    # comes from the target policy row's `security_paths` (workflow-supplied via --surface-path);
+    # an empty supplied list means "not configured for this target" and falls back to the built-in
+    # DEFAULT_TRUST_SURFACE_PATHS so the guard is never silently absent (fail closed).
+    surface_paths = tuple(args.surface_path) if args.surface_path else DEFAULT_TRUST_SURFACE_PATHS
+    surface_hits = trust_surface_paths_touched(diff_files, surface_paths)
+    trust_surface = bool(surface_hits)
+    security = args.security or trust_surface
     # Round-budget exhaustion consults the PURE decide_budget (maintainer directive 2026-07-17):
     # a model-tier escalation or an improving-progress grade extends the loop (hard cap 6 total
     # rounds inside decide_budget) instead of the flat needs-user at the base budget.
@@ -924,10 +1045,11 @@ def review_outcome(args):
                                args.impl_provider, base_rounds=args.max_rounds)
     decision = decide_review(document["verdict"], has_blockers,
                              document["injection_detected"], args.round, args.max_rounds,
-                             args.security, budget_action=budget["action"])
+                             security, budget_action=budget["action"])
     _write_outputs({"decision": decision, "verdict": document["verdict"],
                     "has_blockers": has_blockers,
                     "injection": document["injection_detected"],
+                    "trust_surface": trust_surface,
                     "budget": budget["action"]})
     if decision == "changes":
         if budget["action"] == "extend-model-pin" and budget["pin"]:
@@ -935,14 +1057,22 @@ def review_outcome(args):
                              args.impl_provider, args.run_key, args.bot_login)
         set_review_state(args.repo, args.pr, "changes")
     elif decision == "needs-user":
-        reason = ("the reviewer flagged possible prompt injection"
-                  if document["injection_detected"] else
-                  "a security-labelled surface passed review and needs a HUMAN arm decision"
-                  if document["verdict"] == "approve" else
-                  f"the review round budget is exhausted at {args.round} round(s) (base "
-                  f"{args.max_rounds}, hard cap {HARD_CAP_ROUNDS}) with no extension left — "
-                  "the top fix tier has run and the latest verdict does not grade the PR "
-                  "improving")
+        approved = document["verdict"] == "approve" and not has_blockers
+        if document["injection_detected"]:
+            reason = "the reviewer flagged possible prompt injection"
+        elif approved and trust_surface:
+            # B3: the review APPROVED, but the diff touches a gate-weakening / orchestration
+            # trust-surface path — the automated cross-provider review is complete, but the arm
+            # is a human's regardless of issue labels.
+            reason = ("trust-surface change approved by cross-provider review; human arm "
+                      f"required (diff touches: {', '.join(surface_hits[:8])})")
+        elif approved:
+            reason = "a security-labelled surface passed review and needs a HUMAN arm decision"
+        else:
+            reason = (f"the review round budget is exhausted at {args.round} round(s) (base "
+                      f"{args.max_rounds}, hard cap {HARD_CAP_ROUNDS}) with no extension left — "
+                      "the top fix tier has run and the latest verdict does not grade the PR "
+                      "improving")
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token)
@@ -1031,6 +1161,43 @@ def _self_test():
     check("security label substring", security_flagged({"area:sparq-zk"}), True)
     check("security trust prefix", security_flagged({"trust:untrusted"}), True)
     check("security plain labels", security_flagged({"area:sparq-core", "role:impl"}), False)
+    # [OPUS-4.8] defect #3: per-target keyword injection flags the registry's trust areas that the
+    # builtin keyword set missed (area:worker/dispatch/set-up-account/review-loop/groom).
+    check("defect#3 registry area unflagged by builtin",
+          security_flagged({"area:worker", "role:impl", "status:ready"}), False)
+    check("defect#3 registry area flagged with target keywords",
+          security_flagged({"area:worker", "role:impl"},
+                           extra_keywords=("worker", "dispatch", "set-up-account")), True)
+    check("defect#3 non-trust area still unflagged with keywords",
+          security_flagged({"area:usage", "role:impl"},
+                           extra_keywords=("worker", "dispatch")), False)
+
+    # [OPUS-4.8] B3 / defects #2,#4: the WIRED trust-surface FILE control (both directions +
+    # renamed-path + directory-subtree). A benign diff is NOT flagged; ANY gate-weakening path is.
+    check("trust-surface benign diff",
+          trust_surface_paths_touched(["README.md", "data/leases.json"]), [])
+    check("trust-surface flags a worker script",
+          trust_surface_paths_touched(["README.md", "scripts/worker-pr.py"]),
+          ["scripts/worker-pr.py"])
+    check("trust-surface flags a workflow (subtree)",
+          trust_surface_paths_touched([".github/workflows/dispatch.yml"]),
+          [".github/workflows/dispatch.yml"])
+    check("trust-surface flags policy + orchestration subtrees",
+          trust_surface_paths_touched(["policy/repos.toml", "orchestration/routing.toml"]),
+          ["orchestration/routing.toml", "policy/repos.toml"])
+    # renamed-path case: the OLD path is a trust surface even if the new name is benign — the live
+    # PR-files read exposes both sides, so either side flags.
+    check("trust-surface flags a renamed-from surface path",
+          trust_surface_paths_touched(["docs/moved.md", "scripts/groom.py"]),
+          ["scripts/groom.py"])
+    # a caller-supplied (policy security_paths) list REPLACES the default set.
+    check("trust-surface honours a supplied path list",
+          trust_surface_paths_touched(["scripts/worker-pr.py", "custom/thing.py"],
+                                      surface_paths=("custom/",)),
+          ["custom/thing.py"])
+    # hostile/malformed diff entries can only DEMOTE to human-arm, never silently approve.
+    check("trust-surface tolerates malformed entries",
+          trust_surface_paths_touched(["", None, 123, "policy/x.toml"]), ["policy/x.toml"])
 
     # human_owned: EITHER the loop's own escalation label or groom's parked-PR marker parks the
     # autonomous surface; plain loop states do not.
@@ -1317,7 +1484,8 @@ def _self_test():
                 review_outcome(argparse.Namespace(
                     repo="o/r", pr=41, verdict_file=str(verdict_file),
                     files_file=str(files_file), round=3, max_rounds=3, security=False,
-                    issue=None, impl_provider="anthropic", bot_login=bot, run_key="9.1"))
+                    surface_path=[], issue=None, impl_provider="anthropic", bot_login=bot,
+                    run_key="9.1"))
                 return list(wiring_calls)
 
             sonnet_fix = [{"user": {"login": bot},
@@ -1463,6 +1631,10 @@ def main():
     arm.add_argument("--reviewer-provider", required=True)
     arm.add_argument("--arm", choices=("true", "false"), required=True)
     arm.add_argument("--issue", type=int)
+    # [OPUS-4.8] B3: the live trust-surface arm gate's path list (repeatable; from policy
+    # security_paths). Empty -> DEFAULT_TRUST_SURFACE_PATHS (fail closed, never silently absent).
+    arm.add_argument("--surface-path", action="append", default=[],
+                     help="trust-surface path/prefix (repeatable; from policy security_paths)")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -1470,6 +1642,11 @@ def main():
     rout.add_argument("--round", required=True, type=int)
     rout.add_argument("--max-rounds", required=True, type=int)
     rout.add_argument("--security", action="store_true")
+    # [OPUS-4.8] B3 / defects #2,#4: the WIRED trust-surface FILE list from the target policy
+    # row's `security_paths` (repeatable). Any PR-diff path under one of these forces the human
+    # arm even for a benign-labelled PR. Empty -> the built-in DEFAULT_TRUST_SURFACE_PATHS.
+    rout.add_argument("--surface-path", action="append", default=[],
+                      help="trust-surface path/prefix (repeatable; from policy security_paths)")
     rout.add_argument("--issue", type=int)
     # Budget-extension inputs (maintainer directive 2026-07-17): the implementer provider picks
     # the escalation ladder, the bot login trust-filters the durable fix-model markers, and the
@@ -1555,7 +1732,8 @@ def main():
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,
                           os.environ.get("WORKER_REVIEWER_ACCOUNT", ""),
-                          args.arm == "true", issue=args.issue)
+                          args.arm == "true", issue=args.issue,
+                          surface_paths=args.surface_path or None)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":

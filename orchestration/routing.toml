@@ -1,0 +1,105 @@
+# Routing table for the SELF-MANAGED registry target (jeswr/agent-account-registry).
+# PUBLIC — no account information. Same schema + consumer contract as sparq's
+# orchestration/routing.toml: the dispatch PLAN clones this repo and reads this file BY THE
+# ROUTING POINTER in policy/repos.toml, and route-resolve.py / policy-resolve.py resolve a
+# triaged issue's role/labels to a MODEL fallback-chain + agent.
+#
+# PRECEDENCE (consumer contract, identical to sparq): security-label overrides > explicit role >
+# [defaults], evaluated top-to-bottom, FIRST MATCH WINS. The `[[route]]` blocks with `match_labels`
+# (the security surfaces) are listed FIRST and win over the role blocks below them.
+#
+# match_labels SEMANTICS: a rule matches if ANY of the issue's labels CONTAINS any listed keyword
+# as a SUBSTRING. This is ALSO the signal the review-lane arm-side security classifier consults
+# (worker-pr.py security_flagged / dispatch-claim.py _security_flagged read the target routing's
+# match_labels keywords), so the trust-surface areas below are load-bearing for the arm gate, not
+# only for model selection: a review that approves an issue matched here is routed to a HUMAN arm
+# (needs:user), never auto-armed. THIS repo is the orchestration trust plane, so its worker/
+# dispatch/set-up-account/review-loop/groom areas ARE security surfaces.
+
+# ---------------------------------------------------------------------------------------------------
+# [models] — the catalog. Mirrors sparq's catalog so the shared account_pool + cross-provider
+# review/fix chains resolve identically. A model alias -> provider + harness + concrete provider
+# model id + credential format.
+[models.haiku]
+provider = "anthropic"
+harness = "claude"
+provider_model = "claude-haiku-4-5"
+credential_format = "claude-oauth-token"
+[models.sonnet]
+provider = "anthropic"
+harness = "claude"
+provider_model = "claude-sonnet-4-6"
+credential_format = "claude-oauth-token"
+[models.opus]
+provider = "anthropic"
+harness = "claude"
+provider_model = "claude-opus-4-8"
+credential_format = "claude-oauth-token"
+[models.fable]
+provider = "anthropic"
+harness = "claude"
+provider_model = "claude-fable-5"
+credential_format = "claude-oauth-token"
+[models.terra]
+provider = "openai"
+harness = "codex"
+provider_model = "TBD"                 # terra is an internal alias; maintainer sets the concrete GPT id
+credential_format = "codex-auth-json"
+
+[defaults]
+model_chain = ["fable", "sonnet", "terra"]
+agent = "registry-impl"
+
+# ---------------------------------------------------------------------------------------------------
+# SECURITY-LABEL OVERRIDES (first-match; win over role). On the trust plane the orchestration
+# surfaces themselves are soundness surfaces: any issue whose labels touch dispatch / worker /
+# set-up-account / review-loop / groom runs on Opus and, on chain-exhaustion, ESCALATES to a human
+# (needs:user) rather than degrading to a weaker/cross-provider model. `escalate = true` is
+# consumed by dispatch (escalate_starved) AND the substring keywords here are read by the review
+# lane's arm-side classifier so an approved trust-surface PR is HUMAN-armed, never auto-armed.
+[[route]]
+match_labels = [
+  "dispatch", "worker", "set-up-account", "review-loop", "groom",
+  "zk", "mpc", "crypto", "auth", "e2ee",
+]
+model_chain = ["opus"]
+agent = "registry-reviewer"
+escalate = true
+
+# ---------------------------------------------------------------------------------------------------
+# ROLE ROUTES. Fable is the primary code-writer; terra (GPT) is the cross-provider implementation
+# fallback so an Anthropic outage does not stall implementation. docs -> haiku-led (cheap).
+[[route]]
+role = "impl"
+model_chain = ["fable", "sonnet", "terra"]
+agent = "registry-impl"
+
+[[route]]
+role = "ci"
+model_chain = ["fable", "sonnet", "terra"]
+agent = "registry-ci"
+
+[[route]]
+role = "research"
+model_chain = ["fable", "opus"]
+agent = "registry-researcher"
+
+[[route]]
+role = "docs"
+model_chain = ["haiku", "fable"]
+agent = "registry-docs"
+
+# Review / soundness: Opus only; escalate to a human on unavailability (never fall to a weaker
+# model). The review chain proper is computed cross-provider by dispatch-claim.py; this row exists
+# so a `role:review`/`role:soundness` issue resolves + so policy-resolve escalate is set.
+[[route]]
+role = "review"
+model_chain = ["opus"]
+agent = "registry-reviewer"
+escalate = true
+
+[[route]]
+role = "soundness"
+model_chain = ["opus"]
+agent = "registry-reviewer"
+escalate = true

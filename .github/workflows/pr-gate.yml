@@ -1,0 +1,86 @@
+# [OPUS-4.8] B1: the registry's own required PR gate. The onboarded review lane arms a PR with
+# `gh pr merge --auto` (allow_auto_merge is enabled live on the repo); that latch only merges when
+# a REQUIRED status check named `gate` is green. This workflow IS that check — a `pull_request`
+# job literally named `gate` running the registry-selftest suite (python --self-test + actionlint).
+# It is also the authoritative check dispatch-claim.py's CI_GATE_CHECK reads (name == "gate").
+#
+# The orchestrator requires this via a ruleset AFTER push (documented in the commit message):
+#   required_status_checks context 'gate'; NO require-pull-request rule (direct pipeline pushes —
+#   worker/review-fix branch pushes — must stay allowed). Do NOT create the ruleset here.
+#
+# Least privilege: contents:read only (the gate reads code + runs tests; it never writes). Actions
+# are SHA-pinned. actionlint is fetched from a pinned release tag + checksum-free `go install` is
+# avoided in favour of the official pinned action.
+name: pr-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR head (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML for the workflow-yaml lint
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      - name: Install actionlint (pinned release)
+        uses: raven-actions/actionlint@3a24062651993d40ff222ab58bb35584726cc6ea # v2.0.0
+        with:
+          version: 1.7.7
+
+      - name: Run the full registry self-test suite
+        run: |
+          set -euo pipefail
+          # Every self-testing pipeline script — the same FULL suite worker-live.sh's
+          # registry-selftest gate runs. A missing self-test fails the gate (fail closed).
+          suite="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py triage.py \
+          dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
+          account-usage.py usage-alert.py broker-refresh.py backfill-provenance.py"
+          for s in $suite; do
+            if [[ -f "scripts/$s" ]]; then
+              echo "== self-test $s =="
+              python3 "scripts/$s" --self-test
+            fi
+          done
+          echo "== self-test worker-live.sh =="
+          bash scripts/worker-live.sh self-test
+
+      - name: bash -n every shell script
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in scripts/*.sh; do
+            echo "== bash -n $f =="
+            bash -n "$f"
+          done
+
+      - name: actionlint + yaml-parse every workflow
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            echo "== yaml-parse $f =="
+            python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$f"
+          done
+          echo "== actionlint =="
+          actionlint -color

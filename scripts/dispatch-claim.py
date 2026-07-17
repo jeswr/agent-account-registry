@@ -748,16 +748,49 @@ def _current_issue_matches(repo, item):
     return True, ""
 
 
-def _target_token():
-    return os.environ.get("TARGET_GH_TOKEN", "")
+def _target_tokens_map():
+    """[OPUS-4.8] defects #1,#5: the PER-OWNER target App-token map. dispatch.yml mints one App
+    token per DISTINCT manifest owner and passes {owner: token} as JSON in TARGET_GH_TOKENS. The
+    single-target legacy env TARGET_GH_TOKEN is still honoured as a fallback (mapped to the first
+    manifest owner via TARGET_GH_TOKEN_OWNER), so a single-target deployment is unchanged. This is
+    the fix for the wrong-owner-token bug: with two targets, targets[0]'s token would 404 every
+    registry-owner disarm / needs-user / deferred-label mutation and defer-retry them forever."""
+    raw = os.environ.get("TARGET_GH_TOKENS", "")
+    tokens = {}
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise DispatchError("TARGET_GH_TOKENS is not valid JSON") from exc
+        if not isinstance(data, dict):
+            raise DispatchError("TARGET_GH_TOKENS must be a {owner: token} object")
+        for owner, token in data.items():
+            if isinstance(owner, str) and isinstance(token, str) and owner and token:
+                tokens[owner] = token
+    legacy = os.environ.get("TARGET_GH_TOKEN", "")
+    legacy_owner = os.environ.get("TARGET_GH_TOKEN_OWNER", "")
+    if legacy and legacy_owner and legacy_owner not in tokens:
+        tokens[legacy_owner] = legacy
+    return tokens
 
 
-def _run_target_helper(script_dir, script, args):
+def _target_token(repo):
+    """The App token scoped to the OWNER of `repo`. Empty when this owner has no minted token
+    (that owner's mutation paths then DEFER loudly instead of 404-looping with a wrong-owner
+    token). `repo` is an owner/name string."""
+    if not isinstance(repo, str) or "/" not in repo:
+        return ""
+    owner = repo.split("/", 1)[0]
+    return _target_tokens_map().get(owner, "")
+
+
+def _run_target_helper(script_dir, repo, script, args):
     """Run a registry helper (worker-issue.py / worker-pr.py) against the TARGET repo under the
-    target-scoped App token. The ambient GH_TOKEN stays the registry workflow token."""
-    token = _target_token()
+    OWNER-scoped target App token. The ambient GH_TOKEN stays the registry workflow token."""
+    token = _target_token(repo)
     if not token:
-        raise DispatchError("target-scoped App token is unavailable")
+        raise DispatchError(
+            f"target-scoped App token is unavailable for owner {repo.split('/', 1)[0]!r}")
     result = subprocess.run(
         [sys.executable, str(script_dir / script), *args],
         capture_output=True, text=True, check=False,
@@ -778,11 +811,11 @@ def _pr_needs_user(script_dir, repo, pr_number, issue, reason):
     args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason]
     if isinstance(issue, int) and issue > 0:
         args += ["--issue", str(issue)]
-    _run_target_helper(script_dir, "worker-pr.py", args)
+    _run_target_helper(script_dir, repo, "worker-pr.py", args)
 
 
 def _run_gh_target_comment(repo, issue_or_pr, body):
-    token = _target_token()
+    token = _target_token(repo)
     if not token:
         raise DispatchError("target-scoped App token is unavailable")
     result = subprocess.run(
@@ -959,7 +992,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     # autonomous push can ride the stale auto-merge latch (issue #42), and the
                     # review sweep only enumerates drafts. disarm --when always is idempotent +
                     # live-revalidated; the repair item re-admits next tick against the draft.
-                    _run_target_helper(script_dir, "worker-pr.py", [
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "disarm", "--repo", repo, "--pr", str(number), "--when", "always"])
                     print(f"defer review {repo}#{number}: defused to draft for {item['state']}; "
                           "retried next tick")
@@ -1044,7 +1077,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # Converge the durable pin marker (normally recorded by the review outcome; this
                 # covers a crashed outcome). record_model_pin is idempotent and an existing
                 # equal-or-higher floor wins, so re-running it every tick is safe.
-                _run_target_helper(script_dir, "worker-pr.py", [
+                _run_target_helper(script_dir, repo, "worker-pr.py", [
                     "record-model-pin", "--repo", repo, "--pr", str(number),
                     "--round", str(max(rounds, 1)), "--tier", budget["pin"],
                     "--provider", impl_provider, "--run-key", run_key,
@@ -1112,7 +1145,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     continue
                 verdict_file = Path(registry_root) / worker_pr.verdict_path(repo, number, rounds)
                 if not verdict_file.is_file():
-                    _run_target_helper(script_dir, "worker-pr.py", [
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "record-marker", "--repo", repo, "--pr", str(number), "--kind", "missed",
                         "--round", str(rounds), "--run-key",
                         f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
@@ -1159,7 +1192,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         if claim is None:
             if mode == "fix":
                 try:
-                    _run_target_helper(script_dir, "worker-pr.py", [
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "record-marker", "--repo", repo, "--pr", str(number), "--kind", "missed",
                         "--round", str(round_number), "--run-key",
                         f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
@@ -1236,10 +1269,10 @@ def _apply_disarm_items(disarm_items, repo, script_dir, bot_login):
     for item in disarm_items:
         number = item["pr_number"]
         try:
-            if not bot_login or not _target_token():
+            if not bot_login or not _target_token(repo):
                 print(f"defer disarm {repo}#{number}: target App token unavailable")
                 continue
-            _run_target_helper(script_dir, "worker-pr.py", [
+            _run_target_helper(script_dir, repo, "worker-pr.py", [
                 "disarm", "--repo", repo, "--pr", str(number), "--when", "mismatch"])
             print(f"disarm {repo}#{number}: live armed-SHA invariant re-checked and applied")
         except DispatchError as exc:
@@ -1383,13 +1416,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     # Deferred-retry budget (locked decision 20): re-dispatch is bounded by the
                     # SAME durable attempt markers the worker records; exhausted -> needs-user +
                     # a maintainer-visible comment, never another silent attempt.
-                    if not bot_login or not _target_token():
+                    if not bot_login or not _target_token(repo):
                         print(f"defer {repo}#{number}: deferred retry needs the target App token")
                         continue
                     comments = _pr_comments(repo, number)
                     used = worker_issue.count_attempts(comments, bot_login)
                     if used >= resolved["max_attempts"]:
-                        _run_target_helper(script_dir, "worker-issue.py", [
+                        _run_target_helper(script_dir, repo, "worker-issue.py", [
                             "status", "--repo", repo, "--issue", str(number),
                             "--status", "needs-user"])
                         _run_gh_target_comment(repo, number,
@@ -1429,7 +1462,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 if escalate_starved(resolved.get("escalate"), usage, effective_cap):
                     # Security surfaces never degrade: chain-exhaustion -> needs:user, loudly.
                     try:
-                        _run_target_helper(script_dir, "worker-issue.py", [
+                        _run_target_helper(script_dir, repo, "worker-issue.py", [
                             "status", "--repo", repo, "--issue", str(number),
                             "--status", "needs-user"])
                         _run_gh_target_comment(
@@ -1489,7 +1522,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 # reverify (which requires status:ready) passes. If the workflow launch below
                 # fails, the issue is simply a ready issue again next tick — it converges.
                 try:
-                    _run_target_helper(script_dir, "worker-issue.py", [
+                    _run_target_helper(script_dir, repo, "worker-issue.py", [
                         "status", "--repo", repo, "--issue", str(number), "--status", "retry"])
                 except DispatchError as exc:
                     _release_failed_dispatch(allocator, registry_repo, claim_id)
@@ -1928,7 +1961,7 @@ def _self_test():
             return {"status": "ahead", "files": [{"filename": "src/a.rs"}]}
         raise AssertionError(f"unexpected API read: {path}")
 
-    def fake_helper(script_dir, script, args):
+    def fake_helper(script_dir, target_repo, script, args):
         helper_calls.append((script, args))
 
     def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True):
@@ -1960,7 +1993,7 @@ def _self_test():
         try:
             globals()["_gh_json"] = fake_gh_json
             globals()["_run_target_helper"] = fake_helper
-            globals()["_target_token"] = lambda: "tok"
+            globals()["_target_token"] = lambda repo: "tok"
             gate_red = [{"name": "gate", "status": "completed", "conclusion": "failure",
                          "started_at": "T1"}]
             gate_green = [{"name": "gate", "status": "completed", "conclusion": "success",
@@ -2232,9 +2265,9 @@ def _self_test():
     calls = []
     real_helper, real_token = _run_target_helper, _target_token
     try:
-        globals()["_target_token"] = lambda: "tok"
+        globals()["_target_token"] = lambda repo: "tok"
 
-        def fake_helper(script_dir, script, args):
+        def fake_helper(script_dir, target_repo, script, args):
             calls.append(args)
             if args[4] == "13":
                 raise DispatchError("boom")
@@ -2257,6 +2290,33 @@ def _self_test():
     finally:
         globals()["_run_target_helper"] = real_helper
         globals()["_target_token"] = real_token
+
+    # ---- per-owner target token map (defects #1,#5): the wrong-owner-token bug fix ----
+    _saved_env = {k: os.environ.get(k) for k in
+                  ("TARGET_GH_TOKENS", "TARGET_GH_TOKEN", "TARGET_GH_TOKEN_OWNER")}
+    try:
+        for k in ("TARGET_GH_TOKENS", "TARGET_GH_TOKEN", "TARGET_GH_TOKEN_OWNER"):
+            os.environ.pop(k, None)
+        os.environ["TARGET_GH_TOKENS"] = json.dumps(
+            {"sparq-org": "tok-sparq", "jeswr": "tok-registry"})
+        # EACH owner resolves to ITS OWN token — a registry-owner mutation no longer 404s under the
+        # sparq-org token (the exact defect: single-token mint covered targets[0]=sparq only).
+        assert _target_token("sparq-org/sparq") == "tok-sparq"
+        assert _target_token("jeswr/agent-account-registry") == "tok-registry"
+        assert _target_token("unknown/repo") == ""      # unminted owner -> defer, never wrong-owner
+        assert _target_token("not-a-repo") == ""
+        # legacy single-token fallback stays backward compatible for a single-target deployment
+        os.environ.pop("TARGET_GH_TOKENS", None)
+        os.environ["TARGET_GH_TOKEN"] = "legacy-tok"
+        os.environ["TARGET_GH_TOKEN_OWNER"] = "sparq-org"
+        assert _target_token("sparq-org/sparq") == "legacy-tok"
+        assert _target_token("jeswr/agent-account-registry") == ""   # other owner still deferred
+    finally:
+        for k, v in _saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     # Escalation contract (routing.toml escalate=true, audit-2026-07-17): a security-surface item
     # whose restricted tier has ZERO usage-eligible accounts escalates to needs:user — but ONLY on

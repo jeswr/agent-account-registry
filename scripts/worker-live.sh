@@ -432,8 +432,113 @@ run_gate() {
       cargo test --workspace
       printf 'worker-live: workspace gate passed\n'
       ;;
+    registry-selftest)
+      # [OPUS-4.8] python/actions gate for a self-managed target (the registry itself): the
+      # crate-scoped cargo gate does not fit a python repo. Fail-closed, and NON-VACUOUS — a run
+      # that touched a script but found no runnable suite is an error, not a silent pass.
+      registry_selftest_gate
+      ;;
     *) die "unsupported gate profile $profile" ;;
   esac
+}
+
+# [OPUS-4.8] The registry-selftest gate body (extracted so the host self-test can exercise its
+# PURE selectors — touched-file classification + the suite list — without a live cargo/gh call).
+# FULL_SELFTEST_SUITE mirrors the scripts every recent registry wave self-tests; every touched
+# script that HAS a --self-test is additionally run so a change to it is validated directly.
+FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
+triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
+account-usage.py usage-alert.py broker-refresh.py backfill-provenance.py worker-live.sh"
+
+# PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
+# newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
+# self-test feeds a fixture. Prints, one per line: "self:<script>" for a touched script that has a
+# --self-test, "bash:<file>" for a touched *.sh, "wf:<file>" for a touched workflow yml.
+_registry_selftest_targets() {
+  local suite="$1" path base
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    case "$path" in
+      scripts/*.py)
+        base=${path#scripts/}
+        # only scripts that are part of the known self-testing suite are run (a data/helper py
+        # with no --self-test would otherwise fail closed spuriously)
+        case " $suite " in *" $base "*) printf 'self:%s\n' "$base" ;; esac
+        ;;
+      scripts/*.sh)
+        base=${path#scripts/}
+        printf 'bash:%s\n' "$path"
+        case " $suite " in *" $base "*) printf 'self:%s\n' "$base" ;; esac
+        ;;
+      .github/workflows/*.yml|.github/workflows/*.yaml)
+        printf 'wf:%s\n' "$path"
+        ;;
+    esac
+  done
+}
+
+registry_selftest_gate() {
+  local changed
+  changed="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
+  [[ -n "$changed" ]] || die 'registry-selftest gate: no changed files to validate (fail closed)'
+  local -a targets=()
+  mapfile -t targets < <(printf '%s\n' "$changed" | _registry_selftest_targets "$FULL_SELFTEST_SUITE")
+
+  local ran=0 t kind name
+  # 1) EVERY touched self-testing script, run directly (validates the change itself).
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == self ]]; then
+      printf 'worker-live: self-test %s\n' "$name"
+      if [[ "$name" == *.sh ]]; then
+        bash "scripts/$name" self-test || die "self-test failed: $name"
+      else
+        python3 "scripts/$name" --self-test || die "self-test failed: $name"
+      fi
+      ran=$((ran + 1))
+    fi
+  done
+
+  # 2) The FULL recent-wave suite (regression backstop): every suite script present in the tree,
+  #    run once. A touched script already ran above; running it twice is harmless + idempotent.
+  local script
+  for script in $FULL_SELFTEST_SUITE; do
+    [[ -f "scripts/$script" ]] || continue
+    printf 'worker-live: suite self-test %s\n' "$script"
+    if [[ "$script" == *.sh ]]; then
+      bash "scripts/$script" self-test || die "suite self-test failed: $script"
+    else
+      python3 "scripts/$script" --self-test || die "suite self-test failed: $script"
+    fi
+    ran=$((ran + 1))
+  done
+
+  # 3) bash -n on every touched shell script (syntax check).
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == bash ]]; then
+      printf 'worker-live: bash -n %s\n' "$name"
+      bash -n "$name" || die "bash -n failed: $name"
+    fi
+  done
+
+  # 4) actionlint + a yaml parse on every touched workflow.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == wf ]]; then
+      printf 'worker-live: lint workflow %s\n' "$name"
+      python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$name" \
+        || die "yaml parse failed: $name"
+      if command -v actionlint >/dev/null 2>&1; then
+        actionlint "$name" || die "actionlint failed: $name"
+      else
+        printf 'worker-live: actionlint not on PATH; yaml parse only for %s\n' "$name"
+      fi
+    fi
+  done
+
+  [[ "$ran" -gt 0 ]] || die 'registry-selftest gate ran no suite (fail closed — nothing validated)'
+  printf 'worker-live: registry-selftest gate passed (%s suite run(s))\n' "$ran"
 }
 
 coauthor_for() {
@@ -1228,6 +1333,31 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(git -C "$fixture" rev-parse HEAD^1 HEAD^2 | paste -sd' ' -)" "$feat_sha $main_sha"
   chk "both sides survive the resolution" \
     "$(git -C "$fixture" show HEAD:f.txt | paste -sd'+' -)" "feature side+main side"
+
+  # --- registry-selftest gate PURE selector (non-vacuous): classify a fixture diff into the
+  # self-test / bash / workflow targets the gate must run. Proves a touched suite script is run,
+  # a touched .sh is bash-linted, a touched workflow is actionlinted, and a non-suite/data path is
+  # ignored (no spurious --self-test on a file that has none). ---
+  local sel
+  sel=$(printf '%s\n' \
+    "scripts/worker-pr.py" \
+    "scripts/worker-live.sh" \
+    ".github/workflows/dispatch.yml" \
+    "data/leases.json" \
+    "scripts/backfill-provenance.py" \
+    | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
+  chk "registry gate selects touched suite py" \
+    "$(grep -c 'self:worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate self-tests a touched .sh" \
+    "$(grep -c 'self:worker-live.sh' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate bash-lints a touched .sh" \
+    "$(grep -c 'bash:scripts/worker-live.sh' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate lints a touched workflow" \
+    "$(grep -c 'wf:.github/workflows/dispatch.yml' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate ignores a non-suite data path" \
+    "$(grep -c 'leases.json' <<< "${sel//,/$'\n'}" || true)" "0"
+  chk "registry gate runs a touched non-.sh suite py" \
+    "$(grep -c 'self:backfill-provenance.py' <<< "${sel//,/$'\n'}" || true)" "1"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'

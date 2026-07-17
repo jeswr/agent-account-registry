@@ -22,7 +22,11 @@ import tomllib
 
 
 POLICY_PATH = "policy/repos.toml"
-GATE_PROFILES = {"none", "lint-only", "crate-scoped", "workspace"}
+# [OPUS-4.8] "registry-selftest" is the python/actions gate profile for a self-managed target
+# (the registry itself) — the crate-scoped cargo gate does not fit a python repo. worker-live.sh
+# run_gate implements it: run every touched script's --self-test, the full recent-wave suite, and
+# bash -n / actionlint on touched shell + workflow files. Fail-closed.
+GATE_PROFILES = {"none", "lint-only", "crate-scoped", "workspace", "registry-selftest"}
 DISPATCH_MODES = {"cron", "cron+doorbell"}
 TRUST_MODES = {"collaborators"}
 POLICY_FIELDS = {
@@ -51,8 +55,13 @@ POLICY_FIELDS = {
 #   review_queue_ttl_minutes = positive int — how long a PR may sit review:needs before alerting.
 #   cross_provider_fallback  = bool — opt-in same-provider degrade when the opposite provider is
 #                              starved; default False = stay queued + alert (the honest default).
+# [OPUS-4.8] security_paths (B3 / defects #2,#4): the additive FILE-level trust-surface control
+# for the review lane. A worker PR whose diff touches ANY listed path/prefix routes its ARM to a
+# HUMAN even for a benign-labelled PR — CONSUMED by review-fix.yml (review-outcome + ready-and-arm
+# pass it to worker-pr.trust_surface_paths_touched). NOT a dead tier: an empty/absent list simply
+# means the worker-pr.py DEFAULT_TRUST_SURFACE_PATHS applies (the guard is never silently off).
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
-                          "review_queue_ttl_minutes", "cross_provider_fallback"}
+                          "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths"}
 
 
 class PolicyError(ValueError):
@@ -120,6 +129,15 @@ def _policy_row(target_repo, policy_doc):
             raise PolicyError(f"{field} for {target_repo!r} must be a positive integer")
     if "cross_provider_fallback" in row and not isinstance(row["cross_provider_fallback"], bool):
         raise PolicyError(f"cross_provider_fallback for {target_repo!r} must be boolean")
+    if "security_paths" in row:
+        paths = row["security_paths"]
+        if (not isinstance(paths, list)
+                or any(not isinstance(p, str) or not p.strip() or "\n" in p or "\r" in p
+                       for p in paths)):
+            raise PolicyError(
+                f"security_paths for {target_repo!r} must be a list of non-empty strings")
+        if len(set(paths)) != len(paths):
+            raise PolicyError(f"security_paths for {target_repo!r} contains duplicates")
     return row
 
 
@@ -243,6 +261,7 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "max_review_rounds": int(policy.get("max_review_rounds", 3)),
         "review_queue_ttl_minutes": int(policy.get("review_queue_ttl_minutes", 30)),
         "cross_provider_fallback": bool(policy.get("cross_provider_fallback", False)),
+        "security_paths": list(policy.get("security_paths", [])),
         "worker_timeout_minutes": policy["worker_timeout_minutes"],
         "max_attempts": policy["max_attempts"],
         "dispatch": policy["dispatch"],
@@ -349,6 +368,21 @@ agent = "docs-agent"
     check("review-loop controls overridable",
           (review_impl["max_review_rounds"], review_impl["review_queue_ttl_minutes"],
            review_impl["cross_provider_fallback"]), (5, 45, True))
+    # security_paths (B3 / defects #2,#4): validated + surfaced (consumed by review-fix.yml).
+    check("security_paths default empty", impl["security_paths"], [])
+    sec_paths = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                              'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                              'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                              'security_paths=["scripts/worker-pr.py", ".github/workflows/"]\n')
+    sec_impl = resolve("o/r", "impl", sec_paths, routing)
+    check("security_paths surfaced",
+          sec_impl["security_paths"], ["scripts/worker-pr.py", ".github/workflows/"])
+    bad_paths = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                              'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                              'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                              'security_paths=["ok", ""]\n')
+    rejects("security_paths rejects empty entry", "security_paths",
+            lambda: resolve("o/r", "impl", bad_paths, routing))
     bad_rounds = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                                'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                                'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'

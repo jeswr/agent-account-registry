@@ -111,6 +111,7 @@ jobs:
       gate_profile: ${{ steps.policy.outputs.gate_profile }}
       arm_auto_merge: ${{ steps.policy.outputs.arm_auto_merge }}
       max_review_rounds: ${{ steps.policy.outputs.max_review_rounds }}
+      security_paths: ${{ steps.policy.outputs.security_paths }}
       unresolvable: ${{ steps.policy.outputs.unresolvable }}
     steps:
       - name: Validate dispatch inputs
@@ -296,7 +297,29 @@ jobs:
           if any(label.startswith("needs:") for label in issue_labels):
               raise SystemExit("source issue is human-owned (needs:*)")
           merged = set(labels) | set(issue_labels)
-          keywords = ("zk", "mpc", "crypto", "auth", "e2ee")
+          # [OPUS-4.8] defect #3: the arm-side security classifier must be PER-TARGET. The builtin
+          # keyword set (zk/mpc/crypto/auth/e2ee) did not cover the registry's own trust areas
+          # (worker/dispatch/set-up-account/review-loop/groom), so its ready issues classified as
+          # non-security and would auto-arm. Union the builtin set with the TARGET routing's own
+          # `[[route]].match_labels` keywords (read from the protected routing at its policy
+          # pointer), so a trust-surface issue on ANY target is flagged before the arm gate ever
+          # sees it. A missing/unreadable routing degrades to the builtin set (fail closed:
+          # trust:* still flags, and the path-based arm gate is an independent backstop).
+          import tomllib
+          from pathlib import Path as _Path, PurePosixPath as _PPP
+          keywords = {"zk", "mpc", "crypto", "auth", "e2ee"}
+          try:
+              _pol = tomllib.loads(
+                  _Path("registry/policy/repos.toml").read_text(encoding="utf-8"))
+              _routing_ptr = _pol["repos"][repo]["routing"]
+              _routing_path = _Path("target-routing").joinpath(*_PPP(_routing_ptr).parts)
+              _routing = tomllib.loads(_routing_path.read_text(encoding="utf-8"))
+              for _r in _routing.get("route", []):
+                  for _kw in (_r.get("match_labels") or []):
+                      if isinstance(_kw, str) and _kw:
+                          keywords.add(_kw)
+          except (OSError, KeyError, tomllib.TOMLDecodeError):
+              pass  # builtin keywords + trust:* prefix + the path-based arm gate still apply
           security = (any(k in label for label in merged for k in keywords)
                       or any(label.startswith("trust:") for label in merged))
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
@@ -396,6 +419,13 @@ jobs:
               if concrete or codex_default:
                   chain.append(alias)
           unresolvable = not chain
+          # [OPUS-4.8] B3: the policy row's security_paths ride to the outcome/arm steps as a
+          # single-line base64 JSON list (paths may contain any char; base64 keeps the output
+          # single-line + injection-safe). "W10=" is base64("[]") — a non-empty, valid empty list.
+          import base64 as _b64
+          security_paths = policy.get("security_paths", [])
+          security_paths_b64 = _b64.b64encode(
+              json.dumps(security_paths).encode("utf-8")).decode("ascii")
           values = {
               "routing": policy["routing"],
               "model_chain": ",".join(chain),
@@ -404,6 +434,7 @@ jobs:
               "gate_profile": policy["gate_profile"],
               "arm_auto_merge": str(policy["arm_auto_merge"]).lower(),
               "max_review_rounds": str(policy["max_review_rounds"]),
+              "security_paths": security_paths_b64,
               "unresolvable": str(unresolvable).lower(),
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -1148,6 +1179,9 @@ jobs:
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
           SECURITY: ${{ needs.resolve.outputs.security }}
+          # [OPUS-4.8] B3: the target policy row's security_paths (base64 JSON list). Each path
+          # becomes a --surface-path so a trust-surface diff routes its arm to a human.
+          SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
         run: |
           set -euo pipefail
           args=(
@@ -1164,6 +1198,10 @@ jobs:
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
+          while IFS= read -r p; do
+            [[ -n "$p" ]] && args+=(--surface-path "$p")
+          done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
+            | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
           python3 registry/scripts/worker-pr.py "${args[@]}"
 
       - name: Mint arm-scoped App token (approve path only)
@@ -1195,16 +1233,27 @@ jobs:
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
+          # [OPUS-4.8] B3: the LIVE trust-surface arm gate re-derives the PR diff and, if it
+          # touches one of these paths, withholds auto-arm and escalates to a human.
+          SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
         run: |
-          python3 registry/scripts/worker-pr.py ready-and-arm \
-            --repo "${{ inputs.target_repo }}" \
-            --pr "${{ inputs.pr_number }}" \
-            --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}" \
-            --impl-provider "${{ needs.resolve.outputs.impl_provider }}" \
-            --impl-account-h "${{ needs.resolve.outputs.impl_account_h }}" \
-            --reviewer-provider "${{ needs.claim.outputs.provider }}" \
-            --arm "${{ needs.resolve.outputs.arm_auto_merge }}" \
+          set -euo pipefail
+          args=(
+            ready-and-arm
+            --repo "${{ inputs.target_repo }}"
+            --pr "${{ inputs.pr_number }}"
+            --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
+            --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
+            --impl-account-h "${{ needs.resolve.outputs.impl_account_h }}"
+            --reviewer-provider "${{ needs.claim.outputs.provider }}"
+            --arm "${{ needs.resolve.outputs.arm_auto_merge }}"
             --issue "${{ needs.resolve.outputs.issue }}"
+          )
+          while IFS= read -r p; do
+            [[ -n "$p" ]] && args+=(--surface-path "$p")
+          done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
+            | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
+          python3 registry/scripts/worker-pr.py "${args[@]}"
 
       # LAST mutation by design: binding reviewed-sha == head marks this head's review complete;
       # everything before it is re-derivable, so a crash anywhere above re-converges via the
