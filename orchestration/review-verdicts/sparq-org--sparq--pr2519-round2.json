@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The opt-in stateful surface is correctly isolated from the default bundle, reuses the same SHACL validation and serialization paths as the stateless API, and is exercised through both native equivalence/reuse tests and real wasm-bindgen tests. CI covers default, each opt-in feature, and their combination. The benchmark harness detects the exported handle, excludes parsing from the validate-only timing, cross-checks every measured result against the one-shot path, and records feature provenance. Documentation and the matching public-surface skill are updated without making canonical performance claims. No correctness, soundness, security, or vacuous-test issue was found in the diff.",
+ "verdict": "approve"
+}
