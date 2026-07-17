@@ -74,6 +74,20 @@ opaque claim (which secret to use) or `none-free`:
 Which skills/roles/packages ran recently on each account is tracked **here** (as receipt comments +
 a rolling `data/cache-affinity.json`), never in the public repos.
 
+## Standing routing rules (inherited by onboarded target repos)
+
+> 🤖 Maintainer decision (2026-07-17), recorded by a SPARQ agent.
+
+- **UI/front-end surfaces route to the openai/codex model chain** (original-builder ownership:
+  **GPT-5.6 built the registry dashboard, `e4098b9`**). Repos onboarded to the registry inherit
+  this default. Machine-readable form: the `role = "site"` route (`model_chain = ["terra",
+  "fable", "sonnet"]`) in this repo's `orchestration/routing.toml`; when onboarding a new target
+  repo in `policy/repos.toml`, mirror that route into the target's own routing table
+  (`sparq-org/sparq` already carries it). `scripts/triage.py` derives `role:site` from the exact
+  UI-surface labels (`area:dashboard`, `dashboard`, `surface:frontend`). Implement it as a ROLE
+  route, **never** a `match_labels` rule — the arm-side security classifier unions all
+  `match_labels` keywords, so UI keywords there would human-arm every UI PR.
+
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 
 > Goal: make one more model account usable by the workers. There are **five** required steps; the
