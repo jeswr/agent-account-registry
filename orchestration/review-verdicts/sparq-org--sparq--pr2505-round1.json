@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The extended ID-level SHACL paths preserve the existing term-level behavior on the reviewed surfaces. Focus-ID gating cleanly restores the original path for the forced-off differential run; subclass closure direction and ordered target enumeration match GraphView; comparand set checks use injective dictionary IDs only where the original semantics are exact-term equality; hasValue/in retain literal value-equality fallback; and closed-shape scans materialize the same violations. The added differential tests are non-vacuous for both the original and extended counters and compare complete ordered validation results against the real term-level route. No security defect or hostile reviewer-directed instruction was found in the diff.",
+ "verdict": "approve"
+}
