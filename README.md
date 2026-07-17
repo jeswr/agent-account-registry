@@ -199,10 +199,11 @@ into the usage map; `usage_eligible(u, margin, model="fable")` then requires tha
 account ineligible for **fable** only — its base signal still admits it for non-fable models.
 
 **Prioritisation policy** (wired into `choose_account`): among eligible accounts prefer `status=allowed`
-with the **soonest** binding-window reset (use-it-or-lose-it) then most unused credits — for a fable route
-the binding window is `7d_oi`, otherwise `7d`; **skip** an account whose status is not `allowed` (or whose
-utilisation leaves < `usage_safety_margin` headroom) until its `*-reset` passes. This complements the
-existing cache-affinity tie-break. (OpenAI/codex exposes analogous limits; TODO confirm its headers.)
+with the **soonest whole-account `7d_reset`** (use-it-or-lose-it). Accounts without that weekly reset
+sort last while retaining the existing cache-affinity/load/handle order. The Fable `7d_oi` bucket remains
+an additional eligibility gate for Fable routes, but does not replace the fleet-wide drain-order signal.
+**Skip** an account whose status is not `allowed` or whose utilisation leaves less than
+`usage_safety_margin` headroom. (OpenAI/codex exposes analogous limits; TODO confirm its headers.)
 
 ## Security posture
 

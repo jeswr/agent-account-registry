@@ -54,12 +54,15 @@ function renderSummary(data) {
   const capacity = node("article", "summary-card");
   capacity.append(node("p", "summary-label", "Provider capacity"));
   const lines = node("div", "provider-lines");
-  for (const provider of ["anthropic", "openai"]) {
-    const values = data.fleet.capacity[provider] || { eligible: 0, total: 0 };
+  const providers = Object.entries(data.fleet.capacity || {}).sort(([left], [right]) => (
+    left.localeCompare(right)
+  ));
+  for (const [provider, values] of providers) {
     const line = node("div", "provider-line");
     line.append(node("span", "", provider), node("strong", "", `${values.eligible} / ${values.total}`));
     lines.append(line);
   }
+  if (!providers.length) lines.append(node("p", "summary-meta", "No provider records"));
   capacity.append(lines);
   summary.append(capacity);
   summary.append(summaryCard(
@@ -97,29 +100,119 @@ function renderWindow(windowData) {
   return wrapper;
 }
 
+function renderWeeklyReset(resetAt) {
+  const reset = node("div", "weekly-reset");
+  reset.append(node("span", "weekly-reset-label", "Weekly reset"));
+  if (parseTime(resetAt)) {
+    reset.append(
+      node("strong", "weekly-reset-relative", relative(resetAt)),
+      node("span", "weekly-reset-utc", utc(resetAt)),
+    );
+  } else {
+    reset.append(
+      node("strong", "weekly-reset-relative", "Unknown"),
+      node("span", "weekly-reset-utc", "No 7 day reset in the latest snapshot"),
+    );
+  }
+  return reset;
+}
+
+function accountCard(account) {
+  const card = node("article", "account-card");
+  const top = node("div", "card-top");
+  top.append(node("h4", "account-label", account.label));
+  const badges = node("div", "badges");
+  badges.append(node("span", `badge ${account.availability}`, account.availability));
+  top.append(badges);
+  const agents = node("div", "agent-count");
+  agents.append(node("span", "", "Active agents"), node("strong", "", String(account.active_agents)));
+  const windows = node("div", "window-list");
+  for (const windowData of account.windows) windows.append(renderWindow(windowData));
+  card.append(top, renderWeeklyReset(account.weekly_reset_at), agents, windows);
+  return card;
+}
+
 function renderAccounts(accounts) {
-  const grid = byId("accounts");
-  grid.replaceChildren();
+  const container = byId("accounts");
+  container.replaceChildren();
   byId("account-count").textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"}`;
   if (!accounts.length) {
-    grid.append(node("p", "empty", "No account records are available."));
+    container.append(node("p", "empty", "No account records are available."));
     return;
   }
+
+  const groups = new Map();
   for (const account of accounts) {
-    const card = node("article", "account-card");
-    const top = node("div", "card-top");
-    const identity = node("div");
-    identity.append(node("span", "provider", account.provider), node("h3", "account-label", account.label));
-    const badges = node("div", "badges");
-    badges.append(node("span", `badge ${account.availability}`, account.availability));
-    top.append(identity, badges);
-    const agents = node("div", "agent-count");
-    agents.append(node("span", "", "Active agents"), node("strong", "", String(account.active_agents)));
-    const windows = node("div", "window-list");
-    for (const windowData of account.windows) windows.append(renderWindow(windowData));
-    card.append(top, agents, windows);
-    grid.append(card);
+    if (!groups.has(account.provider)) groups.set(account.provider, []);
+    groups.get(account.provider).push(account);
   }
+  for (const [provider, providerAccounts] of groups) {
+    const section = node("section", "provider-section");
+    const heading = node("div", "provider-heading");
+    heading.append(
+      node("h3", "provider-title", provider),
+      node("span", "freshness", `${providerAccounts.length} account${providerAccounts.length === 1 ? "" : "s"}`),
+    );
+    const grid = node("div", "account-grid");
+    for (const account of providerAccounts) grid.append(accountCard(account));
+    section.append(heading, grid);
+    container.append(section);
+  }
+}
+
+function renderRepositoryAgents(activity, activeAgents) {
+  if (!activity || !Array.isArray(activity.models) || !Array.isArray(activity.repositories)) {
+    throw new Error("invalid repository activity snapshot");
+  }
+  const modelPattern = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/;
+  const repositoryPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+  const models = activity.models;
+  if (new Set(models).size !== models.length || models.some((model) => !modelPattern.test(model))) {
+    throw new Error("invalid model columns in repository activity snapshot");
+  }
+  let total = 0;
+  for (const row of activity.repositories) {
+    if (!row || !repositoryPattern.test(row.repository) || !row.counts || Array.isArray(row.counts)) {
+      throw new Error("invalid repository row in activity snapshot");
+    }
+    for (const [model, count] of Object.entries(row.counts)) {
+      if (!models.includes(model) || !Number.isInteger(count) || count < 0) {
+        throw new Error("invalid model count in repository activity snapshot");
+      }
+      total += count;
+    }
+  }
+  if ((!activity.repositories.length && models.length) || total !== activeAgents) {
+    throw new Error("repository activity does not match live lease count");
+  }
+
+  const empty = byId("repo-agents-empty");
+  const table = byId("repo-agents-table");
+  const head = byId("repo-agents-head");
+  const body = byId("repo-agents-body");
+  if (!activity.repositories.length) {
+    empty.textContent = "No agents currently active.";
+    empty.hidden = false;
+    table.hidden = true;
+    head.replaceChildren();
+    body.replaceChildren();
+    return;
+  }
+
+  const header = node("tr");
+  header.append(node("th", "", "Repository"));
+  for (const model of models) header.append(node("th", "numeric", model));
+  const rows = [];
+  for (const repository of activity.repositories) {
+    const row = node("tr");
+    row.append(node("td", "repository", repository.repository));
+    for (const model of models) row.append(node("td", "numeric", String(repository.counts[model] || 0)));
+    rows.push(row);
+  }
+  head.replaceChildren(header);
+  body.replaceChildren(...rows);
+  empty.hidden = true;
+  table.hidden = false;
 }
 
 function renderOutcomes(outcomes) {
@@ -192,6 +285,7 @@ function updateFreshness(generatedAt) {
 }
 
 function render(data) {
+  renderRepositoryAgents(data.active_by_repository, data.fleet.active_agents);
   renderSummary(data);
   renderAccounts(data.accounts || []);
   renderOutcomes(data.fleet.dispatch_outcomes || []);

@@ -100,20 +100,37 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None):
     return True
 
 
-def _priority_window(model):
-    """The use-it-or-lose-it weekly window to prioritise by: the FABLE sub-quota for a premium route,
-    else the whole-account 7d window."""
-    return FABLE_WINDOW if model in PREMIUM_MODELS else "7d"
+def _weekly_reset(u):
+    """Whole-account weekly reset used for provider-wide use-it-or-lose-it draining."""
+    _, reset = _usage_window(u, "7d")
+    return reset
 
 
-def _weekly_reset(u, model=None):
-    _, reset = _usage_window(u, _priority_window(model))
-    return reset if reset is not None else float("inf")
+def _order_eligible_accounts(accounts, leases, usage, package, role):
+    """Deterministically order accounts that have already passed every eligibility gate.
 
+    Preserve the allocator's cache-affinity/load/handle order, then stably promote known weekly
+    resets from soonest to latest. Accounts without a 7d reset remain last in their prior relative
+    order. This helper deliberately contains no availability, model, capacity, or usage gating.
+    """
+    def affinity(account):
+        times = [lease.get("issued_at", 0) for lease in leases
+                 if lease["account"] == account["handle"]
+                 and lease.get("package") == package and lease.get("role") == role]
+        return max(times) if times else -1
 
-def _weekly_unused(u, model=None):
-    util, _ = _usage_window(u, _priority_window(model))
-    return (1.0 - util) if util is not None else 0.0
+    ordered = sorted(
+        accounts,
+        key=lambda account: (
+            -affinity(account), active_for(leases, account["handle"]), account["handle"]),
+    )
+    if usage is not None:
+        def weekly_key(account):
+            reset = _weekly_reset(usage.get(account["handle"]))
+            return reset is None, reset if reset is not None else 0.0
+
+        ordered.sort(key=weekly_key)
+    return ordered
 
 
 def choose_account(accounts, leases, model_chain, package, role, now, usage=None, margin=SAFETY_MARGIN):
@@ -121,9 +138,10 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
     {handle, models:[...], max_concurrent_workers, available:bool}. Walks the model chain; within a
     model keeps accounts under their concurrency cap and — when live `usage` (a {handle: {status,
     5h_util,5h_reset,7d_util,7d_reset}} map) is supplied — only accounts that pass `usage_eligible`.
-    Orders eligible accounts by EXPIRY-PRIORITY: soonest weekly reset first (use credits before they
-    reset), then most weekly headroom, then CACHE AFFINITY, then least-loaded. With `usage=None` the
-    behaviour is the original cache-affinity-then-least-loaded selection (backward compatible)."""
+    Orders eligible accounts by EXPIRY-PRIORITY: soonest whole-account weekly reset first (use credits
+    before they reset), preserving CACHE AFFINITY, least-loaded, and handle order for equal or unknown
+    resets. With `usage=None` the behaviour is the original cache-affinity-then-least-loaded selection
+    (backward compatible)."""
     live = reclaim_expired(leases, now)
     for model in model_chain:
         serving = [a for a in accounts
@@ -135,19 +153,7 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
         if not serving:
             continue
 
-        def affinity(a):  # most recent same-(package,role) lease on this account -> warmer cache
-            times = [x.get("issued_at", 0) for x in live
-                     if x["account"] == a["handle"] and x.get("package") == package and x.get("role") == role]
-            return max(times) if times else -1
-
-        def sort_key(a, model=model):  # [FABLE-5] prioritise by the window that gates THIS model
-            u = (usage or {}).get(a["handle"])
-            return (_weekly_reset(u, model),          # soonest weekly reset first (use-it-or-lose-it)
-                    -_weekly_unused(u, model),        # then the most unused weekly credits
-                    -affinity(a),                     # then warmest prompt cache
-                    active_for(live, a["handle"]),    # then least-loaded
-                    a["handle"])
-        serving.sort(key=sort_key)
+        serving = _order_eligible_accounts(serving, live, usage, package, role)
         return serving[0]["handle"]
     return None
 
@@ -517,13 +523,14 @@ def _self_test():
     check("ineligible: unknown window", usage_eligible({"status": "allowed", "5h_util": 0.1}), False)
     check("eligible: exempt provider (codex)", usage_eligible({"exempt": True}), True)
     U = [{"handle": "soon", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
+         {"handle": "middle", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "late", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "full", "models": ["fable"], "max_concurrent_workers": 1, "available": True}]
-    # [FABLE-5] fable-capable accounts carry the sub-quota fields; 7d_oi reset mirrors 7d so the base-window
-    # priority ordering (soon < late) still holds under the fable-aware _priority_window.
     usage = {
         "soon": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 3000,
                  "fable_ok": True, "fable_7d_oi_util": 0.2, "fable_7d_oi_reset": 3000},
+        "middle": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 5000,
+                   "fable_ok": True, "fable_7d_oi_util": 0.2, "fable_7d_oi_reset": 5000},
         "late": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 8000,
                  "fable_ok": True, "fable_7d_oi_util": 0.2, "fable_7d_oi_reset": 8000},
         "full": {"status": "allowed", "5h_util": 0.99, "5h_reset": 100, "7d_util": 0.99, "7d_reset": 1000},
@@ -531,14 +538,14 @@ def _self_test():
     # expiry-priority: 'soon' (7d_reset 3000) beats 'late' (8000); 'full' is ineligible (no headroom).
     check("expiry priority picks soonest reset",
           choose_account(U, [], ["fable"], "p", "r", now, usage=usage), "soon")
-    # if 'soon' is removed from usage entirely -> fail-closed skip -> 'late' wins.
+    # if 'soon' is removed from usage entirely -> fail-closed skip -> next reset wins.
     check("fail-closed on missing usage",
           choose_account(U, [], ["fable"], "p", "r", now, usage={k: v for k, v in usage.items() if k != "soon"}),
-          "late")
-    # dynamic concurrency: 2 eligible (soon,late), 'full' backs off; absolute_cap clamps.
-    check("dynamic concurrency counts eligible", dynamic_concurrency(U, usage, ["fable"]), 2)
+          "middle")
+    # dynamic concurrency: 3 eligible (soon,middle,late), 'full' backs off; absolute_cap clamps.
+    check("dynamic concurrency counts eligible", dynamic_concurrency(U, usage, ["fable"]), 3)
     check("dynamic concurrency absolute cap", dynamic_concurrency(U, usage, ["fable"], absolute_cap=1), 1)
-    allfull = {h: {**usage["full"]} for h in ("soon", "late", "full")}
+    allfull = {h: {**usage["full"]} for h in ("soon", "middle", "late", "full")}
     check("dynamic concurrency backs off to 0 when tapped out",
           dynamic_concurrency(U, allfull, ["fable"]), 0)
     check("dynamic concurrency 0 without usage (caller falls back to static)",
@@ -571,13 +578,16 @@ def _self_test():
     }
     check("fable route skips exhausted-bucket account",
           choose_account(F, [], ["fable"], "p", "r", now, usage=fusage), "fb")
-    # priority window: for fable, soonest 7d_oi reset wins among fable-eligible accounts.
+    # Drain priority always follows the whole-account weekly reset; fable_7d_oi remains an eligibility
+    # gate but does not replace the provider-wide 7d ordering signal.
     fusage2 = {
-        "fa": {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 3000},
-        "fb": {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 8000},
+        "fa": {**fresh, "7d_reset": 8000, "fable_ok": True,
+               "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 3000},
+        "fb": {**fresh, "7d_reset": 3000, "fable_ok": True,
+               "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 8000},
     }
-    check("fable priority: soonest fable-bucket reset wins",
-          choose_account(F, [], ["fable"], "p", "r", now, usage=fusage2), "fa")
+    check("fable drain uses whole-account 7d reset, not sub-quota reset",
+          choose_account(F, [], ["fable"], "p", "r", now, usage=fusage2), "fb")
     # dynamic_concurrency on a fable-only chain counts only fable-eligible accounts.
     check("dynamic concurrency (fable chain) counts fable-eligible only",
           dynamic_concurrency(F, fusage, ["fable"]), 1)
@@ -601,6 +611,47 @@ def _self_test():
         def __exit__(self, *a):
             globals()["read_accounts"], globals()["_read_ledger"], globals()["_write_ledger"] = \
                 self._ra, self._rl, self._wl
+
+    drain_accounts = [
+        {"handle": "acct-late", "models": ["haiku"], "max_concurrent_workers": 2,
+         "available": True},
+        {"handle": "acct-middle", "models": ["haiku"], "max_concurrent_workers": 2,
+         "available": True},
+        {"handle": "acct-soon", "models": ["haiku"], "max_concurrent_workers": 2,
+         "available": True},
+        {"handle": "a-missing", "models": ["haiku"], "max_concurrent_workers": 2,
+         "available": True},
+        {"handle": "z-missing", "models": ["haiku"], "max_concurrent_workers": 2,
+         "available": True},
+    ]
+    without_reset = {key: value for key, value in fresh.items() if key != "7d_reset"}
+    drain_usage = {
+        "acct-late": {**fresh, "7d_reset": 9000},
+        "acct-middle": {**fresh, "7d_reset": 6000},
+        "acct-soon": {**fresh, "7d_reset": 3000},
+        "a-missing": dict(without_reset),
+        "z-missing": dict(without_reset),
+    }
+    warm_missing = [
+        make_lease("z-missing", "other/repo#1@run", "p", "impl", "haiku", now - 5, 100),
+    ]
+    check("weekly-drain fixture accounts are all otherwise eligible",
+          [usage_eligible(drain_usage[a["handle"]], model="haiku") for a in drain_accounts],
+          [True, True, True, True, True])
+    check("weekly drain sorts three resets soonest and leaves missing resets last/stable",
+          [account["handle"] for account in _order_eligible_accounts(
+              drain_accounts, warm_missing, drain_usage, "p", "impl")],
+          ["acct-soon", "acct-middle", "acct-late", "z-missing", "a-missing"])
+
+    claim_accounts = drain_accounts[:3]
+    with _StubClaim(claim_accounts):
+        globals()["read_accounts"] = lambda repo: claim_accounts
+        globals()["_read_ledger"] = lambda repo: ([], "sha0")
+        globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+        drained = claim("r", "p", "impl", ["haiku"], "o/r#1@run", now,
+                        usage=drain_usage)
+    check("claim picks soonest of three distinct eligible weekly resets",
+          drained and drained["account"], "acct-soon")
 
     dual = [{"handle": "acctdual", "models": ["fable", "haiku"], "max_concurrent_workers": 1,
              "available": True}]

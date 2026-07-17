@@ -449,7 +449,7 @@ class GitHubAPI:
     has no cross-module import at CLI time; the salt/token never enter a target-code job."""
 
     def __init__(self, token):
-        from urllib.request import Request  # noqa: local import keeps --self-test import-light
+        from urllib.request import Request  # Local import keeps --self-test import-light.
         if not token:
             raise HealthError("registry token is missing")
         self._token = token
@@ -904,7 +904,7 @@ def _self_test():
         {"records": [{"ts": now, "provider": "p", "account": "acct01", "exit_class": "auth"}]})), True)
     chk("ledger read accepts salted hash", validate_ledger(
         {"records": [{"ts": now, "provider": "p", "account": account_hash("a", salt),
-                      "exit_class": "auth"}]}) != None, True)
+                      "exit_class": "auth"}]}) is not None, True)
 
     # ---- CAS writer against a stub API (create + append + conflict retry) --------------------
     ok = _test_cas(chk) and ok

@@ -21,10 +21,13 @@ import zipfile
 
 
 SCHEMA = "account-fleet-dashboard/v1"
-PROVIDERS = ("anthropic", "openai")
 WINDOWS = (("5h", "5 hour"), ("7d", "7 day"), ("fable_7d_oi", "Fable 7 day"))
 ACCOUNT_REF_RE = re.compile(r"ACCT[A-Z0-9]+_TOKEN")
+SAFE_PROVIDER_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
 SAFE_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}")
+HOLDER_RE = re.compile(
+    r"^(?:review:|fix:)?(?P<repository>"
+    r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)#\d+@\S+$")
 DISPATCH_COMPLETE_RE = re.compile(
     r"^\S+\s+dispatcher complete:\s+(\d+) worker/review/fix run\(s\) launched", re.MULTILINE)
 DISPATCHED_RE = re.compile(r"^\S+\s+dispatched\s", re.MULTILINE)
@@ -156,7 +159,7 @@ def _catalog(issues):
         provider = str(fields.get("provider") or "").lower()
         models = fields.get("models") or ""
         secret_ref = fields.get("secret_ref") or ""
-        if (not handle or provider not in PROVIDERS or not models.startswith("[")
+        if (not handle or SAFE_PROVIDER_RE.fullmatch(provider) is None or not models.startswith("[")
                 or ACCOUNT_REF_RE.fullmatch(secret_ref) is None):
             continue
         labels = _labels(issue)
@@ -325,7 +328,7 @@ def _normalize_model_health(document):
         provider = str(item.get("provider") or "").lower()
         checks.append({
             "model": model,
-            "provider": provider if provider in PROVIDERS else None,
+            "provider": provider if SAFE_PROVIDER_RE.fullmatch(provider) else None,
             "status": _health_status(raw_status),
             "checked_at": _utc_iso(
                 item.get("checked_at") or item.get("generated_at") or item.get("timestamp")),
@@ -333,6 +336,43 @@ def _normalize_model_health(document):
         if len(checks) == 20:
             break
     return {"generated_at": generated_at, "checks": checks}
+
+
+def _live_leases(leases, now):
+    live = []
+    for lease in leases:
+        if not isinstance(lease, dict):
+            raise DashboardError("lease ledger entries must be objects")
+        expires_at = lease.get("expires_at")
+        if (not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool)):
+            raise DashboardError("lease ledger entry has an invalid expiry")
+        if expires_at > now:
+            live.append(lease)
+    return live
+
+
+def _repository_activity(live):
+    counts = {}
+    models = set()
+    for lease in live:
+        holder = lease.get("holder")
+        match = HOLDER_RE.fullmatch(holder) if isinstance(holder, str) else None
+        if match is None:
+            raise DashboardError("live lease has an invalid holder")
+        model = lease.get("model")
+        if not isinstance(model, str) or SAFE_MODEL_RE.fullmatch(model) is None:
+            raise DashboardError("live lease has an invalid model")
+        repository = match.group("repository")
+        models.add(model)
+        repository_counts = counts.setdefault(repository, {})
+        repository_counts[model] = repository_counts.get(model, 0) + 1
+    return {
+        "models": sorted(models),
+        "repositories": [
+            {"repository": repository, "counts": counts[repository]}
+            for repository in sorted(counts)
+        ],
+    }
 
 
 def _assert_private(document, private_values):
@@ -365,28 +405,32 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
     leases = leases_document.get("leases") if isinstance(leases_document, dict) else None
     if not isinstance(leases, list):
         raise DashboardError("lease ledger must contain a leases array")
-    live = [lease for lease in leases if isinstance(lease, dict)
-            and isinstance(lease.get("expires_at"), (int, float))
-            and not isinstance(lease.get("expires_at"), bool) and lease["expires_at"] > now]
+    live = _live_leases(leases, now)
     private_values.update(str(lease.get("account")) for lease in leases if lease.get("account"))
     private_values.update(str(handle) for handle in usage)
 
     rows = []
-    capacity = {provider: {"eligible": 0, "total": 0} for provider in PROVIDERS}
+    capacity = {}
     for account in accounts:
         entry = usage.get(account["handle"])
         availability = _availability(account, entry)
-        capacity[account["provider"]]["total"] += 1
+        provider_capacity = capacity.setdefault(
+            account["provider"], {"eligible": 0, "total": 0})
+        provider_capacity["total"] += 1
         if availability == "available":
-            capacity[account["provider"]]["eligible"] += 1
+            provider_capacity["eligible"] += 1
+        weekly_reset_at = _utc_iso(entry.get("7d_reset")) if isinstance(entry, dict) else None
         rows.append({
             "label": labels[account["handle"]],
             "provider": account["provider"],
             "availability": availability,
             "active_agents": sum(1 for lease in live if lease.get("account") == account["handle"]),
+            "weekly_reset_at": weekly_reset_at,
             "windows": _window_rows(account, entry),
         })
-    rows.sort(key=lambda row: (row["provider"], row["label"]))
+    rows.sort(key=lambda row: (
+        row["provider"], row["weekly_reset_at"] is None,
+        row["weekly_reset_at"] or "", row["label"]))
     history = dispatch_history if isinstance(dispatch_history, list) else []
     document = {
         "schema": SCHEMA,
@@ -398,6 +442,7 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
             "last_sweep_at": history[0].get("at") if history else None,
             "dispatch_outcomes": history,
         },
+        "active_by_repository": _repository_activity(live),
         "model_health": _normalize_model_health(model_health),
     }
     _assert_private(document, private_values)
@@ -450,7 +495,8 @@ def _self_test():
                  f"email: {email}\nlimits: 5h_limit=1000 7d_limit=7000\n"),
     }]
     leases = {"leases": [
-        {"account": handle, "expires_at": now + 60},
+        {"account": handle, "holder": "owner/repo#7@run.1", "model": "opus",
+         "expires_at": now + 60},
         {"account": handle, "expires_at": now - 1},
     ]}
     usage = {handle: {"status": "allowed", "5h_util": "0.42", "5h_reset": now + 3600,
@@ -464,6 +510,7 @@ def _self_test():
         "accounts": [{
             "label": "b01f153c", "provider": "anthropic", "availability": "available",
             "active_agents": 1,
+            "weekly_reset_at": "2025-06-16T15:06:40Z",
             "windows": [
                 {"name": "5 hour", "used_percent": 42.0,
                  "reset_at": "2025-06-15T16:06:40Z", "limit": "1000"},
@@ -473,10 +520,13 @@ def _self_test():
         }],
         "fleet": {
             "active_agents": 1,
-            "capacity": {"anthropic": {"eligible": 1, "total": 1},
-                         "openai": {"eligible": 0, "total": 0}},
+            "capacity": {"anthropic": {"eligible": 1, "total": 1}},
             "last_sweep_at": "2025-06-15T15:05:00Z",
             "dispatch_outcomes": history,
+        },
+        "active_by_repository": {
+            "models": ["opus"],
+            "repositories": [{"repository": "owner/repo", "counts": {"opus": 1}}],
         },
         "model_health": None,
     }
@@ -497,6 +547,64 @@ def _self_test():
     check("privacy assertion rejects injected raw handle", rejected, True)
     no_salt = build_dashboard(issues, {"leases": []}, {}, [], None, now, "")
     check("missing salt fails closed", no_salt["accounts"][0]["label"], "salt-missing")
+
+    def issue(account_handle, provider, secret):
+        return {
+            "title": account_handle,
+            "labels": [{"name": "status:available"}],
+            "body": (f"provider: {provider}\nmodels: [haiku]\n"
+                     f"secret_ref: {secret}\n"),
+        }
+
+    ordered_handles = ["anth-late", "anth-unknown", "anth-soon", "openai-one", "future-one"]
+    ordered_issues = [
+        issue("anth-late", "anthropic", "ACCTLATE_TOKEN"),
+        issue("anth-unknown", "anthropic", "ACCTUNKNOWN_TOKEN"),
+        issue("anth-soon", "anthropic", "ACCTSOON_TOKEN"),
+        issue("openai-one", "openai", "ACCTOPENAI_TOKEN"),
+        issue("future-one", "future-provider", "ACCTFUTURE_TOKEN"),
+    ]
+    ordered_usage = {
+        "anth-late": {"status": "allowed", "7d_reset": now + 900},
+        "anth-unknown": {"status": "allowed"},
+        "anth-soon": {"status": "allowed", "7d_reset": now + 100},
+        "openai-one": {"exempt": True},
+        "future-one": {"status": "allowed", "7d_reset": now + 500},
+    }
+    activity_leases = {"leases": [
+        {"account": "anth-soon", "holder": "org/alpha#1@run.1", "model": "sol",
+         "expires_at": now + 30},
+        {"account": "anth-late", "holder": "review:org/alpha#2@run.1", "model": "fable",
+         "expires_at": now + 20},
+        {"account": "anth-unknown", "holder": "fix:org/beta#3@run.1", "model": "opus",
+         "expires_at": now + 10},
+        {"account": "expired-private", "holder": "org/expired#4@old", "model": "terra",
+         "expires_at": now - 1},
+    ]}
+    ordered = build_dashboard(
+        ordered_issues, activity_leases, ordered_usage, [], None, now, "fixture-salt")
+    salted = _salted_labels(ordered_handles, "fixture-salt")
+    check("providers grouped + weekly resets soonest first + unknown last", [
+        (row["provider"], row["label"], row["weekly_reset_at"])
+        for row in ordered["accounts"]
+    ], [
+        ("anthropic", salted["anth-soon"], _utc_iso(now + 100)),
+        ("anthropic", salted["anth-late"], _utc_iso(now + 900)),
+        ("anthropic", salted["anth-unknown"], None),
+        ("future-provider", salted["future-one"], _utc_iso(now + 500)),
+        ("openai", salted["openai-one"], None),
+    ])
+    check("repo/model table parses impl + review + fix and excludes expired", [
+        ordered["fleet"]["active_agents"], ordered["active_by_repository"]
+    ], [3, {
+        "models": ["fable", "opus", "sol"],
+        "repositories": [
+            {"repository": "org/alpha", "counts": {"sol": 1, "fable": 1}},
+            {"repository": "org/beta", "counts": {"opus": 1}},
+        ],
+    }])
+    check("expanded fixture preserves private account identities",
+          all(account_handle not in json.dumps(ordered) for account_handle in ordered_handles), True)
     health = _normalize_model_health({
         "generated_at": now,
         "models": [{"model": "fable", "provider": "anthropic", "status": "ok"}],
@@ -506,11 +614,20 @@ def _self_test():
            "checks": [{"model": "fable", "provider": "anthropic",
                        "status": "healthy", "checked_at": None}]})
     empty = build_dashboard([], {"leases": []}, None, [], None, now, "fixture-salt")
-    check("do-nothing case", (empty["accounts"], empty["fleet"]),
-          ([], {"active_agents": 0,
-                "capacity": {"anthropic": {"eligible": 0, "total": 0},
-                             "openai": {"eligible": 0, "total": 0}},
-                "last_sweep_at": None, "dispatch_outcomes": []}))
+    check("do-nothing case", (empty["accounts"], empty["fleet"],
+                              empty["active_by_repository"]),
+          ([], {"active_agents": 0, "capacity": {}, "last_sweep_at": None,
+                "dispatch_outcomes": []}, {"models": [], "repositories": []}))
+    try:
+        build_dashboard([], {"leases": [{
+            "account": "private-live", "holder": "malformed", "model": "sol",
+            "expires_at": now + 1,
+        }]}, {}, [], None, now, "fixture-salt")
+    except DashboardError:
+        malformed_rejected = True
+    else:
+        malformed_rejected = False
+    check("malformed live lease fails loudly instead of rendering empty", malformed_rejected, True)
     with tempfile.TemporaryDirectory() as directory:
         assets = Path(directory, "assets")
         assets.mkdir()

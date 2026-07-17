@@ -33,6 +33,22 @@
         <div id="summary" class="summary-grid" aria-live="polite"></div>
       </section>
 
+      <section aria-labelledby="repo-agents-heading">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Live allocation</p>
+            <h2 id="repo-agents-heading">Active agents by repository</h2>
+          </div>
+        </div>
+        <p id="repo-agents-empty" class="empty subtle">Loading agent activity…</p>
+        <div id="repo-agents-table" class="table-wrap" hidden>
+          <table>
+            <thead id="repo-agents-head"></thead>
+            <tbody id="repo-agents-body"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section id="health-section" aria-labelledby="health-heading" hidden>
         <div class="section-heading compact">
           <div>
@@ -52,7 +68,7 @@
           </div>
           <p id="account-count" class="freshness"></p>
         </div>
-        <div id="accounts" class="account-grid" aria-live="polite"></div>
+        <div id="accounts" class="provider-sections" aria-live="polite"></div>
       </section>
 
       <section aria-labelledby="dispatch-heading">

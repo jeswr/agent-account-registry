@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 
@@ -274,7 +273,8 @@ def create_followups(repo, source_issue, spec_file):
         body = str(spec.get("body", "")).strip()
         body += (f"\n\n> 🤖 Discovered by the SPARQ worker while implementing #{source_issue}. "
                  "Out-of-scope for that PR; captured as follow-up.\n<!-- sparq-followup:v1 -->")
-        labels = sorted({l for l in (spec.get("labels") or []) if isinstance(l, str) and l}
+        labels = sorted({label for label in (spec.get("labels") or [])
+                         if isinstance(label, str) and label}
                         | {"from:agent", "self-improvement"})
         args = ["issue", "create", "-R", repo, "--title", title, "--body", body]
         for label in labels:
