@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "BudgetSpec::window_budget computes `Instant::now() + t`. Rust's Instant addition may panic when the resulting instant is not representable, while `with_window_timeout` accepts an arbitrary public `Duration`. Thus a caller can configure a large duration successfully and later crash the push/flush path, contrary to the API's documented error-based budget semantics. The tests cover only Duration::ZERO and do not exercise this boundary.",
+   "file": "crates/sparq-rsp/src/budget.rs",
+   "fix_hint": "Use `Instant::checked_add` and define a non-panicking policy for an unrepresentable timeout (for example, treat it as effectively unlimited), then add a test using `Duration::MAX` that evaluates a window and proves push/flush does not panic. If oversized values should instead be rejected, change the builder/API to return an error and update the public skill documentation in the same change.",
+   "severity": "major",
+   "title": "Oversized per-window timeout can panic during evaluation"
+  }
+ ],
+ "summary": "The budget is correctly threaded through all four continuous-query evaluation entry points, and the focused tests exercise row caps, cancellation, timeouts, and an unbudgeted-equivalence case. However, the new public timeout builder accepts any Duration and converts it with unchecked Instant addition at evaluation time. A sufficiently large caller-supplied Duration can therefore panic during push/flush instead of producing an evaluation result, which is inappropriate for a resource-safety API and must be made total before approval.",
+ "verdict": "request_changes"
+}
