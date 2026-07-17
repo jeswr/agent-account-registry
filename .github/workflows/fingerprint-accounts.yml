@@ -8,17 +8,46 @@ permissions: {}
 jobs:
   fingerprint:
     runs-on: ubuntu-latest
-    env:
-      SECRETS_JSON: ${{ toJSON(secrets) }}
     steps:
+      # Least-exposure filter (audit-2026-07-17, issue #41): only this tiny inline step ever sees the
+      # full secrets map; the fingerprint step below receives ONLY the ACCT_* worker-token subset via a
+      # file, so REGISTRY_SECRETS_PAT/PROVENANCE_SALT/ALERT_TOKEN never transit the probe environment.
+      - name: Materialize the ACCT_* worker-token subset for the probe
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/acct-secrets.json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          path = sys.argv[1]
+          allow = re.compile(r"ACCT[A-Z0-9]+_TOKEN")
+          data = json.loads(os.environ["ALL_SECRETS"])
+          subset = {key: value for key, value in data.items()
+                    if isinstance(value, str) and allow.fullmatch(key)}
+          # Create atomically 0600 (O_EXCL: fresh runner temp, the file must not pre-exist) so the
+          # token subset is never even transiently readable under the runner's default umask.
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as handle:
+              json.dump(subset, handle)
+          PY
+
       - name: Fingerprint all ACCT tokens (reset day/time in London; tokens never printed)
+        env:
+          SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
         run: |
           set +e +o pipefail   # tolerate 401/no-header responses (codex tokens 401 on the anthropic endpoint)
           rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/h.txt 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | head -1; }
-          names=$(printf '%s' "$SECRETS_JSON" | jq -r 'keys[] | select(test("^ACCT.*_TOKEN$"))' | sort)
+          # ONE canonical allowlist (review r2): the same ^ACCT[A-Z0-9]+_TOKEN$ the materializer and
+          # both reference workflows (dashboard.yml, dispatch.yml) use — a looser/tighter second
+          # filter here would silently drop (or admit) accounts the other step selected.
+          names=$(jq -r 'keys[] | select(test("^ACCT[A-Z0-9]+_TOKEN$"))' "$SECRETS_FILE" | sort)
           echo "handle | http | 7d_reset_ts | London(day HH:MM) | 7d_util | 5h_util | status"
           for name in $names; do
-            tok=$(printf '%s' "$SECRETS_JSON" | jq -r --arg k "$name" '.[$k]')
+            tok=$(jq -r --arg k "$name" '.[$k]' "$SECRETS_FILE")
             rm -f /tmp/h.txt
             code=$(curl -s -D /tmp/h.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
               -H "Authorization: Bearer $tok" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
