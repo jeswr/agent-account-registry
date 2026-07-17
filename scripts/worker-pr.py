@@ -43,6 +43,23 @@ MARKER_KINDS = {
     "gatefail": "<!-- sparq-fix-gatefail:v1",
     "missed": "<!-- sparq-fix-missed:v1",
 }
+# Model-escalation accounting (maintainer directive 2026-07-17). Durable, bot-authored markers:
+# the fix outcome records WHICH model executed each fix round (the commit [alias] tag is not
+# durable enough — squash merges and force-pushes lose it), a budget extension records the pinned
+# fix-model FLOOR, and the findings comment records the reviewer's progress grade for its round.
+# All are parsed with the same bot-login trust filter as the round markers.
+FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
+MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
+PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
+SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+# Provider escalation ladders in ASCENDING capability order. anthropic: sonnet < fable < opus
+# (opus is the terminal fix tier for hard cases); openai is single-tier (terra) — no ladder, so
+# only the progress extension applies there. A pin or recorded model outside its provider ladder
+# is REJECTED (hostile-input surface: a forged marker must never select an arbitrary
+# provider_model — concrete ids are still resolved from protected target routing by alias).
+ESCALATION_LADDERS = {"anthropic": ["sonnet", "fable", "opus"], "openai": ["terra"]}
+PROGRESS_VALUES = ("improving", "stagnant", "regressing")
+HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
 WORKER_HEAD_RE = re.compile(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+")
 # Human-owned PR labels: review:needs-user is the loop's own terminal escalation, needs:user is
@@ -115,6 +132,155 @@ def round_recorded(comments, bot_login, round_n, run_key):
     return any(marker in str(c.get("body", "")) for c in _bot_comments(comments, bot_login))
 
 
+def fix_round_models(comments, bot_login):
+    """{round: sorted model aliases} recorded by the bot's fix-outcome model markers — the
+    durable per-round record of WHICH model executed each fix round."""
+    result = {}
+    pattern = re.compile(
+        re.escape(FIX_MODEL_MARKER)
+        + r" round=([1-9][0-9]*) model=([A-Za-z0-9][A-Za-z0-9_.-]*) run=\S+ -->")
+    for comment in _bot_comments(comments, bot_login):
+        for match in pattern.finditer(str(comment.get("body", ""))):
+            result.setdefault(int(match.group(1)), set()).add(match.group(2))
+    return {round_n: sorted(models) for round_n, models in result.items()}
+
+
+def round_progress(comments, bot_login):
+    """{round: progress} recorded in the bot's findings comments (the durable round-marker copy
+    of each verdict's progress grade; the registry verdict record is the primary source)."""
+    result = {}
+    pattern = re.compile(
+        re.escape(PROGRESS_MARKER)
+        + r" round=([1-9][0-9]*) progress=(improving|stagnant|regressing) -->")
+    for comment in _bot_comments(comments, bot_login):
+        for match in pattern.finditer(str(comment.get("body", ""))):
+            result[int(match.group(1))] = match.group(2)
+    return result
+
+
+def pinned_fix_floor(comments, bot_login, provider):
+    """Highest recorded fix-model floor pin, validated against the provider ladder. A bot marker
+    naming a tier OUTSIDE the ladder raises (fail closed): silently ignoring a corrupt pin would
+    run the unpinned chain — exactly the fall-back-down the pin exists to prevent — so the
+    caller escalates loudly instead."""
+    ladder = ESCALATION_LADDERS.get(provider)
+    if not ladder:
+        raise WorkerPrError("unknown provider for the escalation ladder")
+    pattern = re.compile(
+        re.escape(MODEL_PIN_MARKER)
+        + r" round=([1-9][0-9]*) tier=([A-Za-z0-9][A-Za-z0-9_.-]*) run=\S+ -->")
+    floor = None
+    for comment in _bot_comments(comments, bot_login):
+        for match in pattern.finditer(str(comment.get("body", ""))):
+            tier = match.group(2)
+            if tier not in ladder:
+                raise WorkerPrError("recorded model pin is not a ladder member for this provider")
+            if floor is None or ladder.index(tier) > ladder.index(floor):
+                floor = tier
+    return floor
+
+
+def pinned_fix_chain(provider, floor):
+    """FLOOR semantics for a pinned fix chain: only ladder members AT OR ABOVE the pin, cheapest
+    first. Tiers below the floor are never offered to the allocator — see the defer-not-fallback
+    rationale on decide_budget."""
+    ladder = ESCALATION_LADDERS.get(provider)
+    if not ladder or floor not in ladder:
+        raise WorkerPrError("model pin must be a ladder member for its provider")
+    return ladder[ladder.index(floor):]
+
+
+def decide_budget(rounds_used, per_round_models, latest_progress, provider,
+                  base_rounds=3, hard_cap=HARD_CAP_ROUNDS,
+                  pending_fix_models=(), pin_floor=None):
+    """PURE combined round-budget policy (maintainer directive 2026-07-17): decide whether the
+    review<->fix loop continues, extends, or hands the PR to a human once the base round budget
+    is spent. Every input derives from hostile-parsed marker/verdict data and is validated.
+
+    Inputs: rounds_used (recorded review rounds), per_round_models (every model alias that
+    executed a fix round, from the durable fix-model markers), latest_progress (the LATEST
+    verdict's progress grade — improving/stagnant/regressing, or None for round 1 / unrecorded),
+    provider (the implementer's provider, whose ladder governs fix escalation),
+    pending_fix_models (model aliases recorded for the LATEST round's fix when that fix is
+    PUSHED but not yet re-reviewed — i.e. the caller is asking about a needs-review head that
+    carries an ungraded fix; empty everywhere else), pin_floor (the recorded fix-model floor
+    pin, if any — validated as a ladder member).
+
+    Returns {"action", "pin"} with action one of:
+      continue         — rounds_used is below the base budget; nothing special to do.
+      extend-pending-review — budget spent, but a fix executed AT/ABOVE the pinned floor (any
+                         ladder member when unpinned) is pushed and not yet re-reviewed:
+                         authorize its re-review. Grading an already-granted, already-executed
+                         fix round is NOT a new fix-round spend — the tick that granted that fix
+                         proved rounds_used < hard cap, so the re-review lands at <= hard cap.
+                         Without this, the model-pin extension's terminal grant ORPHANS the
+                         top-tier fix: the executed opus fix falsifies the "top tier not yet
+                         run" predicate via its own fix-model marker, while the latest recorded
+                         progress grade predates that fix (it graded the weaker tier's stagnant
+                         output — the very reason escalation fired), so neither mechanism below
+                         could authorize the re-review and the scarce top-tier round would be
+                         burned unreviewed with a potentially-approving verdict unreachable.
+                         Precedes both mechanisms: with an ungraded pushed fix, the next step is
+                         grading it — every extend/stop question is answered better by the fresh
+                         grade the re-review produces. A pending fix BELOW the pinned floor does
+                         NOT qualify (the pin forbade that tier from running; a marker claiming
+                         it did is a pin violation or a forgery and must not mint extensions).
+      extend-model-pin — budget spent, but some fix round ran BELOW the provider's top tier and
+                         the top tier has not yet fixed: extend (hard cap 6 total rounds) and
+                         pin the fix-model floor to `pin`, the tier ABOVE the highest that
+                         already ran. Takes precedence over the progress extension because a
+                         stronger model resets the quality question.
+      extend-progress  — budget spent on the top tier (or with no fix-model record), but the
+                         latest verdict grades the PR IMPROVING: extend, at most 6 total rounds.
+      needs-user       — the hard cap is reached, or the top tier is stagnant/regressing/ungraded.
+
+    DEFER-NOT-FALLBACK (the WHY, for every consumer of `pin`): once a floor is pinned, tiers
+    below it must never run another fix round for the PR. The extended budget exists precisely
+    because the below-floor model already burned the base budget without converging; if the
+    pinned tier has no available account the fix DEFERS to a later tick — falling back down the
+    chain would silently spend the extension re-running the model that already failed."""
+    ladder = ESCALATION_LADDERS.get(provider)
+    if not ladder:
+        raise WorkerPrError("unknown provider for the escalation ladder")
+    if not isinstance(rounds_used, int) or isinstance(rounds_used, bool) or rounds_used < 0:
+        raise WorkerPrError("rounds_used must be a non-negative integer")
+    if not isinstance(base_rounds, int) or isinstance(base_rounds, bool) or base_rounds < 1:
+        raise WorkerPrError("base_rounds must be a positive integer")
+    models = sorted(set(per_round_models))
+    for model in models:
+        if model not in ladder:
+            raise WorkerPrError("a recorded fix-round model is not a ladder member")
+    pending = sorted(set(pending_fix_models))
+    for model in pending:
+        if model not in ladder:
+            raise WorkerPrError("a pending fix-round model is not a ladder member")
+    if pin_floor is not None and pin_floor not in ladder:
+        raise WorkerPrError("pin_floor must be a ladder member for its provider")
+    if latest_progress is not None and latest_progress not in PROGRESS_VALUES:
+        raise WorkerPrError("latest_progress must be improving, stagnant, regressing, or None")
+    if rounds_used < base_rounds:
+        return {"action": "continue", "pin": None}
+    if rounds_used >= hard_cap:
+        return {"action": "needs-user", "pin": None}
+    # Re-review authorization — "may we GRADE a fix round already granted and executed" is a
+    # different question from "may we SPEND another fix round" (see extend-pending-review in the
+    # docstring). The hard-cap check above keeps rounds_used < hard_cap here, so the authorized
+    # re-review lands at rounds_used + 1 <= hard_cap.
+    floor_index = ladder.index(pin_floor) if pin_floor is not None else 0
+    if any(ladder.index(model) >= floor_index for model in pending):
+        return {"action": "extend-pending-review", "pin": None}
+    # Mechanism 1 — model escalation: the top tier has not yet run a fix round, so this is not
+    # yet a top-model failure. (No recorded fix rounds at all = nothing to escalate FROM; the
+    # progress mechanism below still applies.)
+    if models and ladder[-1] not in models:
+        highest = max(models, key=ladder.index)
+        return {"action": "extend-model-pin", "pin": ladder[ladder.index(highest) + 1]}
+    # Mechanism 2 — progress extension: only an explicitly IMPROVING latest verdict extends.
+    if latest_progress == "improving":
+        return {"action": "extend-progress", "pin": None}
+    return {"action": "needs-user", "pin": None}
+
+
 def reviewed_sha_of(body):
     match = REVIEWED_SHA_RE.search(body or "")
     return match.group(1) if match else None
@@ -148,7 +314,7 @@ def validate_verdict(document, diff_files):
     (the caller treats an invalid verdict as VOID)."""
     if not isinstance(document, dict):
         raise WorkerPrError("verdict must be a JSON object")
-    allowed = {"verdict", "injection_detected", "summary", "issues", "confidence"}
+    allowed = {"verdict", "injection_detected", "summary", "issues", "confidence", "progress"}
     required = {"verdict", "injection_detected", "summary", "issues"}
     keys = set(document)
     if not required <= keys or not keys <= allowed:
@@ -165,6 +331,12 @@ def validate_verdict(document, diff_files):
         if (not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
                 or not 0.0 <= float(confidence) <= 1.0):
             raise WorkerPrError("confidence must be a number in [0, 1]")
+    if "progress" in document:
+        # Round-over-round progress grade (maintainer directive 2026-07-17): improving /
+        # stagnant / regressing, or null on round 1 / when no prior findings are available.
+        progress = document["progress"]
+        if progress is not None and progress not in PROGRESS_VALUES:
+            raise WorkerPrError("progress must be improving, stagnant, regressing, or null")
     issues = document["issues"]
     if not isinstance(issues, list) or len(issues) > MAX_ISSUES:
         raise WorkerPrError(f"issues must be a list of at most {MAX_ISSUES} entries")
@@ -219,16 +391,22 @@ def decide_disarm(armed, draft, head_sha, reviewed_sha, when):
     return actions
 
 
-def decide_review(verdict, has_blockers, injection, round_n, max_rounds, security):
+def decide_review(verdict, has_blockers, injection, round_n, max_rounds, security,
+                  budget_action="needs-user"):
     """The review-verdict state machine. Every path arms once, requests one fix round, or stops
-    at a human — never loops."""
+    at a human — never loops unboundedly. On round-budget exhaustion the caller supplies
+    decide_budget's action: an extension (model pin or improving progress) keeps the loop in
+    `changes`, bounded by decide_budget's own hard cap; anything else (including the fail-closed
+    default) stops at a human."""
     if injection:
         return "needs-user"
     if verdict == "approve" and not has_blockers:
         # Decision 7: security surfaces (zk/mpc/crypto/auth/e2ee/trust:*) never auto-arm.
         return "needs-user" if security else "arm"
     # request_changes, or a contradictory approve-with-blockers (fail closed as changes).
-    return "needs-user" if round_n >= max_rounds else "changes"
+    if round_n >= max_rounds and budget_action not in {"extend-model-pin", "extend-progress"}:
+        return "needs-user"
+    return "changes"
 
 
 def decide_fix(injection, made_changes, gate_ok, pushed, nochange_runs, gatefail_runs):
@@ -384,6 +562,41 @@ def check_round(repo, pr_number, max_rounds, bot_login):
     print(f"review rounds recorded: {rounds}/{max_rounds}")
 
 
+def record_fix_model(repo, pr_number, round_n, model, run_key, bot_login):
+    """Durably record WHICH model executed a fix round (idempotent per marker content). The
+    commit [alias] tag is not durable enough — squash merges and force-pushes lose it — and
+    decide_budget's model-escalation mechanism needs the per-round record."""
+    if not SAFE_ALIAS_RE.fullmatch(model or ""):
+        raise WorkerPrError("fix model alias is unsafe")
+    comments = _paginated_comments(repo, pr_number)
+    marker = f"{FIX_MODEL_MARKER} round={round_n} model={model} run={run_key} -->"
+    if any(marker in str(c.get("body", "")) for c in _bot_comments(comments, bot_login)):
+        print(f"fix model already recorded for round {round_n}")
+        return
+    _comment(repo, pr_number,
+             f"> 🤖 SPARQ agent — fix round {round_n} executed by `{model}`.\n\n{marker}")
+    print(f"fix model recorded for round {round_n}: {model}")
+
+
+def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_login):
+    """Durably pin the fix-model floor after a budget extension (idempotent: an existing
+    equal-or-higher recorded floor wins — the floor only ever moves UP the ladder)."""
+    ladder = ESCALATION_LADDERS.get(provider)
+    if not ladder or tier not in ladder:
+        raise WorkerPrError("model pin tier must be a ladder member for its provider")
+    comments = _paginated_comments(repo, pr_number)
+    existing = pinned_fix_floor(comments, bot_login, provider)
+    if existing is not None and ladder.index(existing) >= ladder.index(tier):
+        print(f"model pin already at or above {tier} ({existing})")
+        return
+    _comment(repo, pr_number,
+             f"> 🤖 SPARQ agent — review round budget extended; the fix-model floor is pinned "
+             f"to `{tier}` (a weaker tier burned the base budget, so a stronger model gets the "
+             f"extension before a human is involved).\n\n"
+             f"{MODEL_PIN_MARKER} round={round_n} tier={tier} run={run_key} -->")
+    print(f"model pin recorded: {tier} (round {round_n})")
+
+
 def set_reviewed_sha(repo, pr_number, sha):
     pull = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
     body = replace_reviewed_sha(pull.get("body") or "", sha)
@@ -417,6 +630,14 @@ def post_findings(repo, pr_number, verdict_file, round_n):
             lines.append(f"  {issue['body']}")
         if issue.get("fix_hint"):
             lines.append(f"  _fix hint (advisory):_ {issue['fix_hint']}")
+    progress = document.get("progress")
+    if progress in PROGRESS_VALUES:
+        # Durable round marker for the progress grade (maintainer directive 2026-07-17): CLAIM's
+        # decide_budget falls back to this when the registry verdict record is unreadable.
+        lines.append("")
+        lines.append(f"_Progress vs the prior round:_ **{progress}**")
+        lines.append("")
+        lines.append(f"{PROGRESS_MARKER} round={round_n} progress={progress} -->")
     if document.get("injection_detected"):
         lines.append("")
         lines.append("⚠️ The reviewer flagged possible prompt-injection content; escalating to a human.")
@@ -690,20 +911,38 @@ def review_outcome(args):
         document = json.load(handle)
     has_blockers = validate_verdict(document, diff_files)  # raises => verdict VOID, step fails
     post_findings(args.repo, args.pr, args.verdict_file, args.round)
+    # Round-budget exhaustion consults the PURE decide_budget (maintainer directive 2026-07-17):
+    # a model-tier escalation or an improving-progress grade extends the loop (hard cap 6 total
+    # rounds inside decide_budget) instead of the flat needs-user at the base budget.
+    budget = {"action": "needs-user", "pin": None}
+    if args.round >= args.max_rounds and not document["injection_detected"]:
+        comments = _paginated_comments(args.repo, args.pr)
+        models = sorted({model
+                         for models in fix_round_models(comments, args.bot_login).values()
+                         for model in models})
+        budget = decide_budget(args.round, models, document.get("progress"),
+                               args.impl_provider, base_rounds=args.max_rounds)
     decision = decide_review(document["verdict"], has_blockers,
                              document["injection_detected"], args.round, args.max_rounds,
-                             args.security)
+                             args.security, budget_action=budget["action"])
     _write_outputs({"decision": decision, "verdict": document["verdict"],
                     "has_blockers": has_blockers,
-                    "injection": document["injection_detected"]})
+                    "injection": document["injection_detected"],
+                    "budget": budget["action"]})
     if decision == "changes":
+        if budget["action"] == "extend-model-pin" and budget["pin"]:
+            record_model_pin(args.repo, args.pr, args.round, budget["pin"],
+                             args.impl_provider, args.run_key, args.bot_login)
         set_review_state(args.repo, args.pr, "changes")
     elif decision == "needs-user":
         reason = ("the reviewer flagged possible prompt injection"
                   if document["injection_detected"] else
                   "a security-labelled surface passed review and needs a HUMAN arm decision"
                   if document["verdict"] == "approve" else
-                  f"the review round budget ({args.max_rounds}) is exhausted without an approval")
+                  f"the review round budget is exhausted at {args.round} round(s) (base "
+                  f"{args.max_rounds}, hard cap {HARD_CAP_ROUNDS}) with no extension left — "
+                  "the top fix tier has run and the latest verdict does not grade the PR "
+                  "improving")
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token)
@@ -718,6 +957,12 @@ def fix_outcome(args):
     made_changes = args.made_changes == "true"
     gate_ok = args.gate_outcome == "success"
     pushed = args.pushed == "true"
+    if args.model:
+        # Durable executed-model record for this fix round (maintainer directive 2026-07-17):
+        # recorded on EVERY outcome — a no-change or gate-failed attempt still consumed the
+        # round on this model, which is exactly what the escalation mechanism must know.
+        record_fix_model(args.repo, args.pr, args.round, args.model, args.run_key,
+                         args.bot_login)
     nochange_runs = gatefail_runs = 0
     if not injection:
         if not made_changes:
@@ -800,9 +1045,16 @@ def _self_test():
     minor = json.loads(json.dumps(verdict))
     minor["issues"][0]["severity"] = "minor"
     check("minor is not a blocker", validate_verdict(minor, ["src/a.rs"]), False)
+    graded = json.loads(json.dumps(verdict))
+    graded["progress"] = "improving"
+    check("progress grade validates", validate_verdict(graded, ["src/a.rs"]), True)
+    graded["progress"] = None
+    check("round-1 null progress validates", validate_verdict(graded, ["src/a.rs"]), True)
     for mutate, name in (
             (lambda d: d.update(verdict="ship-it"), "verdict enum"),
             (lambda d: d.update(extra=1), "unknown field"),
+            (lambda d: d.update(progress="better"), "unknown progress value"),
+            (lambda d: d.update(progress=True), "boolean progress"),
             (lambda d: d["issues"][0].update(file="../etc/passwd"), "file outside diff"),
             (lambda d: d["issues"][0].update(title="t" * 201), "title cap"),
             (lambda d: d.update(issues=[dict(d["issues"][0])] * 11), "issues cap"),
@@ -827,6 +1079,172 @@ def _self_test():
           "needs-user")
     check("approve with blockers is changes", decide_review("approve", True, False, 1, 3, False),
           "changes")
+    # Budget-extension plumbing (directive 2026-07-17): an extension action keeps the loop in
+    # changes at the cap; a continue/unknown action at the cap fails closed to needs-user; the
+    # injection and security paths are untouched by any extension.
+    for action in ("extend-model-pin", "extend-progress"):
+        check(f"exhaustion + {action} stays changes",
+              decide_review("request_changes", False, False, 3, 3, False, budget_action=action),
+              "changes")
+    check("exhaustion + continue fails closed",
+          decide_review("request_changes", False, False, 3, 3, False, budget_action="continue"),
+          "needs-user")
+    check("extension never overrides injection",
+          decide_review("request_changes", False, True, 3, 3, False,
+                        budget_action="extend-progress"), "needs-user")
+    check("extension never arms security",
+          decide_review("approve", False, False, 3, 3, True,
+                        budget_action="extend-progress"), "needs-user")
+
+    # ---- decide_budget (directive 2026-07-17): the combined round-budget policy ----
+    def budget(rounds, models, progress, provider="anthropic", base=3, pending=(), pin=None):
+        return decide_budget(rounds, models, progress, provider, base_rounds=base,
+                             pending_fix_models=pending, pin_floor=pin)
+
+    check("budget below base continues", budget(2, ["sonnet"], "regressing"),
+          {"action": "continue", "pin": None})
+    check("budget zero rounds continues", budget(0, [], None),
+          {"action": "continue", "pin": None})
+    # Mechanism 1 — model escalation, precedence over progress (it resets the quality question)
+    check("exhaustion on sonnet pins fable", budget(3, ["sonnet"], "stagnant"),
+          {"action": "extend-model-pin", "pin": "fable"})
+    check("model pin outranks improving progress", budget(3, ["sonnet"], "improving"),
+          {"action": "extend-model-pin", "pin": "fable"})
+    check("exhaustion on fable pins opus", budget(3, ["fable"], None),
+          {"action": "extend-model-pin", "pin": "opus"})
+    check("mixed sonnet+fable pins opus", budget(4, ["sonnet", "fable"], "regressing"),
+          {"action": "extend-model-pin", "pin": "opus"})
+    # Mechanism 2 — progress extension once the top tier has run (or nothing is recorded)
+    check("opus + improving extends on progress", budget(3, ["opus"], "improving"),
+          {"action": "extend-progress", "pin": None})
+    check("sonnet+opus + improving is progress-only", budget(4, ["sonnet", "opus"], "improving"),
+          {"action": "extend-progress", "pin": None})
+    check("no fix record + improving extends", budget(3, [], "improving"),
+          {"action": "extend-progress", "pin": None})
+    # Re-review authorization: a PUSHED-but-unreviewed fix at/above the pinned floor gets its
+    # re-review even at exhaustion (the terminal-grant orphan defect: the executed opus fix
+    # falsifies the top-tier predicate while the stagnant grade predates that fix)
+    check("pending pinned-floor fix authorizes its re-review",
+          budget(3, ["fable", "opus"], "stagnant", pending=["opus"], pin="opus"),
+          {"action": "extend-pending-review", "pin": None})
+    check("no pending fix in the same posture stops (flip side)",
+          budget(3, ["fable", "opus"], "stagnant"),
+          {"action": "needs-user", "pin": None})
+    check("pending fix BELOW the pinned floor never extends",
+          budget(3, ["fable", "opus"], "stagnant", pending=["fable"], pin="opus"),
+          {"action": "needs-user", "pin": None})
+    check("unpinned pending fix authorizes (floor is the ladder bottom)",
+          budget(3, ["sonnet"], None, pending=["sonnet"]),
+          {"action": "extend-pending-review", "pin": None})
+    check("pending re-review precedes the progress extension",
+          budget(3, ["opus"], "improving", pending=["opus"], pin="opus"),
+          {"action": "extend-pending-review", "pin": None})
+    check("openai pending fix authorizes its re-review",
+          budget(3, ["terra"], None, provider="openai", pending=["terra"]),
+          {"action": "extend-pending-review", "pin": None})
+    check("hard cap still dominates a pending fix",
+          budget(6, ["fable", "opus"], "stagnant", pending=["opus"], pin="opus"),
+          {"action": "needs-user", "pin": None})
+    check("pending fix below base just continues",
+          budget(2, ["sonnet"], None, pending=["sonnet"]),
+          {"action": "continue", "pin": None})
+    # needs-user sides (flip-goes-red on every ACT above)
+    check("opus + stagnant stops", budget(3, ["opus"], "stagnant"),
+          {"action": "needs-user", "pin": None})
+    check("opus + regressing stops", budget(4, ["opus"], "regressing"),
+          {"action": "needs-user", "pin": None})
+    check("opus + ungraded stops", budget(3, ["opus"], None),
+          {"action": "needs-user", "pin": None})
+    check("no fix record + stagnant stops", budget(3, [], "stagnant"),
+          {"action": "needs-user", "pin": None})
+    check("hard cap stops even below-top + improving", budget(6, ["sonnet"], "improving"),
+          {"action": "needs-user", "pin": None})
+    check("hard cap stops past 6", budget(7, ["sonnet"], "improving"),
+          {"action": "needs-user", "pin": None})
+    check("round 5 still extends under the cap", budget(5, ["sonnet"], None)["action"],
+          "extend-model-pin")
+    # openai: single tier — no ladder, mechanism 2 only
+    check("openai never model-pins", budget(3, ["terra"], "stagnant", provider="openai"),
+          {"action": "needs-user", "pin": None})
+    check("openai improving extends", budget(3, ["terra"], "improving", provider="openai"),
+          {"action": "extend-progress", "pin": None})
+    # an explicit policy base above the hard cap is respected up to the base, never extended
+    check("base above cap continues below base", budget(6, ["sonnet"], "improving", base=8),
+          {"action": "continue", "pin": None})
+    check("base above cap stops at base", budget(8, ["sonnet"], "improving", base=8),
+          {"action": "needs-user", "pin": None})
+    for bad, name in (
+            (lambda: budget(3, ["gpt-omega"], None), "unknown fix model"),
+            (lambda: budget(3, ["terra"], None), "cross-provider fix model"),
+            (lambda: decide_budget(3, [], None, "mystery"), "unknown provider"),
+            (lambda: budget(3, [], "better"), "unknown progress value"),
+            (lambda: budget(True, [], None), "boolean rounds"),
+            (lambda: decide_budget(3, [], None, "anthropic", base_rounds=0), "zero base"),
+            (lambda: budget(3, ["opus"], None, pending=["gpt-omega"]), "unknown pending model"),
+            (lambda: budget(3, ["opus"], None, pending=["terra"]),
+             "cross-provider pending model"),
+            (lambda: budget(3, ["opus"], None, pending=["opus"], pin="terra"),
+             "cross-provider pin floor"),
+            (lambda: budget(3, ["opus"], None, pin="gpt-omega"), "unknown pin floor"),
+    ):
+        try:
+            bad()
+        except WorkerPrError:
+            check(f"budget rejects {name}", "rejected", "rejected")
+        else:
+            check(f"budget rejects {name}", "accepted", "rejected")
+
+    # ---- durable escalation markers: fix-model, progress, and the pinned floor ----
+    esc_comments = [
+        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=1 model=sonnet run=1.1 -->"},
+        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=1 model=sonnet run=1.2 -->"},
+        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=2 model=fable run=2.1 -->"},
+        {"user": {"login": "mallory"},
+         "body": f"x {FIX_MODEL_MARKER} round=3 model=opus run=6.6 -->"},
+        {"user": {"login": bot},
+         "body": f"y {PROGRESS_MARKER} round=2 progress=improving -->"},
+        {"user": {"login": "mallory"},
+         "body": f"y {PROGRESS_MARKER} round=3 progress=improving -->"},
+    ]
+    check("fix models per round (bot-only, deduped)", fix_round_models(esc_comments, bot),
+          {1: ["sonnet"], 2: ["fable"]})
+    check("progress per round (bot-only)", round_progress(esc_comments, bot),
+          {2: "improving"})
+    check("no pin markers yields no floor", pinned_fix_floor(esc_comments, bot, "anthropic"),
+          None)
+    pin_comments = esc_comments + [
+        {"user": {"login": bot}, "body": f"z {MODEL_PIN_MARKER} round=3 tier=fable run=3.1 -->"},
+        {"user": {"login": "mallory"},
+         "body": f"z {MODEL_PIN_MARKER} round=3 tier=opus run=6.6 -->"},
+    ]
+    check("pinned floor reads the bot marker (forged higher pin ignored)",
+          pinned_fix_floor(pin_comments, bot, "anthropic"), "fable")
+    check("highest recorded floor wins",
+          pinned_fix_floor(pin_comments + [
+              {"user": {"login": bot},
+               "body": f"z {MODEL_PIN_MARKER} round=4 tier=opus run=4.1 -->"}], bot,
+              "anthropic"), "opus")
+    try:
+        pinned_fix_floor([{"user": {"login": bot},
+                           "body": f"z {MODEL_PIN_MARKER} round=1 tier=gpt-omega run=1.1 -->"}],
+                         bot, "anthropic")
+    except WorkerPrError:
+        check("corrupt pin tier fails closed", "rejected", "rejected")
+    else:
+        check("corrupt pin tier fails closed", "accepted", "rejected")
+    check("pinned chain keeps floor-and-above ascending",
+          pinned_fix_chain("anthropic", "fable"), ["fable", "opus"])
+    check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "opus"), ["opus"])
+    check("pinned chain at the bottom is the whole ladder",
+          pinned_fix_chain("anthropic", "sonnet"), ["sonnet", "fable", "opus"])
+    check("openai pinned chain is its single tier", pinned_fix_chain("openai", "terra"),
+          ["terra"])
+    try:
+        pinned_fix_chain("anthropic", "terra")
+    except WorkerPrError:
+        check("cross-provider pin fails closed", "rejected", "rejected")
+    else:
+        check("cross-provider pin fails closed", "accepted", "rejected")
 
     # decide_disarm (issue #42): the sweep invariant acts on mismatch when the PR is armed OR
     # ready-but-unarmed (interrupted-disarm crash-window re-entry); matching SHAs are NEVER
@@ -860,6 +1278,64 @@ def _self_test():
         check("disarm rejects an unknown mode", "rejected", "rejected")
     else:
         check("disarm rejects an unknown mode", "accepted", "rejected")
+
+    # ---- review_outcome wiring (monkeypatched I/O): exhaustion consults decide_budget — an
+    # extension records the pin (model path) or not (progress path) and stays review:changes;
+    # the terminal path escalates once with the budget-aware reason ----
+    import tempfile
+
+    wiring_calls = []
+    fake_state = {}
+    wiring_globals = globals()
+    real_io = {name: wiring_globals[name]
+               for name in ("_paginated_comments", "set_review_state", "needs_user",
+                            "post_findings", "record_model_pin", "_alert_route")}
+    try:
+        wiring_globals["_paginated_comments"] = (
+            lambda repo, pr: fake_state.get("comments", []))
+        wiring_globals["set_review_state"] = (
+            lambda repo, pr, state: wiring_calls.append(("state", state)))
+        wiring_globals["needs_user"] = (
+            lambda repo, pr, reason, **kwargs: wiring_calls.append(("needs-user", reason)))
+        wiring_globals["post_findings"] = (
+            lambda repo, pr, vf, rn: wiring_calls.append(("findings", rn)))
+        wiring_globals["record_model_pin"] = (
+            lambda repo, pr, rn, tier, provider, run_key, bot_login:
+            wiring_calls.append(("pin", tier)))
+        wiring_globals["_alert_route"] = lambda: (None, None)
+        with tempfile.TemporaryDirectory() as tmp:
+            verdict_file = Path(tmp) / "verdict.json"
+            files_file = Path(tmp) / "files.txt"
+            files_file.write_text("src/a.rs\n", encoding="utf-8")
+
+            def outcome(progress, comments):
+                wiring_calls.clear()
+                fake_state["comments"] = comments
+                verdict_file.write_text(json.dumps({
+                    "verdict": "request_changes", "injection_detected": False,
+                    "summary": "s", "issues": [], "progress": progress}), encoding="utf-8")
+                review_outcome(argparse.Namespace(
+                    repo="o/r", pr=41, verdict_file=str(verdict_file),
+                    files_file=str(files_file), round=3, max_rounds=3, security=False,
+                    issue=None, impl_provider="anthropic", bot_login=bot, run_key="9.1"))
+                return list(wiring_calls)
+
+            sonnet_fix = [{"user": {"login": bot},
+                           "body": f"x {FIX_MODEL_MARKER} round=1 model=sonnet run=1.1 -->"}]
+            opus_fix = [{"user": {"login": bot},
+                         "body": f"x {FIX_MODEL_MARKER} round=1 model=opus run=1.1 -->"}]
+            check("outcome model extension pins + stays changes",
+                  outcome("stagnant", sonnet_fix),
+                  [("findings", 3), ("pin", "fable"), ("state", "changes")])
+            check("outcome progress extension stays changes without a pin",
+                  outcome("improving", opus_fix), [("findings", 3), ("state", "changes")])
+            terminal = outcome("stagnant", opus_fix)
+            check("outcome terminal escalates once",
+                  [entry[0] for entry in terminal], ["findings", "needs-user"])
+            check("terminal reason names the exhausted budget",
+                  "round budget is exhausted" in terminal[1][1], True)
+    finally:
+        wiring_globals.update(real_io)
 
     check("fix pushed re-reviews", decide_fix(False, True, True, True, 0, 0), "re-review")
     check("first nochange stays", decide_fix(False, False, True, False, 1, 0), "stay-changes")
@@ -995,6 +1471,12 @@ def main():
     rout.add_argument("--max-rounds", required=True, type=int)
     rout.add_argument("--security", action="store_true")
     rout.add_argument("--issue", type=int)
+    # Budget-extension inputs (maintainer directive 2026-07-17): the implementer provider picks
+    # the escalation ladder, the bot login trust-filters the durable fix-model markers, and the
+    # run key stamps a recorded model pin.
+    rout.add_argument("--impl-provider", required=True)
+    rout.add_argument("--bot-login", required=True)
+    rout.add_argument("--run-key", required=True)
 
     fout = subparsers.add_parser("fix-outcome", parents=[common])
     fout.add_argument("--round", required=True, type=int)
@@ -1005,6 +1487,17 @@ def main():
     fout.add_argument("--gate-outcome", required=True)
     fout.add_argument("--pushed", choices=("true", "false"), required=True)
     fout.add_argument("--issue", type=int)
+    fout.add_argument("--model", default="",
+                      help="executed fix-model alias; recorded as a durable round marker")
+
+    # Records/converges the fix-model floor pin (CLAIM's crashed-outcome convergence path; the
+    # review outcome records it in-process). Idempotent — an equal-or-higher floor wins.
+    mpin = subparsers.add_parser("record-model-pin", parents=[common])
+    mpin.add_argument("--round", required=True, type=int)
+    mpin.add_argument("--tier", required=True)
+    mpin.add_argument("--provider", required=True)
+    mpin.add_argument("--run-key", required=True)
+    mpin.add_argument("--bot-login", required=True)
 
     args = parser.parse_args()
     if args.self_test or args.command is None:
@@ -1067,6 +1560,9 @@ def main():
             review_outcome(args)
         elif args.command == "fix-outcome":
             fix_outcome(args)
+        elif args.command == "record-model-pin":
+            record_model_pin(args.repo, args.pr, args.round, args.tier, args.provider,
+                             args.run_key, args.bot_login)
     except (WorkerPrError, OSError, json.JSONDecodeError) as exc:
         print(f"worker-pr: {exc}", file=sys.stderr)
         return 1

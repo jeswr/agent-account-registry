@@ -6,6 +6,11 @@
 # check names arrive as untrusted advisory context), and rebase (host-started merge of the
 # default branch into a CONFLICTING PR branch — the model only resolves conflict markers and
 # the host commits the two-parent merge, so worker-opened ancestry is never rewritten).
+# mode=fix may also carry `model_pin`, a round-budget-extension fix-model FLOOR (maintainer
+# directive 2026-07-17): validated to an escalation-ladder TIER (never an arbitrary model id),
+# it replaces the fix chain with the ladder tiers at/above the floor — tiers below it are never
+# offered (defer-not-fallback; rationale in dispatch-claim.py / worker-pr.py decide_budget).
+# mode=review grades round-over-round `progress` against the prior round's recorded verdict.
 #
 # Trust posture (locked decisions):
 # - The implementer identity comes ONLY from the registry provenance record written at publish
@@ -49,6 +54,11 @@ on:
         options: [verdict, ci, rebase]
       fix_context:
         description: Advisory failing-check-name context for fix_kind=ci (newline-free; the dispatcher derives it live)
+        required: false
+        default: ''
+        type: string
+      model_pin:
+        description: Pinned fix-model floor from a round-budget extension (a ladder tier or empty; fix mode only)
         required: false
         default: ''
         type: string
@@ -111,6 +121,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           FIX_KIND: ${{ inputs.fix_kind }}
           FIX_CONTEXT: ${{ inputs.fix_context }}
+          MODEL_PIN: ${{ inputs.model_pin }}
           REVIEW_ROUND: ${{ inputs.review_round }}
           ACCOUNT: ${{ inputs.account }}
           CLAIM_ID: ${{ inputs.claim_id }}
@@ -124,6 +135,7 @@ jobs:
           mode = os.environ["MODE"]
           fix_kind = os.environ["FIX_KIND"] or "verdict"
           fix_context = os.environ["FIX_CONTEXT"]
+          model_pin = os.environ["MODEL_PIN"]
           review_round = os.environ["REVIEW_ROUND"]
           account = os.environ["ACCOUNT"]
           claim_id = os.environ["CLAIM_ID"]
@@ -137,6 +149,15 @@ jobs:
               raise SystemExit("fix_kind must be verdict, ci, or rebase")
           if mode == "review" and fix_kind != "verdict":
               raise SystemExit("review mode takes no fix flavour")
+          # The pin is a hostile-input surface (maintainer directive 2026-07-17): only a KNOWN
+          # escalation-ladder tier may pass — a forged pin can therefore never select an
+          # arbitrary provider_model (the concrete id is still resolved from the protected
+          # target routing BY ALIAS, and the provider-ladder membership is re-checked against
+          # the provenance-bound implementer provider in the resolve step below).
+          if model_pin and model_pin not in {"sonnet", "fable", "opus", "terra"}:
+              raise SystemExit("model_pin must be empty or an escalation-ladder tier")
+          if mode == "review" and model_pin:
+              raise SystemExit("review mode takes no model pin")
           # Printable-ASCII, single-line, capped: the context is advisory model input (failing
           # check-run names) that must never smuggle control characters into prompts or logs.
           if not re.fullmatch(r"[ -~]{0,1000}", fix_context):
@@ -307,6 +328,7 @@ jobs:
         env:
           TARGET_REPO: ${{ inputs.target_repo }}
           MODE: ${{ inputs.mode }}
+          MODEL_PIN: ${{ inputs.model_pin }}
           IMPL_PROVIDER: ${{ steps.pr.outputs.impl_provider }}
         run: |
           set -euo pipefail
@@ -344,7 +366,22 @@ jobs:
           # anthropic-implemented direction. A claude alias still needs a concrete id.
           review_chain = {"anthropic": ["terra"], "openai": ["opus"]}
           fix_chain = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
-          wanted = (review_chain if mode == "review" else fix_chain)[impl_provider]
+          # Escalation ladders in ascending order — mirrors worker-pr.py ESCALATION_LADDERS
+          # (maintainer directive 2026-07-17). A pinned fix-model FLOOR replaces the default
+          # fix chain with the ladder tiers at/above the pin, cheapest first: tiers below the
+          # floor are DELIBERATELY absent (defer-not-fallback — with no at/above-floor account
+          # free, the claim defers to a later tick instead of burning the extended round budget
+          # on the model that already failed; see dispatch-claim.py). A pin outside the
+          # implementer provider's ladder fails closed.
+          ladders = {"anthropic": ["sonnet", "fable", "opus"], "openai": ["terra"]}
+          model_pin = os.environ.get("MODEL_PIN", "")
+          if mode == "fix" and model_pin:
+              ladder = ladders[impl_provider]
+              if model_pin not in ladder:
+                  raise SystemExit("model_pin is not a ladder tier for the implementer provider")
+              wanted = ladder[ladder.index(model_pin):]
+          else:
+              wanted = (review_chain if mode == "review" else fix_chain)[impl_provider]
           models = routing.get("models", {})
           chain = []
           for alias in wanted:
@@ -841,6 +878,32 @@ jobs:
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
             --bot-login "${{ steps.target.outputs.bot_login }}"
 
+      # Prior-round context for the progress grade (maintainer directive 2026-07-17): the
+      # reviewer must compare this round's findings against the PRIOR round's recorded findings
+      # and grade improving/stagnant/regressing. The registry verdict record is the trusted,
+      # schema-validated source (the same findings sit in the PR round comments, but the
+      # reviewer container has no GitHub access). Round 1 has no prior round, and a missing
+      # record degrades to progress=null — never a failure.
+      - name: Stage the prior-round verdict for the progress assessment
+        id: stage-prior
+        if: ${{ inputs.mode == 'review' && inputs.review_round != '1' && steps.round.outcome == 'success' }}
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          REVIEW_ROUND: ${{ inputs.review_round }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: |
+          set -euo pipefail
+          owner="${TARGET_REPO%%/*}"
+          name="${TARGET_REPO##*/}"
+          prior=$((REVIEW_ROUND - 1))
+          record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${prior}.json"
+          if [[ -f "$record" ]]; then
+            install -m 600 "$record" "$WORKER_ROOT/prior-verdict.json"
+            printf 'staged the round %s verdict for the progress comparison\n' "$prior"
+          else
+            printf '::warning::no registry verdict record for prior round %s; the reviewer will report progress=null\n' "$prior"
+          fi
+
       - name: Run cross-provider review (read-only, verdict file lifted out-of-tree)
         id: review
         if: ${{ inputs.mode == 'review' && steps.round.outcome == 'success' }}
@@ -854,6 +917,8 @@ jobs:
           WORKER_PR_HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
           WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
           WORKER_REVIEW_FILE: ${{ runner.temp }}/registry-worker/review-verdict.json
+          WORKER_REVIEW_ROUND: ${{ inputs.review_round }}
+          WORKER_PRIOR_REVIEW_FILE: ${{ runner.temp }}/registry-worker/prior-verdict.json
           WORKER_IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
           WORKER_IMPL_ALIAS: ${{ needs.resolve.outputs.impl_alias }}
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
@@ -1094,6 +1159,9 @@ jobs:
             --round "${{ inputs.review_round }}"
             --max-rounds "${{ needs.resolve.outputs.max_review_rounds }}"
             --issue "${{ needs.resolve.outputs.issue }}"
+            --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
+            --bot-login "${{ needs.resolve.outputs.pr_author }}"
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
           python3 registry/scripts/worker-pr.py "${args[@]}"
@@ -1167,6 +1235,7 @@ jobs:
             --round "${{ inputs.review_round }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
             --bot-login "${{ needs.resolve.outputs.pr_author }}" \
+            --model "${{ needs.claim.outputs.model }}" \
             --injection "${{ needs.run.outputs.injection_detected == 'true' && 'true' || 'false' }}" \
             --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \
             --gate-outcome "${{ needs.run.outputs.gate_outcome }}" \

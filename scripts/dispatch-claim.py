@@ -26,6 +26,10 @@ import tomllib
 # top-level `disarm_items` (armed-SHA-mismatch safety invariant, registry issue #42). Both
 # validators — this one and the dispatch.yml PLAN inline check — are bumped in the same commit;
 # the TARGET repo's dispatch-plan.py is untouched.
+# The 2026-07-17 round-budget escalation (decide_budget + the fix-model floor pin) deliberately
+# adds NO plan fields: the pin and the round/model/progress accounting are re-derived at CLAIM
+# time from durable bot-authored PR markers plus registry verdict records, so a hostile PLAN
+# artifact cannot inject, clear, or inflate them — the v3 schema is unchanged.
 SCHEMA = "registry-dispatch-plan/v3"
 PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items", "disarm_items"}
 REPOSITORY_FIELDS = {"target_repo", "target_sha", "items"}
@@ -799,6 +803,28 @@ def _pr_comments(repo, pr_number):
     return [item for page in pages if isinstance(page, list) for item in page]
 
 
+def latest_recorded_progress(worker_pr, registry_root, repo, number, rounds, comments,
+                             bot_login):
+    """The LATEST verdict's progress grade for decide_budget. Primary source: the registry
+    verdict record for the newest recorded round (written FIRST in the outcome ordering, so it
+    survives a crash before the findings comment); fallback: the durable progress marker in the
+    bot's findings comment. Missing/unreadable/ungraded degrades to None (decide_budget treats
+    that as not-improving — fail closed toward a human, never toward a silent extension)."""
+    if rounds < 1:
+        return None
+    path = Path(registry_root) / worker_pr.verdict_path(repo, number, rounds)
+    if path.is_file():
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            document = None
+        if isinstance(document, dict):
+            progress = document.get("progress")
+            if progress in worker_pr.PROGRESS_VALUES:
+                return progress
+    return worker_pr.round_progress(comments, bot_login).get(rounds)
+
+
 def _resolvable_chain(chain, routing):
     """Keep only chain aliases the harness can actually run (locked decision 14). A CLAUDE alias
     needs a concrete provider_model. A CODEX alias is resolvable even with a missing/TBD
@@ -968,16 +994,73 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 continue
             comments = _pr_comments(repo, number)
             rounds = worker_pr.count_rounds(comments, bot_login)
-            if rounds >= max_rounds:
-                # Terminal transition applied HERE (not just skipped): if the final review
-                # outcome crashed before its needs-user label landed, the PR would otherwise sit
-                # under an exhausted budget forever, invisible and silent. Idempotent — once the
-                # label lands, PLAN stops enumerating the PR.
-                _pr_needs_user(script_dir, repo, number, issue_number,
-                               f"the review round budget ({rounds}/{max_rounds}) is exhausted "
-                               "without a recorded terminal outcome; a human must decide")
-                continue
             impl_provider = record["impl_provider"]
+            run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
+                       f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
+            # Round budget via the PURE decide_budget (maintainer directive 2026-07-17): the
+            # flat rounds>=max needs-user is replaced by exhaustion-with-escalation — first a
+            # model-tier extension (pin the fix floor one tier up when a weaker model burned the
+            # base budget), then an improving-progress extension, both bounded by the hard cap.
+            # The terminal transition is still applied HERE (not just skipped) so a PR whose
+            # final review outcome crashed before its needs-user label landed converges loudly.
+            # Corrupt/forged escalation markers are ALSO loud (needs-user): silently ignoring a
+            # bad pin would run the unpinned chain — the fall-back-down the pin forbids.
+            try:
+                round_models = worker_pr.fix_round_models(comments, bot_login)
+                fix_models = sorted({model for models in round_models.values()
+                                     for model in models})
+                progress = latest_recorded_progress(worker_pr, registry_root, repo, number,
+                                                    rounds, comments, bot_login)
+                pin_floor = worker_pr.pinned_fix_floor(comments, bot_login, impl_provider)
+                # A needs-review head whose LATEST round carries a fix-model marker is a PUSHED
+                # fix awaiting its re-review (an executed fix flips the label to review:needs).
+                # decide_budget authorizes grading it even at exhaustion — otherwise the model
+                # pin's terminal grant orphans the top-tier fix round: its own marker falsifies
+                # the "top tier not yet run" predicate while the latest recorded grade predates
+                # the fix (it graded the weaker tier's stagnant output). Other states pass no
+                # pending fix: review:changes / repair markers for the current round record
+                # no-change or gate-failed attempts, not a pushed head awaiting grading.
+                pending_fix = (round_models.get(rounds, [])
+                               if item["state"] == "needs-review" else [])
+                budget = worker_pr.decide_budget(rounds, fix_models, progress, impl_provider,
+                                                 base_rounds=max_rounds,
+                                                 pending_fix_models=pending_fix,
+                                                 pin_floor=pin_floor)
+            except worker_pr.WorkerPrError as exc:
+                _pr_needs_user(script_dir, repo, number, issue_number,
+                               f"round-budget escalation-marker validation failed ({exc}); a "
+                               "human must inspect this PR's round/model/pin markers")
+                continue
+            if budget["action"] == "needs-user":
+                _pr_needs_user(script_dir, repo, number, issue_number,
+                               f"the review round budget is exhausted at {rounds} round(s) "
+                               f"(base {max_rounds}, hard cap {worker_pr.HARD_CAP_ROUNDS}) "
+                               "with no extension left — the top fix tier has run, the latest "
+                               "verdict does not grade the PR improving, and no pushed fix at "
+                               "or above the pinned floor awaits re-review; a human must "
+                               "decide")
+                continue
+            if budget["action"] == "extend-model-pin" and budget["pin"]:
+                # Converge the durable pin marker (normally recorded by the review outcome; this
+                # covers a crashed outcome). record_model_pin is idempotent and an existing
+                # equal-or-higher floor wins, so re-running it every tick is safe.
+                _run_target_helper(script_dir, "worker-pr.py", [
+                    "record-model-pin", "--repo", repo, "--pr", str(number),
+                    "--round", str(max(rounds, 1)), "--tier", budget["pin"],
+                    "--provider", impl_provider, "--run-key", run_key,
+                    "--bot-login", bot_login])
+                ladder = worker_pr.ESCALATION_LADDERS[impl_provider]
+                if pin_floor is None or ladder.index(budget["pin"]) > ladder.index(pin_floor):
+                    pin_floor = budget["pin"]
+            # DEFER-NOT-FALLBACK (the WHY): once a floor is pinned, tiers BELOW it are never
+            # offered to the allocator again for this PR. The extended budget exists precisely
+            # because the below-floor model already burned the base budget without converging,
+            # so when no at/above-floor account is free the claim returns None and the item
+            # simply DEFERS to the next tick — falling back down the chain would silently spend
+            # the extension re-running the model that already failed. (The missed-fix marker
+            # budget still bounds how long it can defer before a loud needs-user.)
+            fix_aliases = (worker_pr.pinned_fix_chain(impl_provider, pin_floor)
+                           if pin_floor else FIX_CHAIN[impl_provider])
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # record still carrying a raw handle (or nothing) fails closed — re-run the backfill.
             impl_account_h = str(record.get("impl_account_h", ""))
@@ -1015,7 +1098,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    f"{len(missed)} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR")
                     continue
-                chain = _resolvable_chain(FIX_CHAIN[impl_provider], routing)
+                chain = _resolvable_chain(fix_aliases, routing)
                 holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
             else:
                 if rounds < 1:
@@ -1038,7 +1121,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     print(f"defer review {repo}#{number}: round {rounds} verdict record missing")
                     continue
                 mode, role = "fix", "fix"
-                chain = _resolvable_chain(FIX_CHAIN[impl_provider], routing)
+                chain = _resolvable_chain(fix_aliases, routing)
                 holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
                 round_number = rounds
             if not chain:
@@ -1120,6 +1203,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             "-f", f"mode={mode}",
             "-f", f"fix_kind={fix_kind}",
             "-f", f"fix_context={fix_context}",
+            # The pinned fix-model floor rides along so the workflow's own chain resolution
+            # honours it (review mode never carries a pin; the input is ladder-validated there).
+            "-f", f"model_pin={(pin_floor or '') if mode == 'fix' else ''}",
             "-f", f"review_round={round_number}",
             "-f", f"account={account}",
             "-f", f"claim_id={claim_id}",
@@ -1834,8 +1920,12 @@ def _self_test():
             return fake["pull"]
         if "/check-runs" in path:
             return {"check_runs": fake["check_runs"]}
+        if "/issues/41/comments" in path:
+            return [fake.get("comments", [])]
         if "/issues/7" in path:
             return {"labels": [{"name": name} for name in fake.get("issue_labels", [])]}
+        if "/compare/" in path:
+            return {"status": "ahead", "files": [{"filename": "src/a.rs"}]}
         raise AssertionError(f"unexpected API read: {path}")
 
     def fake_helper(script_dir, script, args):
@@ -1850,11 +1940,11 @@ def _self_test():
                 "user": {"login": bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
-    def run_items(items):
+    def run_items(items, allocator=None, routing=None):
         helper_calls.clear()
         _dispatch_review_items(items, repo, {"max_review_rounds": 3, "account_pool": []},
-                               {}, None, wiring_worker_pr, "reg/repo", wiring_root,
-                               "main", bot, None, 0.10)
+                               routing or {}, allocator, wiring_worker_pr, "reg/repo",
+                               wiring_root, "main", bot, None, 0.10)
 
     ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
                "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
@@ -1907,6 +1997,178 @@ def _self_test():
             fake["check_runs"] = gate_red
             run_items([stranded_item])
             assert helper_calls == [], helper_calls
+
+            # ---- round-budget escalation (directive 2026-07-17): decide_budget replaces the
+            # flat rounds>=max needs-user at CLAIM, the fix chain honours the pinned floor, and
+            # a starved pinned chain DEFERS (defer-not-fallback: sonnet is never re-offered) ----
+            class FakeAllocator:
+                def __init__(self):
+                    self.chains = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    self.chains.append(list(chain))
+                    return None   # no account free: the fix must DEFER, never fall back down
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            def bot_comment(body):
+                return {"user": {"login": bot}, "body": body}
+
+            def round_markers(count):
+                return [bot_comment(f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->")
+                        for i in range(1, count + 1)]
+
+            def write_verdict(round_n, progress):
+                path = Path(tmp) / wiring_worker_pr.verdict_path(repo, 41, round_n)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "verdict": "request_changes", "injection_detected": False,
+                    "summary": "s", "issues": [], "progress": progress}), encoding="utf-8")
+
+            fix_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-fix",
+                        "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
+                        "security": False, "context": ""}
+            routing_ok = {"models": {
+                "sonnet": {"provider_model": "claude-sonnet-4-6", "harness": "claude"},
+                "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
+                "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
+                "terra": {"provider_model": "TBD", "harness": "codex"},
+            }}
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            fix_model = wiring_worker_pr.FIX_MODEL_MARKER
+            pin_marker = wiring_worker_pr.MODEL_PIN_MARKER
+
+            # ACT: base budget spent on sonnet -> extension, fable pin converged, and a chain
+            # WITHOUT sonnet; the None claim then defers with a missed marker, NOT needs-user
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=2 model=sonnet run=2.9 -->")]
+            write_verdict(3, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-model-pin"),
+                ("worker-pr.py", "record-marker")], helper_calls
+            pin_args = helper_calls[0][1]
+            assert pin_args[pin_args.index("--tier") + 1] == "fable", pin_args
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
+
+            # DO-NOTHING flip: under budget -> no pin call, the DEFAULT fix chain is offered
+            fake["comments"] = round_markers(2)
+            write_verdict(2, None)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+
+            # a recorded bot pin governs the chain even under budget (the floor never lowers) ...
+            fake["comments"] = round_markers(2) + [
+                bot_comment(f"z {pin_marker} round=1 tier=opus run=1.5 -->")]
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["opus"]], alloc.chains
+            # ... while a NON-bot forged pin marker is inert (bot-login trust filter)
+            fake["comments"] = round_markers(2) + [
+                {"user": {"login": "mallory"},
+                 "body": f"z {pin_marker} round=1 tier=opus run=6.6 -->"}]
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+
+            # top tier ran + latest verdict improving -> progress extension (pin floor kept)
+            fake["comments"] = round_markers(4) + [
+                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->"),
+                bot_comment(f"z {pin_marker} round=3 tier=opus run=3.9 -->")]
+            write_verdict(4, "improving")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus"]], alloc.chains
+
+            # flip-goes-red: top tier + stagnant -> the loud terminal needs-user, no claim
+            fake["comments"] = round_markers(4) + [
+                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
+            write_verdict(4, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+
+            # hard cap: 6 rounds stop even with a weaker tier + an improving grade
+            fake["comments"] = round_markers(6) + [
+                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->")]
+            write_verdict(6, "improving")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+
+            # a corrupt bot-authored pin tier is LOUD (needs-user) — silently ignoring it
+            # would run the unpinned chain, the exact fall-back-down the pin forbids
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
+                bot_comment(f"z {pin_marker} round=1 tier=gpt-omega run=1.1 -->")]
+            write_verdict(3, "improving")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+
+            # ACT (terminal-grant orphan defect): the pinned opus fix EXECUTED and PUSHED
+            # (state review:needs) must get its re-review — the opus fix-model marker
+            # falsifies the top-tier escalation predicate and the recorded round-3 grade
+            # (stagnant) predates the opus fix, so without the pending-fix authorization
+            # this exact posture went needs-user with the top-tier round burned unreviewed.
+            # The allocator is offered the cross-provider REVIEW chain (round 4), no
+            # needs-user and no pin mutation.
+            review_item = dict(fix_item, state="needs-review")
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=2 model=fable run=2.9 -->"),
+                bot_comment(f"z {pin_marker} round=3 tier=opus run=3.5 -->"),
+                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
+            write_verdict(3, "stagnant")
+            alloc = FakeAllocator()
+            run_items([review_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [["terra"]], alloc.chains
+
+            # flip-goes-red: the same posture whose latest fix ran BELOW the recorded opus
+            # floor (a pin violation / forged marker) mints NO re-review — with the top tier
+            # already graded stagnant it is the loud terminal instead
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"z {pin_marker} round=1 tier=opus run=1.5 -->"),
+                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+            alloc = FakeAllocator()
+            run_items([review_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
+
+            # latest_recorded_progress: the registry record is primary, the findings-comment
+            # marker is the fallback, and unknown/absent degrades to None (never extends)
+            write_verdict(5, "regressing")
+            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 5, [],
+                                            bot) == "regressing"
+            marker_only = [bot_comment(
+                f"y {wiring_worker_pr.PROGRESS_MARKER} round=9 progress=improving -->")]
+            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 9, marker_only,
+                                            bot) == "improving"
+            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 8, marker_only,
+                                            bot) is None
+            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 0, marker_only,
+                                            bot) is None
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io

@@ -13,7 +13,11 @@
 #   dispatch               = "cron" | "cron+doorbell"
 #   trust                  = "collaborators"
 # Optional cross-provider review-loop fields (defaults in policy-resolve.py):
-#   max_review_rounds        = positive integer (default 3)  # review<->fix rounds before needs-user
+#   max_review_rounds        = positive integer (default 3)  # BASE review<->fix rounds; on
+#                              exhaustion decide_budget (worker-pr.py) may extend to a hard cap
+#                              of 6 total via a fix-model-tier escalation, an improving-progress
+#                              verdict, or the re-review of a pushed pinned-floor fix that has
+#                              not been graded yet, before needs-user (2026-07-17)
 #   review_queue_ttl_minutes = positive integer (default 30) # review:needs age before alerting
 #   cross_provider_fallback  = bool (default false)          # opt-in same-provider degrade when the
 #                                                            # opposite provider is starved; false =
@@ -32,6 +36,6 @@ usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH 
 max_attempts = 3              # per-issue worker attempts (also bounds the deferred-retry loop)
 dispatch = "cron"
 trust = "collaborators"
-max_review_rounds = 3         # bound the cross-provider review<->fix loop
+max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total (see header)
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
 cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade

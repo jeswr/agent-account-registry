@@ -44,7 +44,10 @@ POLICY_FIELDS = {
 #                                 admit a worker (point-in-time headroom; burn-rate caveat in
 #                                 select-and-claim.py).
 # Optional cross-provider review-loop controls (defaults 3 / 30 / False -> backward compatible):
-#   max_review_rounds        = positive int — bound on the review<->fix loop before needs-user.
+#   max_review_rounds        = positive int — BASE bound on the review<->fix loop; on exhaustion
+#                              worker-pr.py decide_budget may extend to a hard cap of 6 total
+#                              rounds (fix-model-tier escalation / improving progress, 2026-07-17)
+#                              before needs-user.
 #   review_queue_ttl_minutes = positive int — how long a PR may sit review:needs before alerting.
 #   cross_provider_fallback  = bool — opt-in same-provider degrade when the opposite provider is
 #                              starved; default False = stay queued + alert (the honest default).
