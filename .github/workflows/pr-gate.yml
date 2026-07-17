@@ -44,7 +44,7 @@ jobs:
         run: python3 -m pip install --disable-pip-version-check pyyaml
 
       - name: Install actionlint (pinned release)
-        uses: raven-actions/actionlint@3a24062651993d40ff222ab58bb35584726cc6ea # v2.0.0
+        uses: raven-actions/actionlint@01fce4f43a270a612932cb1c64d40505a029f821 # v2.0.0
         with:
           version: 1.7.7
 
