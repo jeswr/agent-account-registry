@@ -886,18 +886,32 @@ jobs:
           import subprocess
 
           registry_repo = os.environ["REGISTRY_REPO"]
-          repo = os.environ.get("ALERT_REPO") or registry_repo
+          alert_repo = os.environ.get("ALERT_REPO", "")
+          alert_token = os.environ.get("ALERT_TOKEN", "")
+          # Same route semantics as usage-alert.py's _alert_route() (issue #39 bug class): the
+          # private ALERT_REPO is the destination ONLY when ALERT_TOKEN can write there. A
+          # half-configured deployment (repo set, token missing) must NOT write to the private repo
+          # under the ambient registry token (no permission there — the write fails silently and the
+          # alert is dropped); fall back to the registry repo, which the ambient token can always
+          # write. The body carries no account handles, so the registry fallback is safe.
+          repo = alert_repo if (alert_repo and alert_token) else registry_repo
+          token = alert_token if repo == alert_repo and alert_token else None
           label = "ops-alert"
           title = "⚠️ Dispatch PLAN job is failing — fleet-wide dispatch is stalled"
 
-          def gh(args, capture=False):
-              # Same routing as usage-alert.py: an ALERT_TOKEN (when an ALERT_REPO is set) writes to
-              # the private alert repo; otherwise the ambient registry GH_TOKEN is used.
+          def gh(args, capture=False, check=False):
+              # token=None -> ambient registry GH_TOKEN. check=True surfaces a non-zero gh
+              # returncode as a ::warning:: instead of dropping the write silently (issue #39).
               env = dict(os.environ)
-              tok = os.environ.get("ALERT_TOKEN", "")
-              if os.environ.get("ALERT_REPO") and tok:
-                  env["GH_TOKEN"] = tok
-              return subprocess.run(["gh"] + args, capture_output=capture, text=True, env=env)
+              if token:
+                  env["GH_TOKEN"] = token
+              result = subprocess.run(["gh"] + args, capture_output=capture, text=True, env=env)
+              if check and result.returncode != 0:
+                  detail = (result.stderr or "").strip() if capture else ""
+                  print("::warning::plan-alert: gh {} {} failed (rc={}){}".format(
+                      args[0], args[1] if len(args) > 1 else "", result.returncode,
+                      " — " + detail if detail else ""))
+              return result
 
           result = os.environ.get("PLAN_RESULT", "")
           run_url = os.environ.get("RUN_URL", "")
@@ -923,15 +937,17 @@ jobs:
               gh(["label", "create", label, "-R", repo, "--color", "d73a4a",
                   "--description", "Autonomous ops alert (maintainer action)"], capture=True)
               if num:
-                  gh(["issue", "edit", str(num), "-R", repo, "--body", body])
+                  gh(["issue", "edit", str(num), "-R", repo, "--body", body],
+                     capture=True, check=True)
               else:
                   gh(["issue", "create", "-R", repo, "--title", title, "--label", label,
-                      "--body", body])
+                      "--body", body], capture=True, check=True)
               print("::warning::plan-alert: PLAN job {} — maintainer alerted".format(result))
           elif num:
               gh(["issue", "comment", str(num), "-R", repo, "--body",
-                  "✅ Recovered — the dispatch PLAN job succeeded again. Auto-closing."])
-              gh(["issue", "close", str(num), "-R", repo])
+                  "✅ Recovered — the dispatch PLAN job succeeded again. Auto-closing."],
+                 capture=True, check=True)
+              gh(["issue", "close", str(num), "-R", repo], capture=True, check=True)
               print("plan-alert: PLAN recovered — closed the alert")
           else:
               print("plan-alert: PLAN result={} — nothing to do".format(result or "unknown"))
