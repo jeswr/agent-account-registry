@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The export is a deterministic derivation of the existing SUITES registry, cleanly separates extension assertion totals from standards-conformance totals, and exposes the generator through an explicit CLI option with fatal handling for artifact write failures. The unit test checks row and total fidelity, while the integration drift guard byte-compares the committed artifact against fresh generation, exercising the real production renderer rather than a mock. The committed JSON is consistent with the implementation shown, and no correctness, soundness, security, or test-validity defect is evident in the diff.",
+ "verdict": "approve"
+}
