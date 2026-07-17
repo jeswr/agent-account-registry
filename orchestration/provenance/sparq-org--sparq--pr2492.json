@@ -1,0 +1,9 @@
+{
+ "head_sha_at_open": "3bd6734694f2eb2c43b172f9f2317135ef3e39dc",
+ "impl_account_h": "58b7c92faa5b5ca5",
+ "impl_alias": "fable",
+ "impl_provider": "anthropic",
+ "issue": 2486,
+ "pr_number": 2492,
+ "recorded_at_run": "29582591084.1"
+}
