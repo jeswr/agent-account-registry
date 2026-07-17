@@ -760,7 +760,13 @@ def _run_target_helper(script_dir, script, args):
         env={**os.environ, "GH_TOKEN": token},
     )
     if result.returncode != 0:
-        raise DispatchError(f"target helper {script} {args[0] if args else ''} failed")
+        # Surface the failure cause: the helper's stderr never contains the token (GH_TOKEN is
+        # env-only and the helpers never echo it), and without this line a deterministic
+        # App-token-specific failure is invisible in the CLAIM log (live incident 2026-07-17:
+        # 5 defuses failed silently while the same command succeeded under a user token).
+        tail = " | ".join((result.stderr or result.stdout or "").strip().splitlines()[-3:])[:300]
+        raise DispatchError(
+            f"target helper {script} {args[0] if args else ''} failed: {tail or 'no output'}")
     return result
 
 
