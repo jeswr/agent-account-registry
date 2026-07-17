@@ -97,21 +97,51 @@ def _probe_anthropic(token):
     return _assemble_usage(hdr)
 
 
-def _probe_fable(token):
-    """[FABLE-5] Probe the FABLE weekly sub-quota (anthropic-ratelimit-unified-7d_oi-*) with the
-    Claude-Code request shape. Returns {"fable_ok": True, "fable_7d_oi_util","fable_7d_oi_reset"} when the
-    account currently serves fable AND exposes the sub-quota window; None otherwise (rejected/gated/no
-    7d_oi header) so the caller fail-closes FABLE routing for the account. Absence of the extra probe (or
-    a None result) never blocks non-fable routing, which the base 5h/7d signal governs on its own."""
-    hdr = _probe_headers(token, "claude-fable-5", claude_code=True)
-    if hdr is None or hdr.get("7d_oi-utilization") is None:
-        return None  # not a 200 with the sub-quota window (rejected/exhausted/absent) -> fail-closed fable
+def _valid_utilization(val):
+    """True iff `val` is a header string that parses to a utilization fraction in [0.0, 1.0].
+    A provider-side shape change that leaves the header present but with a non-numeric or
+    out-of-range value (e.g. 'unknown', '', '95%', '1.5') is REJECTED here so it fail-closes
+    rather than parsing to garbage. Pure — unit-tested by --self-test."""
+    if not isinstance(val, str) or not val.strip():
+        return False
+    try:
+        num = float(val.strip())
+    except (TypeError, ValueError):
+        return False
+    return 0.0 <= num <= 1.0
+
+
+def _assemble_fable(hdr):
+    """[FABLE-5] Classify a parsed fable-probe header map into the fable sub-quota entry, or None
+    (UNAVAILABLE / fail-closed) on any parse mismatch. The account is admitted for FABLE only when the
+    7d_oi utilization header is present AND parses to a valid [0,1] fraction — a version-pinned request
+    shape that the provider later changes can otherwise leave a header present with a garbage value that
+    would classify a capped/dead account as eligible (issue #30). None means: rejected/gated/absent OR
+    a shape drift the probe no longer understands -> the caller fail-closes FABLE routing. Pure —
+    unit-tested by --self-test."""
+    if hdr is None:
+        return None
+    util = hdr.get("7d_oi-utilization")
+    if not _valid_utilization(util):
+        return None  # absent, or present-but-unparseable (provider shape drift) -> UNAVAILABLE
     result = {"fable_ok": True,
-              "fable_7d_oi_util": hdr.get("7d_oi-utilization"),
+              "fable_7d_oi_util": util,
               "fable_7d_oi_reset": hdr.get("7d_oi-reset")}
     if hdr.get("7d_oi-limit") is not None:
         result["fable_7d_oi_limit"] = hdr.get("7d_oi-limit")
     return result
+
+
+def _probe_fable(token):
+    """[FABLE-5] Probe the FABLE weekly sub-quota (anthropic-ratelimit-unified-7d_oi-*) with the
+    Claude-Code request shape. Returns {"fable_ok": True, "fable_7d_oi_util","fable_7d_oi_reset"} when the
+    account currently serves fable AND exposes a well-formed sub-quota window; None otherwise
+    (rejected/gated/no or unparseable 7d_oi header) so the caller fail-closes FABLE routing for the
+    account. Absence of the extra probe (or a None result) never blocks non-fable routing, which the base
+    5h/7d signal governs on its own. Classification is delegated to the pure `_assemble_fable` so shape
+    drift is caught by the self-test."""
+    hdr = _probe_headers(token, "claude-fable-5", claude_code=True)
+    return _assemble_fable(hdr)
 
 
 def _load_accounts(script_dir, registry_repo):
@@ -287,6 +317,38 @@ def _self_test():
     body4, changed3 = _upsert_limits_line(body2, "limits: 5h_limit=20")
     chk("upsert replaces on change", (changed3, "5h_limit=20" in body4, "5h_limit=10" in body4),
         (True, True, False))
+    # [FABLE-5] fable sub-quota classification (issue #30): shape-drift is caught here, and a present-
+    # but-unparseable window fail-closes to UNAVAILABLE (None) rather than parsing to garbage.
+    #   utilization validator: numeric [0,1] strings only
+    for val, want in (("0.0", True), ("0.42", True), ("1.0", True), (" 0.1 ", True),
+                      ("1.5", False), ("-0.1", False), ("", False), ("unknown", False),
+                      ("95%", False), (None, False), (0.42, False)):
+        chk(f"valid utilization {val!r}", _valid_utilization(val), want)
+    #   recorded good fable response: the exact Claude-Code-shaped 7d_oi header shape we pin to
+    good_fable = _parse_rate_headers(
+        "HTTP/2 200\r\n"
+        "anthropic-ratelimit-unified-status: allowed\r\n"
+        "anthropic-ratelimit-unified-7d_oi-utilization: 0.2\r\n"
+        "anthropic-ratelimit-unified-7d_oi-reset: 1737072000\r\n"
+        "anthropic-ratelimit-unified-7d_oi-limit: 500000\r\n")
+    fable = _assemble_fable(good_fable)
+    chk("fable good: fable_ok", (fable or {}).get("fable_ok"), True)
+    chk("fable good: util", (fable or {}).get("fable_7d_oi_util"), "0.2")
+    chk("fable good: reset", (fable or {}).get("fable_7d_oi_reset"), "1737072000")
+    chk("fable good: limit", (fable or {}).get("fable_7d_oi_limit"), "500000")
+    #   shape drift / mismatch -> UNAVAILABLE (fail-closed None), NOT a garbage fable_ok entry
+    chk("fable absent window -> unavailable", _assemble_fable(_parse_rate_headers(
+        "anthropic-ratelimit-unified-status: allowed\r\n")), None)
+    chk("fable garbage value -> unavailable", _assemble_fable(_parse_rate_headers(
+        "anthropic-ratelimit-unified-7d_oi-utilization: unavailable\r\n")), None)
+    chk("fable out-of-range value -> unavailable", _assemble_fable(_parse_rate_headers(
+        "anthropic-ratelimit-unified-7d_oi-utilization: 1.7\r\n")), None)
+    chk("fable no headers (transport error) -> unavailable", _assemble_fable(None), None)
+    #   limit is optional: a good window without a *-limit header still admits
+    fable_nolimit = _assemble_fable(_parse_rate_headers(
+        "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n"))
+    chk("fable good sans limit: fable_ok", (fable_nolimit or {}).get("fable_ok"), True)
+    chk("fable good sans limit: no limit key", "fable_7d_oi_limit" in (fable_nolimit or {}), False)
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
