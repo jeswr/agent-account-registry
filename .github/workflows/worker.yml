@@ -892,12 +892,42 @@ jobs:
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: bash ../registry/scripts/worker-live.sh gate
 
+      # TTL guard #2 (audit-2026-07-17, issue #40): app-token-post above is minted immediately after
+      # the model step but BEFORE the toolchain-setup + `Run policy-selected local gate` steps. App
+      # installation tokens live 60 minutes, so a long gate (large crate / cold cargo cache) can still
+      # exhaust the whole window and leave publish/followups/final-state with an EXPIRED token — the
+      # exact residual failure app-token-post was meant to close, only shifted past the gate. This
+      # second re-mint runs after the gate so all target writes start inside a fresh 60-minute window.
+      # `always() && !dry_run` mirrors app-token-post so final-state (which runs on the failure path)
+      # is covered too; continue-on-error + the `|| app-token-post || app-token-live` fallbacks below
+      # keep a mint hiccup no worse than the pre-existing single post-model mint.
+      - name: Mint post-gate target-scoped App token (publish/final-state TTL guard)
+        id: app-token-publish
+        if: ${{ always() && !inputs.dry_run }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          # Same App+installation grant as app-token-post: workers push branches touching
+          # .github/workflows/* (role:ci issues were structurally blocked otherwise).
+          permission-workflows: write
+
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
         if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
+        # TTL bound (review r1, issue #40): publish is API-bound (git push + gh pr create) and sits
+        # between the post-gate mint and final-state's token use — bound it so app-token-publish
+        # cannot age past its 60-min TTL before the LAST consumer (final-state) runs.
+        timeout-minutes: 15
         working-directory: target
         env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
           TARGET_DIR: ${{ github.workspace }}/target
           TARGET_REPO: ${{ inputs.target_repo }}
           TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
@@ -920,8 +950,11 @@ jobs:
         # step creates de-duplicated, labelled, back-linked issues. Best-effort; never fails the worker.
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
         continue-on-error: true
+        # TTL bound (review r1, issue #40): best-effort API-bound step between the post-gate mint and
+        # final-state — bound it for the same reason as publish above.
+        timeout-minutes: 10
         env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
         run: |
           set -uo pipefail
@@ -937,7 +970,7 @@ jobs:
       - name: Set final target issue state
         if: ${{ always() && !inputs.dry_run }}
         env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
           ACQUIRED: ${{ needs.claim.outputs.acquired }}
           EXHAUSTED: ${{ steps.budget.outputs.exhausted }}
           TRUST_OUTCOME: ${{ steps.trust.outcome }}
