@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "No changed or existing test invokes `pkg-query --citations`. The renderer tests bypass `run` and therefore do not establish that this new flag selects `FINDING_PROVENANCE`, emits rendered citations and measured metrics on the documented streams, or rejects the documented incompatible modes. Because the load-bearing behavior of this PR is the CLI wiring itself, the current tests are vacuous with respect to that behavior.",
+   "file": "crates/sparq-kb/src/bin/pkg_query.rs",
+   "fix_hint": "Add an integration test that runs the built `pkg-query` binary with `--citations`, asserts success, citation text on stdout, and the metric summary on stderr. Also cover at least the `--citations --json` and `--citations --query ...` rejection paths (and ideally `--sparql-only`) so the new mode contract is pinned.",
+   "severity": "major",
+   "title": "New CLI mode has no end-to-end test"
+  }
+ ],
+ "summary": "The new citation mode is wired to the existing canned query and renderer, and its early --sparql-only path is coherent. However, the PR adds a user-facing CLI mode and several mode-conflict/error paths without any test that invokes the binary. The existing citation tests exercise render_citations directly, so they cannot catch argument parsing, dispatch, stdout/stderr, or exit-status regressions in this change.",
+ "verdict": "request_changes"
+}
