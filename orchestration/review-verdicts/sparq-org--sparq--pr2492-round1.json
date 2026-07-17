@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change only corrects the SPARQL specification wording and section reference in module documentation. The revised description accurately states Extend's error behavior and points to the SELECT expression translation in section 18.2.4.4. It does not alter runtime behavior, security-sensitive logic, or tests, and no hostile instruction is present in the diff.",
+ "verdict": "approve"
+}
