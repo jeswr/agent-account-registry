@@ -392,8 +392,11 @@ jobs:
                           raw_skips = raw_status["skips"]
               # PLAN-side per-item snapshot skips (run 29617040167): a PR whose CI/merge
               # snapshot was oversized/unreadable carries a reason instead of killing the
-              # sweep. It has NO pr_status record, so every snapshot-derived admission below
-              # stands down for it; CLAIM folds these rows into the dispatch summary.
+              # sweep. Two tiers (PR #60 round-1): a pre-detail skip has NO pr_status
+              # record (every snapshot-derived admission stands down); a check-runs-* skip
+              # ships a DEGRADED record too — pr_ci_status forces gate=missing on it, the
+              # repair admissions stand down, and only the #42 disarm net (detail fields
+              # only) consumes it. CLAIM folds these rows into the dispatch summary.
               for skip in raw_skips:
                   if not isinstance(skip, dict):
                       continue

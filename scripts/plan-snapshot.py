@@ -12,9 +12,26 @@ re-running CI on the same head) tripped the runaway-snapshot ceiling and killed 
 ENTIRE sweep — PLAN failed, CLAIM was skipped, zero dispatch fleet-wide. The ceiling is
 now a PER-ITEM backstop: an oversized or unreadable per-PR read skips THAT PR with a
 recorded reason (raw-prstatus `skips` -> plan `snapshot_skips` -> the dispatch summary's
-defer_reasons) and the sweep continues. Fail-closed stays per-item: a skipped PR gets NO
-status record, so every snapshot-derived admission (ci-fix, rebase, stranded, disarm)
-stands down for it this tick — nothing ever guesses about an oversized PR.
+defer_reasons) and the sweep continues.
+
+Degradation is two-tier (round-1 review of PR #60): a check-run failure AFTER the PR
+detail read succeeded must not throw the detail away, because the #42 armed-SHA-mismatch
+DISARM consumes only detail data (head_sha + the auto_merge armed bit) — and for disarm
+the ACT is the safety measure, so a full stand-down there is fail-OPEN (an armed PR whose
+head advanced past its reviewed-sha marker would keep its stale arm latched just because
+its head churned past the check-run ceiling — cheap to induce via merge-queue cancel
+churn, the exact scenario this file exists for). So:
+- POST-detail failure (check-runs-overflow/-malformed/-read-failed): the record is EMITTED
+  with the detail fields intact, `check_runs` EMPTY, and an explicit
+  `check_runs_degraded: <reason>` marker; the skip row is still recorded for visibility.
+  pr_ci_status forces gate="missing" on the marker, and enumerate_review_items stands the
+  check-run-dependent admissions (ci-fix, rebase, stranded) down on it — the disarm net,
+  which never needed check runs, still fires.
+- PRE-detail failure (pr-detail-read-failed/-malformed, worker-pr-census-overflow):
+  nothing sound is derivable — NO record, every snapshot-derived admission including
+  disarm stands down for that PR this tick. Residual, accepted: the detail read failing
+  is a GitHub API outage/malformed-response condition, not attacker-inducible by
+  inflating check-run volume on a head.
 
 Blowup reduced at source: the check-run read is gate-filtered (check_name=CI_GATE_CHECK,
 the d2c0dd0 pattern — an unfiltered listing both grows without bound under churn and can
@@ -53,6 +70,8 @@ class FetchError(Exception):
 
 class SnapshotItemError(Exception):
     """A single PR's status snapshot failed: skip THAT PR with a reason, never the sweep.
+    Raised out of _pr_status_record only for PRE-detail failures (no sound record is
+    derivable); post-detail check-run failures degrade the record instead of raising.
     The reason must be a member of dispatch-claim.py's SNAPSHOT_SKIP_REASONS (validated
     there when the plan artifact is re-checked as hostile data)."""
 
@@ -151,7 +170,13 @@ def _pr_status_record(fetch, claim, repo, number):
     """One worker PR's CI/merge status: detail read (mergeable + auto_merge + fresh head)
     plus the gate-filtered check-run read; the unfiltered listing (advisory failing-leg
     names for the ci-fix prompt) is fetched ONLY when the gate is a concluded failure —
-    the one state that admits a ci-fix."""
+    the one state that admits a ci-fix.
+
+    Raises SnapshotItemError ONLY for pre-detail failures. Once the detail read has
+    succeeded, a check-run failure DEGRADES the record (empty check_runs + an explicit
+    `check_runs_degraded` reason) instead of discarding it: the detail fields are exactly
+    what the #42 armed-SHA-mismatch disarm needs, and dropping them on check-run VOLUME
+    would let an armed PR defeat its own safety net by churning past the ceiling."""
     try:
         detail = fetch(f"https://api.github.com/repos/{repo}/pulls/{number}")
     except FetchError as exc:
@@ -159,23 +184,32 @@ def _pr_status_record(fetch, claim, repo, number):
     if not isinstance(detail, dict):
         raise SnapshotItemError("pr-detail-malformed")
     sha = str((detail.get("head") or {}).get("sha", ""))
-    check_runs = []
-    if SAFE_SHA.fullmatch(sha):
-        check_runs = _fetch_check_runs(fetch, repo, sha, check_name=claim.CI_GATE_CHECK)
-        if claim.interpret_check_runs(check_runs)["gate"] == "failure":
-            check_runs = check_runs + _fetch_check_runs(fetch, repo, sha)
-    return {
+    record = {
         "head_sha": sha,
         "mergeable": detail.get("mergeable"),
         "auto_merge": detail.get("auto_merge"),
-        "check_runs": check_runs,
+        "check_runs": [],
     }
+    if SAFE_SHA.fullmatch(sha):
+        try:
+            check_runs = _fetch_check_runs(fetch, repo, sha, check_name=claim.CI_GATE_CHECK)
+            if claim.interpret_check_runs(check_runs)["gate"] == "failure":
+                check_runs = check_runs + _fetch_check_runs(fetch, repo, sha)
+            record["check_runs"] = check_runs
+        except SnapshotItemError as exc:
+            # POST-detail degradation: keep the detail (disarm still fires), blank the
+            # check runs entirely (a partial gate-only listing must not admit a ci-fix
+            # whose advisory legs walk overflowed), mark the reason for the skip row.
+            record["check_runs_degraded"] = exc.reason
+    return record
 
 
 def _pr_status_snapshot(fetch, claim, repo, pulls):
     """Per-worker-PR CI/merge status (GAP-A/B/C inputs) with per-item degradation.
-    Returns (status_items, skips); a skipped PR has NO status record, so every
-    snapshot-derived admission stands down for it this tick (fail-closed per item)."""
+    Returns (status_items, skips). Two tiers: a PRE-detail failure records a skip and NO
+    status record (every snapshot-derived admission stands down); a POST-detail check-run
+    failure records the SAME skip row for visibility but ALSO emits a degraded record
+    (detail intact, check_runs empty + marked) so the #42 disarm net still fires."""
     worker_pulls = [
         pull for pull in pulls
         if isinstance(pull, dict) and pull.get("state") == "open"
@@ -193,11 +227,17 @@ def _pr_status_snapshot(fetch, claim, repo, pulls):
     for pull in worker_pulls:
         number = pull["number"]
         try:
-            status_items[str(number)] = _pr_status_record(fetch, claim, repo, number)
+            record = _pr_status_record(fetch, claim, repo, number)
         except SnapshotItemError as exc:
-            # THE per-item catch (run 29617040167): one oversized/unreadable PR defers
+            # THE per-item catch (run 29617040167): one unreadable PR detail defers
             # itself with a recorded reason; its siblings and the sweep continue.
             skips.append({"pr_number": number, "reason": exc.reason})
+            continue
+        status_items[str(number)] = record
+        if "check_runs_degraded" in record:
+            # Post-detail degradation stays VISIBLE in the same skip histogram even
+            # though the (detail-only) record is emitted for the disarm net.
+            skips.append({"pr_number": number, "reason": record["check_runs_degraded"]})
     return status_items, skips
 
 
@@ -254,7 +294,9 @@ def _self_test():
             raise FetchError("boom")
         for number, sha in ((7, sha_over), (9, sha_ok), (11, sha_red), (15, sha_legs_over)):
             if url.split("?")[0].endswith(f"/pulls/{number}"):
-                return {"head": {"sha": sha}, "mergeable": True, "auto_merge": None}
+                # PR 7 is ARMED (auto_merge latched) — the round-1 disarm-under-overflow case.
+                return {"head": {"sha": sha}, "mergeable": True,
+                        "auto_merge": {"merge_method": "squash"} if number == 7 else None}
         if f"/commits/{sha_over}/" in url:
             return {"check_runs": [gate_run() for _ in range(100)]}     # never a short page
         if f"/commits/{sha_ok}/" in url:
@@ -282,12 +324,53 @@ def _self_test():
                             {"pr_number": 15, "reason": "check-runs-overflow"}], doc["skips"]
     assert all(skip["reason"] in claim.SNAPSHOT_SKIP_REASONS for skip in doc["skips"])
     # (ii) siblings are still planned, and their records interoperate with the PURE
-    # claim-side interpreters (a skipped PR has NO record: nothing to guess from).
-    assert sorted(doc["items"]) == ["11", "9"], sorted(doc["items"])
+    # claim-side interpreters (a pre-detail-skipped PR has NO record: nothing to guess from).
     healthy = claim.pr_ci_status(doc["items"]["9"])
     assert healthy["gate"] == "success" and healthy["conflicting"] is False
+    assert healthy["check_runs_degraded"] is False
     red = claim.pr_ci_status(doc["items"]["11"])
     assert red["gate"] == "failure" and red["failing_legs"] == ["leg-a"]
+    # (iii) POST-detail degradation (PR #60 round-1 fix): a check-run overflow KEEPS the
+    # detail record — check_runs EMPTY + an explicit marker — while the pre-detail
+    # failure (13) stays a full skip with no record at all.
+    assert sorted(doc["items"]) == ["11", "15", "7", "9"], sorted(doc["items"])
+    assert doc["items"]["7"] == {"head_sha": sha_over, "mergeable": True,
+                                 "auto_merge": {"merge_method": "squash"},
+                                 "check_runs": [],
+                                 "check_runs_degraded": "check-runs-overflow"}
+    degraded = claim.pr_ci_status(doc["items"]["7"])
+    assert degraded["gate"] == "missing" and degraded["armed"] is True
+    assert degraded["check_runs_degraded"] is True
+    # The PARTIAL gate=failure read whose advisory-legs walk overflowed is blanked too:
+    # a degraded record must never admit a ci-fix (gate reads missing, not failure).
+    assert doc["items"]["15"]["check_runs"] == []
+    assert claim.pr_ci_status(doc["items"]["15"])["gate"] == "missing"
+
+    # (iv) THE round-1 point — the degraded record restores the #42 disarm under overflow:
+    # an ARMED worker PR whose churned head advanced past its reviewed-sha marker IS
+    # enumerated for disarm even though its check-run listing blew the ceiling. Deleting
+    # the degraded-record preservation in _pr_status_record turns this red (mutation-
+    # checked): no record -> the disarm net stands down -> fail-OPEN.
+    def bot_pull(number, sha, body, draft=False):
+        return {"number": number, "state": "open", "draft": draft,
+                "user": {"login": "sparq-agent[bot]"}, "labels": [], "body": body,
+                "head": {"ref": f"sparq-agent/issue-{number}-1-1", "sha": sha,
+                         "repo": {"full_name": repo}}}
+
+    pr_status = {int(number): claim.pr_ci_status(record)
+                 for number, record in doc["items"].items()}
+    provenance = {7: {"pr_number": 7}, 13: {"pr_number": 13}}
+    moved = bot_pull(7, sha_over, f"x <!-- sparq-reviewed-sha:{sha_ok} -->")
+    assert [item["pr_number"] for item in claim.enumerate_disarm_items(
+        repo, [moved], pr_status, provenance)] == [7]
+
+    # (v) the PRE-detail residual (documented, accepted): PR 13's detail read itself
+    # failed, so nothing sound is derivable — no record, and the disarm stands down even
+    # for an armed mismatch this tick. A detail-read failure is a GitHub API outage
+    # condition, NOT attacker-inducible by inflating check-run volume on a head (the
+    # vector the round-1 fix closes).
+    moved13 = bot_pull(13, sha_ok, f"x <!-- sparq-reviewed-sha:{sha_red} -->")
+    assert claim.enumerate_disarm_items(repo, [moved13], pr_status, provenance) == []
 
     # Repo-level census overflow degrades to a pr_number-0 skip, not a dead sweep.
     census = [worker_pull(1000 + n, sha_ok) for n in range(WORKER_PR_STATUS_LIMIT + 1)]

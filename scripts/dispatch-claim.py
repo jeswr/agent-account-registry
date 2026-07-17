@@ -66,9 +66,14 @@ REVIEW_ITEM_FIELDS = {
 DISARM_ITEM_FIELDS = {"pr_number", "head_sha", "reviewed_sha", "repo"}
 SNAPSHOT_SKIP_FIELDS = {"repo", "pr_number", "reason"}
 # The reasons plan-snapshot.py may record for a per-item skip of a worker PR's CI/merge
-# snapshot (pr_number 0 = the repo-level worker-PR census overflow). A skipped PR has NO
-# pr_status record, so every snapshot-derived admission (ci-fix/rebase/stranded/disarm)
-# stands down for it that tick — fail-closed per ITEM, never per sweep.
+# snapshot (pr_number 0 = the repo-level worker-PR census overflow). Two tiers (PR #60
+# round-1 review): a PRE-detail skip (pr-detail-*/census) has NO pr_status record, so
+# every snapshot-derived admission (ci-fix/rebase/stranded/disarm) stands down for it
+# that tick. A POST-detail skip (check-runs-*) records the same row for visibility but
+# ALSO ships a DEGRADED record (detail fields intact, check_runs empty + marked): the
+# check-run-dependent admissions stand down, while the #42 armed-SHA-mismatch disarm —
+# which consumes only detail data and whose ACT is itself the safety measure — still
+# fires. Fail-closed per ITEM, never per sweep; never fail-OPEN on the disarm net.
 SNAPSHOT_SKIP_REASONS = {
     "check-runs-overflow",
     "check-runs-malformed",
@@ -397,8 +402,14 @@ def pr_ci_status(record):
         # REST tri-state: False = conflicting, True = clean, null = still computing (unknown).
         "conflicting": True if mergeable is False else (False if mergeable is True else None),
         "armed": isinstance(record.get("auto_merge"), dict),
+        # PLAN's post-detail degradation marker (oversized/unreadable check-run listing).
+        # Hostile-tolerant AND narrows-only: ANY truthy marker forces gate=missing below
+        # (the check-run payload is ignored outright), so a forged marker can only stand
+        # admissions DOWN — it never widens; the disarm net reads head_sha/armed only.
+        "check_runs_degraded": bool(record.get("check_runs_degraded")),
     }
-    status.update(interpret_check_runs(record.get("check_runs")))
+    status.update(interpret_check_runs(
+        [] if status["check_runs_degraded"] else record.get("check_runs")))
     return status
 
 
@@ -460,7 +471,11 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     --when mismatch) before acting, and matching SHAs are NEVER emitted (an unarmed ready PR
     whose head equals its marker is the valid arm=false-policy terminal). Trust surface mirrors
     enumerate_review_items; a review:needs-user or needs:user PR is human-owned (a human
-    arm/park decision stands)."""
+    arm/park decision stands). A check_runs_degraded snapshot record is CONSUMED here on
+    purpose (PR #60 round-1): the disarm reads only head_sha + the armed bit — both detail
+    fields — so check-run volume must never stand this net down (that would be fail-OPEN:
+    the one admission whose ACT is the safety measure, defeatable by churning a head past
+    the check-run ceiling)."""
     items = []
     for pull in pulls:
         if not isinstance(pull, dict):
@@ -632,6 +647,11 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         status = pr_status.get(number) if isinstance(pr_status, dict) else None
         if not isinstance(status, dict) or status.get("head_sha") != sha:
             status = {}                   # stale/unknown CI snapshot — unknown never acts
+        elif status.get("check_runs_degraded"):
+            status = {}                   # PLAN's check-run read degraded for this PR: every
+                                          # snapshot-derived repair admission (rebase/ci-fix/
+                                          # stranded) stands down; only the disarm net — which
+                                          # needs no check runs — consumes a degraded record
         lease_free = (f"fix:{repo}#{number}" not in live_keys
                       and f"review:{repo}#{number}" not in live_keys)
         areas = sorted(label[5:] for label in source_labels if label.startswith("area:"))
@@ -1933,6 +1953,15 @@ def _self_test():
     assert pr_ci_status({**record, "auto_merge": None})["armed"] is False
     assert pr_ci_status({**record, "head_sha": "zz"}) == {}
     assert pr_ci_status("junk") == {}
+    # post-detail degradation (PR #60 round-1): ANY truthy marker forces gate=missing and
+    # the check-run payload is ignored OUTRIGHT — so a forged/hostile marker on a record
+    # that also smuggles check runs can only stand admissions DOWN (narrows-only); the
+    # detail-derived fields (armed/conflicting) survive for the disarm net alone.
+    degraded_ci = pr_ci_status({**record, "check_runs_degraded": "check-runs-overflow"})
+    assert (degraded_ci["gate"], degraded_ci["failing_legs"]) == ("missing", [])
+    assert degraded_ci["check_runs_degraded"] is True and degraded_ci["armed"] is True
+    assert pr_ci_status(record)["check_runs_degraded"] is False
+    assert pr_ci_status({**record, "check_runs_degraded": True})["gate"] == "missing"
 
     # ---- GAP-A/B enumeration: zero-manual repair states over the same surface ----
     def status_of(status_sha, gate="success", conflicting=False, armed=False, legs=()):
@@ -2025,6 +2054,20 @@ def _self_test():
     assert enumerate_review_items(
         repo, [starved], provenance, [], issue_labels, now,
         pr_status={41: status_of(sha_b, gate="failure", conflicting=True)}) == []
+    # a DEGRADED snapshot record (PR #60 round-1) stands EVERY snapshot-derived repair
+    # admission down — rebase (despite the sound conflicting bit), ci-fix, stranded —
+    # even when the record smuggles a would-be trigger past the forced gate=missing
+    degraded_trigger = {41: dict(status_of(sha_a, gate="failure", conflicting=True,
+                                           legs=["js"]), check_runs_degraded=True)}
+    assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                  pr_status=degraded_trigger) == []
+    degraded_green = {41: dict(status_of(sha_a, gate="success"), check_runs_degraded=True)}
+    assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                  pr_status=degraded_green) == []
+    # ... while the snapshot-independent review flow is unaffected by the degradation
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [fresh], provenance, [], issue_labels, now,
+        pr_status=degraded_trigger)] == ["needs-review"]
 
     # ---- GAP-C enumeration (issue #42: armed-SHA-mismatch disarm) ----
     armed_status = {41: status_of(sha_b, armed=True)}
@@ -2065,6 +2108,14 @@ def _self_test():
     unbound = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=False, labels=["review:pass"])
     assert enumerate_disarm_items(repo, [unbound], armed_status, provenance)[0][
         "reviewed_sha"] == "none"
+    # a DEGRADED snapshot record still feeds the disarm net (PR #60 round-1): the disarm
+    # consumes only detail fields (head_sha + armed), so check-run degradation must not
+    # stand the one act-is-the-safety-measure admission down (that would be fail-OPEN,
+    # inducible by churning an armed mismatched head past the check-run ceiling)
+    degraded_armed = {41: dict(status_of(sha_b, gate="missing", armed=True),
+                               check_runs_degraded=True)}
+    assert [item["pr_number"] for item in enumerate_disarm_items(
+        repo, [moved], degraded_armed, provenance)] == [41]
 
     # ---- decide_repair_admission: the LIVE trigger gates the defuse (defect-1 regression) ----
     # trigger holds: drafted proceeds, ready/armed defuses
