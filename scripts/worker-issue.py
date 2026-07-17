@@ -217,6 +217,65 @@ def set_status(repo, issue, status):
     print(f"target issue state: {status}")
 
 
+def claim_receipt(repo, issue, model, run_url):
+    """Post a visible 'the orchestrator is actively working this' receipt. A GitHub App bot user CANNOT
+    be an issue assignee, so this receipt + the `status:in-progress` label ARE the assignment: they show
+    WHO is working the issue, on WHAT model, and link the LIVE run — filterable via the label."""
+    body = (
+        "> 🤖 **SPARQ orchestrator** has claimed this issue and is actively working it.\n\n"
+        f"- Model: `{model}`\n"
+        f"- Live worker run: {run_url}\n\n"
+        "Active autonomous work is filterable with `is:issue label:status:in-progress`. A pull request "
+        "will link back here when it opens. (A GitHub App cannot be a literal assignee — this receipt + "
+        "the `status:in-progress` label are the equivalent.)"
+    )
+    _gh_json(
+        ["api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
+        input_doc={"body": body},
+    )
+    print("claim receipt posted")
+
+
+def create_followups(repo, source_issue, spec_file):
+    """Create de-duplicated follow-up issues from a JSONL file the model wrote (one {title, body, labels}
+    per line) while implementing `source_issue`. Each is linked back + labelled from:agent +
+    self-improvement so the issue-sweeper actions them. Best-effort: NEVER raises (a follow-up failure
+    must not fail the worker). This is the procedure for the orchestrator to capture discovered work."""
+    path = Path(spec_file)
+    if not path.exists():
+        print("no follow-ups declared")
+        return
+    existing = {str(i.get("title", "")) for i in (_gh_json(
+        ["issue", "list", "-R", repo, "--state", "open", "--limit", "300", "--json", "title"]) or [])}
+    created = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            spec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        title = " ".join(str(spec.get("title", "")).split())[:200]
+        if not title or title in existing:
+            continue
+        body = str(spec.get("body", "")).strip()
+        body += (f"\n\n> 🤖 Discovered by the SPARQ worker while implementing #{source_issue}. "
+                 "Out-of-scope for that PR; captured as follow-up.\n<!-- sparq-followup:v1 -->")
+        labels = sorted({l for l in (spec.get("labels") or []) if isinstance(l, str) and l}
+                        | {"from:agent", "self-improvement"})
+        args = ["issue", "create", "-R", repo, "--title", title, "--body", body]
+        for label in labels:
+            args += ["--label", label]
+        result = _run_gh(args, check=False)
+        if result.returncode != 0:            # an unknown label fails the create → retry label-free
+            result = _run_gh(["issue", "create", "-R", repo, "--title", title, "--body", body], check=False)
+        if result.returncode == 0:
+            created += 1
+            existing.add(title)
+    print(f"follow-up issues created: {created}")
+
+
 def _self_test():
     fake = [
         {"user": {"login": "sparq[bot]"}, "body": f"x {ATTEMPT_MARKER} run=1 -->"},
@@ -255,6 +314,14 @@ def main():
     status = subparsers.add_parser("status", parents=[common])
     status.add_argument("--status", choices=("in-progress", "deferred", "needs-user", "complete"),
                         required=True)
+
+    receipt = subparsers.add_parser("claim-receipt", parents=[common])
+    receipt.add_argument("--model", required=True)
+    receipt.add_argument("--run-url", required=True)
+
+    followup = subparsers.add_parser("followup", parents=[common])
+    followup.add_argument("--spec-file", required=True, help="JSONL of {title, body, labels} the model wrote")
+
     subparsers.add_parser("self-test")
     args = parser.parse_args()
 
@@ -268,6 +335,10 @@ def main():
                      args.trust_gate, args.bot_login, args.issue_file)
         elif args.command == "status":
             set_status(args.repo, args.issue, args.status)
+        elif args.command == "claim-receipt":
+            claim_receipt(args.repo, args.issue, args.model, args.run_url)
+        elif args.command == "followup":
+            create_followups(args.repo, args.issue, args.spec_file)
         else:
             _self_test()
     except WorkerIssueError as exc:

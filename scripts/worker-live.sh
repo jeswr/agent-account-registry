@@ -87,6 +87,11 @@ Orchestration contract (overrides any interactive/worktree/PR instructions in th
 - Stay within the routed area scope: {scope}. If the task cannot be completed safely in scope,
   make no speculative changes and explain the blocker in your final response.
 - Make the smallest complete change. The worker will run the policy gate after you return.
+- FOLLOW-UP WORK: if you discover out-of-scope work you must NOT do in this PR (a bug, a missing
+  test, a refactor, a related task), append ONE JSON object per line to a file named
+  `.worker-followups.jsonl` in the repo root: {{"title": "concise title", "body": "why / what",
+  "labels": ["kind:bug"]}}. The worker files these as deduplicated, back-linked follow-up issues.
+  Do NOT implement them here, and do not reference this file anywhere else (it is never committed).
 
 Target issue #{issue.get('number')}: {title}
 
@@ -197,6 +202,15 @@ PY
     { [[ -n ${WORKER_OUTPUT_DIR:-} ]] && printf '%s\n' "$cls" > "$WORKER_OUTPUT_DIR/exit-class" ; } 2>/dev/null || true
   fi
   [[ "$rc" -eq 0 ]] || die "headless $harness model exited non-zero (output withheld to protect credentials)"
+  # [OPUS-4.8] Lift any model-declared follow-ups OUT of the target tree BEFORE the change-detection +
+  # commit, so they become issues (worker.yml) but are NEVER committed. Doing it before the
+  # "no repository changes" check means a follow-ups-only run correctly registers as no real work.
+  if [[ -f "${TARGET_DIR:-.}/.worker-followups.jsonl" ]]; then
+    mkdir -p "${WORKER_ROOT:?}"
+    mv -f "${TARGET_DIR:-.}/.worker-followups.jsonl" "$WORKER_ROOT/followups.jsonl"
+    printf 'worker-live: lifted %s model-declared follow-up line(s) out of the tree\n' \
+      "$(wc -l < "$WORKER_ROOT/followups.jsonl" 2>/dev/null || echo 0)"
+  fi
   [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'model created commits; worker requires edits only'
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'model modified forbidden .beads state'
   [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]] || die 'model produced no repository changes'

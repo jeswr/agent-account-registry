@@ -699,15 +699,23 @@ jobs:
             --bot-login "${{ steps.target.outputs.bot_login }}" \
             --issue-file "$RUNNER_TEMP/verified-issue.json"
 
-      - name: Mark trusted live issue in progress
+      - name: Mark trusted live issue in progress + post claim receipt
         if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.trust.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          WORKER_MODEL: ${{ needs.claim.outputs.model }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 registry/scripts/worker-issue.py status \
             --repo "${{ inputs.target_repo }}" \
             --issue "${{ inputs.issue_number }}" \
             --status in-progress
+          # A GitHub App cannot be a literal issue assignee, so the receipt comment + the
+          # status:in-progress label ARE the "orchestrator is working this" assignment.
+          python3 registry/scripts/worker-issue.py claim-receipt \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --model "$WORKER_MODEL" --run-url "$RUN_URL" || true
 
       - name: Prepare isolated selected-account environment
         id: prepare
@@ -820,6 +828,27 @@ jobs:
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           ARM_AUTO_MERGE_REQUESTED: ${{ needs.resolve.outputs.arm_auto_merge }}
         run: bash ../registry/scripts/worker-live.sh publish
+
+      - name: Create declared follow-up issues (discovered out-of-scope work)
+        # The procedure for the orchestrator to capture work it discovers but must NOT do in this PR:
+        # the model appends {title, body, labels} lines to WORKER_ROOT/followups.jsonl (worker-live.sh
+        # moves them out of the target tree BEFORE the commit so they are never committed), and this
+        # step creates de-duplicated, labelled, back-linked issues. Best-effort; never fails the worker.
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: |
+          set -uo pipefail
+          for l in from:agent self-improvement; do
+            gh label create "$l" -R "${{ inputs.target_repo }}" --color ededed \
+              --description "worker-discovered follow-up" 2>/dev/null || true
+          done
+          python3 registry/scripts/worker-issue.py followup \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --spec-file "$WORKER_ROOT/followups.jsonl" || true
 
       - name: Set final target issue state
         if: ${{ always() && !inputs.dry_run }}
