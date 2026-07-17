@@ -1,8 +1,12 @@
-# agent-account-registry (private)
+# agent-account-registry (public)
 
-The single, **private** source of truth for the model accounts (Anthropic / OpenAI) that back
-automated coding workers across my codebases. **No public repository ever contains account
-handles, limits, usage, tokens, or the selection logic** — all of that lives here.
+The single source of truth for the model accounts (Anthropic / OpenAI) that back automated coding
+workers across my codebases. This repo is **public** so its GitHub Actions run on free unlimited
+minutes. **Token VALUES never live in the repo** — each account's token is an encrypted GitHub
+**secret** (masked in logs, blocked from fork PRs); account **emails / PII are not published**
+(redacted from issues; the private handle→email map lives only in a maintainer secret + gist).
+Account handles, limits, live-usage probing, and the selection logic ARE public — they carry no
+secrets. Read-only to non-collaborators; only maintainer/bot-triggered workflows touch secrets.
 
 A worker (a GitHub Actions job in some codebase, e.g. `sparq-org/sparq`) asks this registry for an
 account to use; the registry applies per-account limits, a cross-codebase concurrency lock, model
