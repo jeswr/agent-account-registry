@@ -843,3 +843,96 @@ jobs:
           set -uo pipefail
           python3 registry/scripts/usage-alert.py --self-test
           python3 registry/scripts/usage-alert.py
+
+  # FAIL-LOUD alert for a HARD PLAN failure (issue #38). Every always()/ops-alert step above lives
+  # INSIDE the claim job, which is `needs: plan` — so when PLAN itself fails or is cancelled (e.g.
+  # sustained snapshot 403s), claim is SKIPPED and none of them run: a persistent PLAN failure means
+  # ZERO dispatching fleet-wide yet presents only as skipped jobs on a cron nobody watches. This
+  # standalone job keys on `needs.plan.result` and, on failure/cancelled, upserts a rolling
+  # `ops-alert` issue @-mentioning the maintainer via the SAME ALERT_REPO/ALERT_TOKEN routing the
+  # account-availability alert uses (locked decision 22c). It never runs when plan succeeds, so a
+  # healthy tick auto-closes any prior open plan-alert. No token or snapshot data reaches this job
+  # (it downloads no PLAN artifact); it only reads the plan JOB RESULT.
+  plan-alert:
+    name: ALERT (hard PLAN-job failure)
+    needs: plan
+    # Runs every tick (always()) so a healthy PLAN can auto-close a prior alert; the body/close
+    # branch inside keys on needs.plan.result — no upsert happens on a success tick with no open
+    # alert (a bare `gh issue list`), so a green tick stays cheap and side-effect-free.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write   # upsert/close the rolling plan-failure ops-alert issue
+    steps:
+      - name: Alert maintainer that the dispatch PLAN job hard-failed
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c): route the alert to a maintainer-set PRIVATE
+          # ALERT_REPO when configured; otherwise the registry repo. The body carries no account
+          # handles (a PLAN failure is target-planner-side), so the registry fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          registry_repo = os.environ["REGISTRY_REPO"]
+          repo = os.environ.get("ALERT_REPO") or registry_repo
+          label = "ops-alert"
+          title = "⚠️ Dispatch PLAN job is failing — fleet-wide dispatch is stalled"
+
+          def gh(args, capture=False):
+              # Same routing as usage-alert.py: an ALERT_TOKEN (when an ALERT_REPO is set) writes to
+              # the private alert repo; otherwise the ambient registry GH_TOKEN is used.
+              env = dict(os.environ)
+              tok = os.environ.get("ALERT_TOKEN", "")
+              if os.environ.get("ALERT_REPO") and tok:
+                  env["GH_TOKEN"] = tok
+              return subprocess.run(["gh"] + args, capture_output=capture, text=True, env=env)
+
+          result = os.environ.get("PLAN_RESULT", "")
+          run_url = os.environ.get("RUN_URL", "")
+          maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
+          failed = result in ("failure", "cancelled")
+
+          listed = gh(["issue", "list", "-R", repo, "--label", label, "--state", "open",
+                       "--json", "number,title", "--limit", "20"], capture=True)
+          found = json.loads(listed.stdout or "[]")
+          num = next((i["number"] for i in found if i.get("title") == title), None)
+
+          if failed:
+              body = (
+                  "> 🤖 SPARQ agent — automated ops-alert (issue #38)\n\n"
+                  f"@{maintainer} the dispatch **PLAN** job ended `{result}`, so the CLAIM job (and "
+                  "every `always()` alert step it hosts) was **skipped** — nothing dispatched this "
+                  "tick, and a sustained PLAN failure means **zero dispatching fleet-wide**.\n\n"
+                  "Common cause: sustained snapshot 403s / GitHub secondary rate-limit on the "
+                  "authenticated snapshot step. Check the run below; the next scheduled tick retries "
+                  "automatically and this alert auto-closes once a PLAN succeeds.\n\n"
+                  f"- Failing run: {run_url}\n"
+              )
+              gh(["label", "create", label, "-R", repo, "--color", "d73a4a",
+                  "--description", "Autonomous ops alert (maintainer action)"], capture=True)
+              if num:
+                  gh(["issue", "edit", str(num), "-R", repo, "--body", body])
+              else:
+                  gh(["issue", "create", "-R", repo, "--title", title, "--label", label,
+                      "--body", body])
+              print("::warning::plan-alert: PLAN job {} — maintainer alerted".format(result))
+          elif num:
+              gh(["issue", "comment", str(num), "-R", repo, "--body",
+                  "✅ Recovered — the dispatch PLAN job succeeded again. Auto-closing."])
+              gh(["issue", "close", str(num), "-R", repo])
+              print("plan-alert: PLAN recovered — closed the alert")
+          else:
+              print("plan-alert: PLAN result={} — nothing to do".format(result or "unknown"))
+          PY
