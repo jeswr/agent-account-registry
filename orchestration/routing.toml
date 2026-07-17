@@ -74,6 +74,17 @@ role = "impl"
 model_chain = ["fable", "sonnet", "terra"]
 agent = "registry-impl"
 
+# [FABLE-5] STANDING RULE — UI/front-end ownership (maintainer decision 2026-07-17): UI/front-end
+# surfaces route to the openai/codex model chain (original-builder ownership: GPT-5.6 codex built
+# the registry dashboard, e4098b9). Repos onboarded to the registry inherit this default — mirror
+# this route (terra-led site chain) into each target's routing.toml (sparq's already carries it).
+# Deliberately a ROLE route, not match_labels: the arm-side security classifier (review-fix.yml)
+# unions ALL match_labels keywords, so UI keywords there would human-arm every UI PR.
+[[route]]
+role = "site"
+model_chain = ["terra", "fable", "sonnet"]
+agent = "registry-impl"
+
 [[route]]
 role = "ci"
 model_chain = ["fable", "sonnet", "terra"]
