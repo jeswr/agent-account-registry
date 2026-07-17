@@ -16,8 +16,8 @@
 [repos."sparq-org/sparq"]
 enabled = true
 routing = "orchestration/routing.toml"
-account_pool = ["acct01", "acct02", "acct03", "acct04", "acct2css", "acct3css", "acct4css"]
-max_concurrent = 7
+account_pool = ["acct01", "acct02", "acct03", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct06", "acct07"]
+max_concurrent = 10
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
 arm_auto_merge = true
