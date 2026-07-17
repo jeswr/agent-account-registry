@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "This diff adds the public `pkg-query --citations` flag, its compatibility rules, output contract, and examples, but changes only the crate README and binary docs. AGENTS.md's required maintenance rule classifies a CLI flag or behavior as a public API and requires the matching `skills/<surface>/SKILL.md` to be updated in the same change. No skill file appears in the diff, leaving agent-facing usage documentation out of sync with the executable surface.",
+   "file": "crates/sparq-kb/src/bin/pkg_query.rs",
+   "fix_hint": "Update the appropriate existing usage skill with `pkg-query --citations`, including its required `query` feature, incompatible flags, stdout/stderr contract, and a runnable example. If sparq-kb has no matching skill yet, add a focused `skills/<surface>/SKILL.md` and link it from the router as required for a new public surface. Include those files in this PR.",
+   "severity": "major",
+   "title": "New public CLI mode is not reflected in an Agent Skill"
+  }
+ ],
+ "summary": "The CLI wiring and end-to-end tests appear internally consistent, but the change adds a public CLI mode without updating the repository's matching Agent Skill documentation. The repository's required maintenance rule says CLI flags and behavior must be documented in the corresponding skill in the same change, so this PR is incomplete as submitted.",
+ "verdict": "request_changes"
+}
