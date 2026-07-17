@@ -1,6 +1,9 @@
 # [OPUS-4.8] Lease groomer (review C3 companion): a cron that CAS-removes expired leases from the
 # ledger so a crashed/cancelled worker's slot is freed. Necessary counterpart to the lease allocator —
 # without it, a dead worker's lease lingers until nothing reclaims it.
+# Also reclaims the short-TTL `review:`/`fix:` leases (20/60 min) from the cross-provider review
+# loop, so a crashed reviewer never pins a scarce codex slot: the dispatch sweep's stuck-state
+# reconciler then re-emits the PR (or escalates it to needs-user) on a later tick.
 name: groom-leases
 on:
   schedule:

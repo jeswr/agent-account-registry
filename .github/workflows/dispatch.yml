@@ -1,12 +1,18 @@
 # [GPT-5.6] REG-4 privilege-separated dispatcher. PLAN executes protected public-target planner
-# code with no permissions or secrets; CLAIM treats its artifact as hostile data before mutation.
+# code with no secrets in its environment; CLAIM treats the PLAN artifact as hostile data before
+# any mutation.
+#
+# The */10 cron below is the SINGLE scheduler for the issue drain AND the cross-provider
+# review/fix loop: every review -> fix -> re-review -> arm transition is a durable-marker state
+# the sweep re-derives each tick, so the loop's LIVENESS depends on this cron. It was enabled
+# after the REG-4 pilot canary passed end-to-end (issues #2407–#2416 flowed through workers;
+# PRs #2417–#2421 merged). "Retry next tick" is real only while this schedule stays on.
 name: dispatch
 
 on:
   workflow_dispatch:
-# Cron is enabled ONLY after the REG-4 canary passes; keep this block commented out until then.
-# schedule:
-#   - cron: '*/10 * * * *'
+  schedule:
+    - cron: '*/10 * * * *'
 
 permissions: {}
 
@@ -20,10 +26,14 @@ env:
 
 jobs:
   plan:
-    name: PLAN (unprivileged, secret-free)
+    name: PLAN (unprivileged, secret-free target half)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    permissions: {}
+    # contents:read exists ONLY for the registry checkout in the assemble step below, which runs
+    # AFTER every target-planner-code step has finished — the hostile target code never sees the
+    # token (persist-credentials is off) or the registry tree (checked out later).
+    permissions:
+      contents: read
     steps:
       - name: Clone protected public targets without credentials
         env:
@@ -58,12 +68,12 @@ jobs:
             index=$((index + 1))
           done < "$RUNNER_TEMP/dispatch-targets/repos.txt"
 
-      - name: Build and schema-check the ready-issue plan
+      - name: Build ready + deferred issue rows and snapshot pull requests (target planner code)
         env:
           TARGET_ROOT: ${{ runner.temp }}/dispatch-targets
         run: |
           set -euo pipefail
-          python3 - "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP/plan.json" <<'PY'
+          python3 - "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP" <<'PY'
           import hashlib
           import importlib.util
           import json
@@ -74,9 +84,8 @@ jobs:
           import sys
           from urllib.error import HTTPError, URLError
           from urllib.request import Request, urlopen
-          from datetime import datetime, timezone
 
-          repos_path, plan_path = sys.argv[1:]
+          repos_path, out_dir = sys.argv[1:]
           root = Path(os.environ["TARGET_ROOT"])
           repos = Path(repos_path).read_text(encoding="utf-8").splitlines()
           trusted_associations = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -132,9 +141,9 @@ jobs:
                   and (author.endswith("[bot]") or association in trusted_associations)
               )
 
-          def linked_open_prs(repo):
+          def linked_issue_numbers(pulls):
               linked = set()
-              for pull in paginated(f"/repos/{repo}/pulls?state=open"):
+              for pull in pulls:
                   if not isinstance(pull, dict):
                       raise SystemExit("target pull-request entry is malformed")
                   head = pull.get("head", {}).get("ref", "")
@@ -180,15 +189,46 @@ jobs:
                   })
                   details[number] = (issue, labels, body)
 
+              pulls = paginated(f"/repos/{repo}/pulls?state=open")
+              linked = linked_issue_numbers(pulls)
               ready = dispatch.compute_ready(readiness_input)
-              linked = linked_open_prs(repo)
               ready = [
                   issue for issue in ready
                   if issue["number"] not in linked and trusted(details[issue["number"]][0])
               ]
-              rows = dispatch.plan_dispatch(ready, dispatch._routing_doc())
+              # Deferred-retry candidates (registry decision: a status:deferred issue with no
+              # live lease and no linked open PR is retryable). The ready-engine gate is reused
+              # by SWAPPING deferred->ready only for readiness computation; the emitted item
+              # keeps the REAL labels plus deferred=true, and CLAIM re-validates + flips the
+              # label on dispatch. The live-lease filter runs registry-side in the next step.
+              taken = set()
+              for issue in ready:
+                  taken |= dispatch.packages_of(dispatch.labels_of(issue))
+              retry_gated = {"status:blocked", "status:in-progress",
+                             "status:in-progress-review", "status:untriaged", "trust:untrusted"}
+              deferred_input = []
+              for row in readiness_input:
+                  labels = set(row["labels"])
+                  number = row["number"]
+                  if "status:deferred" not in labels or "status:ready" in labels:
+                      continue
+                  if labels & retry_gated or any(l.startswith("needs:") for l in labels):
+                      continue
+                  if number in linked or not trusted(details[number][0]):
+                      continue
+                  deferred_input.append({
+                      **row,
+                      "labels": sorted((labels - {"status:deferred"}) | {"status:ready"}),
+                  })
+              deferred_ready = dispatch.compute_ready(
+                  deferred_input, in_progress_packages=taken)
+
+              routing_doc = dispatch._routing_doc()
+              flagged_rows = [(row, False) for row in dispatch.plan_dispatch(ready, routing_doc)]
+              flagged_rows += [(row, True)
+                               for row in dispatch.plan_dispatch(deferred_ready, routing_doc)]
               items = []
-              for row in rows:
+              for row, deferred in flagged_rows:
                   number = row.get("number")
                   issue, labels, body = details[number]
                   author = issue.get("user", {}).get("login")
@@ -199,7 +239,9 @@ jobs:
                       "labels": labels,
                       "author": author,
                       "body_sha": hashlib.sha256(body.encode()).hexdigest(),
+                      "deferred": deferred,
                   })
+              items.sort(key=lambda item: (item["priority"], item["number"]))
               target_sha = subprocess.run(
                   ["git", "-C", str(target), "rev-parse", "HEAD"],
                   capture_output=True,
@@ -210,73 +252,144 @@ jobs:
                   raise SystemExit("target checkout returned an unsafe commit sha")
               repositories.append({"target_repo": repo, "target_sha": target_sha, "items": items})
 
-          document = {
-              "schema": "registry-dispatch-plan/v1",
-              "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "repositories": repositories,
-          }
+              # Field-selected PR snapshot + issue-label map for the registry-side review
+              # enumeration in the assemble step (avoids a second API sweep there).
+              snapshot = []
+              for pull in pulls:
+                  head = pull.get("head") or {}
+                  user = pull.get("user") or {}
+                  snapshot.append({
+                      "number": pull.get("number"),
+                      "state": pull.get("state"),
+                      "draft": pull.get("draft"),
+                      "body": pull.get("body") or "",
+                      "labels": [label.get("name") for label in (pull.get("labels") or [])
+                                 if isinstance(label, dict)],
+                      "head": {"ref": head.get("ref"), "sha": head.get("sha"),
+                               "repo": {"full_name": (head.get("repo") or {}).get("full_name")}},
+                      "user": {"login": user.get("login"), "type": user.get("type")},
+                  })
+              Path(out_dir, f"pulls-{index}.json").write_text(
+                  json.dumps(snapshot), encoding="utf-8")
+              Path(out_dir, f"issue-labels-{index}.json").write_text(
+                  json.dumps({str(number): details[number][1] for number in details}),
+                  encoding="utf-8")
 
-          # PLAN cannot read private registry helpers, so it performs its own complete structural
-          # check here. CLAIM repeats a stricter independent check before any mutation.
-          if set(document) != {"schema", "generated_at", "repositories"}:
+          Path(out_dir, "issue-plan.json").write_text(
+              json.dumps({"repositories": repositories}, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8")
+          print(f"PLAN rows: {sum(len(repo['items']) for repo in repositories)} issue item(s)")
+          PY
+
+      # The registry is checked out only NOW — after every step that executes target planner code
+      # — so hostile target code can never read the registry tree, and no token ever coexists
+      # with it in a step environment.
+      - name: Checkout private registry helpers (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Assemble and validate the v2 plan (registry code only, no tokens, local data)
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP" "$RUNNER_TEMP/plan.json" <<'PY'
+          import importlib.util
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          import time
+          from datetime import datetime, timezone
+
+          out_dir, plan_path = sys.argv[1:]
+          registry = Path("registry")
+
+          def load(name, path):
+              spec = importlib.util.spec_from_file_location(name, path)
+              if spec is None or spec.loader is None:
+                  raise SystemExit(f"cannot load registry helper {path}")
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          claim_mod = load("registry_dispatch_claim", registry / "scripts" / "dispatch-claim.py")
+
+          intermediate = json.loads(Path(out_dir, "issue-plan.json").read_text(encoding="utf-8"))
+          leases_path = registry / "data" / "leases.json"
+          leases = []
+          if leases_path.is_file():
+              leases = json.loads(leases_path.read_text(encoding="utf-8")).get("leases") or []
+          now = int(time.time())
+
+          review_items = []
+          for index, repository in enumerate(intermediate["repositories"]):
+              repo = repository["target_repo"]
+              owner, name = repo.split("/", 1)
+              pulls = json.loads(Path(out_dir, f"pulls-{index}.json").read_text(encoding="utf-8"))
+              issue_labels = {
+                  int(number): labels for number, labels in json.loads(
+                      Path(out_dir, f"issue-labels-{index}.json").read_text(encoding="utf-8")
+                  ).items()
+              }
+              # Registry-recorded provenance is the ROOT OF TRUST: a PR with no record here is
+              # never enumerated for review (fail closed). The target model has no registry token.
+              provenance = {}
+              provenance_dir = registry / "orchestration" / "provenance"
+              if provenance_dir.is_dir():
+                  pattern = re.compile(rf"{re.escape(owner)}--{re.escape(name)}--pr([1-9][0-9]*)\.json")
+                  for record_path in sorted(provenance_dir.iterdir()):
+                      match = pattern.fullmatch(record_path.name)
+                      if not match:
+                          continue
+                      try:
+                          provenance[int(match.group(1))] = json.loads(
+                              record_path.read_text(encoding="utf-8"))
+                      except (OSError, json.JSONDecodeError):
+                          continue
+              # LABEL-terminal states (review:needs-user / review:pass) are excluded inside the
+              # enumerator. Round-budget exhaustion is NOT excluded here: CLAIM re-derives the
+              # live round count and applies the terminal needs-user transition itself, so a PR
+              # whose final outcome mutation crashed converges to a loud human hand-off.
+              review_items.extend(claim_mod.enumerate_review_items(
+                  repo, pulls, provenance, leases, issue_labels, now))
+              # Deferred-retry items with a still-live lease are dropped registry-side.
+              repository["items"] = claim_mod.filter_deferred_items(
+                  repository["items"], repo, leases, now)
+
+          document = {
+              "schema": "registry-dispatch-plan/v2",
+              "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "repositories": intermediate["repositories"],
+              "review_items": review_items,
+          }
+          # PLAN-side inline set-equality checks (CLAIM repeats a stricter independent
+          # re-validation of the artifact as hostile data before any mutation).
+          if set(document) != {"schema", "generated_at", "repositories", "review_items"}:
               raise SystemExit("plan schema top-level fields are invalid")
-          if document["schema"] != "registry-dispatch-plan/v1":
+          if document["schema"] != "registry-dispatch-plan/v2":
               raise SystemExit("plan schema version is invalid")
+          expected_item_fields = {"number", "priority", "package", "role", "model_chain",
+                                  "agent", "escalate", "labels", "author", "body_sha", "deferred"}
           for repository in document["repositories"]:
               if set(repository) != {"target_repo", "target_sha", "items"}:
                   raise SystemExit("plan repository fields are invalid")
-              if (not isinstance(repository["target_repo"], str) or not re.fullmatch(
-                      r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*",
-                      repository["target_repo"],
-              ) or not isinstance(repository["target_sha"], str) or not re.fullmatch(
-                      r"[0-9a-f]{40}", repository["target_sha"],
-              )):
-                  raise SystemExit("plan repository identity is invalid")
-              prior = None
               for item in repository["items"]:
-                  expected = {
-                      "number", "priority", "package", "role", "model_chain", "agent",
-                      "escalate", "labels", "author", "body_sha",
-                  }
-                  if set(item) != expected:
+                  if set(item) != expected_item_fields:
                       raise SystemExit("plan item fields are invalid")
-                  if (not isinstance(item["number"], int) or isinstance(item["number"], bool)
-                          or item["number"] <= 0
-                          or not isinstance(item["priority"], int)
-                          or isinstance(item["priority"], bool)
-                          or item["priority"] not in range(5)):
-                      raise SystemExit("plan item number/priority is invalid")
-                  if (not isinstance(item["package"], str) or not re.fullmatch(
-                          r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*|__global__)", item["package"]
-                  ) or any(not isinstance(item[field], str) or not re.fullmatch(
-                          r"[A-Za-z0-9][A-Za-z0-9_.-]*", item[field]
-                  ) for field in ("role", "agent"))):
-                      raise SystemExit("plan item route strings are invalid")
-                  if (not isinstance(item["model_chain"], list) or not item["model_chain"]
-                          or item["model_chain"] != list(dict.fromkeys(item["model_chain"]))
-                          or any(not isinstance(model, str) or not re.fullmatch(
-                              r"[A-Za-z0-9][A-Za-z0-9_.-]*", model
-                          ) for model in item["model_chain"])
-                          or not isinstance(item["escalate"], bool)):
-                      raise SystemExit("plan item model route is invalid")
-                  if (not isinstance(item["labels"], list) or not item["labels"]
-                          or item["labels"] != sorted(set(item["labels"]))
-                          or any(not isinstance(label, str) or not label or "\n" in label or "\r" in label
-                                 for label in item["labels"])
-                          or not isinstance(item["author"], str) or not re.fullmatch(
-                              r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?", item["author"]
-                          ) or not isinstance(item["body_sha"], str) or not re.fullmatch(
-                              r"[0-9a-f]{64}", item["body_sha"]
-                          )):
-                      raise SystemExit("plan item issue snapshot is invalid")
-                  order = (item["priority"], item["number"])
-                  if prior is not None and order < prior:
-                      raise SystemExit("plan items are not in priority order")
-                  prior = order
+          expected_review_fields = {"pr_number", "head_sha", "state", "impl_provider", "repo",
+                                    "package", "security"}
+          for item in document["review_items"]:
+              if set(item) != expected_review_fields:
+                  raise SystemExit("plan review item fields are invalid")
+          # Full structural validation with the same validator CLAIM uses (strictly stronger
+          # than a hand-rolled inline copy, and available here because the registry is local).
+          claim_mod.validate_plan(document)
           Path(plan_path).write_text(
-              json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-          )
-          print(f"PLAN complete: {sum(len(repo['items']) for repo in repositories)} item(s)")
+              json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"PLAN complete: "
+                f"{sum(len(repo['items']) for repo in document['repositories'])} issue item(s), "
+                f"{len(review_items)} review item(s)")
           PY
 
       - name: Upload immutable plan artifact (pinned)
@@ -309,6 +422,43 @@ jobs:
           path: registry
           persist-credentials: false
 
+      # The deferred-retry label flips, review needs-user escalations, and missed-fix markers are
+      # TARGET mutations, so CLAIM mints its own target-scoped App token. Single-target
+      # assumption: the mint covers the first (only) manifest entry; extend to a loop if the
+      # manifest ever grows. A mint failure only skips those paths (issue dispatch continues).
+      - name: Resolve target owner for the App token
+        id: target
+        env:
+          TARGET_REPOS: ${{ env.DISPATCH_TARGET_REPOS }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          targets = json.loads(os.environ["TARGET_REPOS"])
+          repo = targets[0]
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo):
+              raise SystemExit("unsafe target repo in the manifest")
+          owner, name = repo.split("/", 1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"owner={owner}\n")
+              output.write(f"name={name}\n")
+          PY
+
+      - name: Mint target-scoped App token (issue/PR mutations only)
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.name }}
+          permission-issues: write
+          permission-pull-requests: write
+
       - name: Probe live account usage (usage-aware dispatch; tokens never printed)
         continue-on-error: true   # a probe failure must never block dispatch — it falls back to the static cap
         env:
@@ -320,18 +470,33 @@ jobs:
           python3 registry/scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null || printf '{}' > "$RUNNER_TEMP/usage.json"
           python3 -c "import json,os; d=json.load(open(os.path.join(os.environ['RUNNER_TEMP'],'usage.json'))); print('usage-probe: %d account(s) with live usage' % len(d))" || true
 
-      - name: Strictly validate, CAS claim, and dispatch live workers
+      - name: Strictly validate, CAS claim, and dispatch live workers + review/fix runs
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BOT_LOGIN: ${{ steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          # Privacy routing (locked decision 22c): a maintainer-set ALERT_REPO (+ ALERT_TOKEN
+          # with access to it) sends account-enumerating ops alerts to a PRIVATE repo instead of
+          # this public registry; unset falls back to REGISTRY_REPO + the workflow token.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          # Salt for the provenance account-hash comparison (locked decision 22a). This job runs
+          # registry code only — the salt never enters a job that executes target code.
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
           WORKFLOW_REF: ${{ github.ref_name }}
           WORKER_USAGE_FILE: ${{ runner.temp }}/usage.json
         run: |
           set -euo pipefail
           printf '::add-mask::%s\n' "$GH_TOKEN"
+          [[ -z "$TARGET_GH_TOKEN" ]] || printf '::add-mask::%s\n' "$TARGET_GH_TOKEN"
           python3 registry/scripts/dispatch-claim.py \
             --plan plan/plan.json \
             --policy-file registry/policy/repos.toml \
             --registry-repo "$GITHUB_REPOSITORY" \
+            --registry-root registry \
+            --bot-login "$BOT_LOGIN" \
             --workflow-ref "$WORKFLOW_REF"
 
       # FAIL-LOUD maintainer alert: opposite posture to the fail-closed dispatcher. Runs even if the

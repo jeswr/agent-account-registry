@@ -433,6 +433,72 @@ def _self_test():
           True)
     check("global partition serializes", partition_available(scoped, "owner/repo#", "__global__"),
           False)
+
+    class _StubLedger:
+        """Drive claim()'s pure decision path without GitHub I/O (accounts + ledger stubbed)."""
+
+        def __init__(self, accounts, leases):
+            self.accounts, self.leases = accounts, leases
+
+        def __enter__(self):
+            self._saved = (read_accounts, _read_ledger, _write_ledger)
+            globals()["read_accounts"] = lambda repo: self.accounts
+            globals()["_read_ledger"] = lambda repo: (list(self.leases), "sha0")
+            globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+            return self
+
+        def __exit__(self, *a):
+            (globals()["read_accounts"], globals()["_read_ledger"],
+             globals()["_write_ledger"]) = self._saved
+
+    # ---- disjoint review:/fix: top-level lease prefixes (cross-provider review loop) ----
+    # Review/fix holders are `review:<repo>#<PR>@run` / `fix:<repo>#<PR>@run`. Neither starts with
+    # the impl prefix `<repo>#` (and vice-versa), so impl max_holder_concurrent never counts them,
+    # review/fix caps never count impl, and partition_available never cross-blocks. Load-bearing:
+    # a regression here silently masquerades as none-free.
+    mixed = [
+        make_lease("acct02", "owner/repo#12@r.1", "crate-a", "impl", "fable", now, 100),
+        make_lease("acct01", "review:owner/repo#40@r.1", "crate-a", "review", "terra", now, 100),
+        make_lease("acct02", "fix:owner/repo#41@r.1", "crate-b", "fix", "fable", now, 100),
+    ]
+    check("holder keys stay disjoint across namespaces",
+          (holder_key("owner/repo#5@x"), holder_key("review:owner/repo#5@x"),
+           holder_key("fix:owner/repo#5@x")),
+          ("owner/repo#5", "review:owner/repo#5", "fix:owner/repo#5"))
+    check("impl prefix counting excludes review/fix holders",
+          sum(1 for x in mixed if str(x["holder"]).startswith("owner/repo#")), 1)
+    check("review prefix counting excludes impl/fix holders",
+          sum(1 for x in mixed if str(x["holder"]).startswith("review:")), 1)
+    check("impl lease on a crate does not block a review claim (partition cross-check)",
+          partition_available(mixed, "review:", "crate-b"), True)
+    check("review lease invisible to the impl partition (partition cross-check)",
+          partition_available([mixed[1]], "owner/repo#", "crate-a"), True)
+    check("same-crate reviews still serialize under the shared review: prefix",
+          partition_available(mixed, "review:", "crate-a"), False)
+
+    # Two live review leases for DISTINCT PRs are bounded by the SHARED `review:` prefix cap
+    # (max_holder_concurrent=2 = the static codex slot bound; codex is usage-exempt so the CLI
+    # usage=None path is acceptable). A third claim must come back None, an impl claim must not.
+    review_pair = [
+        make_lease("acct01", "review:owner/repo#40@r.1", "crate-a", "review", "terra", now, 100),
+        make_lease("acct01", "review:owner/repo#41@r.1", "crate-b", "review", "terra", now, 100),
+    ]
+    with _StubLedger([{"handle": "acct01", "models": ["terra"], "max_concurrent_workers": 3,
+                       "available": True, "secret_ref": "ACCT01_TOKEN"}], review_pair):
+        third = claim("r", "crate-c", "review", ["terra"], "review:owner/repo#42@r.1", now,
+                      account_pool=["acct01"], holder_prefix="review:", max_holder_concurrent=2)
+    check("third review claim bounded by the shared review: cap", third, None)
+    with _StubLedger([{"handle": "acct02", "models": ["fable"], "max_concurrent_workers": 3,
+                       "available": True, "secret_ref": "ACCT02_TOKEN"}], review_pair):
+        impl_claim = claim("r", "crate-c", "impl", ["fable"], "owner/repo#9@r.1", now,
+                           account_pool=["acct02"], holder_prefix="owner/repo#",
+                           max_holder_concurrent=2)
+    check("impl cap ignores the two review leases", bool(impl_claim), True)
+    with _StubLedger([{"handle": "acct01", "models": ["terra"], "max_concurrent_workers": 3,
+                       "available": True, "secret_ref": "ACCT01_TOKEN"}], review_pair[:1]):
+        second = claim("r", "crate-c", "review", ["terra"], "review:owner/repo#41@r.1", now,
+                       account_pool=["acct01"], holder_prefix="review:", max_holder_concurrent=2)
+    check("second review claim under the cap succeeds", bool(second), True)
     check("none free", choose_account([{"handle": "a", "models": ["x"], "max_concurrent_workers": 0}],
                                       [], ["x"], "p", "r", now), None)
     pa = _parse_account("provider: openai\nmodels: [terra, gpt]\nmax_concurrent_workers: 2\n"

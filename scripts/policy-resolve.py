@@ -43,7 +43,13 @@ POLICY_FIELDS = {
 #   usage_safety_margin = float in [0,1) — fraction of EACH rate-limit window that must remain free to
 #                                 admit a worker (point-in-time headroom; burn-rate caveat in
 #                                 select-and-claim.py).
-OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin"}
+# Optional cross-provider review-loop controls (defaults 3 / 30 / False -> backward compatible):
+#   max_review_rounds        = positive int — bound on the review<->fix loop before needs-user.
+#   review_queue_ttl_minutes = positive int — how long a PR may sit review:needs before alerting.
+#   cross_provider_fallback  = bool — opt-in same-provider degrade when the opposite provider is
+#                              starved; default False = stay queued + alert (the honest default).
+OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
+                          "review_queue_ttl_minutes", "cross_provider_fallback"}
 
 
 class PolicyError(ValueError):
@@ -106,6 +112,11 @@ def _policy_row(target_repo, policy_doc):
         margin = row["usage_safety_margin"]
         if not isinstance(margin, (int, float)) or isinstance(margin, bool) or not (0.0 <= margin < 1.0):
             raise PolicyError(f"usage_safety_margin for {target_repo!r} must be a float in [0, 1)")
+    for field in ("max_review_rounds", "review_queue_ttl_minutes"):
+        if field in row and not _positive_int(row[field]):
+            raise PolicyError(f"{field} for {target_repo!r} must be a positive integer")
+    if "cross_provider_fallback" in row and not isinstance(row["cross_provider_fallback"], bool):
+        raise PolicyError(f"cross_provider_fallback for {target_repo!r} must be boolean")
     return row
 
 
@@ -226,6 +237,9 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "max_concurrent": policy["max_concurrent"],
         "require_usage": bool(policy.get("require_usage", False)),
         "usage_safety_margin": float(policy.get("usage_safety_margin", 0.10)),
+        "max_review_rounds": int(policy.get("max_review_rounds", 3)),
+        "review_queue_ttl_minutes": int(policy.get("review_queue_ttl_minutes", 30)),
+        "cross_provider_fallback": bool(policy.get("cross_provider_fallback", False)),
         "worker_timeout_minutes": policy["worker_timeout_minutes"],
         "max_attempts": policy["max_attempts"],
         "dispatch": policy["dispatch"],
@@ -321,6 +335,23 @@ agent = "docs-agent"
                          impl["max_attempts"]), (2, 90, 2))
     check("usage controls default off/0.10", (impl["require_usage"], impl["usage_safety_margin"]),
           (False, 0.10))
+    check("review-loop controls default 3/30/False",
+          (impl["max_review_rounds"], impl["review_queue_ttl_minutes"],
+           impl["cross_provider_fallback"]), (3, 30, False))
+    review_over = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                                'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                                'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                                'max_review_rounds=5\nreview_queue_ttl_minutes=45\ncross_provider_fallback=true\n')
+    review_impl = resolve("o/r", "impl", review_over, routing)
+    check("review-loop controls overridable",
+          (review_impl["max_review_rounds"], review_impl["review_queue_ttl_minutes"],
+           review_impl["cross_provider_fallback"]), (5, 45, True))
+    bad_rounds = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                               'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                               'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                               'max_review_rounds=0\n')
+    rejects("max_review_rounds range validated", "max_review_rounds",
+            lambda: resolve("o/r", "impl", bad_rounds, routing))
     over = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                          'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                          'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'

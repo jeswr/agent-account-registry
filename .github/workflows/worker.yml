@@ -1,5 +1,8 @@
 # [GPT-5.6] Private-registry worker. Dry-run remains the default; REG-3's live path claims a CAS
-# lease, revalidates trust, runs one routed model attempt, gates it, and opens an UNARMED target PR.
+# lease, revalidates trust, runs one routed model attempt, gates it, and opens a DRAFT target PR
+# (cross-provider review pending). Publish never arms: the worker records the implementer's
+# identity in the registry (orchestration/provenance/) and stops; its lease releases immediately,
+# and the dispatch sweep drives the review-fix loop that alone may arm the PR.
 name: worker
 run-name: worker claim=${{ inputs.claim_id || 'self' }}
 
@@ -303,7 +306,8 @@ jobs:
                   if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
                       raise SystemExit(f"unsafe or missing dry-run value: {key}")
                   output.write(f"{key}={value}\n")
-          print(f"dry-run account validated: model={model}, harness={harness}, account={account_name}")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"dry-run account validated: model={model}, harness={harness}")
           PY
 
   claim:
@@ -407,7 +411,10 @@ jobs:
                   if "\n" in value or "\r" in value:
                       raise SystemExit(f"allocator returned unsafe {key}")
                   output.write(f"{key}={value}\n")
-          print(f"lease claimed: account={account}, model={model}, claim={claim_id[:8]}")
+          # Privacy (locked decision 22b): public logs never carry account handles. (Historical
+          # pre-migration runs printed the handle here — backfill-provenance.py parses only
+          # those OLD logs; new runs record provenance at publish and never need it.)
+          print(f"lease claimed: model={model}, claim={claim_id[:8]}")
           PY
 
       - name: Adopt dispatcher-owned CAS claim
@@ -471,7 +478,8 @@ jobs:
                   if not isinstance(value, str) or "\n" in value or "\r" in value:
                       raise SystemExit(f"dispatcher claim returned unsafe {key}")
                   output.write(f"{key}={value}\n")
-          print(f"dispatcher lease adopted: account={account}, model={model}, claim={claim_id[:8]}")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")
           PY
           then
             python3 registry/scripts/select-and-claim.py \
@@ -481,13 +489,20 @@ jobs:
           fi
 
   worker:
-    name: ${{ inputs.dry_run && 'Prove dry-run worker environment' || 'Run live target worker (UNARMED)' }}
+    name: ${{ inputs.dry_run && 'Prove dry-run worker environment' || 'Run live target worker (DRAFT, review pending)' }}
     if: ${{ always() && needs.resolve.result == 'success' && (inputs.dry_run || needs.claim.result == 'success') }}
     needs: [resolve, claim]
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(needs.resolve.outputs.worker_timeout_minutes) }}
     permissions:
+      # READ ONLY — this job executes model-authored target code HOST-side (the cargo gate), so
+      # no registry-WRITE token may exist anywhere in its blast radius. The implementer
+      # provenance record (the review loop's root of trust) is written by the separate
+      # `provenance` job below, which executes no target code.
       contents: read
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      bot_login: ${{ steps.target.outputs.bot_login }}
     concurrency:
       group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
       cancel-in-progress: false
@@ -627,12 +642,17 @@ jobs:
           meta = routing.get("models", {}).get(model)
           if not isinstance(meta, dict):
               raise SystemExit("claimed model is missing from protected target routing")
+          # A codex alias may leave provider_model unset/TBD (locked decision 14): worker-live.sh
+          # then omits --model and the codex CLI default applies (the proven drain posture).
+          provider_model = meta.get("provider_model")
+          if meta.get("harness") == "codex" and provider_model in (None, "", "TBD"):
+              provider_model = "TBD"
           values = {
               "account": account,
               "model": model,
               "provider": meta.get("provider"),
               "harness": meta.get("harness"),
-              "provider_model": meta.get("provider_model"),
+              "provider_model": provider_model,
               "credential_format": meta.get("credential_format"),
               "secret_ref": secret_ref,
           }
@@ -668,7 +688,8 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in values.items():
                   output.write(f"{key}={value}\n")
-          print(f"selected account resolved: account={account}, model={model}, harness={values['harness']}")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"selected account resolved: model={model}, harness={values['harness']}")
           PY
 
       - name: Check durable per-issue attempt budget
@@ -759,7 +780,8 @@ jobs:
         if: ${{ !inputs.dry_run && steps.attempt.outcome == 'success' }}
         working-directory: target
         env:
-          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          # Deliberately NO GH_TOKEN here: the model container must never see a GitHub token
+          # (commit/push/PR are host-side in the publish step; the prompt forbids gh use).
           TARGET_DIR: ${{ github.workspace }}/target
           TARGET_REPO: ${{ inputs.target_repo }}
           TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
@@ -808,7 +830,7 @@ jobs:
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: bash ../registry/scripts/worker-live.sh gate
 
-      - name: Commit, push, and open UNARMED target pull request
+      - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
         if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
         working-directory: target
@@ -866,7 +888,9 @@ jobs:
           if [[ "$ACQUIRED" == true && "$EXHAUSTED" == true ]]; then
             status=needs-user
           elif [[ "$ACQUIRED" == true && -n "$PR_URL" ]]; then
-            status=complete
+            # Completion is DEFERRED to the review-fix ARM path (the issue closes only when its
+            # PR is approved cross-provider and armed); the review loop owns it from here.
+            status=in-progress-review
           elif [[ "$ACQUIRED" == true && "$TRUST_OUTCOME" == success \
                   && "$ATTEMPT_NUMBER" =~ ^[1-9][0-9]*$ \
                   && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ \
@@ -890,6 +914,69 @@ jobs:
         run: |
           echo '::error::Live worker attempt did not open its target pull request.'
           exit 1
+
+  # Provenance is REGISTRY-recorded and is the review loop's root of trust: the review sweep
+  # fails closed on a missing record (the PR is never enumerated), so this job must FAIL LOUD —
+  # recovery for a missed record is scripts/backfill-provenance.py. It runs as its OWN job (not
+  # inside `worker`) because the worker job executes hostile target code host-side (the cargo
+  # gate) BEFORE publish: a registry-write token co-located there could be hijacked (poisoned
+  # registry checkout / $GITHUB_ENV / a lingering process) to forge provenance for arbitrary PRs
+  # — precisely what this record must make impossible. This job executes NO target code, takes
+  # the implementer identity from the pre-hostile claim outputs, verifies the (post-hostile)
+  # pr_number against the live API bound to THIS run's issue, and stores only the SALTED account
+  # hash (privacy: the registry is public — locked decision 22a).
+  provenance:
+    name: Record implementer provenance (no target code runs here)
+    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.worker.outputs.pr_number != '' }}
+    needs: [resolve, claim, worker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # registry provenance file via github.token — never in the worker job
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Record implementer provenance in the registry (salted account hash only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Raw handle + salt arrive via env only (argv is echoed into public logs) and only the
+          # 16-hex hash is stored; this job runs no target code, so the salt cannot leak to it.
+          WORKER_IMPL_ACCOUNT: ${{ needs.claim.outputs.account }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+        run: |
+          python3 registry/scripts/worker-pr.py provenance-record \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --target-repo "${{ inputs.target_repo }}" \
+            --pr "${{ needs.worker.outputs.pr_number }}" \
+            --impl-provider "${{ needs.claim.outputs.provider }}" \
+            --impl-alias "${{ needs.claim.outputs.model }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --verify-bot-login "${{ needs.worker.outputs.bot_login }}"
+
+      - name: Mint App token for the review-state stamp
+        id: app-token-stamp
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Stamp the initial review state on the draft PR
+        env:
+          GH_TOKEN: ${{ steps.app-token-stamp.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-pr.py review-state set \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ needs.worker.outputs.pr_number }}" \
+            --state needs
 
   release:
     name: Always release live account lease

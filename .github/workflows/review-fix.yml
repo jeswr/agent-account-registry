@@ -1,0 +1,1197 @@
+# Cross-provider review / same-provider fix runner for worker DRAFT PRs. ONE workflow with a
+# `mode: review|fix` input mirroring worker.yml's resolve -> claim -> run -> release DAG; the
+# dispatch.yml sweep is the single scheduler that launches it off durable PR marker state.
+#
+# Trust posture (locked decisions):
+# - The implementer identity comes ONLY from the registry provenance record written at publish
+#   time (orchestration/provenance/...); commit trailers and PR body markers are audit-only.
+# - mode=review claims the OPPOSITE provider (anthropic impl -> terra, openai impl -> opus),
+#   asserted fail-closed at claim AND script layer; the reviewer model is read-only (mutation=deny,
+#   no GitHub token in the container) and its verdict is VOID unless the tree is byte-identical.
+# - Arming (gh pr ready + gh pr merge --auto) happens ONLY here, host-side, one-shot, gated on a
+#   schema-valid approve verdict + reviewer!=implementer (provider AND account) + the armed head
+#   SHA equalling the reviewed SHA re-read live. Security-labelled surfaces never auto-arm.
+# - rc=3 (none-free) claim handling is copied verbatim from worker.yml: skip-and-retry, never a
+#   failure — scarcity is a queue, not a deadlock. Short TTLs + groom-leases free crashed runs.
+# - Job split: `run` executes the model (and, in fix mode, hostile target code in the gate) with
+#   registry contents:READ only; every registry write + PR mutation + the arm happens in the
+#   separate `outcome` job, which executes no target code (registry-write tokens never share a
+#   runner with hostile execution). Accounts appear in public logs/records only as salted hashes.
+name: review-fix
+run-name: review-fix ${{ inputs.mode }} ${{ inputs.target_repo }}#${{ inputs.pr_number }} claim=${{ inputs.claim_id || 'self' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Target owner/repository allowed by policy/repos.toml
+        required: true
+        type: string
+      pr_number:
+        description: Open DRAFT worker pull request to review or fix
+        required: true
+        type: string
+      mode:
+        description: review (opposite provider, read-only) or fix (same provider, edit+push)
+        required: true
+        type: choice
+        options: [review, fix]
+      review_round:
+        description: Review round this run belongs to (review = rounds+1, fix = current round)
+        required: true
+        default: '1'
+        type: string
+      account:
+        description: Dispatcher-claimed account handle (verified against the adopted lease)
+        required: true
+        type: string
+      claim_id:
+        description: Optional dispatcher-owned CAS claim to adopt
+        required: false
+        default: ''
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: review-fix-${{ inputs.target_repo }}-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve PR, provenance, and inverse chain without worker secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      target_owner: ${{ steps.inputs.outputs.target_owner }}
+      target_name: ${{ steps.inputs.outputs.target_name }}
+      head_branch: ${{ steps.pr.outputs.head_branch }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      pr_author: ${{ steps.pr.outputs.pr_author }}
+      impl_provider: ${{ steps.pr.outputs.impl_provider }}
+      impl_alias: ${{ steps.pr.outputs.impl_alias }}
+      impl_account_h: ${{ steps.pr.outputs.impl_account_h }}
+      already_done: ${{ steps.pr.outputs.already_done }}
+      issue: ${{ steps.pr.outputs.issue }}
+      security: ${{ steps.pr.outputs.security }}
+      packages: ${{ steps.pr.outputs.packages }}
+      package: ${{ steps.pr.outputs.package }}
+      routing: ${{ steps.policy.outputs.routing }}
+      model_chain: ${{ steps.policy.outputs.model_chain }}
+      account_pool: ${{ steps.policy.outputs.account_pool }}
+      agent: ${{ steps.policy.outputs.agent }}
+      gate_profile: ${{ steps.policy.outputs.gate_profile }}
+      arm_auto_merge: ${{ steps.policy.outputs.arm_auto_merge }}
+      max_review_rounds: ${{ steps.policy.outputs.max_review_rounds }}
+      unresolvable: ${{ steps.policy.outputs.unresolvable }}
+    steps:
+      - name: Validate dispatch inputs
+        id: inputs
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode }}
+          REVIEW_ROUND: ${{ inputs.review_round }}
+          ACCOUNT: ${{ inputs.account }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          target = os.environ["TARGET_REPO"]
+          pr_number = os.environ["PR_NUMBER"]
+          mode = os.environ["MODE"]
+          review_round = os.environ["REVIEW_ROUND"]
+          account = os.environ["ACCOUNT"]
+          claim_id = os.environ["CLAIM_ID"]
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", target):
+              raise SystemExit("target_repo must be a safe owner/repository name")
+          if not re.fullmatch(r"[1-9][0-9]*", pr_number):
+              raise SystemExit("pr_number must be a positive integer")
+          if mode not in {"review", "fix"}:
+              raise SystemExit("mode must be review or fix")
+          if not re.fullmatch(r"[1-9][0-9]{0,2}", review_round):
+              raise SystemExit("review_round must be a small positive integer")
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", account):
+              raise SystemExit("account must be an acctNN registry handle")
+          if claim_id and not re.fullmatch(r"[0-9a-f]{32}", claim_id):
+              raise SystemExit("claim_id must be empty or a lowercase 32-hex CAS identifier")
+          owner, name = target.split("/", 1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"target_owner={owner}\n")
+              output.write(f"target_name={name}\n")
+          PY
+
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Checkout public target for protected routing data (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target-routing
+          persist-credentials: false
+
+      - name: Snapshot the PR and bind it to registry provenance (fail closed)
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pull.json"
+          python3 - "$RUNNER_TEMP/pull.json" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              pull = json.load(handle)
+          repo = os.environ["TARGET_REPO"]
+          mode = os.environ["MODE"]
+          if pull.get("state") != "open" or pull.get("draft") is not True:
+              raise SystemExit("pull request is not an open draft")
+          head = pull.get("head") or {}
+          head_repo = (head.get("repo") or {}).get("full_name")
+          head_branch = str(head.get("ref", ""))
+          head_sha = str(head.get("sha", ""))
+          author = str((pull.get("user") or {}).get("login", ""))
+          if head_repo != repo:
+              raise SystemExit("pull request head is a fork; refusing to run models on it")
+          if not re.fullmatch(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+", head_branch):
+              raise SystemExit("pull request head is not a worker branch")
+          if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+              raise SystemExit("pull request head sha is malformed")
+          if not author.endswith("[bot]"):
+              raise SystemExit("pull request author is not a bot")
+          labels = sorted({
+              label.get("name") for label in (pull.get("labels") or [])
+              if isinstance(label, dict) and isinstance(label.get("name"), str)
+          })
+          if "review:needs-user" in labels:
+              raise SystemExit("pull request is terminal (review:needs-user)")
+          if mode == "fix" and "review:changes" not in labels:
+              raise SystemExit("fix mode requires the review:changes state")
+          # Idempotence guard: the reviewed-sha marker is bound LAST in the outcome job, so a
+          # marker equal to the live head proves this head's review completed end-to-end — a
+          # duplicate dispatch (raced against the bind) exits gracefully via `already_done`
+          # instead of burning a scarce reviewer slot on a re-review.
+          already_done = False
+          if mode == "review":
+              marker = re.search(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->",
+                                 pull.get("body") or "")
+              already_done = bool(marker) and marker.group(1) == head_sha
+
+          # REGISTRY provenance is the root of trust for the implementer identity. Missing
+          # record => never reviewed (fail closed); the target model has no registry token.
+          owner, name = repo.split("/", 1)
+          record_path = Path("registry", "orchestration", "provenance",
+                             f"{owner}--{name}--pr{pull['number']}.json")
+          if not record_path.is_file():
+              raise SystemExit("no registry provenance record for this PR (fail closed)")
+          record = json.loads(record_path.read_text(encoding="utf-8"))
+          impl_provider = record.get("impl_provider")
+          impl_alias = str(record.get("impl_alias", ""))
+          # Privacy (locked decision 22a): the PUBLIC registry stores only the salted account
+          # hash, never a raw acctNN handle; the reviewer-side hash comparison runs at claim time.
+          impl_account_h = str(record.get("impl_account_h", ""))
+          issue = record.get("issue")
+          opened_sha = str(record.get("head_sha_at_open", ""))
+          if record.get("pr_number") != pull["number"]:
+              raise SystemExit("provenance record does not match this PR")
+          if impl_provider not in {"anthropic", "openai"}:
+              raise SystemExit("provenance implementer provider is invalid")
+          if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
+              raise SystemExit("provenance implementer account hash is invalid "
+                               "(legacy raw-handle records must be re-recorded via backfill)")
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", impl_alias):
+              raise SystemExit("provenance implementer alias is invalid")
+          if not isinstance(issue, int) or issue <= 0:
+              raise SystemExit("provenance issue number is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40}", opened_sha):
+              raise SystemExit("provenance head sha is malformed")
+          if opened_sha != head_sha:
+              compare = json.loads(subprocess.run(
+                  ["gh", "api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"],
+                  capture_output=True, text=True, check=True).stdout)
+              if compare.get("status") not in {"identical", "ahead"}:
+                  raise SystemExit("PR head does not descend from the worker-opened commit")
+
+          issue_data = json.loads(subprocess.run(
+              ["gh", "api", f"repos/{repo}/issues/{issue}"],
+              capture_output=True, text=True, check=True).stdout)
+          issue_labels = sorted({
+              label.get("name") for label in (issue_data.get("labels") or [])
+              if isinstance(label, dict) and isinstance(label.get("name"), str)
+          })
+          merged = set(labels) | set(issue_labels)
+          keywords = ("zk", "mpc", "crypto", "auth", "e2ee")
+          security = (any(k in label for label in merged for k in keywords)
+                      or any(label.startswith("trust:") for label in merged))
+          packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
+          if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
+              raise SystemExit("source issue has an unsafe area:* label")
+          values = {
+              "head_branch": head_branch,
+              "head_sha": head_sha,
+              "pr_author": author,
+              "impl_provider": impl_provider,
+              "impl_alias": impl_alias,
+              "impl_account_h": impl_account_h,
+              "already_done": "true" if already_done else "false",
+              "issue": str(issue),
+              "security": "true" if security else "false",
+              "packages": ",".join(packages),
+              "package": packages[0] if packages else "__global__",
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  if "\n" in value or "\r" in value:
+                      raise SystemExit(f"unsafe resolved value: {key}")
+                  output.write(f"{key}={value}\n")
+          print(f"PR bound to provenance: impl={impl_provider}/{impl_alias} issue=#{issue}")
+          PY
+
+      - name: Resolve policy and compute the mode chain (inverse chain outside resolve())
+        id: policy
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          MODE: ${{ inputs.mode }}
+          IMPL_PROVIDER: ${{ steps.pr.outputs.impl_provider }}
+        run: |
+          set -euo pipefail
+          role=review
+          [[ "$MODE" == fix ]] && role=impl
+          python3 registry/scripts/policy-resolve.py \
+            --target-repo "$TARGET_REPO" \
+            --policy-file registry/policy/repos.toml \
+            --target-root target-routing \
+            --role "$role" > "$RUNNER_TEMP/policy.json"
+          python3 - "$RUNNER_TEMP/policy.json" <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              policy = json.load(handle)
+          mode = os.environ["MODE"]
+          impl_provider = os.environ["IMPL_PROVIDER"]
+          target_root = Path("target-routing").resolve()
+          routing_path = target_root.joinpath(*PurePosixPath(policy["routing"]).parts).resolve()
+          routing_path.relative_to(target_root)
+          with open(routing_path, "rb") as handle:
+              routing = tomllib.load(handle)
+
+          # The review chain is the INVERSE of the implementer's provider and is computed HERE,
+          # never via resolve() (whose role=review row is always [opus]); resolve() supplies
+          # account_pool / gate / arm / caps only. Fix uses the implementer's own chain.
+          # A CODEX alias with a missing/TBD provider_model is RESOLVABLE (locked decision 14):
+          # the proven codex drain passes no --model flag (CLI default), and worker-live.sh omits
+          # --model in that case — so an unpinned terra never stalls the common
+          # anthropic-implemented direction. A claude alias still needs a concrete id.
+          review_chain = {"anthropic": ["terra"], "openai": ["opus"]}
+          fix_chain = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
+          wanted = (review_chain if mode == "review" else fix_chain)[impl_provider]
+          models = routing.get("models", {})
+          chain = []
+          for alias in wanted:
+              meta = models.get(alias)
+              if not isinstance(meta, dict):
+                  continue
+              provider_model = meta.get("provider_model")
+              concrete = (isinstance(provider_model, str) and provider_model != "TBD"
+                          and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", provider_model))
+              codex_default = (meta.get("harness") == "codex"
+                               and provider_model in (None, "", "TBD"))
+              if concrete or codex_default:
+                  chain.append(alias)
+          unresolvable = not chain
+          values = {
+              "routing": policy["routing"],
+              "model_chain": ",".join(chain),
+              "account_pool": ",".join(policy["account_pool"]),
+              "agent": policy["agent"],
+              "gate_profile": policy["gate_profile"],
+              "arm_auto_merge": str(policy["arm_auto_merge"]).lower(),
+              "max_review_rounds": str(policy["max_review_rounds"]),
+              "unresolvable": str(unresolvable).lower(),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  if not isinstance(value, str) or "\n" in value or "\r" in value:
+                      raise SystemExit(f"unsafe resolved value: {key}")
+                  if key != "model_chain" and not value:
+                      raise SystemExit(f"missing resolved value: {key}")
+                  output.write(f"{key}={value}\n")
+          print(f"{mode} chain for {impl_provider}-implemented PR: {','.join(chain) or 'UNRESOLVABLE'}")
+          PY
+
+  claim:
+    name: Claim ${{ inputs.mode }} account lease
+    needs: resolve
+    if: ${{ needs.resolve.outputs.unresolvable != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: read
+    outputs:
+      acquired: ${{ steps.adopt.outputs.acquired || steps.claim.outputs.acquired }}
+      account: ${{ steps.adopt.outputs.account || steps.claim.outputs.account }}
+      claim_id: ${{ steps.adopt.outputs.claim_id || steps.claim.outputs.claim_id }}
+      model: ${{ steps.adopt.outputs.model || steps.claim.outputs.model }}
+      provider: ${{ steps.adopt.outputs.provider || steps.claim.outputs.provider }}
+      harness: ${{ steps.adopt.outputs.harness || steps.claim.outputs.harness }}
+      credential_format: ${{ steps.adopt.outputs.credential_format || steps.claim.outputs.credential_format }}
+      secret_ref: ${{ steps.adopt.outputs.secret_ref || steps.claim.outputs.secret_ref }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # A dispatch that raced the reviewed-sha bind (this head already reviewed end-to-end)
+      # exits gracefully WITHOUT running a model; a dispatcher-owned lease is released so the
+      # scarce slot frees immediately instead of waiting for the TTL/groom.
+      - name: Skip an already-reviewed head (release any dispatcher lease)
+        id: skip
+        if: ${{ needs.resolve.outputs.already_done == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$CLAIM_ID" ]]; then
+            python3 registry/scripts/select-and-claim.py \
+              --release "$CLAIM_ID" \
+              --repo "$GITHUB_REPOSITORY" || true
+          fi
+          printf 'acquired=false\n' >> "$GITHUB_OUTPUT"
+          printf 'This head was already reviewed end-to-end; nothing to do.\n'
+
+      - name: CAS claim from the opposite/same-provider pool
+        id: claim
+        if: ${{ inputs.claim_id == '' && needs.resolve.outputs.already_done != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode }}
+          MODELS: ${{ needs.resolve.outputs.model_chain }}
+          ACCOUNT_POOL: ${{ needs.resolve.outputs.account_pool }}
+          PACKAGE: ${{ needs.resolve.outputs.package }}
+          IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          IMPL_ACCOUNT_H: ${{ needs.resolve.outputs.impl_account_h }}
+          # Salt for the reviewer!=implementer account-hash assertion (locked decision 22a).
+          # This job runs registry code only — the salt never enters a job executing target code.
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+        run: |
+          set -euo pipefail
+          # Disjoint top-level lease prefixes: `review:`/`fix:` never share a prefix with the
+          # impl `<repo>#`, so neither cap counts the other. The shared per-mode prefix bounds
+          # concurrent reviews to the static codex slot count (codex is usage-exempt; the CLI
+          # claim path does not usage-gate, so this static cap IS the bound — by design).
+          if [[ "$MODE" == review ]]; then
+            prefix="review:"; cap=2; ttl=1200; role=review
+          else
+            prefix="fix:"; cap=3; ttl=3600; role=fix
+          fi
+          holder="$prefix$TARGET_REPO#$PR_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          set +e
+          python3 registry/scripts/select-and-claim.py \
+            --claim \
+            --repo "$GITHUB_REPOSITORY" \
+            --package "$PACKAGE" \
+            --role "$role" \
+            --models "$MODELS" \
+            --account-pool "$ACCOUNT_POOL" \
+            --holder "$holder" \
+            --holder-prefix "$prefix" \
+            --max-holder-concurrent "$cap" \
+            --ttl "$ttl" > "$RUNNER_TEMP/claim.json"
+          rc=$?
+          set -e
+          if [[ "$rc" -eq 3 ]]; then
+            printf 'acquired=false\n' >> "$GITHUB_OUTPUT"
+            printf 'No eligible account lease is free; deferring without failure.\n'
+            exit 0
+          fi
+          [[ "$rc" -eq 0 ]] || { echo '::error::lease claim failed'; exit "$rc"; }
+          python3 - "$RUNNER_TEMP/claim.json" "$ACCOUNT_POOL" "$MODELS" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+
+          claim_path, pool_csv, models_csv = sys.argv[1:]
+          with open(claim_path, encoding="utf-8") as handle:
+              claim = json.load(handle)
+          pool = pool_csv.split(",")
+          models = models_csv.split(",")
+          mode = os.environ["MODE"]
+          impl_provider = os.environ["IMPL_PROVIDER"]
+          impl_account_h = os.environ["IMPL_ACCOUNT_H"]
+          salt = os.environ.get("PROVENANCE_SALT", "")
+          account = claim.get("account")
+          model = claim.get("model")
+          claim_id = claim.get("claim_id")
+          secret_ref = claim.get("secret_ref")
+          provider = claim.get("provider") or ""
+          if account not in pool or model not in models:
+              raise SystemExit("allocator returned an account/model outside resolved policy")
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", str(account)):
+              raise SystemExit("allocator returned an unsafe account")
+          if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(r"[A-Z][A-Z0-9_]*", str(secret_ref)):
+              raise SystemExit("allocator returned an unsafe or mismatched secret_ref")
+          if not re.fullmatch(r"[0-9a-f]{32}", str(claim_id)):
+              raise SystemExit("allocator returned an unsafe claim_id")
+          # Fail-closed cross-provider assertions (claim layer, locked decision 6). The account
+          # comparison runs on SALTED HASHES (locked decision 22a) because the public provenance
+          # record never stores a raw handle; a missing salt fails closed.
+          if not provider:
+              raise SystemExit("claimed account has no provider metadata; failing closed")
+          if mode == "review" and provider == impl_provider:
+              raise SystemExit("reviewer provider equals implementer provider; refusing")
+          if mode == "review":
+              if not salt:
+                  raise SystemExit("PROVENANCE_SALT is unavailable; refusing to assert reviewer identity")
+              if hashlib.sha256(f"{account}:{salt}".encode()).hexdigest()[:16] == impl_account_h:
+                  raise SystemExit("reviewer account equals implementer account; refusing")
+          if mode == "fix" and provider != impl_provider:
+              raise SystemExit("fixer provider must equal implementer provider; refusing")
+          values = {
+              "acquired": "true",
+              "account": account,
+              "claim_id": claim_id,
+              "model": model,
+              "provider": provider,
+              "harness": claim.get("harness") or "",
+              "credential_format": claim.get("credential_format") or "",
+              "secret_ref": secret_ref,
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  if "\n" in value or "\r" in value:
+                      raise SystemExit(f"allocator returned unsafe {key}")
+                  output.write(f"{key}={value}\n")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"lease claimed: model={model}, claim={claim_id[:8]}")
+          PY
+
+      - name: Adopt dispatcher-owned CAS claim
+        id: adopt
+        if: ${{ inputs.claim_id != '' && needs.resolve.outputs.already_done != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode }}
+          EXPECTED_ACCOUNT: ${{ inputs.account }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+          MODELS: ${{ needs.resolve.outputs.model_chain }}
+          ACCOUNT_POOL: ${{ needs.resolve.outputs.account_pool }}
+          PACKAGE: ${{ needs.resolve.outputs.package }}
+          IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          IMPL_ACCOUNT_H: ${{ needs.resolve.outputs.impl_account_h }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+        run: |
+          set -euo pipefail
+          prefix="review:"
+          [[ "$MODE" == fix ]] && prefix="fix:"
+          python3 registry/scripts/select-and-claim.py \
+            --inspect "$CLAIM_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@" > "$RUNNER_TEMP/adopt.json"
+          if ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              claim = json.load(handle)
+          mode = os.environ["MODE"]
+          impl_provider = os.environ["IMPL_PROVIDER"]
+          impl_account_h = os.environ["IMPL_ACCOUNT_H"]
+          salt = os.environ.get("PROVENANCE_SALT", "")
+          account = claim.get("account")
+          model = claim.get("model")
+          claim_id = claim.get("claim_id")
+          secret_ref = claim.get("secret_ref")
+          provider = claim.get("provider") or ""
+          pool = os.environ["ACCOUNT_POOL"].split(",")
+          models = os.environ["MODELS"].split(",")
+          if account != os.environ["EXPECTED_ACCOUNT"] or account not in pool:
+              raise SystemExit("dispatcher claim account is outside resolved policy")
+          if model not in models:
+              raise SystemExit("dispatcher claim model is outside resolved routing")
+          if claim_id != os.environ["CLAIM_ID"] or not re.fullmatch(r"[0-9a-f]{32}", str(claim_id)):
+              raise SystemExit("dispatcher claim id is invalid")
+          if claim.get("role") != mode or claim.get("package") != os.environ["PACKAGE"]:
+              raise SystemExit("dispatcher claim work partition disagrees with the resolved PR")
+          if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(
+                  r"[A-Z][A-Z0-9_]*", str(secret_ref)):
+              raise SystemExit("dispatcher claim secret_ref is unsafe")
+          if not provider:
+              raise SystemExit("claimed account has no provider metadata; failing closed")
+          if mode == "review" and provider == impl_provider:
+              raise SystemExit("reviewer provider equals implementer provider; refusing")
+          if mode == "review":
+              # Salted-hash account assertion (locked decision 22a); missing salt fails closed.
+              if not salt:
+                  raise SystemExit("PROVENANCE_SALT is unavailable; refusing to assert reviewer identity")
+              if hashlib.sha256(f"{account}:{salt}".encode()).hexdigest()[:16] == impl_account_h:
+                  raise SystemExit("reviewer account equals implementer account; refusing")
+          if mode == "fix" and provider != impl_provider:
+              raise SystemExit("fixer provider must equal implementer provider; refusing")
+          values = {
+              "acquired": "true",
+              "account": account,
+              "claim_id": claim_id,
+              "model": model,
+              "provider": provider,
+              "harness": claim.get("harness") or "",
+              "credential_format": claim.get("credential_format") or "",
+              "secret_ref": secret_ref,
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  if not isinstance(value, str) or "\n" in value or "\r" in value:
+                      raise SystemExit(f"dispatcher claim returned unsafe {key}")
+                  output.write(f"{key}={value}\n")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")
+          PY
+          then
+            python3 registry/scripts/select-and-claim.py \
+              --release "$CLAIM_ID" \
+              --repo "$GITHUB_REPOSITORY" || true
+            exit 1
+          fi
+
+  run:
+    name: Run ${{ inputs.mode }} on PR ${{ inputs.pr_number }}
+    needs: [resolve, claim]
+    if: ${{ needs.claim.outputs.acquired == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.mode == 'review' && 25 || 60 }}
+    permissions:
+      # READ ONLY — in fix mode this job executes model-authored target code HOST-side (the
+      # cargo gate), so no registry-WRITE token may exist anywhere in its blast radius. The
+      # registry verdict record, PR label/marker mutations, arming, and escalations all happen
+      # in the separate `outcome` job below, which executes no target code.
+      contents: read
+    outputs:
+      reviewed_sha: ${{ steps.review.outputs.reviewed_sha }}
+      verdict_ok: ${{ steps.verdict.outcome }}
+      verdict_b64: ${{ steps.handoff.outputs.verdict_b64 }}
+      files_b64: ${{ steps.handoff.outputs.files_b64 }}
+      fix_done: ${{ steps.fix.outcome }}
+      fix_made_changes: ${{ steps.fix.outputs.fix_made_changes }}
+      injection_detected: ${{ steps.fix.outputs.injection_detected }}
+      gate_outcome: ${{ steps.gate.outcome }}
+      pushed: ${{ steps.push.outcome == 'success' && 'true' || 'false' }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # Per-phase least-privilege App tokens. The REVIEW token cannot write target contents (the
+      # reviewer never pushes); the FIX token can (it pushes the fix commit). The ARM path mints
+      # its own token in the separate `outcome` job only when the verdict approves. No token
+      # ever enters the model container in any mode.
+      - name: Mint review-scoped App token (no target contents write)
+        id: app-token-review
+        if: ${{ inputs.mode == 'review' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Mint fix-scoped App token (target contents write for the push)
+        id: app-token-fix
+        if: ${{ inputs.mode == 'fix' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Verify target App identity and default branch
+        id: target
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          APP_SLUG: ${{ steps.app-token-review.outputs.app-slug || steps.app-token-fix.outputs.app-slug }}
+          PR_AUTHOR: ${{ needs.resolve.outputs.pr_author }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]] || { echo '::error::target App token was not minted'; exit 1; }
+          [[ -n "$APP_SLUG" ]] || { echo '::error::app slug was not resolved'; exit 1; }
+          printf '::add-mask::%s\n' "$GH_TOKEN"
+          gh api "repos/$TARGET_REPO" > "$RUNNER_TEMP/target.json"
+          gh api "/users/${APP_SLUG}[bot]" > "$RUNNER_TEMP/app-user.json"
+          python3 - "$RUNNER_TEMP/target.json" "$RUNNER_TEMP/app-user.json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              repo = json.load(handle)
+          with open(sys.argv[2], encoding="utf-8") as handle:
+              user = json.load(handle)
+          if repo.get("full_name") != os.environ["TARGET_REPO"]:
+              raise SystemExit("App token read the wrong target")
+          default_branch = repo.get("default_branch")
+          login = user.get("login")
+          user_id = str(user.get("id", ""))
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(default_branch)):
+              raise SystemExit("target has an unsafe default branch")
+          if not re.fullmatch(r"[A-Za-z0-9_.-]+\[bot\]", str(login)) or not user_id.isdigit():
+              raise SystemExit("target token did not identify a GitHub App bot")
+          # Authoritative authorship check: the PR must be authored by THIS App bot — a spoofed
+          # bot-suffixed author from some other App never reaches the model.
+          if os.environ["PR_AUTHOR"] != login:
+              raise SystemExit("pull request author is not the registry App bot")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"default_branch={default_branch}\n")
+              output.write(f"bot_login={login}\n")
+              output.write(f"bot_id={user_id}\n")
+          print(f"target token verified for {repo['full_name']} at {default_branch}")
+          PY
+
+      - name: Checkout target default branch with scoped App token (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ steps.target.outputs.default_branch }}
+          path: target
+          token: ${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve claimed account to concrete target model
+        id: selected
+        env:
+          ROUTING_PATH: ${{ needs.resolve.outputs.routing }}
+          LIVE_ACCOUNT: ${{ needs.claim.outputs.account }}
+          LIVE_MODEL: ${{ needs.claim.outputs.model }}
+          LIVE_PROVIDER: ${{ needs.claim.outputs.provider }}
+          LIVE_HARNESS: ${{ needs.claim.outputs.harness }}
+          LIVE_CREDENTIAL_FORMAT: ${{ needs.claim.outputs.credential_format }}
+          LIVE_SECRET_REF: ${{ needs.claim.outputs.secret_ref }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import tomllib
+
+          target_root = Path(os.environ["GITHUB_WORKSPACE"], "target").resolve()
+          routing_path = target_root.joinpath(*PurePosixPath(os.environ["ROUTING_PATH"]).parts).resolve()
+          try:
+              routing_path.relative_to(target_root)
+          except ValueError as exc:
+              raise SystemExit("resolved routing path escaped target checkout") from exc
+          with open(routing_path, "rb") as handle:
+              routing = tomllib.load(handle)
+
+          account = os.environ["LIVE_ACCOUNT"]
+          model = os.environ["LIVE_MODEL"]
+          secret_ref = os.environ["LIVE_SECRET_REF"]
+          meta = routing.get("models", {}).get(model)
+          if not isinstance(meta, dict):
+              raise SystemExit("claimed model is missing from protected target routing")
+          # A codex alias may leave provider_model unset/TBD (locked decision 14): worker-live.sh
+          # then omits --model and the codex CLI default applies (the proven drain posture).
+          provider_model = meta.get("provider_model")
+          if meta.get("harness") == "codex" and provider_model in (None, "", "TBD"):
+              provider_model = "TBD"
+          values = {
+              "account": account,
+              "model": model,
+              "provider": meta.get("provider"),
+              "harness": meta.get("harness"),
+              "provider_model": provider_model,
+              "credential_format": meta.get("credential_format"),
+              "secret_ref": secret_ref,
+          }
+          if (values["provider"], values["harness"]) not in {
+              ("openai", "codex"), ("anthropic", "claude")
+          }:
+              raise SystemExit("claimed model has an unsupported provider/harness pair")
+          if values["credential_format"] not in {
+              "codex-auth-json", "claude-credentials-json", "claude-oauth-token", "anthropic-api-key"
+          }:
+              raise SystemExit("claimed model has an unsupported credential format")
+          for env_key, meta_key in (("LIVE_PROVIDER", "provider"), ("LIVE_HARNESS", "harness"),
+                                    ("LIVE_CREDENTIAL_FORMAT", "credential_format")):
+              claimed = os.environ[env_key]
+              if claimed and claimed != values[meta_key]:
+                  raise SystemExit(f"claimed account {meta_key} conflicts with protected routing")
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", str(account)):
+              raise SystemExit("unsafe selected account")
+          if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(r"[A-Z][A-Z0-9_]*", str(secret_ref)):
+              raise SystemExit("unsafe selected secret_ref")
+          for key, value in values.items():
+              if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+                  raise SystemExit(f"unsafe or missing selected value: {key}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"selected account resolved: model={model}, harness={values['harness']}")
+          PY
+
+      - name: Prepare isolated selected-account environment
+        id: prepare
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
+          WORKER_ACCOUNT_CREDENTIAL: ${{ secrets[steps.selected.outputs.secret_ref] }}
+          WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
+          WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
+          WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+        run: bash registry/scripts/worker-prep.sh
+
+      # ---- mode=review: read-only opposite-provider review ----
+      # The round marker is recorded BEFORE the model runs so a review that crashes at the model
+      # call still consumes budget: a deterministic crash re-claims at most max_review_rounds
+      # times and then escalates to needs-user via the sweep — never an unbounded
+      # re-claim/re-crash loop. Idempotent per run key (a re-run of this run records nothing new).
+      - name: Record the review round before the model runs (bounded-crash accounting)
+        id: round
+        if: ${{ inputs.mode == 'review' && steps.prepare.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-pr.py round-record \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "${{ inputs.review_round }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --bot-login "${{ steps.target.outputs.bot_login }}"
+
+      - name: Run cross-provider review (read-only, verdict file lifted out-of-tree)
+        id: review
+        if: ${{ inputs.mode == 'review' && steps.round.outcome == 'success' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_PR_NUMBER: ${{ inputs.pr_number }}
+          WORKER_PR_HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
+          WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+          WORKER_REVIEW_FILE: ${{ runner.temp }}/registry-worker/review-verdict.json
+          WORKER_IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          WORKER_IMPL_ALIAS: ${{ needs.resolve.outputs.impl_alias }}
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
+          WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
+        run: bash ../registry/scripts/worker-live.sh review
+
+      - name: Schema-validate the lifted verdict (host-side, no tokens)
+        id: verdict
+        if: ${{ inputs.mode == 'review' && steps.review.outcome == 'success' }}
+        run: |
+          python3 registry/scripts/worker-pr.py validate-verdict \
+            --verdict-file "$RUNNER_TEMP/registry-worker/review-verdict.json" \
+            --files-file "$RUNNER_TEMP/registry-worker/pr-files.txt"
+
+      # The verdict crosses to the `outcome` job as VALIDATED, size-capped data (never via the
+      # registry checkout of THIS job): the outcome job re-validates it on a fresh checkout
+      # before any token touches it.
+      - name: Surface the validated verdict for the outcome job (no tokens)
+        id: handoff
+        if: ${{ inputs.mode == 'review' && steps.verdict.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          verdict="$RUNNER_TEMP/registry-worker/review-verdict.json"
+          files="$RUNNER_TEMP/registry-worker/pr-files.txt"
+          # The schema caps the verdict (<=10 capped issues); the diff FILE LIST is bounded here
+          # so a pathological PR cannot blow the 1MB job-output ceiling.
+          [[ "$(wc -c < "$verdict")" -le 262144 ]] || { echo '::error::verdict exceeds size cap'; exit 1; }
+          [[ "$(wc -c < "$files")" -le 262144 ]] || { echo '::error::diff file list exceeds size cap'; exit 1; }
+          printf 'verdict_b64=%s\n' "$(base64 -w0 "$verdict")" >> "$GITHUB_OUTPUT"
+          printf 'files_b64=%s\n' "$(base64 -w0 "$files")" >> "$GITHUB_OUTPUT"
+
+      # ---- mode=fix: same-provider fix seeded with the registry-recorded verdict ----
+      - name: Stage the registry-recorded verdict for the fixer
+        id: stage-verdict
+        if: ${{ inputs.mode == 'fix' && steps.prepare.outcome == 'success' }}
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          REVIEW_ROUND: ${{ inputs.review_round }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: |
+          set -euo pipefail
+          owner="${TARGET_REPO%%/*}"
+          name="${TARGET_REPO##*/}"
+          record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
+          [[ -f "$record" ]] || { echo "::error::no registry verdict record for round $REVIEW_ROUND"; exit 1; }
+          install -m 600 "$record" "$WORKER_ROOT/review-verdict.json"
+
+      - name: Run same-provider fix (findings framed as untrusted data)
+        id: fix
+        if: ${{ inputs.mode == 'fix' && steps.stage-verdict.outcome == 'success' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_PR_NUMBER: ${{ inputs.pr_number }}
+          WORKER_PR_HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
+          WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+          WORKER_REVIEW_FILE: ${{ runner.temp }}/registry-worker/review-verdict.json
+          WORKER_FIX_ROUND: ${{ inputs.review_round }}
+          WORKER_IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
+          WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
+        run: bash ../registry/scripts/worker-live.sh fix
+
+      # The provider CLI may refresh the account credential during the run (codex rotates its
+      # auth.json); write it back exactly like worker.yml so the next claim still authenticates.
+      # Runs IMMEDIATELY after the model steps and BEFORE the gate: rotation only happens during
+      # the model call, and REGISTRY_SECRETS_PAT must never be live in a step that runs after
+      # hostile target code executed on this runner (the fix-mode cargo gate below).
+      - name: Write back a rotated full account credential
+        if: ${{ always() && steps.prepare.outcome == 'success' && (steps.review.outcome != 'skipped' || steps.fix.outcome != 'skipped') }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
+          WORKER_SECRET_REF: ${{ steps.selected.outputs.secret_ref }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
+        run: bash registry/scripts/worker-live.sh write-back
+
+      - name: Ensure a Rust toolchain for the crate-scoped gate
+        if: ${{ inputs.mode == 'fix' && steps.fix.outputs.fix_made_changes == 'true' && steps.fix.outputs.injection_detected != 'true' }}
+        working-directory: target
+        run: |
+          set -uo pipefail
+          command -v rustup >/dev/null 2>&1 || { echo '::error::rustup not found on the runner'; exit 1; }
+          rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
+          rustup show >/dev/null 2>&1 || true
+          rustup component add clippy rustfmt >/dev/null 2>&1 || true
+          cargo --version; rustc --version
+
+      - name: Run policy-selected local gate on the fix
+        id: gate
+        if: ${{ inputs.mode == 'fix' && steps.fix.outputs.fix_made_changes == 'true' && steps.fix.outputs.injection_detected != 'true' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
+          WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+        run: bash ../registry/scripts/worker-live.sh gate
+
+      - name: Commit and push the fix to the PR head branch
+        id: push
+        if: ${{ inputs.mode == 'fix' && steps.gate.outcome == 'success' }}
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_BOT_LOGIN: ${{ steps.target.outputs.bot_login }}
+          TARGET_BOT_ID: ${{ steps.target.outputs.bot_id }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_PR_NUMBER: ${{ inputs.pr_number }}
+          WORKER_PR_HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
+          WORKER_FIX_ROUND: ${{ inputs.review_round }}
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+        run: bash ../registry/scripts/worker-live.sh push-fix
+
+      - name: Create declared follow-up issues (discovered out-of-scope work)
+        if: ${{ inputs.mode == 'fix' && steps.fix.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/worker-issue.py followup \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ needs.resolve.outputs.issue }}" \
+            --spec-file "$WORKER_ROOT/followups.jsonl" || true
+
+      - name: Cleanup isolated worker state
+        if: ${{ always() }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: rm -rf -- "$WORKER_ROOT"
+
+  # Applies every durable mutation of a review/fix run: the registry verdict record, PR labels
+  # and markers, the one-shot arm, and needs-user escalations. It is a SEPARATE job from `run`
+  # because the run job executes model-authored target code host-side in fix mode (the cargo
+  # gate): no registry-write token (github.token contents/issues write) and no post-hostile PR
+  # mutation may share a runner with that execution — a poisoned checkout/$GITHUB_ENV/lingering
+  # process there could otherwise hijack them. This job checks out FRESH registry code and
+  # executes no target code.
+  #
+  # Liveness ordering (crash-window hardening): 1) the durable registry verdict record,
+  # 2) findings + outcome labels (or arm), 3) the reviewed-sha bind LAST. A crash between any
+  # two leaves reviewed-sha != head, so the sweep re-derives the PR next tick (bounded by the
+  # pre-model round marker + max_review_rounds) instead of a silent permanent stall; the arm
+  # path additionally restores the draft state if `merge --auto` fails after `pr ready`.
+  outcome:
+    name: Apply ${{ inputs.mode }} outcome (no target code runs here)
+    needs: [resolve, claim, run]
+    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # write: record the validated verdict in the registry (github.token)
+      issues: write     # write: ops-alert upsert in the registry on needs-user escalation
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Reconstruct and re-validate the verdict on fresh registry code
+        id: reverify
+        if: ${{ inputs.mode == 'review' }}
+        env:
+          VERDICT_B64: ${{ needs.run.outputs.verdict_b64 }}
+          FILES_B64: ${{ needs.run.outputs.files_b64 }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VERDICT_B64" && -n "$FILES_B64" ]] || { echo '::error::verdict handoff is empty'; exit 1; }
+          base64 -d <<< "$VERDICT_B64" > "$RUNNER_TEMP/review-verdict.json"
+          base64 -d <<< "$FILES_B64" > "$RUNNER_TEMP/pr-files.txt"
+          python3 registry/scripts/worker-pr.py validate-verdict \
+            --verdict-file "$RUNNER_TEMP/review-verdict.json" \
+            --files-file "$RUNNER_TEMP/pr-files.txt"
+
+      # FIRST durable mutation: the registry verdict record (fixer input + audit trail). Written
+      # before any PR mutation so every later step is re-derivable from durable state.
+      - name: Record the validated verdict in the registry
+        if: ${{ inputs.mode == 'review' && steps.reverify.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 registry/scripts/worker-pr.py verdict-record \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --target-repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "${{ inputs.review_round }}" \
+            --verdict-file "$RUNNER_TEMP/review-verdict.json"
+
+      - name: Mint outcome-scoped App token (PR labels/comments only, no target contents)
+        id: app-token-outcome
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Apply the review outcome (findings, labels, escalation)
+        id: outcome
+        if: ${{ inputs.mode == 'review' && steps.reverify.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          # Privacy routing (locked decision 22c): maintainer-set ALERT_REPO sends the
+          # account-enumerating ops alert to a private repo; unset falls back to the registry.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+          SECURITY: ${{ needs.resolve.outputs.security }}
+        run: |
+          set -euo pipefail
+          args=(
+            review-outcome
+            --repo "${{ inputs.target_repo }}"
+            --pr "${{ inputs.pr_number }}"
+            --verdict-file "$RUNNER_TEMP/review-verdict.json"
+            --files-file "$RUNNER_TEMP/pr-files.txt"
+            --round "${{ inputs.review_round }}"
+            --max-rounds "${{ needs.resolve.outputs.max_review_rounds }}"
+            --issue "${{ needs.resolve.outputs.issue }}"
+          )
+          [[ "$SECURITY" == "true" ]] && args+=(--security)
+          python3 registry/scripts/worker-pr.py "${args[@]}"
+
+      - name: Mint arm-scoped App token (approve path only)
+        id: app-token-arm
+        if: ${{ inputs.mode == 'review' && steps.outcome.outputs.decision == 'arm' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Ready + arm (host-only, one-shot, sha-bound, hash-asserted)
+        id: arm
+        if: ${{ inputs.mode == 'review' && steps.outcome.outputs.decision == 'arm' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-arm.outputs.token }}
+          # Reviewer handle via env (never argv — argv is echoed into public logs); compared to
+          # the recorded implementer hash under PROVENANCE_SALT (locked decision 22a). This job
+          # runs no target code, so the salt cannot leak to hostile execution.
+          WORKER_REVIEWER_ACCOUNT: ${{ needs.claim.outputs.account }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+        run: |
+          python3 registry/scripts/worker-pr.py ready-and-arm \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}" \
+            --impl-provider "${{ needs.resolve.outputs.impl_provider }}" \
+            --impl-account-h "${{ needs.resolve.outputs.impl_account_h }}" \
+            --reviewer-provider "${{ needs.claim.outputs.provider }}" \
+            --arm "${{ needs.resolve.outputs.arm_auto_merge }}" \
+            --issue "${{ needs.resolve.outputs.issue }}"
+
+      # LAST mutation by design: binding reviewed-sha == head marks this head's review complete;
+      # everything before it is re-derivable, so a crash anywhere above re-converges via the
+      # sweep instead of permanently skipping an unfinished PR.
+      - name: Bind the reviewed sha (terminal marker for this head)
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && (steps.outcome.outputs.decision != 'arm' || steps.arm.outcome == 'success') }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-pr.py reviewed-sha set \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --sha "${{ needs.run.outputs.reviewed_sha }}"
+
+      - name: Apply the fix outcome (host-side markers, labels, escalation)
+        if: ${{ inputs.mode == 'fix' && needs.run.outputs.fix_done == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+        run: |
+          python3 registry/scripts/worker-pr.py fix-outcome \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "${{ inputs.review_round }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --bot-login "${{ needs.resolve.outputs.pr_author }}" \
+            --injection "${{ needs.run.outputs.injection_detected == 'true' && 'true' || 'false' }}" \
+            --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \
+            --gate-outcome "${{ needs.run.outputs.gate_outcome }}" \
+            --pushed "${{ needs.run.outputs.pushed }}" \
+            --issue "${{ needs.resolve.outputs.issue }}"
+
+  # Escalate an unresolvable inverse chain to a human immediately (never silent-queue): if the
+  # routing catalog cannot resolve a concrete model for this direction, a human must decide.
+  unresolvable:
+    name: Escalate unresolvable model chain
+    needs: resolve
+    if: ${{ needs.resolve.outputs.unresolvable == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write   # write: ops-alert upsert in the registry
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Mint App token for the escalation
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Route the PR and its source issue to a human
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          # Privacy routing (locked decision 22c): maintainer-set ALERT_REPO sends the ops alert
+          # to a private repo; unset falls back to the registry.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+        run: |
+          python3 registry/scripts/worker-pr.py needs-user \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --issue "${{ needs.resolve.outputs.issue }}" \
+            --reason "the ${{ inputs.mode }} model chain for a ${{ needs.resolve.outputs.impl_provider }}-implemented PR is unresolvable in the target routing (no concrete provider model)"
+
+  release:
+    name: Always release the review/fix lease
+    if: ${{ always() && needs.claim.outputs.acquired == 'true' }}
+    needs: [claim, run]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Release CAS lease by claim id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAIM_ID: ${{ needs.claim.outputs.claim_id }}
+        run: |
+          set -euo pipefail
+          [[ "$CLAIM_ID" =~ ^[0-9a-f]{32}$ ]] || { echo '::error::unsafe or missing claim id'; exit 1; }
+          python3 registry/scripts/select-and-claim.py \
+            --release "$CLAIM_ID" \
+            --repo "$GITHUB_REPOSITORY"

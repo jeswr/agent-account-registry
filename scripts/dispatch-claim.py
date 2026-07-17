@@ -18,8 +18,11 @@ import time
 import tomllib
 
 
-SCHEMA = "registry-dispatch-plan/v1"
-PLAN_FIELDS = {"schema", "generated_at", "repositories"}
+# v2 adds top-level `review_items` (the cross-provider review/fix loop) and a per-item `deferred`
+# flag (the deferred-retry path). Both validators — this one and the dispatch.yml PLAN inline
+# check — are bumped in the same commit; the TARGET repo's dispatch-plan.py is untouched.
+SCHEMA = "registry-dispatch-plan/v2"
+PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items"}
 REPOSITORY_FIELDS = {"target_repo", "target_sha", "items"}
 ITEM_FIELDS = {
     "number",
@@ -32,19 +35,53 @@ ITEM_FIELDS = {
     "labels",
     "author",
     "body_sha",
+    "deferred",
 }
+REVIEW_ITEM_FIELDS = {
+    "pr_number",
+    "head_sha",
+    "state",
+    "impl_provider",
+    "repo",
+    "package",
+    "security",
+}
+REVIEW_STATES = {"needs-review", "needs-fix"}
+IMPL_PROVIDERS = {"anthropic", "openai"}
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_ATOM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_PACKAGE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*|__global__)")
 SAFE_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?")
+SAFE_SHA = re.compile(r"[0-9a-f]{40}")
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 BUSY_OR_GATED = {
     "status:blocked",
     "status:deferred",
     "status:in-progress",
+    "status:in-progress-review",
     "status:untriaged",
     "trust:untrusted",
 }
+# Busy/gated set for the deferred-RETRY path: status:deferred is the retry trigger, everything
+# else still gates (locked decision 20).
+DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
+# Cross-provider chains (locked decisions 14/17): the review chain is the INVERSE of the
+# implementer's provider and is computed HERE, never through policy-resolve.resolve() (whose
+# role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
+REVIEW_CHAIN = {"anthropic": ["terra"], "openai": ["opus"]}
+FIX_CHAIN = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
+# Static per-prefix lease caps (locked decision 9). The `select-and-claim` CLI path does not
+# usage-gate; codex accounts are usage-EXEMPT, so this shared `review:` prefix cap IS the codex
+# slot bound (2 accounts), and `fix:` is bounded to 3 concurrent fixes.
+REVIEW_MAX_CONCURRENT = 2
+FIX_MAX_CONCURRENT = 3
+REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
+FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
+MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
+HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
+# Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
+REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
+SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 
 
 class DispatchError(RuntimeError):
@@ -146,7 +183,144 @@ def validate_plan(document):
             if not isinstance(item["body_sha"], str) or not re.fullmatch(
                     r"[0-9a-f]{64}", item["body_sha"]):
                 raise DispatchError(f"{item_where} body_sha is malformed")
+            if not isinstance(item["deferred"], bool):
+                raise DispatchError(f"{item_where} deferred must be boolean")
+    review_items = document["review_items"]
+    if not isinstance(review_items, list):
+        raise DispatchError("plan review_items must be a list")
+    prior_review = None
+    seen_reviews = set()
+    for review_index, item in enumerate(review_items, 1):
+        where = f"review item #{review_index}"
+        _require_exact_fields(item, REVIEW_ITEM_FIELDS, where)
+        number = item["pr_number"]
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            raise DispatchError(f"{where} pr_number must be a positive integer")
+        if not isinstance(item["head_sha"], str) or not SAFE_SHA.fullmatch(item["head_sha"]):
+            raise DispatchError(f"{where} head_sha is malformed")
+        if item["state"] not in REVIEW_STATES:
+            raise DispatchError(f"{where} state is invalid")
+        if item["impl_provider"] not in IMPL_PROVIDERS:
+            raise DispatchError(f"{where} impl_provider is invalid")
+        repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
+        if repo not in seen_repositories:
+            raise DispatchError(f"{where} repo is not a planned repository")
+        _safe_string(item["package"], SAFE_PACKAGE, f"{where} package")
+        if not isinstance(item["security"], bool):
+            raise DispatchError(f"{where} security must be boolean")
+        review_key = (repo, number)
+        if review_key in seen_reviews:
+            raise DispatchError(f"plan repeats review item {repo}#{number}")
+        seen_reviews.add(review_key)
+        if prior_review is not None and review_key < prior_review:
+            raise DispatchError("plan review items are not in deterministic order")
+        prior_review = review_key
     return document
+
+
+def _security_flagged(labels):
+    """Security surfaces never auto-arm (mirrors worker-pr.py security_flagged): substring
+    keywords per routing match_labels semantics plus the trust:* prefix namespace."""
+    return (any(keyword in label for label in labels for keyword in SECURITY_KEYWORDS)
+            or any(label.startswith("trust:") for label in labels))
+
+
+def _live_holder_keys(leases, now):
+    return {
+        str(lease.get("holder", "")).split("@", 1)[0]
+        for lease in leases
+        if isinstance(lease, dict) and lease.get("expires_at", 0) > now
+    }
+
+
+def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login=""):
+    """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
+    unit-tested by --self-test). Fail-closed trust posture (locked decisions 1/3/11/13/19):
+    - only open DRAFT PRs whose head branch matches the worker pattern,
+    - head.repo MUST be the target repo (a fork PR with a spoofed head ref is never enumerated),
+    - the author must be a [bot] (and the App bot when `bot_login` is known),
+    - a REGISTRY provenance record must exist for the PR (the root of trust — the target model
+      cannot write the registry), carrying a valid impl provider,
+    - LABEL-terminal states (review:needs-user / review:pass) never re-enter. Round-budget
+      exhaustion is deliberately NOT excluded here: CLAIM re-derives the live round count and
+      applies the terminal needs-user transition itself, so a PR whose final outcome mutation
+      crashed (label never landed) converges to a loud human hand-off instead of silently
+      stalling under an exhausted budget (liveness over a redundant plan-side filter),
+    - a PR with a LIVE review/fix lease is not re-emitted (the reconciler re-emits a
+      review:changes PR with NO live fix lease, so a crashed fix converges),
+    - a needs-review PR whose head equals its reviewed-sha marker is skipped (no re-review
+      without a head advance; the non-empty-diff gate runs at CLAIM time)."""
+    live_keys = _live_holder_keys(leases, now)
+    items = []
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            raise DispatchError("review enumeration met a malformed pull request")
+        number = pull.get("number")
+        head = pull.get("head") or {}
+        ref = str(head.get("ref", ""))
+        sha = str(head.get("sha", ""))
+        head_repo = (head.get("repo") or {}).get("full_name")
+        login = str((pull.get("user") or {}).get("login", ""))
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        if pull.get("state") != "open" or pull.get("draft") is not True:
+            continue
+        if not HEAD_REF_RE.match(ref):
+            continue
+        if head_repo != repo:
+            continue                      # fork head — attacker-controlled, never reviewed
+        if not login.endswith("[bot]") or (bot_login and login != bot_login):
+            continue
+        record = provenance.get(number)
+        if not isinstance(record, dict) or record.get("pr_number") != number:
+            continue                      # no registry provenance record — fail closed
+        impl_provider = record.get("impl_provider")
+        if impl_provider not in IMPL_PROVIDERS:
+            continue
+        labels = sorted({
+            label.get("name") if isinstance(label, dict) else label
+            for label in (pull.get("labels") or [])
+            if isinstance(label, (dict, str))
+        } - {None})
+        if "review:needs-user" in labels or "review:pass" in labels:
+            continue                      # terminal / nothing to do
+        if not SAFE_SHA.fullmatch(sha):
+            continue
+        if "review:changes" in labels:
+            state = "needs-fix"
+            if f"fix:{repo}#{number}" in live_keys:
+                continue                  # a fix run is live; the reconciler re-emits if it dies
+        else:
+            # review:needs, or a provenance-backfilled pre-migration PR with no review:* label yet.
+            state = "needs-review"
+            if f"review:{repo}#{number}" in live_keys:
+                continue
+            reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
+            if reviewed and reviewed.group(1) == sha:
+                continue                  # head has not advanced past the last review
+        issue_number = record.get("issue")
+        source_labels = issue_labels.get(issue_number, []) if isinstance(issue_number, int) else []
+        areas = sorted(label[5:] for label in source_labels if label.startswith("area:"))
+        items.append({
+            "pr_number": number,
+            "head_sha": sha,
+            "state": state,
+            "impl_provider": impl_provider,
+            "repo": repo,
+            "package": areas[0] if areas else "__global__",
+            "security": _security_flagged(set(labels) | set(source_labels)),
+        })
+    items.sort(key=lambda item: (item["repo"], item["pr_number"]))
+    return items
+
+
+def filter_deferred_items(items, repo, leases, now):
+    """Drop deferred-retry items that still have a LIVE lease (a worker is already on them)."""
+    live_keys = _live_holder_keys(leases, now)
+    return [
+        item for item in items
+        if not item.get("deferred") or f"{repo}#{item['number']}" not in live_keys
+    ]
 
 
 def _run_gh(args, *, check=True):
@@ -237,11 +411,307 @@ def _current_issue_matches(repo, item):
         return False, "issue body changed after planning"
     if not _issue_is_trusted(issue):
         return False, "issue is not maintainer/collaborator/bot authored"
+    if item["deferred"]:
+        # Deferred-retry (locked decision 20): status:deferred IS the trigger; every other
+        # busy/gated label still fails closed. CLAIM flips deferred->ready on dispatch.
+        if "status:deferred" not in labels:
+            return False, "issue is no longer deferred"
+        if "status:ready" in labels:
+            return False, "issue already re-attested ready (normal path will dispatch it)"
+        if any(label in DEFERRED_GATED or label.startswith("needs:") for label in labels):
+            return False, "deferred issue is otherwise busy or gated"
+        return True, ""
     if "status:ready" not in labels:
         return False, "issue lost status:ready"
     if any(label in BUSY_OR_GATED or label.startswith("needs:") for label in labels):
         return False, "issue became busy or gated"
     return True, ""
+
+
+def _target_token():
+    return os.environ.get("TARGET_GH_TOKEN", "")
+
+
+def _run_target_helper(script_dir, script, args):
+    """Run a registry helper (worker-issue.py / worker-pr.py) against the TARGET repo under the
+    target-scoped App token. The ambient GH_TOKEN stays the registry workflow token."""
+    token = _target_token()
+    if not token:
+        raise DispatchError("target-scoped App token is unavailable")
+    result = subprocess.run(
+        [sys.executable, str(script_dir / script), *args],
+        capture_output=True, text=True, check=False,
+        env={**os.environ, "GH_TOKEN": token},
+    )
+    if result.returncode != 0:
+        raise DispatchError(f"target helper {script} {args[0] if args else ''} failed")
+    return result
+
+
+def _pr_needs_user(script_dir, repo, pr_number, issue, reason):
+    args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason]
+    if isinstance(issue, int) and issue > 0:
+        args += ["--issue", str(issue)]
+    _run_target_helper(script_dir, "worker-pr.py", args)
+
+
+def _run_gh_target_comment(repo, issue_or_pr, body):
+    token = _target_token()
+    if not token:
+        raise DispatchError("target-scoped App token is unavailable")
+    result = subprocess.run(
+        ["gh", "api", "-X", "POST", f"repos/{repo}/issues/{issue_or_pr}/comments", "--input", "-"],
+        input=json.dumps({"body": body}), capture_output=True, text=True, check=False,
+        env={**os.environ, "GH_TOKEN": token},
+    )
+    if result.returncode != 0:
+        raise DispatchError("target comment failed")
+
+
+def _pr_comments(repo, pr_number):
+    pages = _gh_json([
+        "api", "--paginate", "--slurp", f"repos/{repo}/issues/{pr_number}/comments?per_page=100",
+    ])
+    if not isinstance(pages, list):
+        raise DispatchError("target PR comments are malformed")
+    return [item for page in pages if isinstance(page, list) for item in page]
+
+
+def _resolvable_chain(chain, routing):
+    """Keep only chain aliases the harness can actually run (locked decision 14). A CLAUDE alias
+    needs a concrete provider_model. A CODEX alias is resolvable even with a missing/TBD
+    provider_model: the proven codex drain passes NO --model flag (codex CLI default; the
+    operator config pins only reasoning effort), and worker-live.sh omits --model in that case —
+    so an unpinned terra never turns into the common-case liveness stop of every
+    anthropic-implemented PR escalating to needs-user. An empty result means the direction is
+    genuinely unresolvable and the caller must escalate to a human immediately (never
+    silent-queue)."""
+    models = routing.get("models") if isinstance(routing, dict) else None
+    if not isinstance(models, dict):
+        return []
+    usable = []
+    for alias in chain:
+        meta = models.get(alias)
+        if not isinstance(meta, dict):
+            continue
+        provider_model = meta.get("provider_model")
+        concrete = (isinstance(provider_model, str) and provider_model != "TBD"
+                    and SAFE_ATOM.fullmatch(provider_model))
+        codex_default = (meta.get("harness") == "codex"
+                         and provider_model in (None, "", "TBD"))
+        if concrete or codex_default:
+            usable.append(alias)
+    return usable
+
+
+def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
+                           registry_repo, registry_root, workflow_ref, bot_login, usage, margin):
+    """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
+    that item (per-item resilience, like the issue loop)."""
+    launched = 0
+    script_dir = Path(__file__).resolve().parent
+    max_rounds = int(policy.get("max_review_rounds", 3))
+    for item in review_items:
+        number = item["pr_number"]
+        try:
+            if not bot_login:
+                print(f"defer review {repo}#{number}: bot login unavailable (no App token)")
+                continue
+            pull = _gh_json(["api", f"repos/{repo}/pulls/{number}"])
+            if not isinstance(pull, dict) or pull.get("state") != "open" \
+                    or pull.get("draft") is not True:
+                print(f"defer review {repo}#{number}: PR is no longer an open draft")
+                continue
+            head = pull.get("head") or {}
+            head_repo = (head.get("repo") or {}).get("full_name")
+            head_ref = str(head.get("ref", ""))
+            head_sha = str(head.get("sha", ""))
+            login = str((pull.get("user") or {}).get("login", ""))
+            if head_repo != repo or not HEAD_REF_RE.match(head_ref):
+                print(f"defer review {repo}#{number}: head is not a same-repo worker branch")
+                continue
+            if login != bot_login:
+                print(f"defer review {repo}#{number}: PR author is not the App bot")
+                continue
+            if head_sha != item["head_sha"] or not SAFE_SHA.fullmatch(head_sha):
+                print(f"defer review {repo}#{number}: head advanced since planning; re-plan")
+                continue
+            labels = _labels(pull)
+            if "review:needs-user" in labels:
+                print(f"defer review {repo}#{number}: terminal review:needs-user")
+                continue
+            record_path = Path(registry_root) / worker_pr.provenance_path(repo, number)
+            if not record_path.is_file():
+                print(f"defer review {repo}#{number}: no registry provenance record (fail closed)")
+                continue
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            if (record.get("pr_number") != number
+                    or record.get("impl_provider") != item["impl_provider"]
+                    or record.get("impl_provider") not in IMPL_PROVIDERS):
+                print(f"defer review {repo}#{number}: provenance disagrees with the plan")
+                continue
+            opened_sha = str(record.get("head_sha_at_open", ""))
+            if not SAFE_SHA.fullmatch(opened_sha):
+                print(f"defer review {repo}#{number}: provenance head sha is malformed")
+                continue
+            issue_number = record.get("issue") if isinstance(record.get("issue"), int) else None
+            if opened_sha != head_sha:
+                compare = _gh_json(["api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"])
+                if compare.get("status") not in {"identical", "ahead"}:
+                    # Rewritten history — the worker-opened commit is no longer an ancestor.
+                    _pr_needs_user(script_dir, repo, number, issue_number,
+                                   "the PR head no longer descends from the worker-opened commit "
+                                   "(history was rewritten); refusing autonomous review")
+                    continue
+            comments = _pr_comments(repo, number)
+            rounds = worker_pr.count_rounds(comments, bot_login)
+            if rounds >= max_rounds:
+                # Terminal transition applied HERE (not just skipped): if the final review
+                # outcome crashed before its needs-user label landed, the PR would otherwise sit
+                # under an exhausted budget forever, invisible and silent. Idempotent — once the
+                # label lands, PLAN stops enumerating the PR.
+                _pr_needs_user(script_dir, repo, number, issue_number,
+                               f"the review round budget ({rounds}/{max_rounds}) is exhausted "
+                               "without a recorded terminal outcome; a human must decide")
+                continue
+            impl_provider = record["impl_provider"]
+            # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
+            # record still carrying a raw handle (or nothing) fails closed — re-run the backfill.
+            impl_account_h = str(record.get("impl_account_h", ""))
+            if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
+                print(f"defer review {repo}#{number}: provenance lacks a salted account hash "
+                      "(re-record it via backfill-provenance.py)")
+                continue
+            if item["state"] == "needs-review":
+                reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
+                if reviewed and reviewed.group(1) == head_sha:
+                    print(f"defer review {repo}#{number}: head already reviewed")
+                    continue
+                base_branch = str((pull.get("base") or {}).get("repo", {}).get(
+                    "default_branch", "")) or "main"
+                diff = _gh_json(["api", f"repos/{repo}/compare/{base_branch}...{head_sha}"])
+                if not diff.get("files"):
+                    print(f"defer review {repo}#{number}: empty diff vs merge base (no-op rebase)")
+                    continue
+                mode, role = "review", "review"
+                chain = _resolvable_chain(REVIEW_CHAIN[impl_provider], routing)
+                holder_prefix, cap, ttl = "review:", REVIEW_MAX_CONCURRENT, REVIEW_TTL
+                round_number = rounds + 1
+            else:
+                if rounds < 1:
+                    print(f"defer review {repo}#{number}: review:changes with no recorded round")
+                    continue
+                missed = worker_pr.marker_runs(comments, bot_login, "missed", rounds)
+                if len(missed) >= MISSED_FIX_LIMIT:
+                    _pr_needs_user(script_dir, repo, number, issue_number,
+                                   f"{len(missed)} consecutive fix dispatches missed for round "
+                                   f"{rounds}; a human must unstick this PR")
+                    continue
+                verdict_file = Path(registry_root) / worker_pr.verdict_path(repo, number, rounds)
+                if not verdict_file.is_file():
+                    _run_target_helper(script_dir, "worker-pr.py", [
+                        "record-marker", "--repo", repo, "--pr", str(number), "--kind", "missed",
+                        "--round", str(rounds), "--run-key",
+                        f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
+                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
+                        "--bot-login", bot_login])
+                    print(f"defer review {repo}#{number}: round {rounds} verdict record missing")
+                    continue
+                mode, role = "fix", "fix"
+                chain = _resolvable_chain(FIX_CHAIN[impl_provider], routing)
+                holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
+                round_number = rounds
+            if not chain:
+                # The inverse (or same-provider) chain cannot resolve a concrete model right now
+                # (e.g. terra provider_model unset). Never silent-queue: hand to a human.
+                _pr_needs_user(script_dir, repo, number, issue_number,
+                               f"the {mode} model chain for a {impl_provider}-implemented PR is "
+                               "unresolvable in the target routing (no concrete provider model)")
+                continue
+        except DispatchError as exc:
+            print(f"defer review {repo}#{number}: revalidation failed ({exc}); skipped")
+            continue
+        now = int(time.time())
+        holder = f"{holder_prefix}{repo}#{number}@dispatch-" \
+                 f"{os.environ.get('GITHUB_RUN_ID', 'local')}." \
+                 f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
+        try:
+            claim = allocator.claim(
+                registry_repo,
+                item["package"],
+                role,
+                chain,
+                holder,
+                now,
+                ttl=ttl,
+                account_pool=policy["account_pool"],
+                holder_prefix=holder_prefix,
+                max_holder_concurrent=cap,
+                usage=usage,
+                margin=margin,
+            )
+        except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            print(f"defer review {repo}#{number}: lease allocation errored ({exc}); skipped")
+            continue
+        if claim is None:
+            if mode == "fix":
+                try:
+                    _run_target_helper(script_dir, "worker-pr.py", [
+                        "record-marker", "--repo", repo, "--pr", str(number), "--kind", "missed",
+                        "--round", str(round_number), "--run-key",
+                        f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
+                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
+                        "--bot-login", bot_login])
+                except DispatchError:
+                    pass
+            print(f"defer review {repo}#{number}: no eligible {mode} lease is free this tick")
+            continue
+        account = claim.get("account")
+        claim_id = claim.get("claim_id")
+        claim_provider = claim.get("provider")
+        # Cross-provider fail-closed assertions (locked decision 6, claim layer). The account
+        # comparison runs on SALTED HASHES (locked decision 22a) — the provenance record never
+        # holds a raw handle, so the live handle is hashed here with the same PROVENANCE_SALT;
+        # a missing salt fails closed (never dispatch with the assertion unverified).
+        salt = os.environ.get("PROVENANCE_SALT", "")
+        violation = ""
+        if not isinstance(account, str) or not re.fullmatch(r"acct[0-9a-z]{2,}", account) \
+                or not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f]{32}", claim_id) \
+                or claim.get("model") not in chain:
+            violation = "allocator returned an unsafe/out-of-policy claim"
+        elif mode == "review" and (not claim_provider or claim_provider == impl_provider):
+            violation = "reviewer provider would equal implementer provider"
+        elif mode == "review" and not salt:
+            violation = "PROVENANCE_SALT unavailable; cannot assert reviewer != implementer"
+        elif mode == "review" and worker_pr.account_hash(account, salt) == impl_account_h:
+            violation = "reviewer account would equal implementer account"
+        elif mode == "fix" and claim_provider and claim_provider != impl_provider:
+            violation = "fixer provider would differ from implementer provider"
+        if violation:
+            _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+            print(f"defer review {repo}#{number}: {violation}; released + skipped")
+            continue
+        result = _run_gh([
+            "workflow", "run", "review-fix.yml",
+            "--repo", registry_repo,
+            "--ref", workflow_ref,
+            "-f", f"target_repo={repo}",
+            "-f", f"pr_number={number}",
+            "-f", f"mode={mode}",
+            "-f", f"review_round={round_number}",
+            "-f", f"account={account}",
+            "-f", f"claim_id={claim_id}",
+        ], check=False)
+        if result.returncode != 0:
+            released = _release_failed_dispatch(allocator, registry_repo, claim_id)
+            if not released:
+                print("::error::review-fix dispatch failed and its lease could not be released")
+            print(f"defer review {repo}#{number}: {mode} dispatch failed; skipped")
+            continue
+        launched += 1
+        # Privacy (locked decision 22b): public workflow logs never carry account handles.
+        print(f"dispatched {mode} {repo}#{number}: round={round_number}, claim={claim_id[:8]}")
+    return launched
 
 
 def _route_matches(repo, item, policy_doc, routing_doc, policy_module):
@@ -310,9 +780,12 @@ def _load_usage():
     return data if isinstance(data, dict) and data else None
 
 
-def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
+def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
+             registry_root=".", bot_login=""):
     policy_module = _load_module("registry_policy_resolve", script_dir / "policy-resolve.py")
     allocator = _load_module("registry_select_and_claim", script_dir / "select-and-claim.py")
+    worker_pr = _load_module("registry_worker_pr", script_dir / "worker-pr.py")
+    worker_issue = _load_module("registry_worker_issue", script_dir / "worker-issue.py")
     usage = _load_usage()
     catalog_cache = {"accounts": None}  # read the account catalog at most once, only if usage-aware
     try:
@@ -357,6 +830,27 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                     print(f"defer {repo}#{number}: {reason}")
                     continue
                 resolved = _route_matches(repo, item, policy_doc, routing, policy_module)
+                if item["deferred"]:
+                    # Deferred-retry budget (locked decision 20): re-dispatch is bounded by the
+                    # SAME durable attempt markers the worker records; exhausted -> needs-user +
+                    # a maintainer-visible comment, never another silent attempt.
+                    if not bot_login or not _target_token():
+                        print(f"defer {repo}#{number}: deferred retry needs the target App token")
+                        continue
+                    comments = _pr_comments(repo, number)
+                    used = worker_issue.count_attempts(comments, bot_login)
+                    if used >= resolved["max_attempts"]:
+                        _run_target_helper(script_dir, "worker-issue.py", [
+                            "status", "--repo", repo, "--issue", str(number),
+                            "--status", "needs-user"])
+                        _run_gh_target_comment(repo, number,
+                                               f"> 🤖 SPARQ agent — deferred-retry budget "
+                                               f"exhausted ({used}/{resolved['max_attempts']} "
+                                               "attempts). "
+                                               f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')} "
+                                               "this issue needs a human.")
+                        print(f"escalated {repo}#{number}: deferred-retry budget exhausted")
+                        continue
             except DispatchError as exc:
                 print(f"defer {repo}#{number}: trust/route/policy resolution failed ({exc}); skipped")
                 continue
@@ -420,6 +914,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                 print(f"defer {repo}#{number}: allocator returned an unsafe/out-of-policy claim; released + skipped")
                 continue
 
+            if item["deferred"]:
+                # Strip status:deferred + restore status:ready ON DISPATCH so the worker's
+                # reverify (which requires status:ready) passes. If the workflow launch below
+                # fails, the issue is simply a ready issue again next tick — it converges.
+                try:
+                    _run_target_helper(script_dir, "worker-issue.py", [
+                        "status", "--repo", repo, "--issue", str(number), "--status", "retry"])
+                except DispatchError as exc:
+                    _release_failed_dispatch(allocator, registry_repo, claim_id)
+                    print(f"defer {repo}#{number}: deferred label flip failed ({exc}); released")
+                    continue
+
             result = _run_gh([
                 "workflow", "run", "worker.yml",
                 "--repo", registry_repo,
@@ -437,8 +943,19 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                 print(f"defer {repo}#{number}: worker dispatch failed; skipped")
                 continue
             dispatched += 1
-            print(f"dispatched {repo}#{number}: account={account}, model={model}, claim={claim_id[:8]}")
-    print(f"dispatcher complete: {dispatched} worker run(s) launched")
+            kind = "deferred-retry" if item["deferred"] else "worker"
+            # Privacy (locked decision 22b): public workflow logs never carry account handles.
+            print(f"dispatched {kind} {repo}#{number}: model={model}, claim={claim_id[:8]}")
+
+        repo_review_items = [
+            entry for entry in plan["review_items"] if entry["repo"] == repo
+        ]
+        if repo_review_items:
+            dispatched += _dispatch_review_items(
+                repo_review_items, repo, policy, routing, allocator, worker_pr,
+                registry_repo, registry_root, workflow_ref, bot_login, usage,
+                float(policy.get("usage_safety_margin", 0.10)))
+    print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
 
 
 def _self_test():
@@ -459,26 +976,160 @@ def _self_test():
                 "labels": ["area:crate-a", "priority:P1", "role:impl", "status:ready"],
                 "author": "maintainer",
                 "body_sha": "b" * 64,
+                "deferred": False,
+            }, {
+                "number": 9,
+                "priority": 2,
+                "package": "crate-b",
+                "role": "impl",
+                "model_chain": ["fable", "terra"],
+                "agent": "repo-impl",
+                "escalate": False,
+                "labels": ["area:crate-b", "priority:P2", "role:impl", "status:deferred"],
+                "author": "maintainer",
+                "body_sha": "c" * 64,
+                "deferred": True,
             }],
+        }],
+        "review_items": [{
+            "pr_number": 41,
+            "head_sha": "d" * 40,
+            "state": "needs-review",
+            "impl_provider": "anthropic",
+            "repo": "example/repo",
+            "package": "crate-a",
+            "security": False,
         }],
     }
     assert validate_plan(fixture) is fixture
     assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"})
     assert _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"})
     assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"})
+    # A DRAFT worker PR must land in linked_open_prs (dedupes issue re-dispatch) while the SAME PR
+    # is separately enumerated as a review_item — the two enumerations must not fight (the issue
+    # stays busy in status:in-progress-review while the PR cycles). Linking is head-ref/body based
+    # and draft-agnostic, so this is structural; asserted here against regression.
     linked = _linked_open_pr_issues([[
-        {"head": {"ref": "sparq-agent/issue-7-1-1"}, "body": ""},
+        {"head": {"ref": "sparq-agent/issue-7-1-1"}, "body": "", "draft": True},
         {"head": {"ref": "topic"}, "body": "Fixes #9"},
     ]])
     assert linked == {7, 9}
-    malformed = json.loads(json.dumps(fixture))
-    malformed["repositories"][0]["items"][0]["unknown"] = True
-    try:
-        validate_plan(malformed)
-    except DispatchError:
-        pass
-    else:
-        raise AssertionError("schema accepted an unknown field")
+    for mutate, name in (
+            (lambda d: d["repositories"][0]["items"][0].update(unknown=True), "unknown item field"),
+            (lambda d: d["repositories"][0]["items"][0].pop("deferred"), "missing deferred flag"),
+            (lambda d: d["review_items"][0].update(state="armed"), "bad review state"),
+            (lambda d: d["review_items"][0].update(impl_provider="other"), "bad impl provider"),
+            (lambda d: d["review_items"][0].update(repo="not/planned"), "unplanned review repo"),
+            (lambda d: d["review_items"][0].update(head_sha="zz"), "bad review head sha"),
+            (lambda d: d.pop("review_items"), "missing review_items"),
+            (lambda d: d.update(schema="registry-dispatch-plan/v1"), "stale schema version"),
+    ):
+        malformed = json.loads(json.dumps(fixture))
+        mutate(malformed)
+        try:
+            validate_plan(malformed)
+        except DispatchError:
+            pass
+        else:
+            raise AssertionError(f"schema accepted {name}")
+
+    # ---- review_items enumeration (fail-closed trust fixtures, locked decision 3) ----
+    now = 1000
+    repo = "example/repo"
+    bot = "sparq-worker[bot]"
+    sha_a, sha_b = "1" * 40, "2" * 40
+
+    def pull(number, ref, sha, *, head_repo=repo, login=bot, draft=True, labels=(),
+             body="", state="open"):
+        return {"number": number, "state": state, "draft": draft, "body": body,
+                "head": {"ref": ref, "sha": sha, "repo": {"full_name": head_repo}},
+                "user": {"login": login, "type": "Bot"},
+                "labels": [{"name": name} for name in labels]}
+
+    # Privacy (locked decision 22a): provenance carries ONLY the salted 16-hex account hash.
+    provenance = {
+        41: {"pr_number": 41, "head_sha_at_open": sha_a, "impl_provider": "anthropic",
+             "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 7,
+             "recorded_at_run": "1.1"},
+        42: {"pr_number": 42, "head_sha_at_open": sha_a, "impl_provider": "openai",
+             "impl_alias": "terra", "impl_account_h": "cd" * 8, "issue": 9,
+             "recorded_at_run": "2.1"},
+    }
+    issue_labels = {7: ["area:crate-a", "role:impl"], 9: ["area:sparq-zk", "role:impl"]}
+    pulls = [
+        pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"]),
+        # spoofed FORK head with a worker-shaped ref: must NOT be enumerated
+        pull(90, "sparq-agent/issue-1-x-1", sha_b, head_repo="mallory/fork",
+             login="mallory", draft=True),
+        # same-repo bot-shaped PR WITHOUT a registry provenance record: fail closed
+        pull(91, "sparq-agent/issue-3-9-1", sha_b, login="other[bot]"),
+        # terminal states never re-enter
+        pull(42, "sparq-agent/issue-9-2-1", sha_b, labels=["review:needs-user"]),
+    ]
+    items = enumerate_review_items(repo, pulls, provenance, [], issue_labels, now)
+    assert [item["pr_number"] for item in items] == [41], items
+    assert items[0]["state"] == "needs-review" and items[0]["impl_provider"] == "anthropic"
+    assert items[0]["package"] == "crate-a" and items[0]["security"] is False
+
+    # security flag from the SOURCE issue labels (zk) — needs a provenance-linked issue
+    sec = enumerate_review_items(
+        repo, [pull(42, "sparq-agent/issue-9-2-1", sha_b, labels=["review:needs"])],
+        provenance, [], issue_labels, now)
+    assert sec and sec[0]["security"] is True
+
+    # reviewed-sha binding: a head equal to the marker is NOT re-enumerated (no advance)
+    marked = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"],
+                  body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert enumerate_review_items(repo, [marked], provenance, [], issue_labels, now) == []
+
+    # Round-budget exhaustion is deliberately NOT excluded at enumeration: CLAIM re-derives the
+    # live round count and applies the terminal needs-user transition itself, so a crashed final
+    # outcome (label never landed) converges loudly instead of silently stalling. Only the LABEL
+    # terminal states filter here — asserted structurally by the review:needs-user case above.
+    assert enumerate_review_items(repo, pulls[:1], provenance, [], issue_labels, now) != []
+
+    # a LIVE fix lease suppresses the needs-fix item; an expired one does not (reconciler)
+    changes = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:changes"])
+    live_fix = [{"holder": f"fix:{repo}#41@run.1", "expires_at": now + 100}]
+    dead_fix = [{"holder": f"fix:{repo}#41@run.1", "expires_at": now - 1}]
+    assert enumerate_review_items(repo, [changes], provenance, live_fix,
+                                  issue_labels, now) == []
+    reconciled = enumerate_review_items(repo, [changes], provenance, dead_fix,
+                                        issue_labels, now)
+    assert reconciled and reconciled[0]["state"] == "needs-fix"
+
+    # non-draft (armed/ready) PRs leave the loop
+    assert enumerate_review_items(repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                                              draft=False)],
+                                  provenance, [], issue_labels, now) == []
+
+    # known bot login pins authorship exactly
+    assert enumerate_review_items(repo, pulls[:1], provenance, [], issue_labels, now,
+                                  bot_login="another[bot]") == []
+
+    # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
+    deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]
+    live_impl = [{"holder": f"{repo}#9@run.1", "expires_at": now + 100}]
+    assert filter_deferred_items(deferred_items, repo, live_impl, now) == [
+        {"number": 7, "deferred": False}]
+    assert filter_deferred_items(deferred_items, repo, [], now) == deferred_items
+
+    # Inverse-chain resolvability (locked decision 14): a CODEX alias with a missing/TBD
+    # provider_model resolves to the CLI default (the proven drain passes no --model flag), so
+    # the common anthropic->terra direction is live from day one; a CLAUDE alias still needs a
+    # concrete id; an alias absent from routing stays unresolvable.
+    routing = {"models": {"terra": {"provider_model": "TBD", "harness": "codex"},
+                          "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
+                          "fable": {"provider_model": "TBD", "harness": "claude"}}}
+    assert _resolvable_chain(["terra"], routing) == ["terra"]
+    assert _resolvable_chain(["opus"], routing) == ["opus"]
+    assert _resolvable_chain(["fable"], routing) == []
+    assert _resolvable_chain(["ghost"], routing) == []
+    del routing["models"]["terra"]["provider_model"]
+    assert _resolvable_chain(["terra"], routing) == ["terra"]
+    routing["models"]["terra"]["provider_model"] = "gpt-5.6-codex"
+    assert _resolvable_chain(["terra"], routing) == ["terra"]
+
     print("dispatch-claim self-test PASSED")
 
 
@@ -487,6 +1138,10 @@ def main():
     parser.add_argument("--plan", help="schema-checked artifact emitted by the PLAN job")
     parser.add_argument("--policy-file", default="policy/repos.toml")
     parser.add_argument("--registry-repo", default="jeswr/agent-account-registry")
+    parser.add_argument("--registry-root", default=".",
+                        help="registry checkout root (provenance + verdict records)")
+    parser.add_argument("--bot-login", default="",
+                        help="target App bot login (<slug>[bot]); required for review/deferred")
     parser.add_argument("--workflow-ref", default="")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -502,6 +1157,8 @@ def main():
             args.registry_repo,
             args.workflow_ref,
             Path(__file__).resolve().parent,
+            registry_root=args.registry_root,
+            bot_login=args.bot_login,
         )
     except DispatchError as exc:
         print(f"dispatch-claim: {exc}", file=sys.stderr)

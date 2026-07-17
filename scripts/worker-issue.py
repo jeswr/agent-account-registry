@@ -18,12 +18,15 @@ BUSY_OR_GATED = {
     "status:blocked",
     "status:deferred",
     "status:in-progress",
+    "status:in-progress-review",
     "status:untriaged",
     "trust:untrusted",
 }
 LABEL_COLOURS = {
     "status:in-progress": "fbca04",
+    "status:in-progress-review": "c5def5",
     "status:deferred": "d4c5f9",
+    "status:ready": "0e8a16",
     "needs:user": "b60205",
 }
 
@@ -198,11 +201,20 @@ def _remove_label(repo, issue, label):
 
 
 def set_status(repo, issue, status):
+    # `in-progress-review`: the worker published a DRAFT PR that is cycling through the
+    # cross-provider review loop — the issue completes only when the review-fix ARM path fires.
+    # `retry`: the dispatcher re-enumerates a deferred issue (deferred-retry, locked decision 20)
+    # — status:deferred is stripped and status:ready restored so the worker's reverify passes.
     transitions = {
         "in-progress": ({"status:in-progress"}, {"status:ready", "status:deferred"}),
-        "deferred": ({"status:deferred"}, {"status:ready", "status:in-progress"}),
-        "needs-user": ({"needs:user", "status:deferred"}, {"status:ready", "status:in-progress"}),
-        "complete": (set(), {"status:in-progress", "status:deferred"}),
+        "in-progress-review": ({"status:in-progress-review"},
+                               {"status:ready", "status:in-progress", "status:deferred"}),
+        "retry": ({"status:ready"}, {"status:deferred"}),
+        "deferred": ({"status:deferred"},
+                     {"status:ready", "status:in-progress", "status:in-progress-review"}),
+        "needs-user": ({"needs:user", "status:deferred"},
+                       {"status:ready", "status:in-progress", "status:in-progress-review"}),
+        "complete": (set(), {"status:in-progress", "status:in-progress-review", "status:deferred"}),
     }
     add, remove = transitions[status]
     for label in sorted(add):
@@ -284,7 +296,9 @@ def _self_test():
     ]
     assert count_attempts(fake, "sparq[bot]") == 2
     assert body_sha("task") == hashlib.sha256(b"task").hexdigest()
-    assert set(LABEL_COLOURS) == {"status:in-progress", "status:deferred", "needs:user"}
+    assert set(LABEL_COLOURS) == {"status:in-progress", "status:in-progress-review",
+                                  "status:deferred", "status:ready", "needs:user"}
+    assert "status:in-progress-review" in BUSY_OR_GATED
     print("worker-issue self-test PASSED")
 
 
@@ -312,7 +326,8 @@ def main():
     trust.add_argument("--issue-file", required=True)
 
     status = subparsers.add_parser("status", parents=[common])
-    status.add_argument("--status", choices=("in-progress", "deferred", "needs-user", "complete"),
+    status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
+                                             "deferred", "needs-user", "complete"),
                         required=True)
 
     receipt = subparsers.add_parser("claim-receipt", parents=[common])

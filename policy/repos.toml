@@ -12,6 +12,12 @@
 #   max_attempts           = positive integer
 #   dispatch               = "cron" | "cron+doorbell"
 #   trust                  = "collaborators"
+# Optional cross-provider review-loop fields (defaults in policy-resolve.py):
+#   max_review_rounds        = positive integer (default 3)  # review<->fix rounds before needs-user
+#   review_queue_ttl_minutes = positive integer (default 30) # review:needs age before alerting
+#   cross_provider_fallback  = bool (default false)          # opt-in same-provider degrade when the
+#                                                            # opposite provider is starved; false =
+#                                                            # stay queued + alert (honest default)
 
 [repos."sparq-org/sparq"]
 enabled = true
@@ -20,9 +26,12 @@ account_pool = ["acct01", "acct02", "acct03", "acct04", "acct2css", "acct3css", 
 max_concurrent = 20
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
-arm_auto_merge = true
+arm_auto_merge = true         # arming now actually happens — ONLY in the review-fix approve path
 require_usage = true          # hold (fail-closed) if the usage probe is unavailable
 usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH windows
-max_attempts = 2
+max_attempts = 3              # per-issue worker attempts (also bounds the deferred-retry loop)
 dispatch = "cron"
 trust = "collaborators"
+max_review_rounds = 3         # bound the cross-provider review<->fix loop
+review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
+cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade
