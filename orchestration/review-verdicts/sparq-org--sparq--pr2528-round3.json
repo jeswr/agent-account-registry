@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The durable auto-close description says the workflow uses `pull_request: [closed]`, while the workflow was deliberately changed to `pull_request_target: [closed]` for fork-safe write permission. This leaves the central agent documentation inconsistent with the security-sensitive trigger and with the explanation in the workflow itself.",
+   "file": "AGENTS.md",
+   "fix_hint": "Change the trigger text in this AGENTS.md entry to `pull_request_target: [closed]` and briefly retain the base-context/no-PR-code safety qualification.",
+   "severity": "minor",
+   "title": "Trigger documentation still names pull_request instead of pull_request_target"
+  }
+ ],
+ "summary": "The issue-native reconciliation is sound as scoped: it authenticates body markers with a migration-owned label, fails closed on duplicate authenticated mappings, preserves epic/human-gated guardrails, verifies the merge through GitHub, and keeps pull_request_target execution pinned to the base branch. The hermetic self-tests for both changed Python scripts pass and cover the key decoy, ambiguity, guard, and checkpoint-provenance cases. One documentation mismatch should be cleaned up, but it does not undermine runtime correctness.",
+ "verdict": "approve"
+}
