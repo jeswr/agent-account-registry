@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "dispatch() permits overlapping requests while state.pod is mutable. The handleRequest receiver can be captured from pod A, then another request can trap and replace state.pod with pod B. If the first request subsequently traps, its catch block assigns `poisoned = state.pod`, which now identifies healthy pod B, sets the state to null, and frees/replaces B even though the trap came from A. Concurrent success can likewise continue against an instance another request has already freed. This breaks the claim that later requests are served safely by the replacement and is reachable through both node:http and Fastify, which process requests concurrently. The tests only issue dispatches sequentially and do not cover this invariant.",
+   "file": "packages/solid-server/src/dispatch.js",
+   "fix_hint": "Capture the exact pod/generation used by each request and only transition/recycle state when that same generation is still current; also prevent a trapped generation from being freed while another request is still executing on it (for example by serializing pod access or tracking in-flight users and retiring generations safely). Add a deterministic overlapping-request test where two calls use pod A, one trap installs pod B, and the later completion/trap from pod A must neither invoke nor free pod B.",
+   "severity": "major",
+   "title": "Concurrent trap recovery can free the wrong pod instance"
+  }
+ ],
+ "summary": "The transport extraction is well tested for sequential requests, but the new shared dispatcher is not safe under concurrent HTTP/Fastify traffic. Its trap-recovery catch block acts on the current global pod rather than the pod that served the failing request, so overlapping requests can discard a healthy replacement and violate the documented recovery contract.",
+ "verdict": "request_changes"
+}
