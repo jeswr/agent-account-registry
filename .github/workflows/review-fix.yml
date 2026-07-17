@@ -407,7 +407,7 @@ jobs:
           # concurrent reviews to the static codex slot count (codex is usage-exempt; the CLI
           # claim path does not usage-gate, so this static cap IS the bound — by design).
           if [[ "$MODE" == review ]]; then
-            prefix="review:"; cap=2; ttl=1200; role=review
+            prefix="review:"; cap=10; ttl=1200; role=review
           else
             prefix="fix:"; cap=3; ttl=3600; role=fix
           fi
