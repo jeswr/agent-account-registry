@@ -1,0 +1,9 @@
+{
+ "head_sha_at_open": "77a0a64a05b75e814b8da253a7dcfa173b028235",
+ "impl_account_h": "33d4bc1f91e9f0a9",
+ "impl_alias": "haiku",
+ "impl_provider": "anthropic",
+ "issue": 2504,
+ "pr_number": 2530,
+ "recorded_at_run": "29589865760.1"
+}
