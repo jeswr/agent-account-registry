@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The dependency split is correct under workspace resolver v2: the unconditional sparq-core edge disables defaults for all targets, while the non-wasm target edge re-enables sparq-core defaults only on native builds through Cargo feature unification. On wasm32, the non-matching native edge is excluded, so sparq-core's default parallel/rayon feature is no longer selected by sparq-introspect. The existing wasm smoke test exercises Graph loading and the real introspection pipeline with parallel disabled; native behavior remains unchanged. No hostile reviewer-directed instruction appears in the diff.",
+ "verdict": "approve"
+}
