@@ -13,19 +13,20 @@ jobs:
     steps:
       - name: Fingerprint all ACCT tokens (reset day/time in London; tokens never printed)
         run: |
-          set -uo pipefail
+          set +e +o pipefail   # tolerate 401/no-header responses (codex tokens 401 on the anthropic endpoint)
+          rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/h.txt 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | head -1; }
           names=$(printf '%s' "$SECRETS_JSON" | jq -r 'keys[] | select(test("^ACCT[0-9]+_TOKEN$"))' | sort)
           echo "handle | http | 7d_reset_ts | London(day HH:MM) | 7d_util | 5h_util | status"
           for name in $names; do
             tok=$(printf '%s' "$SECRETS_JSON" | jq -r --arg k "$name" '.[$k]')
+            rm -f /tmp/h.txt
             code=$(curl -s -D /tmp/h.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
               -H "Authorization: Bearer $tok" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
               -H "anthropic-beta: oauth-2025-04-20" \
-              -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' -w '%{http_code}' || echo curlfail)
-            rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/h.txt | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r'; }
+              -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' -w '%{http_code}')
+            [ -z "$code" ] && code=curlfail
             r7=$(rl 7d-reset)
-            lon=$([ -n "$r7" ] && TZ=Europe/London date -d @"$r7" '+%a %H:%M' 2>/dev/null || echo '-')
+            if [ -n "$r7" ]; then lon=$(TZ=Europe/London date -d @"$r7" '+%a %H:%M' 2>/dev/null); else lon='-'; fi
             printf '%s | %s | %s | %s | %s | %s | %s\n' \
-              "$name" "$code" "${r7:--}" "$lon" "$(rl 7d-utilization)" "$(rl 5h-utilization)" "$(rl status)"
-            rm -f /tmp/h.txt
+              "$name" "$code" "${r7:--}" "${lon:--}" "$(rl 7d-utilization)" "$(rl 5h-utilization)" "$(rl status)"
           done
