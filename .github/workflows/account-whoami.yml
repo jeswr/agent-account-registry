@@ -1,0 +1,32 @@
+# [OPUS-4.8] Resolve the Anthropic account EMAIL behind a stored oauth/setup-token, for registry
+# metadata accuracy. Prints ONLY the email (the token is a masked secret and is never echoed).
+name: account-whoami
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: "Anthropic account handle to introspect (acct02, acct03, …)"
+        required: true
+        default: acct02
+permissions: {}
+jobs:
+  whoami:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve account email (email only; token never printed)
+        env:
+          # index the secret by handle so new accounts need no workflow edit
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          ACCOUNT: ${{ inputs.account }}
+        run: |
+          set -euo pipefail
+          case "$ACCOUNT" in acct[0-9]*) ;; *) echo "::error::bad account handle"; exit 1 ;; esac
+          UP="$(printf '%s' "$ACCOUNT" | tr '[:lower:]' '[:upper:]')_TOKEN"
+          TOK="$(printf '%s' "$SECRETS_JSON" | python3 -c "import sys,json,os; print(json.load(sys.stdin).get(os.environ['UP'],''))" UP="$UP")"
+          [ -n "$TOK" ] || { echo "::error::secret ${UP} is empty/unset"; exit 1; }
+          resp="$(curl -s --max-time 20 -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" https://api.anthropic.com/api/oauth/profile)"
+          email="$(printf '%s' "$resp" | python3 -c "import sys,json;
+try: print(json.load(sys.stdin).get('email','<no email field>'))
+except Exception: print('<non-json response>')")"
+          printf '::notice::account=%s email=%s\n' "$ACCOUNT" "$email"
+          printf 'account=%s email=%s\n' "$ACCOUNT" "$email"
