@@ -902,13 +902,21 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # between PLAN and now (a flaky gate leg re-ran green, the base moved past the
                 # conflict) the item defers with NO mutation, and a matching-SHA valid arm
                 # keeps merging (the earlier head check already pinned live head == plan head).
-                live_gate, failing_legs = None, []
+                live_gate = None
                 if item["state"] == "needs-ci-fix" and pull.get("mergeable") is not False:
+                    # check_name filter is load-bearing: sparq heads carry ~200 check runs, so an
+                    # unfiltered page-1 read drops the `gate` run entirely -> gate reads "missing"
+                    # -> every ci-fix defers forever (observed live 2026-07-17: PLAN emitted 7
+                    # repair items, CLAIM dispatched 0). The gate STATUS is the only live-safety
+                    # input; the failing-leg names are advisory prompt context and come from the
+                    # item's PLAN-computed `context` (paginated snapshot, validated <=1000).
                     checks = _gh_json([
-                        "api", f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100"])
+                        "api",
+                        f"repos/{repo}/commits/{head_sha}/check-runs"
+                        f"?check_name={CI_GATE_CHECK}&per_page=100"])
                     live_ci = interpret_check_runs(
                         (checks or {}).get("check_runs") if isinstance(checks, dict) else None)
-                    live_gate, failing_legs = live_ci["gate"], live_ci["failing_legs"]
+                    live_gate = live_ci["gate"]
                 decision, detail = decide_repair_admission(
                     item["state"], pull.get("mergeable"), live_gate, draft)
                 if decision == "defer":
@@ -926,14 +934,16 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     continue
                 fix_kind = detail
                 if fix_kind == "ci":
-                    fix_context = ", ".join(failing_legs)[:CI_CONTEXT_MAX]
+                    fix_context = item["context"][:CI_CONTEXT_MAX]
             elif item["state"] == "stranded":
                 # Loud escape from the absorbing {drafted, unarmed, reviewed head, green gate}
                 # state — re-derived LIVE before the terminal hand-off; any drift (armed again,
                 # head moved, gate red/pending, base conflicting) defers to the path that owns
                 # the new posture instead.
                 checks = _gh_json([
-                    "api", f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100"])
+                    "api",
+                    f"repos/{repo}/commits/{head_sha}/check-runs"
+                    f"?check_name={CI_GATE_CHECK}&per_page=100"])
                 live_ci = interpret_check_runs(
                     (checks or {}).get("check_runs") if isinstance(checks, dict) else None)
                 reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
