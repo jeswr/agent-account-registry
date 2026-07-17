@@ -1,11 +1,15 @@
-# [GPT-5.6] REG-5 read-mostly grooming sweep. Manual-only until the canary proves target writes.
+# [GPT-5.6] REG-5 grooming sweep: repairs dead-lease in-progress issues, closed-unmerged-PR
+# orphans, exhausted attempt budgets, and stale worker PRs. The cron was enabled after the REG-4
+# staged pilot proved target writes end-to-end (issues #2407–#2416 flowed; PRs #2417–#2421
+# merged) — groom is the ONLY crash-recovery path, so scheduled runs are load-bearing for
+# autonomy. The minute offset avoids same-minute lease-ledger CAS contention with
+# groom-leases.yml's */15 cron (both writers are CAS-safe; this is contention reduction).
 name: groom
 
 on:
   workflow_dispatch:
-# Schedule is enabled ONLY post-canary; keep this cron commented out until canary acceptance.
-# schedule:
-#   - cron: '*/15 * * * *'
+  schedule:
+    - cron: '7-59/15 * * * *'
 
 permissions: {}
 
@@ -42,11 +46,16 @@ jobs:
         env:
           REGISTRY_GH_TOKEN: ${{ github.token }}
           TARGET_GH_TOKEN: ${{ steps.target-token.outputs.token }}
+          # An App INSTALLATION token cannot call GET /user; groom resolves the bot identity from
+          # the public /users/<slug>[bot] endpoint instead (the worker.yml canary fix).
+          APP_SLUG: ${{ steps.target-token.outputs.app-slug }}
         run: |
           set -euo pipefail
           printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
           printf '::add-mask::%s\n' "$TARGET_GH_TOKEN"
+          python3 scripts/groom.py --self-test
           python3 scripts/groom.py \
             --registry-repo "$GITHUB_REPOSITORY" \
             --policy-file policy/repos.toml \
-            --policy-resolver scripts/policy-resolve.py
+            --policy-resolver scripts/policy-resolve.py \
+            --bot-slug "$APP_SLUG"

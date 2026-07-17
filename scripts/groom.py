@@ -234,12 +234,14 @@ def count_attempts(comments: list[dict[str, Any]], bot_login: str) -> int:
 
 
 def label_transition(labels: set[str], mode: str) -> tuple[set[str], set[str]]:
+    # status:in-progress-review is removed by BOTH modes: the orphan repair (a worker PR that
+    # closed without merging) must not leave the review-loop label behind on a re-readied issue.
     if mode == "ready":
         desired = {"status:ready"}
-        remove = {"status:in-progress", "status:deferred"}
+        remove = {"status:in-progress", "status:in-progress-review", "status:deferred"}
     elif mode == "defer":
         desired = {"needs:user", "status:deferred"}
-        remove = {"status:ready", "status:in-progress"}
+        remove = {"status:ready", "status:in-progress", "status:in-progress-review"}
     else:
         raise GroomError("unknown issue label transition")
     return desired - labels, remove & labels
@@ -338,9 +340,12 @@ class GitHubAPI:
             ) from exc
 
     def paginate(self, path: str) -> list[Any]:
+        # The page walk continues until a short page; the explicit ceiling only guards a runaway
+        # snapshot. It was raised from 1000 -> 5000 ahead of the full bd->issue migration (~900
+        # new open issues would otherwise hard-stop grooming; /issues also counts open PRs).
         separator = "&" if "?" in path else "?"
         items: list[Any] = []
-        for page in range(1, 11):
+        for page in range(1, 51):
             result = self.request("GET", f"{path}{separator}per_page=100&page={page}")
             if not isinstance(result, list):
                 raise GroomError(
@@ -349,7 +354,7 @@ class GitHubAPI:
             items.extend(result)
             if len(result) < 100:
                 return items
-        raise GroomError(f"{self._purpose} snapshot may be truncated at 1000 entries")
+        raise GroomError(f"{self._purpose} snapshot may be truncated at 5000 entries")
 
 
 def _load_module(path: Path):
@@ -572,13 +577,28 @@ def _registry_repo(api: GitHubAPI) -> str:
     return repo
 
 
-def _bot_login(api: GitHubAPI) -> str:
-    user = api.request("GET", "/user")
+SAFE_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")
+
+
+def _bot_login(api: GitHubAPI, app_slug: str = "") -> str:
+    """Resolve the target bot identity. An App INSTALLATION token cannot call GET /user (403), so
+    the live path resolves the PUBLIC /users/<app-slug>[bot] endpoint from the slug the token mint
+    step exposes — the same canary fix worker.yml already carries. The /user fallback remains only
+    for non-App tokens (no slug supplied)."""
+    if app_slug:
+        if SAFE_SLUG.fullmatch(app_slug) is None:
+            raise GroomError("target App slug is unsafe")
+        expected = f"{app_slug}[bot]"
+        user = api.request("GET", f"/users/{quote(expected, safe='')}")
+    else:
+        user = api.request("GET", "/user")
+        expected = None
     login = user.get("login") if isinstance(user, dict) else None
     if (
         not isinstance(login, str)
         or SAFE_LOGIN.fullmatch(login) is None
         or not login.endswith("[bot]")
+        or (expected is not None and login != expected)
     ):
         raise GroomError("target token does not identify a GitHub App bot")
     return login
@@ -672,21 +692,41 @@ def _plan_actions(
                     IssueAction(repo, number, "defer", "attempt budget exhausted")
                 )
                 continue
-            if (
-                "status:in-progress" not in labels
-                or key in live_by_issue
-                or number in links
-            ):
+            if key in live_by_issue or number in links:
                 continue
             stale = (
                 now - _epoch(issue["updated_at"], f"target issue {repo}#{number}")
                 >= limits[repo].threshold_seconds
             )
-            if key in dead_by_issue or stale:
+            if "status:in-progress" in labels:
+                if key in dead_by_issue or stale:
+                    reason = (
+                        "dead lease"
+                        if key in dead_by_issue
+                        else "stale in-progress without PR or lease"
+                    )
+                    actions.append(IssueAction(repo, number, "ready", reason))
+                continue
+            # Orphan repair: a worker previously ran (durable attempt evidence, used >= 1) but the
+            # issue no longer holds any dispatchable state — either its worker PR closed WITHOUT
+            # merging after the 'complete' transition stripped every status label (a dead state no
+            # other component recovers), or it is parked status:in-progress-review with no open PR
+            # (the review loop lost its PR). Issues WITHOUT attempt evidence are never touched: a
+            # label-less issue that never saw a worker belongs to triage, not grooming — re-readying
+            # it here would bypass the triage trust gate. status:deferred stays untouched: the
+            # dispatcher's deferred-retry path (locked decision 20) is its single owner.
+            has_status = any(label.startswith("status:") for label in labels)
+            in_review = "status:in-progress-review" in labels
+            if (
+                used >= 1
+                and stale
+                and "needs:user" not in labels
+                and (not has_status or in_review)
+            ):
                 reason = (
-                    "dead lease"
-                    if key in dead_by_issue
-                    else "stale in-progress without PR or lease"
+                    "in review without an open worker PR"
+                    if in_review
+                    else "no orchestration status after a worker attempt"
                 )
                 actions.append(IssueAction(repo, number, "ready", reason))
 
@@ -705,7 +745,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     registry_api = GitHubAPI(os.environ.get("REGISTRY_GH_TOKEN", ""), "registry")
     registry_api.registry_repo = registry_repo
     target_api = GitHubAPI(os.environ.get("TARGET_GH_TOKEN", ""), "target")
-    bot_login = _bot_login(target_api)
+    bot_login = _bot_login(target_api, getattr(args, "bot_slug", "") or "")
     now = int(time.time())
 
     leases, _sha = _read_ledger(registry_api, registry_repo)
@@ -794,21 +834,35 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 if issue.get("comments", 0)
                 else []
             )
+            orphan_repair = action.reason in (
+                "in review without an open worker PR",
+                "no orchestration status after a worker attempt",
+            )
+            fresh_has_status = any(label.startswith("status:") for label in labels)
+            fresh_in_review = "status:in-progress-review" in labels
             if (
                 count_attempts(current_comments, bot_login)
                 >= limits[action.repo].max_attempts
             ):
                 mode = "defer"
-            elif "status:in-progress" not in labels:
+            elif not orphan_repair and "status:in-progress" not in labels:
                 print(
                     f"SKIP issue {action.repo}#{action.number}: no longer in progress"
+                )
+                continue
+            elif orphan_repair and (
+                "needs:user" in labels
+                or (fresh_has_status and not fresh_in_review)
+            ):
+                print(
+                    f"SKIP issue {action.repo}#{action.number}: status changed under grooming"
                 )
                 continue
             elif action.number in current_links[action.repo]:
                 print(f"SKIP issue {action.repo}#{action.number}: an open PR appeared")
                 continue
             elif (
-                action.reason.startswith("stale")
+                (action.reason.startswith("stale") or orphan_repair)
                 and now
                 - _epoch(
                     issue.get("updated_at"),
@@ -973,6 +1027,45 @@ def _self_test() -> int:
         label_transition({"status:ready", "status:in-progress"}, "defer"),
         ({"needs:user", "status:deferred"}, {"status:ready", "status:in-progress"}),
     )
+    check(
+        "ready transition clears the review-loop label",
+        label_transition({"status:in-progress-review"}, "ready"),
+        ({"status:ready"}, {"status:in-progress-review"}),
+    )
+
+    class _StubAPI:
+        def __init__(self, responses):
+            self.responses = responses
+            self.paths: list[str] = []
+
+        def request(self, method, path, **_kwargs):
+            self.paths.append(path)
+            return self.responses.get(path)
+
+    stub = _StubAPI({"/users/app%5Bbot%5D": {"login": "app[bot]"}})
+    check("bot login via app slug", _bot_login(stub, "app"), "app[bot]")
+    check(
+        "slug path avoids GET /user",
+        stub.paths,
+        ["/users/app%5Bbot%5D"],
+    )
+    mismatch_failed = False
+    try:
+        _bot_login(_StubAPI({"/users/app%5Bbot%5D": {"login": "other[bot]"}}), "app")
+    except GroomError:
+        mismatch_failed = True
+    check("slug/login mismatch fails closed", mismatch_failed, True)
+    unsafe_slug_failed = False
+    try:
+        _bot_login(_StubAPI({}), "bad/slug")
+    except GroomError:
+        unsafe_slug_failed = True
+    check("unsafe slug fails closed", unsafe_slug_failed, True)
+    check(
+        "no slug falls back to /user (non-App token)",
+        _bot_login(_StubAPI({"/user": {"login": "legacy[bot]"}})),
+        "legacy[bot]",
+    )
     old_pr = {
         "updated_at": datetime.fromtimestamp(now - 601, timezone.utc).isoformat(),
         "head": {"ref": "sparq-agent/issue-7-99-1"},
@@ -1031,6 +1124,54 @@ def _self_test() -> int:
     )
     check("fixture reclaims dead claim", dead, {"a" * 32})
     check("fixture has no PR writes", prs, [])
+
+    # Orphan repair: closed-unmerged worker PRs strip every status label ('complete' adds nothing),
+    # and a dead review loop leaves status:in-progress-review. Both are recoverable ONLY when the
+    # issue carries worker-attempt evidence, is stale, is not needs:user, and has no open PR.
+    stale_at = datetime.fromtimestamp(now - 700, timezone.utc).isoformat()
+    orphan_issues = {
+        "owner/repo": {
+            21: {"labels": [{"name": "role:impl"}], "updated_at": stale_at},
+            22: {"labels": [{"name": "status:in-progress-review"}], "updated_at": stale_at},
+            23: {"labels": [{"name": "role:impl"}], "updated_at": stale_at},  # no attempts
+            24: {"labels": [{"name": "role:impl"}, {"name": "needs:user"}],
+                 "updated_at": stale_at},
+            25: {"labels": [{"name": "status:in-progress-review"}], "updated_at": stale_at},
+            26: {"labels": [{"name": "status:deferred"}], "updated_at": stale_at},
+            27: {"labels": [{"name": "role:impl"}],
+                 "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat()},
+        }
+    }
+    linked_pull = {
+        "updated_at": stale_at,
+        "head": {"ref": "sparq-agent/issue-25-99-1"},
+        "body": "Fixes #25",
+    }
+    orphan_attempts = {("owner/repo", n): 1 for n in (21, 22, 24, 25, 26, 27)}
+    orphan_attempts[("owner/repo", 23)] = 0
+    orphan_actions, _prs2, _dead2 = _plan_actions(
+        {"owner/repo": limits},
+        orphan_issues,
+        {"owner/repo": {99: linked_pull}},
+        orphan_attempts,
+        {},
+        [],
+        {},
+        now,
+    )
+    check(
+        "orphan repair readies dead states only",
+        sorted((action.number, action.mode) for action in orphan_actions),
+        [(21, "ready"), (22, "ready")],
+    )
+    check(
+        "orphan repair reasons are recoverable",
+        sorted(action.reason for action in orphan_actions),
+        [
+            "in review without an open worker PR",
+            "no orchestration status after a worker attempt",
+        ],
+    )
     malformed_failed = False
     try:
         validate_ledger({"leases": [{**base, "claim_id": "unsafe"}]})
@@ -1048,6 +1189,11 @@ def main() -> int:
     parser.add_argument("--registry-repo")
     parser.add_argument("--policy-file", default="policy/repos.toml")
     parser.add_argument("--policy-resolver", default="scripts/policy-resolve.py")
+    parser.add_argument(
+        "--bot-slug",
+        default="",
+        help="GitHub App slug from the token mint step (an installation token cannot GET /user)",
+    )
     args = parser.parse_args()
     if args.self_test:
         return _self_test()

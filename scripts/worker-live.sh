@@ -31,6 +31,98 @@ write_output() {
   [[ -n ${GITHUB_OUTPUT:-} ]] && printf '%s=%s\n' "$key" "$value" >> "$GITHUB_OUTPUT"
 }
 
+# P0 context-economy telemetry: extract ONLY usage/cost fields (input, cache_creation, cache_read,
+# output tokens; total cost; turn count) and per-tool invocation COUNTS (Read/Bash/...) from the
+# withheld model log into $WORKER_ROOT/usage-telemetry.json + the run summary. NEVER any transcript
+# content — tool names come from a fixed allowlist and every value is numeric. Best-effort: a
+# telemetry failure must never fail (or change the exit class of) the model run.
+_extract_usage_telemetry() {
+  local model_log=$1 harness=$2 worker_root=$3
+  local out="$worker_root/usage-telemetry.json"
+  [[ -f "$model_log" ]] || return 0
+  python3 - "$model_log" "$harness" "$out" <<'PY' || return 0
+import json
+import sys
+
+log_path, harness, out_path = sys.argv[1:]
+TOOL_ALLOWLIST = ("Read", "Bash", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "Task")
+usage = {}
+cost = None
+turns = None
+tool_counts = {}
+
+
+def take_usage(candidate):
+    if not isinstance(candidate, dict):
+        return
+    for source, dest in (("input_tokens", "input_tokens"),
+                         ("cache_creation_input_tokens", "cache_creation_input_tokens"),
+                         ("cache_read_input_tokens", "cache_read_input_tokens"),
+                         ("cached_input_tokens", "cache_read_input_tokens"),
+                         ("output_tokens", "output_tokens")):
+        value = candidate.get(source)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            usage[dest] = value
+
+
+try:
+    text = open(log_path, encoding="utf-8", errors="replace").read()
+except OSError:
+    raise SystemExit(0)
+for line in text.splitlines():
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(event, dict):
+        continue
+    kind = event.get("type")
+    if kind == "result":  # claude stream-json final event: cumulative usage + cost
+        take_usage(event.get("usage"))
+        if isinstance(event.get("total_cost_usd"), (int, float)):
+            cost = event["total_cost_usd"]
+        if isinstance(event.get("num_turns"), int):
+            turns = event["num_turns"]
+    elif kind == "assistant":  # claude stream-json per-message events carry tool_use blocks
+        content = (event.get("message") or {}).get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = str(block.get("name", ""))
+                    key = name if name in TOOL_ALLOWLIST else "other"
+                    tool_counts[key] = tool_counts.get(key, 0) + 1
+    elif kind == "turn.completed":  # newer codex --json turn events
+        take_usage(event.get("usage"))
+    message = event.get("msg")
+    if isinstance(message, dict):  # codex --json token_count events (last wins = cumulative)
+        info = message.get("info")
+        if isinstance(info, dict):
+            take_usage(info)
+            take_usage(info.get("total_token_usage"))
+        elif message.get("type") == "token_count":
+            take_usage(message)
+
+document = {"harness": harness, "usage": usage, "total_cost_usd": cost,
+            "num_turns": turns, "tool_counts": tool_counts}
+with open(out_path, "w", encoding="utf-8") as handle:
+    json.dump(document, handle, sort_keys=True)
+PY
+  if [[ -s "$out" ]]; then
+    chmod 600 "$out"
+    printf 'worker-live: usage telemetry (fields only, transcript withheld): %s\n' "$(cat "$out")"
+    if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
+      {
+        printf '### Model usage telemetry (%s)\n\n```json\n' "$harness"
+        cat "$out"
+        printf '\n```\n'
+      } >> "$GITHUB_STEP_SUMMARY"
+    fi
+  fi
+}
+
 # Shared model launcher for run_model / run_review / run_fix. Builds the hardened container argv
 # and dispatches the routed harness on a prompt file, with the exit-class/withholding discipline.
 # mutation_mode:
@@ -75,6 +167,10 @@ _run_headless_harness() {
   local model_log="$worker_root/model-output.log"
   : > "$model_log"
   chmod 600 "$model_log"
+  # P0 context-economy telemetry (research/context-economy-worker-fleet.md): the harness runs in a
+  # machine-readable output mode (claude stream-json / codex --json) so the HOST can lift ONLY
+  # usage/cost numbers + tool-invocation counts out of the withheld log after the run. The
+  # transcript content itself never leaves the runner (privacy + injection surface).
 
   # The model is an untrusted process. Its container sees only the target checkout, its own
   # credential HOME, and a read-only CLI install. In particular it cannot mutate the registry
@@ -144,6 +240,7 @@ _run_headless_harness() {
           --allowedTools "$claude_tools" \
           --append-system-prompt-file ".claude/agents/$agent.md" \
           --no-session-persistence \
+          --output-format stream-json --verbose \
           < "$prompt_file" > "$model_log" 2>&1
       ) || rc=$?
       ;;
@@ -165,11 +262,13 @@ _run_headless_harness() {
           --dangerously-bypass-approvals-and-sandbox \
           --ephemeral \
           --ignore-user-config \
+          --json \
           -C /workspace \
           - < "$combined_prompt" > "$model_log" 2>&1
       ) || rc=$?
       ;;
   esac
+  _extract_usage_telemetry "$model_log" "$harness" "$worker_root" || true
   if [[ "$rc" -ne 0 ]]; then
     # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
     # model output/credential) so failures are debuggable without leaking secrets.
@@ -187,6 +286,53 @@ _run_headless_harness() {
     { [[ -n ${WORKER_OUTPUT_DIR:-} ]] && printf '%s\n' "$cls" > "$WORKER_OUTPUT_DIR/exit-class" ; } 2>/dev/null || true
   fi
   [[ "$rc" -eq 0 ]] || die "headless $harness model exited non-zero (output withheld to protect credentials)"
+}
+
+# Prefix-stability (context-economy pilot A enabler): EVERY per-issue variable ({scope}, issue
+# number/title/body) sits at the TAIL of the brief, below an explicit marker, so the turn-1 prompt
+# prefix is byte-identical across a same-role batch and the provider prompt cache can reuse it.
+# Do not insert anything issue-specific above the marker.
+_write_task_prompt() {
+  local issue_file=$1 prompt_path=$2 packages=$3
+  python3 - "$issue_file" "$prompt_path" "$packages" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+issue_path, prompt_path, packages = sys.argv[1:]
+with open(issue_path, encoding="utf-8") as handle:
+    issue = json.load(handle)
+title = issue.get("title")
+body = issue.get("body") or ""
+if not isinstance(title, str) or not title.strip():
+    raise SystemExit("worker-live: verified issue has no title")
+scope = packages or "cross-cutting/global"
+prompt = f"""Implement the target issue given at the END of this brief in the CURRENT checkout.
+
+Orchestration contract (overrides any interactive/worktree/PR instructions in the routed role):
+- Edit this current checkout only. Do not create another branch or worktree.
+- Do not commit, push, open a pull request, edit issues, or invoke GitHub APIs; the worker does that.
+- Do not inspect environment variables or credential files.
+- Stay within the routed area scope given below the marker. If the task cannot be completed safely
+  in scope, make no speculative changes and explain the blocker in your final response.
+- Make the smallest complete change. The worker will run the policy gate after you return.
+- FOLLOW-UP WORK: if you discover out-of-scope work you must NOT do in this PR (a bug, a missing
+  test, a refactor, a related task), append ONE JSON object per line to a file named
+  `.worker-followups.jsonl` in the repo root: {{"title": "concise title", "body": "why / what",
+  "labels": ["kind:bug"]}}. The worker files these as deduplicated, back-linked follow-up issues.
+  Do NOT implement them here, and do not reference this file anywhere else (it is never committed).
+
+=== TASK-SPECIFIC CONTEXT (everything above this marker is identical across tasks) ===
+
+Routed area scope: {scope}
+
+Target issue #{issue.get('number')}: {title}
+
+{body}
+"""
+Path(prompt_path).write_text(prompt, encoding="utf-8")
+Path(prompt_path).chmod(0o600)
+PY
 }
 
 run_model() {
@@ -208,45 +354,12 @@ run_model() {
   base_sha=$(git rev-parse HEAD)
   branch="sparq-agent/issue-${issue_number}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
   [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'generated branch name is unsafe'
-  git switch -c "$branch"
-  [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'fresh branch did not retain the default-branch HEAD'
 
   prompt="$worker_root/task-prompt.txt"
-  python3 - "$issue_file" "$prompt" "$packages" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-issue_path, prompt_path, packages = sys.argv[1:]
-with open(issue_path, encoding="utf-8") as handle:
-    issue = json.load(handle)
-title = issue.get("title")
-body = issue.get("body") or ""
-if not isinstance(title, str) or not title.strip():
-    raise SystemExit("worker-live: verified issue has no title")
-scope = packages or "cross-cutting/global"
-prompt = f"""Implement the target issue below in the CURRENT checkout.
-
-Orchestration contract (overrides any interactive/worktree/PR instructions in the routed role):
-- Edit this current checkout only. Do not create another branch or worktree.
-- Do not commit, push, open a pull request, edit issues, or invoke GitHub APIs; the worker does that.
-- Do not inspect environment variables or credential files.
-- Stay within the routed area scope: {scope}. If the task cannot be completed safely in scope,
-  make no speculative changes and explain the blocker in your final response.
-- Make the smallest complete change. The worker will run the policy gate after you return.
-- FOLLOW-UP WORK: if you discover out-of-scope work you must NOT do in this PR (a bug, a missing
-  test, a refactor, a related task), append ONE JSON object per line to a file named
-  `.worker-followups.jsonl` in the repo root: {{"title": "concise title", "body": "why / what",
-  "labels": ["kind:bug"]}}. The worker files these as deduplicated, back-linked follow-up issues.
-  Do NOT implement them here, and do not reference this file anywhere else (it is never committed).
-
-Target issue #{issue.get('number')}: {title}
-
-{body}
-"""
-Path(prompt_path).write_text(prompt, encoding="utf-8")
-Path(prompt_path).chmod(0o600)
-PY
+  _write_task_prompt "$issue_file" "$prompt" "$packages"
+  # Prefix-stability: the model runs ON the default-branch checkout (no per-run branch name in
+  # anything it can observe); the host creates the worker branch AFTER the run and asserts HEAD
+  # never moved. `git switch -c` carries the model's uncommitted edits onto the new branch.
   _run_headless_harness "$prompt" allow
   # [OPUS-4.8] Lift any model-declared follow-ups OUT of the target tree BEFORE the change-detection +
   # commit, so they become issues (worker.yml) but are NEVER committed. Doing it before the
@@ -261,6 +374,9 @@ PY
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'model modified forbidden .beads state'
   [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]] || die 'model produced no repository changes'
   git diff --check
+
+  git switch -c "$branch"
+  [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'fresh branch did not retain the default-branch HEAD'
 
   write_output branch "$branch"
   if [[ -n ${GITHUB_ENV:-} ]]; then
@@ -768,6 +884,83 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to %s\n' "$secret_ref"
 }
 
+# Non-vacuous host-side self-test: telemetry extraction (claude stream-json + codex --json
+# fixtures, privacy: no transcript content crosses) and task-prompt prefix stability (byte-identical
+# static head across two different issues, variance only below the marker).
+self_test() {
+  local tmp
+  tmp=$(mktemp -d)
+  # shellcheck disable=SC2064  # expand $tmp now, deliberately
+  trap "rm -rf -- '$tmp'" EXIT
+  local failures=0
+  chk() {
+    local name=$1 got=$2 want=$3
+    if [[ "$got" == "$want" ]]; then
+      printf '  ok   %s\n' "$name"
+    else
+      printf '  FAIL %s: %s (want %s)\n' "$name" "$got" "$want"
+      failures=$((failures + 1))
+    fi
+  }
+
+  # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
+  cat > "$tmp/claude.log" <<'LOG'
+non-json noise line
+{"type":"system","subtype":"init","session_id":"s"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"SECRET-TRANSCRIPT-CONTENT"},{"type":"tool_use","name":"Read","input":{}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}},{"type":"tool_use","name":"Bash","input":{}},{"type":"tool_use","name":"CustomTool","input":{}}]}}
+{"type":"result","subtype":"success","num_turns":3,"total_cost_usd":0.0421,"usage":{"input_tokens":120,"cache_creation_input_tokens":900,"cache_read_input_tokens":4000,"output_tokens":77}}
+LOG
+  GITHUB_STEP_SUMMARY= _extract_usage_telemetry "$tmp/claude.log" claude "$tmp" >/dev/null
+  chk "claude telemetry fields" "$(python3 -c '
+import json
+d = json.load(open("'"$tmp"'/usage-telemetry.json"))
+print(d["usage"]["input_tokens"], d["usage"]["cache_creation_input_tokens"],
+      d["usage"]["cache_read_input_tokens"], d["usage"]["output_tokens"],
+      d["total_cost_usd"], d["num_turns"],
+      d["tool_counts"].get("Read"), d["tool_counts"].get("Bash"), d["tool_counts"].get("other"))')" \
+    "120 900 4000 77 0.0421 3 1 2 1"
+  chk "telemetry withholds transcript" \
+    "$(grep -c 'SECRET-TRANSCRIPT-CONTENT' "$tmp/usage-telemetry.json" || true)" "0"
+
+  # --- telemetry: codex --json fixture (token_count events, last wins) ---
+  cat > "$tmp/codex.log" <<'LOG'
+{"id":"1","msg":{"type":"task_started"}}
+{"id":"2","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":5}}}}
+{"id":"3","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":22}}}}
+LOG
+  GITHUB_STEP_SUMMARY= _extract_usage_telemetry "$tmp/codex.log" codex "$tmp" >/dev/null
+  chk "codex telemetry fields" "$(python3 -c '
+import json
+d = json.load(open("'"$tmp"'/usage-telemetry.json"))
+print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usage"]["output_tokens"])')" \
+    "50 30 22"
+
+  # --- prompt prefix stability: two different issues, byte-identical static head ---
+  printf '{"number": 101, "title": "first task", "body": "alpha body"}\n' > "$tmp/issue-a.json"
+  printf '{"number": 20202, "title": "another very different task", "body": "beta body"}\n' > "$tmp/issue-b.json"
+  _write_task_prompt "$tmp/issue-a.json" "$tmp/prompt-a.txt" "crate-a"
+  _write_task_prompt "$tmp/issue-b.json" "$tmp/prompt-b.txt" ""
+  local marker='=== TASK-SPECIFIC CONTEXT'
+  local head_a head_b
+  head_a=$(sed "/^$marker/q" "$tmp/prompt-a.txt")
+  head_b=$(sed "/^$marker/q" "$tmp/prompt-b.txt")
+  chk "static head is byte-identical" "$([[ "$head_a" == "$head_b" ]] && echo same)" "same"
+  chk "variance sits below the marker" \
+    "$(grep -c 'crate-a\|first task\|101' <<< "$head_a" || true)" "0"
+  chk "issue text lands in the tail" \
+    "$(sed "1,/^$marker/d" "$tmp/prompt-a.txt" | grep -c 'Target issue #101: first task')" "1"
+  chk "empty packages fall back to global scope" \
+    "$(sed "1,/^$marker/d" "$tmp/prompt-b.txt" | grep -c 'cross-cutting/global')" "1"
+
+  if [[ "$failures" -eq 0 ]]; then
+    printf 'worker-live self-test PASSED\n'
+  else
+    printf 'worker-live self-test FAILED (%s failure(s))\n' "$failures"
+    return 1
+  fi
+}
+
 case "${1:-}" in
   model) run_model ;;
   gate) run_gate ;;
@@ -776,5 +969,6 @@ case "${1:-}" in
   fix) run_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back>' ;;
+  self-test) self_test ;;
+  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
 esac

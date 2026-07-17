@@ -20,6 +20,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -27,6 +28,24 @@ import sys
 # this exact pair the API returns 429 for fable and never emits the 7d_oi sub-quota headers.
 _CLAUDE_CODE_UA = "claude-cli/2.1.177 (external, cli)"
 _CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+
+# Secret-exfil hardening (audit-2026-07-17): a secret_ref is DEREFERENCED from the secrets map, so a
+# poisoned account issue could otherwise name ANY workflow secret (e.g. REGISTRY_ADMIN_APP_KEY) and
+# route it into the probe. Only worker-account token names are ever dereferenced. Matches the real
+# naming scheme `${handle^^}_TOKEN` (ACCT01_TOKEN, ACCT2CSS_TOKEN, ...).
+SECRET_REF_RE = re.compile(r"ACCT[A-Z0-9]+_TOKEN")
+
+
+def _parse_rate_headers(header_text):
+    """Parse raw curl -D header output into the anthropic-ratelimit-unified-* map (lowercased keys,
+    prefix stripped). Pure — unit-tested by --self-test."""
+    hdr = {}
+    for line in header_text.splitlines():
+        low = line.lower()
+        if low.startswith("anthropic-ratelimit-unified-") and ":" in line:
+            key, _, val = line.partition(":")
+            hdr[key.strip().lower()[len("anthropic-ratelimit-unified-"):]] = val.strip()
+    return hdr
 
 
 def _probe_headers(token, model, claude_code=False):
@@ -54,13 +73,20 @@ def _probe_headers(token, model, claude_code=False):
         proc = subprocess.run(args, capture_output=True, text=True, timeout=30, check=False)
     except (subprocess.SubprocessError, OSError):
         return None
-    hdr = {}
-    for line in proc.stdout.splitlines():
-        low = line.lower()
-        if low.startswith("anthropic-ratelimit-unified-") and ":" in line:
-            key, _, val = line.partition(":")
-            hdr[key.strip().lower()[len("anthropic-ratelimit-unified-"):]] = val.strip()
-    return hdr
+    return _parse_rate_headers(proc.stdout)
+
+
+def _assemble_usage(hdr):
+    """Build the per-account usage entry from a parsed header map. Includes the raw *-limit header
+    values when the provider exposes them (capacity-model measurement: the per-account tier limits
+    were 'TBD' — persisting the live limits stops admission flying blind). Pure — unit-tested."""
+    entry = {"status": hdr.get("status"),
+             "5h_util": hdr.get("5h-utilization"), "5h_reset": hdr.get("5h-reset"),
+             "7d_util": hdr.get("7d-utilization"), "7d_reset": hdr.get("7d-reset")}
+    for key, source in (("5h_limit", "5h-limit"), ("7d_limit", "7d-limit")):
+        if hdr.get(source) is not None:
+            entry[key] = hdr.get(source)
+    return entry
 
 
 def _probe_anthropic(token):
@@ -68,9 +94,7 @@ def _probe_anthropic(token):
     hdr = _probe_headers(token, "claude-haiku-4-5")
     if hdr is None or hdr.get("status") is None:
         return None  # transport error or no rate-limit headers (e.g. 401/blocked) -> fail-closed omit
-    return {"status": hdr.get("status"),
-            "5h_util": hdr.get("5h-utilization"), "5h_reset": hdr.get("5h-reset"),
-            "7d_util": hdr.get("7d-utilization"), "7d_reset": hdr.get("7d-reset")}
+    return _assemble_usage(hdr)
 
 
 def _probe_fable(token):
@@ -82,9 +106,12 @@ def _probe_fable(token):
     hdr = _probe_headers(token, "claude-fable-5", claude_code=True)
     if hdr is None or hdr.get("7d_oi-utilization") is None:
         return None  # not a 200 with the sub-quota window (rejected/exhausted/absent) -> fail-closed fable
-    return {"fable_ok": True,
-            "fable_7d_oi_util": hdr.get("7d_oi-utilization"),
-            "fable_7d_oi_reset": hdr.get("7d_oi-reset")}
+    result = {"fable_ok": True,
+              "fable_7d_oi_util": hdr.get("7d_oi-utilization"),
+              "fable_7d_oi_reset": hdr.get("7d_oi-reset")}
+    if hdr.get("7d_oi-limit") is not None:
+        result["fable_7d_oi_limit"] = hdr.get("7d_oi-limit")
+    return result
 
 
 def _load_accounts(script_dir, registry_repo):
@@ -95,10 +122,99 @@ def _load_accounts(script_dir, registry_repo):
     return module.read_accounts(registry_repo)
 
 
+def _load_secrets():
+    """The ACCT_* token subset. SECRETS_FILE (a host-filtered file containing ONLY worker-account
+    tokens) is preferred; SECRETS_JSON (toJSON(secrets)) remains as a fallback for older callers."""
+    path = os.environ.get("SECRETS_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+    try:
+        data = json.loads(os.environ.get("SECRETS_JSON", "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# --- tier-limit persistence (capacity model, 2026-07-17 measurement) ------------------------------
+LIMIT_KEYS = ("5h_limit", "7d_limit", "fable_7d_oi_limit")
+
+
+def _limits_line(entry):
+    """The single `limits:` front-matter line for an account issue, or None when the probe exposed
+    no *-limit headers. Values are the raw header strings (no unit guessing)."""
+    parts = [f"{key}={entry[key]}" for key in LIMIT_KEYS
+             if isinstance(entry, dict) and entry.get(key)]
+    return ("limits: " + " ".join(parts)) if parts else None
+
+
+def _upsert_limits_line(body, line):
+    """(new_body, changed): replace or append the one `limits:` line, idempotently (an identical
+    line means changed=False, so re-probes do not churn issue bodies)."""
+    lines = (body or "").splitlines()
+    out, replaced, changed = [], False, False
+    for existing in lines:
+        if existing.strip().startswith("limits:") and not replaced:
+            replaced = True
+            if existing.strip() != line:
+                out.append(line)
+                changed = True
+            else:
+                out.append(existing)
+        else:
+            out.append(existing)
+    if not replaced:
+        out.append(line)
+        changed = True
+    return "\n".join(out), changed
+
+
+def persist_limits(usage_path):
+    """Write probed tier limits into the account issues' front-matter (title == handle) so the
+    capacity model stops flying blind. Best-effort: never fails the caller; per-account errors are
+    swallowed. select-and-claim's _parse_account ignores unknown keys, so the extra line is inert
+    for the allocator. Privacy: prints carry no handles or counts (locked decision 22b); the
+    account issues themselves already enumerate the catalog (task #325 seam: they move private)."""
+    registry_repo = os.environ["REGISTRY_REPO"]
+    try:
+        with open(usage_path, encoding="utf-8") as handle:
+            usage = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        print("account-usage: no usage snapshot; tier-limit persistence skipped")
+        return 0
+    try:
+        raw = subprocess.run(
+            ["gh", "issue", "list", "-R", registry_repo, "--state", "open", "--limit", "500",
+             "--json", "number,title,body"],
+            capture_output=True, text=True, timeout=60, check=False).stdout
+        issues = json.loads(raw or "[]")
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
+        print("account-usage: account catalog read failed; tier-limit persistence skipped")
+        return 0
+    for issue in issues:
+        handle = str(issue.get("title", "")).strip()
+        line = _limits_line(usage.get(handle)) if isinstance(usage, dict) else None
+        if not line:
+            continue
+        new_body, changed = _upsert_limits_line(issue.get("body") or "", line)
+        if not changed:
+            continue
+        subprocess.run(
+            ["gh", "issue", "edit", str(issue.get("number")), "-R", registry_repo,
+             "--body", new_body],
+            capture_output=True, text=True, timeout=60, check=False)
+    print("account-usage: tier-limit lines refreshed")
+    return 0
+
+
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     registry_repo = os.environ["REGISTRY_REPO"]
-    secrets = json.loads(os.environ.get("SECRETS_JSON", "{}"))
+    secrets = _load_secrets()
     pool = json.loads(os.environ.get("ACCOUNT_POOL", "[]"))  # optional handle allow-list
     usage = {}
     for account in _load_accounts(script_dir, registry_repo):
@@ -108,7 +224,10 @@ def main():
         if str(account.get("provider", "")).lower() != "anthropic":
             usage[handle] = {"exempt": True}
             continue
-        token = secrets.get(account.get("secret_ref"))
+        ref = account.get("secret_ref")
+        if not isinstance(ref, str) or SECRET_REF_RE.fullmatch(ref) is None:
+            continue  # fail-closed omit: never dereference a non-worker-token secret name
+        token = secrets.get(ref)
         if not token:
             continue  # fail-closed omit
         probed = _probe_anthropic(token)
@@ -123,7 +242,59 @@ def main():
                 probed.update(fable)
         usage[handle] = probed
     json.dump(usage, sys.stdout)
+    return 0
+
+
+def _self_test():
+    ok = True
+
+    def chk(n, got, want):
+        nonlocal ok
+        good = got == want
+        ok = ok and good
+        print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
+
+    # secret_ref allow-list: only worker-account token names are dereferenced (audit-2026-07-17)
+    for ref, want in (("ACCT01_TOKEN", True), ("ACCT2CSS_TOKEN", True), ("ACCT99_TOKEN", True),
+                      ("GITHUB_TOKEN", False), ("REGISTRY_ADMIN_APP_KEY", False),
+                      ("acct01_token", False), ("ACCT01_TOKEN\n", False), ("ACCT_", False)):
+        chk(f"secret_ref gate {ref!r}", SECRET_REF_RE.fullmatch(ref) is not None, want)
+    # header parsing from raw curl -D output (case-insensitive names, values trimmed)
+    hdr = _parse_rate_headers(
+        "HTTP/2 200\r\n"
+        "Anthropic-Ratelimit-Unified-Status: allowed\r\n"
+        "anthropic-ratelimit-unified-5h-utilization: 0.42\r\n"
+        "anthropic-ratelimit-unified-5h-limit:  1000000 \r\n"
+        "anthropic-ratelimit-unified-7d-utilization: 0.1\r\n"
+        "x-other: ignored\r\n")
+    chk("header parse status", hdr.get("status"), "allowed")
+    chk("header parse limit trimmed", hdr.get("5h-limit"), "1000000")
+    chk("header parse ignores others", "x-other" in hdr, False)
+    # usage assembly includes limits ONLY when the provider exposes them
+    entry = _assemble_usage(hdr)
+    chk("assemble includes exposed limit", entry.get("5h_limit"), "1000000")
+    chk("assemble omits absent limit", "7d_limit" in entry, False)
+    chk("assemble keeps util fields", entry.get("5h_util"), "0.42")
+    # limits front-matter line + idempotent upsert
+    chk("limits line", _limits_line({"5h_limit": "10", "7d_limit": "70"}),
+        "limits: 5h_limit=10 7d_limit=70")
+    chk("limits line absent", _limits_line({"5h_util": "0.1"}), None)
+    body = "provider: anthropic\nmodels: [haiku]\n"
+    body2, changed = _upsert_limits_line(body, "limits: 5h_limit=10")
+    chk("upsert appends", (changed, body2.endswith("limits: 5h_limit=10")), (True, True))
+    body3, changed2 = _upsert_limits_line(body2, "limits: 5h_limit=10")
+    chk("upsert is idempotent", (changed2, body3), (False, body2))
+    body4, changed3 = _upsert_limits_line(body2, "limits: 5h_limit=20")
+    chk("upsert replaces on change", (changed3, "5h_limit=20" in body4, "5h_limit=10" in body4),
+        (True, True, False))
+    print("account-usage self-test", "PASSED" if ok else "FAILED")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    if "--self-test" in sys.argv:
+        sys.exit(_self_test())
+    if "--persist-limits" in sys.argv:
+        index = sys.argv.index("--persist-limits")
+        sys.exit(persist_limits(sys.argv[index + 1]))
+    sys.exit(main())

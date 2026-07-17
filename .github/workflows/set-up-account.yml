@@ -1,12 +1,19 @@
 # [OPUS-4.8] Web-login broker (review-hardened S5): a maintainer opens a "set up new account" issue
 # labelled `set-up-account`; the broker posts a sign-in URL/code, captures the token, and stores it.
 #
-# Hardening vs the GPT-5.6 review: actor AND author must be admin/maintain; REGISTRY_ADMIN_TOKEN is
+# Hardening vs the GPT-5.6 review: actor AND author must be admin/maintain; the secrets-write PAT is
 # required BEFORE any login (no capturing a credential we can't store); actions are SHA-pinned and the
 # CLI is version-pinned with no curl-to-shell; enrollments are serialized; provider is structured
-# (a provider:* label, no silent default); the target-repo secret uses REGISTRY_ADMIN_TOKEN while
-# registry operations use github.token (fine-grained PATs cannot span two owners); the token is never
-# echoed (only `gh secret set < file`); an always() step shreds all auth state.
+# (a provider:* label, no silent default); the token is never echoed (only `gh secret set < file`);
+# an always() step shreds all auth state.
+#
+# COMPLETION fixes (audit-2026-07-17): the captured secret is stored on THIS registry repo — the
+# only place any consumer reads it (worker.yml `secrets[secret_ref]`, the dispatch usage probe,
+# fingerprint-accounts; the old sparq-org/sparq write registered accounts nothing could use). The
+# account issue now carries the `models:` line read_accounts requires (an account with empty models
+# is silently invisible to the allocator), the broker validates its own registration through the
+# real read_accounts parser, and the handle is appended to policy/repos.toml account_pool with a
+# contents-API compare-and-swap (rebase-retry) so no human policy edit is left dangling.
 name: set-up-account
 on:
   issues:
@@ -14,7 +21,7 @@ on:
 
 permissions:
   issues: write
-  contents: read
+  contents: write   # policy/repos.toml account_pool append (contents-API CAS)
 
 concurrency:
   group: set-up-account
@@ -26,7 +33,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      TARGET_REPO: sparq-org/sparq
       GH_TOKEN: ${{ github.token }}
     steps:
       # The `runner` context is not valid in job-level env (it invalidated the whole workflow —
@@ -44,13 +50,16 @@ jobs:
             esac
           done
 
-      - name: Preflight — require REGISTRY_ADMIN_TOKEN before any login
+      # The workflow's own github.token cannot write Actions secrets; REGISTRY_SECRETS_PAT is the
+      # existing jeswr-owned fine-grained PAT with Secrets:write on THIS registry repo (already
+      # proven by the rotation write-back in worker-live.sh).
+      - name: Preflight — require REGISTRY_SECRETS_PAT before any login
         env:
-          ADMIN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
+          REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: |
-          if [ -z "${ADMIN:-}" ]; then
+          if [ -z "${REGISTRY_PAT:-}" ]; then
             gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "❌ REGISTRY_ADMIN_TOKEN is not set, so a captured token could not be stored. Refusing to start login. Add the fine-grained PAT (Secrets:write on $TARGET_REPO) as \`REGISTRY_ADMIN_TOKEN\`, then re-apply the label." || true
+              --body "❌ REGISTRY_SECRETS_PAT is not set, so a captured token could not be stored. Refusing to start login. Add the fine-grained PAT (Secrets:write on ${{ github.repository }}) as \`REGISTRY_SECRETS_PAT\`, then re-apply the label." || true
             exit 1
           fi
 
@@ -66,11 +75,17 @@ jobs:
               --body "❌ Add a \`provider:openai\` or \`provider:anthropic\` label, then re-apply \`set-up-account\`." || true
             exit 1
           fi
+          # The models line the allocator requires (read_accounts drops model-less accounts),
+          # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
+          if [ "$prov" = openai ]; then models='[terra]'; else models='[fable, opus, sonnet, haiku]'; fi
           n=$(gh issue list -R "${{ github.repository }}" --state all --json title \
                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]|max // 0' 2>/dev/null || echo 0)
-          printf 'provider=%s\n' "$prov" >> "$GITHUB_OUTPUT"
-          printf 'handle=acct%02d\n' "$((n+1))" >> "$GITHUB_OUTPUT"
-          printf 'secret=ACCT%02d_TOKEN\n' "$((n+1))" >> "$GITHUB_OUTPUT"
+          {
+            printf 'provider=%s\n' "$prov"
+            printf 'models=%s\n' "$models"
+            printf 'handle=acct%02d\n' "$((n+1))"
+            printf 'secret=ACCT%02d_TOKEN\n' "$((n+1))"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout (pinned)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -92,28 +107,133 @@ jobs:
           BR=$!
           for _ in $(seq 1 40); do [ -s "$LOGIN_DIR/signin.txt" ] && break; sleep 2; done
           if [ -s "$LOGIN_DIR/signin.txt" ]; then
+            # shellcheck disable=SC2016  # single-quoted printf FORMAT (markdown backticks) is deliberate
             gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
               --body "$(printf '### Sign in to register this account\n\n```\n%s\n```\n\n_Only continue if you started this. The token is captured and stored as a secret; it is never printed._' "$(cat "$LOGIN_DIR/signin.txt")")"
           fi
           if wait "$BR"; then echo "status=ok" >> "$GITHUB_OUTPUT"; else echo "status=fail" >> "$GITHUB_OUTPUT"; fi
 
-      - name: Store token (target secret via ADMIN) + register (github.token)
+      - name: Store token (REGISTRY secret — where workers read it) + register (github.token)
         if: steps.login.outputs.status == 'ok'
         env:
-          ADMIN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
+          REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
+          PROVIDER: ${{ steps.meta.outputs.provider }}
+          MODELS: ${{ steps.meta.outputs.models }}
+          HANDLE: ${{ steps.meta.outputs.handle }}
+          SECRET_NAME: ${{ steps.meta.outputs.secret }}
         run: |
           set -euo pipefail
-          # target-repo secret write needs the admin PAT; never echo the token — gh reads the file.
-          GH_TOKEN="$ADMIN" gh secret set "${{ steps.meta.outputs.secret }}" -R "$TARGET_REPO" < "$LOGIN_DIR/token"
+          # The secret lives on THIS registry repo: worker.yml resolves secrets[secret_ref] here,
+          # the dispatch usage probe reads registry secrets, and the rotation write-back targets the
+          # registry too. Never echo the token — gh reads the file.
+          GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" -R "${{ github.repository }}" < "$LOGIN_DIR/token"
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
-          harness=$([ "${{ steps.meta.outputs.provider }}" = openai ] && echo codex || echo claude)
+          harness=$([ "$PROVIDER" = openai ] && echo codex || echo claude)
           # registry issue + comment use the workflow's own github.token (same-owner)
           gh issue create -R "${{ github.repository }}" \
-            --title "${{ steps.meta.outputs.handle }}" \
-            --label "provider:${{ steps.meta.outputs.provider }}" --label status:available \
-            --body "$(printf 'provider: %s\nharness: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nnotes: registered via set-up-account broker\n' "${{ steps.meta.outputs.provider }}" "$harness" "$fmt" "${{ steps.meta.outputs.secret }}")"
+            --title "$HANDLE" \
+            --label "provider:$PROVIDER" --label status:available \
+            --body "$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nnotes: registered via set-up-account broker\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME")"
+
+      - name: Validate the registration through the real allocator parser
+        if: steps.login.outputs.status == 'ok'
+        env:
+          NEW_HANDLE: ${{ steps.meta.outputs.handle }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import importlib.util
+          import os
+
+          spec = importlib.util.spec_from_file_location(
+              "registry_select_and_claim", "scripts/select-and-claim.py")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          handle = os.environ["NEW_HANDLE"]
+          accounts = {a["handle"]: a for a in module.read_accounts(os.environ["GITHUB_REPOSITORY"])}
+          account = accounts.get(handle)
+          if account is None or not account.get("models"):
+              raise SystemExit(
+                  f"registration validation FAILED: {handle} is invisible to read_accounts "
+                  "(missing or empty models line) — the allocator could never select it")
+          print(f"registration validated: {handle} models={account['models']}")
+          PY
+
+      # SEAM(#325): the account-pool list is slated to move to a PRIVATE location; until then
+      # policy/repos.toml account_pool is the single allow-list every enforcement point checks
+      # (policy-resolve validation, claim()'s pool filter, worker.yml's independent re-check), so
+      # the broker appends the new handle there via a contents-API compare-and-swap.
+      - name: Append the handle to policy account_pool (contents-API CAS, rebase-retry)
+        if: steps.login.outputs.status == 'ok'
+        env:
+          NEW_HANDLE: ${{ steps.meta.outputs.handle }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          import tomllib
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          handle = os.environ["NEW_HANDLE"]
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", handle):
+              raise SystemExit("unsafe handle")
+          path = "policy/repos.toml"
+
+          def gh_api(args, input_doc=None):
+              result = subprocess.run(
+                  ["gh", "api", *args], capture_output=True, text=True, check=False,
+                  input=json.dumps(input_doc) if input_doc is not None else None)
+              return result
+
+          for attempt in range(6):
+              meta = gh_api([f"repos/{repo}/contents/{path}"])
+              if meta.returncode != 0:
+                  raise SystemExit("policy file read failed")
+              document = json.loads(meta.stdout)
+              text = base64.b64decode("".join(document["content"].split())).decode()
+              pattern = re.compile(r"(?m)^(account_pool\s*=\s*\[)([^\]]*)(\])")
+              def append(match):
+                  entries = match.group(2)
+                  if f'"{handle}"' in entries:
+                      return match.group(0)
+                  separator = ", " if entries.strip() else ""
+                  return f"{match.group(1)}{entries}{separator}\"{handle}\"{match.group(3)}"
+              new_text, count = pattern.subn(append, text)
+              if count == 0:
+                  raise SystemExit("no account_pool line found in policy/repos.toml")
+              if new_text == text:
+                  print(f"{handle} already present in account_pool")
+                  break
+              parsed = tomllib.loads(new_text)  # refuse to commit a policy the resolver can't parse
+              if not any(handle in (row.get("account_pool") or [])
+                         for row in parsed.get("repos", {}).values()):
+                  raise SystemExit("edited policy does not contain the new handle; refusing")
+              put = gh_api(
+                  [f"repos/{repo}/contents/{path}", "-X", "PUT", "--input", "-"],
+                  input_doc={
+                      "message": f"register {handle} in account_pool (set-up-account broker)",
+                      "content": base64.b64encode(new_text.encode()).decode(),
+                      "sha": document["sha"],
+                  })
+              if put.returncode == 0:
+                  print(f"appended {handle} to account_pool")
+                  break
+              time.sleep(2 * (attempt + 1))   # CAS conflict -> re-read and retry
+          else:
+              raise SystemExit("account_pool append did not settle after 6 CAS attempts")
+          PY
+
+      - name: Close the request issue (registration complete)
+        if: steps.login.outputs.status == 'ok'
+        run: |
+          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
           gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-            --body "✅ Account **${{ steps.meta.outputs.handle }}** registered (secret \`${{ steps.meta.outputs.secret }}\` on $TARGET_REPO, format \`$fmt\`). Closing." || true
+            --body "✅ Account **${{ steps.meta.outputs.handle }}** registered: secret \`${{ steps.meta.outputs.secret }}\` on \`${{ github.repository }}\` (format \`$fmt\`), \`models: ${{ steps.meta.outputs.models }}\`, appended to \`policy/repos.toml\` account_pool, validated via read_accounts. Closing." || true
           gh issue close "${{ github.event.issue.number }}" -R "${{ github.repository }}" || true
 
       - name: Report failure

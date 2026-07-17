@@ -765,6 +765,16 @@ def _release_failed_dispatch(allocator, registry_repo, claim_id):
         return False
 
 
+def escalate_starved(escalate, usage, effective_cap):
+    """Escalation contract (routing.toml `escalate = true`, security/soundness surfaces): those
+    routes pin a RESTRICTED model chain (e.g. opus-only) and must ESCALATE to a human on
+    chain-exhaustion instead of silently starving or degrading to a weaker model. True when the
+    LIVE usage probe is present and shows ZERO accounts able to serve the chain (dynamic
+    concurrency 0). With no usage map the signal is unknown, so the item simply defers (the
+    require_usage fail-closed hold + usage-alert cover that case)."""
+    return bool(escalate) and usage is not None and effective_cap == 0
+
+
 def _load_usage():
     """Optional live-usage map for usage-aware dispatch, written by scripts/account-usage.py and passed
     via WORKER_USAGE_FILE. Absent/empty/unreadable -> None, and dispatch falls back to the static cap
@@ -877,6 +887,27 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 effective_cap = allocator.dynamic_concurrency(
                     pool_accounts, usage, model_chain=resolved["model_chain"],
                     absolute_cap=resolved["max_concurrent"], margin=margin)
+                if escalate_starved(resolved.get("escalate"), usage, effective_cap):
+                    # Security surfaces never degrade: chain-exhaustion -> needs:user, loudly.
+                    try:
+                        _run_target_helper(script_dir, "worker-issue.py", [
+                            "status", "--repo", repo, "--issue", str(number),
+                            "--status", "needs-user"])
+                        _run_gh_target_comment(
+                            repo, number,
+                            "> 🤖 SPARQ agent — this task routes to the restricted "
+                            f"`{'/'.join(resolved['model_chain'])}` tier (a security/soundness "
+                            "surface, `escalate = true` in routing.toml), and NO account currently "
+                            "has usage headroom to run that tier. Escalating to a human instead of "
+                            "silently starving or degrading to a weaker model. "
+                            f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: free capacity (or "
+                            "decide the route), then remove `needs:user` and re-add "
+                            "`status:ready`.")
+                        print(f"escalated {repo}#{number}: escalate-tier has no eligible account")
+                    except DispatchError as exc:
+                        print(f"defer {repo}#{number}: escalate-tier starved, escalation "
+                              f"failed ({exc}); retried next tick")
+                    continue
             else:
                 effective_cap = resolved["max_concurrent"]
             try:
@@ -1129,6 +1160,17 @@ def _self_test():
     assert _resolvable_chain(["terra"], routing) == ["terra"]
     routing["models"]["terra"]["provider_model"] = "gpt-5.6-codex"
     assert _resolvable_chain(["terra"], routing) == ["terra"]
+
+    # Escalation contract (routing.toml escalate=true, audit-2026-07-17): a security-surface item
+    # whose restricted tier has ZERO usage-eligible accounts escalates to needs:user — but ONLY on
+    # a live usage signal (no probe => defer, the require_usage hold + usage-alert own that), and
+    # NEVER for non-escalate routes (they starve fail-closed and retry next tick).
+    assert escalate_starved(True, {"acct01": {}}, 0) is True
+    assert escalate_starved(True, {}, 0) is True            # empty-but-present map still signals
+    assert escalate_starved(True, None, 0) is False         # no probe -> unknown -> defer
+    assert escalate_starved(True, {"acct01": {}}, 1) is False
+    assert escalate_starved(False, {"acct01": {}}, 0) is False
+    assert escalate_starved(None, {"acct01": {}}, 0) is False
 
     print("dispatch-claim self-test PASSED")
 

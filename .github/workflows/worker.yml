@@ -794,6 +794,28 @@ jobs:
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: bash ../registry/scripts/worker-live.sh model
 
+      # TTL guard (audit-2026-07-17): App installation tokens live 60 minutes and app-token-live is
+      # minted BEFORE the heavy checkout + toolchain + model run, so with worker_timeout_minutes=90
+      # every long run used to reach publish/followups/final-state with an EXPIRED token — the
+      # model's completed work was discarded AND the deferral write failed, stranding the issue
+      # status:in-progress. This fresh mint immediately after the model step keeps all post-model
+      # writes inside a new 60-minute window. `always()` is load-bearing: final-state also runs on
+      # the failure path. continue-on-error + the `|| app-token-live` fallbacks below keep a mint
+      # hiccup from being worse than the old single-mint behavior.
+      - name: Mint post-model target-scoped App token (publish/final-state TTL guard)
+        id: app-token-post
+        if: ${{ always() && !inputs.dry_run }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
       - name: Write back a rotated full account credential
         id: writeback
         if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' && steps.model.outcome != 'skipped' }}
@@ -835,7 +857,7 @@ jobs:
         if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
         working-directory: target
         env:
-          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
           TARGET_DIR: ${{ github.workspace }}/target
           TARGET_REPO: ${{ inputs.target_repo }}
           TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
@@ -859,7 +881,7 @@ jobs:
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
         run: |
           set -uo pipefail
@@ -875,7 +897,7 @@ jobs:
       - name: Set final target issue state
         if: ${{ always() && !inputs.dry_run }}
         env:
-          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
           ACQUIRED: ${{ needs.claim.outputs.acquired }}
           EXHAUSTED: ${{ steps.budget.outputs.exhausted }}
           TRUST_OUTCOME: ${{ steps.trust.outcome }}
