@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change correctly extends the independent property-test expression model and generator with variable-variable relational comparisons. The oracle models the engine's strict comparison families, including numeric promotion and NaN errors, and the hand-computed regression test exercises real query execution paths for less-than, greater-than, their negations, and representative comparable/error cases. The expected rows independently distinguish false from type error, so the test is not vacuous. No security or soundness defect was found in the diff.",
+ "verdict": "approve"
+}
