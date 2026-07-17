@@ -333,7 +333,18 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         if acct is None:
             return None
         a = next(x for x in accounts if x["handle"] == acct)
-        model = next((m for m in model_chain if m in a["models"]), model_chain[0])
+        # [FABLE-5] Assign the model CONSISTENTLY with the eligibility that admitted this account. Picking
+        # the first chain-model the account merely SERVES would route fable onto an account whose fable
+        # sub-quota is exhausted (choose_account admitted it only via a later, non-premium pass) — the exact
+        # mid-run-failure the usage gate exists to prevent. When usage is supplied, require the model to
+        # also be usage_eligible; with usage=None this is the original chain-order pick (backward compatible).
+        if usage is not None:
+            model = next((m for m in model_chain
+                          if m in a["models"] and usage_eligible(usage.get(acct), margin, model=m)), None)
+            if model is None:
+                return None  # no chain model is eligible for the admitted account (defensive; shouldn't happen)
+        else:
+            model = next((m for m in model_chain if m in a["models"]), model_chain[0])
         cid = uuid.uuid4().hex
         live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
         if _write_ledger(repo, live, sha, f"claim {cid[:8]} {acct} {package}/{role}"):
@@ -508,6 +519,35 @@ def _self_test():
           dynamic_concurrency(
               [{"handle": "fa", "models": ["haiku"], "max_concurrent_workers": 1, "available": True}],
               {"fa": {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.99}}, ["haiku"]), 1)
+    # [FABLE-5] claim() model assignment must match the pass that admitted the account: an account serving
+    # BOTH fable+haiku with an EXHAUSTED fable bucket, on a ["fable","haiku"] chain, must be claimed as
+    # haiku (not fable), or the gate is defeated.
+
+    class _StubClaim:
+        """Drive claim()'s pure decision path without GitHub I/O by stubbing the ledger/catalog."""
+        def __init__(self, accounts):
+            self.accounts, self.written = accounts, None
+
+        def __enter__(self):
+            self._ra, self._rl, self._wl = read_accounts, _read_ledger, _write_ledger
+            return self
+
+        def __exit__(self, *a):
+            globals()["read_accounts"], globals()["_read_ledger"], globals()["_write_ledger"] = \
+                self._ra, self._rl, self._wl
+
+    dual = [{"handle": "acctdual", "models": ["fable", "haiku"], "max_concurrent_workers": 1,
+             "available": True}]
+    dual_usage = {"acctdual": {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.99,
+                               "fable_7d_oi_reset": 9000}}
+    with _StubClaim(dual):
+        globals()["read_accounts"] = lambda repo: dual
+        globals()["_read_ledger"] = lambda repo: ([], "sha0")
+        globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+        claimed = claim("r", "p", "impl", ["fable", "haiku"], "o/r#1@run", now,
+                        account_pool=["acctdual"], usage=dual_usage, margin=0.15)
+    check("claim assigns model consistent with the admitting pass (haiku, not fable)",
+          claimed and claimed["model"], "haiku")
 
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
