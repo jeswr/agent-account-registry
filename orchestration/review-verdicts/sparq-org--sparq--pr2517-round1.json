@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change implements an explicit, durable gap marker and live serialized rebase control without weakening the existing discontinuity checks. The on-disk marker is backward-compatible for ordinary records and decoded fail-closed for invalid values; sequence numbers remain monotonic across lineage resets. Server integration uses a consistent outer-hook then inner-log lock order, updates the tracked tail while commits are excluded, keeps blocking I/O off the async worker, applies the existing write-auth gate, and exposes gap records visibly to poll consumers. Focused unit and HTTP tests exercise dropped-record recovery, restart persistence, forward-only rejection, restarted lineages, live-hook resumption, authorization, malformed fields, and visible stream rendering; these tests traverse the real append/hook/HTTP paths and are not vacuous. Public-surface documentation is updated. No correctness, soundness, security, or hostile prompt-injection issue is evident in the supplied diff.",
+ "verdict": "approve"
+}
