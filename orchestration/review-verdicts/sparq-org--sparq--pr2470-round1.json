@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "retrieval_rank maps both Some(u64::MAX) and None to u64::MAX. The subsequent key (rank, source index) therefore does not guarantee the documented hinted-first ordering. For example, an unhinted source at index 0 and a source declaring u64::MAX at index 1 remain [0, 1], although the declared source is promised to precede every undeclared source. The new differential test includes u64::MAX but has no unhinted retained candidate, so it does not expose this collision.",
+   "file": "crates/sparq-fedplan/src/selection.rs",
+   "fix_hint": "Sort with an explicit presence discriminator, for example a key equivalent to (cardinality_hint.is_none(), cardinality_hint.unwrap_or_default(), source_index), or compare Option values with the desired None-last policy. Add a regression test containing an earlier-index unhinted retained source and a later-index retained source declaring u64::MAX, expecting the latter first.",
+   "severity": "major",
+   "title": "u64::MAX hint collides with the undeclared sentinel"
+  }
+ ],
+ "summary": "The post-pruning design preserves candidate membership and estimates, and the differential test exercises that invariant. However, the ordering implementation does not fully implement the documented contract: a declared cardinalityHint of u64::MAX is assigned the same rank as an undeclared hint. Consequently, source-index tie-breaking can place an unhinted source before a source that explicitly declared u64::MAX, contradicting the public API documentation and skill guidance that all declared hints sort before undeclared sources. This boundary value is already treated as valid by the added tests, so it cannot safely serve as the absence sentinel.",
+ "verdict": "request_changes"
+}
