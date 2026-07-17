@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`to_json` flattens each `ChangeRecord` by iterating `rec.changes`. A rebase marker is defined to have an empty `changes` vector, so it produces no response record at all, while page continuation still advances beyond its sequence. An HTTP consumer can therefore replay across the uncaptured span without seeing the marker, exactly the silent-wrong behavior this PR claims to prevent. The only server change here updates a test fixture; there is no real-path test proving gap visibility.",
+   "file": "crates/sparq-server/src/streams.rs",
+   "fix_hint": "Define an explicit HTTP representation for a rebase/gap event and make `to_json` emit it even when `changes` is empty. Add a focused test containing an ordinary record, a rebase record, and a later ordinary record; assert that the gap is visible with its generation/sequence and that continuation cannot skip it silently. Update the documented response shape as needed.",
+   "severity": "major",
+   "title": "HTTP polling silently hides rebase gap records"
+  }
+ ],
+ "summary": "The durable log records and round-trips the new rebase marker, but the existing HTTP stream renderer silently discards it because it emits output only by iterating `rec.changes`. Since a rebase record intentionally has no changes, HTTP consumers advance past its sequence number without ever learning that history has a gap. This contradicts the PR's central honesty guarantee and the updated HTTP-server skill, so the change is incomplete on a public consumer path.",
+ "verdict": "request_changes"
+}
