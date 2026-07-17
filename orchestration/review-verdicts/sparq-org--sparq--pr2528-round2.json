@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "fetch_bd_map() builds id_map from every issue containing a bd-id body marker, without requiring migration provenance. In apply_migration(), every id already in that map is then granted MIGRATION_LABEL. An unprivileged user can therefore create an issue containing a target marker before migration; a resumed --apply run will treat that issue as the migrated issue and attach the supposedly authentication-only label. The real issue is never created, and ci-close-merged-beads.py can later close the decoy. The new self-test covers an unlabeled decoy only at close time, not this label-conferring migration path.",
+   "file": "scripts/bd-to-issues.py",
+   "fix_hint": "Do not backfill MIGRATION_LABEL onto arbitrary body-marker matches. Resolve resumptions from migration-owned state/provenance (for example the trusted checkpoint plus already-labeled issues), or otherwise validate that the existing issue was created by the migration before labeling it. Add a test in which an attacker-authored body marker precedes migration and assert that it is neither labeled nor accepted as the canonical mapping. Ambiguous or unverifiable pre-label mappings should fail closed for operator review.",
+   "severity": "major",
+   "title": "Resume path authenticates untrusted body-only mappings"
+  }
+ ],
+ "summary": "The issue-closing path is fail-closed once migration labels are trustworthy, but the migration resume path can itself authenticate an attacker-forged marker. This breaks the stated security boundary and can cause the canonical bead issue not to be created or closed.",
+ "verdict": "request_changes"
+}
