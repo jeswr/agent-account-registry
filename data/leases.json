@@ -49,6 +49,16 @@
    "model": "fable",
    "issued_at": 1784277879,
    "expires_at": 1784284179
+  },
+  {
+   "account": "acct03",
+   "claim_id": "79c908e4f8f74d5783bf5106cd6cb8ac",
+   "holder": "sparq-org/sparq#2414@dispatch-29567386037.1",
+   "package": "sparq-canon",
+   "role": "impl",
+   "model": "fable",
+   "issued_at": 1784277882,
+   "expires_at": 1784284182
   }
  ]
 }
