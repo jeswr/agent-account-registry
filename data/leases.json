@@ -92,16 +92,6 @@
   },
   {
    "account": "acct04",
-   "claim_id": "69bc3e8a968b46e6b3f0e6025691e592",
-   "holder": "sparq-org/sparq#2489@dispatch-29582505258.1",
-   "package": "sparq-introspect",
-   "role": "ci",
-   "model": "fable",
-   "issued_at": 1784293491,
-   "expires_at": 1784299791
-  },
-  {
-   "account": "acct04",
    "claim_id": "210a7de458c14024b4fe7527acb3c7ed",
    "holder": "sparq-org/sparq#2490@dispatch-29582505258.1",
    "package": "sparq-rsp",
