@@ -62,16 +62,6 @@
   },
   {
    "account": "acct02",
-   "claim_id": "a91149691e9b4593943c71bb3b1f9d75",
-   "holder": "sparq-org/sparq#2426@dispatch-29572641463.1",
-   "package": "sparq-jsonld",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784283185,
-   "expires_at": 1784289485
-  },
-  {
-   "account": "acct02",
    "claim_id": "bebb590f2f244838b55f84edf3af9278",
    "holder": "sparq-org/sparq#2427@dispatch-29572641463.1",
    "package": "sparq-fedplan",
