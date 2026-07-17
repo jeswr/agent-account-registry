@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The version negotiation follows MCP initialize semantics: supported proposals are selected verbatim and unsupported or malformed proposals fall back to the server's latest supported revision. Both base and Solid dispatch paths use the same helper, the public constants are documented and re-exported, and the tests exercise supported, unsupported, missing-version, ordering, and Solid parity cases through the real RPC path. Excluding 2025-03-26 is consistent with this implementation's lack of required incoming JSON-RPC batch handling. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+ "verdict": "approve"
+}
