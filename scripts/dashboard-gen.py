@@ -645,16 +645,24 @@ def _self_test():
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--leases", default="data/leases.json")
+    # No defaults for the data-plane inputs (issue #28, review round 1): the live files sit on
+    # the `ledger` branch, so a default of `data/*.json` would silently render the frozen master
+    # tombstones (a falsely-empty dashboard). Callers must point at a ledger-branch checkout.
+    parser.add_argument("--leases")
     parser.add_argument("--issues-file")
     parser.add_argument("--usage")
-    parser.add_argument("--model-health", default="data/model-health.json")
+    parser.add_argument("--model-health")
     parser.add_argument("--assets", default="dashboard")
     parser.add_argument("--site", default="site")
     parser.add_argument("--history", type=int, default=8)
     args = parser.parse_args(argv)
     if args.self_test:
         return _self_test()
+    if not args.leases or not args.model_health:
+        raise DashboardError(
+            "--leases and --model-health are required and must point at a `ledger`-branch "
+            "checkout — the master copies under data/ are frozen tombstones (issue #28; "
+            "see data/README.md)")
     if not 1 <= args.history <= 20:
         raise DashboardError("--history must be between 1 and 20")
     repo = os.environ.get("REGISTRY_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""

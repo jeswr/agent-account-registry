@@ -36,6 +36,16 @@ jobs:
           ref: ledger
           persist-credentials: false
 
+      # Trust guard (review round 1): the ledger branch is DATA-ONLY by design — a
+      # `workflow_dispatch` at `ref: ledger` would execute the LEDGER copy of a workflow file,
+      # so its non-execution property holds only while no executable content exists at that ref.
+      # Fail LOUD if that ever erodes.
+      - name: Ledger checkout is data-only (trust guard)
+        run: |
+          set -euo pipefail
+          test ! -e ledger/.github
+          test ! -e ledger/scripts
+
       # Only this filter sees the complete secret map; the probe receives an ACCT_* file.
       - name: Materialize the ACCT_* worker-token subset for the probe
         continue-on-error: true
