@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change is internally consistent: it adds the documented worker-specific Claude settings override with valid JSON and uses the supported disableAllHooks setting to prevent project hooks from running in explicitly configured headless workers. The documentation accurately distinguishes that opt-in worker launch path from unchanged interactive sessions. No correctness, soundness, test-validity, or security defect is evident in the scoped change.",
+ "verdict": "approve"
+}
