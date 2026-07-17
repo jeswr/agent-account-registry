@@ -22,16 +22,6 @@
   },
   {
    "account": "acct4css",
-   "claim_id": "b05709521e2748a58e6269315c96bc98",
-   "holder": "sparq-org/sparq#2424@dispatch-29572641463.1",
-   "package": "sparq-engine",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784283178,
-   "expires_at": 1784289478
-  },
-  {
-   "account": "acct4css",
    "claim_id": "847db0cd98804485b6c25fe6c9134b1c",
    "holder": "sparq-org/sparq#2425@dispatch-29572641463.1",
    "package": "sparq-vectors",
