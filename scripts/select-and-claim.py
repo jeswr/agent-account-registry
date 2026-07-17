@@ -313,7 +313,11 @@ def read_accounts(repo):
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
           account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None,
           margin=SAFETY_MARGIN):
-    """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free / conflict)."""
+    """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free).
+    Raises LeaseIOError when an account WAS eligible but the ledger write kept failing — that is an
+    infrastructure failure (persistent CAS contention, or the contents-API PUT rejected outright,
+    e.g. by a required-status-check branch protection on the ledger's branch), NOT a capacity
+    signal, and must not be reported as 'no eligible account' (issue #28)."""
     import uuid
     accounts = read_accounts(repo)
     if account_pool is not None:
@@ -363,7 +367,16 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
                 "model": model,
                 "claim_id": cid,
             }
-    return None  # CAS kept conflicting
+    # Every retry found an eligible account yet the write never landed: an infra failure, not
+    # a capacity condition. Raising (vs returning None) keeps the dispatcher's defer reason
+    # honest — live incident 2026-07-17: a required `gate` status check added to the default
+    # branch rejected every github-actions ledger PUT and every claim in BOTH target repos was
+    # mislabeled "duplicate lease, repository cap, or account cap is active" for hours while
+    # accounts were healthy and the lease ledger was empty.
+    raise LeaseIOError(
+        f"lease ledger write kept failing after {retries} attempts (persistent CAS contention, "
+        f"or the {LEDGER_PATH} contents PUT is being rejected — e.g. branch protection with a "
+        "required status check on the ledger branch blocks github-actions pushes)")
 
 
 def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
@@ -443,14 +456,14 @@ def _self_test():
     class _StubLedger:
         """Drive claim()'s pure decision path without GitHub I/O (accounts + ledger stubbed)."""
 
-        def __init__(self, accounts, leases):
-            self.accounts, self.leases = accounts, leases
+        def __init__(self, accounts, leases, write_ok=True):
+            self.accounts, self.leases, self.write_ok = accounts, leases, write_ok
 
         def __enter__(self):
             self._saved = (read_accounts, _read_ledger, _write_ledger)
             globals()["read_accounts"] = lambda repo: self.accounts
             globals()["_read_ledger"] = lambda repo: (list(self.leases), "sha0")
-            globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+            globals()["_write_ledger"] = lambda repo, leases, sha, msg: self.write_ok
             return self
 
         def __exit__(self, *a):
@@ -505,6 +518,17 @@ def _self_test():
         second = claim("r", "crate-c", "review", ["terra"], "review:owner/repo#41@r.1", now,
                        account_pool=["acct01"], holder_prefix="review:", max_holder_concurrent=2)
     check("second review claim under the cap succeeds", bool(second), True)
+    # A persistent ledger-write failure with an ELIGIBLE account must raise LeaseIOError — never
+    # return None (None = "no eligible account/slot" and the dispatcher would report the infra
+    # failure as "account cap is active"; issue #28, live incident 2026-07-17).
+    try:
+        with _StubLedger([{"handle": "acct02", "models": ["fable"], "max_concurrent_workers": 3,
+                           "available": True, "secret_ref": "ACCT02_TOKEN"}], [], write_ok=False):
+            claim("r", "crate-c", "impl", ["fable"], "owner/repo#9@r.1", now,
+                  account_pool=["acct02"], holder_prefix="owner/repo#", max_holder_concurrent=2)
+        check("persistent ledger-write failure raises", "no exception", "LeaseIOError")
+    except LeaseIOError:
+        check("persistent ledger-write failure raises", "LeaseIOError", "LeaseIOError")
     check("none free", choose_account([{"handle": "a", "models": ["x"], "max_concurrent_workers": 0}],
                                       [], ["x"], "p", "r", now), None)
     pa = _parse_account("provider: openai\nmodels: [terra, gpt]\nmax_concurrent_workers: 2\n"
