@@ -50,6 +50,13 @@ LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 MAX_RECORDS = 200
 WINDOW_HOURS = 48
 WINDOW_SECONDS = WINDOW_HOURS * 3600
+# Future-stamp guard (cross-provider review r2 finding 2): record stamps are write-time, but the
+# ledger is CAS-writable by every outcome job — a forged or clock-skewed stamp far in the FUTURE
+# would (a) never age out of the rolling window and (b) anchor account_backoffs' per-record clamp
+# (which is relative to the RECORD ts), yielding a backoff far past BACKOFF_CAP_SECONDS relative
+# to the sweep's now. Stamps more than this far ahead of the reader's clock are implausible and
+# dropped fail-open; the allowance absorbs legitimate cross-runner clock skew.
+FUTURE_SKEW_SECONDS = 5 * 60
 
 # --- exit-class taxonomy. worker-live.sh emits {session-limit, rate-limit, auth, setup, unknown}
 # (all derived from HOST-observable signals only: the CLI exit code + the CLI's own error lines,
@@ -178,11 +185,14 @@ def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset
 
 
 def prune(records, now):
-    """Keep the rolling window: drop records older than WINDOW_SECONDS, then cap to the most recent
-    MAX_RECORDS. Sorted by ts so the window/consecutive logic below is well defined."""
+    """Keep the rolling window: drop records older than WINDOW_SECONDS — or stamped more than
+    FUTURE_SKEW_SECONDS ahead of `now` (an implausibly-future forgery would never age out) — then
+    cap to the most recent MAX_RECORDS. Sorted by ts so the window/consecutive logic below is well
+    defined."""
     kept = [r for r in records if isinstance(r, dict)
             and isinstance(r.get("ts"), int)
-            and (now - r["ts"]) <= WINDOW_SECONDS]
+            and (now - r["ts"]) <= WINDOW_SECONDS
+            and r["ts"] <= now + FUTURE_SKEW_SECONDS]
     kept.sort(key=lambda r: r["ts"])
     return kept[-MAX_RECORDS:]
 
@@ -280,7 +290,12 @@ def account_backoffs(records, now):
     a limit/transient (rate-limit) record starts or extends the account's backoff — the provider's
     parseable reset hint when present, else BACKOFF_BASE_SECONDS doubling per CONSECUTIVE hit —
     and a SUCCESS record clears the account (multiplier reset). Every duration is clamped to
-    [record_ts, record_ts + BACKOFF_CAP_SECONDS]. Returns only ACTIVE backoffs:
+    [record_ts, record_ts + BACKOFF_CAP_SECONDS], and record_ts itself may sit at most
+    FUTURE_SKEW_SECONDS ahead of `now` (cross-provider review r2 finding 2: the per-record clamp
+    would otherwise let a forged far-future stamp yield a backoff far past the 5 h ceiling —
+    future-forged records are skipped fail-open here, not just in prune, because this walk must
+    not RELY on callers pre-pruning). So every returned backoff ends within
+    now + FUTURE_SKEW_SECONDS + BACKOFF_CAP_SECONDS. Returns only ACTIVE backoffs:
     {account_hash: {"backoff_until", "consecutive", "last_signal", "last_ts"}}."""
     state = {}
     valid = []
@@ -289,8 +304,9 @@ def account_backoffs(records, now):
             continue
         acct, ts = record.get("account"), record.get("ts")
         if (not isinstance(acct, str) or not isinstance(ts, (int, float))
-                or isinstance(ts, bool) or ts != ts or ts in (float("inf"), float("-inf"))):
-            continue                                # non-str acct / non-finite ts: skip fail-open
+                or isinstance(ts, bool) or ts != ts or ts in (float("inf"), float("-inf"))
+                or ts > now + FUTURE_SKEW_SECONDS):
+            continue                # non-str acct / non-finite or future-forged ts: skip fail-open
         valid.append(record)
     # Defensive ts-sort (cross-provider review r1): the consecutive/success-reset walk is order-
     # sensitive; the production caller pre-prunes (which sorts), but do not RELY on callers.
@@ -1073,6 +1089,20 @@ def _self_test():
         account_backoffs([{"account": ah, "exit_class": "rate-limit", "ts": float("inf")},
                           {"account": ah, "exit_class": "rate-limit", "ts": float("nan")}],
                          now), {})
+    # future-stamp guard (cross-provider review r2 finding 2): the per-record clamp is relative to
+    # the RECORD ts, so a forged now+50h stamp would otherwise back off far past the 5 h ceiling —
+    # it must be dropped from the window AND skipped by the backoff walk (fail-open, like the
+    # forged-stamp contract everywhere else); a within-skew stamp (runner clock drift) still works.
+    chk("prune drops an implausibly-future stamp",
+        len(prune([rec("openai", "codex01", "rate-limit", dt=FUTURE_SKEW_SECONDS + 10)], now)), 0)
+    chk("prune keeps a within-skew stamp",
+        len(prune([rec("openai", "codex01", "rate-limit", dt=60)], now)), 1)
+    chk("future-forged stamp skipped fail-open (never a beyond-cap backoff)",
+        account_backoffs([{"account": ah, "exit_class": CLASS_TRANSIENT, "ts": now + 180000}],
+                         now), {})
+    bskew = account_backoffs([{"account": ah, "exit_class": CLASS_TRANSIENT, "ts": now + 60}], now)
+    chk("within-skew stamp still backs off (bounded by skew + cap)",
+        bskew.get(ah, {}).get("backoff_until"), now + 60 + BACKOFF_BASE_SECONDS)
     chk("hint: bare epoch", parse_reset_hint("1770000000", 1000), 1770000000.0)
     chk("hint: past epoch rejected", parse_reset_hint("1770000000", 1780000000), None)
     chk("hint: garbage -> None", parse_reset_hint("resets at 2pm", 1000), None)

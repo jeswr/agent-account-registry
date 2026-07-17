@@ -64,9 +64,12 @@ def _util(value):
     headers are decimal so this is a guard, not a currently-reachable path."""
     if value is None:
         return None
+    # OverflowError (cross-provider review r2 finding 3): float() of a forged huge JSON int
+    # (10**400) RAISES rather than returning inf — uncaught, the monitoring tick died and the
+    # alert was dropped. Unparseable, exactly like nan/inf.
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if parsed != parsed or parsed in (float("inf"), float("-inf")):  # NaN (self-inequality) or ±inf
         return None
@@ -385,6 +388,14 @@ def _self_test():
     # inf/nan stamps fail open to ok (matches usage_eligible's finite-only comparison, r1)
     e11, r11 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "inf"}}, 0.10, now=tnow)
     chk("inf backoff stamp fails open to ok (no dispatch/alert split)", (e11, r11[0][2]), (1, True))
+    # a huge JSON int (10**400) makes float() RAISE OverflowError, not return inf — the monitoring
+    # tick must survive it: exempt backoff fails OPEN to ok, a usage window fails CLOSED to
+    # UNAVAILABLE (cross-provider review r2 finding 3)
+    e13, r13 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": 10**400}}, 0.10, now=tnow)
+    chk("huge-int backoff stamp fails open to ok (no alert drop)", (e13, r13[0][2]), (1, True))
+    e14, r14 = classify(["a"], {"a": {"status": "allowed", "5h_util": 10**400, "7d_util": 0.1}},
+                        0.10, now=tnow)
+    chk("huge-int usage window classifies fail-closed UNAVAILABLE", (e14, r14[0][2]), (0, False))
     # a forged truthy exempt STRING does not ride the exempt arm (STRICT flag, r1)
     e12, r12 = classify(["cx"], {"cx": {"exempt": "false"}}, 0.10, now=tnow)
     chk("forged exempt string classifies fail-closed UNAVAILABLE", (e12, r12[0][2]), (0, False))

@@ -66,9 +66,12 @@ FABLE_WINDOW = "fable_7d_oi"  # prefix of the fable sub-quota util/reset keys in
 
 
 def _usage_num(v):
+    # OverflowError (cross-provider review r2 finding 3): a forged `backoff_until: 10**400` is
+    # valid JSON (Python ints are unbounded) but float() of it RAISES rather than returning inf —
+    # uncaught, it aborted the whole dispatch instead of failing open to no-backoff.
     try:
         return float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -630,6 +633,10 @@ def _self_test():
           usage_eligible({"exempt": True, "backoff_until": "inf"}, now=now), True)
     check("nan backoff stamp fails open",
           usage_eligible({"exempt": True, "backoff_until": "nan"}, now=now), True)
+    # a huge JSON int (10**400) makes float() RAISE OverflowError, not return inf — the forged
+    # stamp must fail open to no-backoff, never abort dispatch (cross-provider review r2 f3)
+    check("huge-int backoff stamp fails open (OverflowError, no dispatch abort)",
+          usage_eligible({"exempt": True, "backoff_until": 10**400}, now=now), True)
     # …and the exempt flag is STRICT: a forged truthy string must not exempt an account whose
     # entry otherwise lacks usage windows (would-be anthropic bypass).
     check("forged exempt='false' string does NOT exempt (fail-closed)",

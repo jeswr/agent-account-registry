@@ -125,6 +125,24 @@ PY
 
 # Shared model launcher for run_model / run_review / run_fix. Builds the hardened container argv
 # and dispatches the routed harness on a prompt file, with the exit-class/withholding discipline.
+# Reset-hint extraction (cross-provider review r2 finding 1): ONE closed grammar for EVERY
+# persisted hint, regardless of exit classification. The r1 fix closed the rate-limit form but
+# left session-limit on a broad tail capture ("resets at" + up-to-60 chars of ANY word charset),
+# which preserved arbitrary CLI-echoed text — e.g. an account handle — into the ledger,
+# WORKER_RESET_HINT, and the public alert body. Here every alternate is digits + a CLOSED keyword
+# set (am/pm/utc/gmt, s/m/h unit words) + punctuation, so no free text can ride along:
+#   relative      "try again in 20s" / "resets in 2 hours" / "retry-after: 120"  (feeds
+#                 model-health.parse_reset_hint for the reactive backoff)
+#   clock/date    "resets at 14:00 UTC" / "resets at 5pm" / "resets on 2026-07-18T14:00:00Z"
+#                 (display-only in the capped alert; parse_reset_hint falls back to exponential)
+# No match -> empty hint (downstream treats absent as "no hint"; BACKOFF_CAP bounds it anyway).
+_extract_reset_hint() {
+  local signals_file=$1
+  grep -aioE \
+    '(resets?|try again|retry)([- ]?(at|on|in|after))?[ :]*([0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?)?|[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?( ?(am|pm))?( ?(utc|gmt))?|[0-9]{1,2} ?(am|pm)( ?(utc|gmt))?|[0-9]+(\.[0-9]+)?( ?(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?))?)' \
+    "$signals_file" 2>/dev/null | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80
+}
+
 # mutation_mode:
 #   allow — today's implementation tooling (claude Bash/Edit/Write; codex unchanged).
 #   deny  — reviewer posture: claude is restricted to Read/Glob/Grep. codex KEEPS
@@ -299,21 +317,16 @@ _run_headless_harness() {
     elif grep -qiE 'ENOENT|command not found|no such file|cannot find' "$err_signals"; then cls=setup
     fi
     # Reset-hint (review defect #9): surface the reset time the session-limit regex already
-    # detects, sanitized to a short fixed charset (it feeds an alert body, never a command).
-    # rate-limit hints ("try again in 20s" / "retry-after: 120") feed the reactive backoff for
-    # probe-exempt providers (decision 2026-07-17, registry issue #29) via the model-health record.
-    # Same host-scoped source ($err_signals = CLI stderr + harness [error]-prefixed lines only).
-    # MACHINE-PARSEABLE forms ONLY for rate-limit (cross-provider review r1): a free-text capture
-    # could carry arbitrary CLI-echoed content into the ledger, and model-health's
-    # parse_reset_hint rejects free text anyway (exponential fallback) — so digits are REQUIRED
-    # and the phrase set is closed. Duration is capped downstream regardless (BACKOFF_CAP).
+    # detects; rate-limit hints ("try again in 20s" / "retry-after: 120") feed the reactive
+    # backoff for probe-exempt providers (decision 2026-07-17, registry issue #29) via the
+    # model-health record. Same host-scoped source ($err_signals = CLI stderr + harness
+    # [error]-prefixed lines only). MACHINE-PARSEABLE forms ONLY for EVERY persisted hint
+    # (cross-provider review r2 finding 1) — one closed grammar in _extract_reset_hint, applied
+    # identically to both classes; the hint feeds an alert body / the ledger, never a command,
+    # and duration is capped downstream regardless (BACKOFF_CAP).
     local reset_hint=""
-    if [[ "$cls" == session-limit ]]; then
-      reset_hint="$(grep -aioE 'resets?( at| on| in)?[ :]*[A-Za-z0-9][A-Za-z0-9 :,/+.()-]{0,60}' "$err_signals" \
-        | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80)" || reset_hint=""
-    elif [[ "$cls" == rate-limit ]]; then
-      reset_hint="$(grep -aioE '(try again (in|after)|retry[ -]?after)[ :]*[0-9]+(\.[0-9]+)?( ?(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?))?\b' "$err_signals" \
-        | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80)" || reset_hint=""
+    if [[ "$cls" == session-limit || "$cls" == rate-limit ]]; then
+      reset_hint="$(_extract_reset_hint "$err_signals")" || reset_hint=""
     fi
     printf '::error::worker-live: model-exit-class=%s (raw model output withheld to protect credentials)\n' "$cls"
     # surface the class to the workflow so it can alert the maintainer on capped/expired accounts
@@ -1260,6 +1273,25 @@ import json
 d = json.load(open("'"$tmp"'/usage-telemetry.json"))
 print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usage"]["output_tokens"])')" \
     "50 30 22"
+
+  # --- reset-hint extraction: CLOSED grammar for every persisted hint (cross-provider r2
+  # finding 1) — a time form is kept, but raw tail text (e.g. an account handle echoed by the
+  # CLI) must NEVER survive into the hint, for session-limit exactly as for rate-limit ---
+  printf 'You have hit your usage limit. It resets at 5pm today for acct07 private-tail\n' > "$tmp/sig-session"
+  chk "session-limit hint keeps the closed time form only" \
+    "$(_extract_reset_hint "$tmp/sig-session")" "resets at 5pm"
+  printf 'Session limit reached; resets at 14:00 UTC on the account acct07\n' > "$tmp/sig-clock"
+  chk "clock+zone hint survives without the tail" \
+    "$(_extract_reset_hint "$tmp/sig-clock")" "resets at 14:00 UTC"
+  printf 'rate limited, try again in 20s (request id r-123 acct07)\n' > "$tmp/sig-rate"
+  chk "relative rate-limit hint is preserved" \
+    "$(_extract_reset_hint "$tmp/sig-rate")" "try again in 20s"
+  printf 'HTTP 429\nRetry-After: 120\n' > "$tmp/sig-ra"
+  chk "unitless retry-after hint is preserved" \
+    "$(_extract_reset_hint "$tmp/sig-ra")" "Retry-After: 120"
+  printf 'usage limit reached; resets whenever acct07 private-tail says so\n' > "$tmp/sig-freetext"
+  chk "digit-free free text yields NO hint (never a raw capture)" \
+    "$(_extract_reset_hint "$tmp/sig-freetext")" ""
 
   # --- prompt prefix stability: two different issues, byte-identical static head ---
   printf '{"number": 101, "title": "first task", "body": "alpha body"}\n' > "$tmp/issue-a.json"
