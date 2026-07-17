@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "routing_labels returns `(effective | verdict[\"add\"]) - base` but discards `verdict[\"remove\"]`. If a future checked-in template supplies `status:untriaged`, a conflicting `role:*`, or another label triage is designed to replace, evaluate() will append additions without removing the obsolete label and can mint an ambiguous issue. Current templates are unaffected, and the new all-template test would catch role/status ambiguity when such a template is added, so this is not blocking this PR.",
+   "file": "scripts/flow-on.py",
+   "fix_hint": "Have routing_labels return the complete final routing-label set or apply both add and remove deltas when constructing labels_full, e.g. compute `(effective | verdict[\"add\"]) - verdict[\"remove\"]`, then derive the labels to append/remove from the original list. Add a focused test with a conflicting preexisting role or status label.",
+   "severity": "minor",
+   "title": "routing_labels ignores labels triage requests removing"
+  }
+ ],
+ "summary": "The change correctly routes newly minted flow-on issues at creation and safely extends retriage to the pre-fix status-less backlog. The focused flow-on and retriage self-tests pass and exercise role derivation, default priority, ready status, restricted github-actions[bot] trust, and no churn for already-routed issues. One non-blocking robustness gap remains: routing_labels applies triage additions but not removals, though the checked-in rule templates do not currently contain conflicting routing labels and the exhaustive template test protects that invariant.",
+ "verdict": "approve"
+}
