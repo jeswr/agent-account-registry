@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change only replaces feature-sensitive intra-doc links with code-formatted plain text. This avoids rustdoc link resolution failures when the referenced feature-gated items are absent, while preserving accurate documentation. No runtime behavior, public API, security boundary, or test logic is changed.",
+ "verdict": "approve"
+}
