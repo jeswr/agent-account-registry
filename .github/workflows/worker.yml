@@ -775,6 +775,21 @@ jobs:
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back
 
+      - name: Ensure a Rust toolchain for the crate-scoped gate
+        # [OPUS-4.8] The gate runs `cargo clippy/test` directly on the runner; a stock ubuntu-latest may
+        # have rustup with NO default toolchain set (and the target may pin one via rust-toolchain.toml),
+        # which fails the gate with "rustup could not choose a version of cargo". Set one up in the target
+        # dir so a rust-toolchain.toml pin is honoured; harmless for non-cargo gate profiles.
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        working-directory: target
+        run: |
+          set -uo pipefail
+          command -v rustup >/dev/null 2>&1 || { echo '::error::rustup not found on the runner'; exit 1; }
+          rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
+          rustup show >/dev/null 2>&1 || true      # installs a rust-toolchain.toml-pinned toolchain if present
+          rustup component add clippy rustfmt >/dev/null 2>&1 || true
+          cargo --version; rustc --version
+
       - name: Run policy-selected local gate
         id: gate
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
