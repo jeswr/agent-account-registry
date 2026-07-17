@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "This diff introduces public `serialize_triples_negotiated`, `JsonLdProfileParam::iri`, and three public `NegotiatedFormat` methods. AGENTS.md requires every public API change in a published crate to update the matching `skills/<surface>/SKILL.md` and crate README in the same change. Neither documentation update appears in the diff, leaving the documented public surface out of sync.",
+   "file": "crates/sparq-lws-core/src/ldp/content.rs",
+   "fix_hint": "Update the matching Solid/LWS usage skill and the sparq-lws-core README in this PR with the profile-aware negotiation/serialization API and behavior. If these items are intentionally crate-private implementation details, reduce their visibility instead.",
+   "severity": "major",
+   "title": "New public API is missing required usage documentation updates"
+  }
+ ],
+ "summary": "The profile-aware serialization and validator behavior is coherently implemented and exercised through real HTTP and round-trip tests. However, the change adds public API to a published crate without the same-change usage-skill and crate README updates mandated by the repository's public-surface maintenance rule, so the PR is incomplete as submitted.",
+ "verdict": "request_changes"
+}
