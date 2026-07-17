@@ -15,7 +15,7 @@ jobs:
         run: |
           set +e +o pipefail   # tolerate 401/no-header responses (codex tokens 401 on the anthropic endpoint)
           rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/h.txt 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | head -1; }
-          names=$(printf '%s' "$SECRETS_JSON" | jq -r 'keys[] | select(test("^ACCT[0-9]+_TOKEN$"))' | sort)
+          names=$(printf '%s' "$SECRETS_JSON" | jq -r 'keys[] | select(test("^ACCT.*_TOKEN$"))' | sort)
           echo "handle | http | 7d_reset_ts | London(day HH:MM) | 7d_util | 5h_util | status"
           for name in $names; do
             tok=$(printf '%s' "$SECRETS_JSON" | jq -r --arg k "$name" '.[$k]')
