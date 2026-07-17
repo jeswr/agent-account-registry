@@ -1,0 +1,21 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "map_beads_to_open_issues() scans every open issue and accepts the first <!-- bd-id:... --> marker. Issue bodies are user-controlled: an external user can open an issue containing a marker copied from a real migrated issue. Because first-wins depends on API ordering, reconciliation may close the decoy and leave the canonical migrated issue open. The self-test establishes first-wins behavior but does not test duplicate markers, so the load-bearing mapping is not trustworthy.",
+   "file": "scripts/ci-close-merged-beads.py",
+   "fix_hint": "Authenticate mapped issues using migration-owned metadata that unprivileged issue authors cannot assign (for example a dedicated repository label applied by the migration), and fail closed if zero or multiple authenticated issues carry a bead ID. Add a test covering a forged duplicate marker and a duplicate authenticated mapping.",
+   "severity": "major",
+   "title": "Untrusted issue-body markers can shadow the real bead mapping"
+  },
+  {
+   "body": "GitHub normally downgrades GITHUB_TOKEN to read-only for pull_request workflows originating from forks. On such a merged PR, gh issue close will fail even though the workflow declares issues: write, so the advertised durable reconciliation is incomplete for external contributions.",
+   "file": ".github/workflows/bead-autoclose.yml",
+   "fix_hint": "Use a safe privileged trigger design appropriate for post-merge base-branch code (for example pull_request_target with checkout pinned to trusted main and no execution of PR-controlled code), or explicitly constrain/document the supported PR origin and add a test or operational fallback that makes fork failures non-lossy and visible.",
+   "severity": "major",
+   "title": "Fork PR merges may not receive an issues-write token"
+  }
+ ],
+ "summary": "The issue-native approach avoids the protected-branch write, but the new resolver treats an unauthenticated marker in any open issue body as authoritative. Since ordinary users can create issue bodies, a duplicate marker can shadow the migrated issue and make reconciliation close the decoy while leaving the real tracker item open. The workflow also needs an explicit decision/test for fork-originated PRs because pull_request workflows normally receive a read-only token for forks, despite issues: write being declared.",
+ "verdict": "request_changes"
+}
