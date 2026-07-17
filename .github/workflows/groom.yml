@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       actions: read       # inspect registry worker run state
-      contents: write     # compare-and-swap data/leases.json + read data/model-health.json
+      contents: write     # CAS data/leases.json + read data/model-health.json (both on the `ledger` branch)
       issues: write       # upsert/close the model-access health alert issues (model-health decide)
     steps:
       - name: Checkout private registry (pinned, no persisted token)

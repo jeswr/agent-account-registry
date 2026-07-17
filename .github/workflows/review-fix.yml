@@ -1379,7 +1379,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write   # CAS-append data/model-health.json via github.token
+      contents: write   # CAS-append data/model-health.json (on the `ledger` branch) via github.token
     steps:
       - name: Checkout private registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

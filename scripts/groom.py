@@ -33,6 +33,10 @@ from urllib.request import Request, urlopen
 
 
 LEDGER_PATH = "data/leases.json"
+# Mutable data plane lives on a dedicated non-code branch (issue #28): required-status-check
+# protection on the default branch rejects the bot's contents-API PUTs, so every ledger read and
+# write pins this ref. Keep in sync with select-and-claim.py / model-health.py LEDGER_REF.
+LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
 STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
 WORKER_PR_MARKER = "> 🤖 SPARQ agent"
@@ -413,10 +417,28 @@ def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
     return limits
 
 
+def ledger_read_path(registry_repo: str) -> str:
+    """Contents-API GET path for the lease ledger, pinned to the data-plane branch."""
+    return f"/repos/{registry_repo}/contents/{LEDGER_PATH}?ref={LEDGER_REF}"
+
+
+def ledger_put_body(message: str, encoded: str, sha: str) -> dict[str, str]:
+    """Contents-API PUT body for the lease ledger, pinned to the data-plane branch (a PUT
+    without `branch` commits to the protected default branch and is rejected)."""
+    return {"message": message, "content": encoded, "sha": sha, "branch": LEDGER_REF}
+
+
 def _read_ledger(
     api: GitHubAPI, registry_repo: str
 ) -> tuple[list[dict[str, Any]], str]:
-    result = api.request("GET", f"/repos/{registry_repo}/contents/{LEDGER_PATH}")
+    result = api.request("GET", ledger_read_path(registry_repo), allow_404=True)
+    if result is None:
+        # LOUD, never silently-empty: grooming against a missing ledger branch would mask the
+        # exact outage class this ref exists to prevent (issue #28).
+        raise GroomError(
+            f"registry lease ledger read returned 404 — is the '{LEDGER_REF}' ledger branch "
+            "present? (see data/README.md)"
+        )
     if not isinstance(result, dict):
         raise GroomError("registry lease ledger response is malformed")
     content = result.get("content")
@@ -450,11 +472,7 @@ def _release_claims(
             result = api.request(
                 "PUT",
                 f"/repos/{registry_repo}/contents/{LEDGER_PATH}",
-                {
-                    "message": f"groom {len(present)} dead lease(s)",
-                    "content": encoded,
-                    "sha": sha,
-                },
+                ledger_put_body(f"groom {len(present)} dead lease(s)", encoded, sha),
                 retry_conflict=True,
             )
         except GroomConflict:
@@ -1208,6 +1226,29 @@ def _self_test() -> int:
     except GroomError:
         bad_holder_failed = True
     check("malformed non-repair holder still fails closed", bad_holder_failed, True)
+
+    # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
+    # Literal "ledger": pointing either helper back at the default branch (or changing the shipped
+    # REGISTRY_LEDGER_REF default) must turn these red.
+    check(
+        "ledger read targets the ledger ref",
+        ledger_read_path("o/r"),
+        f"/repos/o/r/contents/{LEDGER_PATH}?ref=ledger",
+    )
+    check("ledger write pins branch=ledger", ledger_put_body("m", "abc", "s")["branch"], "ledger")
+    seeded = _StubAPI({
+        ledger_read_path("o/r"): {
+            "content": base64.b64encode(json.dumps({"leases": []}).encode()).decode(),
+            "sha": "s1",
+        }
+    })
+    check("ledger read parses at the ledger ref", _read_ledger(seeded, "o/r"), ([], "s1"))
+    missing_ledger_loud = False
+    try:
+        _read_ledger(_StubAPI({}), "o/r")  # stub 404s every path → branch/file absent
+    except GroomError:
+        missing_ledger_loud = True
+    check("missing ledger branch/file fails loud (never silently-empty)", missing_ledger_loud, True)
 
     print("groom self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

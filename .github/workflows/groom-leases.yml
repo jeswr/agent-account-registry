@@ -11,7 +11,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # CAS-update data/leases.json
+  contents: write   # CAS-update data/leases.json on the `ledger` data-plane branch (issue #28)
 
 jobs:
   reclaim:
