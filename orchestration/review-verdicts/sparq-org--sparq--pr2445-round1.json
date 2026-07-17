@@ -1,0 +1,21 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Both filtered branches return immediately from `nearest_filtered_costed` before `search_tied` is reached. Therefore, with `filtered-ann` enabled, an exact query whose admitted candidates tie at the k boundary retains the old ranking/tie behavior instead of selecting membership by N-Triples key. The governing spec explicitly says exact filtered top-k includes VG-TIE-1 ties and that filtering must equal post-filtering the unfiltered retrieval (VG-FILT-2). This is a silent result-membership discrepancy, not merely output ordering.",
+   "file": "crates/sparq-vectors/src/rewrite.rs",
+   "fix_hint": "Apply the same N-Triples boundary-membership rule to the exact filtered candidate pool, with seed exclusion performed before determining the boundary. Ensure both cost-model branches produce identical results. Add an integration test using a restrictive BGP/mask with dictionary-ID order opposed to N-Triples order at the boundary, and cover both node-seed and vector-query forms as applicable.",
+   "severity": "major",
+   "title": "Filtered exact searches bypass the required boundary tie-break"
+  },
+  {
+   "body": "The mainline integration test exercises only an unfiltered `vec:nearest` pattern. Because filtered queries return through a separate early branch, this test remains green while that real path violates VG-TIE-1. The test suite therefore does not validate the claimed mainline completeness or the load-bearing VG-FILT-2 equivalence invariant.",
+   "file": "crates/sparq-vectors/tests/vec_predicate.rs",
+   "fix_hint": "Add a feature-gated filtered-ann test that constructs a mask through surrounding BGP constraints, creates a boundary tie whose ID and N-Triples orders disagree, and asserts the exact admitted set. A useful regression should fail against the current filtered early-return implementation.",
+   "severity": "major",
+   "title": "Tie-break tests omit the supported filtered execution path"
+  }
+ ],
+ "summary": "The unfiltered exact path implements and tests the boundary tie-break, but the exact filtered path still returns the existing ID-tied ranking. This violates the cited VG-TIE-1/VG-FILT-2 semantics and makes the change incomplete on a supported mainline execution path. The added tests do not exercise a filtered boundary tie, so they cannot catch this divergence.",
+ "verdict": "request_changes"
+}
