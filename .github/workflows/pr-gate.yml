@@ -55,7 +55,7 @@ jobs:
           # registry-selftest gate runs. A missing self-test fails the gate (fail closed).
           suite="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py triage.py \
           dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
-          account-usage.py usage-alert.py broker-refresh.py backfill-provenance.py"
+          account-usage.py usage-alert.py broker-refresh.py backfill-provenance.py dashboard-gen.py"
           for s in $suite; do
             if [[ -f "scripts/$s" ]]; then
               echo "== self-test $s =="

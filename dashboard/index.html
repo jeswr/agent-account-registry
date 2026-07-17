@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0b0f14">
+  <title>Account Fleet Monitor</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">Agent account registry</p>
+        <h1>Fleet monitor</h1>
+        <p class="lede">Quota headroom, lease activity, and dispatch health.</p>
+      </div>
+      <div class="live-note"><span class="pulse" aria-hidden="true"></span>Refreshes every 60s</div>
+    </header>
+
+    <div id="warning" class="warning" role="alert" hidden></div>
+
+    <main>
+      <section aria-labelledby="fleet-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">At a glance</p>
+            <h2 id="fleet-heading">Fleet summary</h2>
+          </div>
+          <p id="freshness" class="freshness">Loading data…</p>
+        </div>
+        <div id="summary" class="summary-grid" aria-live="polite"></div>
+      </section>
+
+      <section id="health-section" aria-labelledby="health-heading" hidden>
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Recent checks</p>
+            <h2 id="health-heading">Model health</h2>
+          </div>
+          <p id="health-time" class="freshness"></p>
+        </div>
+        <div id="model-health" class="health-strip"></div>
+      </section>
+
+      <section aria-labelledby="accounts-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Live inventory</p>
+            <h2 id="accounts-heading">Accounts</h2>
+          </div>
+          <p id="account-count" class="freshness"></p>
+        </div>
+        <div id="accounts" class="account-grid" aria-live="polite"></div>
+      </section>
+
+      <section aria-labelledby="dispatch-heading">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Scheduler</p>
+            <h2 id="dispatch-heading">Dispatch outcomes</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Sweep</th><th>Result</th><th>Dispatched</th><th>Deferred</th></tr></thead>
+            <tbody id="outcomes"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer>Public operational view · account identities are HMAC-salted</footer>
+  </div>
+  <script src="app.js" defer></script>
+</body>
+</html>

@@ -448,7 +448,7 @@ run_gate() {
 # script that HAS a --self-test is additionally run so a change to it is validated directly.
 FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
 triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
-account-usage.py usage-alert.py broker-refresh.py backfill-provenance.py worker-live.sh"
+account-usage.py usage-alert.py broker-refresh.py backfill-provenance.py dashboard-gen.py worker-live.sh"
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
@@ -1345,6 +1345,7 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     ".github/workflows/dispatch.yml" \
     "data/leases.json" \
     "scripts/backfill-provenance.py" \
+    "scripts/dashboard-gen.py" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
     "$(grep -c 'self:worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
@@ -1358,6 +1359,8 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(grep -c 'leases.json' <<< "${sel//,/$'\n'}" || true)" "0"
   chk "registry gate runs a touched non-.sh suite py" \
     "$(grep -c 'self:backfill-provenance.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate runs the dashboard privacy self-test" \
+    "$(grep -c 'self:dashboard-gen.py' <<< "${sel//,/$'\n'}" || true)" "1"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'

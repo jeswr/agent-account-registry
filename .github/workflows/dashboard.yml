@@ -1,0 +1,93 @@
+name: account-fleet dashboard
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: account-fleet-dashboard
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build privacy-safe Pages artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Only this filter sees the complete secret map; the probe receives an ACCT_* file.
+      - name: Materialize the ACCT_* worker-token subset for the probe
+        continue-on-error: true
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/acct-secrets.json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          path = sys.argv[1]
+          allow = re.compile(r"ACCT[A-Z0-9]+_TOKEN")
+          data = json.loads(os.environ["ALL_SECRETS"])
+          subset = {key: value for key, value in data.items()
+                    if isinstance(value, str) and allow.fullmatch(key)}
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(subset, handle)
+          os.chmod(path, 0o600)
+          PY
+
+      - name: Probe live account usage (tokens never printed)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
+        run: |
+          set -uo pipefail
+          python3 scripts/account-usage.py --self-test
+          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null || printf '{}' > "$RUNNER_TEMP/usage.json"
+          echo 'usage-probe: snapshot written'
+
+      - name: Generate privacy-safe dashboard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          REGISTRY_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 scripts/dashboard-gen.py --self-test
+          python3 scripts/dashboard-gen.py --usage "$RUNNER_TEMP/usage.json"
+
+      - name: Upload GitHub Pages artifact (pinned)
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: site
+
+  deploy:
+    name: Deploy GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy GitHub Pages (pinned)
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
