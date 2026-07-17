@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The host-clock hook is correctly feature-gated, remains off the untraced path, uses saturating elapsed-time subtraction, preserves the native Instant fallback, and is installed by the real wasm ANALYZE export before execution. The engine unit test verifies routing through the hook, while the wasm-boundary test verifies a populated nonzero root timing. Public API and both Rust/wasm usage documentation are updated consistently. No correctness, soundness, security, or vacuous-test defect requiring changes was found.",
+ "verdict": "approve"
+}
