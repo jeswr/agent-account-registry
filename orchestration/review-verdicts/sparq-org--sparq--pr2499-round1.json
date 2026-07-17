@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change is limited to focused unit tests for the two existing semicolon scanners. The assertions exercise baseline behavior, brace depth, term-state entry/exit, cross-state guards, and nonblank-tail handling directly, so they are not vacuous and accurately reflect the current scanner contract. No production behavior, public API, dependency, or security-sensitive path is changed. Static inspection found no correctness or soundness defect in the added tests. The requested targeted test run could not be performed because cargo is unavailable in the review environment.",
+ "verdict": "approve"
+}
