@@ -36,16 +36,68 @@ def active_for(leases, account):
     return sum(1 for x in leases if x["account"] == account)
 
 
-def choose_account(accounts, leases, model_chain, package, role, now):
+# ---- usage-aware eligibility + expiry-priority (dynamic backoff) --------------------------------
+# [OPUS-4.8] A worker must NOT start on an account that could hit a rate limit mid-run — that burns
+# credits on a half-finished agent. So an account is eligible to START only if we KNOW its live usage
+# (Anthropic anthropic-ratelimit-unified-* headers), its status is "allowed", and BOTH the 5h and 7d
+# windows have >= SAFETY_MARGIN headroom. Fail closed on any missing/unknown usage. Among eligible
+# accounts we prioritise the one whose WEEKLY window resets SOONEST — its unused credits are about to
+# reset, so spend them before they vanish (use-it-or-lose-it).
+SAFETY_MARGIN = 0.10  # fraction of each window that must remain free to admit a new worker
+
+
+def _usage_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_window(u, prefix):
+    """(utilization, reset_ts) for the '5h'/'7d' window, or (None, None) if absent/unparseable."""
+    if not isinstance(u, dict):
+        return None, None
+    return _usage_num(u.get(prefix + "_util")), _usage_num(u.get(prefix + "_reset"))
+
+
+def usage_eligible(u, margin=SAFETY_MARGIN):
+    """Fail-closed admission test for STARTING a worker on an account."""
+    if not isinstance(u, dict):
+        return False                                  # no probe data -> do not risk it
+    if str(u.get("status", "")).lower() not in ("allowed", ""):
+        return False                                  # throttled/rejected -> skip until it resets
+    for prefix in ("5h", "7d"):
+        util, _ = _usage_window(u, prefix)
+        if util is None or (1.0 - util) < margin:
+            return False                              # unknown, or too little headroom to finish
+    return True
+
+
+def _weekly_reset(u):
+    _, reset = _usage_window(u, "7d")
+    return reset if reset is not None else float("inf")
+
+
+def _weekly_unused(u):
+    util, _ = _usage_window(u, "7d")
+    return (1.0 - util) if util is not None else 0.0
+
+
+def choose_account(accounts, leases, model_chain, package, role, now, usage=None):
     """Return the account handle to claim, or None. `accounts`: list of dicts
     {handle, models:[...], max_concurrent_workers, available:bool}. Walks the model chain; within a
-    model, prefers CACHE AFFINITY (an account that most recently ran the same package+role), else the
-    least-loaded eligible account."""
+    model keeps accounts under their concurrency cap and — when live `usage` (a {handle: {status,
+    5h_util,5h_reset,7d_util,7d_reset}} map) is supplied — only accounts that pass `usage_eligible`.
+    Orders eligible accounts by EXPIRY-PRIORITY: soonest weekly reset first (use credits before they
+    reset), then most weekly headroom, then CACHE AFFINITY, then least-loaded. With `usage=None` the
+    behaviour is the original cache-affinity-then-least-loaded selection (backward compatible)."""
     live = reclaim_expired(leases, now)
     for model in model_chain:
         serving = [a for a in accounts
                    if a.get("available", True) and model in a.get("models", [])
                    and active_for(live, a["handle"]) < int(a.get("max_concurrent_workers", 1))]
+        if usage is not None:
+            serving = [a for a in serving if usage_eligible(usage.get(a["handle"]))]
         if not serving:
             continue
 
@@ -54,9 +106,39 @@ def choose_account(accounts, leases, model_chain, package, role, now):
                      if x["account"] == a["handle"] and x.get("package") == package and x.get("role") == role]
             return max(times) if times else -1
 
-        serving.sort(key=lambda a: (-affinity(a), active_for(live, a["handle"]), a["handle"]))
+        def sort_key(a):
+            u = (usage or {}).get(a["handle"])
+            return (_weekly_reset(u),                 # soonest weekly reset first (use-it-or-lose-it)
+                    -_weekly_unused(u),               # then the most unused weekly credits
+                    -affinity(a),                     # then warmest prompt cache
+                    active_for(live, a["handle"]),    # then least-loaded
+                    a["handle"])
+        serving.sort(key=sort_key)
         return serving[0]["handle"]
     return None
+
+
+def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, margin=SAFETY_MARGIN):
+    """How many workers may run right now = sum of per-account slots over accounts eligible to START
+    (available, optionally serving `model_chain`, and `usage_eligible`). Starts HIGH when many accounts
+    have headroom and BACKS OFF automatically as utilisation climbs (ineligible accounts drop out), so
+    credits aren't spent on workers that would half-finish. `absolute_cap` is an optional hard ceiling.
+    Returns 0 when `usage` is empty/None (probe unavailable) — the caller should then fall back to the
+    static policy `max_concurrent`; a returned 0 WITH a non-empty usage map means every account is
+    genuinely tapped out and nothing should dispatch."""
+    if not usage:
+        return 0
+    total = 0
+    for a in accounts:
+        if not a.get("available", True):
+            continue
+        if model_chain is not None and not any(m in a.get("models", []) for m in model_chain):
+            continue
+        if usage_eligible(usage.get(a["handle"]), margin):
+            total += int(a.get("max_concurrent_workers", 1))
+    if absolute_cap is not None:
+        total = min(total, absolute_cap)
+    return total
 
 
 def make_lease(account, holder, package, role, model, now, ttl):
@@ -184,7 +266,7 @@ def read_accounts(repo):
 
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
-          account_pool=None, holder_prefix="", max_holder_concurrent=None):
+          account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free / conflict)."""
     import uuid
     accounts = read_accounts(repo)
@@ -207,7 +289,7 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
             )
             if active_holders >= max_holder_concurrent:
                 return None
-        acct = choose_account(accounts, live, model_chain, package, role, now)
+        acct = choose_account(accounts, live, model_chain, package, role, now, usage=usage)
         if acct is None:
             return None
         a = next(x for x in accounts if x["handle"] == acct)
@@ -307,6 +389,41 @@ def _self_test():
     check("parse account", (pa["models"], pa["max_concurrent_workers"], pa["secret_ref"],
                             pa["credential_format"]),
           (["terra", "gpt"], 2, "ACCT01_TOKEN", "codex-auth-json"))
+
+    # ---- usage-aware eligibility + expiry-priority + dynamic concurrency ----
+    fresh = {"status": "allowed", "5h_util": 0.1, "5h_reset": 5000, "7d_util": 0.1, "7d_reset": 9000}
+    check("eligible: allowed+headroom", usage_eligible(fresh), True)
+    check("ineligible: missing", usage_eligible(None), False)
+    check("ineligible: rejected", usage_eligible({**fresh, "status": "rejected"}), False)
+    check("ineligible: 5h full", usage_eligible({**fresh, "5h_util": 0.95}), False)
+    check("ineligible: 7d full", usage_eligible({**fresh, "7d_util": 0.95}), False)
+    check("ineligible: unknown window", usage_eligible({"status": "allowed", "5h_util": 0.1}), False)
+    U = [{"handle": "soon", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
+         {"handle": "late", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
+         {"handle": "full", "models": ["fable"], "max_concurrent_workers": 1, "available": True}]
+    usage = {
+        "soon": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 3000},
+        "late": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 8000},
+        "full": {"status": "allowed", "5h_util": 0.99, "5h_reset": 100, "7d_util": 0.99, "7d_reset": 1000},
+    }
+    # expiry-priority: 'soon' (7d_reset 3000) beats 'late' (8000); 'full' is ineligible (no headroom).
+    check("expiry priority picks soonest reset",
+          choose_account(U, [], ["fable"], "p", "r", now, usage=usage), "soon")
+    # if 'soon' is removed from usage entirely -> fail-closed skip -> 'late' wins.
+    check("fail-closed on missing usage",
+          choose_account(U, [], ["fable"], "p", "r", now, usage={k: v for k, v in usage.items() if k != "soon"}),
+          "late")
+    # dynamic concurrency: 2 eligible (soon,late), 'full' backs off; absolute_cap clamps.
+    check("dynamic concurrency counts eligible", dynamic_concurrency(U, usage, ["fable"]), 2)
+    check("dynamic concurrency absolute cap", dynamic_concurrency(U, usage, ["fable"], absolute_cap=1), 1)
+    allfull = {h: {**usage["full"]} for h in ("soon", "late", "full")}
+    check("dynamic concurrency backs off to 0 when tapped out",
+          dynamic_concurrency(U, allfull, ["fable"]), 0)
+    check("dynamic concurrency 0 without usage (caller falls back to static)",
+          dynamic_concurrency(U, None, ["fable"]), 0)
+    # backward compat: usage=None keeps the original cache-affinity selection.
+    check("usage=None backward compatible", choose_account(A, [], ["fable"], "pkg", "impl", now), "acct02")
+
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
