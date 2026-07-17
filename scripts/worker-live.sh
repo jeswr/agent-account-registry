@@ -220,16 +220,28 @@ run_gate() {
       ;;
     crate-scoped)
       [[ -f Cargo.toml ]] || die 'crate-scoped gate requires Cargo.toml'
-      [[ -n "$packages" ]] || die 'crate-scoped gate requires at least one area:<crate> label'
-      cargo fmt --all -- --check
-      local package
-      IFS=',' read -r -a package_list <<< "$packages"
-      for package in "${package_list[@]}"; do
-        safe_atom "$package" || die "unsafe crate package $package"
-        cargo clippy -p "$package" --all-targets -- -D warnings
-        cargo test -p "$package"
-      done
-      printf 'worker-live: crate-scoped gate passed for %s\n' "$packages"
+      if [[ -z "$packages" ]]; then
+        # [OPUS-4.8] No area:<crate> label. Legitimate for a docs/non-crate change (e.g. a
+        # role:docs task edits AGENTS.md only) — there is no crate to build, and the PR's CI
+        # docs-quality gate is the real backstop. But it is a REAL error if the diff actually
+        # touches crate source with no crate label, so fail closed in that case.
+        local changed_paths
+        changed_paths="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
+        if printf '%s\n' "$changed_paths" | grep -qE '^crates/|^Cargo\.toml$|^Cargo\.lock$'; then
+          die 'crate-scoped gate requires an area:<crate> label (diff touches crate source)'
+        fi
+        printf 'worker-live: docs/non-crate change (no crate source touched) — nothing to build; gate passed\n'
+      else
+        cargo fmt --all -- --check
+        local package
+        IFS=',' read -r -a package_list <<< "$packages"
+        for package in "${package_list[@]}"; do
+          safe_atom "$package" || die "unsafe crate package $package"
+          cargo clippy -p "$package" --all-targets -- -D warnings
+          cargo test -p "$package"
+        done
+        printf 'worker-live: crate-scoped gate passed for %s\n' "$packages"
+      fi
       ;;
     workspace)
       [[ -f Cargo.toml ]] || die 'workspace gate requires Cargo.toml'
