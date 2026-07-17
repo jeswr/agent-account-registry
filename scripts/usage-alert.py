@@ -17,8 +17,10 @@
 # logs; ALERT_REPO/ALERT_TOKEN route that body to a private repo (fallback: the registry repo). A
 # HALF-configured deployment (ALERT_REPO set, ALERT_TOKEN missing) falls back to the registry repo
 # rather than writing to the private repo under the ambient token that can't reach it — a write that
-# would fail silently and drop the alert (issue #39). Writes go through _gh(check=True), which surfaces
-# a non-zero gh returncode as a ::warning:: instead of dropping it.
+# would fail silently and drop the alert (issue #39) — and REDACTS account handles from that fallback
+# body (the registry is public and the maintainer signalled privacy intent; counts only). Writes go
+# through _gh(check=True), which surfaces a non-zero gh returncode as a sanitized ::warning:: (op +
+# returncode only — never gh stderr, which can echo request bodies under GH_DEBUG=api).
 #
 # Pure classify()/_policy_pool_margin() are unit-tested (--self-test); the CLI wraps them over the
 # usage file + `gh`.
@@ -76,11 +78,13 @@ def _alert_route(alert_repo, alert_token, registry_repo):
     destination ONLY when ALERT_TOKEN can write there; a half-configured deployment (repo var set,
     token secret missed) must NOT try to write to the private repo under the ambient registry token
     (which has no permission there) — that write fails silently and the alert is dropped. So fall
-    back to the registry repo, which the ambient token can always write. Returns token=None to mean
-    "use the ambient GH_TOKEN"."""
+    back to the registry repo, which the ambient token can always write. token=None means "use the
+    ambient GH_TOKEN". redact_handles=True marks the HALF-configured case (ALERT_REPO set, token
+    missing): the maintainer signalled privacy intent, so the fallback body must carry NO account
+    handles — the registry repo is public (decision 22a) — while still failing loud (review r1)."""
     if alert_repo and alert_token:
-        return alert_repo, alert_token
-    return registry_repo, None
+        return alert_repo, alert_token, False
+    return registry_repo, None, bool(alert_repo)
 
 
 def classify(pool, usage, margin):
@@ -116,15 +120,28 @@ def classify(pool, usage, margin):
     return eligible, rows
 
 
-def render(eligible, rows, pool, threshold, maintainer, probe_empty=False):
+def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redact_handles=False):
     lines = ["> 🤖 SPARQ agent — automated worker-account availability check.\n"]
     if probe_empty:
         lines.append("🚨 **The usage probe returned NO data — dispatch is holding fail-closed.** "
                      "This is a probe/secret-infrastructure failure (malformed secrets, endpoint or "
                      "header change, curl outage), not N individually capped accounts.\n")
     lines.append(f"**Usable workers: {eligible}/{len(pool)}**  (degraded below {threshold}).\n")
-    for h, s, ok in rows:
-        lines.append(f"- {'✅' if ok else '⛔'} `{h}`: {s}")
+    if redact_handles:
+        # Half-configured private route (issue #39, review r1): this body lands on the PUBLIC
+        # registry repo even though the maintainer signalled privacy intent via ALERT_REPO, so it
+        # carries counts only — never an account handle (decision 22a).
+        capped = sum(1 for _h, s, _ok in rows if s.startswith("CAPPED"))
+        unavailable = sum(1 for _h, s, _ok in rows if s.startswith("UNAVAILABLE"))
+        ok_count = len(rows) - capped - unavailable
+        lines.append(f"- ⛔ capped: {capped} · unavailable: {unavailable} · ✅ ok: {ok_count}")
+        lines.append("\n⚠️ Per-account detail suppressed: the private alert route is HALF-configured "
+                     "(`ALERT_REPO` is set but the `ALERT_TOKEN` secret is missing), so this alert "
+                     "fell back to the public registry repo. Set `ALERT_TOKEN` to receive per-account "
+                     "detail privately.")
+    else:
+        for h, s, ok in rows:
+            lines.append(f"- {'✅' if ok else '⛔'} `{h}`: {s}")
     if eligible < threshold:
         lines.append(f"\n@{maintainer} — autonomous worker throughput is **degraded**. To restore it: reset the "
                      "usage window on any `CAPPED` subscription account, and rotate the token for any "
@@ -142,9 +159,10 @@ def _gh(args, capture=False, token=None, check=False):
         env["GH_TOKEN"] = token
     result = subprocess.run(["gh"] + args, capture_output=capture, text=True, env=env)
     if check and result.returncode != 0:
-        detail = (result.stderr or "").strip() if capture else ""
+        # Privacy (review r1): do NOT echo gh stderr — under GH_DEBUG=api it can contain the
+        # request body (i.e. account handles). Log only the operation + returncode.
         print(f"::warning::usage-alert: gh {args[0]} {args[1] if len(args) > 1 else ''} "
-              f"failed (rc={result.returncode}){' — ' + detail if detail else ''}")
+              f"failed (rc={result.returncode})")
     return result
 
 
@@ -153,7 +171,7 @@ def main():
     # Where the alert issue lives + which token writes it. A private ALERT_REPO is used ONLY when
     # ALERT_TOKEN can write there; otherwise fall back to the registry repo (issue #39) so a
     # half-configured deployment never silently drops the alert.
-    repo, alert_token = _alert_route(
+    repo, alert_token, redact_handles = _alert_route(
         os.environ.get("ALERT_REPO"), os.environ.get("ALERT_TOKEN"), registry_repo)
     maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
     usage_file = os.environ.get("WORKER_USAGE_FILE")
@@ -174,7 +192,8 @@ def main():
     eligible, rows = classify(pool, usage, margin)
     threshold = max(1, (len(pool) + 1) // 2)      # degraded if fewer than half the pool is usable
     degraded = eligible < threshold
-    body = render(eligible, rows, pool, threshold, maintainer, probe_empty=not usage)
+    body = render(eligible, rows, pool, threshold, maintainer, probe_empty=not usage,
+                  redact_handles=redact_handles)
 
     _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", "d73a4a",
          "--description", "Autonomous worker availability alert (maintainer action)"],
@@ -255,14 +274,49 @@ def _self_test():
     # Alert routing (issue #39): private repo used ONLY when its token is present; a half-configured
     # deployment (repo set, token missing) falls back to the registry repo so the write can't fail
     # silently under the ambient token. token=None means "use the ambient GH_TOKEN".
-    chk("route: repo+token -> private + token",
-        _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok"))
-    chk("route: repo but NO token -> registry fallback",
-        _alert_route("org/private", "", "org/registry"), ("org/registry", None))
-    chk("route: repo but None token -> registry fallback",
-        _alert_route("org/private", None, "org/registry"), ("org/registry", None))
-    chk("route: no repo -> registry",
-        _alert_route("", "tok", "org/registry"), ("org/registry", None))
+    chk("route: repo+token -> private + token, no redaction",
+        _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok", False))
+    chk("route: repo but NO token -> registry fallback, REDACTED",
+        _alert_route("org/private", "", "org/registry"), ("org/registry", None, True))
+    chk("route: repo but None token -> registry fallback, REDACTED",
+        _alert_route("org/private", None, "org/registry"), ("org/registry", None, True))
+    chk("route: no repo -> registry, full body (documented d22c fallback)",
+        _alert_route("", "tok", "org/registry"), ("org/registry", None, False))
+    # Redacted fallback body (review r1): the half-configured route must never put an account
+    # handle on the public registry repo — counts only, plus the fix-it hint.
+    rrows = [("acct-priv-h1", "CAPPED — 5h window 95% used, resets t", False),
+             ("acct-priv-h2", "UNAVAILABLE — token invalid/expired or probe failed", False),
+             ("acct-priv-h3", "ok — 5h 10%, 7d 20%", True)]
+    red = render(1, rrows, ["p", "q", "r"], 2, "m", redact_handles=True)
+    chk("redacted body carries no handle",
+        ("acct-priv-h1" in red, "acct-priv-h2" in red, "acct-priv-h3" in red), (False, False, False))
+    chk("redacted body keeps counts + hint",
+        ("capped: 1" in red, "unavailable: 1" in red, "ok: 1" in red, "ALERT_TOKEN" in red),
+        (True, True, True, True))
+    # _gh(check=True) fail-loud + sanitization (review r1): a non-zero gh returncode must emit a
+    # ::warning:: naming the op + rc, and must NOT republish gh stderr (GH_DEBUG=api can echo the
+    # request body) nor any argument content.
+    import contextlib
+    import io
+
+    class _FailedRun:
+        returncode = 1
+        stderr = "SENTINEL-STDERR-ECHO"
+        stdout = ""
+
+    real_run = subprocess.run
+    subprocess.run = lambda *a, **k: _FailedRun()
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _gh(["issue", "edit", "1", "--body", "SENTINEL-BODY-HANDLE"], capture=True, check=True)
+        warned = buf.getvalue()
+    finally:
+        subprocess.run = real_run
+    chk("gh check=True warns op+rc on failure",
+        ("::warning::" in warned, "issue edit" in warned, "rc=1" in warned), (True, True, True))
+    chk("gh failure warning is sanitized",
+        ("SENTINEL-STDERR-ECHO" in warned, "SENTINEL-BODY-HANDLE" in warned), (False, False))
     # NaN/inf guard (issue #39): a literal `nan`/`inf` header must classify UNAVAILABLE, not `ok`
     # (NaN comparisons are all False, so it would otherwise slip past the CAPPED threshold).
     chk("nan header -> None (fail-closed)", _util("nan"), None)
