@@ -246,20 +246,28 @@ _HINT_RELATIVE_RE = re.compile(
     r"(?:\bin|\bafter)[ :]*([0-9]+(?:\.[0-9]+)?)\s*"
     r"(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b", re.IGNORECASE)
 _HINT_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
+# HTTP-style unitless Retry-After ("retry-after: 120" — delay-seconds by RFC 9110 §10.2.3). The
+# advertised form MUST actually parse (cross-provider review r1); unitless is seconds by spec.
+_HINT_RETRY_AFTER_RE = re.compile(
+    r"retry[ -]?after[ :]*([0-9]+(?:\.[0-9]+)?)(?!\.)\b(?!\s*(?:s|secs?|seconds?|m|mins?|"
+    r"minutes?|h|hrs?|hours?)\b)", re.IGNORECASE)
 
 
 def parse_reset_hint(hint, record_ts):
     """Best-effort EPOCH from a sanitized provider reset hint, or None. Machine-safe forms only:
-    a relative "in/after N s|m|h" (codex/HTTP retry-after style) or a bare epoch-seconds number.
-    Free-text hints ("resets 2pm (Europe/London)") are NOT guessed — the caller falls back to the
-    exponential default, so a garbled or forged hint can never crash the sweep or (with the
-    caller's cap) extend a backoff past BACKOFF_CAP_SECONDS."""
+    a relative "in/after N s|m|h" (codex style), an HTTP "retry-after: N" (unitless = seconds, RFC
+    9110), or a bare epoch-seconds number. Free-text hints ("resets 2pm (Europe/London)") are NOT
+    guessed — the caller falls back to the exponential default, so a garbled or forged hint can
+    never crash the sweep or (with the caller's cap) extend a backoff past BACKOFF_CAP_SECONDS."""
     if not isinstance(hint, str) or not hint.strip():
         return None
     text = hint.strip()
     match = _HINT_RELATIVE_RE.search(text)
     if match:
         return record_ts + float(match.group(1)) * _HINT_UNIT_SECONDS[match.group(2)[0].lower()]
+    match = _HINT_RETRY_AFTER_RE.search(text)
+    if match:
+        return record_ts + float(match.group(1))    # unitless Retry-After is delay-SECONDS
     if re.fullmatch(r"[0-9]{9,12}", text):          # bare epoch seconds (a plausible-era stamp)
         ts = int(text)
         return float(ts) if ts > record_ts else None
@@ -275,12 +283,20 @@ def account_backoffs(records, now):
     [record_ts, record_ts + BACKOFF_CAP_SECONDS]. Returns only ACTIVE backoffs:
     {account_hash: {"backoff_until", "consecutive", "last_signal", "last_ts"}}."""
     state = {}
+    valid = []
     for record in records:
         if not isinstance(record, dict):
             continue
+        acct, ts = record.get("account"), record.get("ts")
+        if (not isinstance(acct, str) or not isinstance(ts, (int, float))
+                or isinstance(ts, bool) or ts != ts or ts in (float("inf"), float("-inf"))):
+            continue                                # non-str acct / non-finite ts: skip fail-open
+        valid.append(record)
+    # Defensive ts-sort (cross-provider review r1): the consecutive/success-reset walk is order-
+    # sensitive; the production caller pre-prunes (which sorts), but do not RELY on callers.
+    valid.sort(key=lambda r: r["ts"])
+    for record in valid:
         acct, cls, ts = record.get("account"), record.get("exit_class"), record.get("ts")
-        if not isinstance(acct, str) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
-            continue
         if cls == SUCCESS:
             state.pop(acct, None)                   # a successful run resets the multiplier
         elif cls in BACKOFF_CLASSES:
@@ -1040,6 +1056,23 @@ def _self_test():
     # parse_reset_hint pure forms
     chk("hint: relative minutes", parse_reset_hint("Please try again in 5 minutes", 1000), 1300.0)
     chk("hint: retry after seconds", parse_reset_hint("retry after 90 seconds", 1000), 1090.0)
+    # the advertised HTTP unitless form must actually parse (cross-provider review r1):
+    # RFC 9110 Retry-After delay-seconds
+    chk("hint: unitless retry-after is seconds", parse_reset_hint("retry-after: 120", 1000), 1120.0)
+    chk("hint: unitless Retry After variant", parse_reset_hint("Retry After 45", 1000), 1045.0)
+    # the SUCCESS-reset / consecutive walk must not depend on caller ordering (r1): shuffled
+    # input yields the same state as ts-order (success at ts=100 clears the ts=0 hit; the ts=200
+    # hit then restarts at base)
+    chk("out-of-order records are ts-sorted before the walk",
+        account_backoffs([rec("openai", "codex01", "rate-limit", dt=200),
+                          rec("openai", "codex01", SUCCESS, dt=100),
+                          rec("openai", "codex01", "rate-limit", dt=0)], now + 300)
+        .get(ah, {}).get("consecutive"), 1)
+    # non-finite ts records are skipped fail-open, never crash int()
+    chk("non-finite ts skipped fail-open",
+        account_backoffs([{"account": ah, "exit_class": "rate-limit", "ts": float("inf")},
+                          {"account": ah, "exit_class": "rate-limit", "ts": float("nan")}],
+                         now), {})
     chk("hint: bare epoch", parse_reset_hint("1770000000", 1000), 1770000000.0)
     chk("hint: past epoch rejected", parse_reset_hint("1770000000", 1780000000), None)
     chk("hint: garbage -> None", parse_reset_hint("resets at 2pm", 1000), None)

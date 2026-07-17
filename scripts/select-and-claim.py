@@ -16,6 +16,7 @@ and heartbeat are keyed by the unique claim_id.
 import argparse
 import base64
 import json
+import math
 import os
 import subprocess
 import sys
@@ -102,9 +103,13 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
     starvation it removes). Anthropic accounts keep the fail-closed probing below unchanged."""
     if not isinstance(u, dict):
         return False                                  # no probe data -> do not risk it
-    if u.get("exempt"):
+    if u.get("exempt") is True:                       # STRICT: only the literal producer-set flag —
+        # a forged truthy string (e.g. "false") must not ride the exempt arm (cross-provider r1).
         until = _usage_num(u.get("backoff_until"))
-        if until is not None:
+        # Finite stamps only (cross-provider review r1): `inf` would sideline the account FOREVER
+        # (now < inf is always True) while usage-alert's nan/inf guard reports it healthy — a
+        # dispatch/monitoring split. Non-finite = no backoff, matching _apply_backoff's fail-open.
+        if until is not None and math.isfinite(until):
             if now is None:
                 import time
                 now = time.time()
@@ -620,6 +625,17 @@ def _self_test():
     # (v) a forged/malformed stamp fails OPEN to no-backoff (never crashes, never starves).
     check("malformed backoff stamp fails open",
           usage_eligible({"exempt": True, "backoff_until": "garbage"}, now=now), True)
+    # (cross-provider review r1) non-finite stamps fail OPEN — inf must not sideline forever…
+    check("inf backoff stamp fails open (no indefinite sideline)",
+          usage_eligible({"exempt": True, "backoff_until": "inf"}, now=now), True)
+    check("nan backoff stamp fails open",
+          usage_eligible({"exempt": True, "backoff_until": "nan"}, now=now), True)
+    # …and the exempt flag is STRICT: a forged truthy string must not exempt an account whose
+    # entry otherwise lacks usage windows (would-be anthropic bypass).
+    check("forged exempt='false' string does NOT exempt (fail-closed)",
+          usage_eligible({"exempt": "false", "status": "allowed"}, now=now), False)
+    check("forged exempt=1 does NOT exempt (fail-closed)",
+          usage_eligible({"exempt": 1, "status": "allowed"}, now=now), False)
     # choose_account skips a backed-off exempt account and picks the free one; None when all backed off.
     OA = [{"handle": "cx1", "models": ["terra"], "max_concurrent_workers": 1, "available": True},
           {"handle": "cx2", "models": ["terra"], "max_concurrent_workers": 1, "available": True}]

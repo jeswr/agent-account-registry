@@ -302,14 +302,17 @@ _run_headless_harness() {
     # detects, sanitized to a short fixed charset (it feeds an alert body, never a command).
     # rate-limit hints ("try again in 20s" / "retry-after: 120") feed the reactive backoff for
     # probe-exempt providers (decision 2026-07-17, registry issue #29) via the model-health record.
-    # Same host-scoped source ($err_signals = CLI stderr + harness [error]-prefixed lines only) and
-    # same sanitization; a forged hint is duration-capped downstream (model-health BACKOFF_CAP).
+    # Same host-scoped source ($err_signals = CLI stderr + harness [error]-prefixed lines only).
+    # MACHINE-PARSEABLE forms ONLY for rate-limit (cross-provider review r1): a free-text capture
+    # could carry arbitrary CLI-echoed content into the ledger, and model-health's
+    # parse_reset_hint rejects free text anyway (exponential fallback) — so digits are REQUIRED
+    # and the phrase set is closed. Duration is capped downstream regardless (BACKOFF_CAP).
     local reset_hint=""
     if [[ "$cls" == session-limit ]]; then
       reset_hint="$(grep -aioE 'resets?( at| on| in)?[ :]*[A-Za-z0-9][A-Za-z0-9 :,/+.()-]{0,60}' "$err_signals" \
         | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80)" || reset_hint=""
     elif [[ "$cls" == rate-limit ]]; then
-      reset_hint="$(grep -aioE '(try again|retry([ -]?after)?|resets?)( at| on| in)?[ :]*[A-Za-z0-9][A-Za-z0-9 :,/+.()-]{0,60}' "$err_signals" \
+      reset_hint="$(grep -aioE '(try again (in|after)|retry[ -]?after)[ :]*[0-9]+(\.[0-9]+)?( ?(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?))?\b' "$err_signals" \
         | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80)" || reset_hint=""
     fi
     printf '::error::worker-live: model-exit-class=%s (raw model output withheld to protect credentials)\n' "$cls"

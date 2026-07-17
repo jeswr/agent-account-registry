@@ -189,17 +189,29 @@ def _load_backoffs(mh, script_dir, now):
         return {}
 
 
+# The exempt PROVIDER allowlist (cross-provider review r1): the maintainer decision names openai;
+# binding the exemption to an explicit allowlist (vs "any non-anthropic string") keeps a missing,
+# misspelled, or unknown provider on the fail-closed probe path (it will surface as UNAVAILABLE in
+# usage-alert — loud), so a catalog typo can never silently exempt an account from usage gating.
+EXEMPT_PROVIDERS = frozenset({"openai"})
+
+
+def _is_exempt_provider(provider):
+    """True only for the explicitly probe-exempt providers (pure; whitespace/case tolerant)."""
+    return str(provider or "").strip().lower() in EXEMPT_PROVIDERS
+
+
 def _apply_backoff(entry, backoff):
     """Annotate one exempt usage entry with an ACTIVE backoff record (pure). Tolerant fail-open:
-    a malformed/forged record (non-dict, non-numeric backoff_until) leaves the entry untouched —
-    never crashes the sweep, never blocks the account."""
+    a malformed/forged record (non-dict, non-numeric/non-finite backoff_until) leaves the entry
+    untouched — never crashes the sweep, never blocks the account."""
     if not isinstance(backoff, dict):
         return entry
     try:
-        until = float(backoff.get("backoff_until"))
-    except (TypeError, ValueError):
-        return entry
-    entry["backoff_until"] = int(until)
+        until = int(float(backoff.get("backoff_until")))
+    except (TypeError, ValueError, OverflowError):
+        return entry               # nan/inf/garbage: fail open (int() rejects non-finite floats)
+    entry["backoff_until"] = until
     if isinstance(backoff.get("consecutive"), int):
         entry["backoff_consecutive"] = backoff["consecutive"]
     if isinstance(backoff.get("last_signal"), str):
@@ -305,22 +317,40 @@ def main():
     now = time.time()
     salt = os.environ.get("PROVENANCE_SALT", "")
     backoffs = None    # lazily loaded on the first probe-exempt account
+    mh = None          # the model-health module once loaded (None until then / on load failure)
+    salt_warned = False
     usage = {}
     for account in _load_accounts(script_dir, registry_repo):
         handle = account["handle"]
         if pool and handle not in pool:
             continue
-        if str(account.get("provider", "")).lower() != "anthropic":
+        if _is_exempt_provider(account.get("provider")):
             # Probe-exempt provider (decision 2026-07-17, issue #29): eligible without usage data,
             # reactively backed off via the model-health rate-limit records. No salt -> no hash
-            # mapping -> loud fail-open (backoff disabled, exemption intact).
+            # mapping -> loud fail-open (backoff disabled, exemption intact). Any provider NOT on
+            # the explicit allowlist (incl. missing/misspelled) falls through to the fail-closed
+            # probe path below and surfaces as UNAVAILABLE in usage-alert.
             entry = {"exempt": True}
             if salt:
                 if backoffs is None:
-                    mh = _load_model_health(script_dir)
-                    backoffs = _load_backoffs(mh, script_dir, now)
-                entry = _apply_backoff(entry, backoffs.get(mh.account_hash(handle, salt)))
-            else:
+                    # Guarded module load (cross-provider review r1): an import failure here must
+                    # fail OPEN like an unreadable ledger — an uncaught exception would crash the
+                    # probe, the shell would write '{}', and EVERY account (anthropic included)
+                    # would fail closed: the exact starvation the exemption exists to prevent.
+                    try:
+                        mh = _load_model_health(script_dir)
+                        backoffs = _load_backoffs(mh, script_dir, now)
+                    except Exception:
+                        print("::warning::account-usage: model-health module unavailable — exempt "
+                              "accounts admitted WITHOUT rate-limit backoff this tick (fail-open)",
+                              file=sys.stderr)
+                        mh, backoffs = None, {}
+                if mh is not None:
+                    entry = _apply_backoff(entry, backoffs.get(mh.account_hash(handle, salt)))
+            elif not salt_warned:
+                # Once, not per account: a per-account repeat would leak the exempt-account COUNT
+                # into the public log (locked decision 22b) and drown the signal.
+                salt_warned = True
                 print("::warning::account-usage: PROVENANCE_SALT missing — exempt accounts "
                       "admitted WITHOUT rate-limit backoff (fail-open)", file=sys.stderr)
             usage[handle] = entry
@@ -435,6 +465,20 @@ def _self_test():
         _apply_backoff({"exempt": True}, {"backoff_until": "garbage"}), {"exempt": True})
     chk("apply backoff: non-dict record fails open", _apply_backoff({"exempt": True}, "x"),
         {"exempt": True})
+    #   non-finite stamps must fail OPEN, not crash (cross-provider review r1: int(nan) raises
+    #   ValueError, int(inf) raises OverflowError — both outside a naive float() guard)
+    chk("apply backoff: nan fails open (no crash)",
+        _apply_backoff({"exempt": True}, {"backoff_until": "nan"}), {"exempt": True})
+    chk("apply backoff: inf fails open (no indefinite sideline)",
+        _apply_backoff({"exempt": True}, {"backoff_until": "inf"}), {"exempt": True})
+    #   the exemption is bound to an explicit provider allowlist (cross-provider review r1):
+    #   missing/misspelled/unknown providers stay on the fail-closed probe path
+    chk("exempt allowlist: openai (case/space tolerant)",
+        (_is_exempt_provider("openai"), _is_exempt_provider(" OpenAI ")), (True, True))
+    chk("exempt allowlist: anthropic/missing/typo/unknown all fail closed",
+        (_is_exempt_provider("anthropic"), _is_exempt_provider(""), _is_exempt_provider(None),
+         _is_exempt_provider("antropic"), _is_exempt_provider("codex")),
+        (False, False, False, False, False))
     #   ledger round-trip: a rate-limit record for a salted handle surfaces as an active backoff
     mh = _load_model_health(script_dir)
     test_now = 1_000_000
@@ -448,15 +492,36 @@ def _self_test():
     backoffs = _load_backoffs(mh, script_dir, test_now + 60)
     chk("ledger round-trip: active backoff derived for the salted handle",
         backoffs.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_BASE_SECONDS)
-    #   (v) malformed ledger -> loud fail-open {} (never crashes the sweep)
+    #   (v) malformed ledger -> loud fail-open {} (never crashes the sweep). CAPTURED stderr
+    #   (cross-provider review r1): un-captured, these intentional failures would emit REAL
+    #   ::warning:: annotations on every workflow run (the step runs --self-test first) and
+    #   destroy the warning's operational signal. Capturing also lets us ASSERT the loudness.
+    import contextlib
+    import io
+
+    def _load_backoffs_captured(now_arg):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            result = _load_backoffs(mh, script_dir, now_arg)
+        return result, buf.getvalue()
+
     with open(good_path, "w", encoding="utf-8") as fh:
         fh.write('{"records": "not-a-list"}')
-    chk("malformed ledger fails open to no-backoff", _load_backoffs(mh, script_dir, test_now), {})
+    got, err = _load_backoffs_captured(test_now)
+    chk("malformed ledger fails open to no-backoff", got, {})
+    chk("malformed ledger fail-open is LOUD (::warning::)", "::warning::" in err, True)
     with open(good_path, "w", encoding="utf-8") as fh:
         fh.write("not json at all")
-    chk("unparseable ledger fails open", _load_backoffs(mh, script_dir, test_now), {})
+    got, err = _load_backoffs_captured(test_now)
+    chk("unparseable ledger fails open", got, {})
+    chk("unparseable ledger fail-open is LOUD", "::warning::" in err, True)
     os.environ["MODEL_HEALTH_FILE"] = os.path.join(good_path, "nope")  # unreadable path
-    chk("missing ledger file fails open", _load_backoffs(mh, script_dir, test_now), {})
+    got, err = _load_backoffs_captured(test_now)
+    chk("missing ledger file fails open", got, {})
+    chk("missing ledger fail-open is LOUD", "::warning::" in err, True)
+    #   the warning line itself must stay sanitized: no handle, no salt, no count
+    chk("fail-open warning carries no handle/salt", ("codex01" in err, "s3cret" in err),
+        (False, False))
     del os.environ["MODEL_HEALTH_FILE"]
     os.unlink(good_path)
     print("account-usage self-test", "PASSED" if ok else "FAILED")

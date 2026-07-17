@@ -104,7 +104,7 @@ def classify(pool, usage, margin, now=None):
         if u is None:
             rows.append((h, "UNAVAILABLE — token invalid/expired or probe failed (rotate setup-token)", False))
             continue
-        if u.get("exempt"):
+        if u.get("exempt") is True:  # STRICT, mirroring usage_eligible (cross-provider review r1)
             until = _util(u.get("backoff_until"))
             if until is not None and now < until:
                 rows.append((h, f"BACKED OFF — provider rate limit hit "
@@ -382,6 +382,12 @@ def _self_test():
     chk("expired backoff -> ok again", (e9, r9[0][2]), (1, True))
     e10, r10 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "garbage"}}, 0.10, now=tnow)
     chk("malformed backoff stamp fails open to ok", (e10, r10[0][2]), (1, True))
+    # inf/nan stamps fail open to ok (matches usage_eligible's finite-only comparison, r1)
+    e11, r11 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "inf"}}, 0.10, now=tnow)
+    chk("inf backoff stamp fails open to ok (no dispatch/alert split)", (e11, r11[0][2]), (1, True))
+    # a forged truthy exempt STRING does not ride the exempt arm (STRICT flag, r1)
+    e12, r12 = classify(["cx"], {"cx": {"exempt": "false"}}, 0.10, now=tnow)
+    chk("forged exempt string classifies fail-closed UNAVAILABLE", (e12, r12[0][2]), (0, False))
     # NaN/inf guard (issue #39): a literal `nan`/`inf` header must classify UNAVAILABLE, not `ok`
     # (NaN comparisons are all False, so it would otherwise slip past the CAPPED threshold).
     chk("nan header -> None (fail-closed)", _util("nan"), None)
