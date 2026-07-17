@@ -49,6 +49,13 @@ SAFETY_MARGIN = 0.10  # default fraction of each window that must remain free to
 # remaining headroom. Set margin >= a typical worker's per-window burn to actually prevent half-finishes.
 # Per-repo overridable via policy `usage_safety_margin`. Projected-burn admission is tracked as follow-up.
 
+# [FABLE-5] Models whose OWN weekly sub-quota (the account-usage `fable_7d_oi_*` window) must ALSO have
+# headroom before a worker starts — routing one of these to an account with low WHOLE-account usage but an
+# exhausted premium bucket fails mid-run and burns credits. account-usage.py only ever emits the fable
+# sub-quota fields for the claude-fable-5 alias; keep this in sync with any alias that maps to that bucket.
+PREMIUM_MODELS = frozenset({"fable"})
+FABLE_WINDOW = "fable_7d_oi"  # prefix of the fable sub-quota util/reset keys in the usage map
+
 
 def _usage_num(v):
     try:
@@ -58,14 +65,26 @@ def _usage_num(v):
 
 
 def _usage_window(u, prefix):
-    """(utilization, reset_ts) for the '5h'/'7d' window, or (None, None) if absent/unparseable."""
+    """(utilization, reset_ts) for a named window, or (None, None) if absent/unparseable."""
     if not isinstance(u, dict):
         return None, None
     return _usage_num(u.get(prefix + "_util")), _usage_num(u.get(prefix + "_reset"))
 
 
-def usage_eligible(u, margin=SAFETY_MARGIN):
-    """Fail-closed admission test for STARTING a worker on an account."""
+def _fable_eligible(u, margin):
+    """[FABLE-5] Fail-closed headroom test for the FABLE weekly sub-quota. Requires the account-usage
+    fable probe to have SUCCEEDED (fable_ok) AND the 7d_oi window to have >= margin headroom. Unknown or
+    unprobed -> ineligible, so a fable route never lands on an account with an exhausted (or unobserved)
+    Fable bucket."""
+    if not isinstance(u, dict) or not u.get("fable_ok"):
+        return False
+    util, _ = _usage_window(u, FABLE_WINDOW)
+    return util is not None and (1.0 - util) >= margin
+
+
+def usage_eligible(u, margin=SAFETY_MARGIN, model=None):
+    """Fail-closed admission test for STARTING a worker (of `model`) on an account. Beyond the whole-account
+    5h/7d headroom, a PREMIUM_MODELS route (fable) additionally requires FABLE sub-quota headroom."""
     if not isinstance(u, dict):
         return False                                  # no probe data -> do not risk it
     if u.get("exempt"):
@@ -76,16 +95,24 @@ def usage_eligible(u, margin=SAFETY_MARGIN):
         util, _ = _usage_window(u, prefix)
         if util is None or (1.0 - util) < margin:
             return False                              # unknown, or too little headroom to finish
+    if model in PREMIUM_MODELS and not _fable_eligible(u, margin):
+        return False                                  # [FABLE-5] whole-account fine, but Fable bucket isn't
     return True
 
 
-def _weekly_reset(u):
-    _, reset = _usage_window(u, "7d")
+def _priority_window(model):
+    """The use-it-or-lose-it weekly window to prioritise by: the FABLE sub-quota for a premium route,
+    else the whole-account 7d window."""
+    return FABLE_WINDOW if model in PREMIUM_MODELS else "7d"
+
+
+def _weekly_reset(u, model=None):
+    _, reset = _usage_window(u, _priority_window(model))
     return reset if reset is not None else float("inf")
 
 
-def _weekly_unused(u):
-    util, _ = _usage_window(u, "7d")
+def _weekly_unused(u, model=None):
+    util, _ = _usage_window(u, _priority_window(model))
     return (1.0 - util) if util is not None else 0.0
 
 
@@ -103,7 +130,8 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
                    if a.get("available", True) and model in a.get("models", [])
                    and active_for(live, a["handle"]) < int(a.get("max_concurrent_workers", 1))]
         if usage is not None:
-            serving = [a for a in serving if usage_eligible(usage.get(a["handle"]), margin)]
+            serving = [a for a in serving
+                       if usage_eligible(usage.get(a["handle"]), margin, model=model)]
         if not serving:
             continue
 
@@ -112,10 +140,10 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
                      if x["account"] == a["handle"] and x.get("package") == package and x.get("role") == role]
             return max(times) if times else -1
 
-        def sort_key(a):
+        def sort_key(a, model=model):  # [FABLE-5] prioritise by the window that gates THIS model
             u = (usage or {}).get(a["handle"])
-            return (_weekly_reset(u),                 # soonest weekly reset first (use-it-or-lose-it)
-                    -_weekly_unused(u),               # then the most unused weekly credits
+            return (_weekly_reset(u, model),          # soonest weekly reset first (use-it-or-lose-it)
+                    -_weekly_unused(u, model),        # then the most unused weekly credits
                     -affinity(a),                     # then warmest prompt cache
                     active_for(live, a["handle"]),    # then least-loaded
                     a["handle"])
@@ -138,9 +166,14 @@ def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, ma
     for a in accounts:
         if not a.get("available", True):
             continue
-        if model_chain is not None and not any(m in a.get("models", []) for m in model_chain):
+        # [FABLE-5] An account counts only if it is eligible for a model it can actually serve from the
+        # chain (a fable-only chain requires fable sub-quota headroom, not just whole-account headroom).
+        servable = [m for m in model_chain if m in a.get("models", [])] if model_chain is not None \
+            else [None]
+        if model_chain is not None and not servable:
             continue
-        if usage_eligible(usage.get(a["handle"]), margin):
+        u = usage.get(a["handle"])
+        if any(usage_eligible(u, margin, model=m) for m in servable):
             total += int(a.get("max_concurrent_workers", 1))
     if absolute_cap is not None:
         total = min(total, absolute_cap)
@@ -409,9 +442,13 @@ def _self_test():
     U = [{"handle": "soon", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "late", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "full", "models": ["fable"], "max_concurrent_workers": 1, "available": True}]
+    # [FABLE-5] fable-capable accounts carry the sub-quota fields; 7d_oi reset mirrors 7d so the base-window
+    # priority ordering (soon < late) still holds under the fable-aware _priority_window.
     usage = {
-        "soon": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 3000},
-        "late": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 8000},
+        "soon": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 3000,
+                 "fable_ok": True, "fable_7d_oi_util": 0.2, "fable_7d_oi_reset": 3000},
+        "late": {"status": "allowed", "5h_util": 0.2, "5h_reset": 100, "7d_util": 0.2, "7d_reset": 8000,
+                 "fable_ok": True, "fable_7d_oi_util": 0.2, "fable_7d_oi_reset": 8000},
         "full": {"status": "allowed", "5h_util": 0.99, "5h_reset": 100, "7d_util": 0.99, "7d_reset": 1000},
     }
     # expiry-priority: 'soon' (7d_reset 3000) beats 'late' (8000); 'full' is ineligible (no headroom).
@@ -431,6 +468,46 @@ def _self_test():
           dynamic_concurrency(U, None, ["fable"]), 0)
     # backward compat: usage=None keeps the original cache-affinity selection.
     check("usage=None backward compatible", choose_account(A, [], ["fable"], "pkg", "impl", now), "acct02")
+
+    # ---- [FABLE-5] fable sub-quota (7d_oi) gate ----
+    fable_ok = {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 9000}
+    check("fable eligible: whole-account + fable headroom",
+          usage_eligible(fable_ok, model="fable"), True)
+    check("non-fable model ignores fable bucket (haiku on same acct)",
+          usage_eligible(fresh, model="haiku"), True)
+    check("fable ineligible: bucket exhausted (whole-account fine)",
+          usage_eligible({**fable_ok, "fable_7d_oi_util": 0.95}, model="fable"), False)
+    check("same acct still eligible for haiku when fable bucket exhausted",
+          usage_eligible({**fable_ok, "fable_7d_oi_util": 0.95}, model="haiku"), True)
+    check("fable ineligible: probe absent (fable_ok missing) fails closed",
+          usage_eligible(fresh, model="fable"), False)
+    check("fable ineligible: probe failed (fable_ok False)",
+          usage_eligible({**fresh, "fable_ok": False}, model="fable"), False)
+    check("fable ineligible: 7d_oi window unknown",
+          usage_eligible({**fresh, "fable_ok": True}, model="fable"), False)
+    # choose_account: fable route skips a fable-exhausted account, picks the healthy one.
+    F = [{"handle": "fa", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
+         {"handle": "fb", "models": ["fable"], "max_concurrent_workers": 1, "available": True}]
+    fusage = {
+        "fa": {**fresh, "7d_reset": 3000, "fable_ok": True, "fable_7d_oi_util": 0.99, "fable_7d_oi_reset": 3000},
+        "fb": {**fresh, "7d_reset": 8000, "fable_ok": True, "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 8000},
+    }
+    check("fable route skips exhausted-bucket account",
+          choose_account(F, [], ["fable"], "p", "r", now, usage=fusage), "fb")
+    # priority window: for fable, soonest 7d_oi reset wins among fable-eligible accounts.
+    fusage2 = {
+        "fa": {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 3000},
+        "fb": {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 8000},
+    }
+    check("fable priority: soonest fable-bucket reset wins",
+          choose_account(F, [], ["fable"], "p", "r", now, usage=fusage2), "fa")
+    # dynamic_concurrency on a fable-only chain counts only fable-eligible accounts.
+    check("dynamic concurrency (fable chain) counts fable-eligible only",
+          dynamic_concurrency(F, fusage, ["fable"]), 1)
+    check("dynamic concurrency (haiku chain) ignores fable bucket",
+          dynamic_concurrency(
+              [{"handle": "fa", "models": ["haiku"], "max_concurrent_workers": 1, "available": True}],
+              {"fa": {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.99}}, ["haiku"]), 1)
 
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

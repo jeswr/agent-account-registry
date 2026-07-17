@@ -182,12 +182,23 @@ API, and `/api/oauth/profile` is 403 for setup-tokens). Key headers:
 | `anthropic-ratelimit-unified-7d-utilization` | fraction of the **weekly** window consumed |
 | `anthropic-ratelimit-unified-7d-reset` | Unix ts when the weekly window resets |
 | `anthropic-ratelimit-unified-representative-claim` | which window is currently binding (`five_hour`/`seven_day`) |
+| `anthropic-ratelimit-unified-7d_oi-utilization` / `…-7d_oi-reset` | **[FABLE]** the account's SEPARATE weekly **claude-fable-5** sub-quota — distinct from `7d`; an account can read `7d-utilization=0.1` yet have this near 1.0 |
 
-**Prioritisation policy** (to be wired into `choose_account`): among eligible accounts prefer
-`status=allowed` with the **lowest** binding-window utilisation; **skip** an account whose status is
-not `allowed` (or whose utilisation ≈ 1.0) until its `*-reset` timestamp passes; surface the soonest
-`*-reset` so a fully-capped fleet knows exactly when capacity returns. This complements the existing
-cache-affinity tie-break. (OpenAI/codex exposes analogous limits; TODO confirm its headers.)
+**Fable sub-quota — a whole-account probe is not enough.** `claude-fable-5` draws from its own weekly
+premium bucket, surfaced as the `…-7d_oi-*` headers. Those headers appear **only** on a probe that is
+`model=claude-fable-5` **and** carries BOTH the Claude-Code `user-agent` (`claude-cli/…`) **and** the
+`You are Claude Code, …` system prompt (the subscription-OAuth premium path) — a plain `haiku`/`opus`
+probe never emits them (and a plain fable probe 429s). `account-usage.py` therefore does a second,
+Claude-Code-shaped fable probe for fable-capable accounts and merges `fable_ok` + `fable_7d_oi_util/reset`
+into the usage map; `usage_eligible(u, margin, model="fable")` then requires that bucket to have headroom
+**in addition to** the whole-account 5h/7d windows. Fail-closed: a rejected/absent fable probe makes the
+account ineligible for **fable** only — its base signal still admits it for non-fable models.
+
+**Prioritisation policy** (wired into `choose_account`): among eligible accounts prefer `status=allowed`
+with the **soonest** binding-window reset (use-it-or-lose-it) then most unused credits — for a fable route
+the binding window is `7d_oi`, otherwise `7d`; **skip** an account whose status is not `allowed` (or whose
+utilisation leaves < `usage_safety_margin` headroom) until its `*-reset` passes. This complements the
+existing cache-affinity tie-break. (OpenAI/codex exposes analogous limits; TODO confirm its headers.)
 
 ## Security posture
 
