@@ -583,23 +583,17 @@ coauthor_for() {
   esac
 }
 
-# Shared host-side commit + authenticated push (used by publish_pr and push_fix). The askpass
-# helper keeps the App token out of argv and the remote URL. Optional 4th/5th args (conflict-
-# repair path, fix kind=rebase): a .beads BASELINE ref — the merged default branch legitimately
-# carries .beads churn, so the tree must MATCH that ref there instead of being untouched — and a
-# 40-hex --force-with-lease guard (CAS push against the dispatched head; the merge commit itself
-# is a fast-forward, the lease only defends the race where someone pushed after dispatch).
-_git_commit_and_push() {
-  local branch=$1 message=$2 trailer=$3 beads_baseline_ref=${4:-} push_lease=${5:-}
-  local worker_root=${WORKER_ROOT:-}
+# Local bot-identity commit of the model's working tree — NO token, NO network. Used by the
+# worker job's post-gate `bundle` mode (which must never hold a credential) and, via
+# _git_commit_and_push, by push_fix. Optional 3rd arg (conflict-repair path, fix kind=rebase):
+# a .beads BASELINE ref — the merged default branch legitimately carries .beads churn, so the
+# tree must MATCH that ref there instead of being untouched.
+_git_commit_local() {
+  local message=$1 trailer=$2 beads_baseline_ref=${3:-}
   local bot_login=${TARGET_BOT_LOGIN:-}
   local bot_id=${TARGET_BOT_ID:-}
-  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
-  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
-  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe push branch'
   [[ "$bot_id" =~ ^[0-9]+$ ]] || die 'unsafe target bot id'
   [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] || die 'unsafe target bot login'
-  [[ -z "$push_lease" || "$push_lease" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe push lease sha'
   if [[ -n "$beads_baseline_ref" ]]; then
     [[ "$beads_baseline_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe .beads baseline ref'
     git diff --quiet "$beads_baseline_ref" -- .beads ||
@@ -609,10 +603,25 @@ _git_commit_and_push() {
   fi
   git config user.name "$bot_login"
   git config user.email "$bot_id+$bot_login@users.noreply.github.com"
-  git add -A -- .
-  git diff --cached --check
+  git add -A -- . || die 'staging the working tree failed'
+  git diff --cached --check || die 'staged changes failed the whitespace/marker check'
   [[ -n "$(git diff --cached --name-only)" ]] || die 'no staged changes to publish'
-  git commit -m "$message" -m "$trailer"
+  git commit -m "$message" -m "$trailer" || die 'local bot commit failed'
+}
+
+# Shared host-side commit + authenticated push (used by push_fix). The askpass helper keeps the
+# App token out of argv and the remote URL. Optional 4th/5th args (conflict-repair path, fix
+# kind=rebase): the .beads baseline ref passed through to _git_commit_local, and a 40-hex
+# --force-with-lease guard (CAS push against the dispatched head; the merge commit itself is a
+# fast-forward, the lease only defends the race where someone pushed after dispatch).
+_git_commit_and_push() {
+  local branch=$1 message=$2 trailer=$3 beads_baseline_ref=${4:-} push_lease=${5:-}
+  local worker_root=${WORKER_ROOT:-}
+  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe push branch'
+  [[ -z "$push_lease" || "$push_lease" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe push lease sha'
+  _git_commit_local "$message" "$trailer" "$beads_baseline_ref"
 
   local askpass="$worker_root/git-askpass.sh"
   cat > "$askpass" <<'ASKPASS'
@@ -629,38 +638,15 @@ ASKPASS
   GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git "${push_args[@]}"
 }
 
-publish_pr() {
-  require_target
-  local issue_file=${WORKER_ISSUE_FILE:-}
-  local issue_number=${ISSUE_NUMBER:-}
-  local branch=${WORKER_BRANCH:-}
-  local default_branch=${TARGET_DEFAULT_BRANCH:-}
-  local bot_login=${TARGET_BOT_LOGIN:-}
-  local bot_id=${TARGET_BOT_ID:-}
-  local model_alias=${WORKER_MODEL_ALIAS:-}
-  local provider_model=${WORKER_PROVIDER_MODEL:-}
-  local agent=${WORKER_AGENT:-}
-  local gate=${GATE_PROFILE:-}
-  local worker_root=${WORKER_ROOT:-}
-  local target_repo=${TARGET_REPO:-}
-  local arm_requested=${ARM_AUTO_MERGE_REQUESTED:-false}
-  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
-  [[ -f "$issue_file" && ! -L "$issue_file" ]] || die 'verified issue snapshot is missing'
-  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
-  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe worker branch'
-  safe_atom "$default_branch" || die 'unsafe target default branch'
-  [[ "$bot_id" =~ ^[0-9]+$ ]] || die 'unsafe target bot id'
-  [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] || die 'unsafe target bot login'
-  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
-  printf '::add-mask::%s\n' "$GH_TOKEN"
-
-  local impl_provider=${WORKER_PROVIDER:-}
-  [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
-    die 'unsafe implementation provider'
-  local pr_title_file="$worker_root/pr-title.txt"
-  local pr_body_file="$worker_root/pr-body.md"
+# Build the DRAFT-PR title/body files from the VERIFIED issue snapshot. Pure data
+# transformation — no token, no network. Runs in the worker job's post-gate `bundle` mode; the
+# resulting files travel to the `publish` job inside the digest-bound payload artifact.
+_write_pr_metadata() {
+  local issue_file=$1 pr_title_file=$2 pr_body_file=$3 issue_number=$4 agent=$5 \
+    model_alias=$6 provider_model=$7 gate=$8 arm_requested=$9 impl_provider=${10}
   python3 - "$issue_file" "$pr_title_file" "$pr_body_file" "$issue_number" "$agent" \
-    "$model_alias" "$provider_model" "$gate" "$arm_requested" "$impl_provider" <<'PY'
+    "$model_alias" "$provider_model" "$gate" "$arm_requested" "$impl_provider" \
+    <<'PY' || die 'PR metadata build failed'
 import json
 import re
 from pathlib import Path
@@ -732,27 +718,297 @@ Path(body_file).write_text(body, encoding="utf-8")
 Path(title_file).chmod(0o600)
 Path(body_file).chmod(0o600)
 PY
+}
 
-  _git_commit_and_push "$branch" \
+# ---- publish-job split (issue #40 remedy (a)) ----------------------------------------------------
+# The worker job executes hostile target code HOST-side (the cargo gate), so NOTHING that runs
+# after the gate on that runner may hold an App key or any GitHub token: a poisoned $GITHUB_ENV
+# (LD_PRELOAD, …) propagates into subsequent steps. The publish flow is therefore split:
+#   bundle  (worker job, post-gate, TOKEN-FREE)  — commit the gate-validated tree locally as the
+#           bot, wrap the exact commit in a thin git bundle, and emit a digest MANIFEST whose
+#           own sha256 crosses to the publish job as a JOB OUTPUT (Actions backend), never
+#           inside the repo-readable artifact it authenticates.
+#   publish (separate fresh-runner job, ZERO target code) — verify the binding, recreate the
+#           byte-identical commit from the bundle into a BARE repo (objects only: no working
+#           tree, no checkout, no hooks — nothing from the payload is ever executed), push it,
+#           and open the DRAFT PR with a token minted ON THAT runner.
+# The binding is only as honest as the worker job that reports it — a fully compromised worker
+# runner can still bind hostile CONTENT, but that equals the model's pre-existing power (a draft
+# PR on the one target repo) and never reaches the App private key.
+
+bundle_payload() {
+  require_target
+  local issue_file=${WORKER_ISSUE_FILE:-}
+  local issue_number=${ISSUE_NUMBER:-}
+  local branch=${WORKER_BRANCH:-}
+  local default_branch=${TARGET_DEFAULT_BRANCH:-}
+  local model_alias=${WORKER_MODEL_ALIAS:-}
+  local provider_model=${WORKER_PROVIDER_MODEL:-}
+  local agent=${WORKER_AGENT:-}
+  local gate=${GATE_PROFILE:-}
+  local worker_root=${WORKER_ROOT:-}
+  local target_repo=${TARGET_REPO:-}
+  local arm_requested=${ARM_AUTO_MERGE_REQUESTED:-false}
+  local gate_outcome=${GATE_OUTCOME:-}
+  local payload_dir=${PAYLOAD_DIR:-}
+  # This mode runs POST-GATE on a runner that has executed hostile target code: it must never
+  # hold ANY GitHub credential. Fail closed if one leaked into the step env.
+  [[ -z ${GH_TOKEN:-} && -z ${GITHUB_TOKEN:-} ]] || die 'bundle mode must not receive a GitHub token'
+  [[ -f "$issue_file" && ! -L "$issue_file" ]] || die 'verified issue snapshot is missing'
+  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
+  [[ "$branch" == "sparq-agent/issue-${issue_number}-"* && "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+    die 'unsafe worker branch'
+  safe_atom "$default_branch" || die 'unsafe target default branch'
+  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
+  [[ "$gate_outcome" == success || "$gate_outcome" == failure ]] || die 'unsafe gate outcome'
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  [[ -n "$payload_dir" && "$payload_dir" != / ]] || die 'PAYLOAD_DIR is unsafe'
+  local impl_provider=${WORKER_PROVIDER:-}
+  [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
+    die 'unsafe implementation provider'
+  [[ "$(git rev-parse --abbrev-ref HEAD)" == "$branch" ]] || die 'checkout is not on the worker branch'
+
+  mkdir -p -- "$payload_dir"
+  _write_pr_metadata "$issue_file" "$payload_dir/pr-title.txt" "$payload_dir/pr-body.md" \
+    "$issue_number" "$agent" "$model_alias" "$provider_model" "$gate" "$arm_requested" \
+    "$impl_provider"
+
+  local base_sha head_sha tree_sha
+  base_sha=$(git rev-parse HEAD)
+  [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || die 'base sha is unsafe'
+  _git_commit_local \
     "feat: resolve target issue #$issue_number [$model_alias]" \
     "Co-Authored-By: $(coauthor_for "$model_alias")"
-
-  local pr_url pr_number head_sha
   head_sha=$(git rev-parse HEAD)
-  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || die 'pushed head sha is unsafe'
-  pr_url=$(gh pr create \
+  tree_sha=$(git rev-parse 'HEAD^{tree}')
+  [[ "$head_sha" =~ ^[0-9a-f]{40}$ && "$tree_sha" =~ ^[0-9a-f]{40}$ ]] || die 'commit shas are unsafe'
+  # Thin bundle: exactly the one validated commit, with the pre-model default-branch HEAD as its
+  # only prerequisite. The publish job fetches that prerequisite from origin, so `bundle verify`
+  # over there fails closed if history was rewritten underneath us.
+  git bundle create "$payload_dir/target.bundle" "^$base_sha" "refs/heads/$branch" ||
+    die 'bundle creation failed'
+  [[ ! -f "$worker_root/followups.jsonl" ]] ||
+    cp -- "$worker_root/followups.jsonl" "$payload_dir/followups.jsonl" ||
+    die 'followups copy failed'
+
+  # Manifest: STRICT ALLOWLIST of fields — no account handle, no secrets, no reset times
+  # (artifacts are repo-readable; privacy locked decision 22b). Every payload file gets a sha256.
+  python3 - "$payload_dir" "$target_repo" "$issue_number" "$branch" "$default_branch" \
+    "$base_sha" "$head_sha" "$tree_sha" "$gate_outcome" "$gate" "$model_alias" \
+    "$provider_model" "$impl_provider" "$agent" "$arm_requested" \
+    "${TARGET_BOT_LOGIN:-}" <<'PY' || die 'manifest build failed'
+import hashlib
+import json
+import os
+import sys
+
+(payload_dir, target_repo, issue_number, branch, default_branch, base_sha, head_sha,
+ tree_sha, gate_outcome, gate_profile, model_alias, provider_model, impl_provider,
+ agent, arm_requested, bot_login) = sys.argv[1:]
+files = {}
+for name in ("target.bundle", "pr-title.txt", "pr-body.md", "followups.jsonl"):
+    path = os.path.join(payload_dir, name)
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            files[name] = hashlib.sha256(handle.read()).hexdigest()
+manifest = {
+    "schema": "1",
+    "target_repo": target_repo,
+    "issue_number": issue_number,
+    "branch": branch,
+    "default_branch": default_branch,
+    "base_sha": base_sha,
+    "head_sha": head_sha,
+    "tree_sha": tree_sha,
+    "gate_outcome": gate_outcome,
+    "gate_profile": gate_profile,
+    "model_alias": model_alias,
+    "provider_model": provider_model,
+    "impl_provider": impl_provider,
+    "agent": agent,
+    "arm_auto_merge_requested": arm_requested,
+    "bot_login": bot_login,
+    "files": files,
+}
+out = os.path.join(payload_dir, "manifest.json")
+with open(out, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+os.chmod(out, 0o600)
+PY
+
+  local manifest_sha
+  manifest_sha=$(sha256sum "$payload_dir/manifest.json" | cut -d' ' -f1)
+  [[ "$manifest_sha" =~ ^[0-9a-f]{64}$ ]] || die 'manifest digest is unsafe'
+  write_output payload true
+  write_output manifest_sha256 "$manifest_sha"
+  write_output head_sha "$head_sha"
+  write_output branch "$branch"
+  printf 'worker-live: publish payload assembled (gate=%s, head=%s)\n' "$gate_outcome" "$head_sha"
+}
+
+# Publish-job side, stage 1: authenticate the artifact against the OUT-OF-BAND expected manifest
+# digest (a worker job OUTPUT — the artifact store itself is untrusted), then validate every
+# manifest field against a strict allowlist and every payload file against its recorded sha256.
+# Exports PAYLOAD_* shell variables (values already regex-constrained). FAIL CLOSED throughout.
+_verify_payload_manifest() {
+  local payload_dir=$1 expected_manifest_sha=$2
+  [[ -d "$payload_dir" ]] || die 'payload directory is missing'
+  [[ "$expected_manifest_sha" =~ ^[0-9a-f]{64}$ ]] || die 'expected manifest digest is unsafe'
+  [[ -f "$payload_dir/manifest.json" ]] || die 'payload manifest is missing'
+  local got
+  got=$(sha256sum "$payload_dir/manifest.json" | cut -d' ' -f1)
+  [[ "$got" == "$expected_manifest_sha" ]] ||
+    die 'payload manifest digest mismatch — tampered or substituted artifact (fail closed)'
+  # Explicit `|| die` everywhere below: this function must fail closed even where `set -e` is
+  # suppressed (e.g. when invoked inside an && list, as the self-test does).
+  local fields="$payload_dir/.fields"
+  rm -f -- "$fields"
+  python3 - "$payload_dir" "$fields" <<'PY' || die 'payload manifest validation failed (fail closed)'
+import hashlib
+import json
+import os
+import re
+import sys
+
+payload_dir, fields_path = sys.argv[1:]
+with open(os.path.join(payload_dir, "manifest.json"), encoding="utf-8") as handle:
+    manifest = json.load(handle)
+RULES = {
+    "schema": r"1",
+    "target_repo": r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*",
+    "issue_number": r"[1-9][0-9]*",
+    "branch": r"[A-Za-z0-9._/-]+",
+    "default_branch": r"[A-Za-z0-9][A-Za-z0-9_.-]*",
+    "base_sha": r"[0-9a-f]{40}",
+    "head_sha": r"[0-9a-f]{40}",
+    "tree_sha": r"[0-9a-f]{40}",
+    # The publish job only ever applies a gate-PASSED payload; a gate-failed artifact exists
+    # solely for the fix loop (issue #33) and must never verify here.
+    "gate_outcome": r"success",
+    "model_alias": r"[A-Za-z0-9][A-Za-z0-9_.-]*",
+    "bot_login": r"[A-Za-z0-9_.-]+\[bot\]",
+}
+values = {}
+for key, rule in RULES.items():
+    value = manifest.get(key)
+    if not isinstance(value, str) or re.fullmatch(rule, value) is None:
+        raise SystemExit(f"worker-live: manifest field {key} failed validation (fail closed)")
+    values[key] = value
+# The branch namespace is load-bearing: publish pushes refs/heads/<branch>, so a hostile
+# manifest naming the default branch (or any non-worker ref) must fail closed here.
+if not values["branch"].startswith(f"sparq-agent/issue-{values['issue_number']}-"):
+    raise SystemExit("worker-live: branch is outside the worker namespace (fail closed)")
+if values["branch"] == values["default_branch"]:
+    raise SystemExit("worker-live: branch must not be the default branch (fail closed)")
+files = manifest.get("files")
+if (not isinstance(files, dict)
+        or not {"target.bundle", "pr-title.txt", "pr-body.md"} <= set(files)):
+    raise SystemExit("worker-live: manifest file table is incomplete (fail closed)")
+for name, digest in files.items():
+    if re.fullmatch(r"[A-Za-z0-9._-]+", str(name)) is None:
+        raise SystemExit("worker-live: manifest file name is unsafe (fail closed)")
+    with open(os.path.join(payload_dir, name), "rb") as handle:
+        got = hashlib.sha256(handle.read()).hexdigest()
+    if got != digest:
+        raise SystemExit(f"worker-live: payload file {name} digest mismatch (fail closed)")
+with open(os.path.join(payload_dir, "pr-title.txt"), encoding="utf-8") as handle:
+    title = handle.read()
+if title.count("\n") != 1 or not title.endswith("\n") or not 0 < len(title.strip()) <= 200:
+    raise SystemExit("worker-live: pr title must be a single sane line (fail closed)")
+with open(fields_path, "w", encoding="utf-8") as handle:
+    for key, value in values.items():
+        handle.write(f"{key}={value}\n")
+os.chmod(fields_path, 0o600)
+PY
+  [[ -f "$fields" ]] || die 'payload field export is missing (fail closed)'
+  local key value
+  while IFS='=' read -r key value; do
+    [[ "$key" =~ ^[a-z_]+$ ]] || die 'manifest field key is unsafe'
+    printf -v "PAYLOAD_${key^^}" '%s' "$value"
+  done < "$fields"
+}
+
+# Publish-job side, stage 2: recreate the exact bound commit from the bundle into a BARE repo
+# whose only ref is the freshly fetched target default branch. Objects only — no working tree,
+# no checkout, no hooks; nothing from the payload is ever executed. Asserts the fetched tip is
+# byte-identical to what the worker's gate validated: head sha, tree sha, and a SINGLE commit
+# whose only parent is the recorded pre-model base.
+_verify_payload_bundle() {
+  local payload_dir=$1 repo_dir=$2
+  git -C "$repo_dir" bundle verify "$payload_dir/target.bundle" >/dev/null ||
+    die 'bundle prerequisites are not satisfied by the target default branch (fail closed)'
+  git -C "$repo_dir" -c transfer.fsckObjects=true fetch --no-tags --quiet \
+    "$payload_dir/target.bundle" "refs/heads/$PAYLOAD_BRANCH:refs/heads/$PAYLOAD_BRANCH" ||
+    die 'bundle fetch failed object validation (fail closed)'
+  local got_head got_tree got_parents
+  got_head=$(git -C "$repo_dir" rev-parse "refs/heads/$PAYLOAD_BRANCH")
+  [[ "$got_head" == "$PAYLOAD_HEAD_SHA" ]] || die 'bundle head does not match the bound head sha (fail closed)'
+  got_tree=$(git -C "$repo_dir" rev-parse "refs/heads/$PAYLOAD_BRANCH^{tree}")
+  [[ "$got_tree" == "$PAYLOAD_TREE_SHA" ]] || die 'bundle tree does not match the gate-validated tree (fail closed)'
+  got_parents=$(git -C "$repo_dir" rev-parse "refs/heads/$PAYLOAD_BRANCH^@" | paste -sd' ' -)
+  [[ "$got_parents" == "$PAYLOAD_BASE_SHA" ]] ||
+    die 'bundle must contain a single commit on the recorded base (fail closed)'
+  git -C "$repo_dir" merge-base --is-ancestor "$PAYLOAD_BASE_SHA" "refs/heads/$PAYLOAD_DEFAULT_BRANCH" ||
+    die 'recorded base is not on the target default branch (fail closed)'
+}
+
+# Publish-job entry point (mode `publish`): runs on a FRESH runner that executes zero target
+# code. Verifies the artifact binding, pushes the pre-validated commit, and opens the DRAFT PR
+# with the token minted on this runner. PUBLISH_REMOTE_URL exists for the offline self-test.
+publish_apply() {
+  local payload_dir=${PAYLOAD_DIR:-}
+  local expected=${PAYLOAD_MANIFEST_SHA256:-}
+  local target_repo=${TARGET_REPO:-}
+  local issue_number=${ISSUE_NUMBER:-}
+  local remote_url=${PUBLISH_REMOTE_URL:-}
+  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  printf '::add-mask::%s\n' "$GH_TOKEN"
+  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
+  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
+  [[ -n "$payload_dir" ]] || die 'PAYLOAD_DIR is missing'
+
+  _verify_payload_manifest "$payload_dir" "$expected"
+  # Bind the payload to THIS dispatch, not just to itself.
+  [[ "$PAYLOAD_TARGET_REPO" == "$target_repo" ]] || die 'payload targets a different repository (fail closed)'
+  [[ "$PAYLOAD_ISSUE_NUMBER" == "$issue_number" ]] || die 'payload is bound to a different issue (fail closed)'
+
+  local work_root=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
+  local repo_dir="$work_root/publish-repo.git"
+  rm -rf -- "$repo_dir"
+  git init --quiet --bare "$repo_dir"
+  [[ -n "$remote_url" ]] || remote_url="https://github.com/$target_repo"
+  git -C "$repo_dir" remote add origin "$remote_url"
+  local askpass="$work_root/publish-askpass.sh"
+  cat > "$askpass" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+  *Username*) printf '%s\n' 'x-access-token' ;;
+  *) printf '%s\n' "$GH_TOKEN" ;;
+esac
+ASKPASS
+  chmod 700 "$askpass"
+  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git -C "$repo_dir" fetch --no-tags --quiet origin \
+    "+refs/heads/$PAYLOAD_DEFAULT_BRANCH:refs/heads/$PAYLOAD_DEFAULT_BRANCH"
+  _verify_payload_bundle "$payload_dir" "$repo_dir"
+
+  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git -C "$repo_dir" push origin \
+    "refs/heads/$PAYLOAD_BRANCH:refs/heads/$PAYLOAD_BRANCH"
+
+  local pr_url pr_number
+  pr_url=$(cd "$repo_dir" && gh pr create \
     --repo "$target_repo" \
-    --base "$default_branch" \
-    --head "$branch" \
+    --base "$PAYLOAD_DEFAULT_BRANCH" \
+    --head "$PAYLOAD_BRANCH" \
     --draft \
-    --title "$(<"$pr_title_file")" \
-    --body-file "$pr_body_file")
+    --title "$(<"$payload_dir/pr-title.txt")" \
+    --body-file "$payload_dir/pr-body.md")
   [[ "$pr_url" =~ ^https://github.com/[^/]+/[^/]+/pull/[0-9]+$ ]] || die 'PR creation returned no URL'
   pr_number=${pr_url##*/}
   [[ "$pr_number" =~ ^[0-9]+$ ]] || die 'PR number could not be derived from the URL'
   write_output pr_url "$pr_url"
   write_output pr_number "$pr_number"
-  write_output head_sha "$head_sha"
+  write_output head_sha "$PAYLOAD_HEAD_SHA"
   printf 'worker-live: opened DRAFT target pull request %s (cross-provider review pending)\n' "$pr_url"
 }
 
@@ -1393,6 +1649,88 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   chk "registry gate runs the dashboard privacy self-test" \
     "$(grep -c 'self:dashboard-gen.py' <<< "${sel//,/$'\n'}" || true)" "1"
 
+  # --- publish-job split (issue #40 remedy (a)): token-free bundle assembly + the publish-side
+  # integrity binding. Real git fixture: an "origin" bare repo stands in for the target, the
+  # publish-side bare repo fetches its default branch, and the bundle must recreate the exact
+  # gate-validated commit. Tamper cases MUST fail closed: a substituted expected digest, an
+  # edited manifest, a bit-flipped bundle, a gate-failed payload, and a default-branch push
+  # attempt. Privacy: the payload must never carry the raw account handle. ---
+  local pfx="$tmp/pubfix" porigin="$tmp/puborigin.git" ppay="$tmp/payload"
+  local pout="$tmp/bundle-out" pwroot="$tmp/pwroot" prepo="$tmp/pubrepo.git"
+  mkdir -p "$pwroot"
+  printf '{"title":"follow-up","body":"b","labels":["from:agent"]}\n' > "$pwroot/followups.jsonl"
+  git init -q -b main "$pfx"
+  git -C "$pfx" config user.name t
+  git -C "$pfx" config user.email t@example.invalid
+  printf 'base\n' > "$pfx/lib.txt"
+  git -C "$pfx" add . && git -C "$pfx" commit -qm base
+  git clone -q --bare "$pfx" "$porigin"
+  git -C "$pfx" switch -qc sparq-agent/issue-7-selftest-1
+  printf 'model change\n' >> "$pfx/lib.txt"
+  run_bundle() {
+    ( cd "$pfx" && \
+      GH_TOKEN="${1:-}" GITHUB_TOKEN= GITHUB_OUTPUT="$pout" GITHUB_ENV= \
+      WORKER_ACCOUNT=acct99selftest \
+      TARGET_DIR="$pfx" WORKER_ISSUE_FILE="$tmp/issue-a.json" ISSUE_NUMBER=7 \
+      WORKER_BRANCH=sparq-agent/issue-7-selftest-1 TARGET_DEFAULT_BRANCH=main \
+      TARGET_BOT_LOGIN='tbot[bot]' TARGET_BOT_ID=99 WORKER_MODEL_ALIAS=fable \
+      WORKER_PROVIDER_MODEL=claude-fable-5 WORKER_AGENT=sparq-rust-feature \
+      GATE_PROFILE=none WORKER_ROOT="$pwroot" TARGET_REPO=o/r \
+      ARM_AUTO_MERGE_REQUESTED=false WORKER_PROVIDER=anthropic GATE_OUTCOME=success \
+      PAYLOAD_DIR="$ppay" bundle_payload )
+  }
+  chk "bundle mode refuses a leaked token" \
+    "$( (run_bundle leaked-token >/dev/null 2>&1 && echo ok) || echo refused )" "refused"
+  : > "$pout"
+  chk "bundle mode assembles the payload" \
+    "$( (run_bundle >/dev/null 2>&1 && [[ -f "$ppay/manifest.json" && -f "$ppay/target.bundle" \
+      && -f "$ppay/pr-title.txt" && -f "$ppay/pr-body.md" && -f "$ppay/followups.jsonl" ]] \
+      && echo ok) || echo refused )" "ok"
+  local msha phead
+  msha=$(grep '^manifest_sha256=' "$pout" | cut -d= -f2)
+  phead=$(grep '^head_sha=' "$pout" | cut -d= -f2)
+  chk "bundle emits the out-of-band binding" \
+    "$( [[ "$msha" =~ ^[0-9a-f]{64}$ && "$phead" =~ ^[0-9a-f]{40}$ ]] && echo ok )" "ok"
+  chk "payload never carries the raw account handle" \
+    "$(grep -rl 'acct99selftest' "$ppay" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  git init -q --bare "$prepo"
+  git -C "$prepo" remote add origin "$porigin"
+  git -C "$prepo" fetch -q --no-tags origin '+refs/heads/main:refs/heads/main'
+  chk "publish verify accepts the bound payload" \
+    "$( ( _verify_payload_manifest "$ppay" "$msha" && _verify_payload_bundle "$ppay" "$prepo" \
+      && [[ "$(git -C "$prepo" rev-parse refs/heads/sparq-agent/issue-7-selftest-1)" == "$phead" ]] \
+      ) >/dev/null 2>&1 && echo ok || echo refused )" "ok"
+  chk "a substituted expected digest fails closed" \
+    "$( ( _verify_payload_manifest "$ppay" "$(printf '0%.0s' {1..64})" ) >/dev/null 2>&1 \
+      && echo ok || echo refused )" "refused"
+  local ptamper="$tmp/payload-tamper"
+  rm -rf -- "$ptamper" && cp -r "$ppay" "$ptamper"
+  printf 'x' >> "$ptamper/target.bundle"
+  chk "a bit-flipped bundle fails closed" \
+    "$( ( _verify_payload_manifest "$ptamper" "$msha" ) >/dev/null 2>&1 && echo ok || echo refused )" "refused"
+  rm -rf -- "$ptamper" && cp -r "$ppay" "$ptamper"
+  python3 - "$ptamper/manifest.json" gate_outcome failure <<'PY'
+import json, sys
+path, key, value = sys.argv[1:]
+doc = json.load(open(path, encoding="utf-8"))
+doc[key] = value
+json.dump(doc, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)
+PY
+  chk "a gate-failed payload never publishes" \
+    "$( ( _verify_payload_manifest "$ptamper" "$(sha256sum "$ptamper/manifest.json" | cut -d' ' -f1)" \
+      ) >/dev/null 2>&1 && echo ok || echo refused )" "refused"
+  rm -rf -- "$ptamper" && cp -r "$ppay" "$ptamper"
+  python3 - "$ptamper/manifest.json" branch main <<'PY'
+import json, sys
+path, key, value = sys.argv[1:]
+doc = json.load(open(path, encoding="utf-8"))
+doc[key] = value
+json.dump(doc, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)
+PY
+  chk "a default-branch push attempt fails closed" \
+    "$( ( _verify_payload_manifest "$ptamper" "$(sha256sum "$ptamper/manifest.json" | cut -d' ' -f1)" \
+      ) >/dev/null 2>&1 && echo ok || echo refused )" "refused"
+
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
   else
@@ -1404,11 +1742,12 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
 case "${1:-}" in
   model) run_model ;;
   gate) run_gate ;;
-  publish) publish_pr ;;
+  bundle) bundle_payload ;;
+  publish) publish_apply ;;
   review) run_review ;;
   fix) run_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|publish|review|fix|push-fix|write-back|self-test>' ;;
 esac
