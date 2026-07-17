@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The command combines a pipeline with `python3 - \"$repo\" <<'PY'`. The heredoc redirects Python's stdin and therefore overrides the pipe from `gh api`; Python reads the heredoc as its program, and `sys.stdin` is then at EOF when `entries = [json.loads(line) for line in sys.stdin ...]` runs. The audit will report 0 bytes, 0 entries, and OK even when the repository cache is full, so the new summary job is vacuous and cannot detect pressure or thrashing.",
+   "file": "scripts/ci-cache-audit.sh",
+   "fix_hint": "Give the Python program and API data separate file descriptors. For example, place the Python code in a script file and pipe `gh api` JSONL to that script, or capture the paginated API output in a temporary file and have the heredoc-driven Python open that explicit file. Add a focused test with non-empty synthetic JSONL that asserts non-zero totals and the expected PRESSURE/THRASH classification.",
+   "severity": "major",
+   "title": "Audit discards all piped cache entries"
+  }
+ ],
+ "summary": "The cache-priming workflow is broadly coherent, but the new audit script cannot consume the GitHub cache API output because its Python process uses standard input for both the program heredoc and the piped JSON. Consequently every successful audit reports an empty cache inventory and an OK verdict, defeating the load-bearing sizing check. This is a major correctness issue and must be fixed before approval.",
+ "verdict": "request_changes"
+}
