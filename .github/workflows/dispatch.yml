@@ -177,7 +177,7 @@ jobs:
                   sha = str((detail.get("head") or {}).get("sha", ""))
                   check_runs = []
                   if re.fullmatch(r"[0-9a-f]{40}", sha):
-                      for page in range(1, 11):
+                      for page in range(1, 41):
                           doc = fetch_page(
                               f"https://api.github.com/repos/{repo}/commits/{sha}"
                               f"/check-runs?per_page=100&page={page}")
@@ -194,7 +194,7 @@ jobs:
                               break
                       else:
                           raise SystemExit(
-                              "refusing a check-run snapshot at or above 1000 entries")
+                              "refusing a check-run snapshot at or above 4000 entries")
                   status_items[str(number)] = {
                       "head_sha": sha,
                       "mergeable": detail.get("mergeable"),
