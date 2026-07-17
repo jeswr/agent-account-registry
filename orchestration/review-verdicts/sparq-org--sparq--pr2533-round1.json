@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change only corrects the docker job comment to accurately describe both configured workflow triggers and the resulting container publication behavior. It is consistent with the workflow_dispatch and v* tag triggers at the top of the same workflow, introduces no executable behavior change, and contains no correctness, soundness, test-validity, or security issue.",
+ "verdict": "approve"
+}
