@@ -87,10 +87,16 @@ def _alert_route(alert_repo, alert_token, registry_repo):
     return registry_repo, None, bool(alert_repo)
 
 
-def classify(pool, usage, margin):
+def classify(pool, usage, margin, now=None):
     """Return (eligible_count, rows[(handle, status_str, ok_bool)]). Mirrors usage_eligible's
     fail-closed posture: an account is usable ONLY with a positive, parseable probe result — missing
-    entry, non-allowed status, or a missing/unparseable 5h/7d window is UNAVAILABLE."""
+    entry, non-allowed status, or a missing/unparseable 5h/7d window is UNAVAILABLE. PROBE-EXEMPT
+    providers (openai/codex — maintainer decision 2026-07-17, registry issue #29) are `ok` by design
+    (never flagged probe-missing) UNLESS the reactive-backoff stamp on the entry is still active, in
+    which case the backoff is surfaced (BACKED OFF) so degraded exempt capacity is visible."""
+    if now is None:
+        import time
+        now = time.time()
     rows = []
     eligible = 0
     for h in pool:
@@ -99,8 +105,14 @@ def classify(pool, usage, margin):
             rows.append((h, "UNAVAILABLE — token invalid/expired or probe failed (rotate setup-token)", False))
             continue
         if u.get("exempt"):
+            until = _util(u.get("backoff_until"))
+            if until is not None and now < until:
+                rows.append((h, f"BACKED OFF — provider rate limit hit "
+                                f"(x{u.get('backoff_consecutive', 1)}); resumes at epoch "
+                                f"{int(until)} (self-clearing)", False))
+                continue
             eligible += 1
-            rows.append((h, "ok — non-metered provider", True))
+            rows.append((h, "ok — probe-exempt provider (reactive rate-limit backoff)", True))
             continue
         if str(u.get("status", "")).lower() not in ("allowed", ""):
             rows.append((h, f"UNAVAILABLE — provider status `{u.get('status')}` (throttled/rejected)", False))
@@ -358,6 +370,18 @@ def _self_test():
     chk("main() half-configured: body is redacted END-TO-END",
         ("acct-wire-h1" in body_arg, "acct-wire-h2" in body_arg, "unavailable: 2" in body_arg),
         (False, False, True))
+    # Probe-exempt backoff surfacing (decision 2026-07-17, registry issue #29): an exempt account
+    # is `ok` by design (never probe-missing), but an ACTIVE backoff is surfaced + not eligible,
+    # an EXPIRED one clears, and a forged/malformed stamp fails open to `ok` (never crashes).
+    tnow = 5_000
+    e8, r8 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow + 300,
+                                      "backoff_consecutive": 2}}, 0.10, now=tnow)
+    chk("active backoff surfaced + not eligible",
+        (e8, "BACKED OFF" in r8[0][1], "x2" in r8[0][1], r8[0][2]), (0, True, True, False))
+    e9, r9 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow - 1}}, 0.10, now=tnow)
+    chk("expired backoff -> ok again", (e9, r9[0][2]), (1, True))
+    e10, r10 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "garbage"}}, 0.10, now=tnow)
+    chk("malformed backoff stamp fails open to ok", (e10, r10[0][2]), (1, True))
     # NaN/inf guard (issue #39): a literal `nan`/`inf` header must classify UNAVAILABLE, not `ok`
     # (NaN comparisons are all False, so it would otherwise slip past the CAPPED threshold).
     chk("nan header -> None (fail-closed)", _util("nan"), None)

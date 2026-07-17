@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # [OPUS-4.8] Probe live per-account usage for usage-aware dispatch. Emits a JSON map
 #   {handle: {"status","5h_util","5h_reset","7d_util","7d_reset", (fable fields)}}  for anthropic accounts
-#   {handle: {"exempt": true}}                                        for non-metered providers (codex)
+#   {handle: {"exempt": true, ("backoff_until": epoch...)}}  for PROBE-EXEMPT providers (openai/codex)
+#
+# PROBE EXEMPTION + REACTIVE BACKOFF (maintainer decision 2026-07-17, registry issue #29): openai
+# usage is not observable via any API, so those accounts are exempt from probing and admitted
+# WITHOUT usage data. They are governed reactively instead: the model-health ledger already records
+# a host-derived rate-limit exit class per salted account, and this script stamps the DERIVED
+# `backoff_until` onto the exempt entry so usage_eligible excludes the account until it expires.
+# The overlay FAILS OPEN with a loud log line (an unreadable ledger/missing salt only disables the
+# backoff optimization — the exemption must never reintroduce fail-closed starvation).
 # to stdout. Each anthropic token is probed with a max_tokens:1 POST /v1/messages and the
 # anthropic-ratelimit-unified-* response headers are read. Tokens come from SECRETS_JSON (toJSON(secrets))
 # by each account's secret_ref and are NEVER printed. FAIL-CLOSED: an account whose token is missing or
@@ -152,6 +160,53 @@ def _load_accounts(script_dir, registry_repo):
     return module.read_accounts(registry_repo)
 
 
+def _load_model_health(script_dir):
+    spec = importlib.util.spec_from_file_location(
+        "registry_model_health", os.path.join(script_dir, "model-health.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_backoffs(mh, script_dir, now):
+    """{salted_account_hash: backoff} derived from the checked-out model-health ledger via the
+    already-loaded model-health module `mh` (MODEL_HEALTH_FILE overrides the default
+    registry-checkout path). FAIL-OPEN by design: any read/validate error returns {} after a LOUD
+    log line — a lost backoff ledger merely admits a possibly rate-limited openai account (one
+    wasted run), while failing closed here would starve the whole exempt provider, the exact
+    regression the exemption removes."""
+    path = os.environ.get("MODEL_HEALTH_FILE") or os.path.join(
+        script_dir, os.pardir, "data", "model-health.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        records = mh.prune(mh.validate_ledger(document), now)
+        return mh.account_backoffs(records, now)
+    except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+        print("::warning::account-usage: model-health ledger unreadable — exempt accounts admitted "
+              "WITHOUT rate-limit backoff this tick (fail-open; fix the ledger to restore backoff)",
+              file=sys.stderr)
+        return {}
+
+
+def _apply_backoff(entry, backoff):
+    """Annotate one exempt usage entry with an ACTIVE backoff record (pure). Tolerant fail-open:
+    a malformed/forged record (non-dict, non-numeric backoff_until) leaves the entry untouched —
+    never crashes the sweep, never blocks the account."""
+    if not isinstance(backoff, dict):
+        return entry
+    try:
+        until = float(backoff.get("backoff_until"))
+    except (TypeError, ValueError):
+        return entry
+    entry["backoff_until"] = int(until)
+    if isinstance(backoff.get("consecutive"), int):
+        entry["backoff_consecutive"] = backoff["consecutive"]
+    if isinstance(backoff.get("last_signal"), str):
+        entry["backoff_signal"] = backoff["last_signal"]
+    return entry
+
+
 def _load_secrets():
     """The ACCT_* token subset. SECRETS_FILE (a host-filtered file containing ONLY worker-account
     tokens) is preferred; SECRETS_JSON (toJSON(secrets)) remains as a fallback for older callers."""
@@ -242,17 +297,33 @@ def persist_limits(usage_path):
 
 
 def main():
+    import time
     script_dir = os.path.dirname(os.path.abspath(__file__))
     registry_repo = os.environ["REGISTRY_REPO"]
     secrets = _load_secrets()
     pool = json.loads(os.environ.get("ACCOUNT_POOL", "[]"))  # optional handle allow-list
+    now = time.time()
+    salt = os.environ.get("PROVENANCE_SALT", "")
+    backoffs = None    # lazily loaded on the first probe-exempt account
     usage = {}
     for account in _load_accounts(script_dir, registry_repo):
         handle = account["handle"]
         if pool and handle not in pool:
             continue
         if str(account.get("provider", "")).lower() != "anthropic":
-            usage[handle] = {"exempt": True}
+            # Probe-exempt provider (decision 2026-07-17, issue #29): eligible without usage data,
+            # reactively backed off via the model-health rate-limit records. No salt -> no hash
+            # mapping -> loud fail-open (backoff disabled, exemption intact).
+            entry = {"exempt": True}
+            if salt:
+                if backoffs is None:
+                    mh = _load_model_health(script_dir)
+                    backoffs = _load_backoffs(mh, script_dir, now)
+                entry = _apply_backoff(entry, backoffs.get(mh.account_hash(handle, salt)))
+            else:
+                print("::warning::account-usage: PROVENANCE_SALT missing — exempt accounts "
+                      "admitted WITHOUT rate-limit backoff (fail-open)", file=sys.stderr)
+            usage[handle] = entry
             continue
         ref = account.get("secret_ref")
         if not isinstance(ref, str) or SECRET_REF_RE.fullmatch(ref) is None:
@@ -349,6 +420,45 @@ def _self_test():
         "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n"))
     chk("fable good sans limit: fable_ok", (fable_nolimit or {}).get("fable_ok"), True)
     chk("fable good sans limit: no limit key", "fable_7d_oi_limit" in (fable_nolimit or {}), False)
+    # ---- probe-exempt backoff overlay (decision 2026-07-17, registry issue #29) ----
+    import tempfile
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    #   pure annotation: active backoff lands on the entry; malformed/absent stays fail-open
+    chk("apply backoff annotates the exempt entry",
+        _apply_backoff({"exempt": True}, {"backoff_until": 2000, "consecutive": 2,
+                                          "last_signal": "transient"}),
+        {"exempt": True, "backoff_until": 2000, "backoff_consecutive": 2,
+         "backoff_signal": "transient"})
+    chk("apply backoff: absent record leaves entry untouched",
+        _apply_backoff({"exempt": True}, None), {"exempt": True})
+    chk("apply backoff: forged/malformed record fails open (no crash)",
+        _apply_backoff({"exempt": True}, {"backoff_until": "garbage"}), {"exempt": True})
+    chk("apply backoff: non-dict record fails open", _apply_backoff({"exempt": True}, "x"),
+        {"exempt": True})
+    #   ledger round-trip: a rate-limit record for a salted handle surfaces as an active backoff
+    mh = _load_model_health(script_dir)
+    test_now = 1_000_000
+    hashed = mh.account_hash("codex01", "s3cret")
+    good_ledger = {"records": [{"ts": test_now, "provider": "openai", "account": hashed,
+                                "model_alias": "gpt", "exit_class": "transient", "run_id": "1"}]}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(good_ledger, fh)
+        good_path = fh.name
+    os.environ["MODEL_HEALTH_FILE"] = good_path
+    backoffs = _load_backoffs(mh, script_dir, test_now + 60)
+    chk("ledger round-trip: active backoff derived for the salted handle",
+        backoffs.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_BASE_SECONDS)
+    #   (v) malformed ledger -> loud fail-open {} (never crashes the sweep)
+    with open(good_path, "w", encoding="utf-8") as fh:
+        fh.write('{"records": "not-a-list"}')
+    chk("malformed ledger fails open to no-backoff", _load_backoffs(mh, script_dir, test_now), {})
+    with open(good_path, "w", encoding="utf-8") as fh:
+        fh.write("not json at all")
+    chk("unparseable ledger fails open", _load_backoffs(mh, script_dir, test_now), {})
+    os.environ["MODEL_HEALTH_FILE"] = os.path.join(good_path, "nope")  # unreadable path
+    chk("missing ledger file fails open", _load_backoffs(mh, script_dir, test_now), {})
+    del os.environ["MODEL_HEALTH_FILE"]
+    os.unlink(good_path)
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
