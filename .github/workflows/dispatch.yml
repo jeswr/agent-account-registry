@@ -50,11 +50,13 @@ jobs:
     name: PLAN (unprivileged, secret-free target half)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # contents:read exists ONLY for (a) the authenticated snapshot step, which runs BEFORE any
-    # target code executes and holds github.token in its own step env, and (b) the registry
-    # checkout in the assemble step, which runs AFTER every target-planner-code step has finished.
-    # The hostile target code itself never sees a token (its steps have no token env and
-    # persist-credentials is off) or the registry tree (checked out later).
+    # contents:read exists ONLY for (a) the snapshot-helper registry checkout + the authenticated
+    # snapshot step it feeds, both of which run BEFORE any target code executes (the token lives
+    # in the snapshot step's own env), and (b) the registry checkout in the assemble step, which
+    # runs AFTER every target-planner-code step has finished. The hostile target code itself
+    # never sees a token (its steps have no token env and persist-credentials is off), and no
+    # registry code that runs AFTER target code reads a tree that existed while it ran (the
+    # assemble step uses its own later checkout, so the early snapshot copy is tamper-inert).
     permissions:
       contents: read
     steps:
@@ -81,130 +83,34 @@ jobs:
           Path(sys.argv[1]).write_text("\n".join(targets) + "\n", encoding="utf-8")
           PY
 
+      # Registry snapshot-helper checkout — BEFORE the snapshot step (and every target-code
+      # step) so the authenticated read runs REGISTRY code with a real self-test
+      # (plan-snapshot.py, extracted from the old heredoc after run 29617040167's whole-sweep
+      # kill). REG-4 note: this copy is consumed ONLY by the snapshot step below, which
+      # precedes all target-code execution; the assemble step keeps its OWN later checkout, so
+      # target planner code can never influence registry code that runs after it.
+      - name: Checkout registry snapshot helper (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry-snapshot
+          persist-credentials: false
+
       # AUTHENTICATED, registry-inline snapshot — runs BEFORE any target code executes, so the
-      # token (repo-scoped github.token, read-only against the public targets) never coexists with
-      # hostile target planner code; the planner step below consumes only these local JSON files.
-      # Authenticated reads remove the 60/hr shared-runner-IP unauthenticated ceiling, and the page
-      # walk (with retry/backoff on 403/429/5xx) removes the old 1000-entry hard-stop that the full
-      # bd->issue migration (~900 new open issues; /issues also counts open PRs) would have tripped.
+      # token (repo-scoped github.token, read-only against the public targets) never coexists
+      # with hostile target planner code; the planner step below consumes only the local JSON
+      # files this writes. Authenticated reads remove the 60/hr shared-runner-IP unauthenticated
+      # ceiling. plan-snapshot.py scopes every per-PR failure to the ITEM (an oversized
+      # check-run listing skips THAT PR with a recorded reason instead of failing the sweep —
+      # the run-29617040167 fix) and reads check runs gate-filtered (check_name=gate, the
+      # d2c0dd0 pattern) so merge-queue churn heads with hundreds of runs stay one small page.
       - name: Snapshot target issues and pull requests (authenticated, registry-inline only)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 - "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP" <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          import re
-          import sys
-          import time
-          from urllib.error import HTTPError, URLError
-          from urllib.request import Request, urlopen
-
-          repos_path, out_dir = sys.argv[1:]
-          token = os.environ["GH_TOKEN"]
-          RETRYABLE = {403, 429, 500, 502, 503, 504}
-
-          def fetch_page(url):
-              for attempt in range(3):
-                  request = Request(url, headers={
-                      "Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {token}",
-                      "User-Agent": "reg4-plan-snapshot",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                  })
-                  try:
-                      with urlopen(request, timeout=30) as response:
-                          return json.load(response)
-                  except HTTPError as exc:
-                      if exc.code in RETRYABLE and attempt < 2:
-                          time.sleep(5 * (attempt + 1))
-                          continue
-                      raise SystemExit(
-                          f"authenticated GitHub read failed (HTTP {exc.code}) for "
-                          + url.split("?")[0])
-                  except (URLError, TimeoutError, json.JSONDecodeError):
-                      if attempt < 2:
-                          time.sleep(5 * (attempt + 1))
-                          continue
-                      raise SystemExit("authenticated GitHub read failed for " + url.split("?")[0])
-
-          def paginated(path):
-              # Real page walk to a short page; the explicit ceiling only guards a runaway snapshot
-              # (5000 covers the migrated backlog with organic-growth margin, fail-closed above it).
-              items = []
-              for page in range(1, 51):
-                  separator = "&" if "?" in path else "?"
-                  result = fetch_page(
-                      f"https://api.github.com{path}{separator}per_page=100&page={page}")
-                  if not isinstance(result, list):
-                      raise SystemExit("GitHub API returned a non-list page")
-                  items.extend(result)
-                  if len(result) < 100:
-                      return items
-              raise SystemExit("refusing a target snapshot at or above 5000 entries")
-
-          repos = Path(repos_path).read_text(encoding="utf-8").splitlines()
-          for index, repo in enumerate(repos):
-              issues = paginated(f"/repos/{repo}/issues?state=open")
-              pulls = paginated(f"/repos/{repo}/pulls?state=open")
-              Path(out_dir, f"raw-issues-{index}.json").write_text(
-                  json.dumps({"complete": True, "items": issues}), encoding="utf-8")
-              Path(out_dir, f"raw-pulls-{index}.json").write_text(
-                  json.dumps({"complete": True, "items": pulls}), encoding="utf-8")
-
-              # Per-worker-PR CI/merge status (GAP-A/B/C inputs): the list API carries neither
-              # `mergeable` nor check runs, so each open same-repo sparq-agent/* PR gets one
-              # detail read (mergeable + auto_merge + fresh head) and one check-runs walk. The
-              # registry-side assemble step interprets these via dispatch-claim's PURE helpers;
-              # this step stays registry-inline (authenticated, before any target code runs).
-              worker_pulls = [
-                  pull for pull in pulls
-                  if isinstance(pull, dict) and pull.get("state") == "open"
-                  and isinstance(pull.get("number"), int) and pull["number"] > 0
-                  and str((pull.get("head") or {}).get("ref", "")).startswith("sparq-agent/")
-                  and ((pull.get("head") or {}).get("repo") or {}).get("full_name") == repo
-              ]
-              if len(worker_pulls) > 100:
-                  raise SystemExit("refusing a per-PR status snapshot above 100 worker PRs")
-              status_items = {}
-              for pull in worker_pulls:
-                  number = pull["number"]
-                  detail = fetch_page(f"https://api.github.com/repos/{repo}/pulls/{number}")
-                  if not isinstance(detail, dict):
-                      raise SystemExit("pull-request detail read returned a non-object")
-                  sha = str((detail.get("head") or {}).get("sha", ""))
-                  check_runs = []
-                  if re.fullmatch(r"[0-9a-f]{40}", sha):
-                      for page in range(1, 41):
-                          doc = fetch_page(
-                              f"https://api.github.com/repos/{repo}/commits/{sha}"
-                              f"/check-runs?per_page=100&page={page}")
-                          runs = doc.get("check_runs") if isinstance(doc, dict) else None
-                          if not isinstance(runs, list):
-                              raise SystemExit("check-runs page is malformed")
-                          check_runs.extend({
-                              "name": run.get("name"),
-                              "status": run.get("status"),
-                              "conclusion": run.get("conclusion"),
-                              "started_at": run.get("started_at"),
-                          } for run in runs if isinstance(run, dict))
-                          if len(runs) < 100:
-                              break
-                      else:
-                          raise SystemExit(
-                              "refusing a check-run snapshot at or above 4000 entries")
-                  status_items[str(number)] = {
-                      "head_sha": sha,
-                      "mergeable": detail.get("mergeable"),
-                      "auto_merge": detail.get("auto_merge"),
-                      "check_runs": check_runs,
-                  }
-              Path(out_dir, f"raw-prstatus-{index}.json").write_text(
-                  json.dumps({"complete": True, "items": status_items}), encoding="utf-8")
-          print(f"SNAPSHOT complete for {len(repos)} target repo(s)")
-          PY
+          python3 registry-snapshot/scripts/plan-snapshot.py --self-test
+          python3 registry-snapshot/scripts/plan-snapshot.py \
+            "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP"
 
       - name: Clone protected public targets without credentials
         run: |
@@ -462,6 +368,7 @@ jobs:
 
           review_items = []
           disarm_items = []
+          snapshot_skips = []
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
@@ -470,6 +377,7 @@ jobs:
               # dispatch-claim helpers (hostile-tolerant: malformed records degrade to unknown,
               # and unknown never emits a repair/disarm item).
               pr_status = {}
+              raw_skips = []
               status_path = Path(out_dir, f"raw-prstatus-{index}.json")
               if status_path.is_file():
                   raw_status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -480,6 +388,22 @@ jobs:
                           for number, record in raw_status["items"].items()
                           if str(number).isdigit()
                       }
+                      if isinstance(raw_status.get("skips"), list):
+                          raw_skips = raw_status["skips"]
+              # PLAN-side per-item snapshot skips (run 29617040167): a PR whose CI/merge
+              # snapshot was oversized/unreadable carries a reason instead of killing the
+              # sweep. It has NO pr_status record, so every snapshot-derived admission below
+              # stands down for it; CLAIM folds these rows into the dispatch summary.
+              for skip in raw_skips:
+                  if not isinstance(skip, dict):
+                      continue
+                  skip_number = skip.get("pr_number")
+                  skip_reason = skip.get("reason")
+                  if not isinstance(skip_number, int) or not isinstance(skip_reason, str):
+                      continue
+                  print(f"SNAPSHOT skip {repo}#{skip_number}: {skip_reason}")
+                  snapshot_skips.append(
+                      {"repo": repo, "pr_number": skip_number, "reason": skip_reason})
               issue_labels = {
                   int(number): labels for number, labels in json.loads(
                       Path(out_dir, f"issue-labels-{index}.json").read_text(encoding="utf-8")
@@ -518,19 +442,21 @@ jobs:
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
                   repo, pulls, issue_labels)
 
+          snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
           document = {
-              "schema": "registry-dispatch-plan/v3",
+              "schema": "registry-dispatch-plan/v4",
               "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "repositories": intermediate["repositories"],
               "review_items": review_items,
               "disarm_items": disarm_items,
+              "snapshot_skips": snapshot_skips,
           }
           # PLAN-side inline set-equality checks (CLAIM repeats a stricter independent
           # re-validation of the artifact as hostile data before any mutation).
           if set(document) != {"schema", "generated_at", "repositories", "review_items",
-                               "disarm_items"}:
+                               "disarm_items", "snapshot_skips"}:
               raise SystemExit("plan schema top-level fields are invalid")
-          if document["schema"] != "registry-dispatch-plan/v3":
+          if document["schema"] != "registry-dispatch-plan/v4":
               raise SystemExit("plan schema version is invalid")
           expected_item_fields = {"number", "priority", "package", "role", "model_chain",
                                   "agent", "escalate", "labels", "author", "body_sha", "deferred"}
@@ -549,6 +475,10 @@ jobs:
           for item in document["disarm_items"]:
               if set(item) != expected_disarm_fields:
                   raise SystemExit("plan disarm item fields are invalid")
+          expected_skip_fields = {"repo", "pr_number", "reason"}
+          for item in document["snapshot_skips"]:
+              if set(item) != expected_skip_fields:
+                  raise SystemExit("plan snapshot skip fields are invalid")
           # Full structural validation with the same validator CLAIM uses (strictly stronger
           # than a hand-rolled inline copy, and available here because the registry is local).
           claim_mod.validate_plan(document)
@@ -556,7 +486,8 @@ jobs:
               json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           print(f"PLAN complete: "
                 f"{sum(len(repo['items']) for repo in document['repositories'])} issue item(s), "
-                f"{len(review_items)} review item(s), {len(disarm_items)} disarm item(s)")
+                f"{len(review_items)} review item(s), {len(disarm_items)} disarm item(s), "
+                f"{len(snapshot_skips)} snapshot skip(s)")
           PY
 
       - name: Upload immutable plan artifact (pinned)

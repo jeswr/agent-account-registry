@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 
@@ -30,9 +31,14 @@ import tomllib
 # The 2026-07-17 round-budget escalation (decide_budget + the fix-model floor pin) deliberately
 # adds NO plan fields: the pin and the round/model/progress accounting are re-derived at CLAIM
 # time from durable bot-authored PR markers plus registry verdict records, so a hostile PLAN
-# artifact cannot inject, clear, or inflate them — the v3 schema is unchanged.
-SCHEMA = "registry-dispatch-plan/v3"
-PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items", "disarm_items"}
+# artifact cannot inject, clear, or inflate them — the (then-)v3 schema was unchanged.
+# v3 -> v4 (run 29617040167): the plan carries PLAN-side per-item snapshot skips
+# (`snapshot_skips`) so one oversized PR's check-run listing defers THAT PR instead of
+# killing the whole sweep. CLAIM only COUNTS these into the dispatch-summary histogram —
+# a hostile plan can at worst inflate accounting noise, never trigger an act.
+SCHEMA = "registry-dispatch-plan/v4"
+PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items", "disarm_items",
+               "snapshot_skips"}
 REPOSITORY_FIELDS = {"target_repo", "target_sha", "items"}
 ITEM_FIELDS = {
     "number",
@@ -58,6 +64,19 @@ REVIEW_ITEM_FIELDS = {
     "context",
 }
 DISARM_ITEM_FIELDS = {"pr_number", "head_sha", "reviewed_sha", "repo"}
+SNAPSHOT_SKIP_FIELDS = {"repo", "pr_number", "reason"}
+# The reasons plan-snapshot.py may record for a per-item skip of a worker PR's CI/merge
+# snapshot (pr_number 0 = the repo-level worker-PR census overflow). A skipped PR has NO
+# pr_status record, so every snapshot-derived admission (ci-fix/rebase/stranded/disarm)
+# stands down for it that tick — fail-closed per ITEM, never per sweep.
+SNAPSHOT_SKIP_REASONS = {
+    "check-runs-overflow",
+    "check-runs-malformed",
+    "check-runs-read-failed",
+    "pr-detail-read-failed",
+    "pr-detail-malformed",
+    "worker-pr-census-overflow",
+}
 # needs-ci-fix / needs-rebase are the zero-manual repair states: same-provider fix runs (reuse
 # mode=fix) that target red full-matrix CI legs / a conflicting base instead of review findings.
 # stranded is the loud terminal escalation for {drafted, unarmed, reviewed-sha == head, green
@@ -279,6 +298,30 @@ def validate_plan(document):
         if prior_disarm is not None and disarm_key < prior_disarm:
             raise DispatchError("plan disarm items are not in deterministic order")
         prior_disarm = disarm_key
+    snapshot_skips = document["snapshot_skips"]
+    if not isinstance(snapshot_skips, list):
+        raise DispatchError("plan snapshot_skips must be a list")
+    prior_skip = None
+    seen_skips = set()
+    for skip_index, item in enumerate(snapshot_skips, 1):
+        where = f"snapshot skip #{skip_index}"
+        _require_exact_fields(item, SNAPSHOT_SKIP_FIELDS, where)
+        number = item["pr_number"]
+        # pr_number 0 is the repo-level worker-PR census-overflow skip (no single PR).
+        if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+            raise DispatchError(f"{where} pr_number must be a non-negative integer")
+        if item["reason"] not in SNAPSHOT_SKIP_REASONS:
+            raise DispatchError(f"{where} reason is invalid")
+        repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
+        if repo not in seen_repositories:
+            raise DispatchError(f"{where} repo is not a planned repository")
+        skip_key = (repo, number)
+        if skip_key in seen_skips:
+            raise DispatchError(f"plan repeats snapshot skip {repo}#{number}")
+        seen_skips.add(skip_key)
+        if prior_skip is not None and skip_key < prior_skip:
+            raise DispatchError("plan snapshot skips are not in deterministic order")
+        prior_skip = skip_key
     return document
 
 
@@ -357,6 +400,16 @@ def pr_ci_status(record):
     }
     status.update(interpret_check_runs(record.get("check_runs")))
     return status
+
+
+def snapshot_skip_reasons(snapshot_skips):
+    """PURE: dispatch-summary histogram entries for PLAN's per-item snapshot skips (run
+    29617040167 fix — a degraded snapshot must be VISIBLE, not silent). Coarse category
+    counts only; PR numbers stay in the logs, never the summary."""
+    reasons = Counter()
+    for skip in snapshot_skips:
+        reasons[f"snapshot-skip:{skip['reason']}"] += 1
+    return reasons
 
 
 def decide_repair_admission(state, mergeable, gate, draft):
@@ -1388,13 +1441,21 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     planned = sum(len(repository["items"]) + len(
         [e for e in plan["review_items"] if e["repo"] == repository["target_repo"]])
         for repository in plan["repositories"])
-    defer_reasons = Counter()
+    # Per-item snapshot degradation (run 29617040167): PLAN skipped these PRs' CI/merge
+    # snapshot (oversized check-run listing, failed detail read, census overflow) instead of
+    # failing the sweep. Their snapshot-derived admissions already stood down at PLAN time
+    # (no pr_status record); here they are made VISIBLE — logged and counted into the
+    # dispatch-summary histogram, so a snapshot-degraded tick never looks like a quiet one.
+    defer_reasons = snapshot_skip_reasons(plan["snapshot_skips"])
+    for skip in plan["snapshot_skips"]:
+        print(f"snapshot skip {skip['repo']}#{skip['pr_number']}: {skip['reason']} "
+              "(snapshot-derived PR admissions stood down this tick)")
     # EARLY summary write (review defect #6): persist the plan-derived planned count BEFORE any
     # claim-side work, so a mid-claim abort (API/validation/setup failure) still leaves a
     # planned>0/launched-0 summary for the workflow's always()-guarded tick recorder — instead of
     # a missing file that used to read as planned=0 and record nothing. The final write below
     # overwrites it with the real launched count + histogram.
-    _write_dispatch_summary(planned, 0, {})
+    _write_dispatch_summary(planned, 0, defer_reasons)
     for repository in plan["repositories"]:
         repo = repository["target_repo"]
         try:
@@ -1678,8 +1739,40 @@ def _self_test():
             "reviewed_sha": "none",
             "repo": "example/repo",
         }],
+        "snapshot_skips": [{
+            "repo": "example/repo",
+            "pr_number": 0,
+            "reason": "worker-pr-census-overflow",
+        }, {
+            "repo": "example/repo",
+            "pr_number": 48,
+            "reason": "check-runs-overflow",
+        }],
     }
     assert validate_plan(fixture) is fixture
+    # A skip-free plan is the common case and must validate too.
+    empty_skips = json.loads(json.dumps(fixture))
+    empty_skips["snapshot_skips"] = []
+    validate_plan(empty_skips)
+    # The dispatch summary records the skips (run 29617040167): the fold is what dispatch()
+    # seeds defer_reasons with, and the summary file carries it for the tick recorder.
+    folded = snapshot_skip_reasons(fixture["snapshot_skips"])
+    assert folded == {"snapshot-skip:worker-pr-census-overflow": 1,
+                      "snapshot-skip:check-runs-overflow": 1}
+    with tempfile.TemporaryDirectory() as summary_dir:
+        summary_file = os.path.join(summary_dir, "summary.json")
+        prior_summary = os.environ.get("DISPATCH_SUMMARY_FILE")
+        os.environ["DISPATCH_SUMMARY_FILE"] = summary_file
+        try:
+            _write_dispatch_summary(5, 0, folded)
+        finally:
+            if prior_summary is None:
+                del os.environ["DISPATCH_SUMMARY_FILE"]
+            else:
+                os.environ["DISPATCH_SUMMARY_FILE"] = prior_summary
+        with open(summary_file, encoding="utf-8") as handle:
+            recorded = json.load(handle)
+    assert recorded["defer_reasons"]["snapshot-skip:check-runs-overflow"] == 1
     assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"})
     assert _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"})
     assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"})
@@ -1714,6 +1807,16 @@ def _self_test():
             (lambda d: d["disarm_items"][0].update(repo="not/planned"), "unplanned disarm repo"),
             (lambda d: d["disarm_items"].append(dict(d["disarm_items"][0])),
              "duplicate disarm item"),
+            (lambda d: d.update(schema="registry-dispatch-plan/v3"),
+             "pre-snapshot-skips schema version"),
+            (lambda d: d.pop("snapshot_skips"), "missing snapshot_skips"),
+            (lambda d: d["snapshot_skips"][0].update(unknown=True), "unknown snapshot skip field"),
+            (lambda d: d["snapshot_skips"][0].update(reason="because"), "invalid snapshot skip reason"),
+            (lambda d: d["snapshot_skips"][0].update(repo="not/planned"), "unplanned snapshot skip repo"),
+            (lambda d: d["snapshot_skips"][0].update(pr_number=-1), "negative snapshot skip pr_number"),
+            (lambda d: d["snapshot_skips"].append(dict(d["snapshot_skips"][1])),
+             "duplicate snapshot skip"),
+            (lambda d: d["snapshot_skips"].reverse(), "unsorted snapshot skips"),
     ):
         malformed = json.loads(json.dumps(fixture))
         mutate(malformed)
@@ -1993,7 +2096,6 @@ def _self_test():
     # ---- _dispatch_review_items wiring (defect-1/2 regression, monkeypatched I/O): the
     # non-draft defuse is reachable ONLY through a live-confirmed trigger, and a human-parked
     # source issue blocks repair admission before any mutation ----
-    import tempfile
     fake = {}
     helper_calls = []
 
