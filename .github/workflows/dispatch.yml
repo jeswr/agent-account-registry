@@ -12,7 +12,20 @@ name: dispatch
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/10 * * * *'
+    # Explicit minutes (not */10): GitHub degrades wildcard schedules under load — measured
+    # 2026-07-17: */10 fired at 12:06 and 12:37 then went silent for 25+ min. Explicit-minute
+    # schedules are throttled less aggressively, and the off-peak offset (:03 not :00) avoids
+    # the top-of-minute stampede. The cron is now the BACKSTOP; the doorbell below is the
+    # primary liveness signal.
+    - cron: '3,13,23,33,43,53 * * * *'
+  # Doorbell: a finished worker or review/fix run is exactly the moment the sweep has new
+  # state to enumerate (publish -> review:needs, review -> fix round or arm, fix -> re-review).
+  # Event-driven dispatch removes the cron-latency floor from every loop transition. The
+  # registry-dispatcher concurrency group (cancel-in-progress: false) coalesces completion
+  # bursts into at most one running + one queued sweep, so this cannot stampede PLAN.
+  workflow_run:
+    workflows: [worker, review-fix]
+    types: [completed]
 
 permissions: {}
 
