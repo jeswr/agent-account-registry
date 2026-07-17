@@ -323,9 +323,11 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
     if account_pool is not None:
         allowed = set(account_pool)
         accounts = [account for account in accounts if account["handle"] in allowed]
-    for _ in range(retries):
-        leases, sha = _read_ledger(repo)
-        live = reclaim_expired(leases, now)
+
+    def _eligible_account(live):
+        """The capacity gauntlet: None = a GENUINE no-slot/no-account condition for this ledger
+        state (a capacity signal — the caller must return None, never raise), else the chosen
+        account handle."""
         key = holder_key(holder)
         if key and any(holder_key(lease.get("holder")) == key for lease in live):
             return None
@@ -339,7 +341,14 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
             )
             if active_holders >= max_holder_concurrent:
                 return None
-        acct = choose_account(accounts, live, model_chain, package, role, now, usage=usage, margin=margin)
+        return choose_account(accounts, live, model_chain, package, role, now, usage=usage,
+                              margin=margin)
+
+    attempted_write = False
+    for _ in range(retries):
+        leases, sha = _read_ledger(repo)
+        live = reclaim_expired(leases, now)
+        acct = _eligible_account(live)
         if acct is None:
             return None
         a = next(x for x in accounts if x["handle"] == acct)
@@ -357,6 +366,7 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
             model = next((m for m in model_chain if m in a["models"]), model_chain[0])
         cid = uuid.uuid4().hex
         live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
+        attempted_write = True
         if _write_ledger(repo, live, sha, f"claim {cid[:8]} {acct} {package}/{role}"):
             return {
                 "account": acct,
@@ -367,12 +377,21 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
                 "model": model,
                 "claim_id": cid,
             }
-    # Every retry found an eligible account yet the write never landed: an infra failure, not
-    # a capacity condition. Raising (vs returning None) keeps the dispatcher's defer reason
-    # honest — live incident 2026-07-17: a required `gate` status check added to the default
-    # branch rejected every github-actions ledger PUT and every claim in BOTH target repos was
-    # mislabeled "duplicate lease, repository cap, or account cap is active" for hours while
-    # accounts were healthy and the lease ledger was empty.
+    if not attempted_write:
+        return None  # retries <= 0: no write was ever attempted — do not claim one failed.
+    # Every retry found an eligible account yet the write never landed. Before calling that an
+    # infra failure, re-read once: the FINAL failed PUT can be a 409 from a concurrent claimant
+    # consuming the last slot, which is a GENUINE capacity condition (the exact inverse mislabel
+    # this fix removes) — if the fresh ledger state no longer admits an account, defer honestly.
+    leases, _sha = _read_ledger(repo)
+    if _eligible_account(reclaim_expired(leases, now)) is None:
+        return None
+    # An account is STILL eligible yet the write never landed: an infra failure, not a capacity
+    # condition. Raising (vs returning None) keeps the dispatcher's defer reason honest — live
+    # incident 2026-07-17: a required `gate` status check added to the default branch rejected
+    # every github-actions ledger PUT and every claim in BOTH target repos was mislabeled
+    # "duplicate lease, repository cap, or account cap is active" for hours while accounts were
+    # healthy and the lease ledger was empty.
     raise LeaseIOError(
         f"lease ledger write kept failing after {retries} attempts (persistent CAS contention, "
         f"or the {LEDGER_PATH} contents PUT is being rejected — e.g. branch protection with a "
@@ -456,13 +475,23 @@ def _self_test():
     class _StubLedger:
         """Drive claim()'s pure decision path without GitHub I/O (accounts + ledger stubbed)."""
 
-        def __init__(self, accounts, leases, write_ok=True):
+        def __init__(self, accounts, leases, write_ok=True, leases_after=None, change_after=None):
             self.accounts, self.leases, self.write_ok = accounts, leases, write_ok
+            # After `change_after` reads, _read_ledger returns `leases_after` instead — models a
+            # concurrent claimant landing a write between our last CAS attempt and the final
+            # post-exhaustion re-read.
+            self.leases_after, self.change_after, self.reads = leases_after, change_after, 0
+
+        def _read(self, repo):
+            self.reads += 1
+            if self.change_after is not None and self.reads > self.change_after:
+                return (list(self.leases_after), "sha1")
+            return (list(self.leases), "sha0")
 
         def __enter__(self):
             self._saved = (read_accounts, _read_ledger, _write_ledger)
             globals()["read_accounts"] = lambda repo: self.accounts
-            globals()["_read_ledger"] = lambda repo: (list(self.leases), "sha0")
+            globals()["_read_ledger"] = self._read
             globals()["_write_ledger"] = lambda repo, leases, sha, msg: self.write_ok
             return self
 
@@ -529,6 +558,26 @@ def _self_test():
         check("persistent ledger-write failure raises", "no exception", "LeaseIOError")
     except LeaseIOError:
         check("persistent ledger-write failure raises", "LeaseIOError", "LeaseIOError")
+    # …but when the FINAL failed CAS was a concurrent claimant consuming the last slot, the
+    # post-exhaustion re-read must classify it as capacity (return None), NOT LeaseIOError —
+    # otherwise a genuine cap defer becomes a loud infra failure (the inverse mislabel).
+    acct02_cap1 = [{"handle": "acct02", "models": ["fable"], "max_concurrent_workers": 1,
+                    "available": True, "secret_ref": "ACCT02_TOKEN"}]
+    stolen = [make_lease("acct02", "other/repo#5@r.1", "crate-x", "impl", "fable", now, 100)]
+    try:
+        with _StubLedger(acct02_cap1, [], write_ok=False, leases_after=stolen, change_after=6):
+            raced = claim("r", "crate-c", "impl", ["fable"], "owner/repo#9@r.1", now,
+                          account_pool=["acct02"], holder_prefix="owner/repo#",
+                          max_holder_concurrent=2)
+        check("last-slot CAS race defers as capacity, not infra", raced, None)
+    except LeaseIOError:
+        check("last-slot CAS race defers as capacity, not infra", "LeaseIOError", None)
+    # retries<=0 attempts no write, so it must stay a plain None (never "write kept failing").
+    with _StubLedger(acct02_cap1, [], write_ok=False):
+        check("retries<=0 returns None without raising",
+              claim("r", "crate-c", "impl", ["fable"], "owner/repo#9@r.1", now, retries=0,
+                    account_pool=["acct02"], holder_prefix="owner/repo#",
+                    max_holder_concurrent=2), None)
     check("none free", choose_account([{"handle": "a", "models": ["x"], "max_concurrent_workers": 0}],
                                       [], ["x"], "p", "r", now), None)
     pa = _parse_account("provider: openai\nmodels: [terra, gpt]\nmax_concurrent_workers: 2\n"
