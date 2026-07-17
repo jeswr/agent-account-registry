@@ -1,0 +1,21 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "In the trap branch, the current pod is freed and then `state.pod = makePod()` is attempted. If `makePod()` throws, the assignment never occurs, so `state.pod` still references the freed, trapped instance. The current call returns 503, but the next dispatch invokes `handleRequest` on that poisoned instance, violating the documented guarantee that a later request is never served by it. This is also untested because the recycle test only covers successful construction.",
+   "file": "packages/solid-server/src/dispatch.js",
+   "fix_hint": "Clear or replace `state.pod` before attempting construction and represent an unavailable state explicitly. Subsequent dispatches should fail closed (503) or retry construction without invoking the old pod. Add a test where the replacement factory throws and assert that the poisoned pod is never called again and that recovery behavior is deterministic.",
+   "severity": "major",
+   "title": "Failed trap replacement leaves the poisoned pod active"
+  },
+  {
+   "body": "The suite explicitly skips whenever Fastify is absent, while this PR adds Fastify only as an optional peer and states that adding a workspace devDependency is deferred. Therefore the committed test environment does not execute any real request through `solidPod`; route matching, parser behavior, lifecycle handling, repeated headers, and claimed Fastify v4/v5 support can all regress while CI remains green. A public transport adapter is incomplete without an executing test configuration.",
+   "file": "packages/solid-server/test/fastify.test.mjs",
+   "fix_hint": "Add Fastify to the package/workspace devDependencies and refresh the lockfile so these tests execute in CI. If both major versions are claimed, exercise both through a matrix or narrow the supported peer range to the version actually tested. Keep skipping only for the wasm artifact if a separate CI job demonstrably builds it and runs this suite; otherwise make that artifact part of the test job too.",
+   "severity": "major",
+   "title": "The new Fastify adapter has only permanently skipped integration tests"
+  }
+ ],
+ "summary": "The transport split is generally coherent, but two load-bearing guarantees are not established. Trap recovery can retain and call the freed, poisoned pod when replacement construction fails, contradicting the public contract. In addition, every real Fastify integration test is designed to skip in the committed dependency state, so the new public adapter and its v4/v5 compatibility have no non-vacuous CI coverage.",
+ "verdict": "request_changes"
+}
