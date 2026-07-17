@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The opt-in dispatch_ql integration is internally consistent and fail-closed: the QL branch reconstructs the original triples, delegates extraction and consistency checking to sparq-reason-ql, maps definitive inconsistency/consistency outcomes directly, and preserves capture gaps as Unknown. The feature remains default-off, the existing deferred arm remains covered without dispatch_ql, and the feature-on tests exercise both a real disjointness violation and a mutation witness where removing the violating assertion returns to Unknown. Cargo feature wiring, conformance coverage, public documentation, and exhaustive outcome reporting are updated together. I found no correctness, soundness, security, or vacuous-test defect in the supplied diff.",
+ "verdict": "approve"
+}
