@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The changes are semantics-preserving Rust idiom cleanups: format-string capture preserves the assertion message and values, Vec::contains preserves the prior equality-based duplicate check, and unwrap_or_default preserves the explicit fallback from a dataset parse error to Graph::default(). No correctness, soundness, security, or test-validity issue is introduced by this diff.",
+ "verdict": "approve"
+}
