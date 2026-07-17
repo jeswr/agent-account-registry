@@ -317,10 +317,52 @@ def _self_test():
         ("::warning::" in warned, "issue edit" in warned, "rc=1" in warned), (True, True, True))
     chk("gh failure warning is sanitized",
         ("SENTINEL-STDERR-ECHO" in warned, "SENTINEL-BODY-HANDLE" in warned), (False, False))
+    # END-TO-END redaction wiring (review r2): main() itself must feed _alert_route's redact flag
+    # into render() AND write to the registry repo — deleting the redact_handles wiring in main()
+    # (not just the pure helpers) must go red here. Half-configured env + stubbed gh.
+    calls = []
+
+    class _OkRun:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+
+    def _capture_run(args, **_kw):
+        calls.append(list(args))
+        return _OkRun()
+
+    wired_env = {"REGISTRY_REPO": "org/registry", "ALERT_REPO": "org/private",
+                 "ACCOUNT_POOL": '["acct-wire-h1", "acct-wire-h2"]',
+                 "POLICY_FILE": "/nonexistent/policy.toml"}
+    saved_env = {k: os.environ.get(k)
+                 for k in list(wired_env) + ["ALERT_TOKEN", "WORKER_USAGE_FILE"]}
+    os.environ.update(wired_env)
+    os.environ.pop("ALERT_TOKEN", None)
+    os.environ.pop("WORKER_USAGE_FILE", None)
+    real_run = subprocess.run
+    subprocess.run = _capture_run
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            main()
+    finally:
+        subprocess.run = real_run
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    created = next((c for c in calls if c[:3] == ["gh", "issue", "create"]), None)
+    body_arg = created[created.index("--body") + 1] if created and "--body" in created else ""
+    repo_arg = created[created.index("-R") + 1] if created and "-R" in created else ""
+    chk("main() half-configured: alert created on the REGISTRY repo", repo_arg, "org/registry")
+    chk("main() half-configured: body is redacted END-TO-END",
+        ("acct-wire-h1" in body_arg, "acct-wire-h2" in body_arg, "unavailable: 2" in body_arg),
+        (False, False, True))
     # NaN/inf guard (issue #39): a literal `nan`/`inf` header must classify UNAVAILABLE, not `ok`
     # (NaN comparisons are all False, so it would otherwise slip past the CAPPED threshold).
     chk("nan header -> None (fail-closed)", _util("nan"), None)
     chk("inf header -> None (fail-closed)", _util("inf"), None)
+    chk("-inf header -> None (fail-closed)", _util("-inf"), None)
     chk("decimal header still parses", _util("0.42"), 0.42)
     e7, r7 = classify(["x"], {"x": {"5h_util": "nan", "7d_util": "0"}}, 0.10)
     chk("nan util -> unavailable, not ok", (e7, r7[0][2]), (0, False))
