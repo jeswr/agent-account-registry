@@ -17,3 +17,11 @@ jobs:
           echo "http_status=$code"
           echo "email=$(jq -r '.email // "<no-email-key>"' /tmp/p.json 2>/dev/null || echo parsefail)"
           echo "response_keys=$(jq -r 'try (keys | join(",")) catch "<non-object>"' /tmp/p.json 2>/dev/null || echo -)"
+          # usage fingerprint (per-account rate-limit window): identifies the account even when
+          # /api/oauth/profile is 403 for a setup-token. Same account => same 5h/7d reset timestamps.
+          curl -s -D /tmp/rl.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
+            -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' || true
+          rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/rl.txt | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r'; }
+          echo "usage_5h_reset=$(rl 5h-reset) usage_7d_reset=$(rl 7d-reset) usage_5h_util=$(rl 5h-utilization) usage_7d_util=$(rl 7d-utilization) status=$(rl status)"
