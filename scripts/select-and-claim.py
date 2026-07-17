@@ -43,7 +43,11 @@ def active_for(leases, account):
 # windows have >= SAFETY_MARGIN headroom. Fail closed on any missing/unknown usage. Among eligible
 # accounts we prioritise the one whose WEEKLY window resets SOONEST — its unused credits are about to
 # reset, so spend them before they vanish (use-it-or-lose-it).
-SAFETY_MARGIN = 0.10  # fraction of each window that must remain free to admit a new worker
+SAFETY_MARGIN = 0.10  # default fraction of each window that must remain free to admit a new worker.
+# CAVEAT: this is a POINT-IN-TIME headroom gate, not a projected-consumption model — an account admitted
+# at (1 - margin) utilisation can still exceed its window mid-run if the worker's burn exceeds the
+# remaining headroom. Set margin >= a typical worker's per-window burn to actually prevent half-finishes.
+# Per-repo overridable via policy `usage_safety_margin`. Projected-burn admission is tracked as follow-up.
 
 
 def _usage_num(v):
@@ -85,7 +89,7 @@ def _weekly_unused(u):
     return (1.0 - util) if util is not None else 0.0
 
 
-def choose_account(accounts, leases, model_chain, package, role, now, usage=None):
+def choose_account(accounts, leases, model_chain, package, role, now, usage=None, margin=SAFETY_MARGIN):
     """Return the account handle to claim, or None. `accounts`: list of dicts
     {handle, models:[...], max_concurrent_workers, available:bool}. Walks the model chain; within a
     model keeps accounts under their concurrency cap and — when live `usage` (a {handle: {status,
@@ -99,7 +103,7 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
                    if a.get("available", True) and model in a.get("models", [])
                    and active_for(live, a["handle"]) < int(a.get("max_concurrent_workers", 1))]
         if usage is not None:
-            serving = [a for a in serving if usage_eligible(usage.get(a["handle"]))]
+            serving = [a for a in serving if usage_eligible(usage.get(a["handle"]), margin)]
         if not serving:
             continue
 
@@ -268,7 +272,8 @@ def read_accounts(repo):
 
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
-          account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None):
+          account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None,
+          margin=SAFETY_MARGIN):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free / conflict)."""
     import uuid
     accounts = read_accounts(repo)
@@ -291,7 +296,7 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
             )
             if active_holders >= max_holder_concurrent:
                 return None
-        acct = choose_account(accounts, live, model_chain, package, role, now, usage=usage)
+        acct = choose_account(accounts, live, model_chain, package, role, now, usage=usage, margin=margin)
         if acct is None:
             return None
         a = next(x for x in accounts if x["handle"] == acct)

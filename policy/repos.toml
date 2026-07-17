@@ -21,6 +21,8 @@ max_concurrent = 7
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
 arm_auto_merge = true
+require_usage = true          # hold (fail-closed) if the usage probe is unavailable
+usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH windows
 max_attempts = 2
 dispatch = "cron"
 trust = "collaborators"

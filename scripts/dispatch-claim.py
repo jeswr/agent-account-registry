@@ -358,9 +358,16 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
             holder = f"{repo}#{number}@dispatch-{os.environ.get('GITHUB_RUN_ID', 'local')}." \
                      f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
             ttl = resolved["worker_timeout_minutes"] * 60 + 900
-            # Dynamic concurrency: when live usage is available, the cap is the number of accounts
-            # with real headroom (starts high, backs off as utilisation climbs), bounded by the static
-            # policy max_concurrent. Without usage, fall back to the static cap (backward compatible).
+            # Dynamic concurrency: when live usage is available, the cap is the number of accounts with
+            # real headroom (starts high, backs off as utilisation climbs), bounded by the static policy
+            # max_concurrent. FAIL-CLOSED: a repo with require_usage=true and NO usage map (a TOTAL probe
+            # failure) HOLDS this cycle rather than dispatching ungated onto possibly rate-limited
+            # accounts. Without require_usage, absent usage falls back to the static cap (backward compat).
+            margin = resolved["usage_safety_margin"]
+            if usage is None and resolved["require_usage"]:
+                print(f"defer {repo}#{number}: require_usage set but live usage is unavailable "
+                      "(probe failed) — holding fail-closed")
+                continue
             if usage is not None:
                 if catalog_cache["accounts"] is None:
                     catalog_cache["accounts"] = allocator.read_accounts(registry_repo)
@@ -368,7 +375,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                 pool_accounts = [a for a in catalog_cache["accounts"] if a["handle"] in pool]
                 effective_cap = allocator.dynamic_concurrency(
                     pool_accounts, usage, model_chain=resolved["model_chain"],
-                    absolute_cap=resolved["max_concurrent"])
+                    absolute_cap=resolved["max_concurrent"], margin=margin)
             else:
                 effective_cap = resolved["max_concurrent"]
             try:
@@ -384,6 +391,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                     holder_prefix=holder_prefix,
                     max_holder_concurrent=effective_cap,
                     usage=usage,
+                    margin=margin,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
                 raise DispatchError(f"lease allocation failed for {repo}#{number}") from exc

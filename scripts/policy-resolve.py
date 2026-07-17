@@ -37,6 +37,13 @@ POLICY_FIELDS = {
     "dispatch",
     "trust",
 }
+# [OPUS-4.8] Optional usage-aware-dispatch controls (default off / 0.10 -> backward compatible):
+#   require_usage       = bool  — when true, a TOTAL usage-probe failure HOLDS the repo (fail-closed)
+#                                 rather than falling back to the ungated static cap.
+#   usage_safety_margin = float in [0,1) — fraction of EACH rate-limit window that must remain free to
+#                                 admit a worker (point-in-time headroom; burn-rate caveat in
+#                                 select-and-claim.py).
+OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin"}
 
 
 class PolicyError(ValueError):
@@ -58,7 +65,7 @@ def _policy_row(target_repo, policy_doc):
         raise PolicyError(f"policy for {target_repo!r} must be a table")
 
     missing = sorted(POLICY_FIELDS - row.keys())
-    extra = sorted(row.keys() - POLICY_FIELDS)
+    extra = sorted(row.keys() - POLICY_FIELDS - OPTIONAL_POLICY_FIELDS)
     if missing:
         raise PolicyError(f"policy for {target_repo!r} is missing fields: {', '.join(missing)}")
     if extra:
@@ -93,6 +100,12 @@ def _policy_row(target_repo, policy_doc):
         raise PolicyError(f"unknown dispatch mode {row['dispatch']!r} for {target_repo!r}")
     if row["trust"] not in TRUST_MODES:
         raise PolicyError(f"unknown trust mode {row['trust']!r} for {target_repo!r}")
+    if "require_usage" in row and not isinstance(row["require_usage"], bool):
+        raise PolicyError(f"require_usage for {target_repo!r} must be boolean")
+    if "usage_safety_margin" in row:
+        margin = row["usage_safety_margin"]
+        if not isinstance(margin, (int, float)) or isinstance(margin, bool) or not (0.0 <= margin < 1.0):
+            raise PolicyError(f"usage_safety_margin for {target_repo!r} must be a float in [0, 1)")
     return row
 
 
@@ -211,6 +224,8 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "gate_profile": policy["gate_profile"],
         "arm_auto_merge": policy["arm_auto_merge"],
         "max_concurrent": policy["max_concurrent"],
+        "require_usage": bool(policy.get("require_usage", False)),
+        "usage_safety_margin": float(policy.get("usage_safety_margin", 0.10)),
         "worker_timeout_minutes": policy["worker_timeout_minutes"],
         "max_attempts": policy["max_attempts"],
         "dispatch": policy["dispatch"],
@@ -304,6 +319,24 @@ agent = "docs-agent"
           ("crate-scoped", True))
     check("named caps", (impl["max_concurrent"], impl["worker_timeout_minutes"],
                          impl["max_attempts"]), (2, 90, 2))
+    check("usage controls default off/0.10", (impl["require_usage"], impl["usage_safety_margin"]),
+          (False, 0.10))
+    over = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                         'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                         'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                         'require_usage=true\nusage_safety_margin=0.2\n')
+    over_impl = resolve("o/r", "impl", over, routing)
+    check("usage controls overridable", (over_impl["require_usage"], over_impl["usage_safety_margin"]),
+          (True, 0.2))
+    bad = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                        'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                        'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                        'usage_safety_margin=1.5\n')
+    try:
+        resolve("o/r", "impl", bad, routing)
+        check("usage_safety_margin range validated", "accepted", "rejected")
+    except PolicyError:
+        check("usage_safety_margin range validated", "rejected", "rejected")
     secure = resolve("sparq-org/sparq", ["role:impl", "area:sparq-zk"], policy, routing)
     check("security label overrides role", (secure["model_chain"], secure["agent"],
                                              secure["escalate"]),
