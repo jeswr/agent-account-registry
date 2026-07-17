@@ -1,0 +1,21 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`select_top_k_tiebreak` accepts every dictionary `Id` and uses `Term::to_string()` as its key. Neither this public path nor `nearest_exact_tiebreak` rejects blank nodes, and `VectorStore::put` can associate a vector with such an ID. Blank-node labels are graph/document-local, so two equivalent stores can select different members at a boundary tie. This violates the function's explicit claim that the key is fixed by the RDF term and that two implementations return the same set. The tests cover only IRIs and literals and therefore do not exercise this load-bearing domain restriction.",
+   "file": "crates/sparq-vectors/src/ann.rs",
+   "fix_hint": "Enforce the specified embeddable domain on the real path: reject blank-node (and any other unsupported) candidate terms before ranking, with a tested fail-closed error. Because the current API returns `Vec` rather than `Result`, adjust the API/callers and matching skill documentation as needed. Alternatively define and implement a stable canonical blank-node key, but plain `Term::to_string()` is insufficient. Add a test that inserts a blank-node ID and proves the chosen fail-closed behavior.",
+   "severity": "major",
+   "title": "Blank-node candidates make the claimed tie-break non-reproducible"
+  },
+  {
+   "body": "This diff documents VG-TIE-1, VG-GOV-3, VG-MET-4, and VG-PROV-5 as implemented mainline behavior, but the referenced normative `site/specs/sparql-vector-genai.typ` still says the current build does not implement VG-TIE-1, marks VG-GOV-1..3 and VG-TIE-1 as not satisfied/implemented, and lists VG-TIE-1, VG-MET-1, VG-MET-4, and VG-PROV-1..5 among known deltas. Since that status document is the audit/spec source cited by the new API and skill text, shipping both creates contradictory public claims and makes the change incomplete.",
+   "file": "skills/vector-search/SKILL.md",
+   "fix_hint": "Update the specification's implementation-status rows and surrounding accuracy text in the same change, but only mark the precise assertions actually established by code and non-vacuous tests. Keep still-unimplemented members of grouped assertion ranges explicitly listed rather than marking an entire range satisfied.",
+   "severity": "major",
+   "title": "Documentation claims implemented conformance while the normative status still says it is absent"
+  }
+ ],
+ "summary": "The boundary selection logic works for the tested IRI/literal cases, but the new public API and mainline path do not enforce the candidate-domain condition required for the claimed cross-implementation determinism. In addition, the normative implementation-status document remains directly inconsistent with the newly documented behavior, so the change is incomplete and overclaims conformance.",
+ "verdict": "request_changes"
+}
