@@ -18,11 +18,13 @@ on:
     # the top-of-minute stampede. The cron is now the BACKSTOP; the doorbell below is the
     # primary liveness signal.
     - cron: '3,13,23,33,43,53 * * * *'
-  # Doorbell: a finished worker or review/fix run is exactly the moment the sweep has new
-  # state to enumerate (publish -> review:needs, review -> fix round or arm, fix -> re-review).
-  # Event-driven dispatch removes the cron-latency floor from every loop transition. The
-  # registry-dispatcher concurrency group (cancel-in-progress: false) coalesces completion
-  # bursts into at most one running + one queued sweep, so this cannot stampede PLAN.
+  # NOTE: this workflow_run trigger is effectively DEAD for pipeline-initiated runs — worker
+  # and review-fix runs are started via the repo GITHUB_TOKEN, and GitHub suppresses
+  # workflow-triggering events from GITHUB_TOKEN-initiated runs (measured 2026-07-17: zero
+  # deliveries). It is kept only for manually-started worker/review runs. The REAL doorbell
+  # is the explicit `doorbell` job at the end of worker.yml / review-fix.yml (workflow_dispatch
+  # API calls are the documented exception to the suppression). The registry-dispatcher
+  # concurrency group coalesces bursts either way.
   workflow_run:
     workflows: [worker, review-fix]
     types: [completed]

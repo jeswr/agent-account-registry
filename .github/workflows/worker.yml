@@ -1025,3 +1025,24 @@ jobs:
           python3 registry/scripts/select-and-claim.py \
             --release "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY"
+
+  # Doorbell: dispatch.yml's workflow_run trigger NEVER fires for these runs — they are
+  # started via the repo GITHUB_TOKEN, and GitHub suppresses workflow-triggering events
+  # from GITHUB_TOKEN-initiated runs (measured 2026-07-17: zero workflow_run deliveries).
+  # workflow_dispatch API calls are the documented exception to that suppression, so each
+  # finished run explicitly re-rings the dispatcher; its registry-dispatcher concurrency
+  # group coalesces bursts. always(): a FAILED run is exactly when the sweep must
+  # re-enumerate (deferral repair, missed-fix accounting, next round).
+  doorbell:
+    name: doorbell (re-ring dispatcher)
+    needs: [release]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    steps:
+      - name: Ring dispatch.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dispatch.yml -R "$GITHUB_REPOSITORY" || echo "::warning::doorbell ring failed (cron backstop covers this tick)"

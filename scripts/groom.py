@@ -44,6 +44,15 @@ HOLDER = re.compile(
     r"#(?P<issue>[1-9][0-9]*)@(?P<run>[^\r\n]+)"
 )
 WORKER_RUN_NAME = re.compile(r"worker claim=(?P<claim>[0-9a-f]{32}|self)")
+# Cross-provider review/fix repair leases (dispatch-claim prefixes `review:` / `fix:`) carry no
+# target-issue holder; they are TTL-managed by groom-leases. Groom must SKIP them, never
+# issue-map them, and never fail the whole sweep on their holder shape (live incident
+# 2026-07-17: every scheduled sweep aborted while a review lease existed).
+REPAIR_HOLDER_PREFIXES = ("review:", "fix:")
+
+
+def is_repair_holder(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(REPAIR_HOLDER_PREFIXES)
 WORKER_BRANCH = re.compile(r"^sparq-agent/issue-(?P<issue>[1-9][0-9]*)-")
 LINKED_ISSUE = re.compile(
     r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(?P<issue>[1-9][0-9]*)\b"
@@ -164,7 +173,8 @@ def validate_ledger(document: Any) -> list[dict[str, Any]]:
         if claim in claims:
             raise GroomError("lease ledger contains duplicate claim ids")
         claims.add(claim)
-        parse_holder(lease.get("holder"))
+        if not is_repair_holder(lease.get("holder")):
+            parse_holder(lease.get("holder"))
         issued = _positive_int(lease.get("issued_at"), "lease issued_at")
         expires = _positive_int(lease.get("expires_at"), "lease expires_at")
         if expires <= issued:
@@ -749,6 +759,10 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     now = int(time.time())
 
     leases, _sha = _read_ledger(registry_api, registry_repo)
+    repair_count = sum(1 for lease in leases if is_repair_holder(lease["holder"]))
+    if repair_count:
+        print(f"skip {repair_count} review/fix repair lease(s) — TTL-managed by groom-leases")
+    leases = [lease for lease in leases if not is_repair_holder(lease["holder"])]
     for lease in leases:
         holder = parse_holder(lease["holder"])
         if holder.repo not in limits:
@@ -809,6 +823,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         (parse_holder(lease["holder"]).repo, parse_holder(lease["holder"]).issue)
         for lease in fresh_leases
         if lease["claim_id"] not in dead_claims
+        and not is_repair_holder(lease["holder"])
     }
     current_pulls = {repo: _pulls(target_api, repo) for repo in limits}
     current_links = {
@@ -1178,6 +1193,21 @@ def _self_test() -> int:
     except GroomError:
         malformed_failed = True
     check("malformed ledger fails closed", malformed_failed, True)
+
+    # Review/fix repair leases: tolerated by validation, never issue-mapped, and a malformed
+    # NON-repair holder still fails closed (the skip must not widen into blanket tolerance).
+    check("repair holder detected", is_repair_holder("review:sparq-org/sparq#2445"), True)
+    check("fix holder detected", is_repair_holder("fix:sparq-org/sparq#2445"), True)
+    check("impl holder is not repair", is_repair_holder(base["holder"]), False)
+    repair_lease = {**base, "claim_id": "c" * 32, "holder": "review:owner/repo#9"}
+    validated = validate_ledger({"leases": [base, repair_lease]})
+    check("repair lease passes ledger validation", len(validated), 2)
+    bad_holder_failed = False
+    try:
+        validate_ledger({"leases": [{**base, "claim_id": "d" * 32, "holder": "not-an-issue-holder"}]})
+    except GroomError:
+        bad_holder_failed = True
+    check("malformed non-repair holder still fails closed", bad_holder_failed, True)
 
     print("groom self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

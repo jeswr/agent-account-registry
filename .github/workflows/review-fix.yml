@@ -1195,3 +1195,20 @@ jobs:
           python3 registry/scripts/select-and-claim.py \
             --release "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY"
+
+  # Doorbell: see worker.yml — GITHUB_TOKEN-initiated runs emit no workflow_run events, so
+  # each finished review/fix explicitly re-rings the dispatcher (fix rounds and re-reviews
+  # are enumerated by the sweep; this removes the cron-latency floor between rounds).
+  doorbell:
+    name: doorbell (re-ring dispatcher)
+    needs: [release]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    steps:
+      - name: Ring dispatch.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dispatch.yml -R "$GITHUB_REPOSITORY" || echo "::warning::doorbell ring failed (cron backstop covers this tick)"
