@@ -1,0 +1,21 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The repository maintenance contract requires every CLI flag or behavior change to update the matching skills/<surface>/SKILL.md in the same PR. This diff adds the public --citations mode but documents it only in the crate README and binary help text. That leaves the agent-facing usage surface incomplete and violates a required merge condition.",
+   "file": "crates/sparq-kb/README.md",
+   "fix_hint": "Update the applicable skill (or add/router-link a sparq-kb usage skill if this CLI has no existing matching skill) with the --citations invocation, output contract, feature requirement, and incompatible flags in this PR. Include that skill file in the diff.",
+   "severity": "major",
+   "title": "Public CLI change is missing the required skill documentation update"
+  },
+  {
+   "body": "--citations is described and implemented as its own mode, but the conflict check only rejects --query and --sparql. Passing --citations --arg value succeeds while discarding the argument because FINDING_PROVENANCE.render(None) is unconditional. Silent acceptance of a meaningless option is inconsistent with the fail-fast handling of --json and the other query modes.",
+   "file": "crates/sparq-kb/src/bin/pkg_query.rs",
+   "fix_hint": "Reject arg.is_some() in citations mode with an explanatory error, and extend the CLI contract test to cover --citations --arg value (or explicitly document and justify accepting it).",
+   "severity": "minor",
+   "title": "--citations silently ignores --arg"
+  }
+ ],
+ "summary": "The CLI wiring and end-to-end tests exercise the real binary path, and the new mode correctly selects the canned provenance query, renders citations, and rejects the documented JSON/query conflicts. However, this is a public CLI behavior change and the repository's mandatory maintenance rule requires the matching Agent Skill documentation to be updated in the same change. The diff only updates the crate README. There is also an unhandled mode conflict: --arg is silently accepted and ignored with --citations.",
+ "verdict": "request_changes"
+}
