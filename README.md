@@ -70,11 +70,124 @@ opaque claim (which secret to use) or `none-free`:
 Which skills/roles/packages ran recently on each account is tracked **here** (as receipt comments +
 a rolling `data/cache-affinity.json`), never in the public repos.
 
-## Adding an account
+## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 
-1. Create a repo/org **secret** with the token: `gh secret set ACCT_<HANDLE>_TOKEN`.
-2. Open an issue titled `<HANDLE>` with the YAML body above (`secret_ref: ACCT_<HANDLE>_TOKEN`).
-3. Label it `provider:anthropic`/`provider:openai` and `status:available`.
+> Goal: make one more model account usable by the workers. There are **five** required steps; the
+> account is invisible to the selector until **all five** are done (notably the `account_pool` edit —
+> a common miss). Every command targets the private registry `jeswr/agent-account-registry`.
+> **Never print a token value** into chat, a log, an issue, or a commit.
+
+**Naming convention.** Handle = `acctNN` (e.g. `acct05`). Its token secret is
+`ACCTNN_TOKEN` (the handle upper-cased + `_TOKEN`, e.g. `ACCT05_TOKEN`). The account issue's
+`secret_ref:` field MUST equal that secret name.
+
+### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
+
+- **Anthropic** (Claude models): run `claude setup-token` while logged into the target account. It
+  prints a long-lived `sk-ant-oat…` token (`credential_format: claude-oauth-token`). **Do NOT** copy
+  `~/.claude/.credentials.json` — that subscription blob's refresh token *rotates* and dies the moment
+  the interactive session refreshes (this broke the canary once). If you prefer a Console API key,
+  that also works: `credential_format: anthropic-api-key` (value is the `sk-ant-api…` key).
+- **OpenAI** (codex/GPT models): the codex CLI OAuth from `~/.codex/auth.json`
+  (`credential_format: codex-auth-json`). (This one does rotate — used only as a cross-provider
+  fallback.)
+- On this work box, pre-provisioned Anthropic setup-tokens already exist as files
+  `~/.claude-acctN-token` (one per account). Read the file; do not echo it.
+
+### Step 1 — save the token as a secret (via stdin, never as a visible arg)
+
+```bash
+tr -d '[:space:]' < ~/.claude-acct5-token | gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry
+# or from a value you already hold, without it hitting the shell history/ps:
+#   gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry   # then paste at the prompt
+```
+
+### Step 2 — validate the token works (and see its live usage)
+
+```bash
+TOK="$(tr -d '[:space:]' < ~/.claude-acct5-token)"
+curl -s -D - -o /dev/null -X POST https://api.anthropic.com/v1/messages \
+  -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" \
+  -H "anthropic-beta: oauth-2025-04-20" -H "content-type: application/json" \
+  -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+  | grep -iE 'HTTP/|anthropic-ratelimit-unified-(status|5h|7d)'
+```
+Expect `HTTP/2 200` and `anthropic-ratelimit-unified-status: allowed`. The
+`…-5h-utilization` / `…-5h-reset` / `…-7d-utilization` / `…-7d-reset` headers are the live usage +
+reset timestamps used for account prioritisation (see **Usage-aware selection** below).
+
+### Step 3 — create the account issue (the catalog entry `select-and-claim.py` reads)
+
+`read_accounts()` parses these exact keys from the issue **body**. Title = the handle.
+
+```bash
+gh issue create -R jeswr/agent-account-registry --title "acct05" --body 'provider: anthropic
+harness: claude
+credential_format: claude-oauth-token
+email: "<the account login email — a setup-token CANNOT introspect it (403 on /api/oauth/profile); fill from the account you logged in as>"
+models: [opus, sonnet, haiku, fable]
+max_concurrent_workers: 1
+secret_ref: ACCT05_TOKEN
+notes: "claude setup-token (long-lived, non-rotating). [your-marker]"'
+```
+For an **OpenAI** account: `provider: openai`, `harness: codex`, `credential_format: codex-auth-json`,
+`models: [terra]` (or the concrete GPT alias), `secret_ref: ACCTNN_TOKEN`.
+
+### Step 4 — label the issue (REQUIRED — no label ⇒ not `available` ⇒ never selected)
+
+```bash
+gh issue edit <ISSUE#> -R jeswr/agent-account-registry \
+  --add-label status:available --add-label provider:anthropic
+```
+`select-and-claim.py` sets `available = (has status:available label)`; without it the account is
+silently skipped.
+
+### Step 5 — add the handle to the repo's `account_pool` (the easy-to-forget step)
+
+Edit `policy/repos.toml` for each target repo that should be allowed to use this account, and raise
+`max_concurrent` if you want more simultaneous workers:
+
+```toml
+[repos."sparq-org/sparq"]
+account_pool = ["acct01", "acct02", "acct03", "acct04", "acct05"]   # add the new handle
+max_concurrent = 5                                                   # optional: allow more parallelism
+```
+Commit + push to `master`. An account that is available + in the catalog but **not** in a repo's
+`account_pool` will never be claimed for that repo.
+
+### Verify
+
+```bash
+gh secret list -R jeswr/agent-account-registry | grep ACCT           # secret present
+gh issue view <ISSUE#> -R jeswr/agent-account-registry --json labels  # status:available + provider:*
+grep account_pool policy/repos.toml                                   # handle present
+```
+
+> Email note: a `claude setup-token` is inference-scoped and returns **403** on
+> `https://api.anthropic.com/api/oauth/profile`, so the account email cannot be derived from the
+> token — record it from the login you used. (An *interactive* subscription OAuth token *can* read
+> `/api/oauth/profile`, which returns `account.email`, plan tier, and `rate_limit_tier`.)
+
+## Usage-aware selection (rate-limit headers)
+
+Anthropic returns live usage + reset data as **response headers on every `/v1/messages` call** (so a
+`max_tokens:1` probe is enough, and it works with an inference-scoped setup-token — no separate usage
+API, and `/api/oauth/profile` is 403 for setup-tokens). Key headers:
+
+| Header | Meaning |
+|---|---|
+| `anthropic-ratelimit-unified-status` | `allowed` \| throttled/`rejected` — is the account usable right now |
+| `anthropic-ratelimit-unified-5h-utilization` | fraction (0–1) of the rolling **5-hour** window consumed |
+| `anthropic-ratelimit-unified-5h-reset` | Unix ts when the 5h window resets |
+| `anthropic-ratelimit-unified-7d-utilization` | fraction of the **weekly** window consumed |
+| `anthropic-ratelimit-unified-7d-reset` | Unix ts when the weekly window resets |
+| `anthropic-ratelimit-unified-representative-claim` | which window is currently binding (`five_hour`/`seven_day`) |
+
+**Prioritisation policy** (to be wired into `choose_account`): among eligible accounts prefer
+`status=allowed` with the **lowest** binding-window utilisation; **skip** an account whose status is
+not `allowed` (or whose utilisation ≈ 1.0) until its `*-reset` timestamp passes; surface the soonest
+`*-reset` so a fully-capped fleet knows exactly when capacity returns. This complements the existing
+cache-affinity tie-break. (OpenAI/codex exposes analogous limits; TODO confirm its headers.)
 
 ## Security posture
 
