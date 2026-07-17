@@ -20,7 +20,8 @@ removes it after the design pass, then the retriage path promotes.
 import re
 import sys
 
-ROLE_BY_KIND = {"docs": "docs", "research": "research", "ci": "ci", "security": "soundness"}
+ROLE_BY_KIND = {"docs": "docs", "research": "research", "ci": "ci", "site": "site",
+                "security": "soundness"}
 ROLE_BY_TYPE = {"feature": "impl", "bug": "impl", "task": "impl", "chore": "ci",
                 "spike": "research", "epic": "impl"}
 # The registry IS the orchestration trust plane: an issue touching these sections is a soundness
@@ -28,6 +29,11 @@ ROLE_BY_TYPE = {"feature": "impl", "bug": "impl", "task": "impl", "chore": "ci",
 # soundness lane so the review of its eventual PR is human-armed, never auto-armed.
 SEC_KEYWORDS = ("dispatch", "worker", "set-up-account", "review-loop", "groom",
                 "zk", "mpc", "crypto", "auth", "e2ee")
+# [FABLE-5] STANDING RULE (maintainer decision 2026-07-17): UI/front-end surfaces route role:site
+# -> the openai/codex chain in orchestration/routing.toml (original-builder ownership: GPT-5.6
+# codex built the registry dashboard, e4098b9). EXACT labels, not substrings — UI keywords must
+# not enter SEC_KEYWORDS/match_labels semantics (that would human-arm every UI PR).
+UI_SURFACE_LABELS = ("area:dashboard", "dashboard", "surface:frontend")
 _PRIO = re.compile(r"^priority:P([0-4])$")
 
 
@@ -47,6 +53,10 @@ def _role(labels, issue_type):
     for lb in labels:
         if lb.startswith("kind:") and lb[5:] in ROLE_BY_KIND:
             return ROLE_BY_KIND[lb[5:]]
+    # [FABLE-5] UI-surface labels derive role:site (codex-led chain) before the generic type map,
+    # after kind (docs about the dashboard stay docs) and after an explicit role:* label.
+    if any(lb in UI_SURFACE_LABELS for lb in labels):
+        return "site"
     return ROLE_BY_TYPE.get(issue_type)
 
 
@@ -104,6 +114,11 @@ def _self_test():
         "soundness")
     chk("dispatch -> soundness", triage(["priority:P1", "area:dispatch"], "feature")["role"],
         "soundness")
+    # [FABLE-5] UI-surface ownership: dashboard work derives role:site (codex-led chain, e4098b9);
+    # kind:docs about the dashboard stays docs.
+    chk("dashboard -> site", triage(["priority:P2", "area:dashboard"], "feature")["role"], "site")
+    chk("dashboard docs stay docs",
+        triage(["priority:P3", "kind:docs", "area:dashboard"], "task")["role"], "docs")
     # B2: a needs:design issue is NOT ready even with a full role+priority+area label-set.
     r = triage(["priority:P2", "role:impl", "area:review-loop", "needs:design"], "task")
     chk("needs:design not ready (B2)", r["ready"], False)
