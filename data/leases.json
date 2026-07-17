@@ -32,16 +32,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "efed29753f4e4626b7aea2b759641846",
-   "holder": "review:sparq-org/sparq#2445@dispatch-29585011066.1",
-   "package": "sparq-vectors",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784295804,
-   "expires_at": 1784297004
-  },
-  {
-   "account": "acct01",
    "claim_id": "ab6e9b5186a246a2a25a67dbd484ecec",
    "holder": "review:sparq-org/sparq#2501@dispatch-29585011066.1",
    "package": "sparq-rsp",
