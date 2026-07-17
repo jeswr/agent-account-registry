@@ -330,13 +330,20 @@ class ParkRecord:
 def latest_park(comments: list[dict[str, Any]], bot_login: str) -> ParkRecord | None:
     """The last stale-park comment authored by the BOT itself, or None. A park marker inside a
     non-bot comment never counts: a human pasting the marker text must not make a human-applied
-    needs:user look reversible."""
+    needs:user look reversible. A bot UNPARK comment CONSUMES any earlier park record: after an
+    unpark, the old park comment no longer explains a needs:user label, so a needs:user applied
+    later (e.g. silently, by a human) is never attributed to groom. A legitimate groom re-park
+    always posts a fresh park comment whenever it (re)applies the label, re-establishing the
+    record after any unpark."""
     bot = bot_login.casefold()
     record: ParkRecord | None = None
     for comment in comments:
         if str(comment.get("user", {}).get("login", "")).casefold() != bot:
             continue
         body = str(comment.get("body", ""))
+        if UNPARK_MARKER in body:
+            record = None
+            continue
         match = STALE_PARK_V2_RE.search(body)
         if match is None and STALE_PR_MARKER not in body:
             continue
@@ -1439,6 +1446,26 @@ def _self_test() -> int:
         ),
         ParkRecord(sha=None, at=park_at),
     )
+    unpark_comment = {
+        "user": {"login": "app[bot]"},
+        "created_at": datetime.fromtimestamp(park_at + 120, timezone.utc).isoformat(),
+        "body": "> 🤖 SPARQ agent\n\nunparked\n\n" + UNPARK_MARKER,
+    }
+    check(
+        "an unpark comment consumes the park record",
+        latest_park([park_comment, unpark_comment], "app[bot]"),
+        None,
+    )
+    repark_comment = {
+        "user": {"login": "app[bot]"},
+        "created_at": datetime.fromtimestamp(park_at + 240, timezone.utc).isoformat(),
+        "body": "> 🤖 SPARQ agent\n\nparked again\n\n" + park_marker(sha_b, park_at + 240),
+    }
+    check(
+        "a re-park after an unpark re-establishes the record",
+        latest_park([park_comment, unpark_comment, repark_comment], "app[bot]"),
+        ParkRecord(sha=sha_b, at=park_at + 240),
+    )
     park = ParkRecord(sha=sha_a, at=park_at)
     parked_labels = {"needs:user", "role:impl"}
     parked_pull = {
@@ -1447,6 +1474,19 @@ def _self_test() -> int:
         "draft": False,
         "mergeable_state": "blocked",
     }
+    check(
+        "no unpark: a consumed park never steals a later-applied needs:user",
+        unpark_reason(
+            parked_pull,
+            parked_labels,
+            latest_park([park_comment, unpark_comment], "app[bot]"),
+            [park_comment, unpark_comment],
+            [],
+            [],
+            "app[bot]",
+        ),
+        None,
+    )
     check(
         "unpark: groom park, no human activity, new head sha",
         unpark_reason(
