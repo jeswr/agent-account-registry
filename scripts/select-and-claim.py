@@ -128,7 +128,7 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
     for model in model_chain:
         serving = [a for a in accounts
                    if a.get("available", True) and model in a.get("models", [])
-                   and active_for(live, a["handle"]) < int(a.get("max_concurrent_workers", 1))]
+                   and active_for(live, a["handle"]) < int(a.get("max_concurrent_workers", 4))]
         if usage is not None:
             serving = [a for a in serving
                        if usage_eligible(usage.get(a["handle"]), margin, model=model)]
@@ -174,7 +174,7 @@ def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, ma
             continue
         u = usage.get(a["handle"])
         if any(usage_eligible(u, margin, model=m) for m in servable):
-            total += int(a.get("max_concurrent_workers", 1))
+            total += int(a.get("max_concurrent_workers", 4))
     if absolute_cap is not None:
         total = min(total, absolute_cap)
     return total
@@ -275,7 +275,7 @@ def _run(args):
 
 
 def _parse_account(body):
-    d = {"models": [], "max_concurrent_workers": 1}
+    d = {"models": [], "max_concurrent_workers": 4}
     for line in (body or "").splitlines():
         if ":" not in line:
             continue

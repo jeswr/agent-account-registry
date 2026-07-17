@@ -70,11 +70,13 @@ DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
 # role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
 REVIEW_CHAIN = {"anthropic": ["terra"], "openai": ["opus"]}
 FIX_CHAIN = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
-# Static per-prefix lease caps (locked decision 9). The `select-and-claim` CLI path does not
-# usage-gate; codex accounts are usage-EXEMPT, so this shared `review:` prefix cap IS the codex
-# slot bound (2 accounts), and `fix:` is bounded to 3 concurrent fixes.
-REVIEW_MAX_CONCURRENT = 2
-FIX_MAX_CONCURRENT = 3
+# Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
+# 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
+# earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
+# path does not usage-gate; codex accounts are usage-EXEMPT, so this shared `review:` prefix
+# cap IS the codex slot bound, and `fix:` bounds concurrent same-provider fix agents.
+REVIEW_MAX_CONCURRENT = 10
+FIX_MAX_CONCURRENT = 8
 REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
 FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
