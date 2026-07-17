@@ -71,9 +71,11 @@ SNAPSHOT_SKIP_FIELDS = {"repo", "pr_number", "reason"}
 # every snapshot-derived admission (ci-fix/rebase/stranded/disarm) stands down for it
 # that tick. A POST-detail skip (check-runs-*) records the same row for visibility but
 # ALSO ships a DEGRADED record (detail fields intact, check_runs empty + marked): the
-# check-run-dependent admissions stand down, while the #42 armed-SHA-mismatch disarm —
-# which consumes only detail data and whose ACT is itself the safety measure — still
-# fires. Fail-closed per ITEM, never per sweep; never fail-OPEN on the disarm net.
+# check-run-DEPENDENT admissions (ci-fix, stranded) stand down, while the detail-derived
+# ones still evaluate on sound data — the needs-rebase conflict repair, and the #42
+# armed-SHA-mismatch disarm (whose ACT is itself the safety measure) still fires.
+# Fail-closed per ITEM, never per sweep; never fail-OPEN on the disarm net; MONOTONE
+# under a forged marker (the unmarked outcome or do-nothing, never a different act).
 SNAPSHOT_SKIP_REASONS = {
     "check-runs-overflow",
     "check-runs-malformed",
@@ -648,10 +650,18 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         if not isinstance(status, dict) or status.get("head_sha") != sha:
             status = {}                   # stale/unknown CI snapshot — unknown never acts
         elif status.get("check_runs_degraded"):
-            status = {}                   # PLAN's check-run read degraded for this PR: every
-                                          # snapshot-derived repair admission (rebase/ci-fix/
-                                          # stranded) stands down; only the disarm net — which
-                                          # needs no check runs — consumes a degraded record
+            # PLAN's check-run read degraded for this PR: keep ONLY the detail-derived
+            # fields (head_sha / conflicting / armed — all read successfully BEFORE the
+            # check runs failed) and drop everything check-run-derived, so the gate-
+            # dependent admissions (ci-fix, stranded) stand down while the conflict
+            # repair and the disarm net still evaluate on sound data. MONOTONE by
+            # construction (round-2 finding): a degraded/forged marker yields the
+            # unmarked outcome or DO-NOTHING, never a DIFFERENT act — blanking the whole
+            # status here would flip a conflicting PR from needs-rebase into the
+            # status-independent review/fix flow (a state SWITCH, not a narrowing).
+            status = {"head_sha": status.get("head_sha"),
+                      "conflicting": status.get("conflicting"),
+                      "armed": status.get("armed")}
         lease_free = (f"fix:{repo}#{number}" not in live_keys
                       and f"review:{repo}#{number}" not in live_keys)
         areas = sorted(label[5:] for label in source_labels if label.startswith("area:"))
@@ -2054,20 +2064,35 @@ def _self_test():
     assert enumerate_review_items(
         repo, [starved], provenance, [], issue_labels, now,
         pr_status={41: status_of(sha_b, gate="failure", conflicting=True)}) == []
-    # a DEGRADED snapshot record (PR #60 round-1) stands EVERY snapshot-derived repair
-    # admission down — rebase (despite the sound conflicting bit), ci-fix, stranded —
-    # even when the record smuggles a would-be trigger past the forced gate=missing
+    # a DEGRADED snapshot record (PR #60 rounds 1+2) is MONOTONE: the check-run-derived
+    # admissions (ci-fix, stranded) stand down even when the record smuggles a would-be
+    # trigger past the forced gate=missing, while the DETAIL-derived fields stay live —
+    # a degraded conflicting PR still emits needs-rebase (the SAME state as unmarked;
+    # blanking it would switch the act into the review/fix flow, widening not narrowing)
     degraded_trigger = {41: dict(status_of(sha_a, gate="failure", conflicting=True,
                                            legs=["js"]), check_runs_degraded=True)}
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [starved], provenance, [], issue_labels, now,
+        pr_status=degraded_trigger)] == ["needs-rebase"]
+    # ... and the SAME degraded record on an unreviewed draft stays needs-rebase too
+    # (identical to the unmarked `both` outcome above — no state switch to needs-review)
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [fresh], provenance, [], issue_labels, now,
+        pr_status=degraded_trigger)] == ["needs-rebase"]
+    # a smuggled RED gate on a clean degraded base admits NO ci-fix (guard is load-
+    # bearing beyond pr_ci_status: a hostile status map bypasses the forced-missing)
+    degraded_red = {41: dict(status_of(sha_a, gate="failure", legs=["js"]),
+                             check_runs_degraded=True)}
     assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
-                                  pr_status=degraded_trigger) == []
+                                  pr_status=degraded_red) == []
+    # a smuggled GREEN gate on a degraded record admits NO stranded escalation
     degraded_green = {41: dict(status_of(sha_a, gate="success"), check_runs_degraded=True)}
     assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
                                   pr_status=degraded_green) == []
     # ... while the snapshot-independent review flow is unaffected by the degradation
     assert [item["state"] for item in enumerate_review_items(
         repo, [fresh], provenance, [], issue_labels, now,
-        pr_status=degraded_trigger)] == ["needs-review"]
+        pr_status={41: dict(status_of(sha_a), check_runs_degraded=True)})] == ["needs-review"]
 
     # ---- GAP-C enumeration (issue #42: armed-SHA-mismatch disarm) ----
     armed_status = {41: status_of(sha_b, armed=True)}

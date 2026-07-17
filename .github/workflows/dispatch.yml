@@ -394,9 +394,10 @@ jobs:
               # snapshot was oversized/unreadable carries a reason instead of killing the
               # sweep. Two tiers (PR #60 round-1): a pre-detail skip has NO pr_status
               # record (every snapshot-derived admission stands down); a check-runs-* skip
-              # ships a DEGRADED record too — pr_ci_status forces gate=missing on it, the
-              # repair admissions stand down, and only the #42 disarm net (detail fields
-              # only) consumes it. CLAIM folds these rows into the dispatch summary.
+              # ships a DEGRADED record too — pr_ci_status forces gate=missing on it, so
+              # the gate-dependent admissions (ci-fix, stranded) stand down while the
+              # detail-derived ones (needs-rebase, the #42 disarm net) still evaluate.
+              # CLAIM folds these rows into the dispatch summary.
               for skip in raw_skips:
                   if not isinstance(skip, dict):
                       continue

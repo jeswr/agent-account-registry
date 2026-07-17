@@ -25,8 +25,10 @@ churn, the exact scenario this file exists for). So:
   with the detail fields intact, `check_runs` EMPTY, and an explicit
   `check_runs_degraded: <reason>` marker; the skip row is still recorded for visibility.
   pr_ci_status forces gate="missing" on the marker, and enumerate_review_items stands the
-  check-run-dependent admissions (ci-fix, rebase, stranded) down on it — the disarm net,
-  which never needed check runs, still fires.
+  check-run-DEPENDENT admissions (ci-fix, stranded) down on it while the detail-derived
+  ones (the needs-rebase conflict repair, and the disarm net) still evaluate on sound
+  data — monotone: a degraded record yields the undegraded outcome or do-nothing, never
+  a different act.
 - PRE-detail failure (pr-detail-read-failed/-malformed, worker-pr-census-overflow):
   nothing sound is derivable — NO record, every snapshot-derived admission including
   disarm stands down for that PR this tick. Residual, accepted: the detail read failing
