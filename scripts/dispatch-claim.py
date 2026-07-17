@@ -365,7 +365,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
             model = claim.get("model")
             claim_id = claim.get("claim_id")
             secret_ref = claim.get("secret_ref")
-            if (not isinstance(account, str) or not re.fullmatch(r"acct[0-9]{2,}", account)
+            if (not isinstance(account, str) or not re.fullmatch(r"acct[0-9a-z]{2,}", account)
                     or model not in resolved["model_chain"]
                     or not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f]{32}", claim_id)
                     or secret_ref != f"{account.upper()}_TOKEN"):
