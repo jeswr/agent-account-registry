@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The changes are semantics-preserving Rust cleanups. Format-string capture preserves the canonicalization assertion and its diagnostics; Vec::contains performs the same resource de-duplication check as the prior iterator expression; and Result::unwrap_or_default returns the loaded graph on success or Graph::default() on error exactly as the replaced match did. No test validity, soundness, correctness, or security issue is introduced.",
+ "verdict": "approve"
+}
