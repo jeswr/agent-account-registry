@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change is answer-safe as scoped: retrieval metadata is consulted only after candidate membership and cardinality estimation are finalized, and sorting uses a total deterministic key that correctly distinguishes an absent hint from every declared u64 value. The focused tests cover ascending order, equal-hint and no-hint stability, u64::MAX sentinel separation, and a non-vacuous differential comparison of retained source/estimate maps with adversarial hints. Documentation and the federated-planning skill consistently describe the changed public ordering contract. No correctness, soundness, test-validity, or security defect was found in the diff. Targeted tests could not be executed in this checkout because cargo is unavailable in the environment.",
+ "verdict": "approve"
+}
