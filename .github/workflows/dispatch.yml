@@ -389,11 +389,14 @@ jobs:
 
               # Field-selected PR snapshot + issue-label map for the registry-side review
               # enumeration in the assemble step (avoids a second API sweep there).
-              snapshot = []
+              # NB: named pr_snapshot, NOT `snapshot` — that would shadow the snapshot() reader
+              # and make the SECOND target's iteration call a list (the exact two-target
+              # TypeError that broke the first multi-target sweep, 2026-07-17).
+              pr_snapshot = []
               for pull in pulls:
                   head = pull.get("head") or {}
                   user = pull.get("user") or {}
-                  snapshot.append({
+                  pr_snapshot.append({
                       "number": pull.get("number"),
                       "state": pull.get("state"),
                       "draft": pull.get("draft"),
@@ -405,7 +408,7 @@ jobs:
                       "user": {"login": user.get("login"), "type": user.get("type")},
                   })
               Path(out_dir, f"pulls-{index}.json").write_text(
-                  json.dumps(snapshot), encoding="utf-8")
+                  json.dumps(pr_snapshot), encoding="utf-8")
               Path(out_dir, f"issue-labels-{index}.json").write_text(
                   json.dumps({str(number): details[number][1] for number in details}),
                   encoding="utf-8")
