@@ -1,0 +1,21 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The new research record hard-codes percentages, millisecond timings, and a 3\u20138x penalty derived from a native shared-work-box run. Calling them advisory does not cure the repository's explicit prohibition on hard-coded performance numbers and its rule that work-box timings are non-canonical. These numbers are also used to justify the public feature in README/SKILL prose, so this is not merely an incidental lab note.",
+   "file": "research/shacl-wasm-stateful-2026-07.md",
+   "fix_hint": "Remove the numeric table and all concrete percentages, timings, and multiplier claims from committed Markdown. Keep only a qualitative, clearly non-canonical observation and point to a generated/git-ignored benchmark envelope or the future canonical quiet-box artifact for quantitative evidence; soften dependent public prose accordingly until that evidence exists.",
+   "severity": "major",
+   "title": "Non-canonical work-box performance numbers are committed as durable claims"
+  },
+  {
+   "body": "The comments say CI builds, clippies, and tests EVERY feature state, but the matrix covers default, shacl-af alone, and stateful alone. It never covers shacl-af+stateful together, even though both public opt-in features can be enabled simultaneously and stateful validation inherits sparq-shacl behavior under shacl-af.",
+   "file": ".github/workflows/ci.yml",
+   "fix_hint": "Either add build/clippy/wasm-pack coverage for --features shacl-af,stateful (preferably using --all-features where appropriate), or change all 'every feature state' claims to accurately describe the individually tested states and explain why the combination is unnecessary.",
+   "severity": "minor",
+   "title": "CI claims every feature state but omits the combined feature state"
+  }
+ ],
+ "summary": "The stateful handle is narrowly implemented and its wasm tests exercise the real exported parse/validate path, but the change cannot be approved because it commits session/work-box performance measurements as durable numeric claims. Repository policy explicitly treats those measurements as non-canonical and forbids hard-coded performance numbers in Markdown. The CI/documentation also overstates feature-combination coverage.",
+ "verdict": "request_changes"
+}
