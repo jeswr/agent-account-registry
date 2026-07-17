@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "BudgetSpec::window_budget unconditionally replaces base.deadline with now + timeout whenever checked_add succeeds. Thus a caller using with_budget with an already-expired or earlier absolute deadline and also using with_window_timeout gets extra execution time; each later window can continue resetting past the absolute deadline. The documentation says the budget's deadline stays absolute and explicitly says it still applies in the overflow case, so the two limits should compose rather than one weakening the other. This is a correctness issue for the advertised worst-case resource bound, and no test exercises both deadline forms together.",
+   "file": "crates/sparq-rsp/src/budget.rs",
+   "fix_hint": "Compute the effective deadline as the earlier of base.deadline and now.checked_add(timeout), preserving base.deadline when checked_add returns None. Add a deterministic test with an expired base deadline plus a nonzero per-window timeout and assert timeout failure, ideally also testing the converse ordering.",
+   "severity": "major",
+   "title": "Per-window timeout overwrites an earlier absolute budget deadline"
+  }
+ ],
+ "summary": "The per-evaluation plumbing and tests cover each registered query form, but combining an absolute QueryBudget deadline with a per-window timeout can silently weaken or erase the caller's absolute deadline. This contradicts the documented composition and breaks the resource-bound guarantee.",
+ "verdict": "request_changes"
+}
