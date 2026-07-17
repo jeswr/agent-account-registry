@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The workflow change correctly distinguishes issue-author trust from event-sender trust, preserves quarantine for actions by untrusted senders, and avoids re-quarantining a promoted issue when a trusted maintainer edits or reopens it. The pre-event label snapshot is used consistently to select the fresh-quarantine versus re-quarantine notice, and all interpolated values are constrained GitHub event metadata rather than issue-controlled content. No correctness, soundness, test-validity, or security defect requiring changes was found in the diff.",
+ "verdict": "approve"
+}
