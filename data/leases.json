@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct3css",
-   "claim_id": "65f73fd1654644f5ac6d20fd92a59839",
-   "holder": "sparq-org/sparq#2388@dispatch-29550483851.1",
-   "package": "sparq-vectors",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784256034,
-   "expires_at": 1784262334
-  },
-  {
    "account": "acct06",
    "claim_id": "cf522cf611984c15b9771abe7552435b",
    "holder": "sparq-org/sparq#2389@dispatch-29551424484.1",
