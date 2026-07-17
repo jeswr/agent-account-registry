@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "generator_diversity_floor increments plusk_dbl whenever the query has a PlusK bind and any term anywhere in the graph is a double. The double need not bind the PlusK source variable, so the asserted floor and its diagnostic label can pass without the randomized corpus exercising computed-double evaluation. This does not invalidate the change because oracle_known_answer_computed_double exercises the real engine path, but it weakens the stated randomized anti-vacuity guarantee.",
+   "file": "crates/sparq-engine/tests/proptest_eval.rs",
+   "fix_hint": "Count a case only when oracle evaluation reaches PlusK with a T::Dbl source, for example by instrumenting the test oracle with a per-case observation flag or by deriving whether at least one pre-BIND solution binds the selected variable to a double. Alternatively rename the counter and comment to describe graph-level coexistence rather than path coverage.",
+   "severity": "minor",
+   "title": "PlusK-over-double diversity floor only checks graph-level coexistence"
+  }
+ ],
+ "summary": "The change consistently widens the differential oracle to cover OFFSET, computed xsd:double values, NaN, and the engine's documented literal-kind ordering. The independent ryu-based formatter handles the special, integral, fixed-decimal, and exponent forms in a way consistent with fmt_xsd_double, and the focused known-answer tests exercise the real Graph/query path rather than only oracle internals. One minor anti-vacuity weakness remains: the diversity counter named plusk_dbl does not prove that the PlusK input variable is actually bound to a double, although the deterministic computed-double test separately exercises that path.",
+ "verdict": "approve"
+}
