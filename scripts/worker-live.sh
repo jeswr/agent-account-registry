@@ -184,11 +184,17 @@ PY
     # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
     # model output/credential) so failures are debuggable without leaking secrets.
     local cls=other
-    if grep -qiE '429|529|overloaded|rate.?limit|too many requests' "$model_log"; then cls=rate-limit
+    # session-limit (subscription window exhausted) is a DISTINCT, maintainer-actionable class from a
+    # transient rate-limit: the account needs its usage window reset, not a retry. Detect it first.
+    if grep -qiE "session limit|hit your (usage|session)|usage limit reached|weekly limit|resets? (at|on|in) " "$model_log"; then cls=session-limit
+    elif grep -qiE '429|529|overloaded|rate.?limit|too many requests' "$model_log"; then cls=rate-limit
     elif grep -qiE '401|403|unauthorized|authenticat|invalid.*(key|credential|token)|expired|oauth|forbidden|not logged in|please run.*login' "$model_log"; then cls=auth
     elif grep -qiE 'ENOENT|command not found|no such file|cannot find' "$model_log"; then cls=setup
     fi
     printf '::error::worker-live: model-exit-class=%s (raw model output withheld to protect credentials)\n' "$cls"
+    # surface the class to the workflow so it can alert the maintainer on capped/expired accounts
+    [[ -n ${GITHUB_ENV:-} ]] && printf 'WORKER_EXIT_CLASS=%s\n' "$cls" >> "$GITHUB_ENV" || true
+    { [[ -n ${WORKER_OUTPUT_DIR:-} ]] && printf '%s\n' "$cls" > "$WORKER_OUTPUT_DIR/exit-class" ; } 2>/dev/null || true
   fi
   [[ "$rc" -eq 0 ]] || die "headless $harness model exited non-zero (output withheld to protect credentials)"
   [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'model created commits; worker requires edits only'
@@ -295,6 +301,7 @@ publish_pr() {
   python3 - "$issue_file" "$pr_title_file" "$pr_body_file" "$issue_number" "$agent" \
     "$model_alias" "$provider_model" "$gate" "$arm_requested" <<'PY'
 import json
+import re
 from pathlib import Path
 import sys
 
@@ -302,10 +309,40 @@ import sys
  arm_requested) = sys.argv[1:]
 with open(issue_file, encoding="utf-8") as handle:
     issue = json.load(handle)
-title = " ".join(str(issue.get("title", "")).split())
-if not title:
+raw = " ".join(str(issue.get("title", "")).split())
+if not raw:
     raise SystemExit("worker-live: issue title is empty")
-title = title[:240]
+# [OPUS-4.8] Build a Conventional-Commits PR title. `.github/workflows/pr-title.yml` validates it,
+# and because main uses squash-merge the PR TITLE becomes the release-plz-parsed commit subject. A
+# migrated issue title is "sq-<id>: <desc>", whose "sq-<id>" reads as an invalid type → the check
+# fails on EVERY worker PR. Derive an allowed type from role/kind, scope from area:<crate>, and keep
+# the bd-id as a suffix for traceability. Allowed types: feat fix docs chore ci test refactor perf
+# build style — anything else must map into that set.
+ALLOWED = {"feat", "fix", "docs", "chore", "ci", "test", "refactor", "perf", "build", "style"}
+# map bd/free-form types into the allowed set (pr-title.yml's list); anything unknown falls through
+TYPE_ALIAS = {"bug": "fix", "bench": "perf", "design": "docs", "research": "docs",
+              "impl": "feat", "site": "feat", "soundness": "fix", "security": "fix", **{t: t for t in ALLOWED}}
+labels = [l["name"] if isinstance(l, dict) else l for l in (issue.get("labels") or [])]
+role = next((l[5:] for l in labels if l.startswith("role:")), "")
+kinds = {l[5:] for l in labels if l.startswith("kind:")}
+scope = next((l[5:] for l in labels if l.startswith("area:")), "")
+m = re.match(r"^(sq-[a-z0-9.]+):\s*(.*)$", raw, re.I)
+bd_id, desc = (m.group(1), m.group(2)) if m else ("", raw)
+# prefer the bead's OWN leading conventional type (e.g. "perf(ingest): …", "bench: …") when it maps
+# into the allowed set — it reflects intent better than the role default; else derive from role/kind.
+lead = re.match(r"^([A-Za-z]+)(?:\(([^)]*)\))?!?:\s*(.*)$", desc)
+if lead and lead.group(1).lower() in TYPE_ALIAS:
+    ctype = TYPE_ALIAS[lead.group(1).lower()]
+    scope = scope or (lead.group(2) or "")
+    desc = lead.group(3).strip() or desc
+else:
+    ctype = (TYPE_ALIAS.get(role) or ("docs" if kinds & {"docs"} else "fix" if kinds & {"bug"} else "feat"))
+head = f"{ctype}({scope})" if scope else ctype
+suffix = f" ({bd_id})" if bd_id else ""
+budget = 100 - len(head) - 2 - len(suffix)          # keep the header a sane length
+if len(desc) > budget:
+    desc = desc[:max(1, budget)].rstrip()
+title = f"{head}: {desc}{suffix}"
 body = f"""> 🤖 SPARQ agent
 
 ## What / why

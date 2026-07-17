@@ -295,7 +295,7 @@ jobs:
     permissions:
       actions: write
       contents: write
-      issues: read
+      issues: write   # write: upsert the rolling worker-availability alert issue (usage-alert.py)
     steps:
       - name: Download PLAN artifact (pinned)
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -333,3 +333,21 @@ jobs:
             --policy-file registry/policy/repos.toml \
             --registry-repo "$GITHUB_REPOSITORY" \
             --workflow-ref "$WORKFLOW_REF"
+
+      # FAIL-LOUD maintainer alert: opposite posture to the fail-closed dispatcher. Runs even if the
+      # claim step above skipped everything (all accounts capped), so degraded throughput is never
+      # silent. Upserts ONE rolling `ops-alert` issue @-mentioning the maintainer; never blocks dispatch.
+      - name: Alert maintainer if worker accounts are unavailable
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          WORKER_USAGE_FILE: ${{ runner.temp }}/usage.json
+          USAGE_SAFETY_MARGIN: '0.10'
+          MAINTAINER_HANDLE: jeswr
+        run: |
+          set -uo pipefail
+          gh label create ops-alert -R "$REGISTRY_REPO" --color d73a4a \
+            --description "Autonomous worker availability alert (maintainer action)" 2>/dev/null || true
+          python3 registry/scripts/usage-alert.py
