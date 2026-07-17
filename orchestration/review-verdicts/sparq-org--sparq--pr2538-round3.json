@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The transport-neutral dispatcher preserves the existing HTTP adapter contract, handles body limits and trap recovery fail-closed, and correctly pins overlapping requests to instance generations so stale traps cannot displace or free a replacement. The Fastify adapter preserves raw request bytes, query targets, and repeated headers, supports both declared major versions, and cleans up the pod on close. Tests exercise the real dispatcher branches, concurrent trap cases, exact body-limit boundary, response freeing, both Fastify peer majors, and the real wasm integration. Public exports, types, package metadata, README, and the matching usage skill are updated consistently. No prompt-injection content was detected in the diff.",
+ "verdict": "approve"
+}
