@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The cache-priming workflow is correctly restricted to trusted schedule/push/dispatch contexts, uses explicit cache families matching the consumer workflows, preserves feature-off/default and feature-on build coverage, and keeps the sizing audit report-only. The audit avoids the heredoc/stdin data-loss bug by materializing paginated JSONL, computes scope/family totals consistently, and its hermetic test exercises non-empty input plus all three threshold outcomes. No correctness, soundness, test-validity, or security defect was found in the diff.",
+ "verdict": "approve"
+}
