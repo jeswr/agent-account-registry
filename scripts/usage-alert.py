@@ -14,7 +14,11 @@
 # classifies EVERY account UNAVAILABLE and always fires the alert — the exact case that used to no-op.
 #
 # Privacy (locked decision 22): account handles appear ONLY in the alert-issue body, never in workflow
-# logs; ALERT_REPO/ALERT_TOKEN route that body to a private repo (fallback: the registry repo).
+# logs; ALERT_REPO/ALERT_TOKEN route that body to a private repo (fallback: the registry repo). A
+# HALF-configured deployment (ALERT_REPO set, ALERT_TOKEN missing) falls back to the registry repo
+# rather than writing to the private repo under the ambient token that can't reach it — a write that
+# would fail silently and drop the alert (issue #39). Writes go through _gh(check=True), which surfaces
+# a non-zero gh returncode as a ::warning:: instead of dropping it.
 #
 # Pure classify()/_policy_pool_margin() are unit-tested (--self-test); the CLI wraps them over the
 # usage file + `gh`.
@@ -52,13 +56,31 @@ def _policy_pool_margin(policy_path):
 
 
 def _util(value):
-    """Parse one utilization field FAIL-CLOSED: missing/None/unparseable -> None (never 0.0)."""
+    """Parse one utilization field FAIL-CLOSED: missing/None/unparseable/NaN -> None (never 0.0).
+    A literal `nan`/`inf` header would parse as a float whose comparisons are all False, so a CAPPED
+    account would classify `ok` — treat any non-finite value as unparseable (issue #39). Real provider
+    headers are decimal so this is a guard, not a currently-reachable path."""
     if value is None:
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):  # NaN (self-inequality) or ±inf
+        return None
+    return parsed
+
+
+def _alert_route(alert_repo, alert_token, registry_repo):
+    """(repo, token) for the alert issue (issue #39, privacy d22c). ALERT_REPO is the PRIMARY
+    destination ONLY when ALERT_TOKEN can write there; a half-configured deployment (repo var set,
+    token secret missed) must NOT try to write to the private repo under the ambient registry token
+    (which has no permission there) — that write fails silently and the alert is dropped. So fall
+    back to the registry repo, which the ambient token can always write. Returns token=None to mean
+    "use the ambient GH_TOKEN"."""
+    if alert_repo and alert_token:
+        return alert_repo, alert_token
+    return registry_repo, None
 
 
 def classify(pool, usage, margin):
@@ -111,19 +133,28 @@ def render(eligible, rows, pool, threshold, maintainer, probe_empty=False):
     return "\n".join(lines)
 
 
-def _gh(args, capture=False):
-    # Privacy routing (locked decision 22c): when ALERT_REPO points at a private repo, ALERT_TOKEN
-    # must be able to write there; otherwise the ambient GH_TOKEN (registry workflow token) is used.
+def _gh(args, capture=False, token=None, check=False):
+    # Privacy routing (locked decision 22c): the caller resolves the alert repo+token via
+    # _alert_route(); pass the resolved `token` here (None -> ambient GH_TOKEN). `check=True` on a
+    # write surfaces a non-zero gh returncode instead of dropping the alert silently (issue #39).
     env = dict(os.environ)
-    alert_token = os.environ.get("ALERT_TOKEN", "")
-    if os.environ.get("ALERT_REPO") and alert_token:
-        env["GH_TOKEN"] = alert_token
-    return subprocess.run(["gh"] + args, capture_output=capture, text=True, env=env)
+    if token:
+        env["GH_TOKEN"] = token
+    result = subprocess.run(["gh"] + args, capture_output=capture, text=True, env=env)
+    if check and result.returncode != 0:
+        detail = (result.stderr or "").strip() if capture else ""
+        print(f"::warning::usage-alert: gh {args[0]} {args[1] if len(args) > 1 else ''} "
+              f"failed (rc={result.returncode}){' — ' + detail if detail else ''}")
+    return result
 
 
 def main():
     registry_repo = os.environ["REGISTRY_REPO"]
-    repo = os.environ.get("ALERT_REPO") or registry_repo   # where the alert issue lives
+    # Where the alert issue lives + which token writes it. A private ALERT_REPO is used ONLY when
+    # ALERT_TOKEN can write there; otherwise fall back to the registry repo (issue #39) so a
+    # half-configured deployment never silently drops the alert.
+    repo, alert_token = _alert_route(
+        os.environ.get("ALERT_REPO"), os.environ.get("ALERT_TOKEN"), registry_repo)
     maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
     usage_file = os.environ.get("WORKER_USAGE_FILE")
     usage = json.load(open(usage_file)) if usage_file and os.path.exists(usage_file) else {}
@@ -146,24 +177,29 @@ def main():
     body = render(eligible, rows, pool, threshold, maintainer, probe_empty=not usage)
 
     _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", "d73a4a",
-         "--description", "Autonomous worker availability alert (maintainer action)"], capture=True)
+         "--description", "Autonomous worker availability alert (maintainer action)"],
+        capture=True, token=alert_token)
     found = json.loads(_gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", "open",
-                            "--json", "number,title", "--limit", "10"], capture=True).stdout or "[]")
+                            "--json", "number,title", "--limit", "10"],
+                           capture=True, token=alert_token).stdout or "[]")
     num = next((i["number"] for i in found if i["title"] == ALERT_TITLE), None)
 
     # Privacy (locked decision 22b): NOTHING printed to the (public) workflow log carries an account
     # handle, a per-provider count, or the pool size — the detail lives only in the alert issue body.
     if degraded:
         if num:
-            _gh(["issue", "edit", str(num), "-R", repo, "--body", body])
+            _gh(["issue", "edit", str(num), "-R", repo, "--body", body], capture=True,
+                token=alert_token, check=True)
         else:
-            _gh(["issue", "create", "-R", repo, "--title", ALERT_TITLE, "--label", ALERT_LABEL, "--body", body])
+            _gh(["issue", "create", "-R", repo, "--title", ALERT_TITLE, "--label", ALERT_LABEL,
+                 "--body", body], capture=True, token=alert_token, check=True)
         print("::warning::usage-alert: degraded=true — maintainer alerted (detail in the alert issue)")
     else:
         if num:
             _gh(["issue", "comment", str(num), "-R", repo, "--body",
-                 "✅ Recovered — worker availability is back above the degraded threshold. Auto-closing."])
-            _gh(["issue", "close", str(num), "-R", repo])
+                 "✅ Recovered — worker availability is back above the degraded threshold. Auto-closing."],
+                capture=True, token=alert_token, check=True)
+            _gh(["issue", "close", str(num), "-R", repo], capture=True, token=alert_token, check=True)
         print("usage-alert: degraded=false")
     return 0
 
@@ -216,6 +252,24 @@ def _self_test():
     chk("policy pool union", got_pool, ["acct01", "acct02", "acct03"])
     chk("policy margin is the max", got_margin, 0.15)
     chk("absent policy falls back", _policy_pool_margin("/nonexistent/policy.toml"), (None, None))
+    # Alert routing (issue #39): private repo used ONLY when its token is present; a half-configured
+    # deployment (repo set, token missing) falls back to the registry repo so the write can't fail
+    # silently under the ambient token. token=None means "use the ambient GH_TOKEN".
+    chk("route: repo+token -> private + token",
+        _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok"))
+    chk("route: repo but NO token -> registry fallback",
+        _alert_route("org/private", "", "org/registry"), ("org/registry", None))
+    chk("route: repo but None token -> registry fallback",
+        _alert_route("org/private", None, "org/registry"), ("org/registry", None))
+    chk("route: no repo -> registry",
+        _alert_route("", "tok", "org/registry"), ("org/registry", None))
+    # NaN/inf guard (issue #39): a literal `nan`/`inf` header must classify UNAVAILABLE, not `ok`
+    # (NaN comparisons are all False, so it would otherwise slip past the CAPPED threshold).
+    chk("nan header -> None (fail-closed)", _util("nan"), None)
+    chk("inf header -> None (fail-closed)", _util("inf"), None)
+    chk("decimal header still parses", _util("0.42"), 0.42)
+    e7, r7 = classify(["x"], {"x": {"5h_util": "nan", "7d_util": "0"}}, 0.10)
+    chk("nan util -> unavailable, not ok", (e7, r7[0][2]), (0, False))
     print("usage-alert self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
