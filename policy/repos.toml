@@ -1,6 +1,12 @@
 # [GPT-5.6] REG-1 per-repository worker policy.
 # PRIVATE. This file contains account names and spend posture, but NEVER tokens or secret values.
 #
+# [FABLE-5] STANDING RULE for every onboarded target (maintainer decision 2026-07-17): UI/front-end
+# surfaces route to the openai/codex model chain (original-builder ownership: GPT-5.6 built the
+# registry dashboard, e4098b9). Each target's routing table (the `routing` pointer below) must
+# carry a terra-led `role = "site"` route — see README "Standing routing rules" + this repo's own
+# orchestration/routing.toml for the canonical form.
+#
 # Schema for every [repos."owner/name"] row (all fields are required):
 #   enabled                = bool
 #   routing                = string  # relative role -> model_chain + agent table in the target repo
