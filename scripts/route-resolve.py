@@ -60,6 +60,12 @@ def _self_test():
     chk("impl+usage -> fable-led", (mc[0], ag, esc), ("fable", "registry-impl", False))
     # docs -> haiku-led.
     chk("docs -> haiku", resolve(["role:docs", "area:docs"], doc)[0][0], "haiku")
+    # [FABLE-5] frontier-tier infra authorship (standing rule 2026-07-17): ci -> fable-first,
+    # FRONTIER-ONLY chain — no sub-frontier model (sonnet/haiku), so chain exhaustion DEFERS at
+    # the claim step (defer-not-fallback) instead of degrading tier.
+    mc, ag, esc = resolve(["role:ci", "area:ci"], doc)
+    chk("ci -> frontier-only fable-first", (mc, ag, esc), (["fable", "terra"], "registry-ci", False))
+    chk("ci chain has no sub-frontier tier", sorted(set(mc) & {"sonnet", "haiku"}), [])
     # no role -> defaults (fable-led).
     chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "fable")
     # review role -> opus + escalate.

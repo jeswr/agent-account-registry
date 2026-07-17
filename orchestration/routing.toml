@@ -85,9 +85,24 @@ role = "site"
 model_chain = ["terra", "fable", "sonnet"]
 agent = "registry-impl"
 
+# [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
+# 2026-07-17, same standing-rule pattern as the UI→codex route above): ALL CI/infrastructure work
+# — .github/workflows, gate aggregators, orchestration plumbing, the self-draining pipeline itself
+# — is authored by a FRONTIER-tier model only: fable (Claude Fable) or terra (GPT-5.6 sol/codex).
+# Cheaper tiers (sonnet/haiku) no longer author infra; cross-provider review is unchanged.
+# FRONTIER-ONLY chain rather than a floor marker: the routing schema has no floor/pin field (the
+# fix-floor pin is a review-loop concept, dispatch-claim.py), and chain exhaustion at the claim
+# step already DEFERS the item (retried next tick) instead of degrading — see dispatch-claim's
+# "a starved pinned chain DEFERS (defer-not-fallback)" self-test. NOT `escalate = true` (that
+# flips a starved item to needs:user; this rule wants defer+retry). On THIS repo most infra
+# surfaces (dispatch/worker/set-up-account/review-loop/groom) are trust surfaces matched by the
+# security override above, which still WINS (opus + human arm) — correct and unchanged; role:ci
+# covers the residual CI plumbing (.github/workflows etc., triage labels area:ci/area:workflows).
+# Repos onboarded to the registry inherit this rule — mirror a frontier-only `role = "ci"` chain
+# into each target's routing.toml (sparq-org/sparq carries it, PR #3422).
 [[route]]
 role = "ci"
-model_chain = ["fable", "sonnet", "terra"]
+model_chain = ["fable", "terra"]
 agent = "registry-ci"
 
 [[route]]

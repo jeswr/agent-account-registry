@@ -7,6 +7,14 @@
 # carry a terra-led `role = "site"` route — see README "Standing routing rules" + this repo's own
 # orchestration/routing.toml for the canonical form.
 #
+# [FABLE-5] STANDING RULE for every onboarded target (maintainer decision 2026-07-17): frontier-
+# tier agents (fable = Claude Fable, terra = GPT-5.6 sol/codex) author ALL CI/infrastructure work,
+# incl. the self-draining pipeline itself (.github/workflows, dispatch/worker/gate scripts).
+# Each target's routing table must carry a FRONTIER-ONLY `role = "ci"` chain (["fable", "terra"] —
+# no sonnet/haiku): chain exhaustion then DEFERS at the claim step (defer-not-fallback, retried
+# next tick) instead of degrading tier. Security match_labels overrides still win where they
+# overlap. See README "Standing routing rules"; sparq-org/sparq carries it (sparq PR #3422).
+#
 # Schema for every [repos."owner/name"] row (all fields are required):
 #   enabled                = bool
 #   routing                = string  # relative role -> model_chain + agent table in the target repo

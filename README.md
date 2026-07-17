@@ -88,6 +88,23 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   route, **never** a `match_labels` rule — the arm-side security classifier unions all
   `match_labels` keywords, so UI keywords there would human-arm every UI PR.
 
+- **Frontier-tier agents author ALL CI/infrastructure work** (maintainer decision 2026-07-17):
+  Claude Fable (`fable`) or GPT-5.6 sol (openai; wired alias `terra`) — explicitly including the
+  self-draining pipeline infrastructure itself (dispatch, workers, gate aggregators,
+  `.github/workflows`, orchestration scripts). Cheaper tiers (sonnet/haiku) no longer author
+  infra; cross-provider review is unchanged (whichever provider's frontier writes, the other
+  reviews). Machine-readable form: the `role = "ci"` route (`model_chain = ["fable", "terra"]`)
+  in this repo's `orchestration/routing.toml`; mirror a frontier-only ci chain into each
+  onboarded target's routing table (`sparq-org/sparq` carries it, sparq PR #3422).
+  `scripts/triage.py` derives `role:ci` from the exact infra-surface labels (`area:ci`,
+  `area:workflows`). The chain is frontier-ONLY rather than floor-pinned: the routing schema has
+  no floor/pin field, and chain exhaustion at the claim step already **defers** the item
+  (retried next tick, defer-not-fallback) instead of degrading tier — deliberately not
+  `escalate = true`, which would flip a starved item to `needs:user`. Where an infra surface is
+  also a trust surface (dispatch/worker/set-up-account/review-loop/groom), the security
+  `match_labels` override still wins (opus + human arm) — stricter than the frontier floor,
+  unchanged.
+
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 
 > Goal: make one more model account usable by the workers. There are **five** required steps; the

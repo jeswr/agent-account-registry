@@ -34,6 +34,16 @@ SEC_KEYWORDS = ("dispatch", "worker", "set-up-account", "review-loop", "groom",
 # codex built the registry dashboard, e4098b9). EXACT labels, not substrings — UI keywords must
 # not enter SEC_KEYWORDS/match_labels semantics (that would human-arm every UI PR).
 UI_SURFACE_LABELS = ("area:dashboard", "dashboard", "surface:frontend")
+# [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
+# 2026-07-17, same pattern as the UI rule above): infra-surface labels derive role:ci so CI
+# plumbing reaches the FRONTIER-ONLY ci chain in orchestration/routing.toml (fable/terra —
+# sonnet/haiku no longer author infra). EXACT labels, not substrings, and NOT routing match_labels
+# (the arm-side security classifier unions those keywords). NOTE the trust-plane infra surfaces
+# (dispatch/worker/set-up-account/review-loop/groom — incl. scripts/dispatch*, scripts/worker*,
+# scripts/groom*, scripts/select-and-claim* issues, which carry those area labels) are ALREADY
+# forced to the soundness lane by SEC_KEYWORDS above, which WINS — opus + human arm is stricter
+# than the frontier floor. role:ci covers the residual: .github/workflows + non-trust CI plumbing.
+INFRA_SURFACE_LABELS = ("area:ci", "area:workflows")
 _PRIO = re.compile(r"^priority:P([0-4])$")
 
 
@@ -57,6 +67,10 @@ def _role(labels, issue_type):
     # after kind (docs about the dashboard stay docs) and after an explicit role:* label.
     if any(lb in UI_SURFACE_LABELS for lb in labels):
         return "site"
+    # [FABLE-5] infra-surface labels derive role:ci (the frontier-only fable/terra chain) in the
+    # same precedence slot: after security (soundness wins), explicit role:*, and kind.
+    if any(lb in INFRA_SURFACE_LABELS for lb in labels):
+        return "ci"
     return ROLE_BY_TYPE.get(issue_type)
 
 
@@ -119,6 +133,14 @@ def _self_test():
     chk("dashboard -> site", triage(["priority:P2", "area:dashboard"], "feature")["role"], "site")
     chk("dashboard docs stay docs",
         triage(["priority:P3", "kind:docs", "area:dashboard"], "task")["role"], "docs")
+    # [FABLE-5] frontier-tier infra authorship: an infra-surface label derives role:ci (the
+    # frontier-only fable/terra chain); kind (docs) and trust-surface keywords still win.
+    chk("infra surface -> ci", triage(["priority:P2", "area:ci"], "feature")["role"], "ci")
+    chk("workflows surface -> ci", triage(["priority:P2", "area:workflows"], "task")["role"], "ci")
+    chk("infra docs stay docs",
+        triage(["priority:P3", "kind:docs", "area:ci"], "task")["role"], "docs")
+    chk("infra+trust surface -> soundness",
+        triage(["priority:P1", "area:ci", "area:dispatch"], "feature")["role"], "soundness")
     # B2: a needs:design issue is NOT ready even with a full role+priority+area label-set.
     r = triage(["priority:P2", "role:impl", "area:review-loop", "needs:design"], "task")
     chk("needs:design not ready (B2)", r["ready"], False)
