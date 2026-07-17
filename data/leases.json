@@ -9,16 +9,6 @@
    "model": "haiku",
    "issued_at": 1784300017,
    "expires_at": 1784306317
-  },
-  {
-   "account": "acct01",
-   "claim_id": "c0850e1994914043b8022e0781241f46",
-   "holder": "review:sparq-org/sparq#2528@dispatch-29589810573.1",
-   "package": "__global__",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784300024,
-   "expires_at": 1784301224
   }
  ]
 }
