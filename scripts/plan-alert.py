@@ -80,8 +80,12 @@ def main():
     run_url = os.environ.get("RUN_URL", "")
     maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
 
+    # --limit 100 (review r2): the `ops-alert` label is SHARED with the account-availability alert
+    # and anything else ops-flavoured; a 20-issue window could push this alert out of the dedupe
+    # scan (duplicate on failure, uncloseable on recovery). 100 comfortably exceeds any plausible
+    # open ops-alert count; the title match below still scans every returned row.
     listed = _gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", "open",
-                  "--json", "number,title", "--limit", "20"], capture=True, token=token, check=True)
+                  "--json", "number,title", "--limit", "100"], capture=True, token=token, check=True)
     if listed.returncode != 0:
         # Fail loud (review r1): without the list we can neither dedupe an upsert nor prove
         # recovery — go red (the job's continue-on-error keeps the dispatcher isolated).
@@ -150,7 +154,10 @@ def _self_test():
     body = _render_body("failure", "https://example.test/run/1", "jeswr")
     chk("body carries run url + mention",
         ("https://example.test/run/1" in body, "@jeswr" in body), (True, True))
-    # Stubbed-gh flow (review r1 finding 4): full main() paths with a fake subprocess.run.
+    # Stubbed-gh flow (review r1 finding 4 + r2 finding 2): full main() paths with a fake
+    # subprocess.run that records the COMPLETE command and env per call, and can inject a failure
+    # for any individual gh subcommand — so repo/token wiring and every mutation return-code check
+    # are asserted, not assumed.
     import contextlib
     import io
 
@@ -160,46 +167,91 @@ def _self_test():
             self.stdout = stdout
             self.stderr = "SENTINEL-STDERR"
 
-    calls = []
-    responses = {}
+    calls = []          # [(cmd_list, env_dict)]
+    responses = {}      # (sub, sub2) -> _Result
 
     def fake_run(cmd, capture_output=False, text=False, env=None):
-        sub = tuple(cmd[1:3])
-        calls.append(sub)
-        return responses.get(sub, _Result())
+        calls.append((list(cmd), dict(env or {})))
+        return responses.get(tuple(cmd[1:3]), _Result())
+
+    def find(sub):
+        return next(((c, e) for c, e in calls if tuple(c[1:3]) == sub), (None, None))
+
+    def subs():
+        return [tuple(c[1:3]) for c, _e in calls]
 
     real_run = subprocess.run
     base_env = {"REGISTRY_REPO": "org/registry", "PLAN_RESULT": "", "RUN_URL": "u",
                 "MAINTAINER_HANDLE": "m", "ALERT_REPO": "", "ALERT_TOKEN": ""}
 
-    def run_main(plan_result, list_json="[]", list_rc=0):
+    def run_main(plan_result, list_json="[]", fail=(), alert_repo="", alert_token=""):
         calls.clear()
         responses.clear()
-        responses[("issue", "list")] = _Result(list_rc, list_json)
+        responses[("issue", "list")] = _Result(1 if ("issue", "list") in fail else 0, list_json)
+        for key in fail:
+            if key != ("issue", "list"):
+                responses[key] = _Result(1)
         os.environ.update(base_env)
         os.environ["PLAN_RESULT"] = plan_result
+        os.environ["ALERT_REPO"] = alert_repo
+        os.environ["ALERT_TOKEN"] = alert_token
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = main()
-        return rc, list(calls), buf.getvalue()
+        return rc, buf.getvalue()
 
     subprocess.run = fake_run
     try:
-        rc_a, calls_a, _ = run_main("failure")
-        chk("flow: failure + no open -> create", (rc_a, ("issue", "create") in calls_a), (0, True))
+        rc_a, _ = run_main("failure")
+        chk("flow: failure + no open -> create", (rc_a, ("issue", "create") in subs()), (0, True))
         open_json = json.dumps([{"number": 7, "title": ALERT_TITLE}])
-        rc_b, calls_b, _ = run_main("failure", open_json)
+        rc_b, _ = run_main("failure", open_json)
         chk("flow: failure + open -> edit not create",
-            (rc_b, ("issue", "edit") in calls_b, ("issue", "create") in calls_b), (0, True, False))
-        rc_c, calls_c, _ = run_main("success", open_json)
+            (rc_b, ("issue", "edit") in subs(), ("issue", "create") in subs()), (0, True, False))
+        rc_c, _ = run_main("success", open_json)
         chk("flow: success + open -> comment+close",
-            (rc_c, ("issue", "comment") in calls_c, ("issue", "close") in calls_c), (0, True, True))
-        rc_d, calls_d, _ = run_main("skipped", open_json)
+            (rc_c, ("issue", "comment") in subs(), ("issue", "close") in subs()), (0, True, True))
+        rc_d, _ = run_main("skipped", open_json)
         chk("flow: skipped + open -> NO mutation",
-            (rc_d, [c for c in calls_d if c != ("issue", "list")]), (0, []))
-        rc_e, _, out_e = run_main("failure", "[]", list_rc=1)
+            (rc_d, [s for s in subs() if s != ("issue", "list")]), (0, []))
+        rc_e, out_e = run_main("failure", fail=(("issue", "list"),))
         chk("flow: list failure -> rc=1 + sanitized warning",
             (rc_e, "::warning::" in out_e, "SENTINEL-STDERR" in out_e), (1, True, False))
+        # r2 finding 2: EVERY mutation's returncode must fail the run (not just the list's).
+        for failing in (("issue", "create"), ("issue", "edit")):
+            rc_f, out_f = run_main("failure", open_json if failing == ("issue", "edit") else "[]",
+                                   fail=(failing,))
+            chk(f"flow: {failing[0]} {failing[1]} failure -> rc=1 + warning",
+                (rc_f, "::warning::" in out_f), (1, True))
+        for failing in (("issue", "comment"), ("issue", "close")):
+            rc_g, out_g = run_main("success", open_json, fail=(failing,))
+            chk(f"flow: {failing[0]} {failing[1]} failure -> rc=1 + warning",
+                (rc_g, "::warning::" in out_g), (1, True))
+        # r2 finding 2: repo/token WIRING. Private route: every command targets ALERT_REPO and
+        # runs under ALERT_TOKEN; fallback route: registry repo under the ambient token.
+        run_main("failure", alert_repo="org/private", alert_token="sentinel-alert-tok")
+        create_cmd, create_env = find(("issue", "create"))
+        chk("wiring: private route -> -R org/private under ALERT_TOKEN",
+            (create_cmd is not None and create_cmd[create_cmd.index("-R") + 1],
+             (create_env or {}).get("GH_TOKEN")),
+            ("org/private", "sentinel-alert-tok"))
+        ambient = os.environ.get("GH_TOKEN")  # whatever the harness ambient is (None locally, set in CI)
+        run_main("failure", alert_repo="org/private", alert_token="")
+        create_cmd2, create_env2 = find(("issue", "create"))
+        chk("wiring: half-config -> -R org/registry under UNCHANGED ambient token",
+            (create_cmd2 is not None and create_cmd2[create_cmd2.index("-R") + 1],
+             (create_env2 or {}).get("GH_TOKEN") == ambient,
+             (create_env2 or {}).get("GH_TOKEN") == "sentinel-alert-tok"),
+            ("org/registry", True, False))
+        # r2 finding 1: the dedupe scan uses --limit 100 and matches a title past position 20.
+        crowd = [{"number": i, "title": f"unrelated ops alert {i}"} for i in range(25)]
+        rc_h, _ = run_main("failure", json.dumps(crowd + [{"number": 99, "title": ALERT_TITLE}]))
+        list_cmd, _list_env = find(("issue", "list"))
+        edit_cmd, _ = find(("issue", "edit"))
+        chk("dedupe: --limit 100 + title found past position 20 -> edit #99, no create",
+            (rc_h, "100" in (list_cmd or []), ("issue", "create") in subs(),
+             edit_cmd is not None and "99" in edit_cmd),
+            (0, True, False, True))
     finally:
         subprocess.run = real_run
         for key in base_env:
