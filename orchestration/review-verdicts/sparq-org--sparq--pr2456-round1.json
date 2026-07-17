@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change correctly extends the property-test model from flat BGP operands to bounded recursive OPTIONAL/UNION bodies, preserves SPARQL multiset LeftJoin and Union semantics in the independent oracle, and renders the nested group structure consistently. Multi-key ORDER BY generation is distinct-key bounded, the primary and secondary checks are sound within their explicitly modeled term-order subset, and the added exact-sequence and checker mutation tests make the new coverage non-vacuous. No security issue or instruction-injection content was found in the diff.",
+ "verdict": "approve"
+}
