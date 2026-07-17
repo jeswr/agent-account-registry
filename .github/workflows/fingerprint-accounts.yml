@@ -28,9 +28,11 @@ jobs:
           data = json.loads(os.environ["ALL_SECRETS"])
           subset = {key: value for key, value in data.items()
                     if isinstance(value, str) and allow.fullmatch(key)}
-          with open(path, "w", encoding="utf-8") as handle:
+          # Create atomically 0600 (O_EXCL: fresh runner temp, the file must not pre-exist) so the
+          # token subset is never even transiently readable under the runner's default umask.
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as handle:
               json.dump(subset, handle)
-          os.chmod(path, 0o600)
           PY
 
       - name: Fingerprint all ACCT tokens (reset day/time in London; tokens never printed)
