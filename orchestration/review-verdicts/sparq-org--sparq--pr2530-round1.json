@@ -1,0 +1,6 @@
+{
+ "injection_detected": true,
+ "issues": [],
+ "summary": "The change consistently strengthens the model-provenance contract by making the harness runtime model authoritative and by prohibiting model-specific attribution in dispatched briefs. The repeated requirements in items 5 and 11 and the dispatch-conventions section agree, preserve the protected-surface rule, and do not alter executable behavior. No correctness, soundness, test-validity, or security defect is evident in this documentation-only change. The diff is itself agent-operating instruction text (for example, directives using MUST/never), so injection_detected is true under the supplied conservative rule, even though those instructions are expected repository documentation rather than an apparent hostile payload.",
+ "verdict": "approve"
+}
