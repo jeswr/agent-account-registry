@@ -39,6 +39,20 @@ LEDGER_PATH = "data/leases.json"
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
 STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
+# v2 park marker: machine-readable head sha + park time so a later sweep can prove BOTH that the
+# needs:user label was applied by groom itself (never a human) AND whether the staleness cause has
+# cleared since. v1 comments (no sha) remain recognised as groom parks; only the head-sha progress
+# branch is unavailable for them. Mirrors the worker-pr.py REVIEWED_SHA_RE bot-marker convention.
+STALE_PARK_V2_RE = re.compile(
+    r"<!-- registry-groom-stale-pr:v2 sha:(?P<sha>[0-9a-f]{40}) "
+    r"parked_at:(?P<parked_at>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{8,15}(?:Z|[+-][0-9]{2}:[0-9]{2})) -->"
+)
+UNPARK_MARKER = "<!-- registry-groom-stale-pr-unpark:v1 -->"
+
+
+def park_marker(head_sha: str, now: int) -> str:
+    stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    return f"<!-- registry-groom-stale-pr:v2 sha:{head_sha} parked_at:{stamp} -->"
 WORKER_PR_MARKER = "> 🤖 SPARQ agent"
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?")
@@ -301,6 +315,113 @@ def stale_worker_pr_reason(
     if not isinstance(merge_state, str):
         raise GroomError("pull request merge state is malformed")
     return BAD_MERGE_STATES.get(merge_state)
+
+
+@dataclass(frozen=True)
+class ParkRecord:
+    """The most recent groom stale-park comment on a PR: parked head sha (None for a legacy v1
+    comment) and the park time (the comment's server-side created_at, so every ordering
+    comparison stays inside GitHub's clock domain)."""
+
+    sha: str | None
+    at: int
+
+
+def latest_park(comments: list[dict[str, Any]], bot_login: str) -> ParkRecord | None:
+    """The last stale-park comment authored by the BOT itself, or None. A park marker inside a
+    non-bot comment never counts: a human pasting the marker text must not make a human-applied
+    needs:user look reversible."""
+    bot = bot_login.casefold()
+    record: ParkRecord | None = None
+    for comment in comments:
+        if str(comment.get("user", {}).get("login", "")).casefold() != bot:
+            continue
+        body = str(comment.get("body", ""))
+        match = STALE_PARK_V2_RE.search(body)
+        if match is None and STALE_PR_MARKER not in body:
+            continue
+        record = ParkRecord(
+            sha=match.group("sha") if match else None,
+            at=_epoch(comment.get("created_at"), "stale-park comment"),
+        )
+    return record
+
+
+def repark_rate_limited(
+    park: ParkRecord | None, head_sha: Any, threshold_seconds: int, now: int
+) -> bool:
+    """True when this exact head sha was already parked within one policy timeout window, so the
+    park write is skipped — a jammed fleet must not churn park/unpark on an unchanged head."""
+    return (
+        park is not None
+        and park.sha is not None
+        and park.sha == head_sha
+        and now - park.at < threshold_seconds
+    )
+
+
+def unpark_reason(
+    pull: dict[str, Any],
+    labels: set[str],
+    park: ParkRecord | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    check_runs: list[dict[str, Any]],
+    bot_login: str,
+) -> str | None:
+    """Return why groom may reverse ITS OWN stale park, or None to leave the PR parked.
+
+    Groom may remove needs:user from an open worker PR ONLY when ALL of these hold:
+      (a) the park is groom's own — the latest needs:user cause is the bot's marker comment;
+      (b) no non-bot comment or review landed after that park (a human who engaged owns the PR);
+      (c) the staleness cause has cleared — a new head sha, OR a check run that completed
+          successfully on this head after the park (fleet recovery), OR a now-clean merge state;
+      (d) review:needs-user (the review loop's terminal escalation) is absent — that label is
+          strictly human-owned and groom never reverses it.
+    A human-applied needs:user has no bot marker, so (a) keeps it terminal forever.
+    """
+    if "needs:user" not in labels:
+        return None
+    if "review:needs-user" in labels:
+        return None
+    if park is None:
+        return None
+    head = pull.get("head", {}).get("ref", "")
+    author = pull.get("user", {}).get("login", "")
+    if (
+        not isinstance(head, str)
+        or WORKER_BRANCH.match(head) is None
+        or not isinstance(author, str)
+        or author.casefold() != bot_login.casefold()
+    ):
+        return None
+    bot = bot_login.casefold()
+    for comment in comments:
+        if (
+            str(comment.get("user", {}).get("login", "")).casefold() != bot
+            and _epoch(comment.get("created_at"), "pull request comment") > park.at
+        ):
+            return None
+    for review in reviews:
+        login = (review.get("user") or {}).get("login")
+        if not isinstance(login, str) or login.casefold() == bot:
+            continue
+        submitted = review.get("submitted_at")
+        # A non-bot review without a parseable timestamp blocks unpark (fail conservative).
+        if not isinstance(submitted, str) or _epoch(submitted, "pull request review") > park.at:
+            return None
+    head_sha = pull.get("head", {}).get("sha", "")
+    if park.sha is not None and isinstance(head_sha, str) and head_sha and head_sha != park.sha:
+        return "the branch has a new head commit"
+    if pull.get("draft") is not True and pull.get("mergeable_state") == "clean":
+        return "the merge state is now clean"
+    for run in check_runs:
+        if run.get("status") != "completed" or run.get("conclusion") != "success":
+            continue
+        completed = run.get("completed_at")
+        if isinstance(completed, str) and _epoch(completed, "check run") > park.at:
+            return "a check run completed successfully after the park"
+    return None
 
 
 class GitHubAPI:
@@ -953,6 +1074,16 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             print(f"SKIP PR {action.repo}#{action.number}: no longer stale/failing")
             continue
         labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
+        comments = _comments(target_api, action.repo, action.number)
+        park = latest_park(comments, bot_login)
+        head_sha = pull.get("head", {}).get("sha")
+        if repark_rate_limited(
+            park, head_sha, limits[action.repo].threshold_seconds, now
+        ) and "needs:user" not in labels:
+            print(
+                f"SKIP PR {action.repo}#{action.number}: this head was parked within the last timeout window"
+            )
+            continue
         label_changed = False
         if "needs:user" not in labels:
             _ensure_label(target_api, action.repo, "needs:user")
@@ -965,20 +1096,23 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
             )
             label_changed = True
-        comments = _comments(target_api, action.repo, action.number)
-        already_commented = any(
-            comment["user"]["login"].casefold() == bot_login.casefold()
-            and STALE_PR_MARKER in comment["body"]
-            for comment in comments
-        )
+        # A fresh park comment is written whenever the label is (re)applied or the recorded head
+        # moved on — it resets the park clock so the unpark predicate never reasons from a stale
+        # parked_at. A steady-state parked PR (label present, sha unchanged) is left alone.
         comment_changed = False
-        if not already_commented:
+        if label_changed or park is None or (park.sha is not None and park.sha != head_sha):
+            marker = (
+                park_marker(head_sha, now)
+                if isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                else STALE_PR_MARKER
+            )
             body = (
                 "> 🤖 SPARQ agent\n\n"
                 f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"
                 f"minute maintenance threshold, and {reason}. Grooming will not close, merge, or force-push "
-                "it; human review is required.\n\n"
-                f"{STALE_PR_MARKER}"
+                "it; human review is required. Grooming will lift this park itself if the cause clears "
+                "(fresh commits or a recovered gate) and no human has engaged.\n\n"
+                f"{marker}"
             )
             target_api.request(
                 "POST",
@@ -990,11 +1124,72 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         if label_changed or comment_changed:
             stale_count += 1
 
+    # Unpark pass: groom may reverse ITS OWN stale park (never a human's) once the cause clears.
+    # The scan is restricted to open worker PRs currently labelled needs:user, so the extra
+    # comment/review/check-run reads stay proportional to the parked set, not O(open PRs).
+    unparked = 0
+    for repo in limits:
+        for number, snapshot in sorted(current_pulls[repo].items()):
+            snapshot_labels = _labels(snapshot, f"target pull request {repo}#{number}")
+            if "needs:user" not in snapshot_labels:
+                continue
+            detail = target_api.request(
+                "GET", f"/repos/{repo}/pulls/{number}", allow_404=True
+            )
+            if not isinstance(detail, dict) or detail.get("state") != "open":
+                continue
+            labels = _labels(detail, f"target pull request {repo}#{number}")
+            comments = _comments(target_api, repo, number)
+            park = latest_park(comments, bot_login)
+            if park is None:
+                print(f"SKIP unpark {repo}#{number}: needs:user was not applied by groom")
+                continue
+            reviews = [
+                review
+                for review in target_api.paginate(f"/repos/{repo}/pulls/{number}/reviews")
+                if isinstance(review, dict)
+            ]
+            head_sha = detail.get("head", {}).get("sha")
+            check_runs: list[dict[str, Any]] = []
+            if isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha):
+                runs_doc = target_api.request(
+                    "GET", f"/repos/{repo}/commits/{head_sha}/check-runs?per_page=100"
+                )
+                if isinstance(runs_doc, dict) and isinstance(
+                    runs_doc.get("check_runs"), list
+                ):
+                    check_runs = [
+                        run for run in runs_doc["check_runs"] if isinstance(run, dict)
+                    ]
+            reason = unpark_reason(
+                detail, labels, park, comments, reviews, check_runs, bot_login
+            )
+            if reason is None:
+                continue
+            target_api.request(
+                "DELETE",
+                f"/repos/{repo}/issues/{number}/labels/{quote('needs:user', safe='')}",
+            )
+            print(f"WRITE remove label repo={repo} issue={number} label=needs:user")
+            body = (
+                "> 🤖 SPARQ agent\n\n"
+                "Unparking: grooming applied this stale-PR park itself, no human has engaged "
+                f"since, and {reason} — autonomous review may resume. A human-applied "
+                "`needs:user` or any `review:needs-user` is never touched by grooming.\n\n"
+                f"{UNPARK_MARKER}"
+            )
+            target_api.request(
+                "POST", f"/repos/{repo}/issues/{number}/comments", {"body": body}
+            )
+            print(f"WRITE unpark comment repo={repo} pr={number}")
+            unparked += 1
+
     reclaimed = _release_claims(registry_api, registry_repo, dead_claims)
     print(
-        f"SUMMARY reclaimed={reclaimed} reset={reset} deferred={deferred} stale_prs={stale_count}"
+        f"SUMMARY reclaimed={reclaimed} reset={reset} deferred={deferred} "
+        f"stale_prs={stale_count} unparked={unparked}"
     )
-    return reclaimed, reset, deferred, stale_count
+    return reclaimed, reset, deferred, stale_count, unparked
 
 
 def _self_test() -> int:
@@ -1215,6 +1410,148 @@ def _self_test() -> int:
             "in review without an open worker PR",
             "no orchestration status after a worker attempt",
         ],
+    )
+    # Stale-PR park reversal: groom may unpark ONLY its own park, only while untouched by humans,
+    # and only once the staleness cause has cleared. Each guard has a dedicated case below that
+    # goes red if that guard is deleted from unpark_reason.
+    sha_a = "a" * 40
+    sha_b = "b" * 40
+    park_at = now - 300
+    park_comment = {
+        "user": {"login": "app[bot]"},
+        "created_at": datetime.fromtimestamp(park_at, timezone.utc).isoformat(),
+        "body": "> 🤖 SPARQ agent\n\nparked\n\n" + park_marker(sha_a, park_at),
+    }
+    check(
+        "park marker round-trips sha and park time",
+        latest_park([park_comment], "app[bot]"),
+        ParkRecord(sha=sha_a, at=park_at),
+    )
+    check(
+        "human-pasted marker is not a groom park",
+        latest_park([{**park_comment, "user": {"login": "human"}}], "app[bot]"),
+        None,
+    )
+    check(
+        "legacy v1 park is recognised without a sha",
+        latest_park(
+            [{**park_comment, "body": "parked\n\n" + STALE_PR_MARKER}], "app[bot]"
+        ),
+        ParkRecord(sha=None, at=park_at),
+    )
+    park = ParkRecord(sha=sha_a, at=park_at)
+    parked_labels = {"needs:user", "role:impl"}
+    parked_pull = {
+        "head": {"ref": "sparq-agent/issue-7-99-1", "sha": sha_b},
+        "user": {"login": "app[bot]"},
+        "draft": False,
+        "mergeable_state": "blocked",
+    }
+    check(
+        "unpark: groom park, no human activity, new head sha",
+        unpark_reason(
+            parked_pull, parked_labels, park, [park_comment], [], [], "app[bot]"
+        ),
+        "the branch has a new head commit",
+    )
+    same_head = {**parked_pull, "head": {"ref": "sparq-agent/issue-7-99-1", "sha": sha_a}}
+    green_run = {
+        "status": "completed",
+        "conclusion": "success",
+        "completed_at": datetime.fromtimestamp(park_at + 60, timezone.utc).isoformat(),
+    }
+    check(
+        "unpark: fleet recovery via a fresh green check run",
+        unpark_reason(
+            same_head, parked_labels, park, [park_comment], [], [green_run], "app[bot]"
+        ),
+        "a check run completed successfully after the park",
+    )
+    check(
+        "unpark: merge state recovered to clean",
+        unpark_reason(
+            {**same_head, "mergeable_state": "clean"},
+            parked_labels, park, [park_comment], [], [], "app[bot]",
+        ),
+        "the merge state is now clean",
+    )
+    check(
+        "no unpark: same head still blocked with no fresh green check",
+        unpark_reason(
+            same_head, parked_labels, park, [park_comment], [],
+            [
+                {**green_run, "conclusion": "failure"},
+                {
+                    **green_run,
+                    "completed_at": datetime.fromtimestamp(
+                        park_at - 60, timezone.utc
+                    ).isoformat(),
+                },
+            ],
+            "app[bot]",
+        ),
+        None,
+    )
+    human_after = {
+        "user": {"login": "human"},
+        "created_at": datetime.fromtimestamp(park_at + 30, timezone.utc).isoformat(),
+        "body": "looking at this",
+    }
+    check(
+        "no unpark: a human commented after the park",
+        unpark_reason(
+            parked_pull, parked_labels, park, [park_comment, human_after], [], [],
+            "app[bot]",
+        ),
+        None,
+    )
+    human_review = {
+        "user": {"login": "human"},
+        "submitted_at": datetime.fromtimestamp(park_at + 30, timezone.utc).isoformat(),
+    }
+    check(
+        "no unpark: a human reviewed after the park",
+        unpark_reason(
+            parked_pull, parked_labels, park, [park_comment], [human_review], [],
+            "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: review:needs-user stays strictly human-owned",
+        unpark_reason(
+            parked_pull, parked_labels | {"review:needs-user"}, park, [park_comment],
+            [], [], "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: needs:user without groom's marker is human-applied",
+        unpark_reason(parked_pull, parked_labels, None, [], [], [], "app[bot]"),
+        None,
+    )
+    check(
+        "no unpark: a non-worker-authored PR is never unparked",
+        unpark_reason(
+            {**parked_pull, "user": {"login": "human"}}, parked_labels, park,
+            [park_comment], [], [], "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "repark of the same head inside one window is rate-limited",
+        repark_rate_limited(park, sha_a, 600, now),
+        True,
+    )
+    check(
+        "repark of a new head is not rate-limited",
+        repark_rate_limited(park, sha_b, 600, now),
+        False,
+    )
+    check(
+        "repark beyond the window is not rate-limited",
+        repark_rate_limited(ParkRecord(sha=sha_a, at=now - 700), sha_a, 600, now),
+        False,
     )
     malformed_failed = False
     try:
