@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change consistently reclassifies only compact manifest entry #t0038 from fail to skip in both conformance runners, without changing the pass floor. The predicate requires both the exact manifest id and the expected specVersion marker, and the added regression test pins that narrow scope, confirms the existing processingMode=json-ld-1.0 cases clear all runner skip gates, and fails if another 1.0-only positive appears at a future suite pin. Scoreboard and research documentation remain arithmetically and semantically aligned at 228 pass / 0 fail / 18 skip. No correctness, soundness, security, or hostile-instruction issue is evident in the supplied diff.",
+ "verdict": "approve"
+}
