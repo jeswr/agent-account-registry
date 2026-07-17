@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The new text calls the cooperative row/byte/cancel limits plus timeout \"the worst-case bound for embedded deployments.\" That guarantee is not provided. QueryBudget is polled only at coarse executor sites, and the accompanying skill documentation explicitly says index-answerable and tiny early-exit shapes may complete before the first poll. In addition, max_bytes is an estimated lower bound that excludes allocator overhead and other memory, and window graph materialisation happens before the prepared-query budget is installed. Thus neither wall-clock time nor total memory has a strict worst-case bound.",
+   "file": "crates/sparq-rsp/README.md",
+   "fix_hint": "Replace the worst-case-bound statement with a precise cooperative-limit claim. State that timeout/cancellation take effect at the next executor poll, max_bytes limits an estimated query working set rather than total process/window-materialisation memory, and some bounded-work paths may finish before polling. Keep the concise README wording consistent with the caveats already present in skills/streaming-rsp/SKILL.md.",
+   "severity": "major",
+   "title": "README falsely promises a worst-case deployment bound"
+  }
+ ],
+ "summary": "The budget is correctly threaded through the prepared SELECT, CONSTRUCT, ASK, and multi-window evaluation seams, and the tests exercise real executor polling paths. However, the README materially overstates the guarantee: cooperative budgets with coarse polling do not provide a worst-case wall-clock or memory bound. The more detailed skill text already acknowledges that some bounded-work query shapes may finish without polling, while QueryBudget's byte accounting is documented as only a lower-bound estimate of heap use. This public embedded-deployment claim should be corrected before approval.",
+ "verdict": "request_changes"
+}
