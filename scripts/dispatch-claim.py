@@ -348,11 +348,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
             if number in linked_open_prs:
                 print(f"defer {repo}#{number}: an open worker/closing PR already exists")
                 continue
-            current, reason = _current_issue_matches(repo, item)
-            if not current:
-                print(f"defer {repo}#{number}: {reason}")
+            # [OPUS-4.8] Per-item resilience: a single item's trust/route/policy resolution failure
+            # must SKIP that item, not abort the whole dispatch (which would strand the other ready
+            # issues and mark the run failed). Global setup errors above still abort as before.
+            try:
+                current, reason = _current_issue_matches(repo, item)
+                if not current:
+                    print(f"defer {repo}#{number}: {reason}")
+                    continue
+                resolved = _route_matches(repo, item, policy_doc, routing, policy_module)
+            except DispatchError as exc:
+                print(f"defer {repo}#{number}: trust/route/policy resolution failed ({exc}); skipped")
                 continue
-            resolved = _route_matches(repo, item, policy_doc, routing, policy_module)
             now = int(time.time())
             holder_prefix = f"{repo}#"
             holder = f"{repo}#{number}@dispatch-{os.environ.get('GITHUB_RUN_ID', 'local')}." \
@@ -394,7 +401,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                     margin=margin,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-                raise DispatchError(f"lease allocation failed for {repo}#{number}") from exc
+                print(f"defer {repo}#{number}: lease allocation errored ({exc}); skipped")
+                continue
             if claim is None:
                 print(
                     f"defer {repo}#{number}: duplicate lease, repository cap, or account cap is active"
@@ -409,7 +417,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                     or not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f]{32}", claim_id)
                     or secret_ref != f"{account.upper()}_TOKEN"):
                 _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
-                raise DispatchError("allocator returned an unsafe or out-of-policy claim")
+                print(f"defer {repo}#{number}: allocator returned an unsafe/out-of-policy claim; released + skipped")
+                continue
 
             result = _run_gh([
                 "workflow", "run", "worker.yml",
@@ -425,7 +434,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                 released = _release_failed_dispatch(allocator, registry_repo, claim_id)
                 if not released:
                     print("::error::worker dispatch failed and its lease could not be released")
-                raise DispatchError(f"worker dispatch failed for {repo}#{number}")
+                print(f"defer {repo}#{number}: worker dispatch failed; skipped")
+                continue
             dispatched += 1
             print(f"dispatched {repo}#{number}: account={account}, model={model}, claim={claim_id[:8]}")
     print(f"dispatcher complete: {dispatched} worker run(s) launched")
