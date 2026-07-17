@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`decode_record_body` independently decodes the `rebase` flag and the insert/delete payload but never verifies that a rebase record has zero declared counts and an empty `changes` vector. This contradicts the documented format invariant (`rebase = true`, no changes). It is correctness-critical because `sparq-server/src/streams.rs::to_json` takes the rebase branch and `continue`s without rendering any attached changes, so a syntactically valid, correctly digested segment with `rebase 1` plus changes is accepted and then silently loses those changes on HTTP replay. The current round-trip/bad-value test covers only an invalid scalar value, not this inconsistent combination.",
+   "file": "crates/sparq-serve/src/change_stream.rs",
+   "fix_hint": "After decoding and validating counts, reject `rebase && !changes.is_empty()` (and preferably reject nonzero declared insert/delete counts explicitly) with `BackupError::Corrupt`. Add a negative test that writes a correctly framed/digested body containing `rebase 1` and at least one declared change and asserts `ChangeLog::open` fails closed.",
+   "severity": "major",
+   "title": "Decoder accepts rebase records containing changes"
+  }
+ ],
+ "summary": "The rebase mechanism and its positive-path tests are coherent, but the on-disk decoder does not enforce the new load-bearing gap-record invariant. A digest-valid record can declare itself a rebase while carrying changes; it will be accepted and later rendered by the HTTP path as an empty REBASE marker, silently discarding those changes from the stream representation. The format must reject this inconsistent state and pin that behavior with a negative test before approval.",
+ "verdict": "request_changes"
+}
