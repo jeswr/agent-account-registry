@@ -52,16 +52,6 @@
   },
   {
    "account": "acct2css",
-   "claim_id": "cb993b54c86140608be89b618d5d603b",
-   "holder": "sparq-org/sparq#2411@dispatch-29572405909.1",
-   "package": "sparq-parse",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784282941,
-   "expires_at": 1784289241
-  },
-  {
-   "account": "acct2css",
    "claim_id": "3685af5d4dc846339e5c3ee87c32d0c4",
    "holder": "sparq-org/sparq#2423@dispatch-29572641463.1",
    "package": "sparq-reason-dl",
