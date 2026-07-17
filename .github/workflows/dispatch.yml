@@ -309,10 +309,22 @@ jobs:
           path: registry
           persist-credentials: false
 
+      - name: Probe live account usage (usage-aware dispatch; tokens never printed)
+        continue-on-error: true   # a probe failure must never block dispatch — it falls back to the static cap
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null || printf '{}' > "$RUNNER_TEMP/usage.json"
+          python3 -c "import json,os; d=json.load(open(os.path.join(os.environ['RUNNER_TEMP'],'usage.json'))); print('usage-probe: %d account(s) with live usage' % len(d))" || true
+
       - name: Strictly validate, CAS claim, and dispatch live workers
         env:
           GH_TOKEN: ${{ github.token }}
           WORKFLOW_REF: ${{ github.ref_name }}
+          WORKER_USAGE_FILE: ${{ runner.temp }}/usage.json
         run: |
           set -euo pipefail
           printf '::add-mask::%s\n' "$GH_TOKEN"
