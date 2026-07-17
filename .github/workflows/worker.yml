@@ -536,6 +536,9 @@ jobs:
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write
+          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
+          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
+          permission-workflows: write
 
       - name: Verify target App identity and default branch
         id: target
@@ -815,6 +818,9 @@ jobs:
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write
+          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
+          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
+          permission-workflows: write
 
       - name: Write back a rotated full account credential
         id: writeback

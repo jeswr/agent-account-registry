@@ -644,6 +644,7 @@ jobs:
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write
+          permission-workflows: write
 
       - name: Verify target App identity and default branch
         id: target
@@ -1062,6 +1063,7 @@ jobs:
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write
+          permission-workflows: write
 
       - name: Ready + arm (host-only, one-shot, sha-bound, hash-asserted)
         id: arm
