@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The profile-aware negotiation is carried consistently through plain RDF reads, container rendering, and identity-document reads. Stored bytes are bypassed whenever a profile is honored; Content-Type and representation validators track the actual negotiated form; compacted and expanded variants are distinguished only when their bytes differ. The local empty-context transformation is appropriately scoped to oxjsonld serializer output, preserves typed/language values and node references, and fails closed on an unexpected top-level shape. Tests exercise real end-to-end GET/304 behavior, content-type echoing, compacted structural output, RDF round-tripping, multi-subject wrapping, and validator separation. Public-surface documentation is updated, and no hostile reviewer-directed instruction appears in the diff.",
+ "verdict": "approve"
+}
