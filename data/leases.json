@@ -22,16 +22,6 @@
   },
   {
    "account": "acct06",
-   "claim_id": "e346fb1539f840829b268c8ac7cb325f",
-   "holder": "sparq-org/sparq#2411@dispatch-29567386037.1",
-   "package": "sparq-parse",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784277874,
-   "expires_at": 1784284174
-  },
-  {
-   "account": "acct06",
    "claim_id": "f61d9ff93fc440aeb2c595d93b081627",
    "holder": "sparq-org/sparq#2412@dispatch-29567386037.1",
    "package": "sparq-kb",
