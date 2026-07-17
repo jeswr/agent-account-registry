@@ -90,6 +90,7 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import re
           import sys
           import time
           from urllib.error import HTTPError, URLError
@@ -146,6 +147,56 @@ jobs:
                   json.dumps({"complete": True, "items": issues}), encoding="utf-8")
               Path(out_dir, f"raw-pulls-{index}.json").write_text(
                   json.dumps({"complete": True, "items": pulls}), encoding="utf-8")
+
+              # Per-worker-PR CI/merge status (GAP-A/B/C inputs): the list API carries neither
+              # `mergeable` nor check runs, so each open same-repo sparq-agent/* PR gets one
+              # detail read (mergeable + auto_merge + fresh head) and one check-runs walk. The
+              # registry-side assemble step interprets these via dispatch-claim's PURE helpers;
+              # this step stays registry-inline (authenticated, before any target code runs).
+              worker_pulls = [
+                  pull for pull in pulls
+                  if isinstance(pull, dict) and pull.get("state") == "open"
+                  and isinstance(pull.get("number"), int) and pull["number"] > 0
+                  and str((pull.get("head") or {}).get("ref", "")).startswith("sparq-agent/")
+                  and ((pull.get("head") or {}).get("repo") or {}).get("full_name") == repo
+              ]
+              if len(worker_pulls) > 100:
+                  raise SystemExit("refusing a per-PR status snapshot above 100 worker PRs")
+              status_items = {}
+              for pull in worker_pulls:
+                  number = pull["number"]
+                  detail = fetch_page(f"https://api.github.com/repos/{repo}/pulls/{number}")
+                  if not isinstance(detail, dict):
+                      raise SystemExit("pull-request detail read returned a non-object")
+                  sha = str((detail.get("head") or {}).get("sha", ""))
+                  check_runs = []
+                  if re.fullmatch(r"[0-9a-f]{40}", sha):
+                      for page in range(1, 11):
+                          doc = fetch_page(
+                              f"https://api.github.com/repos/{repo}/commits/{sha}"
+                              f"/check-runs?per_page=100&page={page}")
+                          runs = doc.get("check_runs") if isinstance(doc, dict) else None
+                          if not isinstance(runs, list):
+                              raise SystemExit("check-runs page is malformed")
+                          check_runs.extend({
+                              "name": run.get("name"),
+                              "status": run.get("status"),
+                              "conclusion": run.get("conclusion"),
+                              "started_at": run.get("started_at"),
+                          } for run in runs if isinstance(run, dict))
+                          if len(runs) < 100:
+                              break
+                      else:
+                          raise SystemExit(
+                              "refusing a check-run snapshot at or above 1000 entries")
+                  status_items[str(number)] = {
+                      "head_sha": sha,
+                      "mergeable": detail.get("mergeable"),
+                      "auto_merge": detail.get("auto_merge"),
+                      "check_runs": check_runs,
+                  }
+              Path(out_dir, f"raw-prstatus-{index}.json").write_text(
+                  json.dumps({"complete": True, "items": status_items}), encoding="utf-8")
           print(f"SNAPSHOT complete for {len(repos)} target repo(s)")
           PY
 
@@ -401,10 +452,25 @@ jobs:
           now = int(time.time())
 
           review_items = []
+          disarm_items = []
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
               pulls = json.loads(Path(out_dir, f"pulls-{index}.json").read_text(encoding="utf-8"))
+              # Per-PR CI/merge status from the authenticated snapshot, interpreted by the PURE
+              # dispatch-claim helpers (hostile-tolerant: malformed records degrade to unknown,
+              # and unknown never emits a repair/disarm item).
+              pr_status = {}
+              status_path = Path(out_dir, f"raw-prstatus-{index}.json")
+              if status_path.is_file():
+                  raw_status = json.loads(status_path.read_text(encoding="utf-8"))
+                  if (isinstance(raw_status, dict) and raw_status.get("complete") is True
+                          and isinstance(raw_status.get("items"), dict)):
+                      pr_status = {
+                          int(number): claim_mod.pr_ci_status(record)
+                          for number, record in raw_status["items"].items()
+                          if str(number).isdigit()
+                      }
               issue_labels = {
                   int(number): labels for number, labels in json.loads(
                       Path(out_dir, f"issue-labels-{index}.json").read_text(encoding="utf-8")
@@ -425,27 +491,37 @@ jobs:
                               record_path.read_text(encoding="utf-8"))
                       except (OSError, json.JSONDecodeError):
                           continue
-              # LABEL-terminal states (review:needs-user / review:pass) are excluded inside the
-              # enumerator. Round-budget exhaustion is NOT excluded here: CLAIM re-derives the
-              # live round count and applies the terminal needs-user transition itself, so a PR
-              # whose final outcome mutation crashed converges to a loud human hand-off.
+              # Human-owned holds (review:needs-user / needs:user on the PR, needs:* on the
+              # source issue) are excluded inside the enumerator, as are label-terminal states.
+              # Round-budget exhaustion is NOT excluded here: CLAIM re-derives the live round
+              # count and applies the terminal needs-user transition itself, so a PR whose
+              # final outcome mutation crashed converges to a loud human hand-off.
               review_items.extend(claim_mod.enumerate_review_items(
-                  repo, pulls, provenance, leases, issue_labels, now))
-              # Deferred-retry items with a still-live lease are dropped registry-side.
-              repository["items"] = claim_mod.filter_deferred_items(
-                  repository["items"], repo, leases, now)
+                  repo, pulls, provenance, leases, issue_labels, now, pr_status=pr_status))
+              # Armed-SHA-mismatch safety invariant (issue #42): CLAIM disarms these FIRST each
+              # sweep, re-deriving every precondition live (matching SHAs are never disarmed).
+              disarm_items.extend(claim_mod.enumerate_disarm_items(
+                  repo, pulls, pr_status, provenance))
+              # Deferred-retry items with a still-live lease are dropped registry-side, then the
+              # busy-area union over ALL open worker PRs (issue #27) keeps impl items out of any
+              # crate with an in-flight review-loop PR.
+              repository["items"] = claim_mod.filter_busy_area_items(
+                  claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
+                  repo, pulls, issue_labels)
 
           document = {
-              "schema": "registry-dispatch-plan/v2",
+              "schema": "registry-dispatch-plan/v3",
               "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "repositories": intermediate["repositories"],
               "review_items": review_items,
+              "disarm_items": disarm_items,
           }
           # PLAN-side inline set-equality checks (CLAIM repeats a stricter independent
           # re-validation of the artifact as hostile data before any mutation).
-          if set(document) != {"schema", "generated_at", "repositories", "review_items"}:
+          if set(document) != {"schema", "generated_at", "repositories", "review_items",
+                               "disarm_items"}:
               raise SystemExit("plan schema top-level fields are invalid")
-          if document["schema"] != "registry-dispatch-plan/v2":
+          if document["schema"] != "registry-dispatch-plan/v3":
               raise SystemExit("plan schema version is invalid")
           expected_item_fields = {"number", "priority", "package", "role", "model_chain",
                                   "agent", "escalate", "labels", "author", "body_sha", "deferred"}
@@ -456,10 +532,14 @@ jobs:
                   if set(item) != expected_item_fields:
                       raise SystemExit("plan item fields are invalid")
           expected_review_fields = {"pr_number", "head_sha", "state", "impl_provider", "repo",
-                                    "package", "security"}
+                                    "package", "security", "context"}
           for item in document["review_items"]:
               if set(item) != expected_review_fields:
                   raise SystemExit("plan review item fields are invalid")
+          expected_disarm_fields = {"pr_number", "head_sha", "reviewed_sha", "repo"}
+          for item in document["disarm_items"]:
+              if set(item) != expected_disarm_fields:
+                  raise SystemExit("plan disarm item fields are invalid")
           # Full structural validation with the same validator CLAIM uses (strictly stronger
           # than a hand-rolled inline copy, and available here because the registry is local).
           claim_mod.validate_plan(document)
@@ -467,7 +547,7 @@ jobs:
               json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           print(f"PLAN complete: "
                 f"{sum(len(repo['items']) for repo in document['repositories'])} issue item(s), "
-                f"{len(review_items)} review item(s)")
+                f"{len(review_items)} review item(s), {len(disarm_items)} disarm item(s)")
           PY
 
       - name: Upload immutable plan artifact (pinned)

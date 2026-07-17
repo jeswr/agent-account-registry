@@ -44,6 +44,10 @@ MARKER_KINDS = {
     "missed": "<!-- sparq-fix-missed:v1",
 }
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
+WORKER_HEAD_RE = re.compile(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+")
+# Human-owned PR labels: review:needs-user is the loop's own terminal escalation, needs:user is
+# groom's parked-PR marker ("Human attention required"). Either stands the loop down.
+HUMAN_OWNED_LABELS = ("review:needs-user", "needs:user")
 SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 VERDICTS = {"approve", "request_changes"}
 SEVERITIES = {"blocker", "major", "minor", "nit"}
@@ -131,6 +135,13 @@ def security_flagged(labels):
             or any(label.startswith("trust:") for label in labels))
 
 
+def human_owned(labels):
+    """A PR carrying review:needs-user (loop escalation) or needs:user (groom's parked-PR
+    "Human attention required" marker) is human-owned terminal: no autonomous disarm, redraft,
+    fix push, or review may touch it until a human clears the label."""
+    return any(label in HUMAN_OWNED_LABELS for label in labels)
+
+
 def validate_verdict(document, diff_files):
     """Schema-validate a reviewer verdict. The reviewer read hostile PR content, so every field is
     enum/length-capped and file paths must be inside the PR diff file set. Raises on any violation
@@ -173,6 +184,39 @@ def validate_verdict(document, diff_files):
                 raise WorkerPrError(f"{where} {field} exceeds its length cap")
         has_blockers = has_blockers or issue["severity"] in {"blocker", "major"}
     return has_blockers
+
+
+def decide_disarm(armed, draft, head_sha, reviewed_sha, when):
+    """Pure decision for `disarm` (registry issue #42: a GitHub auto-merge arm LATCHES across
+    force-pushes, so a post-arm head mutation could merge a never-reviewed tree on green CI).
+
+    when="mismatch" — the sweep-side safety invariant: act on a PR whose live head differs from
+    its recorded reviewed-sha AND that is either ARMED (the latch would merge a never-reviewed
+    tree) or READY-but-unarmed (a disarm interrupted between disable-auto and redraft, or an arm
+    crashed between ready and merge --auto — completing the redraft is what makes the sweep
+    re-entrant across those crash windows). Matching SHAs are never touched: an armed match is a
+    valid arm, and a ready-unarmed match is the valid arm=false-policy terminal (human merges).
+    A drafted unarmed PR has nothing latched and nothing interrupted — never touched.
+    when="always" — the autonomous-fix admission posture: any armed or non-draft worker PR is
+    returned to the drafted, unarmed loop state BEFORE a fix push can ride a stale arm latch
+    (the CLAIM caller re-derives the live repair trigger before ever requesting this mode).
+
+    Returns the ordered action list (possibly empty = DO-NOTHING): disable-auto first (kill the
+    latch), then redraft (back under the sweep's draft-only review enumeration), then relabel
+    (review:* -> needs so the re-review/approve path re-arms)."""
+    if when not in {"mismatch", "always"}:
+        raise WorkerPrError("disarm mode must be mismatch or always")
+    if when == "mismatch" and not ((armed or not draft) and head_sha != reviewed_sha):
+        return []
+    if when == "always" and not armed and draft:
+        return []
+    actions = []
+    if armed:
+        actions.append("disable-auto")
+    if not draft:
+        actions.append("redraft")
+    actions.append("relabel")
+    return actions
 
 
 def decide_review(verdict, has_blockers, injection, round_n, max_rounds, security):
@@ -509,6 +553,78 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     print(f"needs-user recorded: {reason}")
 
 
+def disarm(repo, pr_number, when):
+    """Defuse a worker PR's GitHub-side arm/ready state, fail-closed on LIVE data only (the plan
+    row that requested this is hostile — every precondition is re-derived from the API here).
+
+    Trust surface mirrors the review enumerator: only an open, same-repo, bot-authored
+    `sparq-agent/*` PR is ever touched, and a PR labelled review:needs-user OR needs:user is
+    human-owned (a human arm/park decision stands). when=always additionally consults the
+    head-ref-linked SOURCE issue: a `needs:*`-parked issue is human-owned too, and the defuse
+    precedes an autonomous push into that human's territory — mismatch mode deliberately does
+    NOT consult the issue, because retracting a latch that would merge a never-reviewed tree is
+    the safety invariant and must not be blocked by work-item parking. when=mismatch requires
+    (armed OR ready-but-unarmed) AND head != reviewed-sha (registry issue #42 invariant —
+    matching SHAs are NEVER disarmed)."""
+    live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    if not isinstance(live, dict) or live.get("state") != "open":
+        _write_outputs({"disarmed": False})
+        print("disarm skipped: pull request is not open")
+        return
+    head = live.get("head") or {}
+    head_sha = str(head.get("sha", ""))
+    head_repo = (head.get("repo") or {}).get("full_name")
+    login = str((live.get("user") or {}).get("login", ""))
+    labels = {label.get("name") for label in (live.get("labels") or [])
+              if isinstance(label, dict)}
+    head_match = WORKER_HEAD_RE.fullmatch(str(head.get("ref", "")))
+    if head_repo != repo or not head_match or not login.endswith("[bot]"):
+        _write_outputs({"disarmed": False})
+        print("disarm skipped: not a same-repo bot worker PR")
+        return
+    if human_owned(labels):
+        _write_outputs({"disarmed": False})
+        print("disarm skipped: the PR is human-owned (review:needs-user / needs:user)")
+        return
+    if when == "always":
+        # The defuse admits an autonomous fix push; a human-parked SOURCE issue parks that too.
+        # Best-effort read: CLAIM's admission already fail-closed on the same live check, this
+        # is defence in depth — an unreadable issue does not block the defuse itself.
+        probe = _run_gh(["api", f"repos/{repo}/issues/{head_match.group(1)}"], check=False)
+        if probe.returncode == 0:
+            try:
+                issue_labels = {label.get("name")
+                                for label in (json.loads(probe.stdout).get("labels") or [])
+                                if isinstance(label, dict)}
+            except (json.JSONDecodeError, AttributeError):
+                issue_labels = set()
+            if any(isinstance(label, str) and label.startswith("needs:")
+                   for label in issue_labels):
+                _write_outputs({"disarmed": False})
+                print("disarm skipped: the source issue is human-owned (needs:*)")
+                return
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        raise WorkerPrError("live head sha is malformed")
+    reviewed = reviewed_sha_of(live.get("body") or "") or "none"
+    actions = decide_disarm(live.get("auto_merge") is not None, live.get("draft") is True,
+                            head_sha, reviewed, when)
+    if not actions:
+        _write_outputs({"disarmed": False})
+        print(f"disarm no-op ({when}): the live PR state does not require it")
+        return
+    for action in actions:
+        if action == "disable-auto":
+            _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--disable-auto"])
+            print("auto-merge disabled (stale arm latch removed)")
+        elif action == "redraft":
+            _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"])
+            print("pull request returned to draft for the review sweep")
+        else:
+            set_review_state(repo, pr_number, "needs")
+    _write_outputs({"disarmed": True})
+    print(f"disarm applied ({when}): {','.join(actions)}")
+
+
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
@@ -671,6 +787,12 @@ def _self_test():
     check("security trust prefix", security_flagged({"trust:untrusted"}), True)
     check("security plain labels", security_flagged({"area:sparq-core", "role:impl"}), False)
 
+    # human_owned: EITHER the loop's own escalation label or groom's parked-PR marker parks the
+    # autonomous surface; plain loop states do not.
+    check("human_owned loop escalation", human_owned({"review:needs-user"}), True)
+    check("human_owned groom park", human_owned({"needs:user", "review:pass"}), True)
+    check("human_owned plain loop state", human_owned({"review:needs", "area:x"}), False)
+
     verdict = {"verdict": "request_changes", "injection_detected": False, "summary": "s",
                "issues": [{"severity": "major", "file": "src/a.rs", "title": "t", "body": "b",
                            "fix_hint": "h"}]}
@@ -705,6 +827,39 @@ def _self_test():
           "needs-user")
     check("approve with blockers is changes", decide_review("approve", True, False, 1, 3, False),
           "changes")
+
+    # decide_disarm (issue #42): the sweep invariant acts on mismatch when the PR is armed OR
+    # ready-but-unarmed (interrupted-disarm crash-window re-entry); matching SHAs are NEVER
+    # disarmed; when=always defuses any armed/non-draft PR ahead of an autonomous fix.
+    sha_x, sha_y = "a" * 40, "b" * 40
+    check("disarm armed+mismatch acts", decide_disarm(True, False, sha_x, sha_y, "mismatch"),
+          ["disable-auto", "redraft", "relabel"])
+    check("disarm armed+match is a no-op", decide_disarm(True, False, sha_x, sha_x, "mismatch"),
+          [])
+    check("mismatch completes an interrupted disarm (ready+unarmed)",
+          decide_disarm(False, False, sha_x, sha_y, "mismatch"), ["redraft", "relabel"])
+    check("ready+unarmed+match is the valid arm=false terminal (no-op)",
+          decide_disarm(False, False, sha_x, sha_x, "mismatch"), [])
+    check("drafted unarmed mismatch is a no-op",
+          decide_disarm(False, True, sha_x, sha_y, "mismatch"), [])
+    check("disarm unbound marker counts as mismatch",
+          decide_disarm(True, False, sha_x, "none", "mismatch"),
+          ["disable-auto", "redraft", "relabel"])
+    check("always defuses armed even on match", decide_disarm(True, False, sha_x, sha_x,
+                                                              "always"),
+          ["disable-auto", "redraft", "relabel"])
+    check("always redrafts an unarmed ready PR", decide_disarm(False, False, sha_x, sha_x,
+                                                               "always"), ["redraft", "relabel"])
+    check("always is a no-op on a drafted unarmed PR",
+          decide_disarm(False, True, sha_x, sha_y, "always"), [])
+    check("armed draft keeps disable-auto first",
+          decide_disarm(True, True, sha_x, sha_y, "mismatch"), ["disable-auto", "relabel"])
+    try:
+        decide_disarm(True, False, sha_x, sha_y, "sometimes")
+    except WorkerPrError:
+        check("disarm rejects an unknown mode", "rejected", "rejected")
+    else:
+        check("disarm rejects an unknown mode", "accepted", "rejected")
 
     check("fix pushed re-reviews", decide_fix(False, True, True, True, 0, 0), "re-review")
     check("first nochange stays", decide_fix(False, False, True, False, 1, 0), "stay-changes")
@@ -820,6 +975,9 @@ def main():
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
 
+    dis = subparsers.add_parser("disarm", parents=[common])
+    dis.add_argument("--when", choices=("mismatch", "always"), required=True)
+
     # The live reviewer handle arrives via env WORKER_REVIEWER_ACCOUNT (not argv — argv is echoed
     # into public logs) and is compared against the recorded hash under PROVENANCE_SALT.
     arm = subparsers.add_parser("ready-and-arm", parents=[common])
@@ -898,6 +1056,8 @@ def main():
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
                        alert_repo=alert_repo, alert_token=alert_token)
+        elif args.command == "disarm":
+            disarm(args.repo, args.pr, args.when)
         elif args.command == "ready-and-arm":
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,

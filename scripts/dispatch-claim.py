@@ -19,10 +19,15 @@ import tomllib
 
 
 # v2 adds top-level `review_items` (the cross-provider review/fix loop) and a per-item `deferred`
-# flag (the deferred-retry path). Both validators — this one and the dispatch.yml PLAN inline
-# check — are bumped in the same commit; the TARGET repo's dispatch-plan.py is untouched.
-SCHEMA = "registry-dispatch-plan/v2"
-PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items"}
+# flag (the deferred-retry path). v3 adds the zero-manual repair surface: review-item states
+# `needs-ci-fix` (red ci-summary gate on the current head) and `needs-rebase` (conflicting base)
+# with an advisory `context` field, the `stranded` escalation state ({drafted, unarmed, reviewed
+# head, green gate} has no other autonomous exit — CLAIM hands it loudly to a human), plus
+# top-level `disarm_items` (armed-SHA-mismatch safety invariant, registry issue #42). Both
+# validators — this one and the dispatch.yml PLAN inline check — are bumped in the same commit;
+# the TARGET repo's dispatch-plan.py is untouched.
+SCHEMA = "registry-dispatch-plan/v3"
+PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items", "disarm_items"}
 REPOSITORY_FIELDS = {"target_repo", "target_sha", "items"}
 ITEM_FIELDS = {
     "number",
@@ -45,8 +50,20 @@ REVIEW_ITEM_FIELDS = {
     "repo",
     "package",
     "security",
+    "context",
 }
-REVIEW_STATES = {"needs-review", "needs-fix"}
+DISARM_ITEM_FIELDS = {"pr_number", "head_sha", "reviewed_sha", "repo"}
+# needs-ci-fix / needs-rebase are the zero-manual repair states: same-provider fix runs (reuse
+# mode=fix) that target red full-matrix CI legs / a conflicting base instead of review findings.
+# stranded is the loud terminal escalation for {drafted, unarmed, reviewed-sha == head, green
+# gate}: nothing else re-admits that posture (no re-review without a head advance, no ci-fix
+# without a red gate), so CLAIM re-derives it live and applies the needs-user hand-off.
+REVIEW_STATES = {"needs-review", "needs-fix", "needs-ci-fix", "needs-rebase", "stranded"}
+FIX_KIND_OF_STATE = {"needs-fix": "verdict", "needs-ci-fix": "ci", "needs-rebase": "rebase"}
+# Human-owned PR labels: review:needs-user is the loop's own terminal escalation; needs:user is
+# groom's parked-PR marker ("Human attention required"). EITHER parks the whole autonomous
+# surface for the PR — enumeration, repair admission, and worker-pr.py disarm all stand down.
+HUMAN_HOLD_PR_LABELS = {"review:needs-user", "needs:user"}
 IMPL_PROVIDERS = {"anthropic", "openai"}
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_ATOM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -84,6 +101,13 @@ HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
 SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
+# The authoritative aggregator check-run on the target (sparq's `ci-summary / gate` job): only a
+# CONCLUDED failure of THIS check on the CURRENT head enumerates a ci-fix; in-progress = no churn.
+CI_GATE_CHECK = "gate"
+FAILED_CONCLUSIONS = {"failure", "timed_out"}
+GLOBAL_PACKAGE = "__global__"   # mirrors the target ready-engine's serializing partition
+CI_CONTEXT_MAX = 1000           # advisory failing-leg context cap (plan field + workflow input)
+MAX_FAILING_LEGS = 20
 
 
 class DispatchError(RuntimeError):
@@ -210,6 +234,10 @@ def validate_plan(document):
         _safe_string(item["package"], SAFE_PACKAGE, f"{where} package")
         if not isinstance(item["security"], bool):
             raise DispatchError(f"{where} security must be boolean")
+        context = item["context"]
+        if (not isinstance(context, str) or len(context) > CI_CONTEXT_MAX
+                or "\n" in context or "\r" in context):
+            raise DispatchError(f"{where} context is malformed")
         review_key = (repo, number)
         if review_key in seen_reviews:
             raise DispatchError(f"plan repeats review item {repo}#{number}")
@@ -217,6 +245,35 @@ def validate_plan(document):
         if prior_review is not None and review_key < prior_review:
             raise DispatchError("plan review items are not in deterministic order")
         prior_review = review_key
+    disarm_items = document["disarm_items"]
+    if not isinstance(disarm_items, list):
+        raise DispatchError("plan disarm_items must be a list")
+    prior_disarm = None
+    seen_disarms = set()
+    for disarm_index, item in enumerate(disarm_items, 1):
+        where = f"disarm item #{disarm_index}"
+        _require_exact_fields(item, DISARM_ITEM_FIELDS, where)
+        number = item["pr_number"]
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            raise DispatchError(f"{where} pr_number must be a positive integer")
+        if not isinstance(item["head_sha"], str) or not SAFE_SHA.fullmatch(item["head_sha"]):
+            raise DispatchError(f"{where} head_sha is malformed")
+        reviewed = item["reviewed_sha"]
+        if not isinstance(reviewed, str) or not (reviewed == "none"
+                                                 or SAFE_SHA.fullmatch(reviewed)):
+            raise DispatchError(f"{where} reviewed_sha is malformed")
+        if reviewed == item["head_sha"]:
+            raise DispatchError(f"{where} reviewed_sha equals head_sha (nothing to disarm)")
+        repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
+        if repo not in seen_repositories:
+            raise DispatchError(f"{where} repo is not a planned repository")
+        disarm_key = (repo, number)
+        if disarm_key in seen_disarms:
+            raise DispatchError(f"plan repeats disarm item {repo}#{number}")
+        seen_disarms.add(disarm_key)
+        if prior_disarm is not None and disarm_key < prior_disarm:
+            raise DispatchError("plan disarm items are not in deterministic order")
+        prior_disarm = disarm_key
     return document
 
 
@@ -235,23 +292,243 @@ def _live_holder_keys(leases, now):
     }
 
 
-def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login=""):
+def _sanitize_leg(name):
+    """Printable-ASCII, length-capped check-run leg name (context is advisory model input that
+    also crosses a workflow_dispatch input — never multiline, never control characters)."""
+    return re.sub(r"[^ -~]", "?", str(name))[:120].strip()
+
+
+def interpret_check_runs(check_runs):
+    """PURE interpreter for a commit's check-runs listing (hostile-tolerant: malformed input
+    degrades to gate=unknown, never a crash and never an ACT). Re-runs of the same check name are
+    superseded by the latest `started_at`. Returns {"gate", "failing_legs"} where gate is one of
+    failure|pending|success|missing|unknown — ONLY a concluded `failure` ever admits a ci-fix
+    (an in-progress gate is deliberately not enumerated: no churn)."""
+    if not isinstance(check_runs, list):
+        return {"gate": "unknown", "failing_legs": []}
+    latest = {}
+    for run in check_runs:
+        if not isinstance(run, dict):
+            continue
+        name = run.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        started = str(run.get("started_at") or "")
+        prior = latest.get(name)
+        if prior is None or started >= prior[0]:
+            latest[name] = (started, run)
+    gate_entry = latest.get(CI_GATE_CHECK)
+    if gate_entry is None:
+        gate = "missing"
+    elif gate_entry[1].get("status") != "completed":
+        gate = "pending"
+    elif gate_entry[1].get("conclusion") in FAILED_CONCLUSIONS:
+        gate = "failure"
+    else:
+        gate = "success"
+    failing = sorted({
+        _sanitize_leg(name) for name, (_started, run) in latest.items()
+        if name != CI_GATE_CHECK and run.get("status") == "completed"
+        and run.get("conclusion") in FAILED_CONCLUSIONS and _sanitize_leg(name)
+    })[:MAX_FAILING_LEGS]
+    return {"gate": gate, "failing_legs": failing}
+
+
+def pr_ci_status(record):
+    """PURE per-PR CI/merge status from the PLAN snapshot's raw detail record. Hostile-tolerant:
+    anything malformed degrades to unknown (empty dict / None fields) so a poisoned snapshot can
+    only cause DO-NOTHING, never a spurious repair item."""
+    if not isinstance(record, dict):
+        return {}
+    head_sha = record.get("head_sha")
+    if not isinstance(head_sha, str) or not SAFE_SHA.fullmatch(head_sha):
+        return {}
+    mergeable = record.get("mergeable")
+    status = {
+        "head_sha": head_sha,
+        # REST tri-state: False = conflicting, True = clean, null = still computing (unknown).
+        "conflicting": True if mergeable is False else (False if mergeable is True else None),
+        "armed": isinstance(record.get("auto_merge"), dict),
+    }
+    status.update(interpret_check_runs(record.get("check_runs")))
+    return status
+
+
+def decide_repair_admission(state, mergeable, gate, draft):
+    """PURE repair-admission decision. The LIVE trigger is re-derived BEFORE any defuse can run:
+    a plan row is hostile AND stale by construction, so a validly-armed PR whose PLAN-time
+    trigger evaporated (a flaky gate leg re-ran green, the base moved past the conflict) must
+    NEVER be demoted to draft on snapshot state alone — that would destroy a matching-SHA valid
+    arm and strand the PR in an un-enumerable state. Returns one of:
+    ("defer", reason)   — trigger absent/unknown on live data; NO mutation this tick,
+    ("defuse", kind)    — live-confirmed trigger on a ready/armed PR; disarm --when always first,
+    ("proceed", kind)   — live-confirmed trigger on a drafted PR; dispatch the fix run."""
+    if state == "needs-rebase":
+        if mergeable is not False:
+            return ("defer", "base is no longer conflicting (or mergeability is still computing)")
+    elif state == "needs-ci-fix":
+        if mergeable is False:
+            return ("defer", "base is conflicting; rebase repair runs first")
+        if gate != "failure":
+            return ("defer", "the gate check is not a concluded failure on the live head")
+    else:
+        return ("defer", "not a repair state")
+    kind = FIX_KIND_OF_STATE[state]
+    if not draft:
+        return ("defuse", kind)
+    return ("proceed", kind)
+
+
+def stranded_live(draft, armed, reviewed_match, mergeable, gate):
+    """PURE live re-derivation of the stranded posture: a DRAFTED, UNARMED PR whose current head
+    equals its reviewed-sha marker on a cleanly-mergeable base with a concluded-GREEN gate. The
+    loop has no autonomous exit from that state (re-review is bound to a head advance, ci-fix to
+    a red gate, rebase to a conflict, arm to a review outcome), so it is handed loudly to a
+    human. Anything else — armed, ready, unreviewed, red/pending/unknown gate, conflicting or
+    still-computing base — is some other path's job and must NOT be escalated."""
+    return (draft is True and not armed and reviewed_match
+            and mergeable is True and gate == "success")
+
+
+def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
+    """PURE armed-SHA-mismatch enumerator (registry issue #42): any ARMED worker PR whose live
+    head no longer equals its recorded reviewed-sha marker is a safety violation — the GitHub
+    auto-merge latch survives force-pushes, so on green CI a never-reviewed tree would merge.
+    An UNARMED but READY (non-draft) worker PR with the same mismatch is ALSO emitted: that is a
+    disarm interrupted between disable-auto and redraft (or an arm crash between ready and
+    merge --auto), and re-emitting it until the invariant holds is what makes the disarm loop
+    re-entrant across crash windows. A drafted unarmed PR has nothing latched and nothing
+    interrupted — never emitted. CLAIM re-derives every precondition live (worker-pr.py disarm
+    --when mismatch) before acting, and matching SHAs are NEVER emitted (an unarmed ready PR
+    whose head equals its marker is the valid arm=false-policy terminal). Trust surface mirrors
+    enumerate_review_items; a review:needs-user or needs:user PR is human-owned (a human
+    arm/park decision stands)."""
+    items = []
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            raise DispatchError("disarm enumeration met a malformed pull request")
+        number = pull.get("number")
+        head = pull.get("head") or {}
+        ref = str(head.get("ref", ""))
+        sha = str(head.get("sha", ""))
+        head_repo = (head.get("repo") or {}).get("full_name")
+        login = str((pull.get("user") or {}).get("login", ""))
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        if pull.get("state") != "open":
+            continue
+        if not HEAD_REF_RE.match(ref) or head_repo != repo:
+            continue
+        if not login.endswith("[bot]") or (bot_login and login != bot_login):
+            continue
+        record = provenance.get(number)
+        if not isinstance(record, dict) or record.get("pr_number") != number:
+            continue                      # never loop-armed without provenance — leave to humans
+        if not SAFE_SHA.fullmatch(sha):
+            continue
+        labels = {label.get("name") if isinstance(label, dict) else label
+                  for label in (pull.get("labels") or [])}
+        if labels & HUMAN_HOLD_PR_LABELS:
+            continue
+        status = pr_status.get(number) if isinstance(pr_status, dict) else None
+        if not isinstance(status, dict) or status.get("head_sha") != sha:
+            continue                      # stale/unknown snapshot — unknown never acts
+        if status.get("armed") is not True and pull.get("draft") is True:
+            continue                      # unarmed draft — nothing latched, nothing interrupted
+        reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
+        reviewed_sha = reviewed.group(1) if reviewed else "none"
+        if reviewed_sha == sha:
+            continue                      # the arm is bound to this exact head — valid, keep it
+        items.append({"pr_number": number, "head_sha": sha,
+                      "reviewed_sha": reviewed_sha, "repo": repo})
+    items.sort(key=lambda item: (item["repo"], item["pr_number"]))
+    return items
+
+
+def busy_packages_of_pulls(repo, pulls, issue_labels):
+    """PURE busy-area union for the PLAN conflict partition (registry issue #27): EVERY open
+    same-repo `sparq-agent/*` PR — draft or not, ANY review state — reserves the `area:*`
+    packages of its PR labels plus its head-ref-linked source issue. A known issue with NO area
+    labels reserves the serializing global partition (mirrors the target ready-engine); an
+    unknown/closed issue with no PR areas reserves nothing (never freeze the pipeline on a
+    stray branch)."""
+    busy = set()
+    for pull in pulls:
+        if not isinstance(pull, dict) or pull.get("state") != "open":
+            continue
+        head = pull.get("head") or {}
+        match = HEAD_REF_RE.match(str(head.get("ref", "")))
+        if not match or (head.get("repo") or {}).get("full_name") != repo:
+            continue
+        pr_labels = {
+            label.get("name") if isinstance(label, dict) else label
+            for label in (pull.get("labels") or [])
+        }
+        areas = {label[5:] for label in pr_labels
+                 if isinstance(label, str) and label.startswith("area:")}
+        source = issue_labels.get(int(match.group(1))) if isinstance(issue_labels, dict) else None
+        if isinstance(source, list):
+            issue_areas = {label[5:] for label in source
+                           if isinstance(label, str) and label.startswith("area:")}
+            areas |= issue_areas or {GLOBAL_PACKAGE}
+        elif not areas:
+            continue
+        busy |= areas
+    return busy
+
+
+def filter_busy_area_items(items, repo, pulls, issue_labels):
+    """Drop plan items whose package has an in-flight worker PR (registry issue #27: the review
+    loop's PRs were invisible to the busy-area partition, double-dispatching onto a busy crate).
+    Global semantics mirror the target ready-engine: a global reservation blocks everything, and
+    a global item cannot co-run with ANY reserved package."""
+    busy = busy_packages_of_pulls(repo, pulls, issue_labels)
+    if not busy:
+        return items
+    kept = []
+    for item in items:
+        package = item.get("package")
+        if GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy:
+            continue
+        kept.append(item)
+    return kept
+
+
+def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
+                           pr_status=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
     unit-tested by --self-test). Fail-closed trust posture (locked decisions 1/3/11/13/19):
-    - only open DRAFT PRs whose head branch matches the worker pattern,
+    - only open PRs whose head branch matches the worker pattern,
     - head.repo MUST be the target repo (a fork PR with a spoofed head ref is never enumerated),
     - the author must be a [bot] (and the App bot when `bot_login` is known),
     - a REGISTRY provenance record must exist for the PR (the root of trust — the target model
       cannot write the registry), carrying a valid impl provider,
-    - LABEL-terminal states (review:needs-user / review:pass) never re-enter. Round-budget
-      exhaustion is deliberately NOT excluded here: CLAIM re-derives the live round count and
-      applies the terminal needs-user transition itself, so a PR whose final outcome mutation
-      crashed (label never landed) converges to a loud human hand-off instead of silently
-      stalling under an exhausted budget (liveness over a redundant plan-side filter),
+    - review:needs-user AND needs:user (groom's parked-PR marker) are TERMINAL (human-owned) for
+      every state including the repair states, and a `needs:*` label on the provenance-linked
+      SOURCE issue parks the PR the same way (groom's stale paths ping a maintainer when they
+      park — autonomy stands down until the human clears the label) — required so a
+      budget-exhausted or groom escalation actually halts the loop. Round-budget exhaustion
+      is deliberately NOT excluded here: CLAIM re-derives the live round count and applies the
+      terminal needs-user transition itself, so a PR whose final outcome mutation crashed (label
+      never landed) converges to a loud human hand-off instead of silently stalling,
     - a PR with a LIVE review/fix lease is not re-emitted (the reconciler re-emits a
       review:changes PR with NO live fix lease, so a crashed fix converges),
     - a needs-review PR whose head equals its reviewed-sha marker is skipped (no re-review
-      without a head advance; the non-empty-diff gate runs at CLAIM time)."""
+      without a head advance; the non-empty-diff gate runs at CLAIM time).
+
+    `pr_status` (optional, {number: pr_ci_status(...)}) admits the zero-manual repair states over
+    the SAME surface — draft or not, any non-terminal review state:
+    - needs-rebase: a CONFLICTING base (mutually exclusive with, and prioritized over, both the
+      review/fix loop and the ci-fix — CI and reviews on a conflicted base are noise),
+    - needs-ci-fix: the authoritative gate check CONCLUDED failure on the CURRENT head while the
+      loop has nothing else to do for the PR (the merge-queue starver: crate-scoped local gates
+      pass, full-matrix legs are red, reviews approve on substance, nothing fixes CI). A gate
+      still in progress is NOT enumerated (no churn). A status whose head_sha disagrees with the
+      live listing is stale and ignored (unknown never acts),
+    - stranded: a DRAFTED, unarmed PR whose reviewed head has a concluded-GREEN gate on a clean
+      base — no other state can re-admit it, so CLAIM escalates it to a human (needs-user)
+      after its own live re-derivation. A READY (non-draft) unarmed PR in the same posture is
+      deliberately NOT stranded: that is the valid arm=false-policy terminal (human merges)."""
     live_keys = _live_holder_keys(leases, now)
     items = []
     for pull in pulls:
@@ -265,7 +542,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         login = str((pull.get("user") or {}).get("login", ""))
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
             continue
-        if pull.get("state") != "open" or pull.get("draft") is not True:
+        if pull.get("state") != "open":
             continue
         if not HEAD_REF_RE.match(ref):
             continue
@@ -284,34 +561,71 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             for label in (pull.get("labels") or [])
             if isinstance(label, (dict, str))
         } - {None})
-        if "review:needs-user" in labels or "review:pass" in labels:
-            continue                      # terminal / nothing to do
+        if HUMAN_HOLD_PR_LABELS & set(labels):
+            continue                      # terminal — human-owned, nothing autonomous re-enters
         if not SAFE_SHA.fullmatch(sha):
             continue
-        if "review:changes" in labels:
-            state = "needs-fix"
-            if f"fix:{repo}#{number}" in live_keys:
-                continue                  # a fix run is live; the reconciler re-emits if it dies
-        else:
-            # review:needs, or a provenance-backfilled pre-migration PR with no review:* label yet.
-            state = "needs-review"
-            if f"review:{repo}#{number}" in live_keys:
-                continue
-            reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
-            if reviewed and reviewed.group(1) == sha:
-                continue                  # head has not advanced past the last review
         issue_number = record.get("issue")
         source_labels = issue_labels.get(issue_number, []) if isinstance(issue_number, int) else []
+        if any(isinstance(label, str) and label.startswith("needs:") for label in source_labels):
+            continue                      # the SOURCE issue is human-parked (groom/escalation) —
+                                          # the whole PR surface is human-owned too
+        draft = pull.get("draft") is True
+        status = pr_status.get(number) if isinstance(pr_status, dict) else None
+        if not isinstance(status, dict) or status.get("head_sha") != sha:
+            status = {}                   # stale/unknown CI snapshot — unknown never acts
+        lease_free = (f"fix:{repo}#{number}" not in live_keys
+                      and f"review:{repo}#{number}" not in live_keys)
         areas = sorted(label[5:] for label in source_labels if label.startswith("area:"))
-        items.append({
-            "pr_number": number,
-            "head_sha": sha,
-            "state": state,
-            "impl_provider": impl_provider,
-            "repo": repo,
-            "package": areas[0] if areas else "__global__",
-            "security": _security_flagged(set(labels) | set(source_labels)),
-        })
+        reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
+        reviewed_match = bool(reviewed and reviewed.group(1) == sha)
+
+        def emit(state, context=""):
+            items.append({
+                "pr_number": number,
+                "head_sha": sha,
+                "state": state,
+                "impl_provider": impl_provider,
+                "repo": repo,
+                "package": areas[0] if areas else "__global__",
+                "security": _security_flagged(set(labels) | set(source_labels)),
+                "context": context[:CI_CONTEXT_MAX],
+            })
+
+        # GAP-B: conflict repair FIRST and alone — CI on a conflicted base is noise.
+        if status.get("conflicting") is True:
+            if lease_free:
+                emit("needs-rebase")
+            continue
+        if draft:
+            if "review:changes" in labels:
+                if f"fix:{repo}#{number}" in live_keys:
+                    continue              # a fix run is live; the reconciler re-emits if it dies
+                emit("needs-fix")
+                continue
+            # review:needs, a provenance-backfilled pre-migration PR with no review:* label yet,
+            # or a crashed-disarm artifact still carrying review:pass while drafted (no valid
+            # flow leaves a DRAFT labelled review:pass, so re-review is the converging action).
+            if f"review:{repo}#{number}" in live_keys:
+                continue
+            if not reviewed_match:
+                emit("needs-review")
+                continue
+            # head already reviewed — fall through to the ci-fix consideration below (this is
+            # exactly the starved posture: the loop is done with this head, CI is not).
+        # GAP-A: red authoritative gate on the current head, loop otherwise idle for this PR.
+        if status.get("gate") == "failure" and lease_free:
+            emit("needs-ci-fix", context=", ".join(status.get("failing_legs") or []))
+        elif (draft and reviewed_match and lease_free
+                and status.get("gate") == "success"
+                and status.get("conflicting") is False
+                and status.get("armed") is not True):
+            # Absorbing-state escape (never-silent-stall): a DRAFTED, unarmed PR whose reviewed
+            # head has a concluded-GREEN gate has no other autonomous exit (re-review requires a
+            # head advance, ci-fix a red gate, rebase a conflict, arm a review outcome). It is
+            # the residue of a defused arm whose repair trigger evaporated, or of a crashed
+            # disarm — CLAIM re-derives it live and hands it loudly to a human.
+            emit("stranded")
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
     return items
 
@@ -519,9 +833,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             if not bot_login:
                 print(f"defer review {repo}#{number}: bot login unavailable (no App token)")
                 continue
+            repair_state = item["state"] in {"needs-ci-fix", "needs-rebase"}
             pull = _gh_json(["api", f"repos/{repo}/pulls/{number}"])
-            if not isinstance(pull, dict) or pull.get("state") != "open" \
-                    or pull.get("draft") is not True:
+            if not isinstance(pull, dict) or pull.get("state") != "open":
+                print(f"defer review {repo}#{number}: PR is no longer open")
+                continue
+            draft = pull.get("draft") is True
+            if not draft and not repair_state:
                 print(f"defer review {repo}#{number}: PR is no longer an open draft")
                 continue
             head = pull.get("head") or {}
@@ -539,8 +857,10 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 print(f"defer review {repo}#{number}: head advanced since planning; re-plan")
                 continue
             labels = _labels(pull)
-            if "review:needs-user" in labels:
-                print(f"defer review {repo}#{number}: terminal review:needs-user")
+            held = HUMAN_HOLD_PR_LABELS & set(labels)
+            if held:
+                print(f"defer review {repo}#{number}: human-owned "
+                      f"({'/'.join(sorted(held))})")
                 continue
             record_path = Path(registry_root) / worker_pr.provenance_path(repo, number)
             if not record_path.is_file():
@@ -557,6 +877,15 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 print(f"defer review {repo}#{number}: provenance head sha is malformed")
                 continue
             issue_number = record.get("issue") if isinstance(record.get("issue"), int) else None
+            if issue_number is not None:
+                # Human-owned SOURCE issue: groom's stale paths park work with needs:user (and a
+                # maintainer ping) — the repair loop must never disarm/redraft/push (nor review
+                # past) a PR whose work item a human explicitly owns. Live read, fail closed.
+                source_issue = _gh_json(["api", f"repos/{repo}/issues/{issue_number}"])
+                if any(label.startswith("needs:") for label in _labels(source_issue)):
+                    print(f"defer review {repo}#{number}: source issue #{issue_number} is "
+                          "human-owned (needs:*)")
+                    continue
             if opened_sha != head_sha:
                 compare = _gh_json(["api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"])
                 if compare.get("status") not in {"identical", "ahead"}:
@@ -565,6 +894,62 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    "the PR head no longer descends from the worker-opened commit "
                                    "(history was rewritten); refusing autonomous review")
                     continue
+            fix_kind, fix_context = "verdict", ""
+            if repair_state:
+                # The plan row is HOSTILE AND STALE: re-derive the repair trigger from LIVE data
+                # BEFORE any mutation — including the defuse. A non-draft (ready/armed) PR is
+                # only ever defused on a live-confirmed trigger; if the trigger evaporated
+                # between PLAN and now (a flaky gate leg re-ran green, the base moved past the
+                # conflict) the item defers with NO mutation, and a matching-SHA valid arm
+                # keeps merging (the earlier head check already pinned live head == plan head).
+                live_gate, failing_legs = None, []
+                if item["state"] == "needs-ci-fix" and pull.get("mergeable") is not False:
+                    checks = _gh_json([
+                        "api", f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100"])
+                    live_ci = interpret_check_runs(
+                        (checks or {}).get("check_runs") if isinstance(checks, dict) else None)
+                    live_gate, failing_legs = live_ci["gate"], live_ci["failing_legs"]
+                decision, detail = decide_repair_admission(
+                    item["state"], pull.get("mergeable"), live_gate, draft)
+                if decision == "defer":
+                    print(f"defer review {repo}#{number}: {detail}")
+                    continue
+                if decision == "defuse":
+                    # Live-confirmed trigger on a ready/armed PR: it must be defused BEFORE an
+                    # autonomous push can ride the stale auto-merge latch (issue #42), and the
+                    # review sweep only enumerates drafts. disarm --when always is idempotent +
+                    # live-revalidated; the repair item re-admits next tick against the draft.
+                    _run_target_helper(script_dir, "worker-pr.py", [
+                        "disarm", "--repo", repo, "--pr", str(number), "--when", "always"])
+                    print(f"defer review {repo}#{number}: defused to draft for {item['state']}; "
+                          "retried next tick")
+                    continue
+                fix_kind = detail
+                if fix_kind == "ci":
+                    fix_context = ", ".join(failing_legs)[:CI_CONTEXT_MAX]
+            elif item["state"] == "stranded":
+                # Loud escape from the absorbing {drafted, unarmed, reviewed head, green gate}
+                # state — re-derived LIVE before the terminal hand-off; any drift (armed again,
+                # head moved, gate red/pending, base conflicting) defers to the path that owns
+                # the new posture instead.
+                checks = _gh_json([
+                    "api", f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100"])
+                live_ci = interpret_check_runs(
+                    (checks or {}).get("check_runs") if isinstance(checks, dict) else None)
+                reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
+                if not stranded_live(draft, isinstance(pull.get("auto_merge"), dict),
+                                     bool(reviewed and reviewed.group(1) == head_sha),
+                                     pull.get("mergeable"), live_ci["gate"]):
+                    print(f"defer review {repo}#{number}: the stranded posture did not "
+                          "re-derive on live data")
+                    continue
+                _pr_needs_user(script_dir, repo, number, issue_number,
+                               "the PR's reviewed head has a green gate but the PR is drafted "
+                               "and unarmed with nothing left for the loop to do (the residue "
+                               "of an interrupted defuse/disarm); a human must re-arm it (mark "
+                               "ready + enable auto-merge) or restart the review")
+                print(f"escalated {repo}#{number}: stranded reviewed head handed to a human")
+                continue
             comments = _pr_comments(repo, number)
             rounds = worker_pr.count_rounds(comments, bot_login)
             if rounds >= max_rounds:
@@ -599,6 +984,23 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 chain = _resolvable_chain(REVIEW_CHAIN[impl_provider], routing)
                 holder_prefix, cap, ttl = "review:", REVIEW_MAX_CONCURRENT, REVIEW_TTL
                 round_number = rounds + 1
+            elif repair_state:
+                # GAP-A/B autonomous repair (reuse mode=fix, same-provider chain). The live
+                # trigger was re-derived ABOVE (before any defuse could run). Budgets are
+                # SHARED with the review loop: rounds>=max_rounds already escalated above, every
+                # pushed repair flips to review:needs (the re-review consumes a round), and the
+                # missed/nochange/gatefail markers below bound in-round churn — a ci-fix
+                # ping-pong therefore always terminates in review:needs-user.
+                mode, role = "fix", "fix"
+                round_number = max(rounds, 1)
+                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
+                if len(missed) >= MISSED_FIX_LIMIT:
+                    _pr_needs_user(script_dir, repo, number, issue_number,
+                                   f"{len(missed)} consecutive fix dispatches missed for round "
+                                   f"{round_number}; a human must unstick this PR")
+                    continue
+                chain = _resolvable_chain(FIX_CHAIN[impl_provider], routing)
+                holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
             else:
                 if rounds < 1:
                     print(f"defer review {repo}#{number}: review:changes with no recorded round")
@@ -700,6 +1102,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             "-f", f"target_repo={repo}",
             "-f", f"pr_number={number}",
             "-f", f"mode={mode}",
+            "-f", f"fix_kind={fix_kind}",
+            "-f", f"fix_context={fix_context}",
             "-f", f"review_round={round_number}",
             "-f", f"account={account}",
             "-f", f"claim_id={claim_id}",
@@ -712,8 +1116,33 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             continue
         launched += 1
         # Privacy (locked decision 22b): public workflow logs never carry account handles.
-        print(f"dispatched {mode} {repo}#{number}: round={round_number}, claim={claim_id[:8]}")
+        kind_note = "" if fix_kind == "verdict" else f"/{fix_kind}"
+        print(f"dispatched {mode}{kind_note} {repo}#{number}: round={round_number}, "
+              f"claim={claim_id[:8]}")
     return launched
+
+
+def _apply_disarm_items(disarm_items, repo, script_dir, bot_login):
+    """GAP-C (registry issue #42): retract stale GitHub auto-merge latches BEFORE any fix/review
+    admission each sweep. The plan rows are HOSTILE — worker-pr.py `disarm --when mismatch`
+    re-derives every precondition from the LIVE API (open same-repo bot worker PR, armed OR
+    ready with an interrupted disarm, head != reviewed-sha marker, not human-owned via
+    review:needs-user / needs:user) and is a no-op otherwise, so a spoofed row can never disarm
+    a validly-armed or human-owned PR. Failures skip the item (per-item resilience); the
+    enumeration re-emits next tick until the invariant holds — including across a crash between
+    disable-auto and redraft, which mismatch mode re-enters via the ready-but-unarmed leg."""
+    for item in disarm_items:
+        number = item["pr_number"]
+        try:
+            if not bot_login or not _target_token():
+                print(f"defer disarm {repo}#{number}: target App token unavailable")
+                continue
+            _run_target_helper(script_dir, "worker-pr.py", [
+                "disarm", "--repo", repo, "--pr", str(number), "--when", "mismatch"])
+            print(f"disarm {repo}#{number}: live armed-SHA invariant re-checked and applied")
+        except DispatchError as exc:
+            print(f"defer disarm {repo}#{number}: {exc}; retried next tick")
+            continue
 
 
 def _route_matches(repo, item, policy_doc, routing_doc, policy_module):
@@ -827,6 +1256,12 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             "api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100"
         ])
         linked_open_prs = _linked_open_pr_issues(pull_pages)
+
+        # Safety invariant FIRST (issue #42): stale arm latches are retracted before any fix or
+        # review admission can push onto (or re-review past) an armed, mutated head.
+        _apply_disarm_items(
+            [entry for entry in plan["disarm_items"] if entry["repo"] == repo],
+            repo, script_dir, bot_login)
 
         for item in repository["items"]:
             number = item["number"]
@@ -1032,6 +1467,31 @@ def _self_test():
             "repo": "example/repo",
             "package": "crate-a",
             "security": False,
+            "context": "",
+        }, {
+            "pr_number": 44,
+            "head_sha": "e" * 40,
+            "state": "needs-ci-fix",
+            "impl_provider": "openai",
+            "repo": "example/repo",
+            "package": "crate-b",
+            "security": False,
+            "context": "docs-quality, opt-in wasm feature-OFF equality",
+        }, {
+            "pr_number": 46,
+            "head_sha": "e" * 40,
+            "state": "stranded",
+            "impl_provider": "anthropic",
+            "repo": "example/repo",
+            "package": "crate-a",
+            "security": False,
+            "context": "",
+        }],
+        "disarm_items": [{
+            "pr_number": 45,
+            "head_sha": "f" * 40,
+            "reviewed_sha": "none",
+            "repo": "example/repo",
         }],
     }
     assert validate_plan(fixture) is fixture
@@ -1056,6 +1516,19 @@ def _self_test():
             (lambda d: d["review_items"][0].update(head_sha="zz"), "bad review head sha"),
             (lambda d: d.pop("review_items"), "missing review_items"),
             (lambda d: d.update(schema="registry-dispatch-plan/v1"), "stale schema version"),
+            (lambda d: d.update(schema="registry-dispatch-plan/v2"), "previous schema version"),
+            (lambda d: d["review_items"][0].pop("context"), "missing review context"),
+            (lambda d: d["review_items"][0].update(context="a\nb"), "multiline review context"),
+            (lambda d: d["review_items"][1].update(context="x" * 1001), "oversized review context"),
+            (lambda d: d.pop("disarm_items"), "missing disarm_items"),
+            (lambda d: d["disarm_items"][0].update(unknown=True), "unknown disarm field"),
+            (lambda d: d["disarm_items"][0].pop("reviewed_sha"), "missing disarm reviewed_sha"),
+            (lambda d: d["disarm_items"][0].update(reviewed_sha="zz"), "bad disarm reviewed_sha"),
+            (lambda d: d["disarm_items"][0].update(reviewed_sha="f" * 40),
+             "disarm reviewed==head (nothing to disarm)"),
+            (lambda d: d["disarm_items"][0].update(repo="not/planned"), "unplanned disarm repo"),
+            (lambda d: d["disarm_items"].append(dict(d["disarm_items"][0])),
+             "duplicate disarm item"),
     ):
         malformed = json.loads(json.dumps(fixture))
         mutate(malformed)
@@ -1140,6 +1613,319 @@ def _self_test():
     assert enumerate_review_items(repo, pulls[:1], provenance, [], issue_labels, now,
                                   bot_login="another[bot]") == []
 
+    # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
+    runs = [
+        {"name": "gate", "status": "completed", "conclusion": "failure", "started_at": "T2"},
+        {"name": "docs-quality", "status": "completed", "conclusion": "failure",
+         "started_at": "T1"},
+        {"name": "js", "status": "completed", "conclusion": "timed_out", "started_at": "T1"},
+        {"name": "green", "status": "completed", "conclusion": "success", "started_at": "T1"},
+    ]
+    assert interpret_check_runs(runs) == {"gate": "failure",
+                                          "failing_legs": ["docs-quality", "js"]}
+    # a later re-run supersedes an earlier conclusion of the same check name
+    rerun = runs + [{"name": "gate", "status": "completed", "conclusion": "success",
+                     "started_at": "T3"}]
+    assert interpret_check_runs(rerun)["gate"] == "success"
+    assert interpret_check_runs([{"name": "gate", "status": "in_progress",
+                                  "conclusion": None}])["gate"] == "pending"
+    assert interpret_check_runs([])["gate"] == "missing"
+    assert interpret_check_runs("junk") == {"gate": "unknown", "failing_legs": []}
+    assert interpret_check_runs([
+        {"name": "gate", "status": "completed", "conclusion": "failure"},
+        {"name": "lég\nx", "status": "completed", "conclusion": "failure"},
+    ])["failing_legs"] == ["l?g?x"]
+
+    record = {"head_sha": sha_a, "mergeable": False, "auto_merge": {"merge_method": "squash"},
+              "check_runs": runs}
+    ci = pr_ci_status(record)
+    assert (ci["conflicting"], ci["armed"], ci["gate"]) == (True, True, "failure")
+    assert pr_ci_status({**record, "mergeable": None})["conflicting"] is None
+    assert pr_ci_status({**record, "mergeable": True})["conflicting"] is False
+    assert pr_ci_status({**record, "auto_merge": None})["armed"] is False
+    assert pr_ci_status({**record, "head_sha": "zz"}) == {}
+    assert pr_ci_status("junk") == {}
+
+    # ---- GAP-A/B enumeration: zero-manual repair states over the same surface ----
+    def status_of(status_sha, gate="success", conflicting=False, armed=False, legs=()):
+        return {"head_sha": status_sha, "conflicting": conflicting, "armed": armed,
+                "gate": gate, "failing_legs": sorted(legs)}
+
+    starved = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"],
+                   body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    red = {41: status_of(sha_a, gate="failure", legs=["docs-quality", "workspace clippy"])}
+    ci_items = enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                      pr_status=red)
+    assert [(item["state"], item["context"]) for item in ci_items] == [
+        ("needs-ci-fix", "docs-quality, workspace clippy")], ci_items
+    # an in-progress/absent/unknown gate is DO-NOTHING (no churn while CI is still running)
+    for idle_gate in ("pending", "missing", "unknown"):
+        assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                      pr_status={41: status_of(sha_a, gate=idle_gate)}) == []
+    # ... while a concluded-GREEN gate on a drafted, unarmed, reviewed head is the STRANDED
+    # posture (no other autonomous exit exists) — enumerated so CLAIM can hand it to a human
+    green = {41: status_of(sha_a, gate="success")}
+    stranded_items = enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                            pr_status=green)
+    assert [(item["state"], item["context"]) for item in stranded_items] == [
+        ("stranded", "")], stranded_items
+    # DO-NOTHING sides of stranded: an UNREVIEWED draft head re-reviews instead; a READY
+    # (non-draft) unarmed green reviewed head is the valid arm=false-policy terminal; an
+    # unknown (still-computing) base or a live lease never acts
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"])],
+        provenance, [], issue_labels, now, pr_status=green)] == ["needs-review"]
+    ready_terminal = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                          labels=["review:pass"],
+                          body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert enumerate_review_items(repo, [ready_terminal], provenance, [], issue_labels, now,
+                                  pr_status=green) == []
+    unknown_base = {41: dict(status_of(sha_a, gate="success"), conflicting=None)}
+    assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                  pr_status=unknown_base) == []
+    assert enumerate_review_items(
+        repo, [starved], provenance,
+        [{"holder": f"review:{repo}#41@run.1", "expires_at": now + 100}],
+        issue_labels, now, pr_status=green) == []
+    # an UN-reviewed draft with red CI stays a review item (the loop's own work comes first)
+    fresh = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"])
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [fresh], provenance, [], issue_labels, now, pr_status=red)] == ["needs-review"]
+    # a non-draft review:pass PR blocked on red CI is exactly the merge-queue starver
+    passed = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False, labels=["review:pass"],
+                  body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [passed], provenance, [], issue_labels, now, pr_status=red)] == ["needs-ci-fix"]
+    # review:needs-user stays terminal for the repair states too (escalation must halt the loop)
+    stopped = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs-user"])
+    assert enumerate_review_items(repo, [stopped], provenance, [], issue_labels, now,
+                                  pr_status=red) == []
+    # groom's plain needs:user PR label ("Human attention required") is human-owned terminal
+    # exactly like review:needs-user — for the repair states AND the plain review flow
+    parked_pr = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["needs:user", "review:needs"])
+    assert enumerate_review_items(repo, [parked_pr], provenance, [], issue_labels, now,
+                                  pr_status=red) == []
+    assert enumerate_review_items(repo, [parked_pr], provenance, [], issue_labels, now) == []
+    # ... and a needs:*-parked SOURCE issue parks its PR's whole autonomous surface the same way
+    # (groom's stale-PR path parks exactly the merge states the repair states target)
+    parked_issue = {7: ["area:crate-a", "needs:user", "role:impl", "status:deferred"],
+                    9: issue_labels[9]}
+    assert enumerate_review_items(repo, [starved], provenance, [], parked_issue, now,
+                                  pr_status=red) == []
+    conflicted = {41: status_of(sha_a, gate="failure", conflicting=True)}
+    assert enumerate_review_items(repo, [starved], provenance, [], parked_issue, now,
+                                  pr_status=conflicted) == []
+    assert enumerate_review_items(repo, pulls[:1], provenance, [], parked_issue, now) == []
+    # flip side: the SAME PR without the park emits (asserted red above via ci_items)
+    # GAP-B beats GAP-A per tick: CI on a conflicted base is noise — rebase repair only
+    both = {41: status_of(sha_a, gate="failure", conflicting=True, legs=["js"])}
+    rebase_items = enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                          pr_status=both)
+    assert [(item["state"], item["context"]) for item in rebase_items] == [
+        ("needs-rebase", "")], rebase_items
+    # ... and a conflicting base also pre-empts a normal re-review
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [fresh], provenance, [], issue_labels, now, pr_status=both)] == ["needs-rebase"]
+    # any live review:/fix: lease suppresses both repair states (no double-dispatch)
+    for holder in (f"review:{repo}#41@run.1", f"fix:{repo}#41@run.1"):
+        live = [{"holder": holder, "expires_at": now + 100}]
+        assert enumerate_review_items(repo, [starved], provenance, live, issue_labels, now,
+                                      pr_status=red) == []
+        assert enumerate_review_items(repo, [starved], provenance, live, issue_labels, now,
+                                      pr_status=both) == []
+    # a stale snapshot (status head != live head) is ignored — unknown never acts
+    assert enumerate_review_items(
+        repo, [starved], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_b, gate="failure", conflicting=True)}) == []
+
+    # ---- GAP-C enumeration (issue #42: armed-SHA-mismatch disarm) ----
+    armed_status = {41: status_of(sha_b, armed=True)}
+    moved = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=False, labels=["review:pass"],
+                 body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    acted = enumerate_disarm_items(repo, [moved], armed_status, provenance)
+    assert acted == [{"pr_number": 41, "head_sha": sha_b, "reviewed_sha": sha_a,
+                      "repo": repo}], acted
+    # matching SHAs are NEVER disarmed (the invariant's DO-NOTHING side)
+    bound = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=False, labels=["review:pass"],
+                 body=f"x <!-- sparq-reviewed-sha:{sha_b} -->")
+    assert enumerate_disarm_items(repo, [bound], armed_status, provenance) == []
+    # a READY-but-unarmed mismatch is a disarm interrupted between disable-auto and redraft
+    # (or an arm crash between ready and merge --auto): re-emitted so the sweep re-enters the
+    # crash window and completes the redraft
+    interrupted = enumerate_disarm_items(repo, [moved], {41: status_of(sha_b)}, provenance)
+    assert [item["pr_number"] for item in interrupted] == [41], interrupted
+    # ... but a DRAFTED unarmed mismatch has nothing latched and nothing interrupted, and a
+    # ready-unarmed MATCH is the valid arm=false-policy terminal — both DO-NOTHING
+    drafted_moved = pull(41, "sparq-agent/issue-7-1-1", sha_b, labels=["review:needs"],
+                         body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert enumerate_disarm_items(repo, [drafted_moved], {41: status_of(sha_b)},
+                                  provenance) == []
+    assert enumerate_disarm_items(repo, [bound], {41: status_of(sha_b)}, provenance) == []
+    # unknown snapshot / stale snapshot head / missing provenance / human-owned
+    # (review:needs-user OR groom's needs:user) are all DO-NOTHING
+    assert enumerate_disarm_items(repo, [moved], {}, provenance) == []
+    assert enumerate_disarm_items(repo, [moved], {41: status_of(sha_a, armed=True)},
+                                  provenance) == []
+    assert enumerate_disarm_items(
+        repo, [pull(90, "sparq-agent/issue-1-1-1", sha_b, draft=False)],
+        {90: status_of(sha_b, armed=True)}, provenance) == []
+    for hold in ("review:needs-user", "needs:user"):
+        parked = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=False,
+                      labels=[hold], body="x")
+        assert enumerate_disarm_items(repo, [parked], armed_status, provenance) == []
+    # a never-bound marker reads as "none" (crash-window recovery: arm landed, bind crashed)
+    unbound = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=False, labels=["review:pass"])
+    assert enumerate_disarm_items(repo, [unbound], armed_status, provenance)[0][
+        "reviewed_sha"] == "none"
+
+    # ---- decide_repair_admission: the LIVE trigger gates the defuse (defect-1 regression) ----
+    # trigger holds: drafted proceeds, ready/armed defuses
+    assert decide_repair_admission("needs-rebase", False, None, True) == ("proceed", "rebase")
+    assert decide_repair_admission("needs-rebase", False, None, False) == ("defuse", "rebase")
+    assert decide_repair_admission("needs-ci-fix", True, "failure", True) == ("proceed", "ci")
+    assert decide_repair_admission("needs-ci-fix", None, "failure", False) == ("defuse", "ci")
+    # trigger evaporated between PLAN and CLAIM: a NON-DRAFT (possibly validly-armed) PR must
+    # DEFER with no defuse — never demote a matching-SHA valid arm on snapshot state alone
+    assert decide_repair_admission("needs-rebase", True, None, False)[0] == "defer"
+    assert decide_repair_admission("needs-rebase", None, None, False)[0] == "defer"
+    for live_gate in ("success", "pending", "missing", "unknown", None):
+        assert decide_repair_admission("needs-ci-fix", True, live_gate, False)[0] == "defer"
+        assert decide_repair_admission("needs-ci-fix", True, live_gate, True)[0] == "defer"
+    # conflict repair pre-empts a ci-fix on live data too, and non-repair states never admit
+    assert decide_repair_admission("needs-ci-fix", False, "failure", True)[0] == "defer"
+    assert decide_repair_admission("needs-review", False, "failure", True)[0] == "defer"
+
+    # ---- stranded_live: the terminal hand-off is re-derived live before needs-user ----
+    assert stranded_live(True, False, True, True, "success") is True
+    assert stranded_live(False, False, True, True, "success") is False  # ready: arm=false valid
+    assert stranded_live(True, True, True, True, "success") is False    # armed again: valid arm
+    assert stranded_live(True, False, False, True, "success") is False  # unreviewed: re-review
+    assert stranded_live(True, False, True, False, "success") is False  # conflicting: rebase
+    assert stranded_live(True, False, True, None, "success") is False   # base still computing
+    for live_gate in ("failure", "pending", "missing", "unknown"):
+        assert stranded_live(True, False, True, True, live_gate) is False
+
+    # ---- _dispatch_review_items wiring (defect-1/2 regression, monkeypatched I/O): the
+    # non-draft defuse is reachable ONLY through a live-confirmed trigger, and a human-parked
+    # source issue blocks repair admission before any mutation ----
+    import tempfile
+    fake = {}
+    helper_calls = []
+
+    def fake_gh_json(args):
+        path = args[-1]
+        if "/pulls/41" in path:
+            return fake["pull"]
+        if "/check-runs" in path:
+            return {"check_runs": fake["check_runs"]}
+        if "/issues/7" in path:
+            return {"labels": [{"name": name} for name in fake.get("issue_labels", [])]}
+        raise AssertionError(f"unexpected API read: {path}")
+
+    def fake_helper(script_dir, script, args):
+        helper_calls.append((script, args))
+
+    def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True):
+        return {"number": 41, "state": "open", "draft": draft, "body": body,
+                "mergeable": mergeable, "auto_merge": auto_merge,
+                "head": {"ref": "sparq-agent/issue-7-1-1", "sha": sha_a,
+                         "repo": {"full_name": repo}},
+                "base": {"repo": {"default_branch": "main"}},
+                "user": {"login": bot, "type": "Bot"},
+                "labels": [{"name": name} for name in labels]}
+
+    def run_items(items):
+        helper_calls.clear()
+        _dispatch_review_items(items, repo, {"max_review_rounds": 3, "account_pool": []},
+                               {}, None, wiring_worker_pr, "reg/repo", wiring_root,
+                               "main", bot, None, 0.10)
+
+    ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
+               "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
+               "security": False, "context": "js"}
+    real_io = (_gh_json, _run_target_helper, _target_token)
+    with tempfile.TemporaryDirectory() as tmp:
+        wiring_root = tmp
+        wiring_worker_pr = _load_module(
+            "registry_worker_pr_wiring", Path(__file__).resolve().parent / "worker-pr.py")
+        record_file = Path(tmp) / wiring_worker_pr.provenance_path(repo, 41)
+        record_file.parent.mkdir(parents=True)
+        record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
+        try:
+            globals()["_gh_json"] = fake_gh_json
+            globals()["_run_target_helper"] = fake_helper
+            globals()["_target_token"] = lambda: "tok"
+            gate_red = [{"name": "gate", "status": "completed", "conclusion": "failure",
+                         "started_at": "T1"}]
+            gate_green = [{"name": "gate", "status": "completed", "conclusion": "success",
+                           "started_at": "T1"}]
+            # trigger evaporated (gate re-ran green): the ready PR is NOT defused — no mutation
+            fake.update(pull=live_pull(draft=False, auto_merge={"merge_method": "squash"}),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            run_items([ci_item])
+            assert helper_calls == [], helper_calls
+            # trigger still live: the ready PR IS defused (disarm --when always), exactly once
+            fake["check_runs"] = gate_red
+            run_items([ci_item])
+            assert [(script, args[0], args[-1]) for script, args in helper_calls] == [
+                ("worker-pr.py", "disarm", "always")], helper_calls
+            # human-parked source issue: no defuse, no dispatch, even with a live trigger
+            fake["issue_labels"] = ["area:crate-a", "needs:user"]
+            run_items([ci_item])
+            assert helper_calls == [], helper_calls
+            # human-parked PR label: same stand-down
+            fake.update(pull=live_pull(draft=False, labels=["needs:user"],
+                                       auto_merge={"merge_method": "squash"}),
+                        issue_labels=["area:crate-a"])
+            run_items([ci_item])
+            assert helper_calls == [], helper_calls
+            # stranded ACT: {draft, unarmed, reviewed head, green gate} -> loud needs-user
+            stranded_item = dict(ci_item, state="stranded", context="")
+            fake.update(pull=live_pull(
+                draft=True, labels=["review:needs"],
+                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"), check_runs=gate_green)
+            run_items([stranded_item])
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            # stranded DO-NOTHING: the posture failed to re-derive (gate red again) -> defer
+            fake["check_runs"] = gate_red
+            run_items([stranded_item])
+            assert helper_calls == [], helper_calls
+        finally:
+            (globals()["_gh_json"], globals()["_run_target_helper"],
+             globals()["_target_token"]) = real_io
+
+    # ---- GAP-D (issue #27): busy-area union over ALL open worker PRs ----
+    plan_items = [{"number": 7, "package": "crate-a", "deferred": False},
+                  {"number": 9, "package": "crate-b", "deferred": False}]
+    in_review = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"])
+    kept = filter_busy_area_items(plan_items, repo, [in_review], issue_labels)
+    assert [item["number"] for item in kept] == [9], kept  # crate-a busy via issue 7's area
+    assert filter_busy_area_items(plan_items, repo, [], issue_labels) == plan_items
+    # draft-agnostic, review-state-agnostic: a non-draft review:pass PR still reserves its area
+    ready_pr = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False, labels=["review:pass"])
+    assert [item["number"] for item in filter_busy_area_items(
+        plan_items, repo, [ready_pr], issue_labels)] == [9]
+    # area:* labels on the PR itself union in as well
+    labelled = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["area:crate-b"])
+    assert filter_busy_area_items(plan_items, repo, [labelled], issue_labels) == []
+    # a known source issue with NO areas reserves the serializing global partition
+    assert filter_busy_area_items(plan_items, repo,
+                                  [pull(60, "sparq-agent/issue-8-1-1", sha_a)],
+                                  {8: ["role:impl"]}) == []
+    # an unknown/closed source issue with no PR areas reserves nothing (no pipeline freeze)
+    assert filter_busy_area_items(plan_items, repo,
+                                  [pull(61, "sparq-agent/issue-999-1-1", sha_a)],
+                                  issue_labels) == plan_items
+    # a global plan item never co-runs with ANY in-flight worker PR
+    assert filter_busy_area_items([{"number": 3, "package": "__global__", "deferred": False}],
+                                  repo, [in_review], issue_labels) == []
+    # fork-headed imposters do not reserve
+    assert filter_busy_area_items(plan_items, repo,
+                                  [pull(62, "sparq-agent/issue-7-1-1", sha_a,
+                                        head_repo="mallory/fork")],
+                                  issue_labels) == plan_items
+
     # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
     deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]
     live_impl = [{"holder": f"{repo}#9@run.1", "expires_at": now + 100}]
@@ -1162,6 +1948,37 @@ def _self_test():
     assert _resolvable_chain(["terra"], routing) == ["terra"]
     routing["models"]["terra"]["provider_model"] = "gpt-5.6-codex"
     assert _resolvable_chain(["terra"], routing) == ["terra"]
+
+    # ---- CLAIM disarm application (issue #42): runs per-item-resilient and token-gated; the
+    # live precondition re-derivation itself lives in worker-pr.py disarm (tested there) ----
+    calls = []
+    real_helper, real_token = _run_target_helper, _target_token
+    try:
+        globals()["_target_token"] = lambda: "tok"
+
+        def fake_helper(script_dir, script, args):
+            calls.append(args)
+            if args[4] == "13":
+                raise DispatchError("boom")
+
+        globals()["_run_target_helper"] = fake_helper
+        _apply_disarm_items([
+            {"pr_number": 13, "head_sha": "1" * 40, "reviewed_sha": "none",
+             "repo": "example/repo"},
+            {"pr_number": 14, "head_sha": "1" * 40, "reviewed_sha": "none",
+             "repo": "example/repo"},
+        ], "example/repo", Path("."), "reg[bot]")
+        # a failing item SKIPS (never aborts the sweep) and every call is the strict
+        # mismatch-only mode — CLAIM never requests an unconditional disarm from the plan
+        assert [args[4] for args in calls] == ["13", "14"], calls
+        assert all(args[0] == "disarm" and args[-1] == "mismatch" for args in calls)
+        calls.clear()
+        _apply_disarm_items([{"pr_number": 15, "head_sha": "1" * 40, "reviewed_sha": "none",
+                              "repo": "example/repo"}], "example/repo", Path("."), "")
+        assert calls == []            # no bot identity -> defer with NO mutation attempted
+    finally:
+        globals()["_run_target_helper"] = real_helper
+        globals()["_target_token"] = real_token
 
     # Escalation contract (routing.toml escalate=true, audit-2026-07-17): a security-surface item
     # whose restricted tier has ZERO usage-eligible accounts escalates to needs:user — but ONLY on

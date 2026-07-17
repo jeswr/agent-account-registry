@@ -1,6 +1,11 @@
 # Cross-provider review / same-provider fix runner for worker DRAFT PRs. ONE workflow with a
 # `mode: review|fix` input mirroring worker.yml's resolve -> claim -> run -> release DAG; the
 # dispatch.yml sweep is the single scheduler that launches it off durable PR marker state.
+# mode=fix carries a `fix_kind` flavour: verdict (seeded from the registry-recorded review
+# verdict, the original loop), ci (repair red full-matrix legs on the current head; failing
+# check names arrive as untrusted advisory context), and rebase (host-started merge of the
+# default branch into a CONFLICTING PR branch — the model only resolves conflict markers and
+# the host commits the two-parent merge, so worker-opened ancestry is never rewritten).
 #
 # Trust posture (locked decisions):
 # - The implementer identity comes ONLY from the registry provenance record written at publish
@@ -36,6 +41,17 @@ on:
         required: true
         type: choice
         options: [review, fix]
+      fix_kind:
+        description: fix flavour — verdict (review findings), ci (red full-matrix legs), rebase (conflicting base)
+        required: false
+        default: verdict
+        type: choice
+        options: [verdict, ci, rebase]
+      fix_context:
+        description: Advisory failing-check-name context for fix_kind=ci (newline-free; the dispatcher derives it live)
+        required: false
+        default: ''
+        type: string
       review_round:
         description: Review round this run belongs to (review = rounds+1, fix = current round)
         required: true
@@ -93,6 +109,8 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           MODE: ${{ inputs.mode }}
+          FIX_KIND: ${{ inputs.fix_kind }}
+          FIX_CONTEXT: ${{ inputs.fix_context }}
           REVIEW_ROUND: ${{ inputs.review_round }}
           ACCOUNT: ${{ inputs.account }}
           CLAIM_ID: ${{ inputs.claim_id }}
@@ -104,6 +122,8 @@ jobs:
           target = os.environ["TARGET_REPO"]
           pr_number = os.environ["PR_NUMBER"]
           mode = os.environ["MODE"]
+          fix_kind = os.environ["FIX_KIND"] or "verdict"
+          fix_context = os.environ["FIX_CONTEXT"]
           review_round = os.environ["REVIEW_ROUND"]
           account = os.environ["ACCOUNT"]
           claim_id = os.environ["CLAIM_ID"]
@@ -113,6 +133,14 @@ jobs:
               raise SystemExit("pr_number must be a positive integer")
           if mode not in {"review", "fix"}:
               raise SystemExit("mode must be review or fix")
+          if fix_kind not in {"verdict", "ci", "rebase"}:
+              raise SystemExit("fix_kind must be verdict, ci, or rebase")
+          if mode == "review" and fix_kind != "verdict":
+              raise SystemExit("review mode takes no fix flavour")
+          # Printable-ASCII, single-line, capped: the context is advisory model input (failing
+          # check-run names) that must never smuggle control characters into prompts or logs.
+          if not re.fullmatch(r"[ -~]{0,1000}", fix_context):
+              raise SystemExit("fix_context must be short single-line printable ASCII")
           if not re.fullmatch(r"[1-9][0-9]{0,2}", review_round):
               raise SystemExit("review_round must be a small positive integer")
           if not re.fullmatch(r"acct[0-9a-z]{2,}", account):
@@ -145,6 +173,7 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           MODE: ${{ inputs.mode }}
+          FIX_KIND: ${{ inputs.fix_kind }}
         run: |
           set -euo pipefail
           gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pull.json"
@@ -160,6 +189,7 @@ jobs:
               pull = json.load(handle)
           repo = os.environ["TARGET_REPO"]
           mode = os.environ["MODE"]
+          fix_kind = os.environ.get("FIX_KIND") or "verdict"
           if pull.get("state") != "open" or pull.get("draft") is not True:
               raise SystemExit("pull request is not an open draft")
           head = pull.get("head") or {}
@@ -179,9 +209,14 @@ jobs:
               label.get("name") for label in (pull.get("labels") or [])
               if isinstance(label, dict) and isinstance(label.get("name"), str)
           })
-          if "review:needs-user" in labels:
-              raise SystemExit("pull request is terminal (review:needs-user)")
-          if mode == "fix" and "review:changes" not in labels:
+          # review:needs-user (loop escalation) and needs:user (groom's parked-PR "Human
+          # attention required" marker) are BOTH human-owned terminal for every mode/flavour.
+          if {"review:needs-user", "needs:user"} & set(labels):
+              raise SystemExit("pull request is human-owned (review:needs-user / needs:user)")
+          # Only the verdict flavour is bound to review:changes; the ci/rebase repair flavours
+          # (GAP-A/B) run over any non-terminal review state — the dispatcher re-derived their
+          # triggers (concluded-red gate / conflicting base) from live data at admission.
+          if mode == "fix" and fix_kind == "verdict" and "review:changes" not in labels:
               raise SystemExit("fix mode requires the review:changes state")
           # Idempotence guard: the reviewed-sha marker is bound LAST in the outcome job, so a
           # marker equal to the live head proves this head's review completed end-to-end — a
@@ -235,6 +270,10 @@ jobs:
               label.get("name") for label in (issue_data.get("labels") or [])
               if isinstance(label, dict) and isinstance(label.get("name"), str)
           })
+          # A needs:*-parked SOURCE issue is human-owned: no autonomous review/fix/rebase may
+          # run against its PR until the human clears the label (mirrors CLAIM admission).
+          if any(label.startswith("needs:") for label in issue_labels):
+              raise SystemExit("source issue is human-owned (needs:*)")
           merged = set(labels) | set(issue_labels)
           keywords = ("zk", "mpc", "crypto", "auth", "e2ee")
           security = (any(k in label for label in merged for k in keywords)
@@ -847,10 +886,11 @@ jobs:
           printf 'verdict_b64=%s\n' "$(base64 -w0 "$verdict")" >> "$GITHUB_OUTPUT"
           printf 'files_b64=%s\n' "$(base64 -w0 "$files")" >> "$GITHUB_OUTPUT"
 
-      # ---- mode=fix: same-provider fix seeded with the registry-recorded verdict ----
+      # ---- mode=fix: same-provider fix seeded with the registry-recorded verdict (kind=verdict
+      # only; the ci/rebase repair flavours build their own context and need no verdict) ----
       - name: Stage the registry-recorded verdict for the fixer
         id: stage-verdict
-        if: ${{ inputs.mode == 'fix' && steps.prepare.outcome == 'success' }}
+        if: ${{ inputs.mode == 'fix' && inputs.fix_kind != 'ci' && inputs.fix_kind != 'rebase' && steps.prepare.outcome == 'success' }}
         env:
           TARGET_REPO: ${{ inputs.target_repo }}
           REVIEW_ROUND: ${{ inputs.review_round }}
@@ -865,7 +905,9 @@ jobs:
 
       - name: Run same-provider fix (findings framed as untrusted data)
         id: fix
-        if: ${{ inputs.mode == 'fix' && steps.stage-verdict.outcome == 'success' }}
+        # kind=verdict requires the staged verdict; the ci/rebase flavours run whenever prepare
+        # succeeded (stage-verdict is skipped for them, and a FAILED stage still blocks verdict).
+        if: ${{ inputs.mode == 'fix' && steps.prepare.outcome == 'success' && (steps.stage-verdict.outcome == 'success' || steps.stage-verdict.outcome == 'skipped') }}
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
@@ -877,6 +919,8 @@ jobs:
           WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
           WORKER_REVIEW_FILE: ${{ runner.temp }}/registry-worker/review-verdict.json
           WORKER_FIX_ROUND: ${{ inputs.review_round }}
+          WORKER_FIX_KIND: ${{ inputs.fix_kind }}
+          WORKER_FIX_CONTEXT: ${{ inputs.fix_context }}
           WORKER_IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
           WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
@@ -926,12 +970,15 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}
           TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
           TARGET_BOT_LOGIN: ${{ steps.target.outputs.bot_login }}
           TARGET_BOT_ID: ${{ steps.target.outputs.bot_id }}
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_PR_NUMBER: ${{ inputs.pr_number }}
           WORKER_PR_HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
+          WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
           WORKER_FIX_ROUND: ${{ inputs.review_round }}
+          WORKER_FIX_KIND: ${{ inputs.fix_kind }}
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
         run: bash ../registry/scripts/worker-live.sh push-fix
 
