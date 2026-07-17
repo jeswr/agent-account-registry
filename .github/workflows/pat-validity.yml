@@ -1,0 +1,44 @@
+# [FABLE-5] Weekly REGISTRY_SECRETS_PAT validity probe (issue #37): a rotated/expired PAT used to
+# be discovered only when set-up-account or the rotation write-back actually ran `gh secret set` —
+# i.e. while a human was waiting on onboarding. This probes ahead of time (GET /user + the Actions
+# secrets public-key read, the exact read `gh secret set` performs) and upserts ONE rolling
+# `from:agent` alert issue on invalid/insufficient-scope; network-unknown never alerts and never
+# closes an existing alert (no false alarms, no false recoveries). The token is never printed.
+name: pat-validity
+on:
+  schedule:
+    # Weekly is enough — fine-grained PAT expiry is calendar-scale. Explicit off-peak minute
+    # (not a wildcard or :00) per repo convention: wildcard/top-of-hour schedules are throttled
+    # hardest under load.
+    - cron: '41 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  issues: write   # rolling alert upsert only
+
+concurrency:
+  group: pat-validity
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (pinned)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Self-tests are the gate in this repo: never trust a probe whose own fixtures fail.
+      - name: Self-test the probe before trusting its verdict
+        run: python3 scripts/pat-validity.py --self-test
+
+      - name: Probe PAT validity + upsert the rolling alert
+        env:
+          # Materialized single-secret env (the fingerprint-accounts least-exposure posture):
+          # ONLY the probed PAT enters this step — never toJSON(secrets).
+          REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
+          # The alert issue is written with the ambient token (issues:write above), NOT the PAT —
+          # a broken PAT must still be able to page the maintainer.
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+        run: python3 scripts/pat-validity.py
