@@ -9,8 +9,9 @@
 #   worker/review-fix branch pushes — must stay allowed). Do NOT create the ruleset here.
 #
 # Least privilege: contents:read only (the gate reads code + runs tests; it never writes). Actions
-# are SHA-pinned. actionlint is fetched from a pinned release tag + checksum-free `go install` is
-# avoided in favour of the official pinned action.
+# are SHA-pinned. actionlint is fetched as a pinned release binary verified against the release's
+# published sha256 (the raven-actions installer broke under the runner's forced Node-24 migration,
+# and `go install` is checksum-free — a pinned+checksummed direct download is the sturdiest option).
 name: pr-gate
 
 on:
@@ -43,10 +44,17 @@ jobs:
       - name: Install PyYAML for the workflow-yaml lint
         run: python3 -m pip install --disable-pip-version-check pyyaml
 
-      - name: Install actionlint (pinned release)
-        uses: raven-actions/actionlint@01fce4f43a270a612932cb1c64d40505a029f821 # v2.0.0
-        with:
-          version: 1.7.7
+      - name: Install actionlint (pinned release, sha256-verified)
+        run: |
+          set -euo pipefail
+          ver=1.7.7
+          sha256=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+          curl -fsSL --retry 3 -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz"
+          echo "${sha256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/actionlint-bin"
+          tar -C "$RUNNER_TEMP/actionlint-bin" -xzf /tmp/actionlint.tar.gz actionlint
+          echo "$RUNNER_TEMP/actionlint-bin" >> "$GITHUB_PATH"
 
       - name: Run the full registry self-test suite
         run: |
