@@ -378,7 +378,7 @@ write_back() {
     die 'credential paths escaped WORKER_ROOT'
   [[ -f "$current" && ! -L "$current" && -f "$baseline" && ! -L "$baseline" ]] ||
     die 'credential comparison files are missing or unsafe'
-  [[ "$account" =~ ^acct[0-9]{2,}$ ]] || die 'unsafe account handle'
+  [[ "$account" =~ ^acct[0-9a-z]{2,}$ ]] || die 'unsafe account handle'
   [[ "$secret_ref" == "${account^^}_TOKEN" ]] || die 'secret reference does not match claimed account'
   [[ "$registry_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe registry repo'
   if cmp -s -- "$baseline" "$current"; then

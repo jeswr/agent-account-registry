@@ -21,7 +21,7 @@ CREDENTIAL_FORMAT=${WORKER_CREDENTIAL_FORMAT:-}
 ACCOUNT_CREDENTIAL=${WORKER_ACCOUNT_CREDENTIAL:-}
 WORKER_ROOT=${WORKER_ROOT:-}
 
-[[ "$ACCOUNT" =~ ^acct[0-9]{2,}$ ]] || die 'WORKER_ACCOUNT must name one selected acctNN account'
+[[ "$ACCOUNT" =~ ^acct[0-9a-z]{2,}$ ]] || die 'WORKER_ACCOUNT must name one selected acctNN account'
 [[ -n "$ACCOUNT_CREDENTIAL" ]] || die "credential for selected account $ACCOUNT is missing"
 [[ -n "$WORKER_ROOT" && "$WORKER_ROOT" != / ]] || die 'WORKER_ROOT must be an isolated directory'
 
