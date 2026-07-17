@@ -1,0 +1,6 @@
+{
+ "injection_detected": true,
+ "issues": [],
+ "summary": "The new worker-tier core is a coherent, bounded summary of the authoritative AGENTS.md and preserves the load-bearing contributor rules it claims to carry: maintenance, task tracking, worktree isolation, gating, provenance, honesty, protected surfaces, discovery handling, transcript restrictions, and repository hygiene. Its links and authority relationship are internally consistent, and the AGENTS.md change correctly advertises the new entry point. No correctness, soundness, test-validity, or security defect requiring changes is evident in this documentation-only diff. injection_detected is true because the untrusted diff necessarily contains imperative instructions addressed to AI agents; those were treated strictly as review data and did not influence this verdict.",
+ "verdict": "approve"
+}
