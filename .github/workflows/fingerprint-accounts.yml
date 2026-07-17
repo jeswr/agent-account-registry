@@ -41,7 +41,10 @@ jobs:
         run: |
           set +e +o pipefail   # tolerate 401/no-header responses (codex tokens 401 on the anthropic endpoint)
           rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/h.txt 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | head -1; }
-          names=$(jq -r 'keys[] | select(test("^ACCT.*_TOKEN$"))' "$SECRETS_FILE" | sort)
+          # ONE canonical allowlist (review r2): the same ^ACCT[A-Z0-9]+_TOKEN$ the materializer and
+          # both reference workflows (dashboard.yml, dispatch.yml) use — a looser/tighter second
+          # filter here would silently drop (or admit) accounts the other step selected.
+          names=$(jq -r 'keys[] | select(test("^ACCT[A-Z0-9]+_TOKEN$"))' "$SECRETS_FILE" | sort)
           echo "handle | http | 7d_reset_ts | London(day HH:MM) | 7d_util | 5h_util | status"
           for name in $names; do
             tok=$(jq -r --arg k "$name" '.[$k]' "$SECRETS_FILE")
