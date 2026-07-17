@@ -1,0 +1,14 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Before this change, specVersion=json-ld-1.0 selected ProcessingMode::JsonLd10 and exercised the native compactor. The new predicate returns before that path and broadly skips all such positives, including future manifest additions. Because the implementation exposes and the runner already exercises JSON-LD 1.0 processing mode, the claim that this is merely a test for a different processor is not demonstrated. Reclassifying t0038 changes 228/229 run tests into 228/228 without fixing behavior, while the research record then advertises 100% over run tests. The stated contradiction with tp001 is an argument that one expectation may be invalid, but the diff supplies neither a narrowly pinned exception nor a regression test/evidence establishing the manifest case is formally inapplicable.",
+   "file": "crates/sparq-conformance/tests/jsonld_suite/compact.rs",
+   "fix_hint": "Keep t0038 as a documented failure unless the implementation explicitly drops JSON-LD 1.0-mode conformance. If the pinned upstream case is demonstrably invalid, encode a narrowly scoped skip for that exact manifest ID with a sourceable upstream/spec justification, add a test pinning that only t0038 is skipped and that processingMode=json-ld-1.0 cases still execute, and avoid generalizing the exception to every future specVersion=json-ld-1.0 positive.",
+   "severity": "major",
+   "title": "Failing supported 1.0-mode case is removed from the conformance denominator"
+  }
+ ],
+ "summary": "The change converts the sole failing positive conformance case into a skip without establishing that the case is inapplicable to this implementation. The compact runner already selects ProcessingMode::JsonLd10 from specVersion, so the new early return bypasses an explicitly supported real execution path and makes the reported run-test rate 100% by denominator reduction. The asserted conflict with tp001 may justify documenting an upstream test-suite inconsistency, but it does not by itself justify silently treating every current or future json-ld-1.0 compact positive as out of scope.",
+ "verdict": "request_changes"
+}
