@@ -81,16 +81,6 @@
    "expires_at": 1784299778
   },
   {
-   "account": "acct02",
-   "claim_id": "61ae3eceb55d46cfb97b311e2dd51e05",
-   "holder": "sparq-org/sparq#2486@dispatch-29582505258.1",
-   "package": "sparq-metamorph",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784293481,
-   "expires_at": 1784299781
-  },
-  {
    "account": "acct05",
    "claim_id": "e2d7c220fbed42ec8c4269d1f84125c0",
    "holder": "sparq-org/sparq#2487@dispatch-29582505258.1",
