@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The change correctly applies the deterministic N-Triples boundary tie-break over the complete candidate pool, excludes node seeds before determining the boundary, and preserves identical pre-filter/post-filter results. The blank-node/ground-triple domain guard is recursive and fail-closed wherever a term affects returned membership. Mainline integration propagates errors, leaves approximate retrieval explicitly outside the exact tie contract, rejects declared non-cosine provenance, and updates the public API documentation. The focused unit and end-to-end tests exercise dictionary-order disagreement, both filtered cost branches, seed exclusion, blank-node rejection and non-load-bearing blank nodes, metric rejection, vocabulary revision reporting, and RDF provenance emission; they traverse the real query rewrite paths rather than mocks. No security defect or prompt-injection content was found.",
+ "verdict": "approve"
+}
