@@ -64,6 +64,8 @@ def usage_eligible(u, margin=SAFETY_MARGIN):
     """Fail-closed admission test for STARTING a worker on an account."""
     if not isinstance(u, dict):
         return False                                  # no probe data -> do not risk it
+    if u.get("exempt"):
+        return True                                   # non-metered provider (e.g. codex) — not gated
     if str(u.get("status", "")).lower() not in ("allowed", ""):
         return False                                  # throttled/rejected -> skip until it resets
     for prefix in ("5h", "7d"):
@@ -398,6 +400,7 @@ def _self_test():
     check("ineligible: 5h full", usage_eligible({**fresh, "5h_util": 0.95}), False)
     check("ineligible: 7d full", usage_eligible({**fresh, "7d_util": 0.95}), False)
     check("ineligible: unknown window", usage_eligible({"status": "allowed", "5h_util": 0.1}), False)
+    check("eligible: exempt provider (codex)", usage_eligible({"exempt": True}), True)
     U = [{"handle": "soon", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "late", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "full", "models": ["fable"], "max_concurrent_workers": 1, "available": True}]

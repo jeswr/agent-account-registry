@@ -295,9 +295,26 @@ def _release_failed_dispatch(allocator, registry_repo, claim_id):
         return False
 
 
+def _load_usage():
+    """Optional live-usage map for usage-aware dispatch, written by scripts/account-usage.py and passed
+    via WORKER_USAGE_FILE. Absent/empty/unreadable -> None, and dispatch falls back to the static cap
+    with no usage gating (backward compatible)."""
+    path = os.environ.get("WORKER_USAGE_FILE")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) and data else None
+
+
 def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
     policy_module = _load_module("registry_policy_resolve", script_dir / "policy-resolve.py")
     allocator = _load_module("registry_select_and_claim", script_dir / "select-and-claim.py")
+    usage = _load_usage()
+    catalog_cache = {"accounts": None}  # read the account catalog at most once, only if usage-aware
     try:
         with open(plan_path, encoding="utf-8") as handle:
             plan = validate_plan(json.load(handle))
@@ -341,6 +358,19 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
             holder = f"{repo}#{number}@dispatch-{os.environ.get('GITHUB_RUN_ID', 'local')}." \
                      f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
             ttl = resolved["worker_timeout_minutes"] * 60 + 900
+            # Dynamic concurrency: when live usage is available, the cap is the number of accounts
+            # with real headroom (starts high, backs off as utilisation climbs), bounded by the static
+            # policy max_concurrent. Without usage, fall back to the static cap (backward compatible).
+            if usage is not None:
+                if catalog_cache["accounts"] is None:
+                    catalog_cache["accounts"] = allocator.read_accounts(registry_repo)
+                pool = set(resolved["account_pool"])
+                pool_accounts = [a for a in catalog_cache["accounts"] if a["handle"] in pool]
+                effective_cap = allocator.dynamic_concurrency(
+                    pool_accounts, usage, model_chain=resolved["model_chain"],
+                    absolute_cap=resolved["max_concurrent"])
+            else:
+                effective_cap = resolved["max_concurrent"]
             try:
                 claim = allocator.claim(
                     registry_repo,
@@ -352,7 +382,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir):
                     ttl=ttl,
                     account_pool=resolved["account_pool"],
                     holder_prefix=holder_prefix,
-                    max_holder_concurrent=resolved["max_concurrent"],
+                    max_holder_concurrent=effective_cap,
+                    usage=usage,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
                 raise DispatchError(f"lease allocation failed for {repo}#{number}") from exc
