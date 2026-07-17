@@ -1,5 +1,5 @@
 # [OPUS-4.8] Resolve the Anthropic account EMAIL behind a stored oauth/setup-token, for registry
-# metadata accuracy. Prints ONLY the email (the token is a masked secret and is never echoed).
+# metadata accuracy. Prints ONLY the email + HTTP status (the token is a masked secret, never echoed).
 name: account-whoami
 on:
   workflow_dispatch:
@@ -18,12 +18,14 @@ jobs:
           SECRETS_JSON: ${{ toJSON(secrets) }}
           ACCOUNT: ${{ inputs.account }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           case "$ACCOUNT" in acct[0-9]*) ;; *) echo "::error::bad account handle"; exit 1 ;; esac
           UP="$(printf '%s' "$ACCOUNT" | tr '[:lower:]' '[:upper:]')_TOKEN"
           TOK="$(printf '%s' "$SECRETS_JSON" | jq -r --arg k "$UP" '.[$k] // ""')"
           [ -n "$TOK" ] || { echo "::error::secret ${UP} is empty/unset"; exit 1; }
-          resp="$(curl -s --max-time 20 -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" https://api.anthropic.com/api/oauth/profile)"
-          email="$(printf '%s' "$resp" | grep -oiE '"email"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
-          printf '::notice::account=%s email=%s\n' "$ACCOUNT" "${email:-<no email in response>}"
-          printf 'account=%s email=%s\n' "$ACCOUNT" "${email:-<no email in response>}"
+          code="$(curl -s -o /tmp/prof.json -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" https://api.anthropic.com/api/oauth/profile)"
+          email="$(grep -oiE '"email"[[:space:]]*:[[:space:]]*"[^"]*"' /tmp/prof.json 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
+          keys="$(grep -oE '"[a-zA-Z_]+"[[:space:]]*:' /tmp/prof.json 2>/dev/null | tr -d ' :' | sort -u | tr '\n' ',' )"
+          printf 'account=%s http_status=%s email=%s\n' "$ACCOUNT" "$code" "${email:-<none>}"
+          printf 'response_keys=%s\n' "${keys:-<none>}"
+          printf '::notice::account=%s http_status=%s email=%s\n' "$ACCOUNT" "$code" "${email:-<none>}"
