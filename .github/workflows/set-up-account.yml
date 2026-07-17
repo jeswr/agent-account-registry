@@ -27,9 +27,13 @@ jobs:
     timeout-minutes: 20
     env:
       TARGET_REPO: sparq-org/sparq
-      LOGIN_DIR: ${{ runner.temp }}/login
       GH_TOKEN: ${{ github.token }}
     steps:
+      # The `runner` context is not valid in job-level env (it invalidated the whole workflow —
+      # GitHub refused to parse the file, so the broker never fired). Derive LOGIN_DIR in a step.
+      - name: Resolve LOGIN_DIR under the runner temp dir
+        run: echo "LOGIN_DIR=$RUNNER_TEMP/login" >> "$GITHUB_ENV"
+
       - name: Trust gate — actor AND author must be admin/maintain
         run: |
           for u in "${{ github.actor }}" "${{ github.event.issue.user.login }}"; do
