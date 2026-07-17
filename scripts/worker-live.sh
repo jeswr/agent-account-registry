@@ -165,8 +165,13 @@ _run_headless_harness() {
 
   local combined_prompt="$worker_root/combined-prompt.txt"
   local model_log="$worker_root/model-output.log"
+  # CLI stderr is captured SEPARATELY from model stdout (review defect #4): the exit-class
+  # grep below must classify from HOST-observable signals (the CLI's own error stream) only,
+  # never from model-authored stdout content an adversarial task could steer.
+  local cli_err_log="$worker_root/cli-stderr.log"
   : > "$model_log"
-  chmod 600 "$model_log"
+  : > "$cli_err_log"
+  chmod 600 "$model_log" "$cli_err_log"
   # P0 context-economy telemetry (research/context-economy-worker-fleet.md): the harness runs in a
   # machine-readable output mode (claude stream-json / codex --json) so the HOST can lift ONLY
   # usage/cost numbers + tool-invocation counts out of the withheld log after the run. The
@@ -241,7 +246,7 @@ _run_headless_harness() {
           --append-system-prompt-file ".claude/agents/$agent.md" \
           --no-session-persistence \
           --output-format stream-json --verbose \
-          < "$prompt_file" > "$model_log" 2>&1
+          < "$prompt_file" > "$model_log" 2> "$cli_err_log"
       ) || rc=$?
       ;;
     codex)
@@ -264,7 +269,7 @@ _run_headless_harness() {
           --ignore-user-config \
           --json \
           -C /workspace \
-          - < "$combined_prompt" > "$model_log" 2>&1
+          - < "$combined_prompt" > "$model_log" 2> "$cli_err_log"
       ) || rc=$?
       ;;
   esac
@@ -272,18 +277,40 @@ _run_headless_harness() {
   if [[ "$rc" -ne 0 ]]; then
     # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
     # model output/credential) so failures are debuggable without leaking secrets.
-    local cls=other
+    # HOST-OBSERVABLE SIGNALS ONLY (review defect #4): classify from the nonzero CLI exit code
+    # plus the CLI's OWN error text — its stderr stream and, from stdout, ONLY lines carrying the
+    # harness's `[error]`/`Error:` line-start prefix (in stream-json/--json mode model-authored
+    # content is framed inside `{`-prefixed JSON event lines, so it can never start such a line).
+    # Model stdout content is NEVER grepped wholesale — an adversarial task could otherwise plant
+    # `401`/`usage limit reached` text to steer the class. An unmatched nonzero exit is `unknown`
+    # (not provider-attributable; model-health counts it toward persistence but never an outage).
+    local err_signals="$worker_root/error-signals.log"
+    {
+      cat "$cli_err_log" 2>/dev/null || true
+      grep -aiE '^\[error\]|^error[: ]' "$model_log" 2>/dev/null || true
+    } > "$err_signals"
+    chmod 600 "$err_signals"
+    local cls=unknown
     # session-limit (subscription window exhausted) is a DISTINCT, maintainer-actionable class from a
     # transient rate-limit: the account needs its usage window reset, not a retry. Detect it first.
-    if grep -qiE "session limit|hit your (usage|session)|usage limit reached|weekly limit|resets? (at|on|in) " "$model_log"; then cls=session-limit
-    elif grep -qiE '429|529|overloaded|rate.?limit|too many requests' "$model_log"; then cls=rate-limit
-    elif grep -qiE '401|403|unauthorized|authenticat|invalid.*(key|credential|token)|expired|oauth|forbidden|not logged in|please run.*login' "$model_log"; then cls=auth
-    elif grep -qiE 'ENOENT|command not found|no such file|cannot find' "$model_log"; then cls=setup
+    if grep -qiE "session limit|hit your (usage|session)|usage limit reached|weekly limit|resets? (at|on|in) " "$err_signals"; then cls=session-limit
+    elif grep -qiE '429|529|overloaded|rate.?limit|too many requests' "$err_signals"; then cls=rate-limit
+    elif grep -qiE '401|403|unauthorized|authenticat|invalid.*(key|credential|token)|expired|oauth|forbidden|not logged in|please run.*login' "$err_signals"; then cls=auth
+    elif grep -qiE 'ENOENT|command not found|no such file|cannot find' "$err_signals"; then cls=setup
+    fi
+    # Reset-hint (review defect #9): surface the reset time the session-limit regex already
+    # detects, sanitized to a short fixed charset (it feeds an alert body, never a command).
+    local reset_hint=""
+    if [[ "$cls" == session-limit ]]; then
+      reset_hint="$(grep -aioE 'resets?( at| on| in)?[ :]*[A-Za-z0-9][A-Za-z0-9 :,/+.()-]{0,60}' "$err_signals" \
+        | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80)" || reset_hint=""
     fi
     printf '::error::worker-live: model-exit-class=%s (raw model output withheld to protect credentials)\n' "$cls"
     # surface the class to the workflow so it can alert the maintainer on capped/expired accounts
     [[ -n ${GITHUB_ENV:-} ]] && printf 'WORKER_EXIT_CLASS=%s\n' "$cls" >> "$GITHUB_ENV" || true
+    { [[ -n ${GITHUB_ENV:-} && -n "$reset_hint" ]] && printf 'WORKER_RESET_HINT=%s\n' "$reset_hint" >> "$GITHUB_ENV" ; } || true
     { [[ -n ${WORKER_OUTPUT_DIR:-} ]] && printf '%s\n' "$cls" > "$WORKER_OUTPUT_DIR/exit-class" ; } 2>/dev/null || true
+    { [[ -n ${WORKER_OUTPUT_DIR:-} && -n "$reset_hint" ]] && printf '%s\n' "$reset_hint" > "$WORKER_OUTPUT_DIR/reset-hint" ; } 2>/dev/null || true
   fi
   [[ "$rc" -eq 0 ]] || die "headless $harness model exited non-zero (output withheld to protect credentials)"
 }
@@ -446,9 +473,13 @@ run_gate() {
 # PURE selectors — touched-file classification + the suite list — without a live cargo/gh call).
 # FULL_SELFTEST_SUITE mirrors the scripts every recent registry wave self-tests; every touched
 # script that HAS a --self-test is additionally run so a change to it is validated directly.
+# NAMING NOTE (review round): the routing validator here is scripts/route-resolve.py (added by the
+# onboarding push) — there is NO scripts/routing-validate.py; do not reference that name in suite
+# lists or briefs.
 FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
 triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
-account-usage.py usage-alert.py broker-refresh.py backfill-provenance.py dashboard-gen.py worker-live.sh"
+account-usage.py usage-alert.py model-health.py broker-refresh.py backfill-provenance.py \
+dashboard-gen.py worker-live.sh"
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the

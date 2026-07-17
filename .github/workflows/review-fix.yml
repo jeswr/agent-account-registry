@@ -715,6 +715,11 @@ jobs:
       injection_detected: ${{ steps.fix.outputs.injection_detected }}
       gate_outcome: ${{ steps.gate.outcome }}
       pushed: ${{ steps.push.outcome == 'success' && 'true' || 'false' }}
+      # Model-access health (registry #32): the sanitized exit CLASS of the review/fix model launch,
+      # recorded by the separate no-target-code `model_health` job (success or failure), plus the
+      # sanitized session-limit reset time (review defect #9; empty for every other class).
+      exit_class: ${{ steps.exit-class.outputs.class }}
+      reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
     steps:
       - name: Checkout private registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -1038,6 +1043,31 @@ jobs:
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back
 
+      # Model-access health (registry #32): capture the sanitized exit CLASS of whichever model step
+      # (review or fix) ran so the separate no-target-code `model_health` job records it.
+      # worker-live.sh sets WORKER_EXIT_CLASS (+ WORKER_RESET_HINT on session-limit) in
+      # $GITHUB_ENV on a FAILED launch only; a successful model step means `success`. always()
+      # with NO skipped-guard (review defect #4): both steps skipped after an acquired claim means
+      # a pre-launch abort (prep/checkout failure) or timeout/cancellation — record class=unknown
+      # (counted toward persistence, never a provider-outage) instead of recording nothing.
+      - name: Capture model exit class
+        id: exit-class
+        if: ${{ always() }}
+        env:
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          FIX_OUTCOME: ${{ steps.fix.outcome }}
+        run: |
+          set -uo pipefail
+          if [[ "$REVIEW_OUTCOME" == "success" || "$FIX_OUTCOME" == "success" ]]; then
+            cls=success
+          elif [[ "$REVIEW_OUTCOME" == "skipped" && "$FIX_OUTCOME" == "skipped" ]]; then
+            cls=unknown   # pre-launch abort/cancellation: no host-observed CLI exit exists
+          else
+            cls="${WORKER_EXIT_CLASS:-unknown}"
+          fi
+          echo "class=$cls" >> "$GITHUB_OUTPUT"
+          echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
+
       - name: Ensure a Rust toolchain for the crate-scoped gate
         if: ${{ inputs.mode == 'fix' && steps.fix.outputs.fix_made_changes == 'true' && steps.fix.outputs.injection_detected != 'true' }}
         working-directory: target
@@ -1336,6 +1366,42 @@ jobs:
             --pr "${{ inputs.pr_number }}" \
             --issue "${{ needs.resolve.outputs.issue }}" \
             --reason "the ${{ inputs.mode }} model chain for a ${{ needs.resolve.outputs.impl_provider }}-implemented PR is unresolvable in the target routing (no concrete provider model)"
+
+  # Model-access health record (registry #32): consumes the review/fix model exit CLASS (success OR
+  # any failure) into the registry health ledger. A SEPARATE always()-guarded job — like the worker
+  # `model_health` job — because the `run` job executes hostile target code host-side in fix mode
+  # (the cargo gate): no registry-write token may be co-located there. Runs NO target code, salts
+  # the raw handle before it reaches the ledger, and never fails the pipeline.
+  model_health:
+    name: Record model-access health (no target code runs here)
+    if: ${{ always() && needs.claim.outputs.acquired == 'true' && needs.run.outputs.exit_class != '' }}
+    needs: [resolve, claim, run]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # CAS-append data/model-health.json via github.token
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Append the model-access health record (salted account hash only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          # Raw handle + salt via env only (argv is echoed into public logs); the script salts the
+          # handle so only the 16-hex hash is stored. This job runs no target code.
+          WORKER_ACCOUNT_HANDLE: ${{ needs.claim.outputs.account }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+        run: |
+          python3 registry/scripts/model-health.py record \
+            --provider "${{ needs.claim.outputs.provider }}" \
+            --model-alias "${{ needs.claim.outputs.model }}" \
+            --exit-class "${{ needs.run.outputs.exit_class }}" \
+            --reset-hint "${{ needs.run.outputs.reset_hint }}" \
+            --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
 
   release:
     name: Always release the review/fix lease

@@ -24,7 +24,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       actions: read       # inspect registry worker run state
-      contents: write     # compare-and-swap data/leases.json
+      contents: write     # compare-and-swap data/leases.json + read data/model-health.json
+      issues: write       # upsert/close the model-access health alert issues (model-health decide)
     steps:
       - name: Checkout private registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -59,3 +60,27 @@ jobs:
             --policy-file policy/repos.toml \
             --policy-resolver scripts/policy-resolve.py \
             --bot-slug "$APP_SLUG"
+
+      # Model-access health decision (registry #32): the groom sweep already runs on schedule, so it
+      # is the natural place to evaluate the health record window and raise/close alerts (keeps
+      # dispatch.yml lean). Reads data/model-health.json + the enabled provider->account fleet, then
+      # upserts ONE ops-alert issue per (condition, provider). Best-effort: an evaluation hiccup must
+      # never fail the maintenance sweep. Account identifiers stay salted (decision 22a).
+      - name: Decide + raise/close model-access health alerts
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          # Privacy routing (locked decision 22c) + the #39 fix: ALERT_REPO without ALERT_TOKEN
+          # falls back to the registry repo (never dropped silently). Identifiers stay salted.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+          # Salt to map enabled account handles -> the salted hashes stored in the ledger, so the
+          # provider-capped ("every enabled account") decision can be computed.
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+        run: |
+          set -uo pipefail
+          python3 scripts/model-health.py --self-test
+          python3 scripts/model-health.py decide --policy-file policy/repos.toml

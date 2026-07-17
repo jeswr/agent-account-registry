@@ -503,6 +503,14 @@ jobs:
     outputs:
       pr_number: ${{ steps.pr.outputs.pr_number }}
       bot_login: ${{ steps.target.outputs.bot_login }}
+      # Model-access health (registry #32): the sanitized exit CLASS of the model launch, surfaced
+      # so the separate no-target-code `model_health` job records it (success or failure). The
+      # provider/account/model come from the pre-hostile `claim` job outputs (not this job, which
+      # runs target code), exactly like the provenance record.
+      exit_class: ${{ steps.exit-class.outputs.class }}
+      # The sanitized session-limit reset time worker-live.sh extracts (review defect #9); empty
+      # for every other class. Feeds the provider-capped alert's "earliest known reset".
+      reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
     concurrency:
       group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
       cancel-in-progress: false
@@ -797,6 +805,32 @@ jobs:
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: bash ../registry/scripts/worker-live.sh model
 
+      # Model-access health (registry #32): capture the sanitized exit CLASS so the separate
+      # no-target-code `model_health` job can record it. worker-live.sh sets WORKER_EXIT_CLASS
+      # (+ WORKER_RESET_HINT on session-limit) in $GITHUB_ENV on a FAILED launch only; a
+      # successful model step means `success`. always() with NO skipped-guard (review defect #4):
+      # a pre-launch abort (prep/attempt failure) or a job timeout/cancellation leaves the model
+      # step skipped/cancelled with no host-observed CLI exit — that records class=unknown
+      # (counted toward persistence, never a provider-outage) instead of recording nothing.
+      - name: Capture model exit class
+        id: exit-class
+        if: ${{ always() && !inputs.dry_run }}
+        env:
+          MODEL_OUTCOME: ${{ steps.model.outcome }}
+        run: |
+          set -uo pipefail
+          if [[ "$MODEL_OUTCOME" == "success" ]]; then
+            cls=success
+          elif [[ "$MODEL_OUTCOME" == "skipped" ]]; then
+            cls=unknown   # pre-launch abort: no CLI ever ran
+          else
+            # failure OR cancellation/timeout: use the host-observed class when worker-live.sh
+            # got far enough to write one; otherwise unknown.
+            cls="${WORKER_EXIT_CLASS:-unknown}"
+          fi
+          echo "class=$cls" >> "$GITHUB_OUTPUT"
+          echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
+
       # TTL guard (audit-2026-07-17): App installation tokens live 60 minutes and app-token-live is
       # minted BEFORE the heavy checkout + toolchain + model run, so with worker_timeout_minutes=90
       # every long run used to reach publish/followups/final-state with an EXPIRED token — the
@@ -1005,6 +1039,43 @@ jobs:
             --repo "${{ inputs.target_repo }}" \
             --pr "${{ needs.worker.outputs.pr_number }}" \
             --state needs
+
+  # Model-access health record (registry #32): consumes the worker's exit CLASS (success OR any
+  # failure) into the registry model-health ledger so `decide` (in the groom sweep) can alert when
+  # a whole provider stops having working model access. A SEPARATE job — like `provenance` — because
+  # the worker job executes hostile target code host-side (the cargo gate): a registry-write token
+  # co-located there could forge health records. This job runs NO target code, takes the raw handle
+  # via env (salted before it reaches the ledger — decision 22a), and never fails the pipeline.
+  model_health:
+    name: Record model-access health (no target code runs here)
+    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.worker.outputs.exit_class != '' }}
+    needs: [resolve, claim, worker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # CAS-append data/model-health.json via github.token
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Append the model-access health record (salted account hash only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          # Raw handle + salt arrive via env only (argv is echoed into public logs); the script
+          # salts the handle so only the 16-hex hash is stored. This job runs no target code.
+          WORKER_ACCOUNT_HANDLE: ${{ needs.claim.outputs.account }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+        run: |
+          python3 registry/scripts/model-health.py record \
+            --provider "${{ needs.claim.outputs.provider }}" \
+            --model-alias "${{ needs.claim.outputs.model }}" \
+            --exit-class "${{ needs.worker.outputs.exit_class }}" \
+            --reset-hint "${{ needs.worker.outputs.reset_hint }}" \
+            --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
 
   release:
     name: Always release live account lease

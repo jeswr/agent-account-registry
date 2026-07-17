@@ -726,6 +726,7 @@ jobs:
         run: python3 registry/scripts/account-usage.py --persist-limits "$RUNNER_TEMP/usage.json"
 
       - name: Strictly validate, CAS claim, and dispatch live workers + review/fix runs
+        id: claim
         env:
           GH_TOKEN: ${{ github.token }}
           # Per-owner target App-token map (defects #1,#5): _target_token(repo) resolves the token
@@ -745,6 +746,10 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
           WORKFLOW_REF: ${{ github.ref_name }}
           WORKER_USAGE_FILE: ${{ runner.temp }}/usage.json
+          # Zero-dispatch visibility (registry #28/#32): dispatch-claim writes a compact
+          # {planned, dispatched, defer_reasons} summary here (no issue numbers/handles) for the
+          # step below to render + record.
+          DISPATCH_SUMMARY_FILE: ${{ runner.temp }}/dispatch-summary.json
         run: |
           set -euo pipefail
           printf '::add-mask::%s\n' "$GH_TOKEN"
@@ -763,6 +768,86 @@ jobs:
             --registry-root registry \
             --bot-login "$BOT_LOGIN" \
             --workflow-ref "$WORKFLOW_REF"
+
+      # Zero-dispatch visibility (registry #28) + model-access health (#32): every tick that
+      # PLANNED work writes a health record — `zero-dispatch` when nothing launched, dispatch
+      # SUCCESS when something did (review defect #5: consecutiveness is over the tick sequence,
+      # and a productive tick both resets the run and closes the alert via `decide`). A claim that
+      # ABORTED before writing even the early plan summary records `claim-abort` (review defect
+      # #6, counted as a zero-dispatch tick); dispatch-claim writes the plan-derived summary
+      # BEFORE claim-side work so a mid-claim abort still surfaces as planned>0/launched-0.
+      # Empty-frontier ticks (planned == 0) stay recordless by design. always() so a claim
+      # FAILURE (exactly when nothing launches) is still surfaced. No issue numbers or account
+      # handles are emitted.
+      - name: Surface + record the dispatch-tick health state
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          DISPATCH_SUMMARY_FILE: ${{ runner.temp }}/dispatch-summary.json
+          CLAIM_OUTCOME: ${{ steps.claim.outcome }}
+        run: |
+          set -uo pipefail
+          python3 - "$DISPATCH_SUMMARY_FILE" <<'PY'
+          import json
+          import os
+          import sys
+
+          path = sys.argv[1]
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  summary = json.load(handle)
+          except (OSError, ValueError):
+              summary = None
+          planned = (summary or {}).get("planned", 0)
+          dispatched = (summary or {}).get("dispatched", 0)
+          reasons = (summary or {}).get("defer_reasons", {})
+          zero = isinstance(planned, int) and planned > 0 and dispatched == 0
+          productive = isinstance(planned, int) and planned > 0 and \
+              isinstance(dispatched, int) and dispatched > 0
+          # No summary at all = the claim aborted before even the early plan-summary write
+          # (validation/API/setup); that is a zero-dispatch-shaped tick, not a quiet one.
+          abort = summary is None and os.environ.get("CLAIM_OUTCOME") == "failure"
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if zero and step_summary:
+              with open(step_summary, "a", encoding="utf-8") as out:
+                  out.write("### ⚠️ Zero-dispatch tick\n\n")
+                  out.write(f"Planned **{planned}** ready item(s) but launched **0**. "
+                            "Defer-reason histogram:\n\n")
+                  for reason, count in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
+                      out.write(f"- `{reason}`: {count}\n")
+                  if not reasons:
+                      out.write("- (no per-item defer reason captured)\n")
+          # Emit a marker file the record step reads (keeps the record invocation out of this
+          # inline python so the salted-hash discipline stays in model-health.py).
+          state = "zero" if zero else "abort" if abort else "ok" if productive else "none"
+          with open(os.environ["RUNNER_TEMP"] + "/dispatch-tick-state", "w",
+                    encoding="utf-8") as flag:
+              flag.write(state)
+          PY
+          state="$(cat "$RUNNER_TEMP/dispatch-tick-state" 2>/dev/null || echo none)"
+          case "$state" in
+            zero)
+              python3 registry/scripts/model-health.py record \
+                --provider fleet \
+                --exit-class zero-dispatch \
+                --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+              ;;
+            abort)
+              python3 registry/scripts/model-health.py record \
+                --provider fleet \
+                --exit-class claim-abort \
+                --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+              ;;
+            ok)
+              # dispatch-success record: resets the consecutive zero-tick run + closes the alert
+              python3 registry/scripts/model-health.py record \
+                --provider fleet \
+                --exit-class success \
+                --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+              ;;
+          esac
 
       # FAIL-LOUD maintainer alert: opposite posture to the fail-closed dispatcher. Runs even if the
       # claim step above skipped everything (all accounts capped), so degraded throughput is never

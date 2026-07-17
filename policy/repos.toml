@@ -61,7 +61,7 @@ arm_auto_merge = true         # allow_auto_merge is enabled live (B1); the FINAL
                               # gate-weakening trust-surface diff is still a human's (security_paths
                               # below, enforced at arm time — review stays automated)
 require_usage = true          # hold (fail-closed) if the usage probe is unavailable
-usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH windows
+usage_safety_margin = 0.05    # small python jobs — 15% headroom over-delayed registry claims (2026-07-17); sparq keeps 0.15
 max_attempts = 3
 dispatch = "cron"
 trust = "collaborators"

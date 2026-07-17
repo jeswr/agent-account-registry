@@ -6,6 +6,7 @@
 
 import argparse
 import base64
+from collections import Counter
 import hashlib
 import importlib.util
 import json
@@ -1380,6 +1381,20 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         raise DispatchError("worker workflow ref is missing or unsafe")
 
     dispatched = 0
+    # Zero-dispatch visibility (registry #28/#32): count the ready items the PLAN carried and, per
+    # tick, WHY each was NOT launched. A tick that PLANNED work but launched NOTHING is a health
+    # signal (capacity/access/lease contention, not an empty backlog); the CLAIM step records it +
+    # renders this histogram to the job summary. Categories are coarse (no issue numbers/handles).
+    planned = sum(len(repository["items"]) + len(
+        [e for e in plan["review_items"] if e["repo"] == repository["target_repo"]])
+        for repository in plan["repositories"])
+    defer_reasons = Counter()
+    # EARLY summary write (review defect #6): persist the plan-derived planned count BEFORE any
+    # claim-side work, so a mid-claim abort (API/validation/setup failure) still leaves a
+    # planned>0/launched-0 summary for the workflow's always()-guarded tick recorder — instead of
+    # a missing file that used to read as planned=0 and record nothing. The final write below
+    # overwrites it with the real launched count + histogram.
+    _write_dispatch_summary(planned, 0, {})
     for repository in plan["repositories"]:
         repo = repository["target_repo"]
         try:
@@ -1401,6 +1416,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         for item in repository["items"]:
             number = item["number"]
             if number in linked_open_prs:
+                defer_reasons["existing-pr"] += 1
                 print(f"defer {repo}#{number}: an open worker/closing PR already exists")
                 continue
             # [OPUS-4.8] Per-item resilience: a single item's trust/route/policy resolution failure
@@ -1409,6 +1425,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             try:
                 current, reason = _current_issue_matches(repo, item)
                 if not current:
+                    defer_reasons["stale-issue"] += 1
                     print(f"defer {repo}#{number}: {reason}")
                     continue
                 resolved = _route_matches(repo, item, policy_doc, routing, policy_module)
@@ -1417,6 +1434,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     # SAME durable attempt markers the worker records; exhausted -> needs-user +
                     # a maintainer-visible comment, never another silent attempt.
                     if not bot_login or not _target_token(repo):
+                        defer_reasons["no-target-token"] += 1
                         print(f"defer {repo}#{number}: deferred retry needs the target App token")
                         continue
                     comments = _pr_comments(repo, number)
@@ -1431,9 +1449,11 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                                "attempts). "
                                                f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')} "
                                                "this issue needs a human.")
+                        defer_reasons["budget-exhausted"] += 1
                         print(f"escalated {repo}#{number}: deferred-retry budget exhausted")
                         continue
             except DispatchError as exc:
+                defer_reasons["route-policy-failed"] += 1
                 print(f"defer {repo}#{number}: trust/route/policy resolution failed ({exc}); skipped")
                 continue
             now = int(time.time())
@@ -1448,6 +1468,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             # accounts. Without require_usage, absent usage falls back to the static cap (backward compat).
             margin = resolved["usage_safety_margin"]
             if usage is None and resolved["require_usage"]:
+                defer_reasons["usage-probe-unavailable"] += 1
                 print(f"defer {repo}#{number}: require_usage set but live usage is unavailable "
                       "(probe failed) — holding fail-closed")
                 continue
@@ -1475,8 +1496,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                             f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: free capacity (or "
                             "decide the route), then remove `needs:user` and re-add "
                             "`status:ready`.")
+                        defer_reasons["escalate-tier-starved"] += 1
                         print(f"escalated {repo}#{number}: escalate-tier has no eligible account")
                     except DispatchError as exc:
+                        defer_reasons["escalate-tier-starved"] += 1
                         print(f"defer {repo}#{number}: escalate-tier starved, escalation "
                               f"failed ({exc}); retried next tick")
                     continue
@@ -1498,9 +1521,12 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     margin=margin,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+                defer_reasons["lease-error"] += 1
                 print(f"defer {repo}#{number}: lease allocation errored ({exc}); skipped")
                 continue
             if claim is None:
+                # No eligible account/slot: the dominant capacity/access signal for zero-dispatch.
+                defer_reasons["no-eligible-account"] += 1
                 print(
                     f"defer {repo}#{number}: duplicate lease, repository cap, or account cap is active"
                 )
@@ -1514,6 +1540,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     or not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f]{32}", claim_id)
                     or secret_ref != f"{account.upper()}_TOKEN"):
                 _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+                defer_reasons["unsafe-claim"] += 1
                 print(f"defer {repo}#{number}: allocator returned an unsafe/out-of-policy claim; released + skipped")
                 continue
 
@@ -1526,6 +1553,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                         "status", "--repo", repo, "--issue", str(number), "--status", "retry"])
                 except DispatchError as exc:
                     _release_failed_dispatch(allocator, registry_repo, claim_id)
+                    defer_reasons["label-flip-failed"] += 1
                     print(f"defer {repo}#{number}: deferred label flip failed ({exc}); released")
                     continue
 
@@ -1543,6 +1571,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 released = _release_failed_dispatch(allocator, registry_repo, claim_id)
                 if not released:
                     print("::error::worker dispatch failed and its lease could not be released")
+                defer_reasons["dispatch-launch-failed"] += 1
                 print(f"defer {repo}#{number}: worker dispatch failed; skipped")
                 continue
             dispatched += 1
@@ -1559,6 +1588,27 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 registry_repo, registry_root, workflow_ref, bot_login, usage,
                 float(policy.get("usage_safety_margin", 0.10)))
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
+
+    # Final summary (registry #28/#32): overwrite the early claim-start write with the real
+    # launched count + defer-reason histogram.
+    _write_dispatch_summary(planned, dispatched, defer_reasons)
+
+
+def _write_dispatch_summary(planned, dispatched, defer_reasons):
+    """Zero-dispatch visibility (registry #28/#32): emit a compact, privacy-safe summary
+    ({planned, dispatched, defer_reasons histogram}) for the CLAIM step to render + record. NO
+    issue numbers or account handles — only coarse category counts. Best-effort file write; a
+    failure here must never fail dispatch. Called at claim START (planned only — review defect #6)
+    and again at the end with the launched counts."""
+    summary_path = os.environ.get("DISPATCH_SUMMARY_FILE")
+    if not summary_path:
+        return
+    try:
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump({"planned": planned, "dispatched": dispatched,
+                       "defer_reasons": dict(defer_reasons)}, handle)
+    except OSError as exc:
+        print(f"::warning::dispatch summary write failed ({exc}); continuing")
 
 
 def _self_test():
