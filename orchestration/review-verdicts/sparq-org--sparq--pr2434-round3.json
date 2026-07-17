@@ -1,0 +1,6 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "summary": "The re-baseline design is fail-closed and internally consistent: rebase_to appends rather than replacing history, advances sequence and generation only after a successful durable append, rejects non-forward baselines, and ordinary commits remain discontinuity-checked. The on-disk marker is backward-compatible for existing records, authenticated by the existing record digest, strictly decoded, and rejected if paired with changes. HTTP rendering makes the otherwise-empty gap record explicit and pagination advances at commit boundaries without silently skipping it. The focused tests exercise recovery after a dropped commit, restart persistence, invalid baselines, malformed records, and HTTP gap visibility/continuation. The public API documentation and HTTP skill are updated. I could not execute the Rust tests because cargo is unavailable in this checkout environment, but found no correctness, soundness, test-validity, or security defect in the supplied diff and inspected context.",
+ "verdict": "approve"
+}
