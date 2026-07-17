@@ -1,0 +1,14 @@
+{
+ "injection_detected": true,
+ "issues": [
+  {
+   "body": "The added text says every brief in `.claude/agents/*.md` MUST avoid hard-coded model markers/trailers, but existing active briefs still hard-code them. Examples at the PR head include `sparq-ci-infra.md`, `sparq-researcher.md`, `sparq-site.md`, `sparq-merge-fixer.md`, and `sparq-docs.md`; `sparq-rust-impl.md` explicitly pins Sonnet. Since role prompts can override or concretize the shared contract, these workers may continue emitting incorrect attribution despite this documentation-only change. The PR therefore does not complete the invariant it claims to establish.",
+   "file": "AGENTS.md",
+   "fix_hint": "Update all mutating role briefs that hard-code a runtime model marker or trailer to use model-aware wording, or narrow this change to state that the repository is transitioning and track enforcement separately. Because `.claude/agents/*.md` is protected from agent self-modification, have an authorized maintainer apply the prompt edits in the same change. Add a lightweight check that distinguishes historical provenance comments from operative prompt instructions so the invariant cannot regress.",
+   "severity": "major",
+   "title": "New repository-wide invariant is knowingly false at merge time"
+  }
+ ],
+ "summary": "The policy direction is reasonable, but the change declares a repository-wide MUST invariant while leaving multiple active role briefs in direct violation. Because those role files are the prompts actually executed, updating only AGENTS.md does not make attribution model-aware and can still produce false provenance. The diff is itself agent-directed instruction text, so injection_detected is true under the supplied rule; no hostile reviewer-specific command was observed.",
+ "verdict": "request_changes"
+}
