@@ -18,7 +18,6 @@ import base64
 import json
 import math
 import os
-import re
 import subprocess
 import sys
 
@@ -374,18 +373,18 @@ def read_accounts(repo):
     return accounts
 
 
-# ---- catalog-derived enrollment + account-record migration --------------------------------------
+# ---- catalog-derived enrollment + read-time legacy expansion ------------------------------------
 # choose_account matches an account's `models:` aliases LITERALLY against the offered chain, so an
 # enrollment shape narrower than the routing catalog silently starves every chain tier it omits
 # (sol review r5 finding 2: openai accounts enrolled as models: [terra] could serve NEITHER the
 # sol/luna review chain NOR the openai tiers of the unified fix ladder — merging the chains would
-# starve the lane on every freshly enrolled account). The broker (set-up-account.yml) and the
-# migration sweep below therefore both derive the models line from the catalog, never a literal.
-ACCOUNT_HANDLE_RE = re.compile(r"acct[0-9a-z]{2,}")
-MODELS_LINE_RE = re.compile(r"(?m)^models\s*:.*$")
+# starve the lane on every freshly enrolled account). The broker (set-up-account.yml) derives the
+# models line from the catalog at enrollment, never a literal; records enrolled BEFORE the
+# unification are expanded at READ time by effective_models below — never by rewriting the issue
+# body (sol review r9 finding 3).
 # Pre-unification broker enrollment shapes. ONLY a record whose models set still EQUALS its
-# provider's legacy shape is migrated: any other list is an operator edit (e.g. an alias
-# deliberately withheld from one account) that a convergence sweep must never fight.
+# provider's legacy shape is expanded: any other list is an operator edit (e.g. an alias
+# deliberately withheld from one account) that must always win, verbatim.
 LEGACY_ENROLLMENT_MODELS = {
     "openai": frozenset({"terra"}),
     "anthropic": frozenset({"fable", "opus", "sonnet", "haiku"}),
@@ -407,109 +406,46 @@ def enrollment_models(provider, routing):
     return aliases
 
 
-def migrate_models_line(body, legacy, required):
-    """Pure rewrite of ONE account-record body for the models migration. Returns
-    (new_body, reason); new_body is None when the record must not change:
-    - the models set already covers the required catalog set (idempotent no-op),
-    - the models set differs from the provider's LEGACY enrollment shape (operator-edited —
-      never fought), or
-    - the body is unmigratable (zero or multiple models lines) — surfaced in `reason` so the
-      caller logs it loudly instead of guessing which line to edit."""
-    lines = MODELS_LINE_RE.findall(body or "")
-    if len(lines) != 1:
-        return None, f"unmigratable body ({len(lines)} models lines)"
-    current = set(_parse_account(body)["models"])
-    if current >= set(required):
-        return None, "already covers the catalog set"
-    if legacy is None or current != set(legacy):
-        return None, f"custom models line {sorted(current)} (operator-edited); left alone"
-    replacement = "models: [" + ", ".join(required) + "]"
-    return MODELS_LINE_RE.sub(replacement, body, count=1), "migrated"
+def effective_models(account, routing):
+    """The account dict with the alias list the allocator must MATCH, expanded at READ time.
 
-
-def migrate_account_models(repo, routing):
-    """Converge OPEN account records still carrying a LEGACY enrollment shape to the
-    catalog-derived alias set, so accounts enrolled before the chain unification can serve the
-    sol/luna review chain and the unified fix ladder. Idempotent (a migrated record no longer
-    matches its legacy shape); operator-edited and unparseable records are logged and left
-    alone. Every rewritten body is re-validated through the REAL _parse_account parser before
-    the PATCH; a write or validation failure raises (loud, fail closed).
-
-    Log/error lines identify a record ONLY by its issue number (sol review r7 finding 1: the
-    registry's workflow logs are public and must never carry a raw account handle). The PATCH
-    is guarded by a LIVE equality re-read of the issue body (r7 finding 2): the rewrite was
-    derived from the LISTING snapshot, and issues have no CAS PATCH — if the live body no
-    longer equals that snapshot a concurrent operator edit landed, and overwriting it would
-    fight the operator. Such a record is skipped; the idempotent sweep re-examines it (and
-    its fresh body) on the next run."""
-    out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
-                "--json", "number,title,body,labels"]).stdout
-    migrated = 0
-    for it in json.loads(out or "[]"):
-        number = it.get("number")
-        handle = str(it.get("title", "")).strip()
-        if not isinstance(number, int) or isinstance(number, bool):
-            continue
-        if not ACCOUNT_HANDLE_RE.fullmatch(handle):
-            continue
-        labels = {str(lb.get("name", "")) for lb in it.get("labels", [])
-                  if isinstance(lb, dict)}
-        label_providers = {name[len("provider:"):] for name in labels
-                           if name.startswith("provider:")}
-        body = it.get("body") or ""
-        body_provider = _parse_account(body).get("provider", "")
-        providers = {p for p in label_providers | {body_provider} if p}
-        if len(providers) != 1 or not providers <= set(LEGACY_ENROLLMENT_MODELS):
-            # Ambiguous/unknown provider identity: never guess which alias set applies.
-            print(f"skip account #{number}: ambiguous or unknown provider {sorted(providers)}")
-            continue
-        provider = next(iter(providers))
+    sol review r9 finding 3 (retiring the r5/r7 PATCH sweep): GitHub issue PATCH has no
+    precondition, so ANY body-rewriting migration — even one guarded by a live equality
+    re-read — can clobber an operator edit landing between its read and its write. The only
+    genuinely race-free design on that plane is to WRITE NOTHING: a record still carrying
+    its provider's LEGACY pre-unification enrollment shape (by construction untouched since
+    enrollment — any operator edit changes the set) serves the catalog-derived alias set in
+    memory; EVERY other models list is an operator decision served verbatim, effective on
+    the very next read with no sweep lag and nothing to fight. The issue body stays exactly
+    as the broker/operator last wrote it (display + operator override control) — this module
+    issues no account-record write of any kind. With routing=None (callers that never match
+    chains) the record passes through untouched."""
+    if routing is None:
+        return account
+    provider = account.get("provider", "")
+    legacy = LEGACY_ENROLLMENT_MODELS.get(provider)
+    if legacy is None or set(account.get("models") or []) != legacy:
+        return account
+    try:
         required = enrollment_models(provider, routing)
-        new_body, reason = migrate_models_line(
-            body, LEGACY_ENROLLMENT_MODELS[provider], required)
-        if new_body is None:
-            print(f"skip account #{number}: {reason}")
-            continue
-        if set(_parse_account(new_body)["models"]) != set(required):
-            raise LeaseIOError(f"migrated body for account #{number} does not re-parse to "
-                               "the catalog alias set; refusing to write")
-        live = subprocess.run(
-            ["gh", "api", f"repos/{repo}/issues/{number}"],
-            capture_output=True, text=True, check=False)
-        if live.returncode != 0:
-            raise LeaseIOError(f"live re-read of account #{number} failed before the "
-                               "migration PATCH (fail closed)")
-        try:
-            live_body = json.loads(live.stdout).get("body") or ""
-        except (AttributeError, json.JSONDecodeError) as exc:
-            raise LeaseIOError(f"live re-read of account #{number} returned a malformed "
-                               "record (fail closed)") from exc
-        if live_body != body:
-            print(f"skip account #{number}: body changed since the listing (concurrent "
-                  "edit); the next sweep re-examines the fresh body")
-            continue
-        result = subprocess.run(
-            ["gh", "api", "-X", "PATCH", f"repos/{repo}/issues/{number}",
-             "--input", "-"],
-            input=json.dumps({"body": new_body}), capture_output=True, text=True,
-            check=False)
-        if result.returncode != 0:
-            raise LeaseIOError(f"account-record body PATCH failed for account #{number}")
-        print(f"migrated account #{number}: models -> [{', '.join(required)}]")
-        migrated += 1
-    return migrated
+    except LeaseIOError:
+        # A catalog naming nothing for the provider never rewires a record in memory.
+        return account
+    return {**account, "models": list(required)}
 
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
           account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None,
-          margin=SAFETY_MARGIN):
+          margin=SAFETY_MARGIN, routing=None):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free).
     Raises LeaseIOError when an account WAS eligible but the ledger write kept failing — that is an
     infrastructure failure (persistent CAS contention, or the contents-API PUT rejected outright,
     e.g. by a required-status-check branch protection on the ledger's branch), NOT a capacity
-    signal, and must not be reported as 'no eligible account' (issue #28)."""
+    signal, and must not be reported as 'no eligible account' (issue #28).
+    `routing` (the model catalog) drives effective_models' read-time legacy expansion — without
+    it a pre-unification record serves only its literal legacy aliases."""
     import uuid
-    accounts = read_accounts(repo)
+    accounts = [effective_models(account, routing) for account in read_accounts(repo)]
     if account_pool is not None:
         allowed = set(account_pool)
         accounts = [account for account in accounts if account["handle"] in allowed]
@@ -570,8 +506,10 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         "required status check on the ledger branch blocks github-actions pushes)")
 
 
-def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
-    """Return one active lease plus its current account metadata, or None if it is not adoptable."""
+def inspect_claim(repo, claim_id, now, expected_holder_prefix="", routing=None):
+    """Return one active lease plus its current account metadata, or None if it is not adoptable.
+    `routing` applies the same read-time legacy expansion as claim() — a dispatcher-claimed
+    unified-tier model on a pre-unification record must stay adoptable."""
     leases, _sha = _read_ledger(repo)
     matches = [
         lease for lease in reclaim_expired(leases, now)
@@ -583,7 +521,7 @@ def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
     if expected_holder_prefix and not str(lease.get("holder", "")).startswith(expected_holder_prefix):
         return None
     accounts = [
-        account for account in read_accounts(repo)
+        account for account in (effective_models(raw, routing) for raw in read_accounts(repo))
         if account.get("handle") == lease.get("account") and account.get("available")
     ]
     if len(accounts) != 1 or lease.get("model") not in accounts[0].get("models", []):
@@ -975,7 +913,7 @@ def _self_test():
     check("fixture writes all pin branch=ledger",
           [sum(1 for a in c if a == "branch=ledger") for c in fixture_puts], [1, 1])
 
-    # ---- catalog-derived enrollment + legacy-record migration (sol review r5 finding 2) ----
+    # ---- catalog-derived enrollment + read-time legacy expansion (sol r5 f2, r9 f3) ----
     catalog = {"models": {
         "haiku": {"provider": "anthropic"}, "sonnet": {"provider": "anthropic"},
         "opus": {"provider": "anthropic"}, "fable": {"provider": "anthropic"},
@@ -998,107 +936,70 @@ def _self_test():
         check("a malformed catalog fails closed", "rejected", "rejected")
     else:
         check("a malformed catalog fails closed", "accepted", "rejected")
-    legacy_body = ("provider: openai\nharness: codex\nmodels: [terra]\n"
-                   "credential_format: codex-auth-json\nmax_concurrent_workers: 1\n"
-                   "secret_ref: ACCT01_TOKEN\nnotes: registered via set-up-account broker\n")
-    required = enrollment_models("openai", catalog)
-    migrated_body, reason = migrate_models_line(
-        legacy_body, LEGACY_ENROLLMENT_MODELS["openai"], required)
-    check("legacy openai record migrates to the catalog set", reason, "migrated")
-    check("the migrated body re-parses to the catalog set",
-          _parse_account(migrated_body)["models"], ["terra", "sol", "luna"])
-    check("migration touches ONLY the models line",
-          migrated_body.replace("models: [terra, sol, luna]",
-                                "models: [terra]") == legacy_body, True)
-    legacy_shape = LEGACY_ENROLLMENT_MODELS["openai"]
-    check("migration is idempotent (a migrated body no longer changes)",
-          migrate_models_line(migrated_body, legacy_shape, required)[0], None)
-    check("an operator-edited models line is NEVER fought",
-          migrate_models_line(legacy_body.replace("[terra]", "[terra, sol]"),
-                              legacy_shape, required)[0], None)
-    check("a body with no models line is unmigratable (logged, not guessed)",
-          migrate_models_line("provider: openai\n", legacy_shape, required),
-          (None, "unmigratable body (0 models lines)"))
-    check("a body with duplicate models lines is unmigratable",
-          migrate_models_line("models: [terra]\nmodels: [terra]\n",
-                              legacy_shape, required)[0], None)
-    # Live-driver wiring over stubbed I/O: exactly the legacy openai record is PATCHed; the
-    # anthropic full-set record, an operator-edited record, a provider-conflicted record, and
-    # a non-account issue are all left untouched.
-    issues = [
-        {"number": 1, "title": "acct01", "body": legacy_body,
-         "labels": [{"name": "provider:openai"}, {"name": "status:available"}]},
-        {"number": 2, "title": "acct02",
-         "body": "provider: anthropic\nmodels: [fable, opus, sonnet, haiku]\n",
-         "labels": [{"name": "provider:anthropic"}]},
-        {"number": 3, "title": "acct03", "body": "provider: openai\nmodels: [terra, sol]\n",
-         "labels": [{"name": "provider:openai"}]},
-        {"number": 4, "title": "acct04", "body": "provider: openai\nmodels: [terra]\n",
-         "labels": [{"name": "provider:anthropic"}]},   # label/body conflict: never guessed
-        {"number": 5, "title": "set up new account", "body": "models: [terra]\n",
-         "labels": [{"name": "provider:openai"}]},
-    ]
-    patches = []
-    live_bodies = {it["number"]: it["body"] for it in issues}
-    real_run, real_sub_run = _run, subprocess.run
-
-    def fake_run(args):
-        class _R:
-            stdout = json.dumps(issues)
-        return _R()
-
-    def fake_sub_run(args, **kwargs):
-        class _R:
-            returncode = 0
-            stdout = stderr = ""
-        if "-X" in args:
-            patches.append((args, kwargs.get("input")))
-        else:  # the pre-PATCH live equality re-read (GET repos/<repo>/issues/<n>)
-            _R.stdout = json.dumps({"body": live_bodies[int(args[2].rsplit("/", 1)[1])]})
-        return _R()
-
-    import contextlib
-    import io
-    sweep_log = io.StringIO()
-    try:
-        globals()["_run"] = fake_run
-        subprocess.run = fake_sub_run
-        with contextlib.redirect_stdout(sweep_log):
-            migrated_count = migrate_account_models("reg/repo", catalog)
-    finally:
-        globals()["_run"] = real_run
-        subprocess.run = real_sub_run
-    check("exactly the legacy-shape openai record migrates", migrated_count, 1)
-    check("the PATCH targets that record",
-          [args[4] for args, _ in patches], ["repos/reg/repo/issues/1"])
-    check("the PATCHed body carries the catalog set",
-          _parse_account(json.loads(patches[0][1])["body"])["models"],
-          ["terra", "sol", "luna"])
-    # Privacy (sol review r7 finding 1): the sweep's public-workflow log lines carry NO raw
-    # account handle on any migrate/skip path — records are identified by issue number only.
-    check("migration log carries no raw account handle",
-          any(handle in sweep_log.getvalue()
-              for handle in ("acct01", "acct02", "acct03", "acct04")), False)
-    check("migration log identifies records by issue number",
-          "migrated account #1:" in sweep_log.getvalue(), True)
-    # Concurrent-edit race (sol review r7 finding 2): an operator edit landing between the
-    # LISTING and the PATCH changes the live body — the sweep must skip (never overwrite the
-    # operator), and the next sweep re-examines the fresh body.
-    patches.clear()
-    live_bodies[1] = legacy_body.replace("[terra]", "[terra, sol]")  # operator edit mid-sweep
-    race_log = io.StringIO()
-    try:
-        globals()["_run"] = fake_run
-        subprocess.run = fake_sub_run
-        with contextlib.redirect_stdout(race_log):
-            raced_count = migrate_account_models("reg/repo", catalog)
-    finally:
-        globals()["_run"] = real_run
-        subprocess.run = real_sub_run
-    check("a concurrent operator edit is never overwritten (no PATCH)",
-          (raced_count, patches), (0, []))
-    check("the raced record is skipped loudly for the next sweep",
-          "skip account #1: body changed since the listing" in race_log.getvalue(), True)
+    legacy_openai = {"handle": "acct01", "provider": "openai", "models": ["terra"],
+                     "max_concurrent_workers": 1, "available": True,
+                     "secret_ref": "ACCT01_TOKEN"}
+    check("legacy openai record expands to the catalog set at read time",
+          effective_models(legacy_openai, catalog)["models"], ["terra", "sol", "luna"])
+    check("expansion touches ONLY the models field",
+          {k: v for k, v in effective_models(legacy_openai, catalog).items()
+           if k != "models"},
+          {k: v for k, v in legacy_openai.items() if k != "models"})
+    check("legacy anthropic record expands to the catalog set",
+          effective_models({"provider": "anthropic",
+                            "models": ["fable", "opus", "sonnet", "haiku"]},
+                           catalog)["models"], ["haiku", "sonnet", "opus", "fable"])
+    # The race sol r7 f2 / r9 f3 chased is gone BY CONSTRUCTION: there is no write for an
+    # operator edit to race. ANY models list differing from the legacy shape — including one
+    # an operator saves a millisecond before (or after, or during) an allocator read — is an
+    # operator decision served verbatim on the very next read. No sweep, no PATCH, no window.
+    check("an operator-edited models list is served VERBATIM (never widened, never fought)",
+          effective_models({"provider": "openai", "models": ["terra", "sol"]},
+                           catalog)["models"], ["terra", "sol"])
+    check("an operator-NARROWED list is served verbatim (restriction always wins)",
+          effective_models({"provider": "openai", "models": ["sol"]}, catalog)["models"],
+          ["sol"])
+    check("an unknown provider is never expanded",
+          effective_models({"provider": "mystery", "models": ["terra"]}, catalog)["models"],
+          ["terra"])
+    check("a provider the catalog omits is served verbatim (no in-memory rewire)",
+          effective_models({"provider": "openai", "models": ["terra"]},
+                           {"models": {"fable": {"provider": "anthropic"}}})["models"],
+          ["terra"])
+    check("routing=None passes the record through untouched",
+          effective_models(legacy_openai, None) is legacy_openai, True)
+    # The racy PATCH sweep is REJECTED BY CONSTRUCTION (same pattern as backfill-provenance's
+    # no-trailer check): no code path in this module writes an account issue body.
+    check("no account-record write path exists (migration sweep removed)",
+          hasattr(sys.modules[__name__], "migrate_account_models"), False)
+    # claim() wiring: a pre-unification [terra] record serves a unified-tier (sol) chain when
+    # the catalog is supplied — the r5 starvation stays fixed without any stored migration —
+    # and WITHOUT the catalog the legacy record cannot serve sol (loud starvation, never a
+    # silently-widened record).
+    with _StubClaim([legacy_openai]):
+        globals()["read_accounts"] = lambda repo: [legacy_openai]
+        globals()["_read_ledger"] = lambda repo: ([], "sha0")
+        globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+        sol_claim = claim("r", "p", "impl", ["sol"], "o/r#1@run", now,
+                          account_pool=["acct01"], routing=catalog)
+        sol_claim_no_routing = claim("r", "p", "impl", ["sol"], "o/r#2@run", now,
+                                     account_pool=["acct01"])
+    check("claim serves a unified tier from a legacy record via the catalog",
+          (sol_claim or {}).get("model"), "sol")
+    check("claim without a catalog never invents the expansion", sol_claim_no_routing, None)
+    # inspect_claim() wiring: adopting a dispatcher-claimed unified-tier lease on a legacy
+    # record needs the same expansion.
+    sol_lease = {**make_lease("acct01", "o/r#1@d.1", "p", "impl", "sol", now, 100),
+                 "claim_id": "c" * 32}
+    with _StubClaim([legacy_openai]):
+        globals()["read_accounts"] = lambda repo: [legacy_openai]
+        globals()["_read_ledger"] = lambda repo: ([sol_lease], "sha0")
+        globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+        adopted = inspect_claim("r", "c" * 32, now, routing=catalog)
+        adopted_no_routing = inspect_claim("r", "c" * 32, now)
+    check("inspect_claim adopts a unified-tier lease on a legacy record via the catalog",
+          (adopted or {}).get("model"), "sol")
+    check("inspect_claim without a catalog stays fail-closed", adopted_no_routing, None)
 
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
@@ -1128,23 +1029,22 @@ def main():
     ap.add_argument("--enrollment-models", metavar="PROVIDER",
                     help="print the catalog-derived models line for an enrolling account "
                          "(set-up-account broker)")
-    ap.add_argument("--migrate-account-models", action="store_true",
-                    help="converge legacy-shape open account records to the catalog-derived "
-                         "models line (idempotent groom sweep)")
     ap.add_argument("--routing", default="orchestration/routing.toml",
-                    help="routing catalog for --enrollment-models / --migrate-account-models")
+                    help="routing catalog for --enrollment-models and the read-time "
+                         "legacy-shape expansion in --claim/--inspect")
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
-    if args.enrollment_models or args.migrate_account_models:
+
+    def _load_routing():
+        # Fail LOUD on a missing/malformed catalog: silently claiming without it would
+        # re-open the r5 starvation (legacy records invisible to the unified tiers).
         import tomllib
         with open(args.routing, "rb") as handle:
-            routing = tomllib.load(handle)
-        if args.enrollment_models:
-            print("[" + ", ".join(enrollment_models(args.enrollment_models, routing)) + "]")
-            return 0
-        migrated = migrate_account_models(args.repo, routing)
-        print(f"migrated {migrated} account record(s)")
+            return tomllib.load(handle)
+
+    if args.enrollment_models:
+        print("[" + ", ".join(enrollment_models(args.enrollment_models, _load_routing())) + "]")
         return 0
     import time
     if args.reclaim:
@@ -1160,11 +1060,12 @@ def main():
             return 2
         res = claim(args.repo, args.package, args.role, chain, args.holder, int(time.time()),
                     ttl=args.ttl, account_pool=pool, holder_prefix=args.holder_prefix,
-                    max_holder_concurrent=args.max_holder_concurrent)
+                    max_holder_concurrent=args.max_holder_concurrent, routing=_load_routing())
         print(json.dumps(res) if res else "none-free")
         return 0 if res else 3
     if args.inspect:
-        res = inspect_claim(args.repo, args.inspect, int(time.time()), args.expected_holder_prefix)
+        res = inspect_claim(args.repo, args.inspect, int(time.time()),
+                            args.expected_holder_prefix, routing=_load_routing())
         print(json.dumps(res) if res else "not-adoptable")
         return 0 if res else 3
     if args.release:

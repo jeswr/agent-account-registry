@@ -677,6 +677,7 @@ jobs:
             --holder "$holder" \
             --holder-prefix "$prefix" \
             --max-holder-concurrent "$cap" \
+            --routing registry/orchestration/routing.toml \
             --ttl "$ttl" > "$RUNNER_TEMP/claim.json"
           rc=$?
           set -e
@@ -788,6 +789,7 @@ jobs:
           python3 registry/scripts/select-and-claim.py \
             --inspect "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY" \
+            --routing registry/orchestration/routing.toml \
             --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@" > "$RUNNER_TEMP/adopt.json"
           if ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
           import hashlib
@@ -899,6 +901,7 @@ jobs:
           if python3 registry/scripts/select-and-claim.py \
               --inspect "$CLAIM_ID" \
               --repo "$GITHUB_REPOSITORY" \
+              --routing registry/orchestration/routing.toml \
               --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@dispatch-" \
               > /dev/null; then
             python3 registry/scripts/select-and-claim.py \

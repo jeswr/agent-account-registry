@@ -42,15 +42,6 @@ CLAIM_LINE_RE = re.compile(
     r"(?mi)^[^\t]*claim[^\t]*\t[^\t]*\t\S+\s+"
     r"(?:lease claimed|dispatcher lease adopted): account=(acct[0-9a-z]{2,}), "
     r"model=([A-Za-z0-9][A-Za-z0-9_.-]*)")
-# The resolve step's `policy resolved: models=<chain>` line — the DISPATCH-TIME route
-# resolution, printed by the workflow's own step before any model container runs. This is the
-# trusted original route for the record's immutable route_constraint (sol review r7 finding 5:
-# the source issue's CURRENT labels must never be captured as the original — a since-removed
-# trust label would widen a historically opus-only PR to the default ladder).
-CHAIN_LINE_RE = re.compile(
-    r"policy resolved: models=([A-Za-z0-9][A-Za-z0-9_.-]*(?:,[A-Za-z0-9][A-Za-z0-9_.-]*)*)")
-
-
 class BackfillError(RuntimeError):
     """A concise, credential-free operational error."""
 
@@ -147,6 +138,18 @@ PROV_JOB_BOTLOGIN_RE = _prov_job_field("--verify-bot-login",
 PROV_JOB_TARGET_RE = _prov_job_field("--target-repo", r'"?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"?')
 PROV_JOB_PR_RE = _prov_job_field("--pr", r'"?([1-9][0-9]*)"?')
 PROV_JOB_ISSUE_RE = _prov_job_field("--issue", r'"?([1-9][0-9]*)"?')
+# The resolve job's `policy resolved: models=<chain>` line — the DISPATCH-TIME route
+# resolution, the trusted original for the record's immutable route_constraint (sol review r7
+# finding 5: the source issue's CURRENT labels must never be captured as the original — a
+# since-removed trust label would widen a historically opus-only PR to the default ladder).
+# ANCHORED to the resolve job's log prefix exactly like the claim/provenance anchors above
+# (sol r9 finding 2): that job ("Resolve policy without worker secrets") runs NO target/model
+# code, so a hostile model printing a lookalike line lands under the WORKER job's prefix and
+# can never match. The prior UNANCHORED search accepted a forged chain whenever the genuine
+# line was absent from the fetched log — widening the immutable constraint.
+CHAIN_LINE_RE = re.compile(
+    r"(?mi)^[^\t]*resolve[^\t]*\t[^\t]*\t\S+\s+" + _SGR_PREFIX
+    + r"policy resolved: models=([A-Za-z0-9][A-Za-z0-9_.-]*(?:,[A-Za-z0-9][A-Za-z0-9_.-]*)*)")
 
 
 def provenance_job_identity_from_log(log_text):
@@ -191,29 +194,34 @@ def flatten_pull_pages(pages):
 
 
 def chain_from_log(log_text):
-    """The dispatch-time resolved model chain from a worker run log, or None. FIRST match wins
-    (same trust argument as claim_from_log: the genuine line is printed by the resolve step
-    before the model container runs, so a forged line in later model output can never shadow
-    it)."""
-    match = CHAIN_LINE_RE.search(log_text or "")
-    return match.group(1).split(",") if match else None
+    """Tri-state: the dispatch-time resolved model chain from RESOLVE-job-prefixed lines,
+    None when absent, or AMBIGUOUS when differing anchored repeats conflict (tamper evidence
+    — the resolve job prints the line exactly once per attempt)."""
+    found = set(CHAIN_LINE_RE.findall(log_text or ""))
+    if not found:
+        return None
+    return found.pop().split(",") if len(found) == 1 else AMBIGUOUS
 
 
 def original_route_constraint(log_text, alias, routing):
     """(route_constraint, provenance_note) for the immutable record field, from TRUSTED run
     data only (sol review r7 finding 5 — never from the source issue's mutable current labels):
-    - the run log's dispatch-time `policy resolved: models=` chain when it is present, names
-      the implementing alias (the allocator only assigns chain members), AND every member is
-      a catalog alias with a known provider. The membership checks are load-bearing: the log
-      search is unanchored over the whole run log, so model-container output can carry a
-      forged or handle-shaped line — an unvalidated chain would flow raw `acct…` tokens into
-      this workflow's public log and the immutable public record, or let a hostile model
-      dictate a WIDER constraint than the fallback. Else
+    - the resolve-job-anchored `policy resolved: models=` chain when it is present,
+      UNAMBIGUOUS, names the implementing alias (the allocator only assigns chain members),
+      AND every member is a catalog alias with a known provider. The membership checks stay
+      load-bearing as defense-in-depth behind the job anchor (sol r9 finding 2): an
+      unvalidated chain would flow raw `acct…` tokens into this workflow's public log and the
+      immutable public record. Else
     - constraint-unknown, failing NARROWER: [alias] — the implementing alias is provably a
       member of the original chain, so every later fix-ladder intersection can only be a
-      SUBSET of what the true original would allow, never a widening. (A narrowed alias the
-      unified ladder does not carry fails the ladder intersection closed, to a human.)"""
+      SUBSET of what the true original would allow, never a widening. AMBIGUOUS (conflicting
+      anchored repeats) lands here too: tampering can only ever NARROW the recorded
+      constraint, never widen it. (A narrowed alias the unified ladder does not carry fails
+      the ladder intersection closed, to a human.)"""
     chain = chain_from_log(log_text)
+    if chain is AMBIGUOUS:
+        return [alias], ("constraint-unknown; narrowed to the implementing alias (the run "
+                         "log's resolve-job chain lines CONFLICT — tamper evidence)")
     if (chain is not None and alias in chain
             and all(provider_of(member, routing) is not None for member in chain)):
         return chain, "dispatch-time resolved chain from the worker run log"
@@ -520,38 +528,55 @@ def _self_test():
         "opus": {"provider": "anthropic"}, "fable": {"provider": "anthropic"},
         "haiku": {"provider": "anthropic"}, "luna": {"provider": "openai"},
         "sol": {"provider": "openai"}}}
-    worker_log = ("resolve step\npolicy resolved: models=opus, gate=registry-selftest, "
-                  "max_attempts=2\n...\nlease claimed: account=acct02, model=opus, claim=ab\n")
-    check("dispatch-time chain parses from the run log",
-          chain_from_log("policy resolved: models=fable,haiku, gate=crate-scoped, "
-                         "max_attempts=2"), ["fable", "haiku"])
+    resolve_step = ("Resolve policy without worker secrets\tResolve issue routing through "
+                    "registry policy\t2026-07-18T09:01:00Z ")
+    worker_step = "Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:03:04Z "
+    worker_log = (f"{resolve_step}policy resolved: models=opus, gate=registry-selftest, "
+                  f"max_attempts=2\n{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
+                  "lease claimed: account=acct02, model=opus, claim=ab\n")
+    check("dispatch-time chain parses from the resolve-job-anchored line",
+          chain_from_log(f"{resolve_step}policy resolved: models=fable,haiku, "
+                         "gate=crate-scoped, max_attempts=2"), ["fable", "haiku"])
     check("no resolved-chain line -> None", chain_from_log("nothing here"), None)
-    # First match wins: the genuine resolve-step line precedes any model output, so a forged
-    # WIDER chain printed later by a hostile model can never shadow it.
-    check("a forged later chain line cannot shadow the resolve step's line",
-          chain_from_log(worker_log + "policy resolved: models=opus,luna,fable,sol, gate=x"),
-          ["opus"])
+    # sol r9 finding 2, the load-bearing case: with the genuine resolve-job line ABSENT, a
+    # forged line under the WORKER job's prefix must never be accepted — the job anchor makes
+    # hostile model output unmatchable, so the constraint falls back NARROWER to [alias].
+    forged_chain = f"{worker_step}policy resolved: models=opus,luna,fable,sol, gate=x\n"
+    check("genuine-line-ABSENT + forged worker-job line -> no chain",
+          chain_from_log(forged_chain), None)
+    check("genuine-line-ABSENT + forged worker-job line falls back NARROWER",
+          original_route_constraint(forged_chain, "opus", chain_routing)[0], ["opus"])
+    check("a forged worker-job chain line cannot shadow the resolve job's line",
+          chain_from_log(worker_log + forged_chain), ["opus"])
+    # Conflicting RESOLVE-job-anchored repeats are tamper evidence: AMBIGUOUS, never a pick
+    # between candidates — and the constraint still falls back NARROWER (tampering can only
+    # ever narrow the record, never widen it).
+    conflicted = worker_log + f"{resolve_step}policy resolved: models=opus,sol, gate=x\n"
+    check("conflicting anchored chain lines are AMBIGUOUS, not a pick",
+          chain_from_log(conflicted) is AMBIGUOUS, True)
+    check("an AMBIGUOUS chain falls back NARROWER",
+          original_route_constraint(conflicted, "opus", chain_routing)[0], ["opus"])
     check("route constraint recovers the dispatch-time original",
           original_route_constraint(worker_log, "opus", chain_routing)[0], ["opus"])
     # A logged chain that omits the claimed alias is corrupt/forged (the allocator only
     # assigns chain members) and must NOT be trusted — and the fallback must fail NARROWER:
     # [alias] is provably a subset of the true original, so no later fix ladder can widen.
     check("a chain omitting the claimed alias is not trusted (falls back narrower)",
-          original_route_constraint("policy resolved: models=luna,sol, gate=x", "opus",
-                                    chain_routing)[0], ["opus"])
+          original_route_constraint(f"{resolve_step}policy resolved: models=luna,sol, gate=x",
+                                    "opus", chain_routing)[0], ["opus"])
     check("constraint-unknown fails NARROWER to the implementing alias",
           original_route_constraint("no chain line at all", "fable", chain_routing)[0],
           ["fable"])
-    # The log search is UNANCHORED over hostile-influenceable text: a chain member that is
-    # not a catalog alias (a handle-shaped token, or any unknown name) invalidates the whole
-    # line — nothing handle-shaped may reach the public log or the immutable record, and a
-    # forged line cannot widen past the [alias] fallback.
+    # Defense-in-depth behind the job anchor: a chain member that is not a catalog alias (a
+    # handle-shaped token, or any unknown name) invalidates the whole line — nothing
+    # handle-shaped may reach the public log or the immutable record.
     check("a handle-shaped chain member is never trusted (no handle in log/record)",
-          original_route_constraint("policy resolved: models=opus,acct02xy, gate=x", "opus",
-                                    chain_routing)[0], ["opus"])
+          original_route_constraint(
+              f"{resolve_step}policy resolved: models=opus,acct02xy, gate=x", "opus",
+              chain_routing)[0], ["opus"])
     check("an unknown-alias chain member falls back narrower",
-          original_route_constraint("policy resolved: models=opus,ghost, gate=x", "opus",
-                                    chain_routing)[0], ["opus"])
+          original_route_constraint(f"{resolve_step}policy resolved: models=opus,ghost, "
+                                    "gate=x", "opus", chain_routing)[0], ["opus"])
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

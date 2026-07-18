@@ -1523,6 +1523,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 max_holder_concurrent=cap,
                 usage=usage,
                 margin=margin,
+                # Same read-time legacy expansion as the impl claim path (sol r9 f3).
+                routing=routing,
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             print(f"defer review {repo}#{number}: lease allocation errored ({exc}); skipped")
@@ -1828,7 +1830,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 if catalog_cache["accounts"] is None:
                     catalog_cache["accounts"] = allocator.read_accounts(registry_repo)
                 pool = set(resolved["account_pool"])
-                pool_accounts = [a for a in catalog_cache["accounts"] if a["handle"] in pool]
+                # The cache stays RAW; legacy expansion is per-repo (each repo's routing
+                # catalog may differ) and read-time only (sol r9 f3).
+                pool_accounts = [allocator.effective_models(a, routing)
+                                 for a in catalog_cache["accounts"] if a["handle"] in pool]
                 effective_cap = allocator.dynamic_concurrency(
                     pool_accounts, usage, model_chain=resolved["model_chain"],
                     absolute_cap=resolved["max_concurrent"], margin=margin)
@@ -1871,6 +1876,9 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     max_holder_concurrent=effective_cap,
                     usage=usage,
                     margin=margin,
+                    # Read-time legacy expansion (sol r9 f3): pre-unification records serve
+                    # the catalog-derived alias set in memory, never via an issue-body write.
+                    routing=routing,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
                 defer_reasons["lease-error"] += 1

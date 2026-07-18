@@ -113,25 +113,12 @@ jobs:
             --bot-slug "$APP_SLUG" \
             --ledger-root ledger
 
-      # Account-record models MIGRATION (sol review r5 finding 2): accounts enrolled by the
-      # pre-unification broker carry models: [terra], which the allocator matches literally —
-      # those records can serve NEITHER the sol/luna review chain NOR the openai tiers of the
-      # unified fix ladder, so merging the chains without this sweep would starve the lane.
-      # Idempotent convergence: only an open acctNN record whose models line still EQUALS its
-      # provider's LEGACY enrollment shape is rewritten to the catalog-derived set (an
-      # operator-edited list is never fought; a migrated record no longer matches). Runs every
-      # groom tick from master, so existing accounts gain the aliases on the first tick after
-      # merge with no manual pass. continue-on-error mirrors the model-health step: a
-      # write/validation failure goes visibly red while the maintenance sweep stays alive.
-      - name: Converge legacy account-record model aliases to the catalog
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 scripts/select-and-claim.py --self-test
-          python3 scripts/select-and-claim.py --migrate-account-models \
-            --repo "$GITHUB_REPOSITORY" --routing orchestration/routing.toml
+      # There is deliberately NO account-record models migration step here (sol review r9
+      # finding 3, retiring the r5/r7 sweep): GitHub issue PATCH has no precondition, so any
+      # body-rewriting sweep can clobber an operator edit landing between its read and its
+      # write. Pre-unification records (models: [terra] etc.) are instead expanded to the
+      # catalog-derived alias set at READ time by select-and-claim.py effective_models, in
+      # every consumer that matches chains — nothing ever rewrites an account issue body.
 
       # Model-access health decision (registry #32): the groom sweep already runs on schedule, so it
       # is the natural place to evaluate the health record window and raise/close alerts (keeps

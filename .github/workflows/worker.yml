@@ -266,7 +266,10 @@ jobs:
           if account_name not in policy["account_pool"]:
               raise SystemExit(f"selected account {account_name} is outside the resolved account pool")
 
-          account = allocator._parse_account(item.get("body"))
+          # Read-time legacy expansion (sol r9 f3): a pre-unification record's models are
+          # expanded through the catalog IN MEMORY (never by rewriting the issue body), so this
+          # validate agrees with the allocator's claim-time view of the same record.
+          account = allocator.effective_models(allocator._parse_account(item.get("body")), routing)
           model = next((candidate for candidate in policy["model_chain"]
                         if candidate in account.get("models", [])), None)
           if model is None:
@@ -377,6 +380,7 @@ jobs:
             --holder "$holder" \
             --holder-prefix "$TARGET_REPO#" \
             --max-holder-concurrent "${{ needs.resolve.outputs.max_concurrent }}" \
+            --routing registry/orchestration/routing.toml \
             --ttl "$ttl" > "$RUNNER_TEMP/claim.json"
           rc=$?
           set -e
@@ -448,6 +452,7 @@ jobs:
           python3 registry/scripts/select-and-claim.py \
             --inspect "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY" \
+            --routing registry/orchestration/routing.toml \
             --expected-holder-prefix "$TARGET_REPO#$ISSUE_NUMBER@" > "$RUNNER_TEMP/adopt.json"
           if ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
           import json
