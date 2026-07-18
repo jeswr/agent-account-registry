@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct3css",
-   "claim_id": "55cf8aa98aeb4ee09cd7cc47df85a84c",
-   "holder": "fix:jeswr/agent-account-registry#264@dispatch-29657573847.1",
-   "package": "dispatch",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784402729,
-   "expires_at": 1784406329
-  },
-  {
    "account": "acct01",
    "claim_id": "7102bdb985744ec5ad5a1199835ed05f",
    "holder": "review:jeswr/agent-account-registry#268@dispatch-29657732012.1",
