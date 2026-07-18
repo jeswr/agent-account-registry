@@ -24,6 +24,11 @@ import sys
 
 ALERT_LABEL = "ops-alert"
 ALERT_TITLE = "⚠️ Dispatch PLAN job is failing — fleet-wide dispatch is stalled"
+# Review r3 residual: dedupe keyed on the TITLE alone breaks the moment anyone (human or a later
+# wording tweak) renames the open alert — the next failing tick files a duplicate and recovery
+# can't find the issue to close. The body carries this stable machine marker; dedupe matches the
+# marker first and falls back to the exact title only for pre-marker legacy alerts.
+ALERT_MARKER = "<!-- plan-alert:v1 key=dispatch-plan-failure -->"
 
 
 def _alert_route(alert_repo, alert_token, registry_repo):
@@ -48,6 +53,7 @@ def decide(plan_result, has_open_alert):
 
 def _render_body(result, run_url, maintainer):
     return (
+        f"{ALERT_MARKER}\n"
         "> 🤖 SPARQ agent — automated ops-alert (issue #38)\n\n"
         f"@{maintainer} the dispatch **PLAN** job ended `{result}`, so the CLAIM job (and "
         "every `always()` alert step it hosts) was **skipped** — nothing dispatched this "
@@ -83,15 +89,20 @@ def main():
     # --limit 100 (review r2): the `ops-alert` label is SHARED with the account-availability alert
     # and anything else ops-flavoured; a 20-issue window could push this alert out of the dedupe
     # scan (duplicate on failure, uncloseable on recovery). 100 comfortably exceeds any plausible
-    # open ops-alert count; the title match below still scans every returned row.
+    # open ops-alert count; the marker/title match below still scans every returned row.
     listed = _gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", "open",
-                  "--json", "number,title", "--limit", "100"], capture=True, token=token, check=True)
+                  "--json", "number,title,body", "--limit", "100"],
+                 capture=True, token=token, check=True)
     if listed.returncode != 0:
         # Fail loud (review r1): without the list we can neither dedupe an upsert nor prove
         # recovery — go red (the job's continue-on-error keeps the dispatcher isolated).
         return 1
     found = json.loads(listed.stdout or "[]")
-    num = next((i["number"] for i in found if i.get("title") == ALERT_TITLE), None)
+    # r3 residual: match the stable body MARKER first (survives a retitled alert), exact title
+    # second (legacy alerts filed before the marker existed).
+    num = next((i["number"] for i in found if ALERT_MARKER in (i.get("body") or "")), None)
+    if num is None:
+        num = next((i["number"] for i in found if i.get("title") == ALERT_TITLE), None)
 
     action = decide(result, num is not None)
     if action == "upsert":
@@ -154,6 +165,8 @@ def _self_test():
     body = _render_body("failure", "https://example.test/run/1", "jeswr")
     chk("body carries run url + mention",
         ("https://example.test/run/1" in body, "@jeswr" in body), (True, True))
+    # r3 residual: every rendered body must carry the stable dedupe marker.
+    chk("body carries the stable dedupe marker", ALERT_MARKER in body, True)
     # Stubbed-gh flow (review r1 finding 4 + r2 finding 2): full main() paths with a fake
     # subprocess.run that records the COMPLETE command and env per call, and can inject a failure
     # for any individual gh subcommand — so repo/token wiring and every mutation return-code check
@@ -252,6 +265,31 @@ def _self_test():
             (rc_h, "100" in (list_cmd or []), ("issue", "create") in subs(),
              edit_cmd is not None and "99" in edit_cmd),
             (0, True, False, True))
+        # r3 residual: a RENAMED alert (same underlying failure, retitled by a human or a wording
+        # tweak) must still dedupe via the body marker — edit the open issue, never file a twin.
+        renamed = json.dumps([{"number": 55, "title": "PLAN broke again (renamed by maintainer)",
+                               "body": "legacy prose\n" + ALERT_MARKER + "\nmore prose"}])
+        rc_i, _ = run_main("failure", renamed)
+        edit_i, _ = find(("issue", "edit"))
+        chk("dedupe: RENAMED alert -> marker match edits #55, no create",
+            (rc_i, ("issue", "create") in subs(), edit_i is not None and "55" in edit_i),
+            (0, False, True))
+        # ...and recovery must find the renamed alert too (close via marker, not title).
+        rc_j, _ = run_main("success", renamed)
+        close_j, _ = find(("issue", "close"))
+        chk("close: RENAMED alert -> marker match closes #55",
+            (rc_j, close_j is not None and "55" in close_j), (0, True))
+        # Legacy fallback: a pre-marker alert (exact title, marker-less body) still dedupes.
+        legacy = json.dumps([{"number": 8, "title": ALERT_TITLE, "body": "old body, no marker"}])
+        rc_k, _ = run_main("failure", legacy)
+        edit_k, _ = find(("issue", "edit"))
+        chk("dedupe: legacy title-only alert -> fallback edits #8, no create",
+            (rc_k, ("issue", "create") in subs(), edit_k is not None and "8" in edit_k),
+            (0, False, True))
+        # The list request must fetch `body` or the marker match is silently vacuous.
+        list_cmd_k, _ = find(("issue", "list"))
+        chk("dedupe: list fetches number,title,body",
+            "number,title,body" in (list_cmd_k or []), True)
     finally:
         subprocess.run = real_run
         for key in base_env:
