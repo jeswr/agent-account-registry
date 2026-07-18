@@ -18,8 +18,10 @@ import base64
 import json
 import math
 import os
+import random
 import subprocess
 import sys
+import time
 
 LEDGER_PATH = "data/leases.json"
 # The mutable data plane lives on a dedicated NON-code branch: branch protection on the default
@@ -315,16 +317,70 @@ def _read_ledger(repo):
         raise LeaseIOError("lease ledger is malformed") from exc
 
 
+# ---- CAS retry backoff (issue #179) -------------------------------------------------------------
+# Every CAS writer against the shared ledger tip (claim, release, reclaim — plus groom-leases and
+# model-health on their own crons) previously retried immediately, so a burst that collided once
+# stayed phase-locked and re-collided on every one of its six attempts, exhausting them all. An
+# exponential, FULLY JITTERED sleep between attempts decorrelates the writers so a loser backs off a
+# random amount and the tip has settled by its next read. Split ceiling (deterministic, unit-tested)
+# from the random draw so the schedule is asserted without depending on the RNG.
+def _backoff_ceiling(attempt, base=0.5, cap=8.0):
+    """Upper bound (seconds) for the sleep before CAS retry `attempt` (1-based): exponential
+    base*2**(attempt-1), clamped to `cap`."""
+    return min(cap, base * (2 ** (attempt - 1)))
+
+
+def _backoff_delay(attempt):
+    return random.uniform(0, _backoff_ceiling(attempt))
+
+
+def _sleep_backoff(attempt):
+    """Sleep a full-jitter exponential backoff before CAS retry `attempt` (module-level so the
+    self-test can stub it without sleeping)."""
+    time.sleep(_backoff_delay(attempt))
+
+
+# GitHub's contents-PUT response when a sha-less (create-if-absent) write hits a file that
+# appeared concurrently: HTTP 422 with message 'Invalid request.\n\n"sha" wasn't supplied.'
+_CREATE_RACE_SIGNATURE = "\"sha\" wasn't supplied"
+
+
+def _is_cas_conflict(stderr, create):
+    """True only for a genuine compare-and-swap conflict on the ledger PUT. HTTP 409 is always a
+    lost-SHA race. HTTP 422 counts ONLY when this was a create-if-absent PUT (`create=True`) AND
+    the response carries GitHub's create-race signature — any other 422 is an ordinary request-
+    validation failure (bad payload/branch) that must fail loud, not be retried as contention."""
+    text = stderr or ""
+    if "HTTP 409" in text:
+        return True
+    return create and "HTTP 422" in text and _CREATE_RACE_SIGNATURE in text
+
+
 def _write_ledger(repo, leases, sha, message):
+    """PUT the ledger via CAS. Returns True on success and False ONLY on a genuine CAS conflict
+    (HTTP 409, or the create-race 422 on a sha-less PUT) so the caller retries with backoff. ANY
+    OTHER PUT failure — authorization (403), missing branch/file (404), request validation
+    (non-race 422), server (5xx) — raises LeaseIOError immediately instead of being collapsed into
+    a retryable conflict and mislabeled 'CAS kept conflicting' after six wasted, un-backed-off
+    attempts (issue #179)."""
     body = base64.b64encode(json.dumps({"leases": leases}, indent=1).encode()).decode()
     r = subprocess.run(ledger_write_args(repo, message, body, sha), capture_output=True, text=True)
-    return r.returncode == 0  # non-zero (e.g. 409 SHA conflict) → caller retries
+    if r.returncode == 0:
+        return True
+    if _is_cas_conflict(r.stderr, create=sha is None):
+        return False  # lost the CAS race → caller re-reads and retries
+    raise LeaseIOError(
+        "lease ledger CAS PUT failed with a non-conflict error (authorization, validation, "
+        "missing branch, or availability) — failing loud rather than exhausting CAS retries")
 
 
 def reclaim(repo, now, retries=6):
     """CAS-remove expired leases from the ledger so crashed/cancelled workers free their slot.
-    Returns the number reclaimed, 0 if none, or -1 if the CAS kept conflicting."""
-    for _ in range(retries):
+    Returns the number reclaimed, 0 if none, or -1 if the CAS kept conflicting. A non-conflict PUT
+    error (auth/validation/branch/5xx) raises LeaseIOError rather than masquerading as -1."""
+    for attempt in range(retries):
+        if attempt:
+            _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
         live = reclaim_expired(leases, now)
         n = len(leases) - len(live)
@@ -386,7 +442,9 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
     if account_pool is not None:
         allowed = set(account_pool)
         accounts = [account for account in accounts if account["handle"] in allowed]
-    for _ in range(retries):
+    for attempt in range(retries):
+        if attempt:
+            _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
         live = reclaim_expired(leases, now)
         key = holder_key(holder)
@@ -472,7 +530,9 @@ def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
 
 
 def release(repo, claim_id, now, retries=6):
-    for _ in range(retries):
+    for attempt in range(retries):
+        if attempt:
+            _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
         live = apply_release(leases, claim_id, now)
         if len(live) == len(leases):
@@ -834,11 +894,15 @@ def _self_test():
         return _Res(1 if puts == 1 else 0, stderr="HTTP 409")  # first PUT loses the CAS race
 
     real_run = subprocess.run
+    real_backoff = globals()["_sleep_backoff"]
+    backoff_attempts = []
     subprocess.run = _fake_gh
+    globals()["_sleep_backoff"] = lambda attempt: backoff_attempts.append(attempt)
     try:
         reclaimed = reclaim("o/r", now)
     finally:
         subprocess.run = real_run
+        globals()["_sleep_backoff"] = real_backoff
     fixture_gets = [c for c in fixture_calls if "-X" not in c]
     fixture_puts = [c for c in fixture_calls if "-X" in c]
     check("fixture reclaim rides out one CAS conflict", reclaimed, 1)
@@ -847,6 +911,65 @@ def _self_test():
           all(c[2].endswith("?ref=ledger") for c in fixture_gets), True)
     check("fixture writes all pin branch=ledger",
           [sum(1 for a in c if a == "branch=ledger") for c in fixture_puts], [1, 1])
+    # Backoff fires BETWEEN CAS attempts, never before the first read (issue #179): one conflict
+    # here means exactly one jittered sleep, for retry attempt 1.
+    check("fixture reclaim backs off once (only between attempts)", backoff_attempts, [1])
+
+    # ---- CAS retry backoff schedule + typed PUT errors (issue #179) ----
+    # Exponential, capped ceiling: dropping the exponent (linear) or the cap flips these red.
+    check("backoff ceiling is exponential then capped",
+          [_backoff_ceiling(a) for a in (1, 2, 3, 4, 5, 6, 10)],
+          [0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0])
+    # Full jitter: the delay must BE the RNG draw over exactly [0, ceiling]. Stubbing
+    # random.uniform pins both properties — a deterministic delay (always 0, always the ceiling,
+    # ceiling/2) would either never call the RNG or discard its draw, flipping these red.
+    real_uniform = random.uniform
+    uniform_calls = []
+    sentinel = 123.456
+    random.uniform = lambda lo, hi: (uniform_calls.append((lo, hi)), sentinel)[1]
+    try:
+        draws = [_backoff_delay(a) for a in range(1, 7)]
+    finally:
+        random.uniform = real_uniform
+    check("backoff delay draws uniform(0, ceiling) with exact bounds",
+          uniform_calls, [(0, _backoff_ceiling(a)) for a in range(1, 7)])
+    check("backoff delay propagates the RNG draw unchanged", draws, [sentinel] * 6)
+    # A genuine CAS conflict is retryable → False; any OTHER PUT failure fails LOUD with
+    # LeaseIOError rather than being collapsed into "CAS kept conflicting" (the #179 complaint).
+    # 422 is a conflict ONLY as the create-if-absent race: sha-less PUT + GitHub's
+    # '"sha" wasn't supplied' signature — a bare 422 is a persistent payload/config validation
+    # error that six retries would only obscure.
+    race_422 = "gh: Invalid request.\n\n\"sha\" wasn't supplied. (HTTP 422)"
+    real_run = subprocess.run
+    subprocess.run = lambda args, **_k: _Res(0)
+    try:
+        check("successful PUT returns True", _write_ledger("o/r", [], "sha", "m"), True)
+        subprocess.run = lambda args, **_k: _Res(1, stderr="gh: ... (HTTP 409)")
+        check("CAS 409 PUT is retryable (False, not raise)", _write_ledger("o/r", [], "sha", "m"),
+              False)
+        subprocess.run = lambda args, **_k: _Res(1, stderr=race_422)
+        check("create-race 422 on a sha-less PUT is retryable (False)",
+              _write_ledger("o/r", [], None, "m"), False)
+        loud_puts = [("non-conflict PUT 403 fails loud (not collapsed)",
+                      "gh: ... (HTTP 403)", "sha"),
+                     ("non-conflict PUT 404 fails loud (not collapsed)",
+                      "gh: ... (HTTP 404)", "sha"),
+                     ("non-conflict PUT 500 fails loud (not collapsed)",
+                      "gh: ... (HTTP 500)", "sha"),
+                     ("non-race validation 422 fails loud (not a CAS conflict)",
+                      "gh: Validation Failed (HTTP 422)", "sha"),
+                     ("non-race validation 422 on a sha-less create fails loud",
+                      "gh: Validation Failed (HTTP 422)", None),
+                     ("race-signature 422 on a sha-carrying PUT fails loud", race_422, "sha")]
+        for label, stderr_text, put_sha in loud_puts:
+            subprocess.run = lambda args, _s=stderr_text, **_k: _Res(1, stderr=_s)
+            try:
+                _write_ledger("o/r", [], put_sha, "m")
+                check(label, "no exception", "LeaseIOError")
+            except LeaseIOError:
+                check(label, "LeaseIOError", "LeaseIOError")
+    finally:
+        subprocess.run = real_run
 
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
@@ -876,7 +999,6 @@ def main():
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
-    import time
     if args.reclaim:
         n = reclaim(args.repo, int(time.time()))
         print(f"reclaimed {n} expired lease(s)" if n >= 0 else "reclaim: CAS kept conflicting")

@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import random
 import re
 import sys
 import tempfile
@@ -585,12 +586,33 @@ def _read_ledger(
     return validate_ledger(document), sha
 
 
+# ---- CAS retry backoff (issue #179) -------------------------------------------------------------
+# groom-leases (select-and-claim reclaim) and this sweep both CAS-write the shared ledger tip on
+# overlapping crons; immediate no-backoff retries let a synchronized burst (claim/release/heartbeat/
+# model-health) re-collide on every attempt and exhaust all six. A full-jitter exponential sleep
+# between attempts decorrelates the writers so a loser waits a random amount and re-reads a settled
+# tip. Ceiling is deterministic (unit-tested) and the RNG only draws within it. Kept in sync with
+# select-and-claim.py's identical schedule.
+def _backoff_ceiling(attempt: int, base: float = 0.5, cap: float = 8.0) -> float:
+    """Upper bound (seconds) for the sleep before CAS retry `attempt` (1-based): exponential
+    base*2**(attempt-1), clamped to `cap`."""
+    return min(cap, base * (2 ** (attempt - 1)))
+
+
+def _sleep_backoff(attempt: int) -> None:
+    """Sleep a full-jitter exponential backoff before CAS retry `attempt` (module-level so the
+    self-test can stub it without sleeping)."""
+    time.sleep(random.uniform(0, _backoff_ceiling(attempt)))
+
+
 def _release_claims(
     api: GitHubAPI, registry_repo: str, claims: set[str], retries: int = 6
 ) -> int:
     if not claims:
         return 0
-    for _ in range(retries):
+    for attempt in range(retries):
+        if attempt:
+            _sleep_backoff(attempt)
         leases, sha = _read_ledger(api, registry_repo)
         present = {lease["claim_id"] for lease in leases} & claims
         if not present:
@@ -1660,6 +1682,73 @@ def _self_test() -> int:
         ),
         ([], None),
     )
+
+    # ---- CAS retry backoff schedule + retry/fail-loud behavior (issue #179) ----
+    check(
+        "backoff ceiling is exponential then capped",
+        [_backoff_ceiling(a) for a in (1, 2, 3, 4, 5, 6, 10)],
+        [0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0],
+    )
+
+    dead = "e" * 32
+
+    class _CasAPI:
+        """Drive _release_claims: each GET returns the ledger holding `dead` (fresh sha per read);
+        each PUT raises GroomConflict for the first `conflicts` calls, then a success dict — unless
+        `put_error` is set, in which case every PUT raises it (a non-conflict GitHubAPI failure)."""
+
+        def __init__(self, conflicts=0, put_error=None):
+            self.conflicts, self.put_error = conflicts, put_error
+            self.reads = self.puts = 0
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            if method == "GET":
+                self.reads += 1
+                document = {
+                    "leases": [{
+                        "account": "a", "claim_id": dead, "holder": "owner/repo#7@run.1",
+                        "package": "p", "role": "impl", "model": "m",
+                        "issued_at": 1, "expires_at": 9,
+                    }]
+                }
+                return {
+                    "content": base64.b64encode(json.dumps(document).encode()).decode(),
+                    "sha": f"sha{self.reads}",
+                }
+            self.puts += 1
+            if self.put_error is not None:
+                raise self.put_error
+            if self.puts <= self.conflicts:
+                raise GroomConflict("compare-and-swap conflict")
+            return {"content": {"sha": "new"}}
+
+    real_backoff = globals()["_sleep_backoff"]
+    backoff_attempts: list[int] = []
+    globals()["_sleep_backoff"] = lambda attempt: backoff_attempts.append(attempt)
+    try:
+        rider = _CasAPI(conflicts=1)
+        released = _release_claims(rider, "o/r", {dead})
+        check("release rides out one CAS conflict", released, 1)
+        check("release re-read after the conflict (CAS retry)", rider.reads, 2)
+        check("release backs off once, only between attempts", backoff_attempts, [1])
+        # A non-conflict GitHubAPI failure (e.g. 403 auth) is NOT swallowed as a conflict: it
+        # propagates out of the retry loop instead of being retried six times.
+        backoff_attempts.clear()
+        loud = False
+        try:
+            _release_claims(_CasAPI(put_error=GroomError("auth")), "o/r", {dead})
+        except GroomError:
+            loud = True
+        check("non-conflict PUT error propagates (not collapsed into a conflict retry)", loud, True)
+        # Persistent CAS conflict still settles into the loud "did not settle" after retries.
+        settled_loud = False
+        try:
+            _release_claims(_CasAPI(conflicts=99), "o/r", {dead}, retries=3)
+        except GroomError as exc:
+            settled_loud = "did not settle" in str(exc)
+        check("persistent CAS conflict fails loud after retries", settled_loud, True)
+    finally:
+        globals()["_sleep_backoff"] = real_backoff
 
     print("groom self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
