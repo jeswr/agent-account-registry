@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "SnapshotSync clones only the source Replica's State and applies it to the receiver. If a dot was added and then removed before the snapshot, State retains the dot only in the causal context; it no longer contains the quad association, and Replica::apply records provenance only for dots present in delta.store(). The receiver therefore cannot know that the historical dot belonged to the original quad and accepts a later delta asserting it under a different quad. This contradicts origin.rs's claim that reuse is rejected for the full lifetime of every observed dot and leaves the round-2 defect reachable through the modeled CRDT-JOURNAL-2 snapshot recovery path.",
+   "file": "crates/sparq-crdt/src/schedule.rs",
+   "fix_hint": "Make snapshot import/export carry durable dot-to-quad provenance (or equivalent validation metadata) and merge it fail-closed, rather than passing State alone. Add a regression that creates add(q1,d), removes d, snapshot-syncs a fresh replica, then asserts that forged add(q2,d) is rejected with both state and provenance unchanged. Also exercise this through generated SnapshotSync schedules so catch-up cannot silently lose the validation journal.",
+   "severity": "major",
+   "title": "Snapshot catch-up drops the provenance required by CRDT-WIRE-4"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "Round 3 fixes CRDT-WIRE-4 rejection for replicas that previously received the original add: Replica now retains dot-to-quad provenance after the live store entry is removed, and the directed regression exercises that path. However, the advertised snapshot/catch-up path transfers only State. State contains the tombstoned dot in its causal context but not its historical quad association, so a replica initialized through SnapshotSync cannot reconstruct dot_provenance and will accept a later forged add that reuses the tombstoned dot under another quad. The full-lifetime CRDT-WIRE-4 claim therefore remains false across a supported recovery path. Progress is stagnant because the same major historical-reuse defect remains at the same severity, although its direct-envelope case is now fixed.",
+ "verdict": "request_changes"
+}
