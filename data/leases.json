@@ -179,6 +179,16 @@
    "model": "opus",
    "issued_at": 1784340879,
    "expires_at": 1784347179
+  },
+  {
+   "account": "acct01",
+   "claim_id": "74c16be4d2d34926b74390c7d0ba244a",
+   "holder": "sparq-org/sparq#3207@dispatch-29626600191.1",
+   "package": "performance",
+   "role": "impl",
+   "model": "terra",
+   "issued_at": 1784340884,
+   "expires_at": 1784347184
   }
  ]
 }
