@@ -157,6 +157,22 @@ def provenance_job_identity_from_log(log_text):
     return out
 
 
+def flatten_pull_pages(pages):
+    """Flatten `gh api --paginate --slurp` output (a list of per-page LISTS) into one pull
+    list, or None when the shape is malformed. Every page must be a list of dicts."""
+    if not isinstance(pages, list):
+        return None
+    pulls = []
+    for page in pages:
+        if not isinstance(page, list):
+            return None
+        for pull in page:
+            if not isinstance(pull, dict):
+                return None
+            pulls.append(pull)
+    return pulls
+
+
 def provider_of(alias, routing):
     meta = (routing.get("models") or {}).get(alias)
     provider = meta.get("provider") if isinstance(meta, dict) else None
@@ -214,9 +230,12 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
     if not salt:
         raise BackfillError("PROVENANCE_SALT is required (records store only the salted hash)")
 
-    pulls = _gh_json(["api", "--paginate",
+    # --slurp: without it `gh api --paginate` emits each page as a SEPARATE json array and a
+    # >100-open-PR target aborts on "malformed JSON" before recovery begins (sol r5).
+    pages = _gh_json(["api", "--paginate", "--slurp",
                       f"repos/{target_repo}/pulls?state=open&per_page=100"])
-    if not isinstance(pulls, list):
+    pulls = flatten_pull_pages(pages)
+    if pulls is None:
         raise BackfillError("pull listing is malformed")
     written = skipped = needs_human = 0
     for pull in pulls:
@@ -401,6 +420,12 @@ def _self_test():
     check("issue-binding mismatch fails closed", ident(prov_log, issue=1), None)
     check("live author must EXACTLY match the echoed --verify-bot-login (sol r4)",
           ident(prov_log, author="different-bot[bot]"), None)
+    check("two-page slurped listing flattens (sol r5)",
+          flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
+          [{"number": 1}, {"number": 2}, {"number": 3}])
+    check("non-list page fails closed", flatten_pull_pages([[{"number": 1}], "x"]), None)
+    check("non-dict pull fails closed", flatten_pull_pages([[1]]), None)
+    check("empty slurp is an empty list", flatten_pull_pages([]), [])
     check("forged worker-job lines alone resolve nothing", ident(forged), None)
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
