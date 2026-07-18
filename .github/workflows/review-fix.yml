@@ -236,6 +236,15 @@ jobs:
           head = pull.get("head") or {}
           head_repo = (head.get("repo") or {}).get("full_name")
           head_branch = str(head.get("ref", ""))
+          # sol r6 on #257: the reviewer diffs against the DEFAULT branch; a worker PR
+          # retargeted to any other base would be reviewed against one comparison and
+          # merged against another — reject it at resolution (the sweep re-derives; a
+          # human retarget is an explicit act that removes the PR from the loop).
+          default_branch = str(((pull.get("base") or {}).get("repo") or {})
+                               .get("default_branch", ""))
+          if str((pull.get("base") or {}).get("ref", "")) != default_branch:
+              raise SystemExit("worker PR base is not the default branch (retargeted); "
+                               "refusing to review/arm")
           head_sha = str(head.get("sha", ""))
           author = str((pull.get("user") or {}).get("login", ""))
           if head_repo != repo:
@@ -1274,7 +1283,6 @@ jobs:
             --issue "${{ needs.resolve.outputs.issue }}"
             --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
-            --reviewed-base "${{ needs.resolve.outputs.base_ref }}"
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
@@ -1365,8 +1373,7 @@ jobs:
             --pr "${{ inputs.pr_number }}" \
             --round "${{ inputs.review_round }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
-            --bot-login "${{ needs.resolve.outputs.pr_author }}"
-            --reviewed-base "${{ needs.resolve.outputs.base_ref }}" \
+            --bot-login "${{ needs.resolve.outputs.pr_author }}" \
             --model "${{ needs.claim.outputs.model }}" \
             --injection "${{ needs.run.outputs.injection_detected == 'true' && 'true' || 'false' }}" \
             --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \

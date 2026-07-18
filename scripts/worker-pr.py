@@ -1291,6 +1291,19 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
                        "restored; a human must re-arm or re-draft this PR",
                        issue=issue, alert_repo=alert_repo, alert_token=alert_token)
             raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated")
+    if arm and reviewed_base:
+        # Post-arm base re-verification (sol r6): --match-head-commit CAS covers only the
+        # head; a retarget DURING audit/ready/arm changes the effective diff. A fresh read
+        # after the latch either confirms the binding or the latch is retracted.
+        confirm = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+        if str((confirm.get("base") or {}).get("ref", "")) != reviewed_base:
+            _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--disable-auto"],
+                    check=False)
+            _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
+            set_review_state(repo, pr_number, "needs")
+            _write_outputs({"armed": False, "head_moved": True, "base_moved": True})
+            print("base retargeted during arm; latch retracted, returned to review:needs")
+            return
     set_review_state(repo, pr_number, "pass")
     if issue:
         # Deferred issue completion (locked decision 16): complete only on arm, not on publish.
@@ -1304,7 +1317,7 @@ TRUST_AUDIT_MARKER_PREFIX = "<!-- sparq-trust-audit:v1 sha="
 TRUST_AUDIT_MARKER = TRUST_AUDIT_MARKER_PREFIX  # back-compat alias for tests/greps
 
 
-COMPARE_FILES_CAP = 100  # API max per_page; files appear ONLY on compare page 1 (hard 300 cap)
+COMPARE_FILES_CAP = 300  # GitHub returns up to 300 changed files on compare page 1 (hard cap)
 FILES_TRUNCATED_SENTINEL = "(compare file inventory truncated/unavailable - assumed trust-surface)"
 
 
@@ -1314,7 +1327,7 @@ def _files_at_sha(repo, base_ref, sha):
     r3/r4 on #257). GitHub exposes files only on the FIRST compare page, capped at 300;
     at/over the cap or on a malformed/missing files array this FAILS CLOSED by returning
     the sentinel — the caller treats it as a trust hit and audits MORE, never less."""
-    doc = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{sha}?per_page={COMPARE_FILES_CAP}"])
+    doc = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{sha}"])
     rows = doc.get("files") if isinstance(doc, dict) else None
     if not isinstance(rows, list) or len(rows) >= COMPARE_FILES_CAP:
         return [FILES_TRUNCATED_SENTINEL]
