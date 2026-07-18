@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -534,7 +535,8 @@ def _obs_flow(flow):
         mean = rounds.get("mean")
         review_rounds = {
             "mean": round(float(mean), 2)
-            if isinstance(mean, (int, float)) and not isinstance(mean, bool) and mean >= 0
+            if isinstance(mean, (int, float)) and not isinstance(mean, bool)
+            and math.isfinite(mean) and mean >= 0
             else None,
             "max": _obs_count(rounds.get("max")),
             "budget_exhausted_1h": _obs_count(rounds.get("budget_exhausted_1h")),
@@ -638,7 +640,8 @@ def _normalize_observability(document):
         thresholds = {}
         for key in OBS_THRESHOLD_KEYS:
             value = thresholds_source.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) and value >= 0):
                 thresholds[key] = value
 
     return {
@@ -728,7 +731,9 @@ def _write_site(document, assets, site):
     if copied == 0:
         raise DashboardError("dashboard asset directory is empty")
     with open(site / "data.json", "w", encoding="utf-8") as handle:
-        json.dump(document, handle, indent=2, sort_keys=True)
+        # allow_nan=False: NaN/Infinity would serialize as non-standard JSON tokens that browser
+        # response.json() rejects, taking down the whole public page — die here instead.
+        json.dump(document, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
 
 
@@ -948,6 +953,14 @@ def _self_test():
           _normalize_observability(obs_fixture), obs_expected)
     check("absent observability snapshot stays hidden (None)",
           _normalize_observability(None), None)
+    overflow = copy.deepcopy(obs_fixture)
+    overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
+    overflow["thresholds"]["workflow_failure_rate"] = 1e309
+    overflow_normalized = _normalize_observability(overflow)
+    check("non-finite review-round mean is rejected, never published",
+          overflow_normalized["flow"]["review_rounds"]["mean"], None)
+    check("non-finite threshold is dropped, never published",
+          "workflow_failure_rate" in overflow_normalized["thresholds"], False)
     for bad_document in ({"schema": "wrong/v0"}, ["not", "a", "dict"], {}):
         try:
             _normalize_observability(bad_document)
@@ -1009,6 +1022,14 @@ def _self_test():
               ((site / "index.html").read_text(encoding="utf-8"),
                json.loads((site / "data.json").read_text(encoding="utf-8"))["schema"]),
               ("fixture", SCHEMA))
+        try:
+            _write_site({"schema": SCHEMA, "poison": float("inf")}, assets, site)
+        except ValueError:
+            nonfinite_blocked = True
+        else:
+            nonfinite_blocked = False
+        check("_write_site refuses non-finite numbers (allow_nan=False backstop)",
+              nonfinite_blocked, True)
     print("dashboard-gen self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
