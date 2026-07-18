@@ -502,7 +502,11 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
         if not login.endswith("[bot]") or (bot_login and login != bot_login):
             continue
         record = provenance.get(number)
-        if not isinstance(record, dict) or record.get("pr_number") != number:
+        record_number = record.get("pr_number") if isinstance(record, dict) else None
+        # Strict int identity, bool excluded — same float/bool-equality hazard as
+        # provenance_admission_error: 41.0 == 41 and True == 1 under a bare !=.
+        if (not isinstance(record_number, int) or isinstance(record_number, bool)
+                or record_number != number):
             continue                      # never loop-armed without provenance — leave to humans
         if not SAFE_SHA.fullmatch(sha):
             continue
@@ -580,7 +584,8 @@ def provenance_admission_error(record, pr_number):
 
     This is the ONE definition of "enumerable provenance" — the complete union of every field
     constraint the review path enforces before driving a PR:
-    - dict shape + matching ``pr_number`` + registered ``impl_provider`` (PLAN admission in
+    - dict shape + strict-int matching ``pr_number`` (float/bool excluded: 41.0 == 41 and
+      True == 1 under Python equality) + registered ``impl_provider`` (PLAN admission in
       enumerate_review_items, review-fix.yml resolve),
     - ``impl_alias`` a safe atom (review-fix.yml resolve: the alias flows into workflow
       outputs and model prompts),
@@ -600,7 +605,10 @@ def provenance_admission_error(record, pr_number):
     finding: alias/issue unchecked) is structurally impossible to reintroduce."""
     if not isinstance(record, dict):
         return "provenance record is not a JSON object"
-    if record.get("pr_number") != pr_number:
+    number = record.get("pr_number")
+    # Strict int identity, bool excluded: Python's cross-type equality (41.0 == 41,
+    # True == 1) would otherwise ADMIT a JSON float or bool pr_number under a bare !=.
+    if not isinstance(number, int) or isinstance(number, bool) or number != pr_number:
         return "provenance record does not match this PR"
     impl_provider = record.get("impl_provider")
     # isinstance BEFORE the set membership: an unhashable JSON value ([] / {}) would
@@ -2019,6 +2027,14 @@ def _self_test():
     assert _rejected_everywhere("not-a-dict")
     assert _rejected_everywhere({})
     assert _rejected_everywhere({**provenance[41], "pr_number": 40})       # mismatched PR
+    # Cross-type equality hazard: Python says 41.0 == 41 and True == 1, so a JSON float or
+    # bool pr_number slips through a bare != comparison. The strict int-not-bool guard
+    # rejects both; reverting it to bare != ADMITS 41.0 (this assertion reds).
+    assert _rejected_everywhere({**provenance[41], "pr_number": 41.0})     # float is not an int
+    assert _rejected_everywhere({**provenance[41], "pr_number": True})     # bool is not an int
+    assert _rejected_everywhere({**provenance[41], "pr_number": "41"})     # string is not an int
+    # ... and the True == 1 direction needs a target PR of 1 to be a live tripwire:
+    assert not is_enumerable_provenance({**provenance[41], "pr_number": True}, 1)
     assert _rejected_everywhere({**provenance[41], "impl_provider": "mallory"})
     # UNHASHABLE / wrong-type fields must be REJECTED, never raise: before the
     # isinstance-before-membership guard, impl_provider=[] / {} raised TypeError out of the
@@ -2053,6 +2069,8 @@ def _self_test():
         == "provenance implementer alias is invalid"
     assert provenance_admission_error({**provenance[41], "issue": True}, 41) \
         == "provenance issue number is invalid"
+    assert provenance_admission_error({**provenance[41], "pr_number": 41.0}, 41) \
+        == "provenance record does not match this PR"
     assert provenance_admission_error({**provenance[41], "impl_provider": []}, 41) \
         == "provenance implementer provider is invalid"
 
@@ -2266,6 +2284,12 @@ def _self_test():
                                check_runs_degraded=True)}
     assert [item["pr_number"] for item in enumerate_disarm_items(
         repo, [moved], degraded_armed, provenance)] == [41]
+    # the disarm provenance re-read carries the same strict-int pr_number guard as
+    # provenance_admission_error: a float/bool record (41.0 == 41 under bare !=) never binds
+    assert enumerate_disarm_items(repo, [moved], armed_status,
+                                  {41: {**provenance[41], "pr_number": 41.0}}) == []
+    assert enumerate_disarm_items(repo, [moved], armed_status,
+                                  {41: {**provenance[41], "pr_number": True}}) == []
 
     # ---- decide_repair_admission: the LIVE trigger gates the defuse (defect-1 regression) ----
     # trigger holds: drafted proceeds, ready/armed defuses

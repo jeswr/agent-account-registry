@@ -315,7 +315,8 @@ def worker_pr_provenance_enumerable(
 ) -> bool:
     """True when the registry provenance record for target PR ``repo#number`` exists on disk
     AND is valid by the review loop's OWN admission schema (dispatch-claim.
-    is_enumerable_provenance: JSON object, matching pr_number, registered impl provider,
+    is_enumerable_provenance: JSON object, strict-int matching pr_number (float/bool
+    excluded — 41.0 == 41 and True == 1 under lax equality), registered impl provider,
     safe-atom impl alias, positive-int issue, well-formed 40-hex head sha, salted 16-hex
     account hash — the COMPLETE field set; see provenance_admission_error, the one function
     every consumer calls).
@@ -1372,6 +1373,11 @@ def _self_test() -> int:
         )
         for field, bad_value in (
             ("pr_number", 98),  # points at a different target PR
+            # Cross-type equality hazard: Python says 99.0 == 99 and True == 1, so a bare
+            # != admits a JSON float/bool pr_number. The strict int-not-bool guard in
+            # provenance_admission_error rejects both; reverting it ADMITS 99.0 (reds here).
+            ("pr_number", 99.0),  # float is not an int (99.0 == 99 under lax equality)
+            ("pr_number", True),  # bool is not an int (True == 1 under lax equality)
             ("impl_provider", "mallory"),  # unregistered provider
             # UNHASHABLE / wrong-type fields must park, never raise: before the predicate's
             # isinstance-before-membership guard, [] / {} here raised TypeError out of the
