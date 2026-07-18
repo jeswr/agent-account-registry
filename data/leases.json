@@ -9,6 +9,16 @@
    "model": "opus",
    "issued_at": 1784371182,
    "expires_at": 1784373882
+  },
+  {
+   "account": "acct2css",
+   "claim_id": "283008ab82fa430c90d48ad246a68c20",
+   "holder": "jeswr/agent-account-registry#99@dispatch-29641157888.1",
+   "package": "ci",
+   "role": "ci",
+   "model": "fable",
+   "issued_at": 1784371188,
+   "expires_at": 1784373888
   }
  ]
 }
