@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves the prior major honesty issue. Both the public rustdoc and MPC skill now state that auth_sum only preserves the MAC relation for same-session, honestly formed inputs, does not call mac_check, and requires a successful caller-side batched check before opening or relying on the result. They also explicitly retain the research-grade, internally re-audited but externally unaudited status pending sq-qhy4. The implementation is a direct fallible auth_add fold, so it inherits party-point validation; the non-empty test exercises the helper and compares it with an explicit fold, while the empty-input test checks fail-closed behavior. The public re-export and matching skill update are complete. No new correctness, soundness, test-validity, or security defect is evident in the diff.",
+ "verdict": "approve"
+}
