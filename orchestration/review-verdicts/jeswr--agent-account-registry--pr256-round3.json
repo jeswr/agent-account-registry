@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-3 diff remains correct, non-vacuous, and fail-closed for the stated probe-failure case. The workflow emits an explicit boolean probe outcome, overwrites usage with an empty object when probing fails, and passes the marker to generation. The generator treats missing account measurements as unknown, excludes them from eligible capacity, rejects malformed or non-boolean outcome markers as unknown, and exposes failed/unknown state to the dashboard. The regression checks directly assert unknown availability, zero eligible capacity, the surfaced failed state, and rejection of absent/forged/malformed markers, so they would fail under the relevant regressions. The UI preserves simultaneous stale-generation and failed-probe warnings. No trust check, permission boundary, action pin, or untrusted-text execution surface is weakened. No actionable diff-scoped issue is supported. Round 3 has the same zero findings as round 2, so progress is stagnant under the required scale.",
+ "verdict": "approve"
+}
