@@ -95,6 +95,7 @@ jobs:
       target_name: ${{ steps.inputs.outputs.target_name }}
       head_branch: ${{ steps.pr.outputs.head_branch }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
+      base_ref: ${{ steps.pr.outputs.base_ref }}
       pr_author: ${{ steps.pr.outputs.pr_author }}
       impl_provider: ${{ steps.pr.outputs.impl_provider }}
       impl_alias: ${{ steps.pr.outputs.impl_alias }}
@@ -235,6 +236,15 @@ jobs:
           head = pull.get("head") or {}
           head_repo = (head.get("repo") or {}).get("full_name")
           head_branch = str(head.get("ref", ""))
+          # sol r6 on #257: the reviewer diffs against the DEFAULT branch; a worker PR
+          # retargeted to any other base would be reviewed against one comparison and
+          # merged against another — reject it at resolution (the sweep re-derives; a
+          # human retarget is an explicit act that removes the PR from the loop).
+          default_branch = str(((pull.get("base") or {}).get("repo") or {})
+                               .get("default_branch", ""))
+          if str((pull.get("base") or {}).get("ref", "")) != default_branch:
+              raise SystemExit("worker PR base is not the default branch (retargeted); "
+                               "refusing to review/arm")
           head_sha = str(head.get("sha", ""))
           author = str((pull.get("user") or {}).get("login", ""))
           if head_repo != repo:
@@ -354,6 +364,7 @@ jobs:
           values = {
               "head_branch": head_branch,
               "head_sha": head_sha,
+              "base_ref": str((pull.get("base") or {}).get("ref", "")),
               "pr_author": author,
               "impl_provider": impl_provider,
               "impl_alias": impl_alias,
@@ -1310,8 +1321,8 @@ jobs:
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
-          # [OPUS-4.8] B3: the LIVE trust-surface arm gate re-derives the PR diff and, if it
-          # touches one of these paths, withholds auto-arm and escalates to a human.
+          # [OPUS-4.8] B3, revised per Decision 7 (2026-07-18): the LIVE trust-surface
+          # derivation now feeds the SHA-bound pre-arm AUDIT trail instead of a human park.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
         run: |
           set -euo pipefail
@@ -1325,6 +1336,8 @@ jobs:
             --reviewer-provider "${{ needs.claim.outputs.provider }}"
             --arm "${{ needs.resolve.outputs.arm_auto_merge }}"
             --issue "${{ needs.resolve.outputs.issue }}"
+            --bot-login "${{ needs.resolve.outputs.pr_author }}"
+            --reviewed-base "${{ needs.resolve.outputs.base_ref }}"
           )
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
@@ -1336,7 +1349,10 @@ jobs:
       # everything before it is re-derivable, so a crash anywhere above re-converges via the
       # sweep instead of permanently skipping an unfinished PR.
       - name: Bind the reviewed sha (terminal marker for this head)
-        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && (steps.outcome.outputs.decision != 'arm' || steps.arm.outcome == 'success') }}
+        # sol r7 on #257: step SUCCESS is not enough — the head/base-race paths exit 0 with
+        # armed=false after setting review:needs, and binding reviewed-sha there wedges the
+        # sweep into skipping the pending re-review. Key on the armed OUTPUT.
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
         run: |

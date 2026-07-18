@@ -532,8 +532,14 @@ def decide_review(verdict, has_blockers, injection, round_n, max_rounds, securit
     if injection:
         return "needs-user"
     if verdict == "approve" and not has_blockers:
-        # Decision 7: security surfaces (zk/mpc/crypto/auth/e2ee/trust:*) never auto-arm.
-        return "needs-user" if security else "arm"
+        # Decision 7 REVISED (maintainer 2026-07-18: approved PRs were parking needs:user
+        # unnecessarily — on the registry nearly EVERY self-management diff touches a trust
+        # surface, so approve->park was the default outcome and the queue drowned in human
+        # hand-offs): the cross-provider approve IS the arm decision on every surface. Trust
+        # surfaces keep POST-merge auditability (the `trust-surface` label + an audit comment
+        # listing the touched paths, applied by the outcome step) instead of a pre-merge
+        # park; injection/tamper evidence still stops at a human above.
+        return "arm"
     # request_changes, or a contradictory approve-with-blockers (fail closed as changes).
     if round_n >= max_rounds and budget_action not in {"extend-model-pin", "extend-progress"}:
         return "needs-user"
@@ -772,6 +778,15 @@ def post_findings(repo, pr_number, verdict_file, round_n):
     only validated, length-capped fields are ever surfaced."""
     with open(verdict_file, encoding="utf-8") as handle:
         document = json.load(handle)
+
+    def _neutralize(text):
+        # sol r8 on #257: model-controlled text is republished under the App identity, and
+        # the audit-suppression check trusts App-authored markers — a prompt-injected
+        # reviewer could smuggle the current SHA marker into its verdict and suppress the
+        # real audit comment. Reserved marker prefixes are visibly defanged.
+        return str(text).replace("<!-- sparq-", "<!- sparq-")
+
+    document = json.loads(_neutralize(json.dumps(document)))
     lines = [
         "> 🤖 SPARQ agent — cross-provider review "
         f"round {round_n}: **{document['verdict']}**.",
@@ -1197,7 +1212,8 @@ def disarm(repo, pr_number, when):
 
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
-                  reviewer_account, arm, issue=None, surface_paths=None):
+                  reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
+                  reviewed_base=""):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval).
 
@@ -1208,13 +1224,11 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     PR stays visible to the sweep for a bounded re-review instead of stalling non-draft/unarmed
     forever; if even the undo fails, this escalates to review:needs-user (never silent).
 
-    [OPUS-4.8] B3 / defects #2,#4: DEFENSE-IN-DEPTH trust-surface arm gate re-derived on LIVE
-    data. Even if the upstream review-outcome decided `arm`, this — the last mutation before the
-    latch — re-reads the PR's changed files from the API at the reviewed head and, if ANY touches
-    a gate-weakening / orchestration-control path (renamed paths included, since the check is live
-    against the actual diff, not the planning-time list), WITHHOLDS auto-arm and escalates to a
-    human (review:needs-user). The PR is NOT undrafted/armed; the automated review already ran, the
-    final arm click is a human's for gate-weakening paths regardless of issue labels."""
+    [OPUS-4.8] B3, REVISED per Decision 7 (maintainer 2026-07-18): the trust-surface set is
+    still re-derived on LIVE changed files (renamed-path safe), but a hit no longer withholds
+    the arm — approve IS the arm decision on every surface. The hits feed the POST-arm audit
+    trail (_apply_trust_surface_audit: trust-surface label + one idempotent marker comment),
+    applied only after a successful live arm, with loud failures."""
     if reviewer_provider == impl_provider:
         raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
@@ -1229,26 +1243,56 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     if head_sha != reviewed_sha:
         # Not an error: new commits landed between approve and arm; re-review binds to the new head.
         set_review_state(repo, pr_number, "needs")
-        _write_outputs({"armed": False, "head_moved": True})
+        _write_outputs({"armed": False, "head_moved": True,
+                        "arm_complete": False})
         print("live head advanced past the reviewed sha; returned to review:needs")
         return
+    live_base = str((live.get("base") or {}).get("ref", ""))
+    if reviewed_base and live_base != reviewed_base:
+        # Base retarget changes the EFFECTIVE diff without moving the head, and
+        # --match-head-commit cannot see it (sol r5 on #257) — the approval bound a
+        # different comparison; re-review against the new base. RESIDUAL RISK, DOCUMENTED
+        # (sol r7): GitHub exposes no base-CAS primitive, so a retarget in the window
+        # between this check and the merge latch cannot be excluded mechanically; the
+        # actor able to retarget is a write+ collaborator (already inside the trust
+        # boundary), resolution REJECTS non-default-base PRs outright, and this pre-arm
+        # check plus the head CAS bound everything GitHub's API allows us to bind.
+        set_review_state(repo, pr_number, "needs")
+        _write_outputs({"armed": False, "head_moved": True, "base_moved": True,
+                        "arm_complete": False})
+        print("live base ref differs from the reviewed base; returned to review:needs")
+        return
+    trust_hits = ()
     if arm:
         # Live trust-surface re-derivation BEFORE any undraft/latch (renamed-path safe).
+        # Decision 7 REVISED (maintainer 2026-07-18): a hit no longer parks — it feeds the
+        # POST-arm audit trail below (label + comment applied only after a SUCCESSFUL arm,
+        # with checked failures — sol r1 on #257).
         surfaces = tuple(surface_paths) if surface_paths else DEFAULT_TRUST_SURFACE_PATHS
-        live_files = _pr_changed_files(repo, pr_number)
-        hits = trust_surface_paths_touched(live_files, surfaces)
-        if hits:
-            alert_repo, alert_token = _alert_route()
-            needs_user(repo, pr_number,
-                       "trust-surface change approved by cross-provider review; human arm "
-                       f"required (diff touches: {', '.join(hits[:8])})",
-                       issue=issue, alert_repo=alert_repo, alert_token=alert_token)
-            _write_outputs({"armed": False, "head_moved": False, "trust_surface": True})
-            print("trust-surface diff: withheld auto-arm; escalated to human (review:needs-user)")
-            return
+        # SHA-BOUND snapshot (sol r3): the mutable PR files endpoint is ABA-racable
+        # (A -> benign B -> A force-push between the head check and this read would hide
+        # the hits while the CAS still accepts A). The compare at the immutable
+        # reviewed_sha cannot change under us.
+        base_ref = str((live.get("base") or {}).get("ref", "")) or "main"
+        sha_files = _files_at_sha(repo, base_ref, reviewed_sha)
+        if FILES_TRUNCATED_SENTINEL in sha_files:
+            # Fail closed toward MORE audit: an unverifiable inventory is treated as a hit.
+            trust_hits = (FILES_TRUNCATED_SENTINEL,)
+        else:
+            trust_hits = trust_surface_paths_touched(sha_files, surfaces)
+    if arm and trust_hits:
+        # Durable audit BEFORE the merge latch can fire (sol r2 on #257): auto-merge can
+        # complete immediately, and a post-merge crash would leave an armed trust diff with
+        # no audit trail (reconciliation only walks open PRs). The comment/label are
+        # SHA-bound and idempotent, so an arm failure + re-review re-audits the new head.
+        _apply_trust_surface_audit(repo, pr_number, trust_hits, reviewed_sha,
+                                   bot_login=bot_login)
     _run_gh(["pr", "ready", str(pr_number), "-R", repo])
     if arm:
-        merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto"],
+        # Atomic SHA-bound arm (sol r2): GitHub's own CAS — the latch only sets if the head
+        # still equals the reviewed sha at mutation time, closing the read-to-arm race.
+        merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto",
+                         "--match-head-commit", reviewed_sha],
                         check=False)
         if merge.returncode != 0:
             undo = _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
@@ -1267,8 +1311,68 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     if issue:
         # Deferred issue completion (locked decision 16): complete only on arm, not on publish.
         _load_worker_issue().set_status(repo, issue, "complete")
-    _write_outputs({"armed": bool(arm), "head_moved": False})
+    _write_outputs({"armed": bool(arm), "head_moved": False,
+                    "trust_surface": bool(trust_hits), "arm_complete": True})
     print(f"pull request marked ready{' and armed (auto-merge)' if arm else ''}")
+
+
+TRUST_AUDIT_MARKER_PREFIX = "<!-- sparq-trust-audit:v1 sha="
+TRUST_AUDIT_MARKER = TRUST_AUDIT_MARKER_PREFIX  # back-compat alias for tests/greps
+
+
+COMPARE_FILES_CAP = 300  # GitHub returns up to 300 changed files on compare page 1 (hard cap)
+FILES_TRUNCATED_SENTINEL = "(compare file inventory truncated/unavailable - assumed trust-surface)"
+
+
+def _files_at_sha(repo, base_ref, sha):
+    """Changed-file names (current AND previous names — rename-safe) from the IMMUTABLE
+    base...sha compare, the SHA-bound counterpart of the mutable PR files endpoint (sol
+    r3/r4 on #257). GitHub exposes files only on the FIRST compare page, capped at 300;
+    at/over the cap or on a malformed/missing files array this FAILS CLOSED by returning
+    the sentinel — the caller treats it as a trust hit and audits MORE, never less."""
+    doc = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{sha}"])
+    rows = doc.get("files") if isinstance(doc, dict) else None
+    if not isinstance(rows, list) or len(rows) >= COMPARE_FILES_CAP:
+        return [FILES_TRUNCATED_SENTINEL]
+    files = []
+    for r in rows:
+        if not isinstance(r, dict):
+            return [FILES_TRUNCATED_SENTINEL]
+        files.append(str(r.get("filename", "")))
+        prev = r.get("previous_filename")
+        if isinstance(prev, str) and prev:
+            files.append(prev)
+    return files
+
+
+def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha, bot_login=""):
+    """Durable PRE-arm audit trail for an arming trust-plane diff (Decision 7 revision,
+    hardened per sol r2 on #257): the label + ONE idempotent comment listing the touched
+    security paths, SHA-BOUND — the idempotency marker carries the reviewed sha and only a
+    [bot]-authored marker for THIS sha suppresses a re-post (a stale audit from an earlier
+    head never masks the current one; collaborator pre-seeding is within the existing
+    write+ trust boundary and documented). Failures are LOUD (raise)."""
+    marker = f"{TRUST_AUDIT_MARKER_PREFIX}{reviewed_sha} -->"
+    label = _run_gh(["pr", "edit", str(pr_number), "-R", repo,
+                     "--add-label", "trust-surface"], check=False)
+    if label.returncode != 0:
+        _run_gh(["label", "create", "trust-surface", "-R", repo,
+                 "--description", "Armed trust-plane diff - post-merge audit trail",
+                 "--color", "D93F0B"], check=False)
+        _run_gh(["pr", "edit", str(pr_number), "-R", repo, "--add-label", "trust-surface"])
+    existing = _paginated_comments(repo, pr_number)
+    # Only the EXACT App identity may suppress a re-post (sol r3: any-[bot] let a foreign
+    # issues-write bot pre-seed the marker); with no bot_login supplied, nothing suppresses
+    # (fail toward a duplicate audit, never toward a missing one).
+    if not (bot_login and any(
+            marker in str(c.get("body", ""))
+            and str(c.get("user", {}).get("login", "")) == bot_login
+            for c in existing)):
+        body = ("> 🤖 SPARQ agent\n\nArming on cross-provider approve. "
+                "Trust-surface audit trail (complete): " + ", ".join(hits) + " @ "
+                + reviewed_sha[:12] + ". Post-merge review welcome; revert-and-reopen is "
+                "the escalation path.\n\n" + marker)
+        _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body", body])
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
@@ -1322,14 +1426,6 @@ def review_outcome(args):
         approved = document["verdict"] == "approve" and not has_blockers
         if document["injection_detected"]:
             reason = "the reviewer flagged possible prompt injection"
-        elif approved and trust_surface:
-            # B3: the review APPROVED, but the diff touches a gate-weakening / orchestration
-            # trust-surface path — the automated cross-provider review is complete, but the arm
-            # is a human's regardless of issue labels.
-            reason = ("trust-surface change approved by cross-provider review; human arm "
-                      f"required (diff touches: {', '.join(surface_hits[:8])})")
-        elif approved:
-            reason = "a security-labelled surface passed review and needs a HUMAN arm decision"
         else:
             reason = (f"the review round budget is exhausted at {args.round} round(s) (base "
                       f"{args.max_rounds}, hard cap {HARD_CAP_ROUNDS}) with no extension left — "
@@ -1340,7 +1436,8 @@ def review_outcome(args):
                    alert_repo=alert_repo, alert_token=alert_token)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
-        # narrowly-minted arm token; nothing to mutate here.
+        # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
+        # THERE, after a successful live arm with checked failures (sol r1 on #257).
         print("verdict approved: arm step will run under the arm-scoped token")
 
 
@@ -1498,8 +1595,8 @@ def _self_test():
             check(f"rejects {name}", "accepted", "rejected")
 
     check("approve arms", decide_review("approve", False, False, 1, 3, False), "arm")
-    check("approve+security needs user", decide_review("approve", False, False, 1, 3, True),
-          "needs-user")
+    check("approve+security ARMS (Decision 7 revision 2026-07-18)",
+          decide_review("approve", False, False, 1, 3, True), "arm")
     check("injection short-circuits", decide_review("approve", False, True, 1, 3, False),
           "needs-user")
     check("changes under budget", decide_review("request_changes", True, False, 2, 3, False),
@@ -1521,9 +1618,9 @@ def _self_test():
     check("extension never overrides injection",
           decide_review("request_changes", False, True, 3, 3, False,
                         budget_action="extend-progress"), "needs-user")
-    check("extension never arms security",
+    check("approve at exhaustion still arms on any surface (Decision 7 revision)",
           decide_review("approve", False, False, 3, 3, True,
-                        budget_action="extend-progress"), "needs-user")
+                        budget_action="extend-progress"), "arm")
 
     # ---- decide_budget (directive 2026-07-17): the combined round-budget policy ----
     def budget(rounds, models, progress, provider="anthropic", base=3, pending=(), pin=None):
@@ -2189,6 +2286,127 @@ def _self_test():
     check("alert route honours ALERT_REPO", _alert_route(), ("private/alerts", "t1"))
     for key in ("REGISTRY_REPO", "REGISTRY_ALERT_TOKEN", "ALERT_REPO", "ALERT_TOKEN"):
         os.environ.pop(key, None)
+    # ---- ready_and_arm wiring (Decision 7 revision, sol r1 on #257): approved trust-surface
+    # diffs ARM with a post-arm audit; head races and arm failures never audit ----
+    os.environ.setdefault("PROVENANCE_SALT", "selftest-salt")
+    raa_calls = []
+    raa_outputs = {}
+    raa_state = {}
+    real_raa = {name: globals()[name] for name in (
+        "_gh_json", "_run_gh", "_pr_changed_files", "set_review_state",
+        "_paginated_comments", "needs_user", "_write_outputs")}
+
+    def raa_gh_json(args, **_kw):
+        path = args[1] if len(args) > 1 else ""
+        if "/compare/" in path:
+            # the SHA-bound snapshot (sol r3): only the reviewed sha's compare carries hits
+            sha_in_path = path.split("...", 1)[1].split("?", 1)[0]
+            files = ([{"filename": "scripts/worker-pr.py"}]
+                     if sha_in_path == "b" * 40 else [])
+            return {"files": files}
+        return {"state": "open", "head": {"sha": raa_state["head"]},
+                "base": {"ref": "main"}}
+
+    def raa_run_gh(args, **kw):
+        raa_calls.append(" ".join(args))
+        if "merge" in args and raa_state.get("merge_fails"):
+            if kw.get("check", True):
+                raise WorkerPrError("GitHub API request failed for merge")
+            return argparse.Namespace(returncode=1, stdout="", stderr="")
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    def run_raa(head_ok=True, merge_fails=False, comments=()):
+        raa_calls.clear(); raa_outputs.clear()
+        sha = "b" * 40
+        raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails)
+        globals()["_gh_json"] = raa_gh_json
+        globals()["_run_gh"] = raa_run_gh
+        globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
+        globals()["set_review_state"] = lambda repo, pr, s: raa_calls.append(f"state:{s}")
+        globals()["_paginated_comments"] = lambda repo, pr: list(comments)
+        globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
+        globals()["_write_outputs"] = raa_outputs.update
+        ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
+                      bot_login="sparq[bot]", reviewed_base=raa_state.get("reviewed_base", "main"))
+
+    try:
+        sha = "b" * 40
+        run_raa()
+        check("approved trust-surface diff ARMS (Decision 7 revision)",
+              (any("merge" in c for c in raa_calls), raa_outputs.get("armed"),
+               raa_outputs.get("trust_surface")), (True, True, True))
+        audit_i = next(i for i, c in enumerate(raa_calls) if "trust-surface" in c)
+        merge_i = next(i for i, c in enumerate(raa_calls) if "merge" in c)
+        check("audit trail is DURABLE BEFORE the merge latch (sol r2)",
+              audit_i < merge_i, True)
+        check("the arm is SHA-bound (--match-head-commit CAS)",
+              any("--match-head-commit" in c and sha in c for c in raa_calls), True)
+        check("audit comment carries the SHA-bound idempotency marker",
+              any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        bot_marker = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{sha} -->",
+                      "user": {"login": "sparq[bot]"}}
+        run_raa(comments=(bot_marker,))
+        check("bot marker for THIS sha suppresses a re-post",
+              any(TRUST_AUDIT_MARKER_PREFIX in c and "comment" in c for c in raa_calls),
+              False)
+        stale = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{'d' * 40} -->",
+                 "user": {"login": "sparq[bot]"}}
+        run_raa(comments=(stale,))
+        check("a stale-head marker does NOT suppress the fresh audit",
+              any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        human_marker = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{sha} -->",
+                        "user": {"login": "mallory"}}
+        run_raa(comments=(human_marker,))
+        check("a non-bot marker does NOT suppress the audit",
+              any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        foreign_bot = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{sha} -->",
+                       "user": {"login": "other-ci[bot]"}}
+        run_raa(comments=(foreign_bot,))
+        check("a FOREIGN bot marker does NOT suppress the audit (exact App pin, sol r3)",
+              any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        check("the audit snapshot is SHA-bound (compare at reviewed sha, not the PR endpoint)",
+              raa_outputs.get("trust_surface"), True)
+        # _files_at_sha unit facets (sol r4): renames carry both names; the 300-cap and
+        # malformed rows fail closed to the assumed-trust sentinel.
+        real_files_gh = globals()["_gh_json"]
+        try:
+            globals()["_gh_json"] = lambda a, **k: {"files": [
+                {"filename": "scripts/renamed-away.py",
+                 "previous_filename": "scripts/worker-pr.py"}]}
+            check("renamed trust file still hits (previous_filename tracked)",
+                  bool(trust_surface_paths_touched(_files_at_sha("o/r", "main", "b" * 40))),
+                  True)
+            globals()["_gh_json"] = lambda a, **k: {"files": [
+                {"filename": f"f{i}.txt"} for i in range(COMPARE_FILES_CAP)]}
+            check("at the compare cap the inventory fails closed to the sentinel",
+                  _files_at_sha("o/r", "main", "b" * 40), [FILES_TRUNCATED_SENTINEL])
+            globals()["_gh_json"] = lambda a, **k: {"files": "garbage"}
+            check("malformed files array fails closed to the sentinel",
+                  _files_at_sha("o/r", "main", "b" * 40), [FILES_TRUNCATED_SENTINEL])
+        finally:
+            globals()["_gh_json"] = real_files_gh
+        raa_state["reviewed_base"] = "release"  # live fake serves base ref "main"
+        run_raa()
+        check("base retarget returns to review:needs with NO arm and NO audit (sol r5)",
+              ("state:needs" in raa_calls,
+               any("merge" in c for c in raa_calls),
+               any("trust-surface" in c for c in raa_calls)), (True, False, False))
+        raa_state["reviewed_base"] = "main"
+        run_raa(head_ok=False)
+        check("head race returns to review:needs with NO arm and NO audit",
+              ("state:needs" in raa_calls,
+               any("merge" in c for c in raa_calls),
+               any("trust-surface" in c for c in raa_calls)), (True, False, False))
+        try:
+            run_raa(merge_fails=True)
+            check("arm failure raises (draft restored path)", "no error", "raised")
+        except WorkerPrError:
+            check("arm failure raises (draft restored path)", "raised", "raised")
+        check("the pre-arm audit survives an arm failure (re-review re-audits per sha)",
+              any(TRUST_AUDIT_MARKER_PREFIX in c for c in raa_calls), True)
+    finally:
+        globals().update(real_raa)
+
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -2283,6 +2501,10 @@ def main():
     # security_paths). Empty -> DEFAULT_TRUST_SURFACE_PATHS (fail closed, never silently absent).
     arm.add_argument("--surface-path", action="append", default=[],
                      help="trust-surface path/prefix (repeatable; from policy security_paths)")
+    arm.add_argument("--bot-login", default="",
+                     help="the App bot login (exact audit-marker suppression identity)")
+    arm.add_argument("--reviewed-base", default="",
+                     help="the base ref the review compared against (arm re-validates it)")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -2381,7 +2603,8 @@ def main():
                           args.impl_account_h, args.reviewer_provider,
                           os.environ.get("WORKER_REVIEWER_ACCOUNT", ""),
                           args.arm == "true", issue=args.issue,
-                          surface_paths=args.surface_path or None)
+                          surface_paths=args.surface_path or None,
+                          bot_login=args.bot_login, reviewed_base=args.reviewed_base)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":
