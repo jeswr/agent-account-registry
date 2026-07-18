@@ -75,3 +75,24 @@ jobs:
           rem=$(printf '%s\n' "$out" | sed -n 's/^REMOVE: //p')
           for l in $add; do gh issue edit "$NUM" -R "$REPO" --add-label "$l" || true; done
           for l in $rem; do gh issue edit "$NUM" -R "$REPO" --remove-label "$l" || true; done
+
+  # [FABLE-5] Loud-fail alarm: triage-issue had NO always()-final alarm (the repo convention that
+  # dispatch.yml + set-up-account.yml carry). A failed trust-gate/triage now upserts the rolling
+  # pipeline-failure issue instead of only reddening the Actions tab.
+  alarm:
+    needs: triage
+    if: ${{ always() && (needs.triage.result == 'failure' || needs.triage.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          job-name: triage
+          job-result: ${{ needs.triage.result }}
+          cancelled: ${{ needs.triage.result == 'cancelled' }}
+          detail: "triage-issue ${{ needs.triage.result }} on issue #${{ github.event.issue.number }}"
+          registry-token: ${{ github.token }}

@@ -118,3 +118,31 @@ jobs:
           set -uo pipefail
           python3 scripts/model-health.py --self-test
           python3 scripts/model-health.py decide --policy-file policy/repos.toml
+
+  # [FABLE-5] Loud-fail alarm — the STRUCTURAL GAP the audit flagged: groom.yml had NO
+  # always()/failure()-final alarm, so a failed scheduled groom surfaced ONLY as a red Actions run
+  # (the silent class the maintainer is fighting). groom is the ONLY crash-recovery path, so a
+  # silent groom failure freezes recovery fleet-wide. This job needs: groom and fires on its
+  # failure/cancel, upserting the single rolling pipeline-failure issue.
+  alarm:
+    needs: groom
+    if: ${{ always() && (needs.groom.result == 'failure' || needs.groom.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          job-name: groom
+          job-result: ${{ needs.groom.result }}
+          cancelled: ${{ needs.groom.result == 'cancelled' }}
+          detail: "groom sweep ${{ needs.groom.result }} — the crash-recovery path failed; recovery is frozen this tick"
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}

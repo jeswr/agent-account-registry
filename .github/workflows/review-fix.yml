@@ -1449,3 +1449,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run dispatch.yml -R "$GITHUB_REPOSITORY" || echo "::warning::doorbell ring failed (cron backstop covers this tick)"
+
+  # [FABLE-5] Loud-fail alarm — review-fix.yml had no always()-final alarm. It fires only on a
+  # genuine failure/cancel of any job (NOT skip: several jobs skip by design, e.g. unresolvable when
+  # resolvable, run when a claim was not acquired). A failed cross-provider review or fix is now
+  # visible in the rolling pipeline-failure issue instead of only reddening the Actions tab. Detail
+  # carries only per-job result strings — no PR body, transcript, or account handle.
+  alarm:
+    needs: [resolve, claim, run, outcome, unresolvable, model_health, release, doorbell]
+    if: >-
+      ${{ always() && (
+        contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+      ) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          job-name: ${{ needs.run.result == 'failure' && 'run' || (needs.claim.result == 'failure' && 'claim' || (needs.resolve.result == 'failure' && 'resolve' || 'review-fix-post')) }}
+          job-result: failure
+          cancelled: ${{ contains(needs.*.result, 'cancelled') }}
+          detail: >-
+            review-fix run (mode=${{ inputs.mode }}): resolve=${{ needs.resolve.result }}
+            claim=${{ needs.claim.result }} run=${{ needs.run.result }}
+            outcome=${{ needs.outcome.result }} — a cross-provider review/fix attempt failed
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}

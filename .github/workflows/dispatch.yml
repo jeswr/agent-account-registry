@@ -156,6 +156,24 @@ jobs:
                   raise SystemExit(f"target {kind} snapshot is missing or incomplete")
               return document["items"]
 
+          def repo_snapshot_error(index):
+              # Per-repo degradation (audit modes #2/#3): plan-snapshot.py marks a repo whose
+              # issues/pulls listing failed (5xx/403/429/timeout after retries, non-list page, or a
+              # legitimate >5000-entry overflow) as `complete: False` + `snapshot_error` for ITSELF
+              # only. Returns that reason string (else None). A degraded repo is SKIPPED here
+              # (fail-closed: zero rows — a listing we could not complete must never look empty) and
+              # its reason is routed into snapshot_skips so it surfaces in the always() alarm,
+              # instead of the old whole-sweep-fatal raise that silenced every target.
+              try:
+                  document = json.loads(
+                      Path(out_dir, f"raw-issues-{index}.json").read_text(encoding="utf-8"))
+              except (OSError, ValueError):
+                  return "snapshot-file-unreadable"
+              if isinstance(document, dict) and document.get("complete") is not True:
+                  err = document.get("snapshot_error")
+                  return err if isinstance(err, str) and err else "snapshot-incomplete"
+              return None
+
           def load_dispatch(path):
               spec = importlib.util.spec_from_file_location("target_dispatch_plan", path)
               if spec is None or spec.loader is None:
@@ -202,7 +220,15 @@ jobs:
               return linked
 
           repositories = []
+          degraded_repos = []
           for index, repo in enumerate(repos):
+              degrade_reason = repo_snapshot_error(index)
+              if degrade_reason is not None:
+                  # Per-repo degrade: skip this target entirely (fail-closed) but record WHY so the
+                  # assemble step routes it into snapshot_skips and the always() alarm fires.
+                  print(f"::warning::PLAN repo {repo} DEGRADED, skipped: {degrade_reason}")
+                  degraded_repos.append({"target_repo": repo, "reason": degrade_reason})
+                  continue
               target = root / str(index)
               dispatch = load_dispatch(target / "scripts" / "dispatch-plan.py")
               raw = [
@@ -320,9 +346,11 @@ jobs:
                   encoding="utf-8")
 
           Path(out_dir, "issue-plan.json").write_text(
-              json.dumps({"repositories": repositories}, indent=2, sort_keys=True) + "\n",
+              json.dumps({"repositories": repositories,
+                          "degraded_repos": degraded_repos}, indent=2, sort_keys=True) + "\n",
               encoding="utf-8")
-          print(f"PLAN rows: {sum(len(repo['items']) for repo in repositories)} issue item(s)")
+          print(f"PLAN rows: {sum(len(repo['items']) for repo in repositories)} issue item(s)"
+                f"; {len(degraded_repos)} target repo(s) degraded/skipped")
           PY
 
       # The registry is checked out only NOW — after every step that executes target planner code
@@ -395,6 +423,19 @@ jobs:
           review_items = []
           disarm_items = []
           snapshot_skips = []
+          # Per-repo degradation (audit modes #2/#3): a target whose listing failed was skipped in
+          # PLAN and carries a reason here. Route it into snapshot_skips (pr_number 0 = repo-wide)
+          # so the defer-reason histogram in the always() alarm shows WHICH repo went dark and WHY,
+          # instead of the whole sweep dying silently.
+          for degraded in (intermediate.get("degraded_repos") or []):
+              if not isinstance(degraded, dict):
+                  continue
+              d_repo = degraded.get("target_repo")
+              d_reason = degraded.get("reason")
+              if isinstance(d_repo, str) and isinstance(d_reason, str):
+                  print(f"::warning::SNAPSHOT repo {d_repo} DEGRADED: {d_reason}")
+                  snapshot_skips.append(
+                      {"repo": d_repo, "pr_number": 0, "reason": f"repo-degraded:{d_reason}"})
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
@@ -843,3 +884,41 @@ jobs:
           set -uo pipefail
           python3 registry/scripts/usage-alert.py --self-test
           python3 registry/scripts/usage-alert.py
+
+  # [FABLE-5] THE HEADLINE GAP. The two always() alarm steps above live INSIDE claim, so when PLAN
+  # crashes (any uncaught step failure or the 15m timeout) claim is SKIPPED (needs: plan) and the
+  # whole tick goes 100% silent — exactly the run-29617040167 whole-sweep-kill posture. This
+  # JOB-level alarm needs BOTH jobs and fires on ANY failure/cancel/skip, so a PLAN crash (claim
+  # skipped) AND a claim failure both upsert the single rolling pipeline-failure issue. It is the
+  # last line of defense: no silent dispatch tick.
+  alarm:
+    needs: [plan, claim]
+    if: >-
+      ${{ always() && (
+        needs.plan.result == 'failure' || needs.plan.result == 'cancelled' ||
+        needs.claim.result == 'failure' || needs.claim.result == 'cancelled' ||
+        needs.claim.result == 'skipped'
+      ) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Alarm on PLAN crash (claim skipped) or CLAIM failure
+        uses: ./.github/actions/pipeline-alarm
+        with:
+          job-name: ${{ (needs.plan.result == 'failure' || needs.plan.result == 'cancelled') && 'plan' || 'claim' }}
+          job-result: ${{ (needs.plan.result == 'failure' || needs.plan.result == 'cancelled') && needs.plan.result || needs.claim.result }}
+          cancelled: ${{ needs.plan.result == 'cancelled' || needs.claim.result == 'cancelled' }}
+          detail: >-
+            dispatch tick: plan=${{ needs.plan.result }} claim=${{ needs.claim.result }} —
+            a PLAN crash skips CLAIM and silences the whole sweep (zero-dispatch), a CLAIM failure
+            launches nothing
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
