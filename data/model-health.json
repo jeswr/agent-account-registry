@@ -1407,6 +1407,14 @@
    "model_alias": "sonnet",
    "exit_class": "success",
    "run_id": "29626039634.1"
+  },
+  {
+   "ts": 1784342340,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "success",
+   "run_id": "29627299646.1"
   }
  ]
 }
