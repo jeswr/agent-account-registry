@@ -291,7 +291,11 @@ from the `data/model-health.json` records the worker/review outcome jobs already
 
 You don't paste tokens manually. Instead:
 
-1. Open a **"set up new account"** issue (there's a template) and add the **`set-up-account`** label.
+1. Open a **"set up new account"** issue (there's a template) and add the **`set-up-account`** label,
+   a **`provider:openai`**/**`provider:anthropic`** label, and one or more **`target:<owner>/<name>`**
+   labels naming the repositories this account is authorized for (e.g. `target:sparq-org/sparq`). The
+   account is added **only** to those repos' `account_pool` — a request with no target is rejected, so
+   an account is never blanket-granted to every pool.
 2. The `set-up-account` workflow (trust-gated to the maintainer) runs the provider's device/OAuth
    login and **comments a sign-in URL + one-time code** on the issue.
 3. Sign in with the account you want to register. The broker captures the resulting token, stores it

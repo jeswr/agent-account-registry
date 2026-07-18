@@ -12,8 +12,13 @@
 # fingerprint-accounts; the old sparq-org/sparq write registered accounts nothing could use). The
 # account issue now carries the `models:` line read_accounts requires (an account with empty models
 # is silently invisible to the allocator), the broker validates its own registration through the
-# real read_accounts parser, and the handle is appended to policy/repos.toml account_pool with a
+# real read_accounts parser, and the handle is granted to policy/repos.toml account_pool with a
 # contents-API compare-and-swap (rebase-retry) so no human policy edit is left dangling.
+#
+# SCOPED-GRANT fix (#190): an account is a PER-REPOSITORY grant (account_pool membership IS the
+# authorization every enforcement point re-checks), so the request must name its authorized targets
+# via `target:<owner>/<name>` label(s) — at least one, validated known + enabled — and the handle is
+# added ONLY to those rows' account_pool, never blanket-appended to every (incl. disabled) pool.
 #
 # STALE-SNAPSHOT fix (#186, hardened after review round 1 of #236): the handle/secret in `meta`
 # are only a pre-login HINT. A re-read before the write is still a TOCTOU check, so the store step
@@ -86,6 +91,20 @@ jobs:
               --body "❌ Add a \`provider:openai\` or \`provider:anthropic\` label, then re-apply \`set-up-account\`." || true
             exit 1
           fi
+          # #190: an account is a per-repository grant, not a global one. account_pool membership
+          # IS the authorization (worker.yml re-checks `account_name in account_pool`), so the
+          # request must name the repositories it authorizes via `target:<owner>/<name>` label(s).
+          # At least one is required — a request with no target is UNAUTHORIZED, so fail closed
+          # rather than blanket-granting every pool. Existence + enabled is validated below.
+          targets=""
+          for lb in ${{ join(github.event.issue.labels.*.name, ' ') }}; do
+            case "$lb" in target:*/*) targets="${targets:+$targets }${lb#target:}";; esac
+          done
+          if [ -z "$targets" ]; then
+            gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
+              --body "❌ Add at least one \`target:<owner>/<name>\` label naming the repository pool(s) this account is authorized for (e.g. \`target:sparq-org/sparq\`), then re-apply \`set-up-account\`." || true
+            exit 1
+          fi
           # The models line the allocator requires (read_accounts drops model-less accounts),
           # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
           if [ "$prov" = openai ]; then models='[terra]'; else models='[fable, opus, sonnet, haiku]'; fi
@@ -98,12 +117,41 @@ jobs:
           {
             printf 'provider=%s\n' "$prov"
             printf 'models=%s\n' "$models"
+            printf 'targets=%s\n' "$targets"
             printf 'handle=acct%02d\n' "$((n+1))"
             printf 'secret=ACCT%02d_TOKEN\n' "$((n+1))"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout (pinned)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # #190: reject an unknown or disabled target BEFORE the ~13-min login, so we never capture a
+      # credential we could not fully register (a request naming only a disabled/unknown pool is
+      # unauthorized). The authoritative re-check is at write time against the live policy file.
+      - name: Validate target repositories are known and enabled (fail closed)
+        env:
+          TARGET_REPOS: ${{ steps.meta.outputs.targets }}
+        run: |
+          set -euo pipefail
+          if ! out=$(python3 - <<'PY' 2>&1
+          import os, tomllib
+          targets = os.environ["TARGET_REPOS"].split()
+          with open("policy/repos.toml", "rb") as fh:
+              repos = tomllib.load(fh).get("repos", {})
+          for t in targets:
+              row = repos.get(t)
+              if row is None:
+                  raise SystemExit(f"target {t} is not a repository in policy/repos.toml")
+              if not row.get("enabled", False):
+                  raise SystemExit(f"target {t} is disabled — cannot grant an account to a disabled pool")
+          print("target repositories validated: " + ", ".join(targets))
+          PY
+          ); then
+            gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
+              --body "❌ Target validation failed: $out. Fix the \`target:<owner>/<name>\` label(s), then re-apply \`set-up-account\`." || true
+            echo "::error::$out"; exit 1
+          fi
+          echo "$out"
 
       - name: Install provider CLI (version-pinned, fail on error)
         run: |
@@ -246,11 +294,15 @@ jobs:
       # SEAM(#325): the account-pool list is slated to move to a PRIVATE location; until then
       # policy/repos.toml account_pool is the single allow-list every enforcement point checks
       # (policy-resolve validation, claim()'s pool filter, worker.yml's independent re-check), so
-      # the broker appends the new handle there via a contents-API compare-and-swap.
-      - name: Append the handle to policy account_pool (contents-API CAS, rebase-retry)
+      # the broker grants the new handle there via a contents-API compare-and-swap.
+      # #190: the grant is SCOPED — the handle is added ONLY to the account_pool of the request's
+      # explicitly-authorized, enabled target repositories, never to every pool. Every other row's
+      # account_pool is asserted byte-identical before the write (fail closed on any drift).
+      - name: Grant the handle to the authorized target account_pools (contents-API CAS, rebase-retry)
         if: steps.login.outputs.status == 'ok'
         env:
           NEW_HANDLE: ${{ steps.store.outputs.handle }}
+          TARGET_REPOS: ${{ steps.meta.outputs.targets }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -264,8 +316,11 @@ jobs:
 
           repo = os.environ["GITHUB_REPOSITORY"]
           handle = os.environ["NEW_HANDLE"]
+          targets = os.environ["TARGET_REPOS"].split()
           if not re.fullmatch(r"acct[0-9a-z]{2,}", handle):
               raise SystemExit("unsafe handle")
+          if not targets:
+              raise SystemExit("no authorized target repositories — refusing (fail closed)")
           path = "policy/repos.toml"
 
           def gh_api(args, input_doc=None):
@@ -274,42 +329,81 @@ jobs:
                   input=json.dumps(input_doc) if input_doc is not None else None)
               return result
 
+          # Format-preserving: edit the account_pool line ONLY inside a target's own
+          # [repos."owner/name"] section span. A whole-file subn (the #190 bug) would have appended
+          # the handle to every pool, including disabled and future rows.
+          section_re = re.compile(r'(?m)^\[repos\."([^"]+)"\]')
+          pool_re = re.compile(r"(?m)^(account_pool\s*=\s*\[)([^\]]*)(\])")
+
+          def append(match):
+              entries = match.group(2)
+              if f'"{handle}"' in entries:
+                  return match.group(0)
+              separator = ", " if entries.strip() else ""
+              return f"{match.group(1)}{entries}{separator}\"{handle}\"{match.group(3)}"
+
+          def grant_targets(text):
+              headers = list(section_re.finditer(text))
+              if not headers:
+                  raise SystemExit("no [repos.\"...\"] sections in policy/repos.toml")
+              pieces = [text[:headers[0].start()]]
+              for i, h in enumerate(headers):
+                  name = h.group(1)
+                  end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+                  section = text[h.start():end]
+                  if name in targets:
+                      section, count = pool_re.subn(append, section, count=1)
+                      if count == 0:
+                          raise SystemExit(f"target {name} has no account_pool line — refusing")
+                  pieces.append(section)
+              return "".join(pieces)
+
           for attempt in range(6):
               meta = gh_api([f"repos/{repo}/contents/{path}"])
               if meta.returncode != 0:
                   raise SystemExit("policy file read failed")
               document = json.loads(meta.stdout)
               text = base64.b64decode("".join(document["content"].split())).decode()
-              pattern = re.compile(r"(?m)^(account_pool\s*=\s*\[)([^\]]*)(\])")
-              def append(match):
-                  entries = match.group(2)
-                  if f'"{handle}"' in entries:
-                      return match.group(0)
-                  separator = ", " if entries.strip() else ""
-                  return f"{match.group(1)}{entries}{separator}\"{handle}\"{match.group(3)}"
-              new_text, count = pattern.subn(append, text)
-              if count == 0:
-                  raise SystemExit("no account_pool line found in policy/repos.toml")
+              before = tomllib.loads(text).get("repos", {})
+              # Authoritative re-check against the LIVE policy: every target must still exist and be
+              # enabled at write time (a target disabled mid-login must not be granted). Fail closed.
+              for t in targets:
+                  row = before.get(t)
+                  if row is None:
+                      raise SystemExit(f"target {t} is not a repository in policy/repos.toml — refusing")
+                  if not row.get("enabled", False):
+                      raise SystemExit(f"target {t} is disabled — refusing to grant a disabled pool")
+              new_text = grant_targets(text)
               if new_text == text:
-                  print(f"{handle} already present in account_pool")
+                  print(f"{handle} already present in every target pool")
                   break
-              parsed = tomllib.loads(new_text)  # refuse to commit a policy the resolver can't parse
-              if not any(handle in (row.get("account_pool") or [])
-                         for row in parsed.get("repos", {}).values()):
-                  raise SystemExit("edited policy does not contain the new handle; refusing")
+              after = tomllib.loads(new_text).get("repos", {})  # refuse a policy the resolver can't parse
+              # The scoping invariant that closes #190: EXACTLY the target rows gain the handle and
+              # every non-target row's account_pool is unchanged.
+              for name, row in before.items():
+                  old_pool = list(row.get("account_pool") or [])
+                  new_pool = list(after.get(name, {}).get("account_pool") or [])
+                  if name in targets:
+                      if handle not in new_pool:
+                          raise SystemExit(f"target {name} did not gain {handle}; refusing")
+                      if set(new_pool) - set(old_pool) - {handle}:
+                          raise SystemExit(f"target {name} gained unexpected members; refusing")
+                  elif new_pool != old_pool:
+                      raise SystemExit(
+                          f"non-target {name} account_pool changed — refusing to over-grant (fail closed)")
               put = gh_api(
                   [f"repos/{repo}/contents/{path}", "-X", "PUT", "--input", "-"],
                   input_doc={
-                      "message": f"register {handle} in account_pool (set-up-account broker)",
+                      "message": f"grant {handle} to {', '.join(targets)} account_pool (set-up-account broker)",
                       "content": base64.b64encode(new_text.encode()).decode(),
                       "sha": document["sha"],
                   })
               if put.returncode == 0:
-                  print(f"appended {handle} to account_pool")
+                  print(f"granted {handle} to target pools: {', '.join(targets)}")
                   break
               time.sleep(2 * (attempt + 1))   # CAS conflict -> re-read and retry
           else:
-              raise SystemExit("account_pool append did not settle after 6 CAS attempts")
+              raise SystemExit("account_pool grant did not settle after 6 CAS attempts")
           PY
 
       - name: Close the request issue (registration complete)
@@ -317,7 +411,7 @@ jobs:
         run: |
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
           gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-            --body "✅ Account **${{ steps.store.outputs.handle }}** registered: secret \`${{ steps.store.outputs.secret }}\` on \`${{ github.repository }}\` (format \`$fmt\`), \`models: ${{ steps.meta.outputs.models }}\`, appended to \`policy/repos.toml\` account_pool, validated via read_accounts. Closing." || true
+            --body "✅ Account **${{ steps.store.outputs.handle }}** registered: secret \`${{ steps.store.outputs.secret }}\` on \`${{ github.repository }}\` (format \`$fmt\`), \`models: ${{ steps.meta.outputs.models }}\`, granted to the authorized target pool(s) \`${{ steps.meta.outputs.targets }}\` in \`policy/repos.toml\`, validated via read_accounts. Closing." || true
           gh issue close "${{ github.event.issue.number }}" -R "${{ github.repository }}" || true
 
       - name: Report failure
