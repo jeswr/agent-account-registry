@@ -44,6 +44,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 # --- alert surface (COORDINATED with PR #93's throughput-alert) --------------------------------
@@ -62,6 +63,13 @@ ALERT_TITLE = "⚠️ pipeline failures"
 MAX_TABLE_ROWS = 30          # newest N (workflow/job/class) rows shown in the table + kept in ledger
 MAX_DETAIL_LEN = 400         # per-row sanitized diagnostic tail cap (chars)
 GH_TIMEOUT_S = 45            # per gh call
+# Optimistic-concurrency bound: the issue body is a SHARED ledger with no server-side CAS, so every
+# writer runs a read/merge/write/RE-READ loop — if the re-read shows a concurrent writer clobbered
+# our merge (our row absent / our prune undone), we retry against THEIR body so concurrent alarms
+# MERGE instead of overwrite. Bounded: exhaustion degrades to a loud ::error:: (fail-soft), and the
+# row retries on the next failing tick anyway.
+MAX_WRITE_ATTEMPTS = 4
+RETRY_SLEEP_S = 0.5          # small linear backoff between optimistic-concurrency retries
 
 # --- credential-safe redaction (reuse worker-live.sh's "sanitized class only" posture) ----------
 # Any diagnostic string is scrubbed BEFORE it can reach the issue body. These patterns are
@@ -74,12 +82,15 @@ SECRET_PATTERNS = [
     re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,}"),  # JWT
     re.compile(r"(?i)\b(token|secret|password|passwd|api[_-]?key|bearer|authorization)\b"
                r"\s*[:=]\s*\S+"),                              # key: value credential lines
-    # Account identity is a credential-adjacent PII shape the repo traffics in (acctNN handles +
+    # Account identity is a credential-adjacent PII shape the repo traffics in (acct* handles +
     # worker-account emails, cf account-usage.py / backfill-provenance.py). The alarm body is an
-    # operational failure report, NOT an identity ledger, so redact BOTH the `acctNN` handle and
+    # operational failure report, NOT an identity ledger, so redact BOTH the `acct*` handle and
     # any email before either can reach the issue body (the docstring's "never an account handle"
-    # guarantee is enforced HERE, not merely by which callers exist today).
-    re.compile(r"(?i)\bacct[0-9]{1,4}\b"),                     # acctNN worker-account handle
+    # guarantee is enforced HERE, not merely by which callers exist today). REAL registry handles
+    # are alphanumeric, not digit-only (policy/repos.toml carries acct2css/acct3css/acct4css
+    # alongside acct01..acct07), so the pattern is `acct` + any word-run — unbounded, because a
+    # bounded quantifier plus \b would let an over-long handle skip the match and leak whole.
+    re.compile(r"(?i)\bacct[0-9a-z_-]*\b"),                    # acct* worker-account handle
     re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),  # email address (PII)
     re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"),                   # long base64-ish blobs (token-shaped)
 ]
@@ -287,6 +298,10 @@ def _resolve_alert_target():
 
 
 def _find_rolling_issue(repo, token, state):
+    """Return (number, body) of the CANONICAL rolling issue in `state` — the LOWEST-numbered issue
+    carrying the marker. Lowest-first is the concurrency tiebreak: two racing first-creates both
+    re-list after creating, both pick the same (lowest) canonical, and the loser folds its row into
+    it and closes its own duplicate — duplicate first-creates CONVERGE instead of persisting."""
     proc = _gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", state,
                 "--json", "number,body", "--limit", "50"], token, capture=True)
     if proc.returncode != 0:
@@ -295,17 +310,63 @@ def _find_rolling_issue(repo, token, state):
         found = json.loads(proc.stdout or "[]")
     except ValueError:
         return None, None
-    for issue in found:
-        if isinstance(issue, dict) and MARKER in (issue.get("body") or ""):
-            return issue.get("number"), issue.get("body") or ""
-    return None, None
+    marked = [issue for issue in found
+              if isinstance(issue, dict) and isinstance(issue.get("number"), int)
+              and MARKER in (issue.get("body") or "")]
+    if not marked:
+        return None, None
+    canonical = min(marked, key=lambda issue: issue["number"])
+    return canonical["number"], canonical.get("body") or ""
+
+
+def _issue_view(num, repo, token):
+    """(body, state) of an issue, or (None, None) on any read failure (callers degrade fail-soft)."""
+    proc = _gh(["issue", "view", str(num), "-R", repo, "--json", "body,state"],
+               token, capture=True)
+    if proc.returncode != 0:
+        return None, None
+    try:
+        doc = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None, None
+    if not isinstance(doc, dict):
+        return None, None
+    return doc.get("body") or "", str(doc.get("state") or "")
+
+
+def _row_reflected(body, row):
+    """True iff the CURRENT issue body carries `row`'s (workflow, job, class) key at least as fresh
+    as `row` itself. This is the optimistic-concurrency verify predicate for a failure write: if a
+    concurrent writer clobbered our merge, our key is absent (or stale) in their body and we retry
+    the merge against it. `>=` (not `==`) terminates the two-writers-same-key race: whichever
+    recurrence's last_seen survives satisfies BOTH writers (the count may undercount by one in that
+    rare interleave — the ROW, i.e. the alarm itself, is what must never be lost)."""
+    key = (row.get("workflow"), row.get("job"), row.get("failure_class"))
+    for existing in _parse_ledger(body):
+        if (existing.get("workflow"), existing.get("job"), existing.get("failure_class")) == key:
+            return str(existing.get("last_seen", "")) >= str(row.get("last_seen", ""))
+    return False
+
+
+def _create_issue(repo, token, rendered):
+    """Create the rolling issue; return its number (parsed from the printed URL) or None."""
+    proc = _gh(["issue", "create", "-R", repo, "--title", ALERT_TITLE,
+                "--label", ALERT_LABEL, "--body", rendered], token, capture=True)
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"/issues/([0-9]+)\s*$", (proc.stdout or "").strip())
+    return int(match.group(1)) if match else 0   # 0 = created but number unknown (best-effort)
 
 
 def upsert_alarm(new_row, repo, token, maintainer):
-    """Idempotent single-rolling-issue upsert. Loads the existing ledger (open, else the closed
-    marker issue to REOPEN it rather than mint a duplicate), merges the new failure row, and writes
-    the refreshed body. Every gh return code is checked; a failure degrades LOUD to ::error:: and
-    never raises (fail-soft)."""
+    """Idempotent single-rolling-issue upsert under OPTIMISTIC CONCURRENCY. The issue body is a
+    shared ledger with no server-side CAS, so every write is read/merge/edit/RE-READ: if the re-read
+    shows a concurrent writer overwrote our merge (our row absent), we retry the merge against
+    THEIR body — concurrent alarms from different workflows MERGE instead of losing rows. Racing
+    first-creates converge on the lowest-numbered marker issue (the loser closes its duplicate and
+    folds its row in). A verify that finds the issue CLOSED (a racing --resolve closed it after our
+    row landed) REOPENS it — a live failure row never hides behind a closed alert. Every gh return
+    code is checked; failure degrades LOUD to ::error:: and never raises (fail-soft)."""
     if not repo or not token:
         print("::error::pipeline-alarm: no alert repo/token resolved; failure NOT recorded to an "
               "issue (still visible as the run's red X). Set REGISTRY_REPO + a token env.")
@@ -313,88 +374,164 @@ def upsert_alarm(new_row, repo, token, maintainer):
     _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", ALERT_COLOR,
          "--description", "Automated pipeline-failure alarm (maintainer action)"],
         token, capture=True)
-    num, body = _find_rolling_issue(repo, token, "open")
-    reopened = False
-    if num is None:
-        num, body = _find_rolling_issue(repo, token, "closed")
-        reopened = num is not None
-    ledger = _parse_ledger(body)
-    ledger = _merge_row(ledger, new_row)
-    ledger = _prune(ledger)
-    rendered = render_body(ledger, maintainer)
-    if num is None:
-        rc = _gh(["issue", "create", "-R", repo, "--title", ALERT_TITLE,
-                  "--label", ALERT_LABEL, "--body", rendered], token).returncode
-        if rc == 0:
+    # Sanitize the key fields UP FRONT so the merge key matches the (sanitized) persisted ledger —
+    # otherwise a workflow name carrying a stripped char could never verify and would spin the loop.
+    new_row = _sanitize_row(new_row)
+    for attempt in range(MAX_WRITE_ATTEMPTS):
+        if attempt:
+            time.sleep(RETRY_SLEEP_S * attempt)
+        num, body = _find_rolling_issue(repo, token, "open")
+        reopened = False
+        if num is None:
+            num, body = _find_rolling_issue(repo, token, "closed")
+            reopened = num is not None
+        if num is None:
+            rendered = render_body(_prune(_merge_row([], dict(new_row))), maintainer)
+            created = _create_issue(repo, token, rendered)
+            if created is None:
+                print("::error::pipeline-alarm: raising the alert FAILED (retries next failing "
+                      "tick); primary failure still visible as the run's red X")
+                return False
+            # Duplicate-first-create convergence: re-list; if a DIFFERENT (lower-numbered) marker
+            # issue exists, ours is the duplicate — close it and retry, folding our row into the
+            # canonical issue instead. Both racing creators pick the same canonical (lowest).
+            canonical, _ = _find_rolling_issue(repo, token, "open")
+            if canonical is not None and created and canonical != created:
+                _gh(["issue", "close", str(created), "-R", repo, "--comment",
+                     f"Duplicate of #{canonical} (concurrent first-create); folding this row "
+                     "into the canonical rolling alert."], token)
+                continue
             print("::warning::pipeline-alarm: raised the rolling pipeline-failure alert")
             return True
-        print("::error::pipeline-alarm: raising the alert FAILED (retries next failing tick); "
-              "primary failure still visible as the run's red X")
-        return False
-    if reopened:
-        _gh(["issue", "reopen", str(num), "-R", repo], token)
-    rc = _gh(["issue", "edit", str(num), "-R", repo, "--body", rendered], token).returncode
-    if rc == 0:
-        print(f"::warning::pipeline-alarm: {'reopened' if reopened else 'refreshed'} "
-              f"the rolling pipeline-failure alert (#{num})")
-        return True
-    print("::error::pipeline-alarm: updating the alert FAILED (retries next failing tick); "
+        ledger = _merge_row(_parse_ledger(body), dict(new_row))
+        rendered = render_body(_prune(ledger), maintainer)
+        if reopened:
+            _gh(["issue", "reopen", str(num), "-R", repo], token)
+        rc = _gh(["issue", "edit", str(num), "-R", repo, "--body", rendered], token).returncode
+        if rc != 0:
+            print("::error::pipeline-alarm: updating the alert FAILED (retries next failing "
+                  "tick); primary failure still visible as the run's red X")
+            return False
+        # RE-READ verify: did our merge survive, or did a concurrent writer clobber it?
+        current, state = _issue_view(num, repo, token)
+        if current is None or _row_reflected(current, new_row):
+            # (an unreadable verify degrades to trusting our own write — fail-soft; the row
+            # re-merges on the next failing tick regardless)
+            if state and state.upper() == "CLOSED" and not reopened:
+                # close-vs-failure race: a concurrent --resolve closed the issue AFTER our row
+                # landed. A live failure row must never hide behind a closed alert — reopen.
+                _gh(["issue", "reopen", str(num), "-R", repo], token)
+                print(f"::warning::pipeline-alarm: reopened #{num} — a concurrent recovery "
+                      "closed it over this still-live failure row")
+            print(f"::warning::pipeline-alarm: {'reopened' if reopened else 'refreshed'} "
+                  f"the rolling pipeline-failure alert (#{num})")
+            return True
+        print(f"::warning::pipeline-alarm: concurrent writer clobbered the merge on #{num}; "
+              f"retrying against the fresh body (attempt {attempt + 1}/{MAX_WRITE_ATTEMPTS})")
+    print("::error::pipeline-alarm: could not converge the ledger merge after "
+          f"{MAX_WRITE_ATTEMPTS} attempts of concurrent writes (retries next failing tick); "
           "primary failure still visible as the run's red X")
     return False
 
 
-def _resolve_ledger(ledger, workflow):
+def _resolve_ledger(ledger, workflow, before=None):
     """Drop every row whose `workflow` matches `workflow` (a workflow just ran healthy, so its
-    prior failures are recovered). Returns (kept_rows, dropped_count). Recovery is WORKFLOW-scoped
-    because the rolling issue is fleet-wide: a healthy `dispatch` tick must not close an alert that
-    a still-failing `worker` also owns. Ported from PR #51's plan-alert auto-close-on-heal, but
-    applied to whichever workflow just recovered rather than only PLAN."""
+    prior failures are recovered) AND whose last_seen predates `before` (when given). Returns
+    (kept_rows, dropped_count). Recovery is WORKFLOW-scoped because the rolling issue is
+    fleet-wide: a healthy `dispatch` tick must not close an alert that a still-failing `worker`
+    also owns. The `before` bound is the close-vs-failure race guard: a CONCURRENT failure of the
+    same workflow (recorded after this healthy tick started) is NEWER information and must survive
+    the prune — --resolve never erases a failure it did not observe recover. Ported from PR #51's
+    plan-alert auto-close-on-heal, applied to whichever workflow just recovered."""
     wf = _sanitize(workflow) if workflow else ""
     if not wf:
         return list(ledger), 0
-    kept = [r for r in ledger if _sanitize(r.get("workflow", "")) != wf]
+    kept = [r for r in ledger
+            if _sanitize(r.get("workflow", "")) != wf
+            or (before is not None and str(r.get("last_seen", "")) >= before)]
     return kept, len(ledger) - len(kept)
 
 
-def resolve_alarm(workflow, repo, token, maintainer):
+def _prune_reflected(body, workflow, before):
+    """Optimistic-concurrency verify predicate for a recovery write: True iff the CURRENT body
+    carries no pre-`before` row for `workflow`. A concurrent stale-merge that resurrected a pruned
+    row fails this and triggers a retry; a concurrent NEW failure (last_seen >= before) passes —
+    it is newer information the prune deliberately preserves."""
+    wf = _sanitize(workflow) if workflow else ""
+    return all(_sanitize(r.get("workflow", "")) != wf or str(r.get("last_seen", "")) >= before
+               for r in _parse_ledger(body))
+
+
+def resolve_alarm(workflow, repo, token, maintainer, now=None):
     """Auto-close-on-heal (PR #51's recovery behavior, generalized): on a HEALTHY run of `workflow`,
-    prune that workflow's rows from the rolling ledger. If rows remain (other workflows still
-    failing) the issue is refreshed; if the ledger empties, the rolling issue is COMMENTED + CLOSED
-    (it reopens on the next failure). A green tick with no open alert is a cheap no-op (one list).
+    prune that workflow's PRE-EXISTING rows from the rolling ledger. If rows remain (other
+    workflows still failing, or a CONCURRENT new failure landed) the issue is refreshed; if the
+    ledger empties, the rolling issue is COMMENTED + CLOSED (it reopens on the next failure).
+
+    Concurrency: the same read/edit/RE-READ optimistic loop as upsert_alarm — a concurrent writer
+    that clobbers the prune triggers a retry against the fresh body, and rows recorded AFTER this
+    healthy tick started (last_seen >= `before`) are never pruned, so --resolve cannot close over a
+    concurrent new failure. After a close, the body is re-read ONCE more: if a writer slipped a row
+    in between the verify and the close, the issue is REOPENED (the writer-side verify carries the
+    symmetric guard). A green tick with no open alert is a cheap no-op (one list).
     Fail-soft: every gh rc is checked, never raises, returns a bool for the self-test."""
     if not repo or not token:
         # No target to read/close — nothing to do on a healthy tick (do NOT redden: success path).
         return False
-    num, body = _find_rolling_issue(repo, token, "open")
-    if num is None:
-        # No open alert for this fleet — a healthy tick is a cheap no-op (matches #51's
-        # green-tick-is-side-effect-free posture).
-        return False
-    ledger = _parse_ledger(body)
-    kept, dropped = _resolve_ledger(ledger, workflow)
-    if dropped == 0:
-        # This workflow had no open failure rows; leave the alert untouched (another workflow owns
-        # it). Never close an issue whose failures we did not just recover.
-        return False
-    if kept:
-        rendered = render_body(_prune(kept), maintainer)
+    if not workflow or not _sanitize(workflow):
+        return False   # never mass-prune on a missing workflow name
+    before = _now(now).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for attempt in range(MAX_WRITE_ATTEMPTS):
+        if attempt:
+            time.sleep(RETRY_SLEEP_S * attempt)
+        num, body = _find_rolling_issue(repo, token, "open")
+        if num is None:
+            # No open alert for this fleet — a healthy tick is a cheap no-op (matches #51's
+            # green-tick-is-side-effect-free posture).
+            return False
+        ledger = _parse_ledger(body)
+        kept, dropped = _resolve_ledger(ledger, workflow, before)
+        if dropped == 0:
+            # This workflow had no open failure rows; leave the alert untouched (another workflow
+            # owns it). Never close an issue whose failures we did not just recover.
+            return False
+        rendered = render_body(_prune(kept), maintainer) if kept else render_body([], maintainer)
         rc = _gh(["issue", "edit", str(num), "-R", repo, "--body", rendered], token).returncode
-        if rc == 0:
+        if rc != 0:
+            print("::error::pipeline-alarm: pruning the recovered rows FAILED (retries next tick)")
+            return False
+        # RE-READ verify: did the prune survive, or did a concurrent stale merge resurrect rows?
+        current, _state = _issue_view(num, repo, token)
+        if current is not None and not _prune_reflected(current, workflow, before):
+            print(f"::warning::pipeline-alarm: concurrent writer clobbered the recovery prune on "
+                  f"#{num}; retrying (attempt {attempt + 1}/{MAX_WRITE_ATTEMPTS})")
+            continue
+        if kept:
             print(f"::warning::pipeline-alarm: {_sanitize(workflow)} recovered — pruned its rows "
-                  f"from the rolling alert (#{num}); other workflows still failing")
+                  f"from the rolling alert (#{num}); other rows remain open")
             return True
-        print("::error::pipeline-alarm: pruning the recovered rows FAILED (retries next tick)")
-        return False
-    # Ledger emptied: every recorded failure has recovered → comment + close (reopens on next fail).
-    _gh(["issue", "comment", str(num), "-R", repo, "--body",
-         f"✅ Recovered — `{_sanitize(workflow)}` succeeded and no pipeline failures remain in the "
-         "ledger. Auto-closing; this issue reopens on the next failure."], token)
-    rc = _gh(["issue", "close", str(num), "-R", repo], token).returncode
-    if rc == 0:
+        # Ledger emptied: every recorded failure recovered → comment + close (reopens on next
+        # failure). The verify above already confirmed no concurrent row survived the prune.
+        _gh(["issue", "comment", str(num), "-R", repo, "--body",
+             f"✅ Recovered — `{_sanitize(workflow)}` succeeded and no pipeline failures remain in "
+             "the ledger. Auto-closing; this issue reopens on the next failure."], token)
+        rc = _gh(["issue", "close", str(num), "-R", repo], token).returncode
+        if rc != 0:
+            print("::error::pipeline-alarm: closing the recovered alert FAILED (retries next tick)")
+            return False
+        # Close-vs-failure race guard: re-read AFTER the close — a writer that landed a row
+        # between our verify and the close must not stay hidden behind a closed alert.
+        post, _post_state = _issue_view(num, repo, token)
+        if post is not None and _parse_ledger(post):
+            _gh(["issue", "reopen", str(num), "-R", repo], token)
+            print(f"::warning::pipeline-alarm: reopened #{num} — a failure row landed "
+                  "concurrently with the recovery close")
+            return True
         print(f"::warning::pipeline-alarm: all pipeline failures recovered — closed the rolling "
               f"alert (#{num})")
         return True
-    print("::error::pipeline-alarm: closing the recovered alert FAILED (retries next tick)")
+    print("::error::pipeline-alarm: recovery prune could not converge after "
+          f"{MAX_WRITE_ATTEMPTS} attempts of concurrent writes (retries next healthy tick)")
     return False
 
 
@@ -503,7 +640,10 @@ def _self_test():
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghij",
         "A" * 60,  # long base64-ish blob
         "j99379855@example.com",   # worker-account email (PII) — the "never a handle" claim
-        "acct04",                  # acctNN worker-account handle
+        "acct04",                  # digit-suffixed worker-account handle
+        "acct2css",                # REAL alphanumeric handle shape (policy/repos.toml account_pool)
+        "acct4css",                # ditto — digits-only matching let these leak (review finding)
+        "ACCT3CSS",                # case-insensitive: an upcased handle must not slip through
     ]
     for i, leak in enumerate(leaks):
         san = _sanitize(f"error near {leak} happened")
@@ -519,6 +659,15 @@ def _self_test():
     ok("sanitize scrubs a bare acctNN handle", "acct02" not in _sanitize("acct02"))
     ok("sanitize scrubs an acctNN handle in a key=value form",
        "acct04" not in _sanitize("account acct04=capped"))
+    # REAL registry handle shapes are alphanumeric (acct2css/acct3css/acct4css in
+    # policy/repos.toml), not digit-only — the "never a raw account handle" boundary must hold
+    # for them bare, in prose, and when over-long (an unbounded run, so no bounded-quantifier
+    # \b escape leaks the whole token).
+    ok("sanitize scrubs a bare alphanumeric handle", "acct2css" not in _sanitize("acct2css"))
+    ok("sanitize scrubs an alphanumeric handle mid-sentence",
+       "acct3css" not in _sanitize("worker acct3css hit the cap"))
+    ok("sanitize scrubs an over-long acct handle whole",
+       "acct" not in _sanitize("acct" + "x" * 64))
     # sanitize also strips table-breaking + markdown-active chars + bounds length
     ok("sanitize strips backtick/pipe", "`" not in _sanitize("a`b|c") and "|" not in _sanitize("a`b|c"))
     ok("sanitize strips markdown link/image/mention chars",
@@ -669,10 +818,15 @@ def _self_test():
                 return subprocess.CompletedProcess(
                     args, 0, json.dumps([{"number": 7, "body": existing["body"]}]), "")
             return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": existing["body"], "state": "OPEN"}), "")
         if verb in ("create", "edit"):
             # capture the written body (the --body value)
             if "--body" in args:
                 existing["body"] = args[args.index("--body") + 1]
+            if verb == "create":
+                return subprocess.CompletedProcess(args, 0, "https://x/issues/7\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -703,6 +857,8 @@ def _self_test():
                                 "count": 1, "last_seen": "2026-07-18T10:00:00Z",
                                 "run_url": "https://x/1", "detail": "d"}], "jeswr")
 
+    flap_store = {"body": closed_body}
+
     def fake_gh_closed(args, token, capture=False):
         calls.append(list(args))
         verb = args[1] if len(args) > 1 else ""
@@ -710,8 +866,14 @@ def _self_test():
             state = args[args.index("--state") + 1] if "--state" in args else ""
             if state == "closed":
                 return subprocess.CompletedProcess(
-                    args, 0, json.dumps([{"number": 9, "body": closed_body}]), "")
+                    args, 0, json.dumps([{"number": 9, "body": flap_store["body"]}]), "")
             return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": flap_store["body"], "state": "OPEN"}), "")
+        if verb == "edit" and "--body" in args:
+            flap_store["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
     globals()["_gh"] = fake_gh_closed
@@ -747,21 +909,40 @@ def _self_test():
     chk("resolve of a workflow with no rows drops nothing (never touches others)", dropped_none, 0)
     _, dropped_blank = _resolve_ledger(mixed, "")
     chk("resolve with no workflow name is a no-op (never mass-prunes)", dropped_blank, 0)
+    # the close-vs-failure race bound: a row recorded AFTER the healthy tick started
+    # (last_seen >= before) is NEWER information and must survive the prune.
+    racing = [
+        {"workflow": "dispatch", "job": "plan", "failure_class": "job-failure", "count": 1,
+         "last_seen": "2026-07-18T10:00:00Z"},
+        {"workflow": "dispatch", "job": "plan", "failure_class": "upstream-skip", "count": 1,
+         "last_seen": "2026-07-18T13:00:00Z"},
+    ]
+    kept_racing, dropped_racing = _resolve_ledger(racing, "dispatch", "2026-07-18T12:00:00Z")
+    chk("resolve prunes only rows OLDER than the healthy tick", dropped_racing, 1)
+    ok("a concurrent NEW failure row survives the prune",
+       len(kept_racing) == 1 and kept_racing[0]["last_seen"] == "2026-07-18T13:00:00Z")
 
     # resolve_alarm against a stubbed gh: a healthy tick that EMPTIES the ledger COMMENTS + CLOSES;
     # a healthy tick that leaves other rows only EDITS; a green tick with no open alert is a no-op.
     def make_resolve_gh(open_body):
         seen = []
+        store = {"body": open_body}
 
         def fake(args, token, capture=False):
             seen.append(list(args))
             verb = args[1] if len(args) > 1 else ""
             if verb == "list":
                 state = args[args.index("--state") + 1] if "--state" in args else ""
-                if state == "open" and open_body is not None:
+                if state == "open" and store["body"] is not None:
                     return subprocess.CompletedProcess(
-                        args, 0, json.dumps([{"number": 5, "body": open_body}]), "")
+                        args, 0, json.dumps([{"number": 5, "body": store["body"]}]), "")
                 return subprocess.CompletedProcess(args, 0, "[]", "")
+            if verb == "view":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"body": store["body"] or "", "state": "OPEN"}), "")
+            if verb == "edit" and "--body" in args:
+                store["body"] = args[args.index("--body") + 1]
+                return subprocess.CompletedProcess(args, 0, "", "")
             return subprocess.CompletedProcess(args, 0, "", "")
         return fake, seen
 
@@ -772,7 +953,7 @@ def _self_test():
     fake, seen = make_resolve_gh(sole)
     globals()["_gh"] = fake
     try:
-        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr")
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr", now=now)
         closes = sum(1 for c in seen if c[:2] == ["issue", "close"])
         comments = sum(1 for c in seen if c[:2] == ["issue", "comment"])
         chk("healthy tick that empties the ledger CLOSES the alert", closes, 1)
@@ -790,7 +971,7 @@ def _self_test():
     fake, seen = make_resolve_gh(twowf)
     globals()["_gh"] = fake
     try:
-        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr")
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr", now=now)
         closes = sum(1 for c in seen if c[:2] == ["issue", "close"])
         edits = sum(1 for c in seen if c[:2] == ["issue", "edit"])
         chk("recovery with a still-failing workflow does NOT close", closes, 0)
@@ -809,10 +990,189 @@ def _self_test():
     fake, seen = make_resolve_gh(None)
     globals()["_gh"] = fake
     try:
-        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr")
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr", now=now)
         muts = sum(1 for c in seen if c[:2] in (["issue", "close"], ["issue", "edit"],
                                                 ["issue", "comment"]))
         chk("green tick with no open alert makes zero mutations", muts, 0)
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- OPTIMISTIC CONCURRENCY (review P1): interleaved writers MERGE, never lose a row --------
+    # Writer A's row is already in the ledger. Writer B edits, but a concurrent stale-base writer
+    # clobbers the body between B's edit and B's RE-READ verify (B's merge vanishes — the classic
+    # lost update). B must detect it on the verify, retry against the fresh body, and converge
+    # with BOTH rows present. Deleting the re-read/retry loop in upsert_alarm turns this red.
+    row_a = {"workflow": "dispatch", "job": "plan", "failure_class": "job-failure",
+             "failed_step": "", "detail": "a", "run_url": "https://x/1",
+             "last_seen": "2026-07-18T12:00:00Z", "count": 3}
+    body_with_a = render_body(_prune([dict(row_a)]), "jeswr")
+    inter = {"body": body_with_a, "clobbered": False}
+
+    def interleaved_gh(args, token, capture=False):
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 3, "body": inter["body"]}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            inter["body"] = args[args.index("--body") + 1]
+            if not inter["clobbered"]:
+                # the concurrent stale-base writer lands right after B's first edit, overwriting
+                # the body with a merge that never saw B's row (the lost-update interleave)
+                inter["body"] = body_with_a
+                inter["clobbered"] = True
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": inter["body"], "state": "OPEN"}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = interleaved_gh
+    try:
+        converged = upsert_alarm(
+            {"workflow": "worker", "job": "run", "failure_class": "job-failure",
+             "failed_step": "", "detail": "b", "run_url": "https://x/2",
+             "last_seen": "2026-07-18T12:05:00Z"}, "jeswr/x", "tok", "jeswr")
+        final = _parse_ledger(inter["body"])
+        ok("interleaved writer converges (returns True)", converged is True)
+        ok("the clobber interleave was actually exercised", inter["clobbered"])
+        ok("BOTH rows survive the interleave (merge, not overwrite)",
+           any(r.get("workflow") == "dispatch" for r in final)
+           and any(r.get("workflow") == "worker" for r in final))
+        ok("the pre-existing row's count survives the retry merge",
+           any(r.get("workflow") == "dispatch" and r.get("count") == 3 for r in final))
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- duplicate first-creates CONVERGE on the lowest-numbered issue --------------------------
+    # Two racing first alarms both see "no issue" and both create. The loser (higher number) must
+    # detect the concurrent canonical on its post-create re-list, close its own duplicate, and
+    # fold its row into the canonical — never leave two rolling issues.
+    other_body = render_body(_prune([{
+        "workflow": "groom", "job": "groom", "failure_class": "job-failure", "count": 1,
+        "last_seen": "2026-07-18T12:00:00Z", "run_url": "https://x/9", "detail": "d",
+        "failed_step": ""}]), "jeswr")
+    dup = {"created": False, "canonical_body": other_body, "closed": [], "edits": 0}
+
+    def dup_create_gh(args, token, capture=False):
+        if args and args[0] != "issue":   # the ensure-label call also has args[1] == "create"
+            return subprocess.CompletedProcess(args, 0, "", "")
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state != "open" or not dup["created"]:
+                # before our create the racer's issue is not yet visible (the race window)
+                return subprocess.CompletedProcess(args, 0, "[]", "")
+            # after our create the re-list reveals BOTH: the racer's #4 (canonical) and our #8
+            issues = [{"number": 8, "body": MARKER + " ours"},
+                      {"number": 4, "body": dup["canonical_body"]}]
+            return subprocess.CompletedProcess(args, 0, json.dumps(issues), "")
+        if verb == "create":
+            dup["created"] = True
+            return subprocess.CompletedProcess(args, 0, "https://x/issues/8\n", "")
+        if verb == "close":
+            dup["closed"].append(args[2])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "edit" and "--body" in args:
+            dup["edits"] += 1
+            dup["canonical_body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": dup["canonical_body"], "state": "OPEN"}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = dup_create_gh
+    try:
+        upsert_alarm({"workflow": "worker", "job": "run", "failure_class": "job-failure",
+                      "failed_step": "", "detail": "d", "run_url": "https://x/2",
+                      "last_seen": "2026-07-18T12:10:00Z"}, "jeswr/x", "tok", "jeswr")
+        chk("the duplicate first-create is CLOSED (converged, not left as a 2nd spammer)",
+            dup["closed"], ["8"])
+        ok("the loser folds its row into the canonical issue",
+           dup["edits"] >= 1
+           and any(r.get("workflow") == "worker" for r in _parse_ledger(dup["canonical_body"]))
+           and any(r.get("workflow") == "groom" for r in _parse_ledger(dup["canonical_body"])))
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- upsert verify reopens if a concurrent --resolve closed over our fresh row --------------
+    cvr = {"body": "", "reopened": 0}
+
+    def closed_after_write_gh(args, token, capture=False):
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 2, "body": render_body([], "jeswr")}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            cvr["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            # our row landed, but a racing recovery closed the issue right after
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": cvr["body"], "state": "CLOSED"}), "")
+        if verb == "reopen":
+            cvr["reopened"] += 1
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = closed_after_write_gh
+    try:
+        upsert_alarm({"workflow": "w", "job": "j", "failure_class": "job-failure",
+                      "failed_step": "", "detail": "d", "run_url": "https://x/1",
+                      "last_seen": "2026-07-18T12:00:00Z"}, "jeswr/x", "tok", "jeswr")
+        chk("a concurrent close over a fresh failure row is REOPENED by the writer",
+            cvr["reopened"], 1)
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- --resolve never closes over a concurrent new failure -----------------------------------
+    # The resolver empties the ledger and closes, but a failure row lands between its verify and
+    # the close. The post-close re-read must catch it and REOPEN the issue.
+    race = {"body": render_body(_prune([{
+        "workflow": "dispatch", "job": "plan", "failure_class": "job-failure", "count": 1,
+        "last_seen": "2026-07-18T10:00:00Z", "run_url": "https://x/1", "detail": "d",
+        "failed_step": ""}]), "jeswr"), "closed": False, "reopened": 0}
+    late_row_body = render_body(_prune([{
+        "workflow": "worker", "job": "run", "failure_class": "job-failure", "count": 1,
+        "last_seen": "2026-07-18T12:30:00Z", "run_url": "https://x/2", "detail": "d",
+        "failed_step": ""}]), "jeswr")
+
+    def close_race_gh(args, token, capture=False):
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open" and not race["closed"]:
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 6, "body": race["body"]}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            race["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "close":
+            # the concurrent worker failure lands JUST as the close is issued
+            race["closed"] = True
+            race["body"] = late_row_body
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "reopen":
+            race["reopened"] += 1
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": race["body"],
+                                     "state": "CLOSED" if race["closed"] else "OPEN"}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = close_race_gh
+    try:
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr", now=now)
+        chk("a failure landing at close time REOPENS the alert (never silently closed)",
+            race["reopened"], 1)
     finally:
         globals()["_gh"] = real_gh
 

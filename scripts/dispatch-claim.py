@@ -76,6 +76,19 @@ SNAPSHOT_SKIP_FIELDS = {"repo", "pr_number", "reason"}
 # armed-SHA-mismatch disarm (whose ACT is itself the safety measure) still fires.
 # Fail-closed per ITEM, never per sweep; never fail-OPEN on the disarm net; MONOTONE
 # under a forged marker (the unmarked outcome or do-nothing, never a different act).
+# Repo-level degradation (pipeline-failure-visibility): a target whose issues/pulls LISTING
+# failed is kept PLANNED-BUT-EMPTY (zero items — fail-closed, and the planned set still equals
+# enabled policy so CLAIM's manifest equality holds) and carries a pr_number-0 skip row with a
+# `repo-degraded:` reason. The reason SUFFIX is a closed set — plan-snapshot.py records the
+# stable `listing-failed` token (never raw exception text), and fold_degraded_repos() below
+# normalizes anything else to `snapshot-incomplete` — so the full reason is allowlistable here
+# and a degraded PLAN artifact validates END-TO-END instead of dying at CLAIM.
+REPO_DEGRADED_PREFIX = "repo-degraded:"
+REPO_DEGRADED_REASONS = {
+    "listing-failed",            # plan-snapshot.py: the repo's issues/pulls listing failed
+    "snapshot-file-unreadable",  # planner step: the raw-issues file is missing/garbled
+    "snapshot-incomplete",       # planner step: complete != True with no usable reason string
+}
 SNAPSHOT_SKIP_REASONS = {
     "check-runs-overflow",
     "check-runs-malformed",
@@ -83,7 +96,7 @@ SNAPSHOT_SKIP_REASONS = {
     "pr-detail-read-failed",
     "pr-detail-malformed",
     "worker-pr-census-overflow",
-}
+} | {REPO_DEGRADED_PREFIX + reason for reason in REPO_DEGRADED_REASONS}
 # needs-ci-fix / needs-rebase are the zero-manual repair states: same-provider fix runs (reuse
 # mode=fix) that target red full-matrix CI legs / a conflicting base instead of review findings.
 # stranded is the loud terminal escalation for {drafted, unarmed, reviewed-sha == head, green
@@ -428,6 +441,29 @@ def snapshot_skip_reasons(snapshot_skips):
     for skip in snapshot_skips:
         reasons[f"snapshot-skip:{skip['reason']}"] += 1
     return reasons
+
+
+def fold_degraded_repos(degraded_repos):
+    """PURE: normalize PLAN's per-repo degradation records into ALLOWLISTED snapshot_skips rows
+    (pr_number 0 = repo-wide). This is the single mapping the dispatch.yml assemble step calls, so
+    a degraded repo VALIDATES end-to-end: every emitted reason is a member of
+    SNAPSHOT_SKIP_REASONS by construction — an unexpected/dynamic reason string (exception text, a
+    future plan-snapshot token this validator predates) is coerced to `snapshot-incomplete` rather
+    than minting a reason validate_plan would reject and thereby re-killing the sweep the
+    degradation exists to save. Malformed entries are dropped (the plan validator would reject
+    anything they could contribute; the ::warning:: surface in the workflow already printed them)."""
+    skips = []
+    for degraded in degraded_repos or []:
+        if not isinstance(degraded, dict):
+            continue
+        repo = degraded.get("target_repo")
+        if not isinstance(repo, str) or not SAFE_REPO.fullmatch(repo):
+            continue
+        reason = degraded.get("reason")
+        if reason not in REPO_DEGRADED_REASONS:
+            reason = "snapshot-incomplete"
+        skips.append({"repo": repo, "pr_number": 0, "reason": REPO_DEGRADED_PREFIX + reason})
+    return skips
 
 
 def decide_repair_admission(state, mergeable, gate, draft):
@@ -1877,6 +1913,54 @@ def _self_test():
         with open(summary_file, encoding="utf-8") as handle:
             recorded = json.load(handle)
     assert recorded["defer_reasons"]["snapshot-skip:check-runs-overflow"] == 1
+
+    # ---- repo-level degradation validates END-TO-END (review P1: the degraded PLAN path) ----
+    # A target whose listing failed is kept PLANNED-BUT-EMPTY at its ORIGINAL index (so the
+    # assemble step's per-index artifact reads stay aligned and the planned set still equals
+    # enabled policy — CLAIM's manifest-equality gate), and its pr_number-0 `repo-degraded:*`
+    # skip row — built by the SAME fold_degraded_repos the assemble step calls — must pass the
+    # hostile-plan validator. Both the FIRST-target and the LAST-target degradation validate.
+    degraded_first = json.loads(json.dumps(fixture))
+    degraded_first["repositories"] = [
+        {"target_repo": "example/degraded", "target_sha": "0" * 40, "items": []},
+        degraded_first["repositories"][0],
+    ]
+    degraded_first["snapshot_skips"] = sorted(
+        degraded_first["snapshot_skips"]
+        + fold_degraded_repos([{"target_repo": "example/degraded", "reason": "listing-failed"}]),
+        key=lambda skip: (skip["repo"], skip["pr_number"]))
+    assert validate_plan(degraded_first) is degraded_first
+    # planned set retains the degraded repo: the CLAIM-side manifest equality
+    # (planned == enabled policy) holds — degradation no longer un-plans the repo.
+    assert {entry["target_repo"] for entry in degraded_first["repositories"]} == \
+        {"example/degraded", "example/repo"}
+    degraded_last = json.loads(json.dumps(fixture))
+    degraded_last["repositories"] = degraded_last["repositories"] + [
+        {"target_repo": "example/zdegraded", "target_sha": "0" * 40, "items": []}]
+    degraded_last["snapshot_skips"] = sorted(
+        degraded_last["snapshot_skips"]
+        + fold_degraded_repos([{"target_repo": "example/zdegraded",
+                                "reason": "snapshot-file-unreadable"}]),
+        key=lambda skip: (skip["repo"], skip["pr_number"]))
+    assert validate_plan(degraded_last) is degraded_last
+    # the degraded rows fold into the same defer-reason histogram (visible in the tick summary)
+    assert snapshot_skip_reasons(fold_degraded_repos(
+        [{"target_repo": "example/degraded", "reason": "listing-failed"}])) == \
+        {"snapshot-skip:repo-degraded:listing-failed": 1}
+    # fold_degraded_repos NEVER emits a reason the validator rejects: a dynamic/unknown reason
+    # (raw exception text, a future plan-snapshot token) coerces to `snapshot-incomplete`;
+    # malformed rows drop entirely (nothing they contribute could validate).
+    folded_degraded = fold_degraded_repos([
+        {"target_repo": "example/repo", "reason": "listing-failed"},
+        {"target_repo": "example/repo", "reason": "listing-failed:HTTP 503 for https://x"},
+        {"target_repo": "bad repo name", "reason": "listing-failed"},
+        "not-a-dict",
+    ])
+    assert [skip["reason"] for skip in folded_degraded] == [
+        "repo-degraded:listing-failed", "repo-degraded:snapshot-incomplete"]
+    assert all(skip["reason"] in SNAPSHOT_SKIP_REASONS for skip in folded_degraded)
+    assert fold_degraded_repos(None) == []
+
     assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"})
     assert _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"})
     assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"})
@@ -1918,6 +2002,10 @@ def _self_test():
             (lambda d: d.pop("snapshot_skips"), "missing snapshot_skips"),
             (lambda d: d["snapshot_skips"][0].update(unknown=True), "unknown snapshot skip field"),
             (lambda d: d["snapshot_skips"][0].update(reason="because"), "invalid snapshot skip reason"),
+            (lambda d: d["snapshot_skips"][0].update(reason="repo-degraded:listing-failed:HTTP 503"),
+             "dynamic (non-allowlisted) repo-degraded reason"),
+            (lambda d: d["snapshot_skips"][0].update(reason="repo-degraded:because"),
+             "unknown repo-degraded reason suffix"),
             (lambda d: d["snapshot_skips"][0].update(reason=[]), "unhashable snapshot skip reason"),
             (lambda d: d["snapshot_skips"][0].update(repo="not/planned"), "unplanned snapshot skip repo"),
             (lambda d: d["snapshot_skips"][0].update(pr_number=-1), "negative snapshot skip pr_number"),

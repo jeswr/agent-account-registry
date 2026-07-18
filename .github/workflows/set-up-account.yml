@@ -271,3 +271,24 @@ jobs:
           cancelled: ${{ needs.login.result == 'cancelled' }}
           detail: "set-up-account login job ${{ needs.login.result }} — account onboarding broker crashed at the job level"
           registry-token: ${{ github.token }}
+
+  # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): a healthy
+  # login run prunes set-up-account's rows from the rolling pipeline alert (--resolve), so a
+  # recovered onboarding broker never pins the alert open forever. Never reddens; cheap no-op
+  # with no open alert. No token or handle enters this job beyond the ambient workflow token.
+  recover:
+    needs: login
+    if: ${{ always() && needs.login.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          mode: resolve
+          registry-token: ${{ github.token }}

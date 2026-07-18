@@ -5,15 +5,28 @@
 # scripts/pipeline-alarm.py for the full contract. FAIL-SOFT: this action never masks the primary
 # failure — its own step is `continue-on-error`-safe and the script always exits 0.
 #
-# SELF-CONTAINED BY DESIGN: it does its OWN pinned checkout of the registry into a private temp path
-# and runs the master copy of the alarm script from there. It therefore works even when the calling
-# job (a) never checked out the registry, or (b) checked out HOSTILE target code into the default
-# workspace — the alarm never runs a script that target code could have influenced.
+# SELF-CONTAINED BY DESIGN — and enforced, not merely claimed (review P2): the action performs its
+# OWN pinned checkout of the registry at the RUNNING WORKFLOW's commit (${{ github.sha }}, sparse:
+# just scripts/pipeline-alarm.py) into a private action-owned path, and executes ONLY that copy. It
+# NEVER prefers ${GITHUB_WORKSPACE}/scripts — a workspace copy is whatever the calling job's earlier
+# steps left there, and the documented in-job usage runs AFTER those steps, so a hostile target
+# checkout could otherwise substitute the script that receives the registry/alert tokens. The
+# isolated checkout works whether or not the caller ever checked the registry out, and its own
+# failure degrades fail-soft (continue-on-error + a loud ::error:: annotation), never masking the
+# primary failure and never reddening a healthy `mode: resolve` run.
 name: pipeline-alarm
 description: >-
   Loud, deduped, credential-safe pipeline-failure alarm. Wire as the final
   `if: ${{ failure() || cancelled() }}` step so no pipeline failure is ever silent.
 inputs:
+  mode:
+    description: >-
+      `alarm` (default) records a failure. `resolve` is the HEALTHY-tick recovery path
+      (pipeline-alarm.py --resolve): prunes this workflow's rows from the rolling alert and
+      auto-closes it once the ledger empties. Wire `resolve` from an all-jobs-succeeded recover
+      job so a recovered workflow's stale rows never pin the alert open forever.
+    required: false
+    default: "alarm"
   job-name:
     description: The failing job's display name (e.g. matrix.job.name). Defaults to $GITHUB_JOB.
     required: false
@@ -59,9 +72,29 @@ inputs:
 runs:
   using: composite
   steps:
+    # The pinned ISOLATED checkout that makes the header's hostile-workspace guarantee true: the
+    # registry at the exact commit the running workflow was loaded from (github.sha — never a
+    # movable ref a concurrent push could swap under us), sparse to the one script, into an
+    # action-owned path. actions/checkout's default clean pass wipes anything a hostile earlier
+    # step pre-planted at this path. continue-on-error: an unreachable checkout must neither mask
+    # the primary failure nor redden a healthy resolve run — the run step below degrades LOUD.
+    - name: Isolated pinned checkout of the registry alarm script
+      continue-on-error: true
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        repository: ${{ github.repository }}
+        ref: ${{ github.sha }}
+        token: ${{ inputs.registry-token }}
+        persist-credentials: false
+        path: .pipeline-alarm-isolated
+        sparse-checkout: |
+          scripts/pipeline-alarm.py
+        sparse-checkout-cone-mode: false
+
     - name: Raise the loud, deduped, credential-safe pipeline-failure alarm
       shell: bash
       env:
+        ALARM_MODE: ${{ inputs.mode }}
         ALARM_GH_TOKEN: ${{ inputs.registry-token }}
         REGISTRY_REPO: ${{ github.repository }}
         ALERT_REPO: ${{ inputs.alert-repo }}
@@ -76,26 +109,26 @@ runs:
         set -uo pipefail
         printf '::add-mask::%s\n' "$ALARM_GH_TOKEN"
         if [ -n "${ALERT_TOKEN:-}" ]; then printf '::add-mask::%s\n' "$ALERT_TOKEN"; fi
-        # Prefer the caller's workspace checkout (every alarm-job caller checks out the registry to
-        # the workspace root first). Fall back to the action's OWN bundled copy — the action files
-        # live in the registry at the workflow ref, so ${GITHUB_ACTION_PATH}/../../../scripts is the
-        # same master copy regardless of what the caller's workspace holds (immune to hostile target
-        # code in a different job's workspace).
-        script=""
-        for cand in \
-          "${GITHUB_WORKSPACE}/scripts/pipeline-alarm.py" \
-          "${GITHUB_ACTION_PATH}/../../../scripts/pipeline-alarm.py"; do
-          if [ -f "$cand" ]; then script="$cand"; break; fi
-        done
-        if [ -z "$script" ]; then
-          # Degrade LOUD but never mask the primary failure (the script IS the alarm; if even it is
-          # missing, this annotation is the alarm surface).
-          echo "::error::pipeline-alarm: helper script not found — pipeline failure in ${GITHUB_WORKFLOW}/${GITHUB_JOB} is NOT recorded to an issue (still red in Actions)"
+        # ONLY the isolated pinned checkout above — NEVER a caller-workspace copy, which the
+        # calling job's earlier (possibly hostile-target) steps could have substituted before this
+        # final step runs with the registry/alert tokens in its environment.
+        script="${GITHUB_WORKSPACE}/.pipeline-alarm-isolated/scripts/pipeline-alarm.py"
+        if [ ! -f "$script" ]; then
+          # Degrade LOUD but never mask the primary failure (the script IS the alarm; if even its
+          # isolated checkout failed, this annotation is the alarm surface). exit 0 also keeps a
+          # healthy `mode: resolve` run green (recovery is best-effort, retried next tick).
+          echo "::error::pipeline-alarm: isolated pinned checkout failed — pipeline ${ALARM_MODE} for ${GITHUB_WORKFLOW}/${GITHUB_JOB} is NOT recorded to an issue (a failure is still red in Actions; a recovery retries next healthy tick)"
           exit 0
         fi
         # Self-test first (the alarm's own correctness is load-bearing); a self-test failure still
         # degrades to an annotation, never to masking the primary failure.
         python3 "$script" --self-test || \
           echo "::error::pipeline-alarm: self-test FAILED; attempting the alert anyway (fail-soft)"
-        python3 "$script"
+        if [ "$ALARM_MODE" = "resolve" ]; then
+          python3 "$script" --resolve
+        else
+          python3 "$script"
+        fi
+        # Leave nothing behind in the shared workspace (the checkout is this action's own concern).
+        rm -rf "${GITHUB_WORKSPACE}/.pipeline-alarm-isolated" || true
         exit 0

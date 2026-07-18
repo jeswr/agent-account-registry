@@ -96,3 +96,23 @@ jobs:
           cancelled: ${{ needs.triage.result == 'cancelled' }}
           detail: "triage-issue ${{ needs.triage.result }} on issue #${{ github.event.issue.number }}"
           registry-token: ${{ github.token }}
+
+  # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): a healthy
+  # triage prunes triage-issue's rows from the rolling pipeline alert (--resolve), so a recovered
+  # triage never pins the alert open forever. Never reddens; cheap no-op with no open alert.
+  recover:
+    needs: triage
+    if: ${{ always() && needs.triage.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          mode: resolve
+          registry-token: ${{ github.token }}

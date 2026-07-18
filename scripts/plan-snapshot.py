@@ -261,8 +261,12 @@ def snapshot_targets(fetch, claim, repos, out_dir):
             pulls = _paginated(fetch, f"/repos/{repo}/pulls?state=open")
         except FetchError as exc:
             # Per-repo degrade: mark THIS repo incomplete (fail-closed: no items) and keep going.
+            # The recorded reason is the STABLE token dispatch-claim.py allowlists
+            # (`repo-degraded:listing-failed` after the assemble step's fold) — raw exception
+            # text would mint a dynamic reason validate_plan rejects, re-killing the sweep this
+            # degradation exists to save. The human diagnostic stays in the ::warning:: line.
             degraded += 1
-            reason = f"listing-failed:{exc}"
+            reason = "listing-failed"
             print(f"::warning::SNAPSHOT repo {repo} DEGRADED (listing failed): {exc}")
             Path(out_dir, f"raw-issues-{index}.json").write_text(
                 json.dumps({"complete": False, "items": [], "snapshot_error": reason}),
@@ -454,6 +458,15 @@ def _self_test():
     # every degraded file for that repo is marked (issues, pulls, prstatus) so the planner + the
     # assemble step both see it and route it into snapshot_skips (the always() alarm).
     assert bad_pulls["complete"] is False and bad_prstatus["complete"] is False
+    # END-TO-END allowlist link (review P1): the recorded reason must be the STABLE token whose
+    # `repo-degraded:`-prefixed form the CLAIM-side validator accepts — raw exception text here
+    # would make the degraded plan FAIL final validation and re-kill the sweep. The fold below is
+    # exactly what the dispatch.yml assemble step runs.
+    assert bad_doc["snapshot_error"] == "listing-failed", bad_doc["snapshot_error"]
+    folded = claim.fold_degraded_repos(
+        [{"target_repo": bad, "reason": bad_doc["snapshot_error"]}])
+    assert folded == [{"repo": bad, "pr_number": 0, "reason": "repo-degraded:listing-failed"}]
+    assert all(skip["reason"] in claim.SNAPSHOT_SKIP_REASONS for skip in folded)
 
     # BUT a FLEET-WIDE listing failure (EVERY target fails) stays FATAL: an all-empty plan must not
     # masquerade as a healthy empty backlog — the dispatch alarm job needs the PLAN failure to fire.

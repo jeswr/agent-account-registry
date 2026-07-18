@@ -44,3 +44,23 @@ jobs:
           cancelled: ${{ needs.reclaim.result == 'cancelled' }}
           detail: "groom-leases reclaim ${{ needs.reclaim.result }} — expired leases may still pin worker slots"
           registry-token: ${{ github.token }}
+
+  # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): a healthy
+  # reclaim prunes groom-leases' rows from the rolling pipeline alert (--resolve), so a recovered
+  # lease groomer never pins the alert open forever. Never reddens; cheap no-op with no open alert.
+  recover:
+    needs: reclaim
+    if: ${{ always() && needs.reclaim.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          mode: resolve
+          registry-token: ${{ github.token }}

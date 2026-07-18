@@ -160,7 +160,7 @@ jobs:
               # Per-repo degradation (audit modes #2/#3): plan-snapshot.py marks a repo whose
               # issues/pulls listing failed (5xx/403/429/timeout after retries, non-list page, or a
               # legitimate >5000-entry overflow) as `complete: False` + `snapshot_error` for ITSELF
-              # only. Returns that reason string (else None). A degraded repo is SKIPPED here
+              # only. Returns that reason string (else None). A degraded repo is planned EMPTY here
               # (fail-closed: zero rows — a listing we could not complete must never look empty) and
               # its reason is routed into snapshot_skips so it surfaces in the always() alarm,
               # instead of the old whole-sweep-fatal raise that silenced every target.
@@ -219,15 +219,38 @@ jobs:
                   ))
               return linked
 
+          def checked_target_sha(target):
+              target_sha = subprocess.run(
+                  ["git", "-C", str(target), "rev-parse", "HEAD"],
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              ).stdout.strip()
+              if not re.fullmatch(r"[0-9a-f]{40}", target_sha):
+                  raise SystemExit("target checkout returned an unsafe commit sha")
+              return target_sha
+
           repositories = []
           degraded_repos = []
           for index, repo in enumerate(repos):
               degrade_reason = repo_snapshot_error(index)
               if degrade_reason is not None:
-                  # Per-repo degrade: skip this target entirely (fail-closed) but record WHY so the
-                  # assemble step routes it into snapshot_skips and the always() alarm fires.
-                  print(f"::warning::PLAN repo {repo} DEGRADED, skipped: {degrade_reason}")
+                  # Per-repo degrade (review P1): keep the repo PLANNED-BUT-EMPTY at its ORIGINAL
+                  # index. Un-planning it broke the sweep twice over — CLAIM requires the planned
+                  # set to exactly equal enabled policy, and removing the entry shifted every later
+                  # repo's compressed index off its per-index raw-*.json artifacts (degrading the
+                  # FIRST target made the second target read index 0). Zero items is still
+                  # fail-closed (a listing we could not complete must never look empty-and-
+                  # groomable — nothing is dispatched for it), the empty pulls/issue-labels
+                  # artifacts keep the assemble step's index-aligned reads valid, and the reason is
+                  # routed into snapshot_skips so the degradation surfaces in the always() alarm.
+                  print(f"::warning::PLAN repo {repo} DEGRADED, planned empty: {degrade_reason}")
                   degraded_repos.append({"target_repo": repo, "reason": degrade_reason})
+                  repositories.append({"target_repo": repo,
+                                       "target_sha": checked_target_sha(root / str(index)),
+                                       "items": []})
+                  Path(out_dir, f"pulls-{index}.json").write_text("[]", encoding="utf-8")
+                  Path(out_dir, f"issue-labels-{index}.json").write_text("{}", encoding="utf-8")
                   continue
               target = root / str(index)
               dispatch = load_dispatch(target / "scripts" / "dispatch-plan.py")
@@ -309,15 +332,9 @@ jobs:
                       "deferred": deferred,
                   })
               items.sort(key=lambda item: (item["priority"], item["number"]))
-              target_sha = subprocess.run(
-                  ["git", "-C", str(target), "rev-parse", "HEAD"],
-                  capture_output=True,
-                  text=True,
-                  check=True,
-              ).stdout.strip()
-              if not re.fullmatch(r"[0-9a-f]{40}", target_sha):
-                  raise SystemExit("target checkout returned an unsafe commit sha")
-              repositories.append({"target_repo": repo, "target_sha": target_sha, "items": items})
+              repositories.append({"target_repo": repo,
+                                   "target_sha": checked_target_sha(target),
+                                   "items": items})
 
               # Field-selected PR snapshot + issue-label map for the registry-side review
               # enumeration in the assemble step (avoids a second API sweep there).
@@ -423,19 +440,16 @@ jobs:
           review_items = []
           disarm_items = []
           snapshot_skips = []
-          # Per-repo degradation (audit modes #2/#3): a target whose listing failed was skipped in
-          # PLAN and carries a reason here. Route it into snapshot_skips (pr_number 0 = repo-wide)
-          # so the defer-reason histogram in the always() alarm shows WHICH repo went dark and WHY,
-          # instead of the whole sweep dying silently.
-          for degraded in (intermediate.get("degraded_repos") or []):
-              if not isinstance(degraded, dict):
-                  continue
-              d_repo = degraded.get("target_repo")
-              d_reason = degraded.get("reason")
-              if isinstance(d_repo, str) and isinstance(d_reason, str):
-                  print(f"::warning::SNAPSHOT repo {d_repo} DEGRADED: {d_reason}")
-                  snapshot_skips.append(
-                      {"repo": d_repo, "pr_number": 0, "reason": f"repo-degraded:{d_reason}"})
+          # Per-repo degradation (audit modes #2/#3, review P1): a target whose listing failed is
+          # PLANNED-BUT-EMPTY in `repositories` (manifest equality + index alignment hold) and
+          # carries a reason here. Fold it into snapshot_skips (pr_number 0 = repo-wide) through
+          # the SAME allowlist-normalizing helper the CLAIM validator locks (fold_degraded_repos),
+          # so a degraded plan VALIDATES end-to-end and the defer-reason histogram in the always()
+          # alarm shows WHICH repo went dark and WHY, instead of the whole sweep dying silently.
+          degraded_skips = claim_mod.fold_degraded_repos(intermediate.get("degraded_repos") or [])
+          for skip in degraded_skips:
+              print(f"::warning::SNAPSHOT repo {skip['repo']} DEGRADED: {skip['reason']}")
+          snapshot_skips.extend(degraded_skips)
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
