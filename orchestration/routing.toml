@@ -43,7 +43,12 @@ credential_format = "claude-oauth-token"
 [models.terra]
 provider = "openai"
 harness = "codex"
-provider_model = "TBD"                 # terra is an internal alias; maintainer sets the concrete GPT id
+provider_model = ""                    # EMPTY = omit --model: the codex CLI default tracks the account's
+                                       # supported model. A literal placeholder here ("TBD") reached
+                                       # `codex exec --model TBD` in every terra fleet worker -> API 400 /
+                                       # degraded no-tool-call fallback ("model produced no repository
+                                       # changes", 8/8 uniform 2026-07-18). Set a concrete id only once
+                                       # verified against the worker account type.
 credential_format = "codex-auth-json"
 
 [defaults]

@@ -288,8 +288,19 @@ jobs:
               "codex-auth-json", "claude-credentials-json", "claude-oauth-token", "anthropic-api-key"
           }:
               raise SystemExit("resolved model has an unsupported credential format")
-          if not isinstance(provider_model, str) or not provider_model:
-              raise SystemExit("resolved model has no concrete provider model")
+          # Harness-aware contract (2026-07-18): for codex, an unpinned provider_model
+          # (absent/empty/legacy "TBD") normalizes to EMPTY -> worker-live.sh omits --model
+          # and the codex CLI default tracks the account's supported model. The literal
+          # "TBD" placeholder previously passed the old non-empty check and reached
+          # `codex exec --model TBD` -> API 400 / degraded no-tool-call fallback on every
+          # terra fleet worker. For claude, a concrete id remains mandatory.
+          if provider_model in (None, "", "TBD"):
+              if harness == "codex":
+                  provider_model = ""
+              else:
+                  raise SystemExit("resolved claude model has no concrete provider model")
+          elif not isinstance(provider_model, str):
+              raise SystemExit("resolved model provider_model is malformed")
           secret_ref = account.get("secret_ref")
           if secret_ref != f"{account_name.upper()}_TOKEN" or not re.fullmatch(r"[A-Z][A-Z0-9_]*", secret_ref):
               raise SystemExit("selected account has an unsafe or mismatched secret_ref")

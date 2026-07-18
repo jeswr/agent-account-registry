@@ -261,7 +261,7 @@ _run_headless_harness() {
         # --model only when the routing pins a concrete id; otherwise the codex CLI default
         # (the configuration the proven drain runs).
         local -a model_args=()
-        [[ -n "$provider_model" ]] && model_args+=(--model "$provider_model")
+        [[ -n "$provider_model" && "$provider_model" != "TBD" ]] && model_args+=(--model "$provider_model")  # TBD/empty = CLI default (see worker.yml resolve)
         "${container[@]}" "$image" /opt/model-cli/node_modules/.bin/codex exec \
           "${model_args[@]}" \
           --dangerously-bypass-approvals-and-sandbox \
