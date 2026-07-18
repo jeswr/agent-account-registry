@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "append() treats any quoted handle text inside the regex-captured account_pool source as existing, and when all edits are suppressed grant_targets() returns the original text. The subsequent `if new_text == text` branch immediately reports that the handle is present in every target pool and exits without parsing or checking membership. A valid multiline TOML array can contain a comment such as `# retired \"acct08\"`; that text makes append() skip the target even though tomllib does not include acct08 in the array. The workflow then closes the request as successfully granted, while the account is unusable for that target. This violates the exact-match/fail-closed requirement at the account_pool authorization boundary.",
+   "file": ".github/workflows/set-up-account.yml",
+   "fix_hint": "Parse and verify the resulting document for every target before either the no-op break or the PUT. Require `handle in after[target].account_pool` on the unchanged path too. Prefer determining membership from parsed TOML rather than substring-searching the raw array body, and add a regression case with a multiline account_pool whose comment contains the quoted handle.",
+   "severity": "major",
+   "title": "Textual no-op path skips the authorization postcondition"
+  }
+ ],
+ "progress": null,
+ "summary": "The scoped-grant direction is sound, but the write path has a fail-open idempotence check: textual presence of the handle can cause the workflow to report success without proving that every requested target pool actually contains it. Because account_pool membership is the authorization boundary, this needs a parsed postcondition on both changed and unchanged paths.",
+ "verdict": "request_changes"
+}
