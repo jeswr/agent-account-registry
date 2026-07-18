@@ -340,25 +340,34 @@ def _sleep_backoff(attempt):
     time.sleep(_backoff_delay(attempt))
 
 
-def _is_cas_conflict(stderr):
-    """True only for a genuine compare-and-swap conflict on the ledger PUT (a lost SHA race, or the
-    create-if-absent race when the file appeared concurrently). Matches groom.py's classifier so
-    the two ledger writers agree; keep them in sync."""
+# GitHub's contents-PUT response when a sha-less (create-if-absent) write hits a file that
+# appeared concurrently: HTTP 422 with message 'Invalid request.\n\n"sha" wasn't supplied.'
+_CREATE_RACE_SIGNATURE = "\"sha\" wasn't supplied"
+
+
+def _is_cas_conflict(stderr, create):
+    """True only for a genuine compare-and-swap conflict on the ledger PUT. HTTP 409 is always a
+    lost-SHA race. HTTP 422 counts ONLY when this was a create-if-absent PUT (`create=True`) AND
+    the response carries GitHub's create-race signature — any other 422 is an ordinary request-
+    validation failure (bad payload/branch) that must fail loud, not be retried as contention."""
     text = stderr or ""
-    return "HTTP 409" in text or "HTTP 422" in text
+    if "HTTP 409" in text:
+        return True
+    return create and "HTTP 422" in text and _CREATE_RACE_SIGNATURE in text
 
 
 def _write_ledger(repo, leases, sha, message):
-    """PUT the ledger via CAS. Returns True on success and False ONLY on a CAS conflict (HTTP
-    409/422) so the caller retries with backoff. ANY OTHER PUT failure — authorization (403),
-    missing branch/file (404), server (5xx) — raises LeaseIOError immediately instead of being
-    collapsed into a retryable conflict and mislabeled 'CAS kept conflicting' after six wasted,
-    un-backed-off attempts (issue #179)."""
+    """PUT the ledger via CAS. Returns True on success and False ONLY on a genuine CAS conflict
+    (HTTP 409, or the create-race 422 on a sha-less PUT) so the caller retries with backoff. ANY
+    OTHER PUT failure — authorization (403), missing branch/file (404), request validation
+    (non-race 422), server (5xx) — raises LeaseIOError immediately instead of being collapsed into
+    a retryable conflict and mislabeled 'CAS kept conflicting' after six wasted, un-backed-off
+    attempts (issue #179)."""
     body = base64.b64encode(json.dumps({"leases": leases}, indent=1).encode()).decode()
     r = subprocess.run(ledger_write_args(repo, message, body, sha), capture_output=True, text=True)
     if r.returncode == 0:
         return True
-    if _is_cas_conflict(r.stderr):
+    if _is_cas_conflict(r.stderr, create=sha is None):
         return False  # lost the CAS race → caller re-reads and retries
     raise LeaseIOError(
         "lease ledger CAS PUT failed with a non-conflict error (authorization, validation, "
@@ -911,13 +920,26 @@ def _self_test():
     check("backoff ceiling is exponential then capped",
           [_backoff_ceiling(a) for a in (1, 2, 3, 4, 5, 6, 10)],
           [0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0])
-    # Full jitter: every draw stays within [0, ceiling]; seeded so the assertion is deterministic.
-    random.seed(179)
-    check("backoff delay stays within [0, ceiling] (full jitter)",
-          all(0 <= _backoff_delay(a) <= _backoff_ceiling(a) for a in range(1, 7)
-              for _ in range(50)), True)
-    # A CAS conflict (409/422) is retryable → False; any OTHER PUT failure fails LOUD with
+    # Full jitter: the delay must BE the RNG draw over exactly [0, ceiling]. Stubbing
+    # random.uniform pins both properties — a deterministic delay (always 0, always the ceiling,
+    # ceiling/2) would either never call the RNG or discard its draw, flipping these red.
+    real_uniform = random.uniform
+    uniform_calls = []
+    sentinel = 123.456
+    random.uniform = lambda lo, hi: (uniform_calls.append((lo, hi)), sentinel)[1]
+    try:
+        draws = [_backoff_delay(a) for a in range(1, 7)]
+    finally:
+        random.uniform = real_uniform
+    check("backoff delay draws uniform(0, ceiling) with exact bounds",
+          uniform_calls, [(0, _backoff_ceiling(a)) for a in range(1, 7)])
+    check("backoff delay propagates the RNG draw unchanged", draws, [sentinel] * 6)
+    # A genuine CAS conflict is retryable → False; any OTHER PUT failure fails LOUD with
     # LeaseIOError rather than being collapsed into "CAS kept conflicting" (the #179 complaint).
+    # 422 is a conflict ONLY as the create-if-absent race: sha-less PUT + GitHub's
+    # '"sha" wasn't supplied' signature — a bare 422 is a persistent payload/config validation
+    # error that six retries would only obscure.
+    race_422 = "gh: Invalid request.\n\n\"sha\" wasn't supplied. (HTTP 422)"
     real_run = subprocess.run
     subprocess.run = lambda args, **_k: _Res(0)
     try:
@@ -925,18 +947,27 @@ def _self_test():
         subprocess.run = lambda args, **_k: _Res(1, stderr="gh: ... (HTTP 409)")
         check("CAS 409 PUT is retryable (False, not raise)", _write_ledger("o/r", [], "sha", "m"),
               False)
-        subprocess.run = lambda args, **_k: _Res(1, stderr="gh: ... (HTTP 422)")
-        check("CAS 422 create-race is retryable (False)", _write_ledger("o/r", [], "sha", "m"),
-              False)
-        for code in ("403", "404", "500"):
-            subprocess.run = lambda args, _code=code, **_k: _Res(1, stderr=f"gh: ... (HTTP {_code})")
+        subprocess.run = lambda args, **_k: _Res(1, stderr=race_422)
+        check("create-race 422 on a sha-less PUT is retryable (False)",
+              _write_ledger("o/r", [], None, "m"), False)
+        loud_puts = [("non-conflict PUT 403 fails loud (not collapsed)",
+                      "gh: ... (HTTP 403)", "sha"),
+                     ("non-conflict PUT 404 fails loud (not collapsed)",
+                      "gh: ... (HTTP 404)", "sha"),
+                     ("non-conflict PUT 500 fails loud (not collapsed)",
+                      "gh: ... (HTTP 500)", "sha"),
+                     ("non-race validation 422 fails loud (not a CAS conflict)",
+                      "gh: Validation Failed (HTTP 422)", "sha"),
+                     ("non-race validation 422 on a sha-less create fails loud",
+                      "gh: Validation Failed (HTTP 422)", None),
+                     ("race-signature 422 on a sha-carrying PUT fails loud", race_422, "sha")]
+        for label, stderr_text, put_sha in loud_puts:
+            subprocess.run = lambda args, _s=stderr_text, **_k: _Res(1, stderr=_s)
             try:
-                _write_ledger("o/r", [], "sha", "m")
-                check(f"non-conflict PUT {code} fails loud (not collapsed)", "no exception",
-                      "LeaseIOError")
+                _write_ledger("o/r", [], put_sha, "m")
+                check(label, "no exception", "LeaseIOError")
             except LeaseIOError:
-                check(f"non-conflict PUT {code} fails loud (not collapsed)", "LeaseIOError",
-                      "LeaseIOError")
+                check(label, "LeaseIOError", "LeaseIOError")
     finally:
         subprocess.run = real_run
 
