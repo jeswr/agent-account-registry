@@ -169,6 +169,16 @@
    "model": "fable",
    "issued_at": 1784340437,
    "expires_at": 1784346737
+  },
+  {
+   "account": "acct05",
+   "claim_id": "590ba056d7d04d25af2ae2be8f731a6c",
+   "holder": "sparq-org/sparq#2871@dispatch-29626390979.1",
+   "package": "ci-fragments",
+   "role": "impl",
+   "model": "fable",
+   "issued_at": 1784340442,
+   "expires_at": 1784346742
   }
  ]
 }
