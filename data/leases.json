@@ -259,6 +259,16 @@
    "model": "terra",
    "issued_at": 1784339608,
    "expires_at": 1784345908
+  },
+  {
+   "account": "acct01",
+   "claim_id": "fa544b36abff404b8eea0bed08a4a480",
+   "holder": "sparq-org/sparq#3187@dispatch-29625933900.1",
+   "package": "sparq-engine-exec",
+   "role": "impl",
+   "model": "terra",
+   "issued_at": 1784339611,
+   "expires_at": 1784345911
   }
  ]
 }
