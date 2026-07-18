@@ -506,12 +506,16 @@ def _load_module(path: Path, name: str):
     return module
 
 
-def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
+def _policy_document(policy_file: Path) -> Any:
     try:
         with policy_file.open("rb") as handle:
-            document = tomllib.load(handle)
+            return tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise GroomError("repository policy could not be read") from exc
+
+
+def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
+    document = _policy_document(policy_file)
     repos = document.get("repos") if isinstance(document, dict) else None
     if not isinstance(repos, dict) or not repos:
         raise GroomError("repository policy has no target rows")
@@ -541,6 +545,49 @@ def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
     if not limits:
         raise GroomError("repository policy has no enabled target rows")
     return limits
+
+
+# Exact owner -> GITHUB_OUTPUT key map for the per-owner App-token mint steps in groom.yml
+# (issue #168). The workflow's mint steps are STATIC (one step per known owner), so the
+# resolver below fails LOUD when policy's enabled owner set drifts from this map — a silently
+# dropped owner would reintroduce the wrong-owner-token bug.
+EXPECTED_TARGET_OWNERS = {"sparq-org": "sparq_names", "jeswr": "jeswr_names"}
+
+
+def enabled_owner_repos(document: Any) -> dict[str, list[str]]:
+    """EVERY enabled repo name per owner (issue #168, review round 1). Each per-owner App-token
+    mint must be scoped to ALL of that owner's enabled repositories — a single "representative"
+    repo would mint a token that 404s the owner's other enabled repos, and groom (which routes
+    tokens per OWNER) would then abort mid-sweep on a supported policy shape."""
+    repos = document.get("repos") if isinstance(document, dict) else None
+    if not isinstance(repos, dict) or not repos:
+        raise GroomError("repository policy has no target rows")
+    owners: dict[str, list[str]] = {}
+    for repo, raw in repos.items():
+        if not isinstance(repo, str) or SAFE_REPO.fullmatch(repo) is None:
+            raise GroomError("repository policy contains an unsafe target name")
+        if not isinstance(raw, dict) or not isinstance(raw.get("enabled"), bool):
+            raise GroomError(f"repository policy enablement is malformed for {repo}")
+        if not raw["enabled"]:
+            continue
+        owner, name = repo.split("/", 1)
+        owners.setdefault(owner, []).append(name)
+    if not owners:
+        raise GroomError("repository policy has no enabled target rows")
+    return owners
+
+
+def owner_repo_output_lines(document: Any) -> list[str]:
+    """GITHUB_OUTPUT lines (``<key>=name1,name2``) scoping each mint step's ``repositories``
+    input to the owner's full enabled-repo list. Fails LOUD unless the enabled owner set is
+    exactly ``EXPECTED_TARGET_OWNERS`` — never silently drops an owner's token."""
+    owners = enabled_owner_repos(document)
+    if set(owners) != set(EXPECTED_TARGET_OWNERS):
+        raise GroomError(
+            f"unexpected enabled target owners {sorted(owners)}; groom.yml mints tokens for "
+            f"exactly {sorted(EXPECTED_TARGET_OWNERS)} — add a mint step before widening policy"
+        )
+    return [f"{key}={','.join(owners[owner])}" for owner, key in EXPECTED_TARGET_OWNERS.items()]
 
 
 def ledger_read_path(registry_repo: str) -> str:
@@ -1789,6 +1836,52 @@ def _self_test() -> int:
             else:
                 os.environ[key] = value
 
+    # ---- per-owner mint scoping (issue #168, review round 1) ----
+    # Each owner's App token must be scoped to EVERY enabled repo under that owner: reverting
+    # enabled_owner_repos to "one representative repo per owner" reds the two-repos check below,
+    # and dropping the exact-owner-set assertion reds the drift checks (fail-loud, never a
+    # silently dropped or under-scoped owner token).
+    two_per_owner = {
+        "repos": {
+            "sparq-org/sparq": {"enabled": True},
+            "sparq-org/second-target": {"enabled": True},
+            "jeswr/agent-account-registry": {"enabled": True},
+            "jeswr/disabled-target": {"enabled": False},
+        }
+    }
+    check(
+        "ALL enabled repos are collected per owner (not one representative)",
+        enabled_owner_repos(two_per_owner),
+        {"sparq-org": ["sparq", "second-target"], "jeswr": ["agent-account-registry"]},
+    )
+    check(
+        "mint-scope outputs carry every enabled repo, comma-joined per owner",
+        sorted(owner_repo_output_lines(two_per_owner)),
+        ["jeswr_names=agent-account-registry", "sparq_names=sparq,second-target"],
+    )
+    for drift_name, drift_doc in (
+        (
+            "an unexpected third enabled owner fails loud (no silent token drop)",
+            {"repos": {**two_per_owner["repos"], "third-org/repo": {"enabled": True}}},
+        ),
+        (
+            "a missing expected owner fails loud (its mint step would be unscoped)",
+            {"repos": {"sparq-org/sparq": {"enabled": True}}},
+        ),
+    ):
+        drifted = False
+        try:
+            owner_repo_output_lines(drift_doc)
+        except GroomError:
+            drifted = True
+        check(drift_name, drifted, True)
+    unsafe_owner_repo = False
+    try:
+        enabled_owner_repos({"repos": {"bad name/repo": {"enabled": True}}})
+    except GroomError:
+        unsafe_owner_repo = True
+    check("unsafe enabled repo name fails closed in mint scoping", unsafe_owner_repo, True)
+
     # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
     # Literal "ledger": pointing either helper back at the default branch (or changing the shipped
     # REGISTRY_LEDGER_REF default) must turn these red.
@@ -1897,6 +1990,12 @@ def _self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--print-owner-repos",
+        action="store_true",
+        help="print the per-owner enabled-repo GITHUB_OUTPUT lines that scope groom.yml's "
+             "App-token mints (issue #168), then exit",
+    )
     parser.add_argument("--registry-repo")
     parser.add_argument("--policy-file", default="policy/repos.toml")
     parser.add_argument("--policy-resolver", default="scripts/policy-resolve.py")
@@ -1914,6 +2013,14 @@ def main() -> int:
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
+    if args.print_owner_repos:
+        try:
+            for line in owner_repo_output_lines(_policy_document(Path(args.policy_file))):
+                print(line)
+        except GroomError as exc:
+            print(f"groom: {exc}", file=sys.stderr)
+            return 1
+        return 0
     if not args.registry_repo:
         parser.error("--registry-repo is required outside --self-test")
     try:
