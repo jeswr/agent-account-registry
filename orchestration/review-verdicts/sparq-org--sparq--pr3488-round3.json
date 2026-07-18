@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "valid_envelope returns success for any existing prefix-matching file that merely parses as JSON. It does not require the file to have been produced by this invocation, nor verify engine, suite/cut, canonical status, or the required Recall@100/nDCG@10 deficit values. Because RESULTS_DIR is never cleared or snapshotted, a rerun whose gather fails can reuse prior envelopes; even on a fresh checkout, `{}` or an envelope with empty values passes. The hermetic success fixture reinforces the gap by emitting `values: {}` and still expecting canonical=true. Thus GATHER_DONE can certify a run without the claimed scored evidence.",
+   "file": "scripts/bench/canonical-beir-gather-instance.sh",
+   "fix_hint": "Before gathering, isolate this invocation's output (clear the dedicated results directory or record-and-reject pre-existing paths), then validate each expected envelope's schema and identity: exact engine, expected beir-ir cut/suite, canonical outcome if applicable, and finite required Recall@100/nDCG@10 deficit fields. Update the sentinel test so empty/wrong-engine/wrong-cut and stale prefix-matching JSON all fail, while realistic scored envelopes pass.",
+   "severity": "major",
+   "title": "Canonical success accepts stale or semantically empty envelopes"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 2's fail-honest sentinel/provenance defect is materially fixed: metadata must now be written and re-parsed, GATHER_DONE precedes the console completion marker, and launcher success also requires recovered canonical metadata. However, the new success validator establishes only that some prefix-matching file parses as JSON. It neither proves that the envelope belongs to the current invocation nor validates its engine/suite/cut/metrics semantics; the success test itself passes empty values. Consequently stale or semantically empty JSON can certify a canonical quality gather. This is a new major correctness finding, so progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
