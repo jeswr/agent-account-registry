@@ -83,28 +83,116 @@ jobs:
             exit 1
           fi
 
-      - name: Mint target-scoped maintenance App token (pinned)
-        id: target-token
+      # Per-owner target token mint (issue #168): policy enables targets under TWO distinct owners
+      # (sparq-org, jeswr), so a SINGLE App token scoped to one owner 404s every read and fails
+      # every write on the other owner's repo — aborting the sweep before dead leases are released.
+      # dispatch.yml already mints one token per owner; groom now does the same. This step derives
+      # the enabled owners from policy and asserts they are exactly {sparq-org, jeswr}, so a policy
+      # change adding a third owner fails LOUD here instead of silently dropping that owner's token
+      # (which would reintroduce the wrong-owner-token bug).
+      - name: Resolve distinct enabled target owners from policy
+        id: owners
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          with open("policy/repos.toml", "rb") as handle:
+              document = tomllib.load(handle)
+          repos = document.get("repos") if isinstance(document, dict) else None
+          if not isinstance(repos, dict) or not repos:
+              raise SystemExit("policy has no target rows")
+          safe = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
+          owners = {}
+          for repo, row in repos.items():
+              if not isinstance(row, dict) or row.get("enabled") is not True:
+                  continue
+              if not isinstance(repo, str) or not safe.fullmatch(repo):
+                  raise SystemExit(f"unsafe enabled target repo {repo!r} in policy")
+              owner, name = repo.split("/", 1)
+              owners.setdefault(owner, name)  # one representative repo per owner is enough
+          if set(owners) != {"sparq-org", "jeswr"}:
+              raise SystemExit(f"unexpected enabled target owners {sorted(owners)}; add a mint step")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"sparq_name={owners['sparq-org']}\n")
+              output.write(f"jeswr_name={owners['jeswr']}\n")
+          PY
+
+      # Each mint is continue-on-error: a missing install for one owner only DEFERS that owner's
+      # issue/PR repair (groom.py skips it loudly); dead-lease release and the other owner's
+      # grooming still run — the whole sweep is never aborted by one owner's credential gap.
+      - name: Mint sparq-org target-scoped maintenance App token (pinned)
+        id: target-token-sparq
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
           owner: sparq-org
-          repositories: sparq
+          repositories: ${{ steps.owners.outputs.sparq_name }}
           permission-issues: write
           permission-pull-requests: write
+
+      - name: Mint jeswr target-scoped maintenance App token (pinned)
+        id: target-token-jeswr
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: ${{ steps.owners.outputs.jeswr_name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      # Assemble the {owner: token} JSON map from whichever mints succeeded — a masked, single-line
+      # step output; missing owners are simply absent (their grooming defers, never wrong-owner).
+      - name: Assemble the per-owner target token map
+        id: token-map
+        env:
+          SPARQ_TOKEN: ${{ steps.target-token-sparq.outputs.token }}
+          JESWR_TOKEN: ${{ steps.target-token-jeswr.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ -z "${SPARQ_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$SPARQ_TOKEN"
+          [[ -z "${JESWR_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$JESWR_TOKEN"
+          python3 - <<'PY'
+          import json
+          import os
+
+          tokens = {}
+          if os.environ.get("SPARQ_TOKEN"):
+              tokens["sparq-org"] = os.environ["SPARQ_TOKEN"]
+          if os.environ.get("JESWR_TOKEN"):
+              tokens["jeswr"] = os.environ["JESWR_TOKEN"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              # Compact single-line JSON — GITHUB_OUTPUT is line-based; the tokens are masked above.
+              output.write(f"tokens={json.dumps(tokens, separators=(',', ':'))}\n")
+          PY
 
       - name: Sweep dead leases, stale issues, exhausted attempts, and stale PRs
         env:
           REGISTRY_GH_TOKEN: ${{ github.token }}
-          TARGET_GH_TOKEN: ${{ steps.target-token.outputs.token }}
+          # Per-owner target App-token map (issue #168): groom.py resolves the token for each target
+          # repo's OWNER, so a repo under a second owner is never read/written with the wrong token.
+          TARGET_GH_TOKENS: ${{ steps.token-map.outputs.tokens }}
           # An App INSTALLATION token cannot call GET /user; groom resolves the bot identity from
-          # the public /users/<slug>[bot] endpoint instead (the worker.yml canary fix).
-          APP_SLUG: ${{ steps.target-token.outputs.app-slug }}
+          # the public /users/<slug>[bot] endpoint instead (the worker.yml canary fix). The same App
+          # is installed on both owners, so the slug is identical — take it from whichever mint won.
+          APP_SLUG: ${{ steps.target-token-sparq.outputs.app-slug || steps.target-token-jeswr.outputs.app-slug }}
         run: |
           set -euo pipefail
           printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
-          printf '::add-mask::%s\n' "$TARGET_GH_TOKEN"
+          # Re-mask each per-owner target token defensively (already masked at map assembly).
+          python3 - <<'PY'
+          import json
+          import os
+          for token in json.loads(os.environ.get("TARGET_GH_TOKENS", "{}") or "{}").values():
+              if token:
+                  print(f"::add-mask::{token}")
+          PY
           python3 scripts/groom.py --self-test
           python3 scripts/groom.py \
             --registry-repo "$GITHUB_REPOSITORY" \

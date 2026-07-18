@@ -2,10 +2,15 @@
 # [GPT-5.6] REG-5 fail-closed maintenance sweep for the private-registry orchestrator.
 """Reclaim dead worker leases and conservatively repair target orchestration state.
 
-The live path uses two deliberately separate credentials: ``REGISTRY_GH_TOKEN`` may only update
-the private registry lease ledger and inspect registry Actions runs, while ``TARGET_GH_TOKEN`` is
-a target-scoped GitHub App token used for issue and pull-request reads/writes. Tokens are never
-accepted on the command line or included in diagnostics.
+The live path uses deliberately separate credentials: ``REGISTRY_GH_TOKEN`` may only update the
+private registry lease ledger and inspect registry Actions runs, while ``TARGET_GH_TOKENS`` is a
+JSON ``{owner: token}`` map of per-owner target-scoped GitHub App tokens used for issue and
+pull-request reads/writes — one token per enabled-policy owner, so a target under a second owner is
+never read or written with the wrong owner's token (issue #168: a single sparq-org-scoped token
+404s every read and fails every write on jeswr/agent-account-registry, aborting the sweep before
+dead leases are released). The single-owner legacy env ``TARGET_GH_TOKEN`` (with
+``TARGET_GH_TOKEN_OWNER``) is still honoured as a fallback. Tokens are never accepted on the
+command line or included in diagnostics.
 
 Policy ``worker_timeout_minutes`` supplies both the uncorrelated-worker and stale-object age
 threshold. Policy ``max_attempts`` supplies the durable retry cap. The policy rows are validated
@@ -918,6 +923,42 @@ def _plan_actions(
     return actions, pull_actions, dead_claims
 
 
+def target_tokens_map() -> dict[str, str]:
+    """The PER-OWNER target App-token map (issue #168). groom.yml mints one App token per DISTINCT
+    enabled-policy owner and passes ``{owner: token}`` as JSON in ``TARGET_GH_TOKENS`` — mirroring
+    dispatch.yml, whose CLAIM already routes per owner. A single token scoped to one owner 404s
+    every read and fails every write on the other owner's repo, aborting the sweep before dead
+    leases are released. The single-owner legacy env ``TARGET_GH_TOKEN`` is still honoured as a
+    fallback (mapped to ``TARGET_GH_TOKEN_OWNER``) so a single-target deployment is unchanged.
+    Blank owners/tokens are dropped so a partially-minted map never yields a wrong-owner token."""
+    raw = os.environ.get("TARGET_GH_TOKENS", "")
+    tokens: dict[str, str] = {}
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise GroomError("TARGET_GH_TOKENS is not valid JSON") from exc
+        if not isinstance(data, dict):
+            raise GroomError("TARGET_GH_TOKENS must be a {owner: token} object")
+        for owner, token in data.items():
+            if isinstance(owner, str) and isinstance(token, str) and owner and token:
+                tokens[owner] = token
+    legacy = os.environ.get("TARGET_GH_TOKEN", "")
+    legacy_owner = os.environ.get("TARGET_GH_TOKEN_OWNER", "")
+    if legacy and legacy_owner and legacy_owner not in tokens:
+        tokens[legacy_owner] = legacy
+    return tokens
+
+
+def target_api_for(repo: str, apis: dict[str, "GitHubAPI"]) -> "GitHubAPI | None":
+    """The target GitHubAPI scoped to ``repo``'s OWNER, or None when that owner has no minted
+    token. A missing token DEFERS that owner's issue/PR repair (groom skips it loudly) instead of
+    404-looping a wrong-owner token — fail closed, never wrong-owner access. ``repo`` is owner/name."""
+    if not isinstance(repo, str) or "/" not in repo:
+        return None
+    return apis.get(repo.split("/", 1)[0])
+
+
 def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     registry_repo = args.registry_repo
     if SAFE_REPO.fullmatch(registry_repo) is None:
@@ -925,9 +966,39 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     limits = load_limits(Path(args.policy_file), Path(args.policy_resolver))
     registry_api = GitHubAPI(os.environ.get("REGISTRY_GH_TOKEN", ""), "registry")
     registry_api.registry_repo = registry_repo
-    target_api = GitHubAPI(os.environ.get("TARGET_GH_TOKEN", ""), "target")
-    bot_login = _bot_login(target_api, getattr(args, "bot_slug", "") or "")
+    # Per-owner target App-token map (issue #168): one client per enabled-policy owner, so each
+    # target repo is read/written under ITS owner's token — never a wrong-owner token that 404s
+    # and aborts the whole sweep before dead-lease release.
+    target_apis = {
+        owner: GitHubAPI(token, f"target {owner}")
+        for owner, token in target_tokens_map().items()
+    }
+    groomable = {
+        repo: api
+        for repo in limits
+        if (api := target_api_for(repo, target_apis)) is not None
+    }
+    for repo in limits:
+        if repo not in groomable:
+            print(
+                f"skip target grooming for {repo}: no App token minted for owner "
+                f"{repo.split('/', 1)[0]!r} — its issue/PR repair defers this tick "
+                "(dead-lease release still runs)"
+            )
     now = int(time.time())
+    # The bot identity is the same GitHub App across every owner install, so resolve it once from
+    # any groomable owner's token. With no groomable owner nothing on the target side is read or
+    # written, so no bot login is needed (dead-lease release below still runs).
+    bot_login = (
+        _bot_login(next(iter(groomable.values())), getattr(args, "bot_slug", "") or "")
+        if groomable
+        else ""
+    )
+    if not groomable:
+        print(
+            "skip all target grooming: no target App token minted for any enabled owner "
+            "(dead-lease release still runs)"
+        )
     # Provenance records live on the `ledger` branch checkout first (issue #96), with the
     # master checkout (groom's working directory) as the legacy pre-outage fallback.
     ledger_root = Path(args.ledger_root) if getattr(args, "ledger_root", "") else None
@@ -962,11 +1033,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     pulls: dict[str, dict[int, dict[str, Any]]] = {}
     attempts: dict[tuple[str, int], int] = {}
     stale_prs: dict[tuple[str, int], str] = {}
-    for repo, repo_limits in limits.items():
-        issues[repo] = _issues(target_api, repo)
-        pulls[repo] = _pulls(target_api, repo)
+    for repo, api in groomable.items():
+        repo_limits = limits[repo]
+        issues[repo] = _issues(api, repo)
+        pulls[repo] = _pulls(api, repo)
         for number, issue in issues[repo].items():
-            comments = _comments(target_api, repo, number) if issue["comments"] else []
+            comments = _comments(api, repo, number) if issue["comments"] else []
             attempts[(repo, number)] = count_attempts(comments, bot_login)
         for number, pull in pulls[repo].items():
             if (
@@ -974,7 +1046,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 < repo_limits.threshold_seconds
             ):
                 continue
-            detail = target_api.request("GET", f"/repos/{repo}/pulls/{number}")
+            detail = api.request("GET", f"/repos/{repo}/pulls/{number}")
             if not isinstance(detail, dict):
                 raise GroomError(
                     f"target pull request detail is malformed for {repo}#{number}"
@@ -1004,7 +1076,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         if lease["claim_id"] not in dead_claims
         and not is_repair_holder(lease["holder"])
     }
-    current_pulls = {repo: _pulls(target_api, repo) for repo in limits}
+    current_pulls = {repo: _pulls(api, repo) for repo, api in groomable.items()}
     current_links = {
         repo: _current_links(repo_pulls) for repo, repo_pulls in current_pulls.items()
     }
@@ -1012,11 +1084,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     reset = 0
     deferred = 0
     for action in issue_actions:
+        api = groomable[action.repo]
         key = (action.repo, action.number)
         if key in fresh_live_issues:
             print(f"SKIP issue {action.repo}#{action.number}: a live lease appeared")
             continue
-        issue = _fresh_issue(target_api, action.repo, action.number)
+        issue = _fresh_issue(api, action.repo, action.number)
         if issue is None or issue.get("state") != "open":
             print(f"SKIP issue {action.repo}#{action.number}: no longer open")
             continue
@@ -1024,7 +1097,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         mode = action.mode
         if mode == "ready":
             current_comments = (
-                _comments(target_api, action.repo, action.number)
+                _comments(api, action.repo, action.number)
                 if issue.get("comments", 0)
                 else []
             )
@@ -1070,7 +1143,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 continue
         else:
             current_comments = (
-                _comments(target_api, action.repo, action.number)
+                _comments(api, action.repo, action.number)
                 if issue.get("comments", 0)
                 else []
             )
@@ -1082,7 +1155,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     f"SKIP issue {action.repo}#{action.number}: attempt budget is no longer exhausted"
                 )
                 continue
-        changed = _apply_labels(target_api, action.repo, action.number, labels, mode)
+        changed = _apply_labels(api, action.repo, action.number, labels, mode)
         if changed and mode == "ready":
             reset += 1
         elif changed:
@@ -1090,7 +1163,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
 
     stale_count = 0
     for action in pull_actions:
-        pull = target_api.request(
+        api = groomable[action.repo]
+        pull = api.request(
             "GET", f"/repos/{action.repo}/pulls/{action.number}", allow_404=True
         )
         if not isinstance(pull, dict) or pull.get("state") != "open":
@@ -1110,8 +1184,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
         label_changed = False
         if "needs:user" not in labels:
-            _ensure_label(target_api, action.repo, "needs:user")
-            target_api.request(
+            _ensure_label(api, action.repo, "needs:user")
+            api.request(
                 "POST",
                 f"/repos/{action.repo}/issues/{action.number}/labels",
                 {"labels": ["needs:user"]},
@@ -1120,7 +1194,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
             )
             label_changed = True
-        comments = _comments(target_api, action.repo, action.number)
+        comments = _comments(api, action.repo, action.number)
         already_commented = any(
             comment["user"]["login"].casefold() == bot_login.casefold()
             and STALE_PR_MARKER in comment["body"]
@@ -1135,7 +1209,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 "it; human review is required.\n\n"
                 f"{STALE_PR_MARKER}"
             )
-            target_api.request(
+            api.request(
                 "POST",
                 f"/repos/{action.repo}/issues/{action.number}/comments",
                 {"body": body},
@@ -1648,6 +1722,72 @@ def _self_test() -> int:
     except GroomError:
         bad_holder_failed = True
     check("malformed non-repair holder still fails closed", bad_holder_failed, True)
+
+    # ---- per-owner target token routing (issue #168: two enabled owners, one token per owner) ----
+    # The sweep reads/writes each target under ITS owner's App token; a single sparq-org-scoped
+    # token 404s every jeswr read and fails every jeswr write, aborting the sweep before dead-lease
+    # release. Reverting target_api_for to a single shared client (owner-blind) reds the "different
+    # api per owner" checks; dropping the wrong-owner defer reds the "unminted owner -> None" check.
+    sparq_api, jeswr_api = object(), object()
+    routed = {"sparq-org": sparq_api, "jeswr": jeswr_api}
+    check(
+        "sparq-org repo routes to the sparq-org token client",
+        target_api_for("sparq-org/sparq", routed) is sparq_api,
+        True,
+    )
+    check(
+        "jeswr repo routes to the DIFFERENT jeswr token client (not the sparq one)",
+        target_api_for("jeswr/agent-account-registry", routed) is jeswr_api,
+        True,
+    )
+    check(
+        "unminted owner routes to None (defer, never a wrong-owner token)",
+        target_api_for("other/repo", {"sparq-org": sparq_api}),
+        None,
+    )
+    check("malformed repo routes to None", target_api_for("no-slash", routed), None)
+
+    saved_token_env = {
+        key: os.environ.get(key)
+        for key in ("TARGET_GH_TOKENS", "TARGET_GH_TOKEN", "TARGET_GH_TOKEN_OWNER")
+    }
+    try:
+        for key in saved_token_env:
+            os.environ.pop(key, None)
+        os.environ["TARGET_GH_TOKENS"] = json.dumps(
+            {"sparq-org": "tok-sparq", "jeswr": "tok-jeswr", "blank": "", "": "x"}
+        )
+        check(
+            "per-owner token map parses and drops blank owner/token entries",
+            target_tokens_map(),
+            {"sparq-org": "tok-sparq", "jeswr": "tok-jeswr"},
+        )
+        os.environ.pop("TARGET_GH_TOKENS", None)
+        os.environ["TARGET_GH_TOKEN"] = "legacy-tok"
+        os.environ["TARGET_GH_TOKEN_OWNER"] = "sparq-org"
+        legacy_map = target_tokens_map()
+        check("legacy single token maps to its declared owner", legacy_map, {"sparq-org": "legacy-tok"})
+        check("legacy token does NOT cover the other owner (defers)", "jeswr" in legacy_map, False)
+        os.environ["TARGET_GH_TOKENS"] = "{not json"
+        malformed_tokens = False
+        try:
+            target_tokens_map()
+        except GroomError:
+            malformed_tokens = True
+        check("malformed TARGET_GH_TOKENS fails closed", malformed_tokens, True)
+        os.environ["TARGET_GH_TOKENS"] = json.dumps(["sparq-org", "tok"])
+        non_object_tokens = False
+        try:
+            target_tokens_map()
+        except GroomError:
+            non_object_tokens = True
+        check("non-object TARGET_GH_TOKENS fails closed", non_object_tokens, True)
+    finally:
+        for key, value in saved_token_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
     # Literal "ledger": pointing either helper back at the default branch (or changing the shipped
