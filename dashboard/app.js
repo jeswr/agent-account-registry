@@ -70,6 +70,13 @@ function renderSummary(data) {
     data.fleet.last_sweep_at ? utc(data.fleet.last_sweep_at) : "No completed sweep data",
   ));
   summary.append(summaryCard("Data freshness", relative(data.generated_at), utc(data.generated_at)));
+  const probe = data.usage_probe;
+  if (probe && typeof probe.status === "string") {
+    summary.append(summaryCard(
+      "Usage probe", probe.status,
+      probe.at ? `Measured ${relative(probe.at)} · ${utc(probe.at)}` : "No measurement timestamp",
+    ));
+  }
 }
 
 function renderWindow(windowData) {
@@ -268,20 +275,23 @@ function renderHealth(health) {
   }
 }
 
-function updateFreshness(generatedAt) {
+function updateFreshness(generatedAt, probe) {
   const generated = parseTime(generatedAt);
   const warning = byId("warning");
   byId("freshness").textContent = generated
     ? `Generated ${relative(generatedAt)} · ${utc(generatedAt)}` : "Generation time unknown";
+  const messages = [];
   if (!generated || Date.now() - generated.getTime() > STALE_MS) {
-    warning.hidden = false;
-    warning.textContent = generated
+    messages.push(generated
       ? `Stale data: this snapshot is ${relative(generatedAt)}. The dashboard pipeline may need attention.`
-      : "Data freshness is unknown. The dashboard pipeline may need attention.";
-  } else {
-    warning.hidden = true;
-    warning.textContent = "";
+      : "Data freshness is unknown. The dashboard pipeline may need attention.");
   }
+  if (probe && typeof probe.status === "string" && probe.status !== "ok") {
+    messages.push(`Usage probe ${probe.status}: quota utilization was not measured for this `
+      + "snapshot — unmeasured accounts are shown as unknown and excluded from eligible capacity.");
+  }
+  warning.hidden = !messages.length;
+  warning.textContent = messages.join(" ");
 }
 
 function render(data) {
@@ -290,7 +300,7 @@ function render(data) {
   renderAccounts(data.accounts || []);
   renderOutcomes(data.fleet.dispatch_outcomes || []);
   renderHealth(data.model_health);
-  updateFreshness(data.generated_at);
+  updateFreshness(data.generated_at, data.usage_probe);
 }
 
 async function refresh() {

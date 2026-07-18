@@ -77,9 +77,21 @@ jobs:
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
         run: |
           set -uo pipefail
-          python3 scripts/account-usage.py --self-test
-          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null || printf '{}' > "$RUNNER_TEMP/usage.json"
-          echo 'usage-probe: snapshot written'
+          # Explicit probe outcome (issue #219): the ok verdict requires the materialized secret
+          # subset (the Materialize step above is also continue-on-error) AND a clean probe run.
+          # Any failure is persisted as ok=false so the generator renders unmeasured accounts as
+          # unknown instead of publishing an empty-but-fresh snapshot as available capacity.
+          probe_ok=false
+          if [ -f "$SECRETS_FILE" ] \
+              && python3 scripts/account-usage.py --self-test \
+              && python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null; then
+            probe_ok=true
+          else
+            printf '{}' > "$RUNNER_TEMP/usage.json"
+            echo '::warning::usage probe failed — the dashboard will mark unmeasured accounts unknown'
+          fi
+          printf '{"ok": %s, "at": %s}\n' "$probe_ok" "$(date +%s)" > "$RUNNER_TEMP/usage-probe.json"
+          echo "usage-probe: snapshot written (ok=$probe_ok)"
 
       - name: Generate privacy-safe dashboard
         env:
@@ -95,6 +107,7 @@ jobs:
           test -f ledger/data/model-health.json
           python3 scripts/dashboard-gen.py --self-test
           python3 scripts/dashboard-gen.py --usage "$RUNNER_TEMP/usage.json" \
+            --usage-probe "$RUNNER_TEMP/usage-probe.json" \
             --leases ledger/data/leases.json --model-health ledger/data/model-health.json
 
       - name: Upload GitHub Pages artifact (pinned)

@@ -203,7 +203,10 @@ def _availability(account, usage_entry):
     if not account["catalog_available"]:
         return "unavailable"
     if not isinstance(usage_entry, dict):
-        return "available"
+        # No measurement for a catalog-available account (failed/omitted probe): "unknown", never
+        # "available" — a total probe failure ({} snapshot) must not publish fresh-looking spare
+        # capacity (issue #219). Unknown rows are excluded from eligible capacity below.
+        return "unknown"
     status = str(usage_entry.get("status") or "").strip().lower()
     if status not in {"", "allowed"}:
         return "unavailable"
@@ -231,6 +234,16 @@ def _window_rows(account, usage_entry):
             "limit": str(limit) if limit is not None else None,
         })
     return rows
+
+
+def _normalize_usage_probe(document):
+    """Public probe-outcome marker for the dashboard (issue #219). The workflow persists an
+    explicit {"ok": bool, "at": epoch} verdict next to the usage snapshot; anything else —
+    missing file, malformed JSON, forged non-bool ok — degrades to "unknown", never to "ok",
+    so measurement provenance fails closed. Pure — unit-tested by --self-test."""
+    if not isinstance(document, dict) or not isinstance(document.get("ok"), bool):
+        return {"status": "unknown", "at": None}
+    return {"status": "ok" if document["ok"] else "failed", "at": _utc_iso(document.get("at"))}
 
 
 def _parse_dispatch_log(log_text):
@@ -458,7 +471,8 @@ def _assert_private(document, private_values):
         raise DashboardError("privacy assertion failed: raw account identity reached public JSON")
 
 
-def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt):
+def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
+                    usage_probe=None):
     accounts, private_values = _catalog(issues)
     handles = [account["handle"] for account in accounts]
     labels = _salted_labels(handles, salt)
@@ -505,6 +519,7 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         },
         "active_by_repository": _repository_activity(live),
         "model_health": _normalize_model_health(model_health),
+        "usage_probe": _normalize_usage_probe(usage_probe),
     }
     _assert_private(document, private_values)
     return document
@@ -564,7 +579,8 @@ def _self_test():
                       "7d_util": "0.8", "7d_reset": now + 86400}}
     history = [{"at": "2025-06-15T15:05:00Z", "conclusion": "success",
                 "dispatched": 2, "deferred": 3}]
-    got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt")
+    got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                          usage_probe={"ok": True, "at": now - 60})
     expected = {
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
@@ -590,8 +606,24 @@ def _self_test():
             "repositories": [{"repository": "owner/repo", "counts": {"opus": 1}}],
         },
         "model_health": None,
+        "usage_probe": {"status": "ok", "at": _utc_iso(now - 60)},
     }
     check("fixture leases + limits -> expected JSON", got, expected)
+    # Issue #219 regression: a failed probe ({} snapshot) must render every catalog-available
+    # account as UNKNOWN (never fresh "available"), keep it out of eligible capacity, and carry
+    # the explicit failure marker into the public document.
+    degraded = build_dashboard(issues, {"leases": []}, {}, [], None, now, "fixture-salt",
+                               usage_probe={"ok": False, "at": now - 30})
+    check("failed probe: unmeasured account is unknown + ineligible, failure surfaced",
+          (degraded["accounts"][0]["availability"],
+           degraded["fleet"]["capacity"]["anthropic"],
+           degraded["usage_probe"]),
+          ("unknown", {"eligible": 0, "total": 1},
+           {"status": "failed", "at": _utc_iso(now - 30)}))
+    check("probe outcome fails closed: absent/forged/malformed -> unknown, never ok",
+          (_normalize_usage_probe(None), _normalize_usage_probe({"ok": "yes", "at": now}),
+           _normalize_usage_probe([{"ok": True}])),
+          tuple([{"status": "unknown", "at": None}] * 3))
     check("dispatch log counts", _parse_dispatch_log(
         "2025-01-01Z dispatched worker owner/repo#1\n"
         "2025-01-01Z defer owner/repo#2: busy\n"
@@ -744,6 +776,7 @@ def main(argv=None):
     parser.add_argument("--leases")
     parser.add_argument("--issues-file")
     parser.add_argument("--usage")
+    parser.add_argument("--usage-probe")
     parser.add_argument("--model-health")
     parser.add_argument("--assets", default="dashboard")
     parser.add_argument("--site", default="site")
@@ -769,11 +802,18 @@ def main(argv=None):
         issues = _fetch_issues(repo)
     leases = _read_json(args.leases, required=True)
     usage = _read_json(_optional_usage_path(args.usage), default={})
+    try:
+        # An unreadable/malformed probe-outcome file degrades to "unknown" (issue #219) rather
+        # than killing the build: the dashboard must still render, visibly degraded, precisely
+        # when measurement is broken.
+        usage_probe = _read_json(args.usage_probe, default=None)
+    except DashboardError:
+        usage_probe = None
     model_health = _read_json(args.model_health, default=None)
     history = _fetch_dispatch_history(repo, args.history)
     document = build_dashboard(
         issues, leases, usage, history, model_health, int(time.time()),
-        os.environ.get("PROVENANCE_SALT", ""))
+        os.environ.get("PROVENANCE_SALT", ""), usage_probe=usage_probe)
     _write_site(document, args.assets, args.site)
     print(f"dashboard-gen: wrote {args.site}/data.json with {len(document['accounts'])} account(s)")
     return 0
