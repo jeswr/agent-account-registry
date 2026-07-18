@@ -727,6 +727,14 @@
    "model_alias": "terra",
    "exit_class": "success",
    "run_id": "29626187834.1"
+  },
+  {
+   "ts": 1784340289,
+   "provider": "anthropic",
+   "account": "51bde6688e140866",
+   "model_alias": "fable",
+   "exit_class": "success",
+   "run_id": "29626022178.1"
   }
  ]
 }
