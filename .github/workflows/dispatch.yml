@@ -488,6 +488,10 @@ jobs:
               "disarm_items": disarm_items,
               "snapshot_skips": snapshot_skips,
           }
+          # GLOBAL (repo, pr_number) order via the SHARED, self-tested helper (sol r2 on
+          # #233): per-repo policy-order assembly inverts lexicographically with a second
+          # active target; the sort must be the exact code the self-test exercises.
+          claim_mod.normalize_plan_order(document)
           # PLAN-side inline set-equality checks (CLAIM repeats a stricter independent
           # re-validation of the artifact as hostile data before any mutation).
           if set(document) != {"schema", "generated_at", "repositories", "review_items",

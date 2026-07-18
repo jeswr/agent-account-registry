@@ -174,6 +174,17 @@ def _safe_string(value, pattern, where):
     return value
 
 
+def normalize_plan_order(document):
+    """Sort review/disarm items into the GLOBAL (repo, pr_number) order validate_plan
+    requires. THE one production sort — the PLAN assembler (dispatch.yml heredoc) calls this
+    instead of sorting inline, so the self-test exercises the exact code the workflow runs
+    (sol r2 on #233: an inline workflow sort could regress to a crashing key while a
+    fixture-local sort kept the test green). Returns the document for chaining."""
+    document["review_items"].sort(key=lambda item: (item["repo"], item["pr_number"]))
+    document["disarm_items"].sort(key=lambda item: (item["repo"], item["pr_number"]))
+    return document
+
+
 def validate_plan(document):
     """Strictly validate the entire PLAN artifact before any network mutation."""
     _require_exact_fields(document, PLAN_FIELDS, "plan")
@@ -1873,6 +1884,33 @@ def _self_test():
         }],
     }
     assert validate_plan(fixture) is fixture
+    # MIXED-REPO regression (2026-07-18 outage): the assembler must emit GLOBAL
+    # (repo, pr_number) order — per-repo policy order inverts it lexicographically the
+    # moment a second target has review items ("jeswr/..." < "sparq-org/..."), and the
+    # assembler's sort key must be pr_number (a wrong "number" key KeyErrors every
+    # non-empty plan — sol r1 on #233). Simulate the assembler on reverse-policy-order
+    # input and require the sorted document to validate.
+    mixed = json.loads(json.dumps(fixture))
+    second = json.loads(json.dumps(mixed["repositories"][0]))
+    second["target_repo"] = "aaa/first-lexically"
+    mixed["repositories"].append(second)
+    ri = json.loads(json.dumps(mixed["review_items"][0]))
+    ri["repo"] = "aaa/first-lexically"
+    # policy order appends the second repo's items AFTER example/repo's — unsorted this
+    # violates the global-order invariant
+    mixed["review_items"] = mixed["review_items"] + [ri]
+    di = json.loads(json.dumps(mixed["disarm_items"][0]))
+    di["repo"] = "aaa/first-lexically"
+    mixed["disarm_items"] = mixed["disarm_items"] + [di]
+    try:
+        validate_plan(mixed)
+        raise AssertionError("unsorted mixed-repo plan must be rejected")
+    except DispatchError:
+        pass
+    # the PRODUCTION sort — the same helper dispatch.yml calls
+    validate_plan(normalize_plan_order(mixed))
+    assert mixed["review_items"][0]["repo"] == "aaa/first-lexically"
+    assert mixed["disarm_items"][0]["repo"] == "aaa/first-lexically"
     # A skip-free plan is the common case and must validate too.
     empty_skips = json.loads(json.dumps(fixture))
     empty_skips["snapshot_skips"] = []
