@@ -69,18 +69,48 @@ jobs:
       # The workflow's own github.token cannot write Actions secrets; REGISTRY_SECRETS_PAT is the
       # jeswr-owned fine-grained PAT on THIS registry repo (already proven by the rotation
       # write-back in worker-live.sh). Post-#101 it lives in the dispatch-secrets environment
-      # (this job is env-bound to resolve it) and needs Secrets: read/write AND
-      # Environments: read/write — the env-secret endpoints the broker/write-back now use sit
-      # under the fine-grained "Environments" permission.
-      - name: Preflight — require REGISTRY_SECRETS_PAT before any login
+      # (this job is env-bound to resolve it). LEAST-PRIVILEGE GRANTS (sol review round 4 of
+      # #275): repository Secrets: READ (the store step only LISTS repo-scope secrets and GETs
+      # the candidate name for the both-scopes absence probe — it never writes at repo scope)
+      # + Environments: READ AND WRITE (the env public-key read `gh secret set --env` performs
+      # sits under Environments: read; the env-secret PUT under Environments: write).
+      #
+      # PRESENCE ALONE IS NOT ENOUGH (round-4 finding 1): a PAT that exists but was minted
+      # under-scoped — or stored at repo scope by a well-meaning operator following a vague
+      # recovery hint, re-tripping the secrets-guard — would fail only AFTER the credential was
+      # captured. So BOTH capabilities are proven HERE, before any login starts or sign-in URL
+      # is surfaced: (1) the NON-MUTATING repo-scope secrets listing the store step's absence
+      # probe performs, and (2) an AUTHORITATIVE environment write — a real `gh secret set
+      # --env` on the disposable REGISTRY_PAT_PROBE_CANARY secret pat-validity.py already
+      # overwrites weekly (it holds NO secret material; only a completed write proves write
+      # access — a read probe would bless a read-only PAT). Fail closed pre-login on either.
+      - name: Preflight — REGISTRY_SECRETS_PAT present AND store-capable, before any login
         env:
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: |
-          if [ -z "${REGISTRY_PAT:-}" ]; then
+          set -euo pipefail
+          fail() {
             gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "❌ REGISTRY_SECRETS_PAT is not set, so a captured token could not be stored. Refusing to start login. Add the fine-grained PAT (Secrets:write on ${{ github.repository }}) as \`REGISTRY_SECRETS_PAT\`, then re-apply the label." || true
+              --body "❌ $1 Refusing to start login — no sign-in URL is surfaced until the broker has proven it can store what the login captures (fail closed). **Fix:** mint a fine-grained PAT on \`${{ github.repository }}\` with repository **Secrets: read** + **Environments: read and write** (least privilege — the broker only lists/reads repo-scope secrets and writes environment secrets), store it with \`gh secret set REGISTRY_SECRETS_PAT --repo ${{ github.repository }} --env dispatch-secrets\` (the dispatch-secrets ENVIRONMENT is its canonical home — a repo-scope copy would re-trip the secrets-guard), then re-apply the \`set-up-account\` label." || true
             exit 1
+          }
+          if [ -z "${REGISTRY_PAT:-}" ]; then
+            fail "\`REGISTRY_SECRETS_PAT\` is not set (not resolvable from the \`dispatch-secrets\` environment), so a captured token could not be stored."
           fi
+          # Capability probe 1 — repository Secrets: READ, via the same NON-MUTATING listing the
+          # store step's both-scopes absence probe performs (never a repo-scope write, which
+          # would re-trip the secrets-guard).
+          if ! GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/actions/secrets?per_page=1" --jq .total_count >/dev/null; then
+            fail "\`REGISTRY_SECRETS_PAT\` resolves but cannot LIST repository-scope secrets — it lacks repository **Secrets: read**, so the store step's both-scopes absence probe would fail closed only AFTER the credential was captured."
+          fi
+          # Capability probe 2 — authoritative Environments: WRITE, via a real env-secret write
+          # to the disposable canary pat-validity.py overwrites weekly (holds no secret
+          # material; value via stdin, never argv, per the repo convention).
+          if ! printf '%s' "set-up-account preflight write-probe canary - holds no secret material" \
+              | GH_TOKEN="$REGISTRY_PAT" gh secret set REGISTRY_PAT_PROBE_CANARY -R "${{ github.repository }}" --env dispatch-secrets; then
+            fail "\`REGISTRY_SECRETS_PAT\` resolves but cannot WRITE a \`dispatch-secrets\` environment secret — it lacks **Environments: read and write**, so storing the captured credential would fail only AFTER capture."
+          fi
+          echo "preflight: REGISTRY_SECRETS_PAT proven store-capable (repo Secrets:read listing + authoritative dispatch-secrets canary write)"
 
       - name: Determine provider (structured — no silent default)
         id: meta

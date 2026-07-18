@@ -293,8 +293,11 @@ from the `data/model-health.json` records the worker/review outcome jobs already
   policy admits ONLY `master`, so a modified workflow copy dispatched at any other ref is refused
   the secrets server-side. This covers the 14 pipeline secrets AND `REGISTRY_SECRETS_PAT`
   (currently unset; when restored it goes into the environment — mint it fine-grained with
-  **Secrets: read/write + Environments: read/write** on this repo, the latter because env-secret
-  endpoints sit under the fine-grained "Environments" permission).
+  repository **Secrets: read + Environments: read/write** on this repo: least privilege, because
+  post-cutover the PAT only LISTs/GETs repo-scope secrets (onboarding's both-scopes absence
+  probe) and WRITEs environment secrets — env-secret endpoints sit under the fine-grained
+  "Environments" permission, whose read half covers the env public-key read. Store it with
+  `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`).
 - `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the `dispatch-secrets` environment secrets public-key read, then an authoritative `gh secret set --env dispatch-secrets` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only read access, so it would bless a read-only PAT that onboarding's env write still breaks on; a repo-scope canary would re-trip the secrets-guard weekly) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and network blips never false-alarm.
 - Account metadata + selection logic: only in this private repo.
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
@@ -313,7 +316,13 @@ You don't paste tokens manually. Instead:
 
 Providers: **OpenAI** via `codex login --device-auth` (native device flow); **Anthropic** via
 `claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_SECRETS_PAT` (a
-fine-grained PAT with Secrets: read/write + Environments: read/write on this registry repo,
-stored in the `dispatch-secrets` environment — the broker job is env-bound to resolve it, and it
-stores captured tokens into that same environment) — until it's set, the broker still surfaces
-the URL but reports that the secret couldn't be stored.
+fine-grained PAT with repository **Secrets: read + Environments: read/write** on this registry
+repo — least privilege; the broker only lists/reads repo-scope secrets and writes environment
+secrets — stored in the `dispatch-secrets` environment: the broker job is env-bound to resolve
+it, and it stores captured tokens into that same environment). The broker **fails closed before
+any login**: its preflight proves the PAT can actually store a credential (a non-mutating
+repo-secret listing plus an authoritative environment canary write) and, if the PAT is missing
+or under-scoped, exits **without ever surfacing a sign-in URL** — remediation (the exact mint
+grants and the storage command
+`gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`)
+is posted on the issue, so a credential is never captured that cannot be stored.

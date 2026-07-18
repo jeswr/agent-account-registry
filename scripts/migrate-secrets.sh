@@ -62,9 +62,13 @@
 # and PER-ENDPOINT PERMISSION-model failures (run-list without actions:read; env-secret write
 # without environments:write) so an under-granted mint is caught by the harness, not production.
 # Exact argv sequences (env set via STDIN, no --body, and — load-bearing — ZERO bootstrap deletes
-# in the main phase) are asserted. Wired into pr-gate.yml and worker-live's FULL_SELFTEST_SUITE
-# so it gates. When the migration workflow is deleted after its successful run, delete this
-# script too and unenrol it from BOTH suite lists.
+# in the main phase) are asserted. The suite also STATICALLY pins the WORKFLOW's declared mint
+# grants (round-4 finding 3: the fake-gh model alone never noticed a permission line deleted
+# from migrate-secrets-to-env.yml): check_workflow_mint_contract asserts both mint steps'
+# exact phase-specific `permission-*` sets and goes red on any removal/weakening/widening.
+# Wired into pr-gate.yml and worker-live's FULL_SELFTEST_SUITE so it gates. When the migration
+# workflow is deleted after its successful run, delete this script too and unenrol it from BOTH
+# suite lists.
 set -euo pipefail
 set +x   # belt-and-braces: never trace commands while secret values are in scope
 umask 077
@@ -275,6 +279,48 @@ phase_cleanup() {
   [[ "$stray" -eq 0 ]] \
     || die 'both phases have converged for the 14, but the secrets-guard requires an EMPTY repo scope — move or remove the stray secret(s) named above, then dispatch recovers'
   printf 'MIGRATION COMPLETE (both phases): all 14 live in %s and the repo scope holds none of them — the secrets-guard goes green now. Delete migrate-secrets-to-env.yml (and unenrol+delete this script).\n' "$ENV_NAME"
+}
+
+# ---------------------------------------------------------------------------------------------
+# WORKFLOW MINT CONTRACT (sol review round 4 of #275, finding 3 — vacuity gap): the fake-gh
+# permission model above tests the SCRIPT's behavior under an under-granted token, but nothing
+# tied the WORKFLOW's declared mint grants to it — deleting both `permission-actions: read`
+# lines from migrate-secrets-to-env.yml still passed every scenario. This static assertion
+# (anchored awk over the stable two-space job indentation — the repo toolchain carries no
+# PyYAML) pins BOTH create-github-app-token steps' EXACT phase-specific grant sets:
+#   main job `migrate`:            secrets: write + environments: write + actions: read
+#   job `cleanup-bootstrap`:       secrets: write + environments: read  + actions: read
+# The comparison is against the FULL sorted set, so REMOVING, WEAKENING (write -> read), or
+# silently WIDENING any `permission-*` declaration goes red in --self-test (wired into
+# pr-gate.yml and worker-live's FULL_SELFTEST_SUITE). When the workflow is deleted after the
+# migration succeeds, this script is deleted with it (see header), taking the contract along.
+
+_mint_grants() {  # _mint_grants WORKFLOW_FILE JOB_KEY -> that job's sorted permission-* lines
+  awk -v job="$2" '
+    /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
+    injob && /^ +permission-[a-z-]+:/ { sub(/^ +/, ""); sub(/[ \t]+$/, ""); print }
+  ' "$1" | sort
+}
+
+check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
+  local wf=$1 want got rc=0
+  if [[ ! -f "$wf" ]]; then
+    printf '::error::migrate-secrets: workflow contract: %s not found (delete this script together with the workflow)\n' "$wf" >&2
+    return 1
+  fi
+  want=$(printf 'permission-actions: read\npermission-environments: write\npermission-secrets: write')
+  got=$(_mint_grants "$wf" migrate)
+  if [[ "$got" != "$want" ]]; then
+    printf '::error::migrate-secrets: workflow contract violated — the MAIN mint (job migrate) must declare EXACTLY {permission-secrets: write, permission-environments: write, permission-actions: read}; found:\n%s\n' "${got:-<none>}" >&2
+    rc=1
+  fi
+  want=$(printf 'permission-actions: read\npermission-environments: read\npermission-secrets: write')
+  got=$(_mint_grants "$wf" cleanup-bootstrap)
+  if [[ "$got" != "$want" ]]; then
+    printf '::error::migrate-secrets: workflow contract violated — the CLEANUP mint (job cleanup-bootstrap) must declare EXACTLY {permission-secrets: write, permission-environments: read, permission-actions: read}; found:\n%s\n' "${got:-<none>}" >&2
+    rc=1
+  fi
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -668,6 +714,26 @@ FAKE
     "$(grep -c 'gh secret set ACCOUNT_EMAIL_MAP --env dispatch-secrets failed' "$tmp/s17.out")" 1
   chk "no environments:write grant: NO deletions, repo scope untouched" \
     "$(grep -cE '^secret delete ' "$s17/calls.log" || true)-$(wc -l < "$s17/repo_secrets")" 0-14
+
+  # --- scenario 18: WORKFLOW MINT CONTRACT (round-4 finding 3) — the REAL workflow's two mint
+  # steps must declare exactly the phase-specific grant sets the permission scenarios above
+  # model; the fake-gh grants files prove the SCRIPT fails closed under-granted, this proves the
+  # WORKFLOW actually requests the grants. Then the check's own non-vacuity: a mutated copy with
+  # a REMOVED declaration and one with a WEAKENED declaration must each go red.
+  local wf_real wf_mut="$tmp/wf-mut.yml"
+  wf_real="$(dirname -- "$me")/../.github/workflows/migrate-secrets-to-env.yml"
+  rc=0; check_workflow_mint_contract "$wf_real" > "$tmp/s18.out" 2>&1 || rc=$?
+  chk "workflow mint contract holds on the real migrate-secrets-to-env.yml" "$rc" 0
+  grep -v 'permission-actions: read' "$wf_real" > "$wf_mut"   # strips BOTH actions:read mints
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18b.out" 2>&1 || rc=$?
+  chk "contract goes RED when the permission-actions: read declarations are removed (the exact round-4 vacuity gap)" "$rc" 1
+  sed 's/permission-environments: write/permission-environments: read/' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18c.out" 2>&1 || rc=$?
+  chk "contract goes RED when the main-phase environments grant is WEAKENED to read" "$rc" 1
+  sed 's/^          permission-secrets: write$/          permission-secrets: write\n          permission-contents: write/' \
+    "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18d.out" 2>&1 || rc=$?
+  chk "contract goes RED when an extra grant is silently WIDENED in (exact-set pin)" "$rc" 1
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'migrate-secrets self-test PASSED\n'

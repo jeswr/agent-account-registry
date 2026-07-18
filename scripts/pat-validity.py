@@ -395,9 +395,15 @@ def render_alert(result, repo):
              impact]
     if result.get("expires_at"):
         lines.append(f"Token expiry (from the API's expiration header): {result['expires_at']}\n")
-    lines.append(f"**Fix:** mint a fine-grained PAT with **Secrets: read and write** AND "
-                 f"**Environments: read and write** on `{repo}` (env-secret writes sit under the "
-                 f"'Environments' permission), then "
+    # LEAST PRIVILEGE (sol review round 4 of #275): post-cutover the PAT only LISTs/GETs
+    # repo-scope secrets (onboarding's both-scopes absence probe) and WRITEs environment
+    # secrets, so the grant set is repository Secrets: READ + Environments: READ AND WRITE
+    # (the env public-key read sits under Environments: read) — never Secrets: write.
+    lines.append(f"**Fix:** mint a fine-grained PAT with repository **Secrets: read** AND "
+                 f"**Environments: read and write** on `{repo}` — least privilege: the pipeline "
+                 f"only lists/reads repo-scope secrets and writes environment secrets "
+                 f"(env-secret endpoints sit under the 'Environments' permission; its read half "
+                 f"covers the public-key read). Then "
                  f"`gh secret set REGISTRY_SECRETS_PAT -R {repo} --env {CANARY_ENV}` (paste at "
                  "the prompt — never as a visible argument; the environment is its canonical "
                  "home post-#101, repo scope must stay empty). This issue updates itself on the "
@@ -712,6 +718,15 @@ def _self_test():
         SENTINEL in render_alert(r401, "o/r") + render_alert(rmiss, "o/r")
         + render_alert(r_ro, "o/r") + render_alert(r_soon, "o/r") + render_alert(rbad, "o/r"),
         False)
+    # Round-4 finding 2: the remediation must name the LEAST-PRIVILEGE grant set — repository
+    # Secrets: read (never write) + Environments: read and write — or an operator following the
+    # alert re-mints an over-privileged PAT.
+    fix_body = render_alert(r_ro, "o/r")
+    chk("alert Fix line names the least-privilege grants (repo Secrets: read, env read+write)",
+        ("**Secrets: read**" in fix_body,
+         "**Environments: read and write**" in fix_body,
+         "Secrets: read and write" in fix_body),
+        (True, True, False))
     chk("fetch AND write probes received the token (probe is non-vacuous)",
         all(t == SENTINEL for t in chk_token_holder) and len(chk_token_holder) == 26, True)
 
