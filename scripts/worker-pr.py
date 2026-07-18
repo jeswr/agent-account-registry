@@ -839,12 +839,13 @@ def _registry_put_file(registry_repo, path, document, message, retries=6):
     the REAL last API error is raised, never a generic conflict message."""
     body = json.dumps(document, indent=1, sort_keys=True) + "\n"
     encoded = base64.b64encode(body.encode()).decode()
-    # Legacy records (<= sparq#2542) live on master; readers fall back to them, so a divergent
-    # ledger copy would silently rewrite history. Checked once — master records are immutable.
+    # BOTH record locations are probed before any success short-circuit (sol review r1 on
+    # #100): readers consume the LEDGER copy first, so a divergent ledger record must fail
+    # this write even when the legacy master copy is byte-identical — "already recorded" is
+    # only claimable when EVERY existing copy matches. Legacy (<= sparq#2542) checked once —
+    # master records are immutable; the ledger probe re-runs inside the CAS retry loop.
     legacy, _legacy_sha = _probe_registry_file(registry_repo, path)
-    if legacy is not None:
-        if legacy == body:
-            return False  # already recorded pre-migration — idempotent success
+    if legacy is not None and legacy != body:
         raise WorkerPrError(
             f"registry file {path} already exists with different content on the default branch")
     last_error = ""
@@ -853,7 +854,10 @@ def _registry_put_file(registry_repo, path, document, message, retries=6):
         if existing is not None:
             if existing == body:
                 return False  # already recorded — idempotent success
-            raise WorkerPrError(f"registry file {path} already exists with different content")
+            raise WorkerPrError(f"registry file {path} already exists with different content "
+                                f"on the '{LEDGER_REF}' branch")
+        if legacy is not None:
+            return False  # identical pre-migration record, no ledger copy — idempotent success
         args = ["api", "-X", "PUT", f"repos/{registry_repo}/contents/{path}",
                 "-f", f"message={message}", "-f", f"content={encoded}",
                 "-f", f"branch={LEDGER_REF}"]
@@ -1844,6 +1848,23 @@ def _self_test():
         except WorkerPrError as exc:
             check("divergent legacy master record fails closed",
                   "different content" in str(exc) and "default branch" in str(exc), True)
+        # sol review r1: an identical LEGACY copy must never mask a divergent LEDGER copy —
+        # readers consume the ledger first, so this exact combination silently served the
+        # divergent record while the writer reported "already recorded".
+        put_state["files"] = {legacy_loc: record_meta(doc),
+                              ledger_loc: record_meta({"pr_number": 8})}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("identical legacy never masks a divergent ledger copy", "no error", "error")
+        except WorkerPrError as exc:
+            check("identical legacy never masks a divergent ledger copy",
+                  "different content" in str(exc) and LEDGER_REF in str(exc), True)
+        put_calls.clear()
+        put_state["files"] = {legacy_loc: record_meta(doc)}
+        check("identical legacy + no ledger copy stays idempotent (no PUT)",
+              (_registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                  doc, "m"),
+               any("-X" in call for call in put_calls)), (False, False))
 
         put_calls.clear()
         put_state.update(files={}, put_rc=1,
