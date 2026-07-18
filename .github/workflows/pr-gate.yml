@@ -62,7 +62,7 @@ jobs:
           # Every self-testing pipeline script — the same FULL suite worker-live.sh's
           # registry-selftest gate runs. A missing self-test fails the gate (fail closed).
           suite="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
-          plan-snapshot.py triage.py \
+          plan-snapshot.py triage.py pipeline-alarm.py \
           dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
           account-usage.py usage-alert.py model-health.py pat-validity.py broker-refresh.py \
           backfill-provenance.py dashboard-gen.py"
@@ -89,6 +89,12 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            echo "== yaml-parse $f =="
+            python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$f"
+          done
+          # Composite actions (action.yml) are not linted by actionlint's default workflow scan —
+          # yaml-parse them too so a broken pipeline-alarm action fails the gate (fail closed).
+          for f in .github/actions/*/action.yml .github/actions/*/action.yaml; do
             echo "== yaml-parse $f =="
             python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$f"
           done

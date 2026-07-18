@@ -1,0 +1,101 @@
+# [FABLE-5] Unified loud-fail pipeline alarm — the shared FINAL step every pipeline workflow wires
+# in as `if: ${{ failure() || cancelled() }}`. On any job failure/cancel/skip it classifies the
+# failure, captures a credential-safe diagnostic tail, and upserts the single rolling
+# "⚠️ pipeline failures" issue (label `pipeline-alert`, deduped by a hidden body marker). See
+# scripts/pipeline-alarm.py for the full contract. FAIL-SOFT: this action never masks the primary
+# failure — its own step is `continue-on-error`-safe and the script always exits 0.
+#
+# SELF-CONTAINED BY DESIGN: it does its OWN pinned checkout of the registry into a private temp path
+# and runs the master copy of the alarm script from there. It therefore works even when the calling
+# job (a) never checked out the registry, or (b) checked out HOSTILE target code into the default
+# workspace — the alarm never runs a script that target code could have influenced.
+name: pipeline-alarm
+description: >-
+  Loud, deduped, credential-safe pipeline-failure alarm. Wire as the final
+  `if: ${{ failure() || cancelled() }}` step so no pipeline failure is ever silent.
+inputs:
+  job-name:
+    description: The failing job's display name (e.g. matrix.job.name). Defaults to $GITHUB_JOB.
+    required: false
+    default: ""
+  job-result:
+    description: >-
+      The failing job's result. From a FINAL-alarm job pass `needs.<job>.result`; from an in-job
+      final step pass the empty string (the step only runs on failure(), so failure is implied).
+    required: false
+    default: "failure"
+  failed-step:
+    description: Best-effort name of the step that failed (credential-safe; sanitized regardless).
+    required: false
+    default: ""
+  detail:
+    description: >-
+      Optional short diagnostic string. CREDENTIAL-SAFE ONLY — never pass a token, account handle,
+      or model transcript; the script re-sanitizes it, but keep it host-observable (an error class
+      / exit code / step name), mirroring worker-live.sh.
+    required: false
+    default: ""
+  cancelled:
+    description: "true if the run was cancelled/timed-out (pass ${{ cancelled() }})."
+    required: false
+    default: "false"
+  registry-token:
+    description: >-
+      Token to READ the registry (for the pinned checkout) and WRITE the alert issue. Pass
+      ${{ github.token }} in the registry's own workflows. Needs contents:read + issues:write.
+    required: true
+  alert-repo:
+    description: Optional private ALERT_REPO override (privacy routing, cf model-health/usage-alert).
+    required: false
+    default: ""
+  alert-token:
+    description: Token with issues:write on alert-repo (required only if alert-repo is a private one).
+    required: false
+    default: ""
+  maintainer:
+    description: Maintainer handle to @-mention in the alert.
+    required: false
+    default: "jeswr"
+runs:
+  using: composite
+  steps:
+    - name: Raise the loud, deduped, credential-safe pipeline-failure alarm
+      shell: bash
+      env:
+        ALARM_GH_TOKEN: ${{ inputs.registry-token }}
+        REGISTRY_REPO: ${{ github.repository }}
+        ALERT_REPO: ${{ inputs.alert-repo }}
+        ALERT_TOKEN: ${{ inputs.alert-token }}
+        MAINTAINER_HANDLE: ${{ inputs.maintainer }}
+        ALARM_JOB_NAME: ${{ inputs.job-name }}
+        ALARM_JOB_RESULT: ${{ inputs.job-result }}
+        ALARM_FAILED_STEP: ${{ inputs.failed-step }}
+        ALARM_DETAIL: ${{ inputs.detail }}
+        ALARM_CANCELLED: ${{ inputs.cancelled }}
+      run: |
+        set -uo pipefail
+        printf '::add-mask::%s\n' "$ALARM_GH_TOKEN"
+        if [ -n "${ALERT_TOKEN:-}" ]; then printf '::add-mask::%s\n' "$ALERT_TOKEN"; fi
+        # Prefer the caller's workspace checkout (every alarm-job caller checks out the registry to
+        # the workspace root first). Fall back to the action's OWN bundled copy — the action files
+        # live in the registry at the workflow ref, so ${GITHUB_ACTION_PATH}/../../../scripts is the
+        # same master copy regardless of what the caller's workspace holds (immune to hostile target
+        # code in a different job's workspace).
+        script=""
+        for cand in \
+          "${GITHUB_WORKSPACE}/scripts/pipeline-alarm.py" \
+          "${GITHUB_ACTION_PATH}/../../../scripts/pipeline-alarm.py"; do
+          if [ -f "$cand" ]; then script="$cand"; break; fi
+        done
+        if [ -z "$script" ]; then
+          # Degrade LOUD but never mask the primary failure (the script IS the alarm; if even it is
+          # missing, this annotation is the alarm surface).
+          echo "::error::pipeline-alarm: helper script not found — pipeline failure in ${GITHUB_WORKFLOW}/${GITHUB_JOB} is NOT recorded to an issue (still red in Actions)"
+          exit 0
+        fi
+        # Self-test first (the alarm's own correctness is load-bearing); a self-test failure still
+        # degrades to an annotation, never to masking the primary failure.
+        python3 "$script" --self-test || \
+          echo "::error::pipeline-alarm: self-test FAILED; attempting the alert anyway (fail-soft)"
+        python3 "$script"
+        exit 0
