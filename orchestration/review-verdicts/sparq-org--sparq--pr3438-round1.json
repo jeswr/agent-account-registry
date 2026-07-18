@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The hdt 0.7 bump replaces the sophia/sucds/rio tree with qwt 0.4 and pulls in a notably larger transitive set for this crate: bincode, binout, co_sort, dyn_size_of, fsum, minimum_redundancy, mem_dbg(+derive), bitset-core, env_logger + env_filter + the full anstream/anstyle chain, clap_derive, generic-tests, serde-big-array (per Cargo.lock). sparq-hdt is opt-in and native-only (never in the sparq-wasm graph), so the core/wasm hygiene rule is respected and this is not a correctness problem. But the added surface (e.g. env_logger, clap_derive) should be confirmed against the workspace supply-chain gate.",
+   "file": "crates/sparq-hdt/Cargo.toml",
+   "fix_hint": "Ensure the supply-chain lane (cargo-deny advisories/bans/licenses/sources and cargo-vet) is green for the new transitive crates before merge; no code change needed if the gate passes.",
+   "severity": "minor",
+   "title": "New transitive dependency surface for the opt-in crate is sizeable; confirm cargo-deny/vet stays green"
+  },
+  {
+   "body": "The comment (Cargo.toml lines ~54-56 and the mirrored UPSTREAM.md note) claims hdt 0.7's move to qwt 0.4 makes the aarch64 prefetch path use stable inline assembly instead of a nightly-only intrinsic, which is the stated justification for finally dropping the 0.4 pin. This is a plausible and well-documented rationale, but it cannot be confirmed on this x86_64 host; correctness of the nightly-vs-stable claim is only exercised by the aarch64 CI lane.",
+   "file": "crates/sparq-hdt/Cargo.toml",
+   "fix_hint": "No change required if aarch64 CI builds sparq-hdt on stable; treat the aarch64 lane's green build as the confirming evidence for the comment's claim.",
+   "severity": "nit",
+   "title": "aarch64 stable-inline-asm rationale is unverifiable in this x86 environment"
+  }
+ ],
+ "progress": null,
+ "summary": "Dependency bump of the wrapped `hdt` crate 0.4 -> 0.7 for sparq-hdt, swapping the opt-in write feature from `hdt/sophia` to the narrower `hdt/nt` (N-Triples fixture writer), plus Cargo.lock, UPSTREAM.md, and a test comment update. The diff carries ZERO source changes despite a 3-major-version jump, which is the central risk since sparq-hdt reaches deep into hdt's pub-internal modules (hdt::containers, hdt::dict_sect_pfc, hdt::four_sect_dict, hdt::triples, hdt::vocab, hdt::hdt::Error). I verified this empirically against the PR-head checkout: `cargo check -p sparq-hdt --features write,load-filter` compiles clean, the default read-only build and `cargo doc` (default + write surfaces) are clean with no feature-gated intra-doc-link break, and the full test suite passes (34+ tests, 0 failures) INCLUDING the load-bearing byte-level format-compatibility tests: direct_decoder_matches_upstream_generated_multiblock, saved_archive_loads_via_upstream_oracle_too, direct_encode_matches_upstream_builder, and save_round_trips_escaped_literals_exactly. The `hdt/sophia`->`hdt/nt` swap is sound: `Hdt::read_nt` is reachable via `nt`, and encode.rs's direct section writers are not `nt`-gated. The `--all-features` build fails only because the opt-in `zlib-ng` C backend needs `cmake` (absent in this env) \u2014 an environment issue, not a code defect. Doc/comment updates in Cargo.toml and UPSTREAM.md are consistent with the change and contain no overclaim; no ZK/MPC surface, no hard-coded perf numbers. Change is correct and complete. Two minor, non-blocking notes below.",
+ "verdict": "approve"
+}
