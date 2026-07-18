@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 fixes the prior major finding. The exact-text scan has been replaced by token-based enumeration that removes comments outside IRIs/literals and treats whitespace and line breaks uniformly, so every secx:property token in the current methods Turtle reaches validation rather than individual reformatted assertions silently disappearing behind a global found count. The added regressions exercise the previously missed multiline/comment form (including a typo object) and ensure commented-out or IRI-internal text is not misclassified. The implementation is intentionally narrower than a complete Turtle parser, but for the guarded predicate/object shape it fails loudly on unsupported object forms instead of silently skipping them. No correctness, soundness, test-validity, or security issue remains in the diff-scoped change.",
+ "verdict": "approve"
+}
