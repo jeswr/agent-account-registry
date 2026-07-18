@@ -277,7 +277,12 @@ def linked_issue_numbers(pull: dict[str, Any]) -> set[int]:
 def stale_worker_pr_reason(
     pull: dict[str, Any], bot_login: str, threshold_seconds: int, now: int
 ) -> str | None:
-    """Return why an old worker PR needs attention, or None when it should remain untouched."""
+    """Return why an old worker PR needs HUMAN attention, or None when it should remain untouched.
+
+    Scope: this age sweep only escalates a NON-DRAFT worker PR wedged in a BAD_MERGE_STATE
+    (conflicting/dirty/behind/blocked/unstable/unknown) — a state no automation recovers. A DRAFT
+    worker PR is review-loop-owned and is NEVER escalated here (see the draft branch below); its
+    starved-lane escalation belongs to the review-queue-TTL alert, not this sweep."""
     updated = _epoch(pull.get("updated_at"), "pull request")
     if now - updated < threshold_seconds:
         return None
@@ -294,7 +299,20 @@ def stale_worker_pr_reason(
     ):
         return None
     if pull.get("draft") is True:
-        return "the worker pull request is still a draft"
+        # [FABLE-5] A DRAFT worker PR is REVIEW-LOOP-OWNED, never age-parked here (deadlock fix,
+        # live PRs jeswr/agent-account-registry#3472 / #3470). Draft is the NORMAL pre-review
+        # pipeline state: dispatch-claim.enumerate_review_items picks the draft up, the review-fix
+        # loop reviews it, then undrafts + arms it. A draft awaiting review gets NO `updated_at`
+        # bump, so it ages past worker_timeout_minutes purely by WAITING for a (backed-up) review
+        # lane — being old is NOT being stuck. Applying `needs:user` here is TERMINAL: it (and a
+        # `needs:` label on the source issue) is in dispatch-claim.HUMAN_HOLD_PR_LABELS, which
+        # EXCLUDES the PR from enumerate_review_items — so parking a pipeline-owned draft removes
+        # it from the exact loop that would otherwise drive it, a self-inflicted deadlock the
+        # maintainer reported as "can't be drained". The escalation owner for a starved/dead review
+        # lane is the review-queue-TTL alert (policy `review_queue_ttl_minutes`, surfaced by the
+        # dispatch/review pipeline as a NON-terminal ops alert that the review enumerator still sees
+        # through) — NOT this age sweep and NEVER the terminal label. Return None: leave untouched.
+        return None
     merge_state = pull.get("mergeable_state")
     if merge_state is None:
         merge_state = "unknown"
@@ -1131,6 +1149,80 @@ def _self_test() -> int:
         None,
     )
     check("worker branch links issue", linked_issue_numbers(old_pr), {7})
+
+    # [FABLE-5] Deadlock regression (live PRs #3472/#3470): a stale DRAFT worker PR (aged past the
+    # maintenance threshold purely by WAITING for a backed-up review lane) is REVIEW-LOOP-OWNED and
+    # must NOT be age-parked into terminal needs:user by this sweep — that terminal label excludes
+    # the PR from dispatch-claim.enumerate_review_items, deadlocking the exact loop that drives it.
+    # (a) THE BUG: a stale draft returns None (no needs:user park). Even a draft in an otherwise-bad
+    # merge state stays untouched here — draft-ownership dominates the merge-state escalation.
+    stale_draft_pr = {**old_pr, "draft": True}
+    check(
+        "stale DRAFT worker PR is NOT age-parked (review-loop-owned; deadlock fix)",
+        stale_worker_pr_reason(stale_draft_pr, "app[bot]", limits.threshold_seconds, now),
+        None,
+    )
+    check(
+        "stale draft is untouched even in a bad merge state (draft ownership wins)",
+        stale_worker_pr_reason(
+            {**old_pr, "draft": True, "mergeable_state": "dirty"},
+            "app[bot]",
+            limits.threshold_seconds,
+            now,
+        ),
+        None,
+    )
+    # (b) A stale NON-DRAFT worker PR wedged in a bad merge state STILL parks (unchanged; a state no
+    # automation recovers — the defensible, in-scope escalation the fix must not remove).
+    check(
+        "stale NON-DRAFT bad-merge-state worker PR still parks (unchanged)",
+        stale_worker_pr_reason(
+            {**old_pr, "draft": False, "mergeable_state": "dirty"},
+            "app[bot]",
+            limits.threshold_seconds,
+            now,
+        ),
+        BAD_MERGE_STATES["dirty"],
+    )
+    # (c) Non-vacuity / mutation guard: reintroducing the removed draft-park (returning the old
+    # "still a draft" reason) is exactly what stale_worker_pr_reason would do WITHOUT the fix. This
+    # models the reverted code and asserts it WOULD have parked the draft fixture — proving test (a)
+    # is a live discriminator, not a vacuous pass. If the draft branch is ever restored to return a
+    # reason, run_sweep's pull_actions loop applies needs:user (line ~957), re-arming the deadlock.
+    def _reverted_stale_worker_pr_reason(pull, bot, threshold, at):
+        updated = _epoch(pull.get("updated_at"), "pull request")
+        if at - updated < threshold:
+            return None
+        head = pull.get("head", {}).get("ref", "")
+        author = pull.get("user", {}).get("login", "")
+        pbody = pull.get("body") or ""
+        if (
+            not isinstance(head, str)
+            or WORKER_BRANCH.match(head) is None
+            or not isinstance(author, str)
+            or author.casefold() != bot.casefold()
+            or not isinstance(pbody, str)
+            or not pbody.lstrip().startswith(WORKER_PR_MARKER)
+        ):
+            return None
+        if pull.get("draft") is True:
+            return "the worker pull request is still a draft"  # the removed terminal-park
+        merge_state = pull.get("mergeable_state") or "unknown"
+        return BAD_MERGE_STATES.get(merge_state)
+
+    check(
+        "MUTATION: reverting the draft-fix re-parks the draft (non-vacuous)",
+        _reverted_stale_worker_pr_reason(
+            stale_draft_pr, "app[bot]", limits.threshold_seconds, now
+        ),
+        "the worker pull request is still a draft",
+    )
+    check(
+        "MUTATION guard agrees with the live fix on the non-draft park (only draft changed)",
+        _reverted_stale_worker_pr_reason(old_pr, "app[bot]", limits.threshold_seconds, now)
+        == stale_worker_pr_reason(old_pr, "app[bot]", limits.threshold_seconds, now),
+        True,
+    )
 
     fixture_issues = {
         "owner/repo": {
