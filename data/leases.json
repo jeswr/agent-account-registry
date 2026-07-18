@@ -31,16 +31,6 @@
    "expires_at": 1784387647
   },
   {
-   "account": "acct2css",
-   "claim_id": "b3794e91e6b847d69ff189671b30f4a4",
-   "holder": "jeswr/agent-account-registry#170@dispatch-29647634753.1",
-   "package": "groom",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784384235,
-   "expires_at": 1784386935
-  },
-  {
    "account": "acct4css",
    "claim_id": "514793d4fff4440f8dca296479b80cdd",
    "holder": "jeswr/agent-account-registry#183@dispatch-29647634753.1",
