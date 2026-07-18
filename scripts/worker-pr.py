@@ -1245,9 +1245,18 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         surfaces = tuple(surface_paths) if surface_paths else DEFAULT_TRUST_SURFACE_PATHS
         live_files = _pr_changed_files(repo, pr_number)
         trust_hits = trust_surface_paths_touched(live_files, surfaces)
+    if arm and trust_hits:
+        # Durable audit BEFORE the merge latch can fire (sol r2 on #257): auto-merge can
+        # complete immediately, and a post-merge crash would leave an armed trust diff with
+        # no audit trail (reconciliation only walks open PRs). The comment/label are
+        # SHA-bound and idempotent, so an arm failure + re-review re-audits the new head.
+        _apply_trust_surface_audit(repo, pr_number, trust_hits, reviewed_sha)
     _run_gh(["pr", "ready", str(pr_number), "-R", repo])
     if arm:
-        merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto"],
+        # Atomic SHA-bound arm (sol r2): GitHub's own CAS — the latch only sets if the head
+        # still equals the reviewed sha at mutation time, closing the read-to-arm race.
+        merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto",
+                         "--match-head-commit", reviewed_sha],
                         check=False)
         if merge.returncode != 0:
             undo = _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
@@ -1263,8 +1272,6 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
                        issue=issue, alert_repo=alert_repo, alert_token=alert_token)
             raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated")
     set_review_state(repo, pr_number, "pass")
-    if arm and trust_hits:
-        _apply_trust_surface_audit(repo, pr_number, trust_hits)
     if issue:
         # Deferred issue completion (locked decision 16): complete only on arm, not on publish.
         _load_worker_issue().set_status(repo, issue, "complete")
@@ -1273,15 +1280,18 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     print(f"pull request marked ready{' and armed (auto-merge)' if arm else ''}")
 
 
-TRUST_AUDIT_MARKER = "<!-- sparq-trust-audit:v1 -->"
+TRUST_AUDIT_MARKER_PREFIX = "<!-- sparq-trust-audit:v1 sha="
+TRUST_AUDIT_MARKER = TRUST_AUDIT_MARKER_PREFIX  # back-compat alias for tests/greps
 
 
-def _apply_trust_surface_audit(repo, pr_number, hits):
-    """Durable post-arm audit trail for an armed trust-plane diff (Decision 7 revision):
-    the label + ONE idempotent comment listing the touched security paths. Runs only after
-    a SUCCESSFUL arm; failures are LOUD (raise) — an armed trust diff without its audit
-    trail violates the revised contract; the sweep's crash-window semantics retry it
-    (reviewed-sha binds after this step)."""
+def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha):
+    """Durable PRE-arm audit trail for an arming trust-plane diff (Decision 7 revision,
+    hardened per sol r2 on #257): the label + ONE idempotent comment listing the touched
+    security paths, SHA-BOUND — the idempotency marker carries the reviewed sha and only a
+    [bot]-authored marker for THIS sha suppresses a re-post (a stale audit from an earlier
+    head never masks the current one; collaborator pre-seeding is within the existing
+    write+ trust boundary and documented). Failures are LOUD (raise)."""
+    marker = f"{TRUST_AUDIT_MARKER_PREFIX}{reviewed_sha} -->"
     label = _run_gh(["pr", "edit", str(pr_number), "-R", repo,
                      "--add-label", "trust-surface"], check=False)
     if label.returncode != 0:
@@ -1290,10 +1300,13 @@ def _apply_trust_surface_audit(repo, pr_number, hits):
                  "--color", "D93F0B"], check=False)
         _run_gh(["pr", "edit", str(pr_number), "-R", repo, "--add-label", "trust-surface"])
     existing = _paginated_comments(repo, pr_number)
-    if not any(TRUST_AUDIT_MARKER in str(c.get("body", "")) for c in existing):
-        body = ("> \U0001F916 SPARQ agent\n\nARMED on cross-provider approve. "
-                "Trust-surface audit trail: " + ", ".join(hits[:8]) + ". Post-merge review "
-                "welcome; revert-and-reopen is the escalation path.\n\n" + TRUST_AUDIT_MARKER)
+    if not any(marker in str(c.get("body", ""))
+               and str(c.get("user", {}).get("login", "")).endswith("[bot]")
+               for c in existing):
+        body = ("> \U0001F916 SPARQ agent\n\nArming on cross-provider approve. "
+                "Trust-surface audit trail: " + ", ".join(hits[:8]) + " @ "
+                + reviewed_sha[:12] + ". Post-merge review welcome; revert-and-reopen is "
+                "the escalation path.\n\n" + marker)
         _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body",
                  body.encode().decode("unicode_escape")])
 
@@ -2244,18 +2257,35 @@ def _self_test():
         ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True)
 
     try:
+        sha = "b" * 40
         run_raa()
         check("approved trust-surface diff ARMS (Decision 7 revision)",
               (any("merge" in c for c in raa_calls), raa_outputs.get("armed"),
                raa_outputs.get("trust_surface")), (True, True, True))
         audit_i = next(i for i, c in enumerate(raa_calls) if "trust-surface" in c)
         merge_i = next(i for i, c in enumerate(raa_calls) if "merge" in c)
-        check("audit trail applies AFTER the successful arm", audit_i > merge_i, True)
-        check("audit comment carries the idempotency marker",
-              any(TRUST_AUDIT_MARKER in c for c in raa_calls), True)
-        run_raa(comments=({"body": f"x {TRUST_AUDIT_MARKER}"},))
-        check("audit comment is idempotent (marker present -> no second comment)",
-              any(TRUST_AUDIT_MARKER in c for c in raa_calls), False)
+        check("audit trail is DURABLE BEFORE the merge latch (sol r2)",
+              audit_i < merge_i, True)
+        check("the arm is SHA-bound (--match-head-commit CAS)",
+              any("--match-head-commit" in c and sha in c for c in raa_calls), True)
+        check("audit comment carries the SHA-bound idempotency marker",
+              any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        bot_marker = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{sha} -->",
+                      "user": {"login": "sparq[bot]"}}
+        run_raa(comments=(bot_marker,))
+        check("bot marker for THIS sha suppresses a re-post",
+              any(TRUST_AUDIT_MARKER_PREFIX in c and "comment" in c for c in raa_calls),
+              False)
+        stale = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{'d' * 40} -->",
+                 "user": {"login": "sparq[bot]"}}
+        run_raa(comments=(stale,))
+        check("a stale-head marker does NOT suppress the fresh audit",
+              any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        human_marker = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{sha} -->",
+                        "user": {"login": "mallory"}}
+        run_raa(comments=(human_marker,))
+        check("a non-bot marker does NOT suppress the audit",
+              any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
         run_raa(head_ok=False)
         check("head race returns to review:needs with NO arm and NO audit",
               ("state:needs" in raa_calls,
@@ -2266,8 +2296,8 @@ def _self_test():
             check("arm failure raises (draft restored path)", "no error", "raised")
         except WorkerPrError:
             check("arm failure raises (draft restored path)", "raised", "raised")
-        check("failed arm never audits",
-              any("trust-surface" in c for c in raa_calls), False)
+        check("the pre-arm audit survives an arm failure (re-review re-audits per sha)",
+              any(TRUST_AUDIT_MARKER_PREFIX in c for c in raa_calls), True)
     finally:
         globals().update(real_raa)
 
