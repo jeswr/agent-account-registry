@@ -255,9 +255,13 @@ def validate_plan(document):
             raise DispatchError(f"{where} pr_number must be a positive integer")
         if not isinstance(item["head_sha"], str) or not SAFE_SHA.fullmatch(item["head_sha"]):
             raise DispatchError(f"{where} head_sha is malformed")
-        if item["state"] not in REVIEW_STATES:
+        # isinstance BEFORE each set membership: an unhashable JSON value ([] / {}) would
+        # TypeError the lookup — malformed plan input must fail as DispatchError, not crash.
+        state = item["state"]
+        if not isinstance(state, str) or state not in REVIEW_STATES:
             raise DispatchError(f"{where} state is invalid")
-        if item["impl_provider"] not in IMPL_PROVIDERS:
+        impl_provider = item["impl_provider"]
+        if not isinstance(impl_provider, str) or impl_provider not in IMPL_PROVIDERS:
             raise DispatchError(f"{where} impl_provider is invalid")
         repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
         if repo not in seen_repositories:
@@ -317,7 +321,8 @@ def validate_plan(document):
         # pr_number 0 is the repo-level worker-PR census-overflow skip (no single PR).
         if not isinstance(number, int) or isinstance(number, bool) or number < 0:
             raise DispatchError(f"{where} pr_number must be a non-negative integer")
-        if item["reason"] not in SNAPSHOT_SKIP_REASONS:
+        reason = item["reason"]
+        if not isinstance(reason, str) or reason not in SNAPSHOT_SKIP_REASONS:
             raise DispatchError(f"{where} reason is invalid")
         repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
         if repo not in seen_repositories:
@@ -597,7 +602,11 @@ def provenance_admission_error(record, pr_number):
         return "provenance record is not a JSON object"
     if record.get("pr_number") != pr_number:
         return "provenance record does not match this PR"
-    if record.get("impl_provider") not in IMPL_PROVIDERS:
+    impl_provider = record.get("impl_provider")
+    # isinstance BEFORE the set membership: an unhashable JSON value ([] / {}) would
+    # TypeError the lookup, and this predicate must REJECT a malformed record, never
+    # raise — a raise here aborts the whole PLAN/groom run instead of parking one orphan.
+    if not isinstance(impl_provider, str) or impl_provider not in IMPL_PROVIDERS:
         return "provenance implementer provider is invalid"
     impl_alias = record.get("impl_alias")
     if not isinstance(impl_alias, str) or not SAFE_ATOM.fullmatch(impl_alias):
@@ -1876,7 +1885,9 @@ def _self_test():
             (lambda d: d["repositories"][0]["items"][0].update(unknown=True), "unknown item field"),
             (lambda d: d["repositories"][0]["items"][0].pop("deferred"), "missing deferred flag"),
             (lambda d: d["review_items"][0].update(state="armed"), "bad review state"),
+            (lambda d: d["review_items"][0].update(state=[]), "unhashable review state"),
             (lambda d: d["review_items"][0].update(impl_provider="other"), "bad impl provider"),
+            (lambda d: d["review_items"][0].update(impl_provider={}), "unhashable impl provider"),
             (lambda d: d["review_items"][0].update(repo="not/planned"), "unplanned review repo"),
             (lambda d: d["review_items"][0].update(head_sha="zz"), "bad review head sha"),
             (lambda d: d.pop("review_items"), "missing review_items"),
@@ -1899,6 +1910,7 @@ def _self_test():
             (lambda d: d.pop("snapshot_skips"), "missing snapshot_skips"),
             (lambda d: d["snapshot_skips"][0].update(unknown=True), "unknown snapshot skip field"),
             (lambda d: d["snapshot_skips"][0].update(reason="because"), "invalid snapshot skip reason"),
+            (lambda d: d["snapshot_skips"][0].update(reason=[]), "unhashable snapshot skip reason"),
             (lambda d: d["snapshot_skips"][0].update(repo="not/planned"), "unplanned snapshot skip repo"),
             (lambda d: d["snapshot_skips"][0].update(pr_number=-1), "negative snapshot skip pr_number"),
             (lambda d: d["snapshot_skips"].append(dict(d["snapshot_skips"][1])),
@@ -2008,6 +2020,16 @@ def _self_test():
     assert _rejected_everywhere({})
     assert _rejected_everywhere({**provenance[41], "pr_number": 40})       # mismatched PR
     assert _rejected_everywhere({**provenance[41], "impl_provider": "mallory"})
+    # UNHASHABLE / wrong-type fields must be REJECTED, never raise: before the
+    # isinstance-before-membership guard, impl_provider=[] / {} raised TypeError out of the
+    # set lookup and aborted the entire PLAN/groom run instead of parking the one orphan.
+    # Reverting that guard makes these assertions RAISE (mutation tripwire), not just fail.
+    assert _rejected_everywhere({**provenance[41], "impl_provider": []})
+    assert _rejected_everywhere({**provenance[41], "impl_provider": {}})
+    assert _rejected_everywhere({**provenance[41], "impl_provider": 5})
+    assert _rejected_everywhere({**provenance[41], "issue": []})
+    assert _rejected_everywhere({**provenance[41], "head_sha_at_open": {}})
+    assert _rejected_everywhere({**provenance[41], "impl_account_h": []})
     assert _rejected_everywhere({**provenance[41], "head_sha_at_open": "not-a-sha"})
     assert _rejected_everywhere({**provenance[41], "impl_account_h": "raw-handle@example"})
     assert _rejected_everywhere(
@@ -2031,6 +2053,8 @@ def _self_test():
         == "provenance implementer alias is invalid"
     assert provenance_admission_error({**provenance[41], "issue": True}, 41) \
         == "provenance issue number is invalid"
+    assert provenance_admission_error({**provenance[41], "impl_provider": []}, 41) \
+        == "provenance implementer provider is invalid"
 
     # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
     runs = [

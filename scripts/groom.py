@@ -1373,6 +1373,14 @@ def _self_test() -> int:
         for field, bad_value in (
             ("pr_number", 98),  # points at a different target PR
             ("impl_provider", "mallory"),  # unregistered provider
+            # UNHASHABLE / wrong-type fields must park, never raise: before the predicate's
+            # isinstance-before-membership guard, [] / {} here raised TypeError out of the
+            # provider set lookup and aborted the whole groom run instead of parking one
+            # orphan. Reverting that guard makes these cases RAISE (mutation tripwire).
+            ("impl_provider", []),  # unhashable list
+            ("impl_provider", {}),  # unhashable object
+            ("issue", []),  # wrong-type (list) issue number
+            ("head_sha_at_open", {}),  # wrong-type (object) opened-head sha
             ("head_sha_at_open", "not-a-sha"),  # malformed opened-head sha
             ("impl_account_h", "raw-handle@x"),  # not the salted 16-hex hash (decision 22a)
             # Round-3 finding: review-fix.yml's resolve rejects these two, so a draft carrying
