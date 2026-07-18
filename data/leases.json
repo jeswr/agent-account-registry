@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct01",
-   "claim_id": "dbbaeb96145146dc8a3f085e0bc3ca4f",
-   "holder": "review:sparq-org/sparq#2473@dispatch-29622902023.1",
-   "package": "sparq-engine",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784334230,
-   "expires_at": 1784335430
-  },
-  {
-   "account": "acct01",
    "claim_id": "61439cecc4e346e5b1f477988656542c",
    "holder": "review:sparq-org/sparq#2494@dispatch-29622902023.1",
    "package": "sparq-introspect",
