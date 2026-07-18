@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The script deliberately continues after provisioning, build, and per-cut failures, but unconditionally writes gather-meta.json with canonical=true, logs 'gather complete', and touches /root/GATHER_DONE. Consequently a run where pyserini cannot import, sparq-text cannot build, or all cuts fail is indistinguishable at the launcher protocol level from a successful canonical gather. The launcher observes the sentinel and reports completion, so the promised honest NOT-RUN state is not machine-enforced and an empty/partial result can be treated as a completed canonical run.",
+   "file": "scripts/bench/canonical-beir-gather-instance.sh",
+   "fix_hint": "Track required outcomes per requested cut (and both engines if the comparison requires both). Emit GATHER_DONE only after validating the expected envelopes and their JSON payloads. On partial/failure, write a distinct failure sentinel/status metadata with canonical=false and exit nonzero; teach the launcher to surface that state without losing logs/results. Add a shell-level test covering total failure and partial output.",
+   "severity": "major",
+   "title": "Failed or empty gathers still emit the success sentinel"
+  },
+  {
+   "body": "The instance prints markers as '===ENVELOPE-BEGIN <basename>===' with no space before the closing marker. The recovery awk assigns name=$2 verbatim, so it creates '<basename>===' rather than '<basename>'. Recovered JSON files therefore do not end in .json, are omitted by the launcher's later *.json listing, and do not match the documented competitor-results envelope paths. This breaks the advertised authoritative recovery channel precisely when SSH is unavailable.",
+   "file": "scripts/bench/canonical-beir-bench.sh",
+   "fix_hint": "Use an unambiguous marker format and strip/parse the closing delimiter before constructing the path (while also rejecting slashes and unexpected names). Add a fixture test that feeds one emitted marker block through the extractor and asserts the exact filename and valid JSON content.",
+   "severity": "major",
+   "title": "Console recovery appends === to recovered envelope names"
+  }
+ ],
+ "progress": null,
+ "summary": "The gather's primary execution path is plausible and both new shell files parse, but the canonical completion signal is currently emitted even when provisioning, building, or every requested cut fails. That can label a failed/empty run as canonical and cause the launcher to report normal completion. The advertised console recovery path also corrupts every recovered envelope filename by retaining the marker suffix. These defects undermine the harness's fail-honest and recovery guarantees.",
+ "verdict": "request_changes"
+}
