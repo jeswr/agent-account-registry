@@ -51,16 +51,6 @@
    "expires_at": 1784348239
   },
   {
-   "account": "acct04",
-   "claim_id": "5fc10ea7c12c4f6faa8a0eb6438db13a",
-   "holder": "sparq-org/sparq#3404@dispatch-29627125828.1",
-   "package": "sparq-sim",
-   "role": "perf",
-   "model": "fable",
-   "issued_at": 1784341956,
-   "expires_at": 1784348256
-  },
-  {
    "account": "acct03",
    "claim_id": "f4ef4abcc2e7459295cdecc948f6072b",
    "holder": "sparq-org/sparq#2562@dispatch-29627222478.1",
