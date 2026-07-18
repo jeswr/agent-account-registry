@@ -160,10 +160,13 @@ jobs:
           handle = os.environ["NEW_HANDLE"]
           accounts = {a["handle"]: a for a in module.read_accounts(os.environ["GITHUB_REPOSITORY"])}
           account = accounts.get(handle)
+          # Privacy (locked rule; r8 audit): this log is public — never print the raw
+          # handle. The operator who dispatched this run knows which account it enrolled.
           if account is None or not account.get("models"):
               raise SystemExit(
-                  f"registration validation FAILED: {handle} is invisible to read_accounts "
-                  "(missing or empty models line) — the allocator could never select it")
+                  "registration validation FAILED: the enrolled account is invisible to "
+                  "read_accounts (missing or empty models line) — the allocator could "
+                  "never select it")
           # Catalog coverage (sol review r5 finding 2): the registered aliases must cover the
           # provider's FULL catalog set, or the account silently starves every chain tier it
           # omits (the allocator matches aliases literally).
@@ -172,10 +175,10 @@ jobs:
           required = set(module.enrollment_models(account.get("provider", ""), routing))
           if not required <= set(account["models"]):
               raise SystemExit(
-                  f"registration validation FAILED: {handle} models={account['models']} does "
-                  f"not cover the catalog set {sorted(required)} — the review/fix chains "
-                  "could starve on this account")
-          print(f"registration validated: {handle} models={account['models']}")
+                  f"registration validation FAILED: the enrolled account's "
+                  f"models={account['models']} do not cover the catalog set "
+                  f"{sorted(required)} — the review/fix chains could starve on this account")
+          print(f"registration validated: models={account['models']}")
           PY
 
       # SEAM(#325): the account-pool list is slated to move to a PRIVATE location; until then

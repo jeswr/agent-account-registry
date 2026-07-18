@@ -464,6 +464,37 @@ def decide_repair_admission(state, mergeable, gate, draft):
     return ("proceed", kind)
 
 
+def review_changes_recovery(authors, head_sha, rounds, head_attributable):
+    """PURE crash-window triage for a review:changes (needs-fix) head (sol review r7
+    finding 3). The fix flow's durable ordering is push -> sha-bound author marker ->
+    review:needs label flip, so a crash leaves the PR stuck in review:changes in one of two
+    windows, and blindly redispatching a fixer is wrong in both:
+
+    - "reconcile": the LIVE head carries an exact-SHA successful-push author marker for the
+      CURRENT round — the round's fix already pushed and only the review:needs flip crashed.
+      The caller flips the label (idempotent, converging); dispatching another fixer would
+      burn a round re-fixing an already-fixed head. A marker for an EARLIER round bound to
+      the same sha does NOT reconcile: that is the normal posture after a re-review demanded
+      further changes on an unchanged head.
+    - "escalate": the head advanced but NO marker binds it and it is not a proven merge-only
+      carry-forward (`head_attributable` False — the caller's content_author_alias probe
+      raised). Every review-fix resolve rejects exactly this head fail-closed, so each
+      redispatched fixer dies at resolve and the loop spins forever; a human must attribute
+      or reset the head.
+    - "dispatch": the normal fixer dispatch (round-1 changes on the opened head, or a
+      re-review that demanded more changes).
+
+    Escalate is checked FIRST: an unattributable head with a current-round marker match can
+    only mean conflicting author markers for one sha (corrupt/forged marker data) — flipping
+    that to review:needs would just re-fail at the review's own author derivation."""
+    if not head_attributable:
+        return "escalate"
+    if any(marked_round == rounds and marked_sha == head_sha
+           for marked_round, _model, marked_sha in authors):
+        return "reconcile"
+    return "dispatch"
+
+
 def stranded_live(draft, armed, reviewed_match, mergeable, gate):
     """PURE live re-derivation of the stranded posture: a DRAFTED, UNARMED PR whose current head
     equals its reviewed-sha marker on a cleanly-mergeable base with a concluded-GREEN gate. The
@@ -1228,6 +1259,52 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             impl_provider = record["impl_provider"]
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
+            if item["state"] == "needs-fix":
+                # Fix-push crash-window triage BEFORE the budget block and any fixer dispatch
+                # (sol review r7 finding 3). The fix flow's durable ordering is push ->
+                # sha-bound author marker -> review:needs flip, so a crash in either gap
+                # strands the PR in review:changes where this sweep would otherwise
+                # redispatch fixers forever:
+                # - an exact-SHA author marker for the CURRENT round means the round's fix
+                #   already pushed and only the label flip crashed -> reconcile to
+                #   review:needs so the pushed head gets its re-review. This must precede
+                #   decide_budget: at exhaustion the review:changes state passes no
+                #   pending_fix, so the budget would needs-user and ORPHAN the pushed
+                #   (possibly top-tier) fix the extend-pending-review mechanism exists for.
+                # - an advanced head NO marker binds (and no merge-only carry-forward
+                #   proves) is exactly what every review-fix resolve rejects fail-closed —
+                #   head_attributable mirrors that resolve probe — so each redispatched
+                #   fixer would die at resolve; escalate to a human instead.
+                authors = worker_pr.fix_push_authors(comments, bot_login)
+                base_ref = str((pull.get("base") or {}).get("ref") or "")
+                try:
+                    worker_pr.content_author_alias(
+                        authors, head_sha, opened_sha,
+                        carry_forward=lambda marked_sha: bool(base_ref)
+                        and worker_pr._merge_only_carry_forward(repo, head_sha, marked_sha,
+                                                                base_ref))
+                    head_attributable = True
+                except worker_pr.WorkerPrError:
+                    head_attributable = False
+                recovery = review_changes_recovery(authors, head_sha, rounds,
+                                                   head_attributable)
+                if recovery == "reconcile":
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
+                        "review-state", "set", "--repo", repo, "--pr", str(number),
+                        "--state", "needs"])
+                    print(f"reconciled {repo}#{number}: round {rounds} fix already pushed "
+                          "this head (sha-exact author marker); flipped to review:needs "
+                          "for its re-review")
+                    continue
+                if recovery == "escalate":
+                    _pr_needs_user(script_dir, repo, number, issue_number,
+                                   "the review:changes head advanced past every recorded "
+                                   "push with no sha-bound author marker (a fix push whose "
+                                   "outcome recording crashed, or an out-of-band push); "
+                                   "every fix resolve rejects this head fail-closed, so "
+                                   "redispatching cannot converge — a human must attribute "
+                                   "the content or reset the branch")
+                    continue
             # Route-constrained fix ladder (sol audit 2026-07-18, hardened by sol review r3
             # finding 2): the ORIGINAL constraint is the provenance record's route_constraint
             # — persisted at publication, immutable — intersected with the unified ladder AND
@@ -2439,6 +2516,23 @@ def _self_test():
     for live_gate in ("failure", "pending", "missing", "unknown"):
         assert stranded_live(True, False, True, True, live_gate) is False
 
+    # ---- review_changes_recovery: fix-push crash-window triage (sol review r7 finding 3) —
+    # push -> sha-bound author marker -> review:needs flip, a crash in either gap must not
+    # respin fixers ----
+    marked = [(3, "opus", "1" * 40)]
+    # window B: the CURRENT round's marker binds the live head (label flip crashed)
+    assert review_changes_recovery(marked, "1" * 40, 3, True) == "reconcile"
+    # an EARLIER round's marker on the same head: normal re-review-demanded-changes posture
+    assert review_changes_recovery(marked, "1" * 40, 4, True) == "dispatch"
+    # round-1 changes on the opened head (no markers, implementer-attributable)
+    assert review_changes_recovery([], "1" * 40, 1, True) == "dispatch"
+    # window A: advanced head no marker binds and no carry-forward proves
+    assert review_changes_recovery([], "2" * 40, 3, False) == "escalate"
+    assert review_changes_recovery(marked, "2" * 40, 3, False) == "escalate"
+    # conflicting markers for one sha (unattributable even with a round match) escalate —
+    # reconciling would only re-fail at the review's own author derivation
+    assert review_changes_recovery(marked, "1" * 40, 3, False) == "escalate"
+
     # ---- _dispatch_review_items wiring (defect-1/2 regression, monkeypatched I/O): the
     # non-draft defuse is reachable ONLY through a live-confirmed trigger, and a human-parked
     # source issue blocks repair admission before any mutation ----
@@ -2911,6 +3005,68 @@ def _self_test():
             assert alloc.chains == [["sol", "luna"]], alloc.chains
             wiring_worker_pr._merge_only_carry_forward = real_carry
             ledger_record.write_text(json.dumps(provenance[41]), encoding="utf-8")
+
+            # ---- fix-push crash-window recovery on review:changes (sol review r7 f3) ----
+            # window B: crash AFTER the sha-bound author marker, BEFORE the review:needs
+            # flip — the CURRENT round's marker binds the live head, so CLAIM reconciles the
+            # label to review:needs (no fixer dispatch, no round burned). The rounds are at
+            # the base budget on purpose: the reconcile must PRECEDE decide_budget, whose
+            # review:changes arm sees no pending fix and would otherwise pin/park and orphan
+            # the pushed fix.
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->"),
+                bot_comment(f"a {fix_author} round=3 model=opus sha={sha_a} run=3.9 -->")]
+            write_verdict(3, "improving", root=wiring_ledger_root)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "review-state")], helper_calls
+            reconcile_args = helper_calls[0][1]
+            assert reconcile_args[reconcile_args.index("--state") + 1] == "needs", \
+                reconcile_args
+            assert alloc.chains == [], alloc.chains
+            # an EARLIER round's marker on the same head is the normal posture after a
+            # re-review demanded further changes: the fixer dispatch proceeds
+            fake["comments"] = round_markers(2) + [
+                bot_comment(f"a {fix_author} round=1 model=opus sha={sha_a} run=1.9 -->")]
+            write_verdict(2, None, root=wiring_ledger_root)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus", "luna", "fable", "sol"]], alloc.chains
+            # window A: crash AFTER the push, BEFORE the author marker — the head advanced
+            # past every recorded push, no marker binds it, the carry-forward probe (run
+            # against the OPENED sha + the actual base ref) disproves: every fix resolve
+            # would reject this head fail-closed, so CLAIM escalates instead of respinning
+            # fixers forever
+            advanced_pull = live_pull(draft=True, labels=["review:changes"])
+            advanced_pull["head"]["sha"] = sha_b
+            advanced_item = dict(fix_item, head_sha=sha_b)
+            fake.update(pull=advanced_pull)
+            fake["comments"] = round_markers(2)
+            write_verdict(2, None, root=wiring_ledger_root)
+            real_carry = wiring_worker_pr._merge_only_carry_forward
+            probe_calls = []
+            wiring_worker_pr._merge_only_carry_forward = (
+                lambda *args: probe_calls.append(args) or False)
+            alloc = FakeAllocator()
+            run_items([advanced_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+            assert probe_calls == [(repo, sha_b, sha_a, "main")], probe_calls
+            # a PROVEN merge-only, content-identical advance of the opened sha is NOT the
+            # crash window (the implementer still owns the content): dispatch proceeds
+            wiring_worker_pr._merge_only_carry_forward = lambda *args: True
+            alloc = FakeAllocator()
+            run_items([advanced_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus", "luna", "fable", "sol"]], alloc.chains
+            wiring_worker_pr._merge_only_carry_forward = real_carry
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
 
             # ---- claim-layer guard is CONTENT-keyed (sol audit; previously unreachable —
             # the deferring allocator never returned a claim) ----

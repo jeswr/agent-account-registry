@@ -68,6 +68,36 @@ class PolicyError(ValueError):
     """A fail-closed policy or routing error suitable for a concise CLI diagnostic."""
 
 
+# Maintainer rule 2026-07-18 (sol review r7 finding 4): the cheap tiers sonnet/terra author
+# NOTHING but docs. route-resolve.py enforces this at PLAN resolution; THIS resolver is the
+# other real execution path (worker resolution + dispatch CLAIM revalidation), so the same
+# structural rule must hold here or the machine policy is bypassable. Keep the set and the
+# rule in lockstep with route-resolve.validate_routing (parity-tested in --self-test).
+DOCS_ONLY_MODELS = frozenset({"sonnet", "terra"})
+
+
+def _reject_docs_only_misuse(defaults, routes):
+    """Raise unless sonnet/terra appear ONLY in the model_chain of a role == "docs" route —
+    never in [defaults], a match_labels security rule, or any other role's chain."""
+    offenders = []
+    if DOCS_ONLY_MODELS & set(defaults.get("model_chain") or []):
+        offenders.append("defaults")
+    for route in routes:
+        chain = route.get("model_chain") or [] if isinstance(route, dict) else []
+        # Only a PURE docs role row is exempt (kept semantically identical to
+        # route-resolve.validate_routing): a dual-key row carrying match_labels too is
+        # structurally rejected earlier here, but the predicate must not drift — in
+        # route-resolve such a row EXECUTES as a security rule (r8 audit).
+        is_pure_docs_role = route.get("role") == "docs" and "match_labels" not in route
+        if DOCS_ONLY_MODELS & set(chain) and not is_pure_docs_role:
+            offenders.append(str(route.get("role")
+                                 or ",".join(route.get("match_labels") or [])
+                                 or "<unnamed>"))
+    if offenders:
+        raise PolicyError("routing violates the docs-only rule for sonnet/terra (maintainer "
+                          "2026-07-18) in: " + "; ".join(offenders))
+
+
 def _positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
@@ -215,6 +245,7 @@ def _validated_routing(routing_doc):
             if role in role_routes:
                 raise PolicyError(f"routing has duplicate role {role!r}")
             role_routes[role] = value
+    _reject_docs_only_misuse(defaults, routes)
     return default_value, security_routes, role_routes
 
 
@@ -430,6 +461,73 @@ agent = "docs-agent"
             lambda: resolve("sparq-org/sparq", "impl", policy, bad_routing))
     check("pure core leaves fixtures unchanged",
           policy == policy_before and routing == routing_before, True)
+
+    # ---- docs-only sonnet/terra: PARITY with route-resolve.py (sol review r7 finding 4) ----
+    # Both resolvers guard REAL execution paths (route-resolve at PLAN, this resolver at worker
+    # resolution + dispatch CLAIM revalidation); a table one rejects and the other accepts is a
+    # policy bypass. Each violating fixture must be rejected by BOTH, the docs-role placement
+    # accepted by BOTH. PolicyError subclasses ValueError, matching route-resolve's raise type.
+    import importlib.util
+    rr_spec = importlib.util.spec_from_file_location(
+        "registry_route_resolve", Path(__file__).resolve().parent / "route-resolve.py")
+    route_resolve = importlib.util.module_from_spec(rr_spec)
+    rr_spec.loader.exec_module(route_resolve)
+
+    def docs_violation_rejected(doc):
+        """(policy-resolve rejects, route-resolve rejects) for one routing table."""
+        outcomes = []
+        for probe in (lambda: _validated_routing(doc),
+                      lambda: route_resolve.validate_routing(doc)):
+            try:
+                probe()
+                outcomes.append(False)
+            except ValueError as exc:
+                outcomes.append("docs-only" in str(exc))
+        return tuple(outcomes)
+
+    def docs_fixture(**overrides):
+        base = {"models": {"haiku": {}, "sonnet": {}, "terra": {}, "opus": {}, "fable": {}},
+                "defaults": {"model_chain": ["fable"], "agent": "a"},
+                "route": [{"role": "docs", "model_chain": ["haiku", "sonnet"], "agent": "a"}]}
+        return {**base, **overrides}
+
+    check("sonnet in defaults rejected by BOTH resolvers",
+          docs_violation_rejected(docs_fixture(
+              defaults={"model_chain": ["fable", "sonnet"], "agent": "a"})), (True, True))
+    check("terra in a non-docs role chain rejected by BOTH resolvers",
+          docs_violation_rejected(docs_fixture(route=[
+              {"role": "impl", "model_chain": ["fable", "terra"], "agent": "a"}])),
+          (True, True))
+    check("sonnet in a match_labels security rule rejected by BOTH resolvers",
+          docs_violation_rejected(docs_fixture(route=[
+              {"match_labels": ["zk"], "model_chain": ["sonnet"], "agent": "a"}])),
+          (True, True))
+    check("sonnet/terra in the docs role accepted by BOTH resolvers",
+          docs_violation_rejected(docs_fixture(route=[
+              {"role": "docs", "model_chain": ["haiku", "sonnet", "terra"], "agent": "a"}])),
+          (False, False))
+    # A DUAL-KEY row (match_labels + role="docs") must be rejected by BOTH: this resolver
+    # rejects it structurally (exactly-one-of), route-resolve via the docs-only rule — in
+    # route-resolve such a row EXECUTES as a security match rule, so exempting it on its
+    # role key would smuggle sonnet into a trust-surface rule (r8 audit).
+    def dual_key_rejected(doc):
+        outcomes = []
+        for probe in (lambda: _validated_routing(doc),
+                      lambda: route_resolve.validate_routing(doc)):
+            try:
+                probe()
+                outcomes.append(False)
+            except ValueError:
+                outcomes.append(True)
+        return tuple(outcomes)
+
+    check("dual-key docs/match_labels smuggle rejected by BOTH resolvers",
+          dual_key_rejected(docs_fixture(route=[
+              {"match_labels": ["worker"], "role": "docs", "model_chain": ["sonnet"],
+               "agent": "a"}])), (True, True))
+    rejects("this resolver's own resolve() path enforces docs-only", "docs-only",
+            lambda: resolve("o/r", "impl", review_over, docs_fixture(
+                defaults={"model_chain": ["terra"], "agent": "a"})))
     print("policy-resolve self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

@@ -28,7 +28,12 @@ def validate_routing(doc):
     if docs_only & set(doc.get("defaults", {}).get("model_chain", [])):
         offenders.append("defaults")
     for r in doc.get("route", []):
-        if docs_only & set(r.get("model_chain", [])) and r.get("role") != "docs":
+        # Only a PURE docs role row is exempt. A dual-key row carrying match_labels TOO is
+        # executed by resolve() as a security rule (match_labels wins in-row), so exempting
+        # it on its `role` key would let `role = "docs"` smuggle sonnet/terra into a
+        # trust-surface match rule (r8 audit).
+        is_pure_docs_role = r.get("role") == "docs" and "match_labels" not in r
+        if docs_only & set(r.get("model_chain", [])) and not is_pure_docs_role:
             offenders.append(r.get("role") or ",".join(r.get("match_labels", [])) or "<unnamed>")
     if offenders:
         raise ValueError("routing violates the docs-only rule for sonnet/terra (maintainer "
@@ -91,7 +96,8 @@ def _self_test():
     chk("review -> opus/escalate", resolve(["role:review"], doc)[1:], ("registry-reviewer", True))
     # sonnet-docs-only (maintainer 2026-07-18): the shipped table must carry sonnet in no
     # non-docs chain, and a violating table must be REJECTED at resolve time.
-    non_docs = [r for r in doc.get("route", []) if r.get("role") != "docs"]
+    non_docs = [r for r in doc.get("route", [])
+                if r.get("role") != "docs" or "match_labels" in r]
     chk("sonnet/terra absent from all non-docs chains",
         [bool({"sonnet", "terra"} & set(r.get("model_chain", []))) for r in non_docs].count(True)
         + bool({"sonnet", "terra"} & set(doc.get("defaults", {}).get("model_chain", []))), 0)
@@ -100,6 +106,17 @@ def _self_test():
         chk("violating table rejected", "no error", "ValueError")
     except ValueError:
         chk("violating table rejected", "ValueError", "ValueError")
+    # A DUAL-KEY row (match_labels + role="docs") is executed as a security match rule, so
+    # the docs exemption must not apply to it (r8 audit: `role = "docs"` must not smuggle
+    # sonnet into a trust-surface rule).
+    try:
+        resolve(["area:worker"], {
+            "defaults": {"model_chain": ["fable"], "agent": "x"},
+            "route": [{"match_labels": ["worker"], "role": "docs",
+                       "model_chain": ["sonnet"], "agent": "x"}]})
+        chk("dual-key docs/match_labels smuggle rejected", "no error", "ValueError")
+    except ValueError:
+        chk("dual-key docs/match_labels smuggle rejected", "ValueError", "ValueError")
     print("route-resolve self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

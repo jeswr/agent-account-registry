@@ -433,12 +433,23 @@ def migrate_account_models(repo, routing):
     sol/luna review chain and the unified fix ladder. Idempotent (a migrated record no longer
     matches its legacy shape); operator-edited and unparseable records are logged and left
     alone. Every rewritten body is re-validated through the REAL _parse_account parser before
-    the PATCH; a write or validation failure raises (loud, fail closed)."""
+    the PATCH; a write or validation failure raises (loud, fail closed).
+
+    Log/error lines identify a record ONLY by its issue number (sol review r7 finding 1: the
+    registry's workflow logs are public and must never carry a raw account handle). The PATCH
+    is guarded by a LIVE equality re-read of the issue body (r7 finding 2): the rewrite was
+    derived from the LISTING snapshot, and issues have no CAS PATCH — if the live body no
+    longer equals that snapshot a concurrent operator edit landed, and overwriting it would
+    fight the operator. Such a record is skipped; the idempotent sweep re-examines it (and
+    its fresh body) on the next run."""
     out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
                 "--json", "number,title,body,labels"]).stdout
     migrated = 0
     for it in json.loads(out or "[]"):
+        number = it.get("number")
         handle = str(it.get("title", "")).strip()
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
         if not ACCOUNT_HANDLE_RE.fullmatch(handle):
             continue
         labels = {str(lb.get("name", "")) for lb in it.get("labels", [])
@@ -450,26 +461,41 @@ def migrate_account_models(repo, routing):
         providers = {p for p in label_providers | {body_provider} if p}
         if len(providers) != 1 or not providers <= set(LEGACY_ENROLLMENT_MODELS):
             # Ambiguous/unknown provider identity: never guess which alias set applies.
-            print(f"skip {handle}: ambiguous or unknown provider {sorted(providers)}")
+            print(f"skip account #{number}: ambiguous or unknown provider {sorted(providers)}")
             continue
         provider = next(iter(providers))
         required = enrollment_models(provider, routing)
         new_body, reason = migrate_models_line(
             body, LEGACY_ENROLLMENT_MODELS[provider], required)
         if new_body is None:
-            print(f"skip {handle}: {reason}")
+            print(f"skip account #{number}: {reason}")
             continue
         if set(_parse_account(new_body)["models"]) != set(required):
-            raise LeaseIOError(f"migrated body for {handle} does not re-parse to the "
-                               "catalog alias set; refusing to write")
+            raise LeaseIOError(f"migrated body for account #{number} does not re-parse to "
+                               "the catalog alias set; refusing to write")
+        live = subprocess.run(
+            ["gh", "api", f"repos/{repo}/issues/{number}"],
+            capture_output=True, text=True, check=False)
+        if live.returncode != 0:
+            raise LeaseIOError(f"live re-read of account #{number} failed before the "
+                               "migration PATCH (fail closed)")
+        try:
+            live_body = json.loads(live.stdout).get("body") or ""
+        except (AttributeError, json.JSONDecodeError) as exc:
+            raise LeaseIOError(f"live re-read of account #{number} returned a malformed "
+                               "record (fail closed)") from exc
+        if live_body != body:
+            print(f"skip account #{number}: body changed since the listing (concurrent "
+                  "edit); the next sweep re-examines the fresh body")
+            continue
         result = subprocess.run(
-            ["gh", "api", "-X", "PATCH", f"repos/{repo}/issues/{it['number']}",
+            ["gh", "api", "-X", "PATCH", f"repos/{repo}/issues/{number}",
              "--input", "-"],
             input=json.dumps({"body": new_body}), capture_output=True, text=True,
             check=False)
         if result.returncode != 0:
-            raise LeaseIOError(f"account-record body PATCH failed for {handle}")
-        print(f"migrated {handle}: models -> [{', '.join(required)}]")
+            raise LeaseIOError(f"account-record body PATCH failed for account #{number}")
+        print(f"migrated account #{number}: models -> [{', '.join(required)}]")
         migrated += 1
     return migrated
 
@@ -1013,6 +1039,7 @@ def _self_test():
          "labels": [{"name": "provider:openai"}]},
     ]
     patches = []
+    live_bodies = {it["number"]: it["body"] for it in issues}
     real_run, real_sub_run = _run, subprocess.run
 
     def fake_run(args):
@@ -1021,17 +1048,23 @@ def _self_test():
         return _R()
 
     def fake_sub_run(args, **kwargs):
-        patches.append((args, kwargs.get("input")))
-
         class _R:
             returncode = 0
             stdout = stderr = ""
+        if "-X" in args:
+            patches.append((args, kwargs.get("input")))
+        else:  # the pre-PATCH live equality re-read (GET repos/<repo>/issues/<n>)
+            _R.stdout = json.dumps({"body": live_bodies[int(args[2].rsplit("/", 1)[1])]})
         return _R()
 
+    import contextlib
+    import io
+    sweep_log = io.StringIO()
     try:
         globals()["_run"] = fake_run
         subprocess.run = fake_sub_run
-        migrated_count = migrate_account_models("reg/repo", catalog)
+        with contextlib.redirect_stdout(sweep_log):
+            migrated_count = migrate_account_models("reg/repo", catalog)
     finally:
         globals()["_run"] = real_run
         subprocess.run = real_sub_run
@@ -1041,6 +1074,31 @@ def _self_test():
     check("the PATCHed body carries the catalog set",
           _parse_account(json.loads(patches[0][1])["body"])["models"],
           ["terra", "sol", "luna"])
+    # Privacy (sol review r7 finding 1): the sweep's public-workflow log lines carry NO raw
+    # account handle on any migrate/skip path — records are identified by issue number only.
+    check("migration log carries no raw account handle",
+          any(handle in sweep_log.getvalue()
+              for handle in ("acct01", "acct02", "acct03", "acct04")), False)
+    check("migration log identifies records by issue number",
+          "migrated account #1:" in sweep_log.getvalue(), True)
+    # Concurrent-edit race (sol review r7 finding 2): an operator edit landing between the
+    # LISTING and the PATCH changes the live body — the sweep must skip (never overwrite the
+    # operator), and the next sweep re-examines the fresh body.
+    patches.clear()
+    live_bodies[1] = legacy_body.replace("[terra]", "[terra, sol]")  # operator edit mid-sweep
+    race_log = io.StringIO()
+    try:
+        globals()["_run"] = fake_run
+        subprocess.run = fake_sub_run
+        with contextlib.redirect_stdout(race_log):
+            raced_count = migrate_account_models("reg/repo", catalog)
+    finally:
+        globals()["_run"] = real_run
+        subprocess.run = real_sub_run
+    check("a concurrent operator edit is never overwritten (no PATCH)",
+          (raced_count, patches), (0, []))
+    check("the raced record is skipped loudly for the next sweep",
+          "skip account #1: body changed since the listing" in race_log.getvalue(), True)
 
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

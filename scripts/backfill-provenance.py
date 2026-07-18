@@ -42,6 +42,13 @@ CLAIM_LINE_RE = re.compile(
     r"(?mi)^[^\t]*claim[^\t]*\t[^\t]*\t\S+\s+"
     r"(?:lease claimed|dispatcher lease adopted): account=(acct[0-9a-z]{2,}), "
     r"model=([A-Za-z0-9][A-Za-z0-9_.-]*)")
+# The resolve step's `policy resolved: models=<chain>` line — the DISPATCH-TIME route
+# resolution, printed by the workflow's own step before any model container runs. This is the
+# trusted original route for the record's immutable route_constraint (sol review r7 finding 5:
+# the source issue's CURRENT labels must never be captured as the original — a since-removed
+# trust label would widen a historically opus-only PR to the default ladder).
+CHAIN_LINE_RE = re.compile(
+    r"policy resolved: models=([A-Za-z0-9][A-Za-z0-9_.-]*(?:,[A-Za-z0-9][A-Za-z0-9_.-]*)*)")
 
 
 class BackfillError(RuntimeError):
@@ -181,6 +188,37 @@ def flatten_pull_pages(pages):
                 return None
             pulls.append(pull)
     return pulls
+
+
+def chain_from_log(log_text):
+    """The dispatch-time resolved model chain from a worker run log, or None. FIRST match wins
+    (same trust argument as claim_from_log: the genuine line is printed by the resolve step
+    before the model container runs, so a forged line in later model output can never shadow
+    it)."""
+    match = CHAIN_LINE_RE.search(log_text or "")
+    return match.group(1).split(",") if match else None
+
+
+def original_route_constraint(log_text, alias, routing):
+    """(route_constraint, provenance_note) for the immutable record field, from TRUSTED run
+    data only (sol review r7 finding 5 — never from the source issue's mutable current labels):
+    - the run log's dispatch-time `policy resolved: models=` chain when it is present, names
+      the implementing alias (the allocator only assigns chain members), AND every member is
+      a catalog alias with a known provider. The membership checks are load-bearing: the log
+      search is unanchored over the whole run log, so model-container output can carry a
+      forged or handle-shaped line — an unvalidated chain would flow raw `acct…` tokens into
+      this workflow's public log and the immutable public record, or let a hostile model
+      dictate a WIDER constraint than the fallback. Else
+    - constraint-unknown, failing NARROWER: [alias] — the implementing alias is provably a
+      member of the original chain, so every later fix-ladder intersection can only be a
+      SUBSET of what the true original would allow, never a widening. (A narrowed alias the
+      unified ladder does not carry fails the ladder intersection closed, to a human.)"""
+    chain = chain_from_log(log_text)
+    if (chain is not None and alias in chain
+            and all(provider_of(member, routing) is not None for member in chain)):
+        return chain, "dispatch-time resolved chain from the worker run log"
+    return [alias], ("constraint-unknown; narrowed to the implementing alias (the run log "
+                     "has no trustworthy resolved-chain line)")
 
 
 def provider_of(alias, routing):
@@ -342,25 +380,18 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
             print(f"skip #{number}: first commit sha is malformed")
             continue
 
-        # Reconstruct the route constraint for the record (sol review r3 finding 2 made it a
-        # REQUIRED field): the best available original is the SOURCE issue's current labels
-        # resolved through the routing table — for this pre-migration population the labels
-        # predate the record, so this is the closest attestable original. An unresolvable
-        # route (unknown/ambiguous role, empty chain) stays fail-closed invisible for a human.
-        try:
-            issue_data = _gh_json(["api", f"repos/{target_repo}/issues/{issue}"])
-            issue_labels = {label.get("name")
-                            for label in (issue_data.get("labels") or [])
-                            if isinstance(label, dict)}
-            route_constraint = worker_pr.route_fix_constraint(issue_labels, routing)
-        except (worker_pr.WorkerPrError, BackfillError, AttributeError):
-            route_constraint = []
-        if not route_constraint:
-            needs_human += 1
-            print(f"NEEDS-HUMAN #{number}: the route constraint for issue #{issue} is "
-                  "unresolvable from its labels; record provenance manually after a human "
-                  "establishes the original route")
-            continue
+        # Reconstruct the IMMUTABLE route constraint (a REQUIRED field, sol review r3
+        # finding 2) from TRUSTED run data only — the same worker run log the identity came
+        # from. The source issue's CURRENT labels are deliberately never consulted (sol
+        # review r7 finding 5): labels are mutable, so a since-removed trust label would let
+        # this backfill capture a WIDER-than-original chain as the immutable original —
+        # exactly the weakening route_constraint exists to prevent. When the log carries no
+        # trustworthy resolved chain the constraint falls back NARROWER, to the implementing
+        # alias alone (provably a member of the original chain).
+        route_constraint, constraint_note = original_route_constraint(log.stdout, alias,
+                                                                      routing)
+        print(f"#{number}: route constraint = {','.join(route_constraint)} "
+              f"({constraint_note})")
 
         impl_account_h = worker_pr.account_hash(account, salt)
         if apply_changes:
@@ -481,22 +512,46 @@ def _self_test():
     check("non-dict pull fails closed", flatten_pull_pages([[1]]), None)
     check("empty slurp is an empty list", flatten_pull_pages([]), [])
     check("forged worker-job lines alone resolve nothing", ident(forged), None)
-    # route_constraint is a REQUIRED provenance field (sol review r3 finding 2): the backfill
-    # reconstructs it via worker-pr's shared resolver, and an unresolvable route (e.g. an
-    # unknown role) stays fail-closed for a human — never a guessed/defaulted constraint.
-    worker_pr = _load_worker_pr()
-    check("route constraint derives via the shared resolver",
-          worker_pr.route_fix_constraint(
-              {"role:docs"},
-              {"route": [{"role": "docs", "model_chain": ["haiku", "sonnet"]}]}),
-          ["haiku", "sonnet"])
-    try:
-        worker_pr.route_fix_constraint(
-            {"role:mystery"}, {"defaults": {"model_chain": ["fable"]}})
-    except worker_pr.WorkerPrError:
-        check("unknown role stays fail-closed for a human", "rejected", "rejected")
-    else:
-        check("unknown role stays fail-closed for a human", "accepted", "rejected")
+    # route_constraint is a REQUIRED provenance field (sol review r3 finding 2), reconstructed
+    # from TRUSTED run data ONLY (sol review r7 finding 5): original_route_constraint takes
+    # nothing but the run log and the claimed alias, so the source issue's mutable current
+    # labels CANNOT influence the recorded original by construction.
+    chain_routing = {"models": {
+        "opus": {"provider": "anthropic"}, "fable": {"provider": "anthropic"},
+        "haiku": {"provider": "anthropic"}, "luna": {"provider": "openai"},
+        "sol": {"provider": "openai"}}}
+    worker_log = ("resolve step\npolicy resolved: models=opus, gate=registry-selftest, "
+                  "max_attempts=2\n...\nlease claimed: account=acct02, model=opus, claim=ab\n")
+    check("dispatch-time chain parses from the run log",
+          chain_from_log("policy resolved: models=fable,haiku, gate=crate-scoped, "
+                         "max_attempts=2"), ["fable", "haiku"])
+    check("no resolved-chain line -> None", chain_from_log("nothing here"), None)
+    # First match wins: the genuine resolve-step line precedes any model output, so a forged
+    # WIDER chain printed later by a hostile model can never shadow it.
+    check("a forged later chain line cannot shadow the resolve step's line",
+          chain_from_log(worker_log + "policy resolved: models=opus,luna,fable,sol, gate=x"),
+          ["opus"])
+    check("route constraint recovers the dispatch-time original",
+          original_route_constraint(worker_log, "opus", chain_routing)[0], ["opus"])
+    # A logged chain that omits the claimed alias is corrupt/forged (the allocator only
+    # assigns chain members) and must NOT be trusted — and the fallback must fail NARROWER:
+    # [alias] is provably a subset of the true original, so no later fix ladder can widen.
+    check("a chain omitting the claimed alias is not trusted (falls back narrower)",
+          original_route_constraint("policy resolved: models=luna,sol, gate=x", "opus",
+                                    chain_routing)[0], ["opus"])
+    check("constraint-unknown fails NARROWER to the implementing alias",
+          original_route_constraint("no chain line at all", "fable", chain_routing)[0],
+          ["fable"])
+    # The log search is UNANCHORED over hostile-influenceable text: a chain member that is
+    # not a catalog alias (a handle-shaped token, or any unknown name) invalidates the whole
+    # line — nothing handle-shaped may reach the public log or the immutable record, and a
+    # forged line cannot widen past the [alias] fallback.
+    check("a handle-shaped chain member is never trusted (no handle in log/record)",
+          original_route_constraint("policy resolved: models=opus,acct02xy, gate=x", "opus",
+                                    chain_routing)[0], ["opus"])
+    check("an unknown-alias chain member falls back narrower",
+          original_route_constraint("policy resolved: models=opus,ghost, gate=x", "opus",
+                                    chain_routing)[0], ["opus"])
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
