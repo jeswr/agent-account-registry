@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Capability stores publisher_sk and admin_sk as Option<[u8; 32]> but has no Zeroize/ZeroizeOnDrop implementation. Dropping a decoded or constructed write/admin capability therefore leaves raw private-key seed bytes in freed memory. This contradicts Cargo.toml's stated secret-memory hygiene ('zero read secrets / private keys on drop') and ids.rs's statement that raw private-key bytes use zeroizing storage. Secret32 is protected, but these two equally sensitive fields are not.",
+   "file": "crates/sparq-e2ee-ng/src/capability.rs",
+   "fix_hint": "Store both private-key seeds in a zeroizing wrapper (for example Secret32 or Zeroizing<[u8; 32]>) or implement a Drop/ZeroizeOnDrop path for Capability that zeroizes publisher_sk and admin_sk. Preserve redacted Debug behavior and add a focused test using a zeroize-observable wrapper or a compile-time trait assertion so future field changes cannot silently remove the drop guarantee.",
+   "severity": "major",
+   "title": "Capability private-key seeds are not zeroized on drop"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Both round-2 findings are materially fixed with non-vacuous tests: skipped nested maps now enforce integer keys, deterministic ordering, and duplicate rejection through the real extension path, and publisher_pub presence is checked in both public and secret capability validation. However, review round 3 found a new major secret-memory-hygiene defect: Capability stores publisher and admin private-key seeds in ordinary arrays that are not zeroized on drop, contradicting the crate's explicit guarantee. Because a new major finding remains, progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
