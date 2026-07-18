@@ -70,7 +70,7 @@ def claim_from_log(log_text):
     return found.pop() if len(found) == 1 else AMBIGUOUS
 
 
-def run_identity_from_log(log_text, target_repo, pr_number, issue):
+def run_identity_from_log(log_text, target_repo, pr_number, issue, live_author):
     """The PR-BOUND (account, model_alias) for the run, or None (needs-human).
 
     Fail-closed rules (sol r1+r2):
@@ -86,6 +86,11 @@ def run_identity_from_log(log_text, target_repo, pr_number, issue):
         return None
     if (anchored["target_repo"] != target_repo or anchored["pr"] != int(pr_number)
             or anchored["issue"] != int(issue)):
+        return None
+    # The historical job hard-required this exact App author (provenance_record
+    # --verify-bot-login); the live PR author must still match it EXACTLY — any *[bot] is not
+    # enough (sol r4: a job that failed VALIDATION, not the write, must never be recorded).
+    if anchored["bot_login"] != live_author:
         return None
     legacy = claim_from_log(log_text)
     if legacy is AMBIGUOUS:
@@ -114,6 +119,11 @@ PROV_JOB_ALIAS_RE = _prov_job_field("--impl-alias", r'"?([A-Za-z0-9][A-Za-z0-9_.
 # The PROVIDER is also run-bound (sol r3): deriving it from TODAY's mutable routing lets a
 # routing remap flip a historical anthropic run to openai and defeat the cross-provider gate.
 PROV_JOB_PROVIDER_RE = _prov_job_field("--impl-provider", r'"?(anthropic|openai)"?')
+# The exact App-bot author the historical job REQUIRED (sol r4): accepting any *[bot] would
+# record a provenance job that failed VALIDATION (hostile worker pointed it at another bot's
+# PR) as if it were the #96 write outage.
+PROV_JOB_BOTLOGIN_RE = _prov_job_field("--verify-bot-login",
+                                       r'"?([A-Za-z0-9._-]+\[bot\])"?')
 # PR-binding fields (sol r2): the provenance job's command echo names the exact PR it was
 # recording — required to match the live PR, so a forged/reused run id in a head branch can
 # never transplant another PR's identity.
@@ -127,7 +137,7 @@ def provenance_job_identity_from_log(log_text):
     job's log section, None when the section/fields are absent, or AMBIGUOUS when any field
     has differing repeated matches (tamper evidence). Every field is required."""
     fields = {"account": PROV_JOB_ACCOUNT_RE, "alias": PROV_JOB_ALIAS_RE,
-              "provider": PROV_JOB_PROVIDER_RE,
+              "provider": PROV_JOB_PROVIDER_RE, "bot_login": PROV_JOB_BOTLOGIN_RE,
               "target_repo": PROV_JOB_TARGET_RE, "pr": PROV_JOB_PR_RE,
               "issue": PROV_JOB_ISSUE_RE}
     out = {}
@@ -252,7 +262,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
                        "--repo", registry_repo, "--log"], check=False)
         echo_provider = None
         if log.returncode == 0:
-            found = run_identity_from_log(log.stdout, target_repo, number, issue)
+            found = run_identity_from_log(log.stdout, target_repo, number, issue, login)
             if found:
                 account, alias, echo_provider = found
         if alias is None or account is None:
@@ -348,10 +358,12 @@ def _self_test():
                 f'{step}--pr "{pr}" \\\n'
                 f'{step}--impl-provider "{provider}" \\\n'
                 f'{step}--impl-alias "{alias}" \\\n'
-                f'{step}--issue "{issue}" \\\n')
+                f'{step}--issue "{issue}" \\\n'
+                f'{step}--verify-bot-login "sparq-orchestrator[bot]"\n')
 
     prov_log = prov_lines()
     bound = {"account": "acct0fx1", "alias": "fable", "provider": "anthropic",
+             "bot_login": "sparq-orchestrator[bot]",
              "target_repo": "sparq-org/sparq", "pr": 3459, "issue": 3404}
     check("provenance-job echo parses ALL binding fields",
           provenance_job_identity_from_log(prov_log), bound)
@@ -370,8 +382,8 @@ def _self_test():
           is AMBIGUOUS, True)
     claim_ok = (f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
                 "lease claimed: account=acct0fx1, model=fable, claim=x\n")
-    ident = lambda log, pr=3459, issue=3404: run_identity_from_log(
-        log, "sparq-org/sparq", pr, issue)
+    ident = lambda log, pr=3459, issue=3404, author="sparq-orchestrator[bot]": (
+        run_identity_from_log(log, "sparq-org/sparq", pr, issue, author))
     check("bound identity resolves with the RUN's provider", ident(prov_log),
           ("acct0fx1", "fable", "anthropic"))
     check("agreeing legacy corroboration keeps it", ident(claim_ok + prov_log),
@@ -387,6 +399,8 @@ def _self_test():
           ident(claim_ok), None)
     check("PR-binding mismatch fails closed (reused run id)", ident(prov_log, pr=9999), None)
     check("issue-binding mismatch fails closed", ident(prov_log, issue=1), None)
+    check("live author must EXACTLY match the echoed --verify-bot-login (sol r4)",
+          ident(prov_log, author="different-bot[bot]"), None)
     check("forged worker-job lines alone resolve nothing", ident(forged), None)
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
