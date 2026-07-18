@@ -136,7 +136,14 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         is_draft = pull.get("draft") is True
         issue, run_id, _attempt = parsed
         record_path = worker_pr.provenance_path(target_repo, number)
-        probe = _run_gh(["api", f"repos/{registry_repo}/contents/{record_path}"], check=False)
+        # Post-outage records live on the `ledger` data-plane branch (issue #96); pre-outage
+        # ones on master. Either counts as already-recorded.
+        probe = _run_gh(
+            ["api", f"repos/{registry_repo}/contents/{record_path}?ref={worker_pr.LEDGER_REF}"],
+            check=False)
+        if probe.returncode != 0:
+            probe = _run_gh(["api", f"repos/{registry_repo}/contents/{record_path}"],
+                            check=False)
         if probe.returncode == 0:
             skipped += 1
             print(f"skip #{number}: provenance already recorded")

@@ -98,6 +98,12 @@ SEVERITIES = {"blocker", "major", "minor", "nit"}
 MAX_ISSUES = 10
 PROVENANCE_DIR = "orchestration/provenance"
 VERDICT_DIR = "orchestration/review-verdicts"
+# Provenance + verdict records are written to the unprotected `ledger` data-plane branch
+# (issue #96): master's required `gate` status check rejects EVERY direct contents-API PUT from
+# github.token — no retry budget can ever land one — so record writes pin this ref exactly like
+# the lease ledger (select-and-claim.py) and model-health CAS append. Keep in sync with
+# groom.py / select-and-claim.py / model-health.py LEDGER_REF.
+LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 
 
 class WorkerPrError(RuntimeError):
@@ -804,34 +810,66 @@ def verdict_path(target_repo, pr_number, round_n):
     return f"{VERDICT_DIR}/{owner}--{name}--pr{pr_number}-round{round_n}.json"
 
 
+def _probe_registry_file(registry_repo, path, ref=None):
+    """(existing_body, sha) for a registry data file, or (None, None) on a clean 404. Any other
+    probe failure raises with the REAL API error text (issue #96: a masked error class turned a
+    permanent branch-protection rejection into 80 silent 'kept conflicting' losses)."""
+    location = f"repos/{registry_repo}/contents/{path}" + (f"?ref={ref}" if ref else "")
+    probe = _run_gh(["api", location], check=False)
+    if probe.returncode != 0:
+        if "HTTP 404" in probe.stderr:
+            return None, None
+        raise WorkerPrError(
+            f"registry file {path} probe failed: {(probe.stderr or '').strip() or 'unknown'}")
+    try:
+        meta = json.loads(probe.stdout)
+        return base64.b64decode("".join(meta["content"].split())).decode(), meta["sha"]
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkerPrError(f"registry file {path} is unreadable") from exc
+
+
 def _registry_put_file(registry_repo, path, document, message, retries=6):
     """Create-or-keep a registry data file via the contents API with the same read-SHA CAS retry
-    the lease ledger uses. Idempotent: an existing byte-identical file is success; an existing
-    DIFFERENT file fails closed (provenance must never be silently rewritten)."""
+    the lease ledger uses. Probe AND write pin the unprotected `ledger` data-plane branch
+    (issue #96): master's required `gate` status check permanently rejects every direct
+    contents-API PUT, so an unpinned write can never land regardless of retries. Idempotent: an
+    existing byte-identical file — on the ledger branch OR the legacy pre-outage master copy —
+    is success; an existing DIFFERENT file fails closed (provenance must never be silently
+    rewritten, and a ledger write must never shadow a divergent legacy record). On final failure
+    the REAL last API error is raised, never a generic conflict message."""
     body = json.dumps(document, indent=1, sort_keys=True) + "\n"
     encoded = base64.b64encode(body.encode()).decode()
+    # BOTH record locations are probed before any success short-circuit (sol review r1 on
+    # #100): readers consume the LEDGER copy first, so a divergent ledger record must fail
+    # this write even when the legacy master copy is byte-identical — "already recorded" is
+    # only claimable when EVERY existing copy matches. Legacy (<= sparq#2542) checked once —
+    # master records are immutable; the ledger probe re-runs inside the CAS retry loop.
+    legacy, _legacy_sha = _probe_registry_file(registry_repo, path)
+    if legacy is not None and legacy != body:
+        raise WorkerPrError(
+            f"registry file {path} already exists with different content on the default branch")
+    last_error = ""
     for _ in range(retries):
-        probe = _run_gh(["api", f"repos/{registry_repo}/contents/{path}"], check=False)
-        sha = None
-        if probe.returncode == 0:
-            try:
-                meta = json.loads(probe.stdout)
-                existing = base64.b64decode("".join(meta["content"].split())).decode()
-                sha = meta["sha"]
-            except (KeyError, ValueError, json.JSONDecodeError) as exc:
-                raise WorkerPrError(f"registry file {path} is unreadable") from exc
+        existing, sha = _probe_registry_file(registry_repo, path, ref=LEDGER_REF)
+        if existing is not None:
             if existing == body:
                 return False  # already recorded — idempotent success
-            raise WorkerPrError(f"registry file {path} already exists with different content")
-        elif "HTTP 404" not in probe.stderr:
-            raise WorkerPrError(f"registry file {path} probe failed")
+            raise WorkerPrError(f"registry file {path} already exists with different content "
+                                f"on the '{LEDGER_REF}' branch")
+        if legacy is not None:
+            return False  # identical pre-migration record, no ledger copy — idempotent success
         args = ["api", "-X", "PUT", f"repos/{registry_repo}/contents/{path}",
-                "-f", f"message={message}", "-f", f"content={encoded}"]
+                "-f", f"message={message}", "-f", f"content={encoded}",
+                "-f", f"branch={LEDGER_REF}"]
         if sha:
             args += ["-f", f"sha={sha}"]
-        if _run_gh(args, check=False).returncode == 0:
+        put = _run_gh(args, check=False)
+        if put.returncode == 0:
             return True
-    raise WorkerPrError(f"registry write for {path} kept conflicting")
+        last_error = (put.stderr or put.stdout or "").strip()
+    raise WorkerPrError(
+        f"registry write for {path} on branch '{LEDGER_REF}' failed after {retries} attempts; "
+        f"last API error: {last_error or 'unknown'}")
 
 
 def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_provider, impl_alias,
@@ -1746,6 +1784,103 @@ def _self_test():
                   "round budget is exhausted" in terminal[1][1], True)
     finally:
         wiring_globals.update(real_io)
+
+    # ---- registry record writes pin the `ledger` data-plane branch (issue #96): master's
+    # required `gate` status check permanently rejects every direct contents-API PUT from
+    # github.token, so the probe must carry ?ref= and the PUT an explicit branch param, and a
+    # final failure must surface the REAL API error (the masked generic 'kept conflicting'
+    # is what silently lost every provenance/verdict record for 14h) ----
+    put_calls = []
+    put_state = {"files": {}, "put_rc": 0, "put_stderr": ""}
+
+    def fake_put_run_gh(args, **_kwargs):
+        put_calls.append(list(args))
+        if "-X" in args:  # the PUT
+            return argparse.Namespace(returncode=put_state["put_rc"], stdout="",
+                                      stderr=put_state["put_stderr"])
+        meta = put_state["files"].get(args[1])
+        if meta is None:
+            return argparse.Namespace(returncode=1, stdout="", stderr="HTTP 404: Not Found")
+        return argparse.Namespace(returncode=0, stdout=json.dumps(meta), stderr="")
+
+    def record_meta(document):
+        body = json.dumps(document, indent=1, sort_keys=True) + "\n"
+        return {"content": base64.b64encode(body.encode()).decode(), "sha": "f" * 40}
+
+    real_put_io = wiring_globals["_run_gh"]
+    doc = {"pr_number": 7}
+    legacy_loc = "repos/reg/repo/contents/orchestration/provenance/o--r--pr7.json"
+    ledger_loc = f"{legacy_loc}?ref={LEDGER_REF}"
+    try:
+        wiring_globals["_run_gh"] = fake_put_run_gh
+        created = _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                     doc, "m")
+        check("fresh record write creates", created, True)
+        check("probe order: legacy master copy, then the pinned ledger ref",
+              [call[1] for call in put_calls if "-X" not in call],
+              [legacy_loc, ledger_loc])
+        put_args = next(call for call in put_calls if "-X" in call)
+        check("the PUT pins the ledger branch (never the protected default)",
+              f"branch={LEDGER_REF}" in put_args, True)
+
+        put_calls.clear()
+        put_state["files"] = {ledger_loc: record_meta(doc)}
+        check("byte-identical ledger record is idempotent success",
+              _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                 doc, "m"), False)
+        check("idempotent hit performs no PUT",
+              any("-X" in call for call in put_calls), False)
+        put_state["files"] = {legacy_loc: record_meta(doc)}
+        check("byte-identical legacy master record is idempotent success (pre-outage records)",
+              _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                 doc, "m"), False)
+        put_state["files"] = {ledger_loc: record_meta({"pr_number": 8})}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("divergent existing ledger record fails closed", "no error", "error")
+        except WorkerPrError as exc:
+            check("divergent existing ledger record fails closed",
+                  "different content" in str(exc), True)
+        put_state["files"] = {legacy_loc: record_meta({"pr_number": 8})}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("divergent legacy master record fails closed", "no error", "error")
+        except WorkerPrError as exc:
+            check("divergent legacy master record fails closed",
+                  "different content" in str(exc) and "default branch" in str(exc), True)
+        # sol review r1: an identical LEGACY copy must never mask a divergent LEDGER copy —
+        # readers consume the ledger first, so this exact combination silently served the
+        # divergent record while the writer reported "already recorded".
+        put_state["files"] = {legacy_loc: record_meta(doc),
+                              ledger_loc: record_meta({"pr_number": 8})}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("identical legacy never masks a divergent ledger copy", "no error", "error")
+        except WorkerPrError as exc:
+            check("identical legacy never masks a divergent ledger copy",
+                  "different content" in str(exc) and LEDGER_REF in str(exc), True)
+        put_calls.clear()
+        put_state["files"] = {legacy_loc: record_meta(doc)}
+        check("identical legacy + no ledger copy stays idempotent (no PUT)",
+              (_registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                  doc, "m"),
+               any("-X" in call for call in put_calls)), (False, False))
+
+        put_calls.clear()
+        put_state.update(files={}, put_rc=1,
+                         put_stderr="HTTP 409: Required status check \"gate\" is expected.")
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("exhausted write raises", "no error", "error")
+        except WorkerPrError as exc:
+            check("exhausted write surfaces the REAL API error text",
+                  "Required status check \"gate\" is expected" in str(exc), True)
+            check("exhausted write never masks as a generic conflict",
+                  "kept conflicting" in str(exc), False)
+        check("write failure retries the full budget",
+              sum(1 for call in put_calls if "-X" in call), 6)
+    finally:
+        wiring_globals["_run_gh"] = real_put_io
 
     # ---- disarm wiring (monkeypatched I/O), issue #69: a merge-only advance carries the
     # binding forward with the arm intact; a real content change still disarms; a QUEUED

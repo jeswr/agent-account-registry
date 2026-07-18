@@ -311,7 +311,8 @@ def _review_loop_module() -> Any:
 
 
 def worker_pr_provenance_enumerable(
-    repo: str, number: int, registry_root: Path = Path(".")
+    repo: str, number: int, registry_root: Path = Path("."),
+    ledger_root: Path | None = None,
 ) -> bool:
     """True when the registry provenance record for target PR ``repo#number`` exists on disk
     AND is valid by the review loop's OWN admission schema (dispatch-claim.
@@ -328,11 +329,22 @@ def worker_pr_provenance_enumerable(
     unreadable or schema-invalid record exactly as on a missing one, so a draft carrying such a
     record is owned by no automated loop and must keep the age-park hand-off. (A bare existence
     check would groom-preserve that draft while the review loop never admits it — the same
-    silent-strand deadlock class, for the malformed case.)"""
+    silent-strand deadlock class, for the malformed case.)
+
+    Record location (issue #96): the ``ledger`` data-plane branch checkout is PRIMARY — master's
+    required `gate` status check rejects every direct contents-API PUT, so post-outage records
+    exist ONLY there — and the legacy master registry checkout is the fallback so pre-outage
+    records (<= sparq#2542) stay visible. A present-but-invalid ledger record is judged as-is
+    (never falls back: the fallback is for the missing-file migration case only)."""
     owner, _, name = repo.partition("/")
     if not owner or not name:
         raise GroomError("target repository name is malformed")
-    record_path = registry_root / PROVENANCE_DIR / f"{owner}--{name}--pr{number}.json"
+    record_name = f"{owner}--{name}--pr{number}.json"
+    record_path = registry_root / PROVENANCE_DIR / record_name
+    if ledger_root is not None:
+        ledger_path = Path(ledger_root) / PROVENANCE_DIR / record_name
+        if ledger_path.is_file():
+            record_path = ledger_path
     if not record_path.is_file():
         return False
     try:
@@ -894,6 +906,9 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     target_api = GitHubAPI(os.environ.get("TARGET_GH_TOKEN", ""), "target")
     bot_login = _bot_login(target_api, getattr(args, "bot_slug", "") or "")
     now = int(time.time())
+    # Provenance records live on the `ledger` branch checkout first (issue #96), with the
+    # master checkout (groom's working directory) as the legacy pre-outage fallback.
+    ledger_root = Path(args.ledger_root) if getattr(args, "ledger_root", "") else None
 
     leases, _sha = _read_ledger(registry_api, registry_repo)
     repair_count = sum(1 for lease in leases if is_repair_holder(lease["holder"]))
@@ -947,7 +962,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 bot_login,
                 repo_limits.threshold_seconds,
                 now,
-                has_valid_provenance=worker_pr_provenance_enumerable(repo, number),
+                has_valid_provenance=worker_pr_provenance_enumerable(
+                    repo, number, ledger_root=ledger_root),
             )
             if reason:
                 stale_prs[(repo, number)] = reason
@@ -1063,7 +1079,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             bot_login,
             limits[action.repo].threshold_seconds,
             now,
-            has_valid_provenance=worker_pr_provenance_enumerable(action.repo, action.number),
+            has_valid_provenance=worker_pr_provenance_enumerable(
+                action.repo, action.number, ledger_root=ledger_root),
         )
         if reason is None:
             print(f"SKIP PR {action.repo}#{action.number}: no longer stale/failing")
@@ -1423,6 +1440,43 @@ def _self_test() -> int:
         except GroomError:
             malformed_repo_failed = True
         check("provenance validity: malformed repo fails closed", malformed_repo_failed, True)
+        # (a4) Ledger-first resolution (issue #96): post-outage records exist ONLY on the
+        # `ledger` branch checkout — a groom that reads just the master checkout would orphan-
+        # park every ledger-recorded draft (the exact deadlock the outage caused). The legacy
+        # master-checkout record stays visible as the fallback (pre-outage PRs <= sparq#2542).
+        record_path.unlink()
+        ledger_dir = registry_root / "ledger-checkout"
+        ledger_record = ledger_dir / PROVENANCE_DIR / "owner--repo--pr99.json"
+        ledger_record.parent.mkdir(parents=True)
+        ledger_record.write_text(json.dumps(valid_record), encoding="utf-8")
+        check(
+            "provenance validity: ledger-only record -> True (review-loop-owned)",
+            worker_pr_provenance_enumerable(
+                "owner/repo", 99, registry_root, ledger_root=ledger_dir),
+            True,
+        )
+        check(
+            "provenance validity: ledger-only record invisible without a ledger root",
+            worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
+            False,
+        )
+        ledger_record.unlink()
+        record_path.write_text(json.dumps(valid_record), encoding="utf-8")
+        check(
+            "provenance validity: legacy master-checkout record still admits (fallback)",
+            worker_pr_provenance_enumerable(
+                "owner/repo", 99, registry_root, ledger_root=ledger_dir),
+            True,
+        )
+        # A PRESENT ledger record governs even when invalid — never fall back past it to a
+        # stale-but-valid master copy (validity, not just existence, decides ownership).
+        ledger_record.write_text("{not json", encoding="utf-8")
+        check(
+            "provenance validity: present-but-invalid ledger record -> False (no fallback)",
+            worker_pr_provenance_enumerable(
+                "owner/repo", 99, registry_root, ledger_root=ledger_dir),
+            False,
+        )
     # (c) Non-vacuity / mutation guards. The two draft tests above are mutually discriminating:
     # reverting the draft branch to master's UNCONDITIONAL park reds test (a) (valid-provenance
     # draft would park), and reverting it to an unconditional Return-None (the earlier revision of
@@ -1621,6 +1675,12 @@ def main() -> int:
         "--bot-slug",
         default="",
         help="GitHub App slug from the token mint step (an installation token cannot GET /user)",
+    )
+    parser.add_argument(
+        "--ledger-root",
+        default="",
+        help="`ledger` data-plane branch checkout root — the PRIMARY provenance record "
+             "location (issue #96); empty falls back to the master checkout only",
     )
     args = parser.parse_args()
     if args.self_test:
