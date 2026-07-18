@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-1 routing defect is fixed correctly. Id-bearing errors now take an exclusive id-routed path: they are consumed for closing subscriptions, terminate a matching active subscription, or are reported through onUnrouted, and they cannot fall through to pending.shift(). The added regression test exercises the real multiplexing state machine with a pending subscribe, an unknown/stale id-bearing error, and a subsequent subscribed acknowledgement, confirming that the pending entry remains intact. This matches the server protocol path, which emits id-bearing errors for unknown unsubscribe ids while subscribe refusals remain id-less and processes client frames serially. No new correctness, soundness, test-validity, or security issue is evident in the changed diff.",
+ "verdict": "approve"
+}
