@@ -69,6 +69,16 @@
    "model": "sonnet",
    "issued_at": 1784382623,
    "expires_at": 1784386223
+  },
+  {
+   "account": "acct4css",
+   "claim_id": "31fef0a0cf7e42af8cf9f6cd992d0b12",
+   "holder": "fix:sparq-org/sparq#3456@dispatch-29646900320.1",
+   "package": "sparq-reason",
+   "role": "fix",
+   "model": "fable",
+   "issued_at": 1784382784,
+   "expires_at": 1784386384
   }
  ]
 }
