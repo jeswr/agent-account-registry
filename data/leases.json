@@ -69,6 +69,16 @@
    "model": "sonnet",
    "issued_at": 1784391710,
    "expires_at": 1784395310
+  },
+  {
+   "account": "acct4css",
+   "claim_id": "9d4e2cb48b834ff19e7fc4633bf61708",
+   "holder": "jeswr/agent-account-registry#218@dispatch-29651708285.1",
+   "package": "ci",
+   "role": "ci",
+   "model": "fable",
+   "issued_at": 1784391722,
+   "expires_at": 1784394422
   }
  ]
 }
