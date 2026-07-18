@@ -27,7 +27,6 @@ POLICY_PATH = "policy/repos.toml"
 # run_gate implements it: run every touched script's --self-test, the full recent-wave suite, and
 # bash -n / actionlint on touched shell + workflow files. Fail-closed.
 GATE_PROFILES = {"none", "lint-only", "crate-scoped", "workspace", "registry-selftest"}
-DISPATCH_MODES = {"cron", "cron+doorbell"}
 TRUST_MODES = {"collaborators"}
 POLICY_FIELDS = {
     "enabled",
@@ -38,7 +37,6 @@ POLICY_FIELDS = {
     "gate_profile",
     "arm_auto_merge",
     "max_attempts",
-    "dispatch",
     "trust",
 }
 # [OPUS-4.8] Optional usage-aware-dispatch controls (default off / 0.10 -> backward compatible):
@@ -114,8 +112,6 @@ def _policy_row(target_repo, policy_doc):
         raise PolicyError(f"unknown gate_profile {row['gate_profile']!r} for {target_repo!r}")
     if not isinstance(row["arm_auto_merge"], bool):
         raise PolicyError(f"arm_auto_merge for {target_repo!r} must be boolean")
-    if row["dispatch"] not in DISPATCH_MODES:
-        raise PolicyError(f"unknown dispatch mode {row['dispatch']!r} for {target_repo!r}")
     if row["trust"] not in TRUST_MODES:
         raise PolicyError(f"unknown trust mode {row['trust']!r} for {target_repo!r}")
     if "require_usage" in row and not isinstance(row["require_usage"], bool):
@@ -264,7 +260,6 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "security_paths": list(policy.get("security_paths", [])),
         "worker_timeout_minutes": policy["worker_timeout_minutes"],
         "max_attempts": policy["max_attempts"],
-        "dispatch": policy["dispatch"],
         "trust": policy["trust"],
     }
 
@@ -280,7 +275,6 @@ worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
 arm_auto_merge = true
 max_attempts = 2
-dispatch = "cron"
 trust = "collaborators"
 
 [repos."example/disabled"]
@@ -292,7 +286,6 @@ worker_timeout_minutes = 30
 gate_profile = "lint-only"
 arm_auto_merge = false
 max_attempts = 1
-dispatch = "cron"
 trust = "collaborators"
 ''')
     # The role route intentionally precedes the security rule: precedence must not depend on that.
@@ -362,7 +355,7 @@ agent = "docs-agent"
            impl["cross_provider_fallback"]), (3, 30, False))
     review_over = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                                 'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
-                                'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                                'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                                 'max_review_rounds=5\nreview_queue_ttl_minutes=45\ncross_provider_fallback=true\n')
     review_impl = resolve("o/r", "impl", review_over, routing)
     check("review-loop controls overridable",
@@ -372,33 +365,33 @@ agent = "docs-agent"
     check("security_paths default empty", impl["security_paths"], [])
     sec_paths = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                               'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
-                              'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                              'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                               'security_paths=["scripts/worker-pr.py", ".github/workflows/"]\n')
     sec_impl = resolve("o/r", "impl", sec_paths, routing)
     check("security_paths surfaced",
           sec_impl["security_paths"], ["scripts/worker-pr.py", ".github/workflows/"])
     bad_paths = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                               'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
-                              'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                              'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                               'security_paths=["ok", ""]\n')
     rejects("security_paths rejects empty entry", "security_paths",
             lambda: resolve("o/r", "impl", bad_paths, routing))
     bad_rounds = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                                'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
-                               'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                               'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                                'max_review_rounds=0\n')
     rejects("max_review_rounds range validated", "max_review_rounds",
             lambda: resolve("o/r", "impl", bad_rounds, routing))
     over = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                          'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
-                         'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                         'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                          'require_usage=true\nusage_safety_margin=0.2\n')
     over_impl = resolve("o/r", "impl", over, routing)
     check("usage controls overridable", (over_impl["require_usage"], over_impl["usage_safety_margin"]),
           (True, 0.2))
     bad = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                         'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
-                        'arm_auto_merge=false\nmax_attempts=1\ndispatch="cron"\ntrust="collaborators"\n'
+                        'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                         'usage_safety_margin=1.5\n')
     try:
         resolve("o/r", "impl", bad, routing)
