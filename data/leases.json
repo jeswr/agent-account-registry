@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct01",
-   "claim_id": "a2b0e63f01c1498792296f01ebaeaf26",
-   "holder": "review:sparq-org/sparq#3434@dispatch-29645854760.1",
-   "package": "sparq-zk",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784380732,
-   "expires_at": 1784381932
-  },
-  {
-   "account": "acct01",
    "claim_id": "ab22c3f1c8df4032933bc7b39b564392",
    "holder": "review:sparq-org/sparq#3436@dispatch-29645854760.1",
    "package": "sparq-substrate",
