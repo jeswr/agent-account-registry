@@ -35,6 +35,15 @@
 # set is non-empty and EXACTLY equals the captured set (grant-account.py verify_live_targets,
 # regression-tested by the gate).
 #
+# LABEL-INJECTION fix (review round 4 of #260): the provider/target derivation looped over
+# `${{ join(github.event.issue.labels.*.name, ' ') }}`, splicing UNTRUSTED label text straight
+# into `run:` source — a label carrying `$()`/`;`/backticks (a collaborator can add one before a
+# trusted actor applies the label; the actor/author gate does not sanitize pre-existing labels)
+# executed with this job's contents:write GITHUB_TOKEN. Labels are now carried as JSON (toJSON in
+# an env var, never join) and parsed OFFLINE by grant-account.py's provider_from_labels/
+# targets_from_labels — structured, fail-closed (unknown/ambiguous provider or no target refuses),
+# and gate-self-tested against injection-shaped names. No label text ever reaches the shell.
+#
 # STALE-SNAPSHOT fix (#186, hardened after review round 1 of #236): the handle/secret in `meta`
 # are only a pre-login HINT. A re-read before the write is still a TOCTOU check, so the store step
 # instead takes ATOMIC ownership of the slot by creating `refs/acct-claims/<handle>` — git ref
@@ -94,32 +103,58 @@ jobs:
             exit 1
           fi
 
-      - name: Determine provider (structured — no silent default)
+      # Label names are UNTRUSTED and may contain shell metacharacters. A collaborator can add
+      # a label BEFORE a trusted actor applies `set-up-account`, so the actor/author trust gate
+      # does not make pre-existing label text safe. The old `for lb in ${{ join(labels) }}` loops
+      # spliced that text into `run:` source, so a crafted label (e.g. `$(...)`, `;`, backticks)
+      # executed with this job's contents:write GITHUB_TOKEN. Carry the names as JSON (toJSON —
+      # never join) in an env var and parse them OFFLINE via grant-account.py's structured
+      # provider_from_labels/targets_from_labels (gate-self-tested against injection-shaped names);
+      # no label text ever reaches the shell. #190: at least one `target:<owner>/<name>` is
+      # required (an untargeted request is UNAUTHORIZED — fail closed, no blanket grant).
+      - name: Determine provider + targets (structured — no label text in shell source)
         id: meta
+        env:
+          LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
         run: |
-          prov=""
-          for lb in ${{ join(github.event.issue.labels.*.name, ' ') }}; do
-            case "$lb" in provider:openai) prov=openai;; provider:anthropic) prov=anthropic;; esac
-          done
-          if [ -z "$prov" ]; then
-            gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "❌ Add a \`provider:openai\` or \`provider:anthropic\` label, then re-apply \`set-up-account\`." || true
+          set -euo pipefail
+          result=$(python3 - <<'PY'
+          import importlib.util
+          import json
+          import os
+
+          spec = importlib.util.spec_from_file_location(
+              "registry_grant_account", "scripts/grant-account.py")
+          ga = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(ga)
+          labels = json.loads(os.environ["LABELS_JSON"])
+          provider = ga.provider_from_labels(labels)
+          targets = sorted(ga.targets_from_labels(labels))
+          if provider is None:
+              print("ERR provider")
+          elif not targets:
+              print("ERR targets")
+          else:
+              # provider is one of the fixed PROVIDERS constants and each target matched the
+              # `target:<owner>/<name>` grammar; both are shell-safe to emit as outputs.
+              print("OK")
+              print(provider)
+              print(" ".join(targets))
+          PY
+          )
+          status=$(printf '%s\n' "$result" | sed -n 1p)
+          if [ "$status" != OK ]; then
+            kind=$(printf '%s\n' "$result" | sed -n 1p | cut -d' ' -f2)
+            if [ "$kind" = targets ]; then
+              body="❌ Add at least one \`target:<owner>/<name>\` label naming the repository pool(s) this account is authorized for (e.g. \`target:sparq-org/sparq\`), then re-apply \`set-up-account\`."
+            else
+              body="❌ Add exactly one \`provider:openai\` or \`provider:anthropic\` label, then re-apply \`set-up-account\`."
+            fi
+            gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" --body "$body" || true
             exit 1
           fi
-          # #190: an account is a per-repository grant, not a global one. account_pool membership
-          # IS the authorization (worker.yml re-checks `account_name in account_pool`), so the
-          # request must name the repositories it authorizes via `target:<owner>/<name>` label(s).
-          # At least one is required — a request with no target is UNAUTHORIZED, so fail closed
-          # rather than blanket-granting every pool. Existence + enabled is validated below.
-          targets=""
-          for lb in ${{ join(github.event.issue.labels.*.name, ' ') }}; do
-            case "$lb" in target:*/*) targets="${targets:+$targets }${lb#target:}";; esac
-          done
-          if [ -z "$targets" ]; then
-            gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "❌ Add at least one \`target:<owner>/<name>\` label naming the repository pool(s) this account is authorized for (e.g. \`target:sparq-org/sparq\`), then re-apply \`set-up-account\`." || true
-            exit 1
-          fi
+          prov=$(printf '%s\n' "$result" | sed -n 2p)
+          targets=$(printf '%s\n' "$result" | sed -n 3p)
           # The models line the allocator requires (read_accounts drops model-less accounts),
           # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
           if [ "$prov" = openai ]; then models='[terra]'; else models='[fable, opus, sonnet, haiku]'; fi

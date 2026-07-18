@@ -33,10 +33,25 @@ def pool_of(repos_doc, name):
     return list((repos_doc.get(name) or {}).get("account_pool") or [])
 
 
+PROVIDERS = ("openai", "anthropic")
+
+
+def provider_from_labels(label_names):
+    """The single provider a request's `provider:<name>` label selects (one of PROVIDERS),
+    or None when absent, unknown, or AMBIGUOUS (several distinct provider labels). The broker
+    fails closed on None — no silent default. Decided from the structured label LIST, never by
+    splicing label text into shell `run:` source: a label name is untrusted and may carry shell
+    metacharacters (a collaborator can add one before a trusted actor applies set-up-account),
+    so `for lb in ${{ join(labels) }}` was a command-injection sink into a contents:write job."""
+    present = [p for p in PROVIDERS if f"provider:{p}" in label_names]
+    return present[0] if len(present) == 1 else None
+
+
 def targets_from_labels(label_names):
     """The target-repo set a list of issue label names authorizes: every
     `target:<owner>/<name>` label (the same shape the broker's pre-login capture
-    matches — `target:*/*`). Every other label authorizes nothing."""
+    matches — `target:*/*`). Every other label authorizes nothing. Structured-list only,
+    for the same injection reason as provider_from_labels — never shell-interpolated."""
     return {
         name[len("target:"):]
         for name in label_names
@@ -228,6 +243,29 @@ def _self_test():
         targets_from_labels(live), {"o/single", "o/empty"})
     chk("non-target and slash-less labels authorize nothing",
         targets_from_labels(["target:noslash", "provider:openai", "o/em"]), set())
+
+    # --- provider derivation is structured + fail-closed (the #260 r4 injection fix). These
+    # labels are UNTRUSTED: parsing them from the list must never depend on shell-safe text,
+    # and the provider must be exactly one known value or None (no silent default). ---
+    chk("single provider label selects it",
+        provider_from_labels(["set-up-account", "provider:anthropic"]), "anthropic")
+    chk("no provider label -> None (fail closed, no default)",
+        provider_from_labels(["set-up-account", "target:o/single"]), None)
+    chk("unknown provider value -> None",
+        provider_from_labels(["provider:evilcorp"]), None)
+    chk("ambiguous (two providers) -> None (refuse, not last-wins)",
+        provider_from_labels(["provider:openai", "provider:anthropic"]), None)
+    # Injection-shaped label names the reviewer named (spaces/quotes/$()/;/newlines): as list
+    # elements they are inert data — they select no provider/target and never reach a shell.
+    hostile = ['provider:openai; rm -rf /', 'a "b"', '$(touch pwned)', 'x;y', 'line1\nprovider:anthropic', 'target:o/x`whoami`']
+    chk("hostile look-alike labels select no provider",
+        provider_from_labels(hostile), None)
+    chk("a real provider label is still found alongside hostile look-alikes",
+        provider_from_labels(hostile + ["provider:openai"]), "openai")
+    chk("hostile target look-alikes do not forge a clean target",
+        targets_from_labels(hostile), {"o/x`whoami`"})
+    chk("newline-embedded provider text is not a real provider label",
+        provider_from_labels(['provider:openai\nprovider:anthropic']), None)
     verify_live_targets(["o/single", "o/empty"], live)
     print("  ok   verify_live_targets accepts an unchanged live target set")
     raises("all target labels removed mid-login refuses (revocation)",
