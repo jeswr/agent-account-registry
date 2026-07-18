@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly routes both matching and skip diagnostics through the same composed pattern, implements XPath literal-mode `q` without translating escapes inside quoted patterns, preserves only the meaningful case-insensitive effect, and expands XML NameStartChar/NameChar escapes with the XML 1.0 ranges. The focused tests exercise the real SHACL validation path, including violations, complements, nested character-class use, and escaped-backslash handling. No correctness, soundness, security, or vacuous-test issue is evident in the diff. Focused tests could not be executed in this checkout because `cargo` is unavailable, so this approval is based on diff-scoped static review.",
+ "verdict": "approve"
+}
