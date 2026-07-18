@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change is sound as scoped. The circuit relation rebinds each private graph witness to its public commitment, anchors active leaves to committed rows, constrains every active rule premise to a strictly earlier conclusion, checks fixed RDFS rule shapes, and binds the terminal active conclusion to the public root. The negative tests exercise ungrounded premises, absent leaves, and root substitution on the real relation, while the Rust tests cover the added host-side rule shapes. The documentation accurately limits this to a research-grade, not externally audited, not yet compiled or verifier-dispatched relation and makes no measured-cost claim.",
+ "verdict": "approve"
+}
