@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`stratum_blanks` maps a carried `_:b` after stratum 0 to the fixed label `_:__st0_b`, but the next stratum is free to contain that exact blank label. After `parsed.facts.append(&mut carried)`, both then denote the same `Term::Blank`, violating the API's documented guarantee that carried blanks are renamed apart from the next stratum's labels. The same fixed namespace may collide with labels produced for rule existentials. The existing test uses `_:b` in both strata and therefore exercises only the ordinary case, not the claimed collision avoidance.",
+   "file": "crates/sparq-reason/src/n3/mod.rs",
+   "fix_hint": "Before merging carried facts with a parsed stratum, collect every blank label already present in that stratum (recursing through lists, formulae, and quoted triples) and allocate fresh carried labels from a namespace proven absent, maintaining one old-to-new map so co-reference is preserved. Include rule/existential namespaces in the freshness reasoning. Add a regression test where stratum 1 carries `_:b` and stratum 2 explicitly uses `_:__st0_b` (plus an existential-collision case if applicable), asserting the subjects remain distinct.",
+   "severity": "major",
+   "title": "Stratum blank-node renaming can collide with labels in the next document"
+  }
+ ],
+ "progress": null,
+ "summary": "The scoped aggregation implementation and tests cover the principal behavior, but the new stratified API does not actually guarantee the documented per-stratum blank-node separation for all valid inputs. Its deterministic renaming namespace can collide with a blank label written in the following stratum (and potentially with parser-minted existential labels), causing two nodes that must be distinct to co-refer. Because blank-node scoping is a load-bearing correctness claim of the public API, this needs a freshness-based rename and an adversarial regression test before approval.",
+ "verdict": "request_changes"
+}
