@@ -123,7 +123,15 @@ FIX_CHAIN = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
 # earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
 # path does not usage-gate; codex accounts are usage-EXEMPT, so this shared `review:` prefix
 # cap IS the codex slot bound, and `fix:` bounds concurrent same-provider fix agents.
-REVIEW_MAX_CONCURRENT = 10
+# [FABLE-5 r7 #2] 10 -> 24 (maintainer decision: maximum realistic throughput). The pre-batch cap
+# of 10 assumed ONE review per lease; a K-slot batch lease reserves REVIEW_BATCH_K slots, so at 10
+# only floor(10/4)=2 full batches could coexist (16 assigned PRs, 8 concurrent calls) — far short
+# of the >40-review ask. At 24, floor(24/4)=6 full batches fit, covering a whole tick's
+# REVIEW_BATCH_JOBS_MAX and 6*8=48 assigned PRs. Codex rate limits are far from binding
+# (maintainer direction 2026-07-17) and per-account load stays bounded regardless of this shared
+# cap by each account's max_concurrent_workers in the catalog (choose_account counts slot-weighted
+# load per account).
+REVIEW_MAX_CONCURRENT = 24
 FIX_MAX_CONCURRENT = 8
 REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
 FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
@@ -3127,8 +3135,58 @@ def _self_test():
                                    cand(2, "anthropic", "crate-b"),
                                    cand(3, "anthropic", "crate-a")], batch_size=8, jobs_max=6)
     assert [b[0]["package"] for b in ordered] == ["crate-a", "crate-b", "crate-z"]
-    # the throughput identity the design turns on: jobs*SIZE effective reviews > the 40-slot ask.
-    assert REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_SIZE > 40
+    # [FABLE-5 r7 #2] The throughput the design turns on, exercised against the REAL allocator —
+    # not the vacuous jobs*SIZE arithmetic identity it replaces (which held even when the ledger
+    # admitted only 2 batches). Drive select-and-claim.claim() (IO stubbed to an in-memory CAS
+    # ledger) with the exact kwargs _dispatch_review_batches uses and count how many K-slot batch
+    # claims the slot-weighted `review:` prefix cap ACTUALLY admits at REVIEW_MAX_CONCURRENT.
+    cap_alloc = _load_module("capacity_select_and_claim",
+                             Path(__file__).resolve().parent / "select-and-claim.py")
+    cap_ledger = {"leases": [], "sha": "sha-0"}
+
+    def cap_read_accounts(_repo):
+        # Plenty of codex accounts, each bounded at K workers (one full batch per account), so
+        # the SHARED review: cap — the invariant under test — is the binding constraint.
+        return [{"handle": f"acct{i:02d}", "models": ["terra"], "available": True,
+                 "max_concurrent_workers": REVIEW_BATCH_K, "secret_ref": f"ref{i}",
+                 "provider": "openai", "harness": "codex", "credential_format": "cf"}
+                for i in range(10, 30)]
+
+    def cap_read_ledger(_repo):
+        return json.loads(json.dumps(cap_ledger["leases"])), cap_ledger["sha"]
+
+    def cap_write_ledger(_repo, leases, sha, _msg):
+        if sha != cap_ledger["sha"]:
+            return False
+        cap_ledger["leases"] = leases
+        cap_ledger["sha"] = f"sha-{len(leases)}-{sum(cap_alloc.lease_slots(x) for x in leases)}"
+        return True
+
+    cap_alloc.read_accounts = cap_read_accounts
+    cap_alloc._read_ledger = cap_read_ledger
+    cap_alloc._write_ledger = cap_write_ledger
+    cap_now = 1_700_000_000
+    cap_slots = min(REVIEW_BATCH_SIZE, REVIEW_BATCH_K)
+    cap_admitted = 0
+    denied_at_cap = False
+    for i in range(REVIEW_BATCH_JOBS_MAX + 4):  # keep claiming PAST a full tick's batches
+        got = cap_alloc.claim(
+            "reg/repo", f"crate-cap-{i}", "review", ["terra"],
+            f"review:t/r#batch-{i}@cap-test", cap_now,
+            ttl=REVIEW_BATCH_TTL, holder_prefix="review:",
+            max_holder_concurrent=REVIEW_MAX_CONCURRENT, slots=cap_slots)
+        if got is None:
+            denied_at_cap = True
+            break
+        cap_admitted += 1
+    # the cap is ENFORCED (the loop was denied, not exhausted) at exactly floor(cap / K) batches...
+    assert denied_at_cap, "review: prefix cap never bound — test is vacuous"
+    assert cap_admitted == REVIEW_MAX_CONCURRENT // cap_slots, cap_admitted
+    # ...a full tick's batches all fit concurrently, and the ADMITTED capacity (not a constant
+    # identity) covers the >40-review maintainer ask.
+    assert cap_admitted >= REVIEW_BATCH_JOBS_MAX, (cap_admitted, REVIEW_BATCH_JOBS_MAX)
+    assert cap_admitted * REVIEW_BATCH_SIZE > 40, cap_admitted * REVIEW_BATCH_SIZE
+    assert sum(cap_alloc.lease_slots(x) for x in cap_ledger["leases"]) <= REVIEW_MAX_CONCURRENT
     # [GPT-5.6 r4 #3] a K-batch reserves K slot-weighted workers, so concurrent model calls are
     # BOUND BY THE LEDGER at REVIEW_MAX_CONCURRENT (the codex comfort cap) — one batch must fit.
     assert REVIEW_BATCH_K <= REVIEW_MAX_CONCURRENT

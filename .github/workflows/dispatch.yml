@@ -742,6 +742,11 @@ jobs:
           # registry code only — the salt never enters a job that executes target code.
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
           WORKFLOW_REF: ${{ github.ref_name }}
+          # Batch-review rollout flag (staged rollout): dispatch-claim reads this from its
+          # process environment, so the repository VARIABLE must be exported here or the flag
+          # can never turn the lane on ("1"/"true"/"yes" enable; unset/other stays the
+          # single-review path).
+          REVIEW_BATCH_ENABLED: ${{ vars.REVIEW_BATCH_ENABLED || '' }}
           WORKER_USAGE_FILE: ${{ runner.temp }}/usage.json
           # Zero-dispatch visibility (registry #28/#32): dispatch-claim writes a compact
           # {planned, dispatched, defer_reasons} summary here (no issue numbers/handles) for the

@@ -119,7 +119,10 @@ jobs:
       count: ${{ steps.admit.outputs.count }}
       target_owner: ${{ steps.admit.outputs.target_owner }}
       target_name: ${{ steps.admit.outputs.target_name }}
-      batch_k: ${{ steps.admit.outputs.batch_k }}
+      # [FABLE-5 r7 #4] The VALIDATED concurrency bound from lease adoption (== the live lease's
+      # slot reservation, asserted against batch_k AND manifest cardinality) — never the raw
+      # batch_k input.
+      batch_k: ${{ steps.adopt.outputs.validated_k }}
       # [FABLE-5 r5 #1] The policy-resolved TARGET routing pointer + routed agent ride to every
       # review leg (review-fix.yml `needs.resolve.outputs.routing/agent` convention) — the legs
       # resolve the model from the TARGET catalog and export WORKER_AGENT to worker-live.sh.
@@ -260,6 +263,14 @@ jobs:
       # releasing it would sever that job mid-run — it just expires via TTL/groom), and the
       # release job below is gated on this step's claim_adopted output for the same reason.
       # `--inspect` itself fails closed (exit 3) on an unknown/expired claim or holder mismatch.
+      # [FABLE-5 r7 #4] The batch's ACTUAL matrix concurrency is bound to the adopted lease here:
+      # batch_k must be a well-formed positive integer (no silent default), and the live lease's
+      # `slots` reservation must equal min(manifest cardinality, batch_k) — the exact reservation
+      # the dispatcher made (slots = min(len(batch), REVIEW_BATCH_K)). A manual/malformed
+      # dispatch that inflates batch_k (which feeds max-parallel) or shrinks the reservation can
+      # therefore never run more concurrent model calls than the ledger reserved: the review
+      # job's max-parallel is capped by this step's VALIDATED value (the lease slots), never the
+      # raw input.
       - name: Adopt the dispatcher lease (validate against the live ledger; no secret deref yet)
         id: adopt
         env:
@@ -274,6 +285,8 @@ jobs:
           EXPECTED_SECRET_REF: ${{ inputs.secret_ref }}
           EXPECTED_HARNESS: ${{ inputs.harness }}
           EXPECTED_CREDENTIAL_FORMAT: ${{ inputs.credential_format }}
+          BATCH_K: ${{ inputs.batch_k }}
+          MANIFEST_B64: ${{ inputs.manifest_b64 }}
           MODELS: ${{ steps.policy.outputs.model_chain }}
           ACCOUNT_POOL: ${{ steps.policy.outputs.account_pool }}
         run: |
@@ -284,12 +297,33 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --expected-holder-prefix "review:$TARGET_REPO#batch-" > "$RUNNER_TEMP/adopt.json"
           python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
-          import json, os, re, sys
+          import base64, json, os, re, sys
 
           with open(sys.argv[1], encoding="utf-8") as handle:
               claim = json.load(handle)
           if not isinstance(claim, dict):
               raise SystemExit("dispatcher claim is not adoptable (fail closed)")
+          # [FABLE-5 r7 #4] Bind matrix concurrency to the lease reservation. batch_k is a
+          # HOSTILE input (workflow_dispatch): a malformed value fails closed here rather than
+          # silently defaulting, and the lease's slot reservation must be EXACTLY the
+          # dispatcher's contract min(manifest cardinality, batch_k).
+          if not re.fullmatch(r"[1-9][0-9]*", os.environ.get("BATCH_K", "")):
+              raise SystemExit("batch_k is not a positive integer (fail closed)")
+          batch_k = int(os.environ["BATCH_K"])
+          try:
+              manifest = json.loads(base64.b64decode(os.environ["MANIFEST_B64"]))
+          except (ValueError, TypeError) as exc:
+              raise SystemExit("manifest is undecodable at adoption (fail closed)") from exc
+          if not isinstance(manifest, list) or not manifest:
+              raise SystemExit("manifest is empty/malformed at adoption (fail closed)")
+          try:
+              slots = int(claim.get("slots", 1))
+          except (TypeError, ValueError):
+              raise SystemExit("lease slots reservation is malformed (fail closed)")
+          if slots != min(len(manifest), batch_k):
+              raise SystemExit(
+                  f"lease reserves {slots} slot(s) but the dispatch asks for "
+                  f"min({len(manifest)}, {batch_k}) concurrent calls; refusing the batch")
           account = claim.get("account")
           model = claim.get("model")
           claim_id = claim.get("claim_id")
@@ -325,8 +359,12 @@ jobs:
                   raise SystemExit(f"supplied {claim_key} disagrees with the live account record")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("claim_adopted=true\n")
+              # [FABLE-5 r7 #4] The VALIDATED concurrency bound (== the lease's slot
+              # reservation) — the only value max-parallel may consume.
+              output.write(f"validated_k={slots}\n")
           # Privacy (locked decision 22b): public workflow logs never carry account handles.
-          print(f"dispatcher batch lease adopted: model={model}, claim={claim_id[:8]}")
+          print(f"dispatcher batch lease adopted: model={model}, claim={claim_id[:8]}, "
+                f"validated_k={slots}")
           PY
 
       - name: Mint read-only App token for live re-admission (no target contents write)
@@ -348,7 +386,6 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           IMPL_PROVIDER: ${{ inputs.impl_provider }}
           MANIFEST_B64: ${{ inputs.manifest_b64 }}
-          BATCH_K: ${{ inputs.batch_k }}
           # The registry App bot's PR-author login (<app-slug>[bot]). Each admitted PR's author MUST
           # equal this — the single dispatch path enforces `login == bot_login` (dispatch-claim.py);
           # batching must re-assert the same per-PR trust gate. Empty (App slug unavailable) fails
@@ -367,9 +404,6 @@ jobs:
           set -euo pipefail
           printf 'target_owner=%s\n' "${TARGET_REPO%%/*}" >> "$GITHUB_OUTPUT"
           printf 'target_name=%s\n' "${TARGET_REPO##*/}" >> "$GITHUB_OUTPUT"
-          k="${BATCH_K:-4}"
-          [[ "$k" =~ ^[1-9][0-9]*$ ]] || k=4
-          printf 'batch_k=%s\n' "$k" >> "$GITHUB_OUTPUT"
           printf '%s' "$MANIFEST_B64" | base64 -d > "$RUNNER_TEMP/manifest.json"
           python3 registry/scripts/worker-pr.py --self-test >/dev/null  # fail fast if the helper is broken
           python3 - <<'PY'
@@ -575,8 +609,12 @@ jobs:
     timeout-minutes: 25
     permissions:
       contents: read
+      issues: read   # [FABLE-5 r7 #4] per-leg lease re-inspection reads the live account catalog
     strategy:
       fail-fast: false
+      # [FABLE-5 r7 #4] Bound by the ADOPTION-VALIDATED lease reservation (== the live lease's
+      # `slots`, asserted against batch_k and manifest cardinality in resolve-batch) — a
+      # malformed dispatch can never fan out more concurrent model calls than the ledger reserved.
       max-parallel: ${{ fromJSON(needs.resolve-batch.outputs.batch_k) }}
       matrix: ${{ fromJSON(needs.resolve-batch.outputs.matrix) }}
     steps:
@@ -797,6 +835,58 @@ jobs:
           print(f"selected account resolved: model={model}, harness={values['harness']}")
           PY
 
+      # [FABLE-5 r7 #4] Re-inspect the adopted lease in THIS leg, immediately before the account
+      # credential is dereferenced (the very next step's env): a matrix leg can sit queued behind
+      # max-parallel for an unbounded runner delay, and resolve-batch's adoption is stale by then.
+      # `--inspect` fails closed (exit 3) on an expired/reclaimed/unknown claim — a leg whose
+      # lease is gone re-plans instead of running on capacity the ledger no longer reserves —
+      # and the live lease must still name THIS batch's account/model/secret_ref (never a
+      # different account's credential). The leg additionally requires the remaining TTL to
+      # cover its own 25-minute budget (keep in sync with this job's timeout-minutes), so a
+      # lease can't expire and be re-claimed MID-review either. Renewal is deliberately NOT done
+      # here: a ledger-WRITE token never rides in a leg (the model_health job exists for exactly
+      # that split), and REVIEW_BATCH_TTL already budgets the full DAG wall-clock — a leg outside
+      # that budget must fail closed and re-plan, not extend its own lease unboundedly.
+      - name: Re-inspect the adopted lease before credential dereference (fail closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          EXPECTED_ACCOUNT: ${{ steps.selected.outputs.account }}
+          EXPECTED_MODEL: ${{ steps.selected.outputs.model }}
+          EXPECTED_SECRET_REF: ${{ steps.selected.outputs.secret_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$CLAIM_ID" =~ ^[0-9a-f]{32}$ ]] || { echo '::error::unsafe or missing claim id'; exit 1; }
+          python3 registry/scripts/select-and-claim.py \
+            --inspect "$CLAIM_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --expected-holder-prefix "review:$TARGET_REPO#batch-" > "$RUNNER_TEMP/leg-lease.json"
+          python3 - "$RUNNER_TEMP/leg-lease.json" <<'PY'
+          import json, os, sys, time
+
+          LEG_BUDGET = 25 * 60  # this job's timeout-minutes (keep in sync)
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              lease = json.load(handle)
+          if not isinstance(lease, dict):
+              raise SystemExit("adopted lease vanished before credential dereference (fail closed)")
+          for env_key, lease_key in (("EXPECTED_ACCOUNT", "account"),
+                                     ("EXPECTED_MODEL", "model"),
+                                     ("EXPECTED_SECRET_REF", "secret_ref")):
+              if lease.get(lease_key) != os.environ[env_key]:
+                  raise SystemExit(f"live lease {lease_key} no longer matches this batch; "
+                                   "refusing the credential")
+          try:
+              remaining = int(lease.get("expires_at", 0)) - int(time.time())
+          except (TypeError, ValueError):
+              raise SystemExit("live lease expiry is malformed (fail closed)")
+          if remaining < LEG_BUDGET:
+              raise SystemExit(
+                  f"lease has {remaining}s left, under this leg's {LEG_BUDGET}s budget; "
+                  "re-planning instead of risking a mid-review reclaim")
+          print(f"lease re-inspected: {remaining}s remaining covers the leg budget")
+          PY
+
       - name: Prepare the read-only reviewer container (no GitHub token inside)
         id: prepare
         env:
@@ -878,22 +968,60 @@ jobs:
           WORKER_AGENT: ${{ needs.resolve-batch.outputs.agent }}
         run: bash ../registry/scripts/worker-live.sh review
 
-      # [GPT-5.6 r4 #5] The provider CLI may refresh the account credential during the run (codex
-      # rotates its auth.json); write it back exactly like review-fix.yml/worker.yml so the next
-      # claim still authenticates — without this the batch lane could leave the repository secret
-      # stale. Runs IMMEDIATELY after the model step (rotation only happens during the model
-      # call; this leg runs no target code afterwards). K legs share the ONE claimed account, so
-      # concurrent rotations race last-writer-wins — every written value is a FULL refreshed
-      # credential worker-live.sh validated, so any winner authenticates.
-      - name: Write back a rotated full account credential
+      # [FABLE-5 r7 #5] The provider CLI may refresh the account credential during the run (codex
+      # rotates its auth.json). K legs share the ONE claimed account, so per-leg unconditional
+      # `gh secret set` writes were a LOST-UPDATE race: a leg holding an OLDER refresh generation
+      # could finish last and overwrite a newer credential, stranding the account. The batch
+      # therefore does exactly ONE write-back, in the commit-outcome job: each leg only STAGES
+      # its rotated credential (encrypted — this registry is public and artifacts are readable
+      # with repo read access; the passphrase is REGISTRY_SECRETS_PAT, which already rides in
+      # review legs for the write-back it replaces and is available to commit-outcome), and the
+      # outcome job picks the NEWEST generation by the auth file's own refresh/expiry field and
+      # performs the single worker-live.sh write-back. An unchanged credential stages nothing.
+      - name: Stage a rotated account credential for the single batch write-back (encrypted)
+        id: stage-credential
         if: ${{ always() && steps.prepare.outcome == 'success' && steps.review.outcome != 'skipped' }}
         env:
-          WORKER_ROOT: ${{ runner.temp }}/registry-worker
-          WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
-          WORKER_SECRET_REF: ${{ steps.selected.outputs.secret_ref }}
-          REGISTRY_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ matrix.pr_number }}
+          CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
-        run: bash registry/scripts/worker-live.sh write-back
+        run: |
+          set -euo pipefail
+          # WORKER_CREDENTIAL_PATH/BASELINE come from worker-prep.sh via GITHUB_ENV.
+          [[ -n "${WORKER_CREDENTIAL_PATH:-}" && -f "$WORKER_CREDENTIAL_PATH" \
+             && -n "${WORKER_CREDENTIAL_BASELINE:-}" && -f "$WORKER_CREDENTIAL_BASELINE" ]] || {
+            echo '::warning::credential files unavailable; nothing to stage'; exit 0; }
+          if cmp -s -- "$WORKER_CREDENTIAL_BASELINE" "$WORKER_CREDENTIAL_PATH"; then
+            echo 'credential unchanged; nothing to stage'
+            exit 0
+          fi
+          if [[ -z "$REGISTRY_SECRETS_PAT" ]]; then
+            echo '::warning::credential rotated but REGISTRY_SECRETS_PAT is absent; cannot stage it'
+            exit 0
+          fi
+          out="$RUNNER_TEMP/rotated-credential"
+          mkdir -p "$out"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -pass env:REGISTRY_SECRETS_PAT \
+            -in "$WORKER_CREDENTIAL_PATH" -out "$out/credential.enc"
+          CAPTURED_AT="$(date -u +%s)" python3 - "$out/meta.json" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as fh:
+              json.dump({"pr_number": int(os.environ["PR_NUMBER"]),
+                         "credential_format": os.environ["CREDENTIAL_FORMAT"],
+                         "captured_at": int(os.environ["CAPTURED_AT"])}, fh)
+          PY
+          printf 'staged=true\n' >> "$GITHUB_OUTPUT"
+          echo 'rotated credential staged (encrypted) for the single batch write-back'
+
+      - name: Upload this leg's rotated-credential artifact
+        if: ${{ always() && steps.stage-credential.outputs.staged == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: batch-credential-${{ matrix.pr_number }}
+          path: ${{ runner.temp }}/rotated-credential
+          retention-days: 1
+          if-no-files-found: error
 
       # [GPT-5.6 r4 #5] Model-access health (registry #32), single-path semantics per LEG:
       # a successful review is `success`; a skipped model step after the batch claim is a
@@ -1103,6 +1231,124 @@ jobs:
           path: ${{ runner.temp }}/items
           pattern: batch-verdict-*
 
+      # [FABLE-5 r7 #5] EXACTLY ONE credential write-back per batch. The K legs share one
+      # rotating account credential; each leg that observed a rotation staged it encrypted
+      # (never a per-leg `gh secret set` — that was a lost-update race where an older refresh
+      # generation finishing last overwrote a newer one). Here the newest generation is chosen
+      # by the auth file's OWN refresh/expiry field (codex auth.json `last_refresh`, claude
+      # credentials `claudeAiOauth.expiresAt`; the leg's capture time is only the fallback
+      # tiebreak) and written back ONCE through the same validated worker-live.sh write-back
+      # the single path uses. always(): a verdict-pipeline failure must not lose a rotated
+      # credential — that would strand the account for every future claim.
+      - name: Download all per-leg rotated-credential artifacts
+        if: ${{ always() }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/credentials
+          pattern: batch-credential-*
+
+      - name: Write back the newest rotated credential (single serialized write)
+        if: ${{ always() }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/writeback
+          WORKER_ACCOUNT: ${{ inputs.account }}
+          WORKER_SECRET_REF: ${{ inputs.secret_ref }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dirs=("$RUNNER_TEMP"/credentials/batch-credential-*)
+          if [[ ${#dirs[@]} -eq 0 ]]; then
+            echo 'no leg staged a rotated credential; write-back not needed'
+            exit 0
+          fi
+          if [[ -z "$REGISTRY_SECRETS_PAT" ]]; then
+            echo '::warning::rotated credentials staged but REGISTRY_SECRETS_PAT is absent; skipping write-back'
+            exit 0
+          fi
+          printf '::add-mask::%s\n' "$REGISTRY_SECRETS_PAT"
+          mkdir -p "$WORKER_ROOT"
+          for d in "${dirs[@]}"; do
+            [[ -f "$d/credential.enc" && -f "$d/meta.json" ]] || continue
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -pass env:REGISTRY_SECRETS_PAT \
+              -in "$d/credential.enc" -out "$d/credential.dec" \
+              || { echo "::warning::undecryptable staged credential in $(basename "$d")"; continue; }
+          done
+          python3 - "$RUNNER_TEMP/credentials" "$WORKER_ROOT" <<'PY'
+          import json, os, sys
+          from datetime import datetime
+
+          cred_root, worker_root = sys.argv[1], sys.argv[2]
+
+          def iso_ts(value):
+              try:
+                  return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+              except (TypeError, ValueError):
+                  return None
+
+          def generation(path, fmt):
+              """The credential's OWN refresh generation, by format; None when it defines none."""
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      doc = json.load(fh)
+              except (OSError, ValueError, UnicodeDecodeError):
+                  return None
+              if not isinstance(doc, dict):
+                  return None
+              if fmt == "codex-auth-json":
+                  return iso_ts(doc.get("last_refresh"))
+              if fmt == "claude-credentials-json":
+                  oauth = doc.get("claudeAiOauth")
+                  if isinstance(oauth, dict):
+                      try:
+                          return float(oauth["expiresAt"])
+                      except (KeyError, TypeError, ValueError):
+                          return None
+              return None
+
+          candidates = []
+          for name in sorted(os.listdir(cred_root)):
+              d = os.path.join(cred_root, name)
+              dec, mf = os.path.join(d, "credential.dec"), os.path.join(d, "meta.json")
+              if not (os.path.isfile(dec) and os.path.isfile(mf)):
+                  continue
+              try:
+                  with open(mf, encoding="utf-8") as fh:
+                      meta = json.load(fh)
+                  fmt = str(meta["credential_format"])
+                  captured = int(meta["captured_at"])
+              except (OSError, ValueError, KeyError, TypeError):
+                  print(f"::warning::malformed staged credential meta in {name}; skipped")
+                  continue
+              gen = generation(dec, fmt)
+              candidates.append(((gen is not None, gen if gen is not None else 0.0, captured),
+                                 dec, fmt, meta.get("pr_number")))
+          if not candidates:
+              print("no decryptable staged credential; write-back skipped")
+              raise SystemExit(0)
+          candidates.sort(key=lambda c: c[0])
+          _, chosen, fmt, leg = candidates[-1]
+          with open(chosen, "rb") as src, open(
+                  os.path.join(worker_root, "credential-current"), "wb") as dst:
+              dst.write(src.read())
+          # An EMPTY baseline can never equal a real credential, so worker-live.sh write-back's
+          # unchanged-cmp gate always proceeds to its validation + single `gh secret set`.
+          open(os.path.join(worker_root, "credential-baseline"), "wb").close()
+          with open(os.path.join(worker_root, "credential-format"), "w",
+                    encoding="utf-8") as fh:
+              fh.write(fmt)
+          print(f"newest rotated credential chosen from leg #{leg} "
+                f"({len(candidates)} staged, format={fmt})")
+          PY
+          if [[ -f "$WORKER_ROOT/credential-current" ]]; then
+            WORKER_CREDENTIAL_PATH="$WORKER_ROOT/credential-current" \
+            WORKER_CREDENTIAL_BASELINE="$WORKER_ROOT/credential-baseline" \
+            WORKER_CREDENTIAL_FORMAT="$(cat "$WORKER_ROOT/credential-format")" \
+            bash registry/scripts/worker-live.sh write-back
+          fi
+
       - name: Build the batch manifest + re-validate every verdict on fresh code
         id: build
         env:
@@ -1161,7 +1407,7 @@ jobs:
           # ([GPT-5.6 r4] / issue #96 — the protected default branch rejects EVERY github.token
           # write, Contents-API and Git-Data-API alike, so a master-targeted commit can never
           # land). Every verdict reader resolves records ledger-FIRST with a legacy
-          # default-branch fallback (dispatch-claim --registry-ledger-root, review-fix/-batch
+          # default-branch fallback (dispatch-claim --ledger-root, review-fix/-batch
           # stage steps), so verdicts land exactly where the readers look. Override for
           # tests/migration only.
           REGISTRY_VERDICT_REF: ${{ vars.REGISTRY_VERDICT_REF || 'ledger' }}
