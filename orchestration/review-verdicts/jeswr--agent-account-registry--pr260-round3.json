@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-2 stale-authorization finding is resolved. Immediately before the policy CAS, the workflow fetches the issue's live labels through the API, fails closed on fetch or malformed-state errors, and requires the live non-empty target set to exactly equal the pre-login snapshot. The added self-test is non-vacuous: removal, replacement, narrowing, and widening each must raise, while an unchanged set must pass. The write path also revalidates each target against the current policy snapshot and preserves the parsed membership/scoping postconditions from round 2. No blocker or major issue remains in the diff.",
+ "verdict": "approve"
+}
