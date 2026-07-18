@@ -920,7 +920,16 @@ def _plan_actions(
             key = (repo, number)
             labels = _labels(issue, f"target issue {repo}#{number}")
             used = attempts[key]
-            if used >= limits[repo].max_attempts and key not in live_by_issue:
+            # An open PR that links this issue means the final allowed attempt SUCCEEDED — its
+            # worker PR is live. Parking the source issue (`needs:user`) here would strip that PR
+            # from dispatch's review loop (any source `needs:*` is terminal there), so exhaustion
+            # never defers while a linked PR is open. This mirrors the `number in links` guard just
+            # below; it must run FIRST so a successful last attempt is not mis-parked.
+            if (
+                used >= limits[repo].max_attempts
+                and key not in live_by_issue
+                and number not in links
+            ):
                 actions.append(
                     IssueAction(repo, number, "defer", "attempt budget exhausted")
                 )
@@ -1189,6 +1198,13 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 )
                 continue
         else:
+            # Recheck the freshly revalidated links immediately before the defer write: if a linked
+            # worker PR is open now, the exhausted final attempt succeeded and parking it would
+            # strand that PR in dispatch's review loop. Mirrors the plan-time `number not in links`
+            # suppression and the ready-path open-PR guard above.
+            if action.number in current_links[action.repo]:
+                print(f"SKIP issue {action.repo}#{action.number}: an open PR appeared")
+                continue
             current_comments = (
                 _comments(api, action.repo, action.number)
                 if issue.get("comments", 0)
@@ -1678,10 +1694,27 @@ def _self_test() -> int:
                     now - 700, timezone.utc
                 ).isoformat(),
             },
+            # Issue #9: the attempt budget is exhausted (issue #170), but its FINAL allowed attempt
+            # opened a still-open worker PR (linked via #91). Exhaustion must NOT defer it — parking
+            # `needs:user` here would strip #91 from dispatch's review loop.
+            9: {
+                "labels": [{"name": "status:in-progress"}],
+                "updated_at": datetime.fromtimestamp(
+                    now - 700, timezone.utc
+                ).isoformat(),
+            },
         }
     }
-    fixture_pulls = {"owner/repo": {}}
-    fixture_attempts = {("owner/repo", 7): 0, ("owner/repo", 8): 2}
+    fixture_pulls = {
+        "owner/repo": {
+            91: {
+                "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat(),
+                "head": {"ref": "sparq-agent/issue-9-91-1"},
+                "body": "Fixes #9",
+            }
+        }
+    }
+    fixture_attempts = {("owner/repo", 7): 0, ("owner/repo", 8): 2, ("owner/repo", 9): 2}
     fixture_states = {"a" * 32: LeaseDecision("dead", "fixture complete")}
     actions, prs, dead = _plan_actions(
         {"owner/repo": limits},
@@ -1697,6 +1730,11 @@ def _self_test() -> int:
         "fixture plans dead reset and exhaustion",
         [(action.number, action.mode) for action in actions],
         [(7, "ready"), (8, "defer")],
+    )
+    check(
+        "MUTATION: exhaustion does NOT defer an issue whose final attempt PR is open (#170)",
+        any(action.number == 9 for action in actions),
+        False,
     )
     check("fixture reclaims dead claim", dead, {"a" * 32})
     check("fixture has no PR writes", prs, [])
