@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "validate_policy_for_n3 does not enforce single-valued odrl:action, odrl:target, or odrl:assignee for permissions. The Rust parser used by materialize_policy selects only first_str for each attribute, but odrl-d.n3 matches any value present. Thus a permission containing two assignees (or actions/targets) can fail to match in Rust yet match and grant in N3, violating the documented decision-equivalence and creating an authorization-widening discrepancy. The current differential corpus contains only single-valued rules, so it cannot detect this.",
+   "file": "crates/sparq-solid/src/odrl_bridge.rs",
+   "fix_hint": "Before reasoning, reject any permission or prohibition rule having cardinality other than exactly one for action/target/assignee, or define and implement identical multi-value semantics in both paths. Add a public-path differential test with two assignees (and preferably action/target variants) that fixes which value the Rust parser selects and asserts the N3 call refuses or produces exactly the same no-grant result while leaving the graph unchanged.",
+   "severity": "major",
+   "title": "Multi-valued permission attributes can widen access on the N3 path"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 4 regresses from the clean round-3 verdict: reserved-term injection remains blocked, but the new N3 path is not decision-equivalent to the Rust evaluator for multi-valued permission attributes. The Rust parser collapses each rule's action/target/assignee to one value, while the N3 rules existentially match every RDF value. An untrusted policy can therefore add a second matching action, target, or assignee and obtain an N3 grant that the Rust path does not grant. Validation currently applies structural checks only to prohibitions and does not reject cardinality ambiguity on permissions. This is authorization-widening and needs a real differential rejection test.",
+ "verdict": "request_changes"
+}
