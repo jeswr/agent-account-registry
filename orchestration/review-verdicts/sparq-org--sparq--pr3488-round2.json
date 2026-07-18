@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The gather-meta.json writer is followed by `|| step WARN`, so write/serialization failure does not change GATHER_STATUS or prevent the complete branch. That branch then logs `gather complete` before touching GATHER_DONE. The launcher explicitly accepts that console text as DONE, so failure after the log but before the touch is also accepted. In both cases the launcher can exit zero even though the documented canonical-success artifacts were not durably produced; this leaves the same fail-honest protocol class only partially fixed.",
+   "file": "scripts/bench/canonical-beir-gather-instance.sh",
+   "fix_hint": "Make a successfully written and re-parsed gather-meta.json with canonical=true a prerequisite for success, otherwise set failed/partial, write GATHER_FAILED, and exit nonzero. Touch GATHER_DONE before emitting any console completion marker, or have the launcher reserve success strictly for the sentinel and use console output only to recover artifacts. Extend the sentinel test with a forced metadata-write failure and a fixture proving console `gather complete` without GATHER_DONE cannot produce launcher success.",
+   "severity": "major",
+   "title": "Success can be reported without provenance metadata or the success sentinel"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 1's two defects are materially addressed: failure/partial cases now have a distinct nonzero protocol with hermetic coverage, and the fixture-tested extractor recovers exact allowlisted JSON basenames. However, the success protocol is still not fully machine-enforced. Metadata generation is explicitly best-effort, and the launcher also treats a console log line emitted before the success sentinel as equivalent to observing that sentinel. Thus a validated gather whose gather-meta.json write fails, or which dies between logging completion and touching GATHER_DONE, can still be reported as successful. Because this is a new major finding despite the prior findings being fixed, progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
