@@ -549,12 +549,23 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
 
 
 def busy_packages_of_pulls(repo, pulls, issue_labels):
-    """PURE busy-area union for the PLAN conflict partition (registry issue #27): EVERY open
-    same-repo `sparq-agent/*` PR — draft or not, ANY review state — reserves the `area:*`
-    packages of its PR labels plus its head-ref-linked source issue. A known issue with NO area
-    labels reserves the serializing global partition (mirrors the target ready-engine); an
-    unknown/closed issue with no PR areas reserves nothing (never freeze the pipeline on a
-    stray branch)."""
+    """PURE busy-area union for the PLAN conflict partition (registry issue #27): every open
+    same-repo `sparq-agent/*` PR the review loop still OWNS — draft or not, any NON-TERMINAL
+    review state — reserves the `area:*` packages of its PR labels plus its head-ref-linked
+    source issue. A known issue with NO area labels reserves the serializing global partition
+    (mirrors the target ready-engine); an unknown/closed issue with no PR areas reserves
+    nothing (never freeze the pipeline on a stray branch).
+
+    HUMAN-PARKED PRs reserve NOTHING (the 2026-07-18 P1 frontier collapse): a PR that is
+    terminal for enumerate_review_items — `review:needs-user`/`needs:user` on the PR, or a
+    `needs:*` label on its source issue — will never be advanced autonomously, so letting it
+    hold its crate deadlocks dispatch for as long as the human takes. Measured collapse: 26 of
+    27 open sparq worker PRs sat source-parked, every planned crate read busy, and the PLAN
+    emitted ~1 item/tick against a 13-row ready frontier (dispatch runs 29664401328/
+    29665207000). The exclusions here mirror the enumerator's terminal set EXACTLY so
+    "review-loop-owned" means the same thing in both places; the parked SOURCE issue itself is
+    still `needs:*`-gated out of the target ready engine, so freeing the crate can never
+    re-dispatch the parked issue — only siblings in the same crate."""
     busy = set()
     for pull in pulls:
         if not isinstance(pull, dict) or pull.get("state") != "open":
@@ -567,10 +578,15 @@ def busy_packages_of_pulls(repo, pulls, issue_labels):
             label.get("name") if isinstance(label, dict) else label
             for label in (pull.get("labels") or [])
         }
+        if pr_labels & HUMAN_HOLD_PR_LABELS:
+            continue                      # terminal human-owned PR — not review-loop-owned
         areas = {label[5:] for label in pr_labels
                  if isinstance(label, str) and label.startswith("area:")}
         source = issue_labels.get(int(match.group(1))) if isinstance(issue_labels, dict) else None
         if isinstance(source, list):
+            if any(isinstance(label, str) and label.startswith("needs:")
+                   for label in source):
+                continue                  # source issue human-parked — same terminal posture
             issue_areas = {label[5:] for label in source
                            if isinstance(label, str) and label.startswith("area:")}
             areas |= issue_areas or {GLOBAL_PACKAGE}
@@ -2901,6 +2917,49 @@ def _self_test():
                                   [pull(62, "sparq-agent/issue-7-1-1", sha_a,
                                         head_repo="mallory/fork")],
                                   issue_labels) == plan_items
+
+    # ---- P1 frontier-collapse regression (2026-07-18): HUMAN-PARKED worker PRs must NOT
+    # reserve their crates. Reproduction shape (dispatch runs 29664401328/29665207000): a
+    # ready frontier of N=4 rows across M=4 crates while 3 crates carry an open worker PR —
+    # but only ONE of those PRs is review-loop-owned; the other two are terminal (a `needs:*`
+    # park on the source issue / a HUMAN_HOLD label on the PR itself, the exact
+    # enumerate_review_items exclusions). The plan must emit the 3 free-crate rows — dropping
+    # ONLY the live PR's crate — not collapse to the single PR-less crate (the measured
+    # ~1-item/tick deadlock: 26/27 open sparq worker PRs sat parked and every planned crate
+    # read busy).
+    frontier = [{"number": 70, "package": "crate-a", "deferred": False},
+                {"number": 71, "package": "crate-b", "deferred": False},
+                {"number": 72, "package": "crate-c", "deferred": False},
+                {"number": 73, "package": "crate-d", "deferred": False}]
+    collapse_labels = {80: ["area:crate-a", "needs:user", "role:impl"],  # source-parked
+                       81: ["area:crate-b", "role:impl"],  # source of the PR-label-parked PR
+                       82: ["area:crate-c", "role:impl"]}  # source of the LIVE in-flight PR
+    collapse_pulls = [
+        pull(75, "sparq-agent/issue-80-1-1", sha_a, labels=["review:needs"]),
+        pull(76, "sparq-agent/issue-81-1-1", sha_a, labels=["review:needs-user"]),
+        pull(77, "sparq-agent/issue-82-1-1", sha_a, labels=["review:needs"]),
+    ]
+    assert busy_packages_of_pulls(repo, collapse_pulls, collapse_labels) == {"crate-c"}
+    kept = filter_busy_area_items(frontier, repo, collapse_pulls, collapse_labels)
+    assert [item["number"] for item in kept] == [70, 71, 73], kept
+    # a needs:user PR label parks just as terminally as review:needs-user
+    assert filter_busy_area_items(
+        frontier, repo, [pull(78, "sparq-agent/issue-81-1-1", sha_a, labels=["needs:user"])],
+        collapse_labels) == frontier
+    # the GLOBAL-freeze slice of the same bug: a PARKED PR whose known source issue has no
+    # area labels must not reserve the serializing global partition (pre-fix it froze the
+    # ENTIRE repo frontier); the unparked twin still does.
+    assert filter_busy_area_items(
+        frontier, repo, [pull(79, "sparq-agent/issue-84-1-1", sha_a)],
+        {84: ["needs:user", "role:impl"]}) == frontier
+    assert filter_busy_area_items(
+        frontier, repo, [pull(79, "sparq-agent/issue-84-1-1", sha_a)],
+        {84: ["role:impl"]}) == []
+    # a parked PR's own area:* labels are discarded with it (the whole PR is terminal)
+    assert filter_busy_area_items(
+        frontier, repo, [pull(78, "sparq-agent/issue-81-1-1", sha_a,
+                              labels=["needs:user", "area:crate-d"])],
+        collapse_labels) == frontier
 
     # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
     deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]
