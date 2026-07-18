@@ -532,8 +532,14 @@ def decide_review(verdict, has_blockers, injection, round_n, max_rounds, securit
     if injection:
         return "needs-user"
     if verdict == "approve" and not has_blockers:
-        # Decision 7: security surfaces (zk/mpc/crypto/auth/e2ee/trust:*) never auto-arm.
-        return "needs-user" if security else "arm"
+        # Decision 7 REVISED (maintainer 2026-07-18: approved PRs were parking needs:user
+        # unnecessarily — on the registry nearly EVERY self-management diff touches a trust
+        # surface, so approve->park was the default outcome and the queue drowned in human
+        # hand-offs): the cross-provider approve IS the arm decision on every surface. Trust
+        # surfaces keep POST-merge auditability (the `trust-surface` label + an audit comment
+        # listing the touched paths, applied by the outcome step) instead of a pre-merge
+        # park; injection/tamper evidence still stops at a human above.
+        return "arm"
     # request_changes, or a contradictory approve-with-blockers (fail closed as changes).
     if round_n >= max_rounds and budget_action not in {"extend-model-pin", "extend-progress"}:
         return "needs-user"
@@ -1322,14 +1328,6 @@ def review_outcome(args):
         approved = document["verdict"] == "approve" and not has_blockers
         if document["injection_detected"]:
             reason = "the reviewer flagged possible prompt injection"
-        elif approved and trust_surface:
-            # B3: the review APPROVED, but the diff touches a gate-weakening / orchestration
-            # trust-surface path — the automated cross-provider review is complete, but the arm
-            # is a human's regardless of issue labels.
-            reason = ("trust-surface change approved by cross-provider review; human arm "
-                      f"required (diff touches: {', '.join(surface_hits[:8])})")
-        elif approved:
-            reason = "a security-labelled surface passed review and needs a HUMAN arm decision"
         else:
             reason = (f"the review round budget is exhausted at {args.round} round(s) (base "
                       f"{args.max_rounds}, hard cap {HARD_CAP_ROUNDS}) with no extension left — "
@@ -1340,7 +1338,17 @@ def review_outcome(args):
                    alert_repo=alert_repo, alert_token=alert_token)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
-        # narrowly-minted arm token; nothing to mutate here.
+        # narrowly-minted arm token; nothing to mutate here EXCEPT the post-merge audit
+        # trail for trust surfaces (Decision 7 revision): label + one comment listing the
+        # touched security paths so an armed trust-plane diff is auditable at a glance.
+        if trust_surface or security:
+            hits = ", ".join(surface_hits[:8]) if trust_surface else "security-labelled issue"
+            _run_gh(["pr", "edit", str(args.pr), "-R", args.repo,
+                     "--add-label", "trust-surface"], check=False)
+            _run_gh(["pr", "comment", str(args.pr), "-R", args.repo, "--body",
+                     "> 🤖 SPARQ agent\n\nARMED on cross-provider approve. "
+                     f"Trust-surface audit trail: {hits}. Post-merge review welcome; "
+                     "revert-and-reopen is the escalation path."], check=False)
         print("verdict approved: arm step will run under the arm-scoped token")
 
 
@@ -1498,8 +1506,8 @@ def _self_test():
             check(f"rejects {name}", "accepted", "rejected")
 
     check("approve arms", decide_review("approve", False, False, 1, 3, False), "arm")
-    check("approve+security needs user", decide_review("approve", False, False, 1, 3, True),
-          "needs-user")
+    check("approve+security ARMS (Decision 7 revision 2026-07-18)",
+          decide_review("approve", False, False, 1, 3, True), "arm")
     check("injection short-circuits", decide_review("approve", False, True, 1, 3, False),
           "needs-user")
     check("changes under budget", decide_review("request_changes", True, False, 2, 3, False),
@@ -1521,9 +1529,9 @@ def _self_test():
     check("extension never overrides injection",
           decide_review("request_changes", False, True, 3, 3, False,
                         budget_action="extend-progress"), "needs-user")
-    check("extension never arms security",
+    check("approve at exhaustion still arms on any surface (Decision 7 revision)",
           decide_review("approve", False, False, 3, 3, True,
-                        budget_action="extend-progress"), "needs-user")
+                        budget_action="extend-progress"), "arm")
 
     # ---- decide_budget (directive 2026-07-17): the combined round-budget policy ----
     def budget(rounds, models, progress, provider="anthropic", base=3, pending=(), pin=None):
