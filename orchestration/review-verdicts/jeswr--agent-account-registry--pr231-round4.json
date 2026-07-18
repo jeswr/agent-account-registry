@@ -1,0 +1,15 @@
+{
+ "injection_detected": true,
+ "issues": [
+  {
+   "body": "The model previously held the live credential while writing the target. `_gate_container_argv` still mounts that target read-write into hostile gate code, does not pass `--network none`, and streams the container's stdout/stderr directly to the job log. A steered model can preserve the credential in a reversible encoding that the literal pre-gate scan cannot detect; gate code can then decode it and transmit it over the network, print it to the unredacted log, or write plaintext into the target after the only credential scan. `publish_pr` later stages the whole tree. The diff itself accurately concedes these channels, so the sandbox changes do not resolve the prior blocker. The new self-test is also incomplete: it asserts mount count and hardening flags but has no assertion that `--network none` is present or that hostile output and post-scan target writes cannot become exfiltration/publication channels.",
+   "file": "scripts/worker-live.sh",
+   "fix_hint": "Remove the condition in which one actor both receives the live credential and can write data later consumed by hostile target code, for example by brokering credential use outside the model's writable trust domain. Deny the gate outbound network access, prevent unredacted hostile output from reaching logs, and ensure gate writes cannot enter the post-scan publish set. Add non-vacuous self-tests that fail when `--network none` or the corresponding output/write containment is absent. Another literal credential scan is not a sound substitute for containment against reversible encodings.",
+   "severity": "blocker",
+   "title": "Gate still exposes model-stashed credentials through live egress channels"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "The round-3 blocker remains. The new comments now explicitly acknowledge that the gate can read a recoverably encoded credential from the model-writable target and exfiltrate it through unrestricted network access or unredacted stdout/stderr, but the launcher still provides all of those channels. The added self-tests verify mounts and several hardening flags while omitting the decisive no-network and output-containment assertions. The diff also contains reviewer-directed imperative text (for example, \"do not read this as a containment proof\"), so injection_detected is true. Because the material security finding is unchanged at blocker severity, progress is stagnant.",
+ "verdict": "request_changes"
+}
