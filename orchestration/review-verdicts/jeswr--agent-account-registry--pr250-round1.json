@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The new threshold and review-round mean validators check type and `>= 0` but never require finiteness. Python's JSON decoder turns a valid large exponent such as `1e309` into positive infinity; that value passes both checks. `_write_site` then uses the default `json.dump(..., allow_nan=True)` and emits the non-standard token `Infinity`. Browser `response.json()` rejects that document, so one malformed collector metric takes down the entire public dashboard instead of being rejected or sanitized. The affected paths are `thresholds.*` and `flow.review_rounds.mean` (and direct `Infinity` input is also accepted by Python's decoder). The self-test has no non-finite/overflow case, so this regression is not caught.",
+   "file": "scripts/dashboard-gen.py",
+   "fix_hint": "Require `math.isfinite()` for every accepted float, including thresholds and review-round mean, and add self-tests using an overflow value such as `1e309` for both paths. Also serialize with `allow_nan=False` as a final fail-closed backstop so no future normalization path can publish NaN or Infinity.",
+   "severity": "major",
+   "title": "Non-finite observability numbers can corrupt the published data.json"
+  }
+ ],
+ "progress": null,
+ "summary": "The observability path is generally well structured and its golden/rejection tests are substantive, but numeric normalization is not fully fail-closed. Valid JSON numeric inputs can become non-finite Python floats and then be published as non-standard JSON, breaking every dashboard refresh. This needs correction before approval.",
+ "verdict": "request_changes"
+}
