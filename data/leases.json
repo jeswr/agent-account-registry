@@ -9,6 +9,16 @@
    "model": "sonnet",
    "issued_at": 1784393855,
    "expires_at": 1784397455
+  },
+  {
+   "account": "acct03",
+   "claim_id": "f2989e5921034104a452a62080f9ee19",
+   "holder": "fix:sparq-org/sparq#3478@dispatch-29654326159.1",
+   "package": "sparq-shacl",
+   "role": "fix",
+   "model": "opus",
+   "issued_at": 1784396530,
+   "expires_at": 1784400130
   }
  ]
 }
