@@ -24,10 +24,16 @@ jobs:
     # (continue-on-error — the dashboard still deploys, rendering usage as `unknown`), but
     # their REAL outcomes feed this output so a failed probe raises a non-terminal
     # `usage-probe-degraded` alarm and BLOCKS the recover job — a silent probe failure can no
-    # longer publish false availability or clear prior dashboard alerts. 'true' ONLY when both
-    # steps genuinely succeeded; anything else (including a crash before them) is degraded.
+    # longer publish false availability or clear prior dashboard alerts. Round-9 P1: step
+    # outcomes alone are NOT health — account-usage.py deliberately OMITS accounts whose
+    # token/probe failed and still exits 0 (a `{}` snapshot "succeeds"), so the gate also
+    # requires the probe's SEMANTIC coverage verdict (`coverage_ok`, written by the script to
+    # $GITHUB_OUTPUT: true only when EVERY pool-admitted catalog account carries a usage entry).
+    # 'true' ONLY when both steps genuinely succeeded AND coverage is complete; anything else
+    # (including a crash before the verdict is written — the output then reads empty) is
+    # degraded.
     outputs:
-      usage_probe_ok: ${{ (steps.acct-secrets.outcome == 'success' && steps.probe.outcome == 'success') && 'true' || 'false' }}
+      usage_probe_ok: ${{ (steps.acct-secrets.outcome == 'success' && steps.probe.outcome == 'success' && steps.probe.outputs.coverage_ok == 'true') && 'true' || 'false' }}
     steps:
       - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -83,7 +89,12 @@ jobs:
       # "successful" `{}` snapshot (which the generator then published as every account
       # AVAILABLE). A failed self-test or probe now fails THIS step — non-terminal via
       # continue-on-error (the dashboard still deploys, rendering usage as `unknown`), but the
-      # real outcome feeds `usage_probe_ok`, which alarms and blocks recovery. stderr is still
+      # real outcome feeds `usage_probe_ok`, which alarms and blocks recovery. Round-9 P1: the
+      # script ALSO writes its semantic coverage verdict (`coverage_ok=true` only when every
+      # pool-admitted account carries a usage entry — a fail-closed per-account omit exits 0)
+      # straight to $GITHUB_OUTPUT, and `usage_probe_ok` requires it; the verdict is a boolean,
+      # never a count (locked decision 22b). USAGE_COVERAGE_OUTPUT is scoped to the snapshot
+      # invocation only so the self-test can never write a stray output line. stderr is still
       # discarded on the probe call (credential-safety posture: never stream probe stderr).
       - name: Probe live account usage (tokens never printed)
         id: probe
@@ -95,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/account-usage.py --self-test
-          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null
+          USAGE_COVERAGE_OUTPUT="$GITHUB_OUTPUT" python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null
           echo 'usage-probe: snapshot written'
 
       - name: Generate privacy-safe dashboard
@@ -190,8 +201,10 @@ jobs:
       # [FABLE-5] Round-8 P1: the degraded-usage-probe out-of-band alarm. NON-TERMINAL — the
       # tick stays green and the dashboard still deploys — but LOUD: the rolling alert carries a
       # `usage-probe-degraded` row, and `recover` (gated on usage_probe_ok == 'true') will not
-      # clear dashboard rows until a tick probes cleanly. Both steps can fire in one run
-      # (probe degraded + deploy failed): two distinct rows, both accurate.
+      # clear dashboard rows until a tick probes cleanly. Round-9 P1: `usage_probe_ok` now also
+      # embeds the probe's SEMANTIC coverage verdict, so a green probe step whose snapshot
+      # silently omitted failed accounts (even a bare `{}`) fires this alarm too. Both steps can
+      # fire in one run (probe degraded + deploy failed): two distinct rows, both accurate.
       - name: Alarm on a degraded usage probe (dashboard deployed with unknown usage, non-terminal)
         if: >-
           ${{ needs.build.result == 'success' &&
@@ -203,9 +216,10 @@ jobs:
           failure-class: usage-probe-degraded
           detail: >-
             dashboard usage probe DEGRADED — the secret materialization or live usage probe
-            failed, so the dashboard deployed rendering every account's usage/availability as
-            unknown (no false availability is published); heals automatically once a dashboard
-            tick probes cleanly
+            failed, or the probe observed usage for only part of the account catalog (semantic
+            coverage incomplete), so the dashboard deployed rendering the unobserved accounts'
+            usage/availability as unknown (no false availability is published); heals
+            automatically once a dashboard tick probes cleanly with full coverage
           registry-token: ${{ github.token }}
           alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           alert-token: ${{ secrets.ALERT_TOKEN || '' }}
@@ -219,8 +233,11 @@ jobs:
     # `usage_probe_ok == 'true'` (round-8 P1): a green tick whose usage probe failed proved
     # NOTHING about probe health — running --resolve on it would clear prior dashboard alerts
     # (including the freshly-raised `usage-probe-degraded` row's predecessors) on the strength
-    # of a run that observed no usage data at all. The exact-'true' comparison is itself
-    # fail-closed: a missing/empty output skips recovery too.
+    # of a run that observed no usage data at all. Round-9 P1: the gate is SEMANTIC, not just
+    # step-outcome — usage_probe_ok also requires the probe's coverage_ok verdict, so a
+    # "successful" probe whose snapshot omitted failed accounts (a `{}` result is not health)
+    # blocks recovery too. The exact-'true' comparison is itself fail-closed: a missing/empty
+    # output skips recovery.
     if: >-
       ${{ always() && needs.build.result == 'success' && needs.deploy.result == 'success' &&
           needs.build.outputs.usage_probe_ok == 'true' }}

@@ -78,7 +78,18 @@ def _trusted_logins():
     return TRUSTED_COMMENT_LOGINS | {t.strip() for t in extra.split(",") if t.strip()}
 
 # --- bounds (WHY): the issue body is the rendered view; keep it small + readable. ----------------
-MAX_TABLE_ROWS = 30          # newest N (workflow/job/class) rows shown in the table + kept in ledger
+# MAX_TABLE_ROWS bounds ONLY the RENDERED table (round-9 P1: it used to bound the persisted ledger
+# too, so a 31st distinct active key silently evicted the oldest row — whose durable comment was
+# already below the fold watermark, so it could never be re-folded, and once the surviving 30
+# recovered the issue closed over a failure that never recovered). The hidden JSON ledger now
+# keeps EVERY active row (see _prune). That set is bounded by the number of DISTINCT
+# (workflow, job, failure-class) keys — fleet-bounded and trust-gated (only trusted authors can
+# feed the fold), not attacker-growable. Fail direction if it ever outgrows the issue-body size
+# limit anyway: the body edit fails LOUDLY, rows stay durable in the comment log above the
+# watermark, and recovery cannot close (a stuck-OPEN alert — fail closed, never a forgotten
+# failure). Rows beyond the rendered slice drop their free-text detail tail to keep the body
+# compact (detail refreshes on the next recurrence; the structural row is what must survive).
+MAX_TABLE_ROWS = 30          # newest N (workflow/job/class) rows RENDERED in the table (view bound)
 MAX_DETAIL_LEN = 400         # per-row sanitized diagnostic tail cap (chars)
 GH_TIMEOUT_S = 45            # per gh call
 # CONCURRENCY MODEL (round-3 P1: the body-only optimistic loop could still LOSE a row — A edits and
@@ -327,10 +338,21 @@ def _sanitize_row(row):
 
 
 def _prune(ledger):
-    """Keep the newest MAX_TABLE_ROWS rows by last_seen so the body stays bounded + readable, and
-    re-sanitize every retained row (defense-in-depth against a tampered/inherited ledger)."""
+    """Order the ACTIVE ledger newest-first and re-sanitize every row (defense-in-depth against a
+    tampered/inherited ledger). NEVER drops an active row (round-9 P1: truncating here to
+    MAX_TABLE_ROWS let a 31st distinct key evict the oldest row while its durable comment sat
+    below the fold watermark — permanently forgotten, so recovery could close over it). An active
+    row leaves the ledger ONLY via recovery (_resolve_ledger) or coercion-drop of junk. Rows
+    beyond the rendered-table slice keep their structural fields but drop the free-text detail
+    tail (body-size compactness; detail refreshes on the row's next recurrence)."""
     ledger.sort(key=lambda r: str(r.get("last_seen", "")), reverse=True)
-    return [_sanitize_row(r) for r in ledger[:MAX_TABLE_ROWS]]
+    out = []
+    for index, row in enumerate(ledger):
+        sanitized = _sanitize_row(row)
+        if index >= MAX_TABLE_ROWS:
+            sanitized["detail"] = None
+        out.append(sanitized)
+    return out
 
 
 def render_body(ledger, maintainer, folded_through=0):
@@ -340,8 +362,12 @@ def render_body(ledger, maintainer, folded_through=0):
     self-healing fold protocol rests on). EVERY rendered cell is re-sanitized — the body is the
     only thing a human reads, so nothing unsanitized may reach it even if a prior tick's ledger
     was tampered — and every count read is exception-proof (_safe_count), so a semantically
-    malformed retained row can never wedge the render (round-3 P1)."""
+    malformed retained row can never wedge the render (round-3 P1). The TABLE is bounded to the
+    newest MAX_TABLE_ROWS rows; the persisted ledger block below it carries EVERY active row
+    (round-9 P1 — a row beyond the table bound must never be forgotten by the store)."""
     total = sum(_safe_count(r.get("count"), 0) for r in ledger)
+    view = sorted(ledger, key=lambda r: str(r.get("last_seen", "")), reverse=True)
+    hidden = len(view) - MAX_TABLE_ROWS
     lines = [
         MARKER,
         f"> 🤖 SPARQ agent — automated pipeline-failure alarm. @{maintainer}",
@@ -354,7 +380,7 @@ def render_body(ledger, maintainer, folded_through=0):
         "| workflow | job | class | count | last seen (UTC) | run |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
-    for r in ledger:
+    for r in view[:MAX_TABLE_ROWS]:
         wf = _sanitize(r.get("workflow", "?"))
         job = _sanitize(r.get("job", "?"))
         cls = _sanitize(r.get("failure_class", "?"))
@@ -363,9 +389,14 @@ def render_body(ledger, maintainer, folded_through=0):
         url = r.get("run_url", "")
         run_cell = f"[run]({url})" if url.startswith("https://") else "—"
         lines.append(f"| {wf} | {job} | `{cls}` | {cnt} | {last} | {run_cell} |")
+    if hidden > 0:
+        lines.append("")
+        lines.append(f"…plus **{hidden}** older active failure class(es) beyond the "
+                     f"{MAX_TABLE_ROWS}-row table — still tracked in the hidden ledger below and "
+                     "still blocking auto-close until they recover.")
     lines.append("")
     lines.append("**Most recent diagnostic tails (credential-safe, host-observable only):**")
-    for r in sorted(ledger, key=lambda x: str(x.get("last_seen", "")), reverse=True)[:5]:
+    for r in view[:5]:
         step = _sanitize(r.get("failed_step") or "")
         detail = _sanitize(r.get("detail"))
         loc = f" · step `{step}`" if step and step != "(no diagnostic captured)" else ""
@@ -559,28 +590,40 @@ def _list_row_comments(num, repo, token):
     post-close race check, so recovery could close over a live failure). The per-write fold bound
     now lives in _fold_pending, after the `cid > folded_through` filter. Untrusted authors are
     ignored (comment-injection gate: comments are world-writable on a public repo; only the
-    workflow bot / collaborators may feed the ledger). Returns None when the listing itself failed
-    (callers degrade to a body-only write — fail-soft), [] when readable but empty/garbled."""
+    workflow bot / collaborators may feed the ledger). Returns None whenever the listing CANNOT
+    be trusted as a complete read — a failed call, empty stdout, invalid JSON, or an unexpected
+    envelope shape (round-9 P2: a successful-but-truncated/garbled response was coerced to [] and
+    read by recovery as PROOF of an empty durable log, closing over an unseen pending row; a
+    parse/shape failure is never proof of emptiness). Callers pick their fail direction: upsert
+    degrades to a body-only write (fail-soft), resolve ABORTS (fail closed). [] means a genuinely
+    readable, genuinely empty/marker-free listing. An INDIVIDUAL trusted marker comment whose
+    JSON row is garbled/uncoercible is still skipped (the envelope was intact — that is one bad
+    row, not an unreadable log; a trusted writer never produces one, and an untrusted author is
+    already ignored)."""
     proc = _gh(["api", "--paginate", "--slurp",
                 f"repos/{repo}/issues/{int(num)}/comments?per_page=100"], token, capture=True)
     if proc.returncode != 0:
         return None
+    if not (proc.stdout or "").strip():
+        return None                          # rc 0 with no payload is not a readable listing
     try:
-        pages = json.loads(proc.stdout or "[]")
+        pages = json.loads(proc.stdout)
     except ValueError:
-        return []
+        return None
     if not isinstance(pages, list):
-        return []
+        return None
     comments = []
     for page in pages:                       # --slurp wraps pages: [[...], [...]]
         if isinstance(page, list):
             comments.extend(page)
         elif isinstance(page, dict):         # tolerate an unwrapped single page
             comments.append(page)
+        else:
+            return None                      # a page that is neither is a garbled envelope
     out = []
     for comment in comments:
         if not isinstance(comment, dict):
-            continue
+            return None                      # a non-object comment entry is a garbled envelope
         cid = comment.get("id")
         body = comment.get("body")
         if (not isinstance(cid, int) or isinstance(cid, bool) or cid <= 0
@@ -1243,13 +1286,29 @@ def _self_test():
     chk("garbled ledger json -> []",
         _parse_ledger(f"{LEDGER_MARKER_OPEN}\n```json\n{{not json[[[\n```\n{LEDGER_MARKER_CLOSE}"), [])
 
-    # --- prune bounds the body ------------------------------------------------------------------
+    # --- the TABLE is bounded; the persisted ACTIVE ledger is COMPLETE (round-9 P1) -------------
+    # _prune used to truncate the ledger itself to MAX_TABLE_ROWS, so a 31st distinct active key
+    # evicted the oldest row while its durable comment sat below the fold watermark — permanently
+    # forgotten, and recovery could close over it. Now only the RENDERED table is bounded.
     big = []
     for i in range(MAX_TABLE_ROWS + 15):
         big = _merge_row(big, {"workflow": "w", "job": f"j{i}", "failure_class": "job-failure",
                                "detail": "d", "run_url": "https://x",
                                "last_seen": f"2026-07-18T{i % 24:02d}:00:00Z"})
-    chk("prune bounds row count", len(_prune(big)), MAX_TABLE_ROWS)
+    pruned_big = _prune(big)
+    chk("prune keeps EVERY active row (never forgets beyond the table bound)",
+        len(pruned_big), MAX_TABLE_ROWS + 15)
+    ok("rows beyond the rendered slice drop only the free-text detail tail",
+       pruned_big[MAX_TABLE_ROWS]["detail"] is None
+       and isinstance(pruned_big[0]["detail"], str))
+    big_body = render_body(pruned_big, "jeswr")
+    chk("the rendered TABLE stays bounded to MAX_TABLE_ROWS data rows",
+        sum(1 for line in big_body.splitlines() if line.startswith("|")),
+        MAX_TABLE_ROWS + 2)   # header + separator + data rows
+    ok("the overflow is announced, never silent (no silent caps)",
+       "plus **15** older active failure class(es)" in big_body)
+    chk("EVERY active row round-trips through the persisted ledger block",
+        len(_parse_ledger(big_body)), MAX_TABLE_ROWS + 15)
 
     # --- build_row from env ---------------------------------------------------------------------
     saved = dict(os.environ)
@@ -1442,6 +1501,10 @@ def _self_test():
 
         def fake(args, token, capture=False):
             seen.append(list(args))
+            if args and args[0] == "api":
+                if "--slurp" in args:      # a READABLE, EMPTY comment log ("" would abort now)
+                    return subprocess.CompletedProcess(args, 0, "[]", "")
+                return subprocess.CompletedProcess(args, 0, "", "")
             verb = args[1] if len(args) > 1 else ""
             if verb == "list":
                 state = args[args.index("--state") + 1] if "--state" in args else ""
@@ -1570,6 +1633,8 @@ def _self_test():
 
     def dup_create_gh(args, token, capture=False):
         if args and args[0] != "issue":   # the ensure-label call also has args[1] == "create"
+            if "--slurp" in args:         # a READABLE, EMPTY comment log (reconcile may close)
+                return subprocess.CompletedProcess(args, 0, "[]", "")
             return subprocess.CompletedProcess(args, 0, "", "")
         verb = args[1] if len(args) > 1 else ""
         if verb == "list":
@@ -1797,6 +1862,8 @@ def _self_test():
 
         def fake(args, token, capture=False):
             if args and args[0] == "api":
+                if "--slurp" in args:      # a READABLE, EMPTY comment log ("" would abort now)
+                    return subprocess.CompletedProcess(args, 0, "[]", "")
                 return subprocess.CompletedProcess(args, 0, "", "")
             verb = args[1] if len(args) > 1 else ""
             if verb == "list":
@@ -2539,6 +2606,165 @@ def _self_test():
            and all(r.get("workflow") != "dispatch" for r in _parse_ledger(bd["body"])))
         ok("resolve's unbounded fold advances the watermark over the newest comment",
            _parse_ledger_doc(bd["body"])[1] >= 456)
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- round-9 P1 regression: >MAX_TABLE_ROWS distinct ACTIVE keys — the row beyond the ------
+    # table bound must survive the write AND block recovery-close. The old _prune dropped the
+    # oldest (31st) row at write time; its comment was already below the watermark, so once the
+    # surviving 30 recovered the issue CLOSED although that workflow never recovered.
+    many_rows = [{"workflow": "busy", "job": f"j{i}", "failure_class": "job-failure",
+                  "count": 1, "last_seen": "2026-07-18T11:00:00Z", "run_url": "https://x/1",
+                  "detail": "d", "failed_step": ""} for i in range(MAX_TABLE_ROWS)]
+    many_rows.append({"workflow": "forgotten", "job": "run", "failure_class": "job-failure",
+                      "count": 1, "last_seen": "2026-07-18T09:00:00Z",   # the OLDEST — evicted
+                      "run_url": "https://x/2", "detail": "d", "failed_step": ""})
+    many_body = render_body(_prune(list(many_rows)), "jeswr")
+    ok("the 31st (oldest) active row survives the body write",
+       any(r.get("workflow") == "forgotten" for r in _parse_ledger(many_body)))
+    mn = {"body": many_body, "closes": 0}
+
+    def many_keys_gh(args, token, capture=False):
+        if args and args[0] == "api":
+            if "--slurp" in args:
+                return subprocess.CompletedProcess(args, 0, "[]", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 92, "body": mn["body"]}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            mn["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "close":
+            mn["closes"] += 1
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": mn["body"], "state": "OPEN"}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = many_keys_gh
+    try:
+        resolve_alarm("busy", "jeswr/x", "tok", "jeswr", run_started="2026-07-18T12:00:00Z")
+        chk("recovering the 30 table rows NEVER closes over the beyond-bound 31st row",
+            mn["closes"], 0)
+        remaining_many = _parse_ledger(mn["body"])
+        ok("the beyond-bound unrecovered row is retained (and now renders in the table)",
+           any(r.get("workflow") == "forgotten" for r in remaining_many)
+           and all(r.get("workflow") != "busy" for r in remaining_many))
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- round-9 P2 regression: a MALFORMED comment-list response is None, never [] -------------
+    # A successful-but-truncated/garbled `gh api` response must abort recovery — parse/shape
+    # failures are not proof of an empty durable log.
+    for label, payload in (("truncated/garbled json", '[[{"id": 7, "bo'),
+                           ("non-list envelope", '{"comments": []}'),
+                           ("empty stdout", ""),
+                           ("non-object comment entry", '[["garbage-string"]]')):
+        def malformed_gh(args, token, capture=False, _p=payload):
+            return subprocess.CompletedProcess(args, 0, _p, "")
+        globals()["_gh"] = malformed_gh
+        try:
+            ok(f"_list_row_comments: {label} -> None (unreadable, not empty)",
+               _list_row_comments(1, "jeswr/x", "tok") is None)
+        finally:
+            globals()["_gh"] = real_gh
+
+    def empty_ok_gh(args, token, capture=False):
+        return subprocess.CompletedProcess(args, 0, "[]", "")
+
+    globals()["_gh"] = empty_ok_gh
+    try:
+        chk("_list_row_comments: a readable empty listing is still []",
+            _list_row_comments(1, "jeswr/x", "tok"), [])
+    finally:
+        globals()["_gh"] = real_gh
+
+    # ...and on the CLOSE PATH: recovery against a garbled (rc-0) comment listing must ABORT
+    # with zero mutations, exactly like the rc!=0 outage.
+    g9_body = render_body(_prune([{
+        "workflow": "dispatch", "job": "plan", "failure_class": "job-failure", "count": 1,
+        "last_seen": "2026-07-18T10:00:00Z", "run_url": "https://x/1", "detail": "d",
+        "failed_step": ""}]), "jeswr")
+    g9 = {"muts": 0}
+
+    def garbled_close_gh(args, token, capture=False):
+        if args and args[0] == "api":
+            if "--slurp" in args:
+                return subprocess.CompletedProcess(args, 0, '[[{"id": 7, "bo', "")  # rc 0!
+            return subprocess.CompletedProcess(args, 0, "", "")
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 93, "body": g9_body}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb in ("edit", "close", "reopen", "comment"):
+            g9["muts"] += 1
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = garbled_close_gh
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            garbled_aborted = resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr",
+                                            run_started="2026-07-18T12:00:00Z")
+        ok("a GARBLED (rc-0) comment listing ABORTS recovery on the close path",
+           garbled_aborted is False)
+        chk("the garbled-listing recovery performs ZERO mutations", g9["muts"], 0)
+        ok("the garbled-listing abort is LOUD (::error::)", "::error::" in buf.getvalue())
+    finally:
+        globals()["_gh"] = real_gh
+
+    # ...and a listing that turns garbled only AFTER the close is UNVERIFIABLE state: the
+    # resolver must reopen rather than trust "no late row seen".
+    pg = {"closed": False, "reopens": 0,
+          "body": render_body(_prune([{
+              "workflow": "dispatch", "job": "plan", "failure_class": "job-failure",
+              "count": 1, "last_seen": "2026-07-18T10:00:00Z", "run_url": "https://x/1",
+              "detail": "d", "failed_step": ""}]), "jeswr")}
+
+    def post_close_garbled_gh(args, token, capture=False):
+        if args and args[0] == "api":
+            if "--slurp" in args:
+                if pg["closed"]:
+                    return subprocess.CompletedProcess(args, 0, "{not json", "")  # rc 0!
+                return subprocess.CompletedProcess(args, 0, "[]", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open" and not pg["closed"]:
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 94, "body": pg["body"]}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            pg["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "close":
+            pg["closed"] = True
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "reopen":
+            pg["reopens"] += 1
+            pg["closed"] = False
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": pg["body"],
+                                     "state": "CLOSED" if pg["closed"] else "OPEN"}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = post_close_garbled_gh
+    try:
+        ok("a post-close GARBLED listing forces the fail-closed reopen (never trusted as empty)",
+           resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr",
+                         run_started="2026-07-18T12:00:00Z") is True and pg["reopens"] >= 1)
     finally:
         globals()["_gh"] = real_gh
 

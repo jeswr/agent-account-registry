@@ -363,8 +363,15 @@ def read_accounts(repo):
     """The account catalog from the open account issues (title=handle, YAML body, status:available)."""
     out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
                 "--json", "title,body,labels"]).stdout
+    if not (out or "").strip():
+        # rc 0 with ZERO bytes is a truncated read, not an empty catalog — gh prints "[]" for
+        # one. Coercing it to [] fails open everywhere downstream ([FABLE-5] round-9 audit: the
+        # claim path would report "no eligible account" as a capacity signal, and the usage
+        # probe's semantic-coverage gate would read an expectation of 0 — an empty snapshot as
+        # health). Garbled non-empty output already raises via json.loads below.
+        raise LeaseIOError("registry account catalog read returned no payload")
     accounts = []
-    for it in json.loads(out or "[]"):
+    for it in json.loads(out):
         a = _parse_account(it.get("body"))
         a["handle"] = it["title"].strip()
         a["available"] = any(lb["name"] == "status:available" for lb in it.get("labels", []))
@@ -847,6 +854,29 @@ def _self_test():
           all(c[2].endswith("?ref=ledger") for c in fixture_gets), True)
     check("fixture writes all pin branch=ledger",
           [sum(1 for a in c if a == "branch=ledger") for c in fixture_puts], [1, 1])
+
+    # ---- catalog read: rc-0-with-empty-stdout is a truncated read, NEVER an empty catalog ------
+    # ([FABLE-5] round-9 audit: coercing it to [] fed the claim path a false "no eligible
+    # account" and the usage probe's coverage gate a false expectation of 0). gh prints "[]"
+    # for a genuinely empty listing, which must still parse to [].
+    def _fake_catalog(payload):
+        def fake(args, **_kwargs):
+            return _Res(0, stdout=payload)
+        return fake
+
+    subprocess.run = _fake_catalog("")
+    try:
+        read_accounts("o/r")
+        check("empty-payload catalog read raises (fail closed)", "no exception", "LeaseIOError")
+    except LeaseIOError:
+        check("empty-payload catalog read raises (fail closed)", "LeaseIOError", "LeaseIOError")
+    finally:
+        subprocess.run = real_run
+    subprocess.run = _fake_catalog("[]")
+    try:
+        check("a genuinely empty '[]' catalog still reads as empty", read_accounts("o/r"), [])
+    finally:
+        subprocess.run = real_run
 
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
