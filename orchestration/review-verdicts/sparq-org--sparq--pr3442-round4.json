@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 4 resolves the prior major finding. collect_bgps now gives Join conjunction semantics by taking the cross product of child DNF disjuncts and merging each pair into one BGP, so variables shared across a Join are frozen through one per-disjunct map. The added JOIN_RAW_UCQ regression confirms the fixture actually parses with a Join node, requires a non-empty raw result, and demonstrates that dropping a non-subsumed joined branch changes the result set. Union remains alternative-producing, and FILTER/VALUES witness synthesis still fails closed. I found no remaining correctness, soundness, test-validity, or security defect in the changed paths.",
+ "verdict": "approve"
+}
