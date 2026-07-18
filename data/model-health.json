@@ -1,14 +1,6 @@
 {
  "records": [
   {
-   "ts": 1784384519,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "terra",
-   "exit_class": "success",
-   "run_id": "29647839184.1"
-  },
-  {
    "ts": 1784384543,
    "provider": "openai",
    "account": "dc2d751954080e13",
@@ -1599,6 +1591,14 @@
    "model_alias": "",
    "exit_class": "success",
    "run_id": "29656511047.1"
+  },
+  {
+   "ts": 1784400601,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "terra",
+   "exit_class": "success",
+   "run_id": "29656590906.1"
   }
  ]
 }
