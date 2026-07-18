@@ -69,6 +69,16 @@
    "model": "terra",
    "issued_at": 1784392650,
    "expires_at": 1784393850
+  },
+  {
+   "account": "acct01",
+   "claim_id": "1e9775d8a6fa4f11b0897ff5e8c2eeb9",
+   "holder": "review:jeswr/agent-account-registry#244@dispatch-29652181510.1",
+   "package": "dispatch",
+   "role": "review",
+   "model": "terra",
+   "issued_at": 1784392655,
+   "expires_at": 1784393855
   }
  ]
 }
