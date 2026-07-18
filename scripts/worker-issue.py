@@ -8,11 +8,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tempfile
 
 
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
+# Maintainer-approval convention (issue #31): a HUMAN maintainer approves a retry by commenting
+# the word "approved" on the issue AFTER the worker's most recent attempt receipt. The trusted
+# human set is derived the same way the triage trust-gate derives it — repo collaborator
+# permission in {admin, maintain, write} — and bot/App logins NEVER count.
+APPROVAL_RE = re.compile(r"\bapproved\b", re.IGNORECASE)
+HUMAN_MAINTAINER_PERMISSIONS = {"admin", "maintain", "write"}
 BUSY_OR_GATED = {
     "status:blocked",
     "status:deferred",
@@ -46,6 +54,59 @@ def count_attempts(comments, bot_login):
         if str(comment.get("user", {}).get("login", "")).casefold() == bot
         and ATTEMPT_MARKER in str(comment.get("body", ""))
     )
+
+
+def find_maintainer_approval(comments, bot_login, is_human_maintainer):
+    """Return the approving comment, or None when the retry must fail closed.
+
+    Evidence of maintainer approval (issue #31) is a comment by a HUMAN maintainer whose body
+    matches APPROVAL_RE, created strictly after the bot's most recent attempt receipt (the
+    failure being retried). `status:ready` is written by the automation itself (triage/groom/
+    the deferred-retry transition below) and is therefore NEVER approval evidence. Bot and App
+    logins never count as human, whatever they comment — and neither does a comment whose
+    `performed_via_github_app` is non-null: an App driving a maintainer's user token posts as
+    user.type=User under the maintainer's own login, so the user-shaped filters and the
+    collaborator probe all pass; only the App attribution field betrays that no human typed it.
+    `is_human_maintainer(login)` supplies the trusted-set probe so this stays pure and
+    self-testable.
+    """
+    bot = bot_login.casefold()
+    last_failure = max(
+        (str(comment.get("created_at", ""))
+         for comment in comments
+         if str(comment.get("user", {}).get("login", "")).casefold() == bot
+         and ATTEMPT_MARKER in str(comment.get("body", ""))),
+        default="",
+    )
+    for comment in comments:
+        user = comment.get("user", {}) or {}
+        login = str(user.get("login", ""))
+        if (not login
+                or str(user.get("type", "")).casefold() == "bot"
+                or login.casefold().endswith("[bot]")
+                or login.casefold() == bot
+                or comment.get("performed_via_github_app") is not None):
+            continue
+        if not APPROVAL_RE.search(str(comment.get("body", ""))):
+            continue
+        # ISO-8601 UTC timestamps compare lexicographically; an approval at-or-before the last
+        # attempt receipt is stale — it blessed a run that has since failed.
+        if str(comment.get("created_at", "")) <= last_failure:
+            continue
+        if is_human_maintainer(login):
+            return comment
+    return None
+
+
+def _is_human_maintainer(repo, login):
+    # Same derivation as the triage-issue trust-gate: collaborator permission probe. The
+    # trust-gate's extra exact-match entry is the registry App bot, which is excluded here by
+    # design — approval must come from a human. Probe failure counts as "not a maintainer".
+    result = _run_gh(
+        ["api", f"repos/{repo}/collaborators/{login}/permission", "--jq", ".permission"],
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() in HUMAN_MAINTAINER_PERMISSIONS
 
 
 def _run_gh(args, *, input_text=None, check=True):
@@ -162,8 +223,19 @@ def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_lo
     ]
     verdict = subprocess.run(command, capture_output=True, text=True, check=False)
     if verdict.returncode == 3:
-        # A ready third-party issue was promoted by the trusted target-side pipeline. Supplying the
-        # positive attestation here makes trust-gate independently return its "promoted" verdict.
+        # A third-party issue may re-enter the run path only on explicit HUMAN evidence. The
+        # status:ready label checked above is NOT that evidence — the automation writes it
+        # itself, so honouring it here would let the worker self-approve its own retry.
+        approval = find_maintainer_approval(
+            _paginated(repo, issue, "comments"),
+            bot_login,
+            lambda login: _is_human_maintainer(repo, login),
+        )
+        if approval is None:
+            raise WorkerIssueError(
+                "third-party issue has no fresh maintainer approval — a human maintainer must "
+                "comment 'approved' after the last worker attempt; deferring instead of retrying"
+            )
         verdict = subprocess.run(
             [*command, "--maintainer-approved"], capture_output=True, text=True, check=False
         )
@@ -204,6 +276,8 @@ def set_status(repo, issue, status):
     # cross-provider review loop — the issue completes only when the review-fix ARM path fires.
     # `retry`: the dispatcher re-enumerates a deferred issue (deferred-retry, locked decision 20)
     # — status:deferred is stripped and status:ready restored so the worker's reverify passes.
+    # NOTE (issue #31): status:ready written here is dispatchability only, never maintainer
+    # approval — the reverify third-party path demands separate human evidence.
     transitions = {
         "in-progress": ({"status:in-progress"}, {"status:ready", "status:deferred"}),
         "in-progress-review": ({"status:in-progress-review"},
@@ -299,6 +373,128 @@ def _self_test():
     assert set(LABEL_COLOURS) == {"status:in-progress", "status:in-progress-review",
                                   "status:deferred", "status:ready", "needs:user"}
     assert "status:in-progress-review" in BUSY_OR_GATED
+
+    # Maintainer-approval evidence for the reverify third-party retry (issue #31).
+    maintainers = lambda login: login == "jeswr"  # noqa: E731 — trivial trusted-set stub
+    failure = {"user": {"login": "sparq[bot]", "type": "Bot"},
+               "body": f"x {ATTEMPT_MARKER} run=9 -->", "created_at": "2026-07-10T00:00:00Z"}
+    human_after = {"user": {"login": "jeswr", "type": "User"},
+                   "body": "Reviewed the re-attested body — approved.",
+                   "created_at": "2026-07-11T00:00:00Z"}
+    bot_marker = {"user": {"login": "sparq[bot]", "type": "Bot"},
+                  "body": "approved", "created_at": "2026-07-12T00:00:00Z"}
+    stale_human = {"user": {"login": "jeswr", "type": "User"},
+                   "body": "approved", "created_at": "2026-07-09T00:00:00Z"}
+    # (i) the regression this issue demands stays dead: a status:ready issue with NO human
+    # comment (only the bot's own attempt receipt) is NOT approved.
+    assert find_maintainer_approval([failure], "sparq[bot]", maintainers) is None
+    # (ii) a human maintainer's marker comment after the last failure IS approval.
+    assert find_maintainer_approval([failure, human_after], "sparq[bot]", maintainers) is human_after
+    # (iii) a bot comment carrying the marker is NOT approval.
+    assert find_maintainer_approval([failure, bot_marker], "sparq[bot]", maintainers) is None
+    # (iv) a marker predating the last failure is stale, NOT approval.
+    assert find_maintainer_approval([failure, stale_human], "sparq[bot]", maintainers) is None
+    # A human without maintainer permission never approves; App-typed users never count even
+    # without a [bot] suffix.
+    outsider = {**human_after, "user": {"login": "drive-by", "type": "User"}}
+    app_user = {**human_after, "user": {"login": "some-app", "type": "Bot"}}
+    assert find_maintainer_approval([failure, outsider], "sparq[bot]", maintainers) is None
+    assert find_maintainer_approval([failure, app_user], "sparq[bot]", maintainers) is None
+    # With no prior attempt receipt there is nothing to be stale against: approval stands.
+    assert find_maintainer_approval([human_after], "sparq[bot]", maintainers) is human_after
+
+    # (v) each identity filter is load-bearing on its own (review r1). A trust-everyone stub
+    # removes the trusted-set probe as a confounding rejector, so ONLY the bot/App filters can
+    # be doing the rejecting here — deleting any one of them turns a case green.
+    trust_all = lambda login: True  # noqa: E731 — trivial trusted-set stub
+    app_typed = {"user": {"login": "registry-app", "type": "Bot"},
+                 "body": "approved", "created_at": "2026-07-11T00:00:00Z"}
+    suffixed = {"user": {"login": "helper[bot]", "type": "User"},
+                "body": "approved", "created_at": "2026-07-11T00:00:00Z"}
+    assert find_maintainer_approval([failure, app_typed], "sparq[bot]", trust_all) is None
+    assert find_maintainer_approval([failure, suffixed], "sparq[bot]", trust_all) is None
+    # An App wielding a maintainer's user token (review r2): the comment is user.type=User under
+    # the maintainer's own login — every user-shaped filter passes and the collaborator probe
+    # would confirm it — but performed_via_github_app is non-null. Must be rejected, and ONLY
+    # the App-attribution check can be doing the rejecting under trust_all.
+    app_on_behalf = {**human_after,
+                     "performed_via_github_app": {"id": 7, "slug": "registry-app"}}
+    assert find_maintainer_approval([failure, app_on_behalf], "sparq[bot]", trust_all) is None
+    # The check is non-null attribution, not key presence: the JSON-null the API returns for a
+    # genuinely human comment must still pass.
+    explicit_null = {**human_after, "performed_via_github_app": None}
+    assert find_maintainer_approval(
+        [failure, explicit_null], "sparq[bot]", trust_all) is explicit_null
+    # The worker's own login never self-approves, even typed User with no [bot] suffix.
+    own_receipt = {"user": {"login": "sparq-svc", "type": "User"},
+                   "body": f"x {ATTEMPT_MARKER} run=9 -->", "created_at": "2026-07-10T00:00:00Z"}
+    own_approval = {"user": {"login": "sparq-svc", "type": "User"},
+                    "body": "approved", "created_at": "2026-07-11T00:00:00Z"}
+    assert find_maintainer_approval([own_receipt, own_approval], "sparq-svc", trust_all) is None
+    # trust_all admits a genuine human, proving the rejections above came from the identity
+    # filters and not from the stub being secretly restrictive.
+    assert find_maintainer_approval([failure, human_after], "sparq[bot]", trust_all) is human_after
+
+    # (vi) the approval predicate is load-bearing: a trusted human comment after the receipt
+    # that never says "approved" is NOT approval.
+    unmarked = {"user": {"login": "jeswr", "type": "User"},
+                "body": "looks good to me", "created_at": "2026-07-11T00:00:00Z"}
+    assert find_maintainer_approval([failure, unmarked], "sparq[bot]", maintainers) is None
+
+    # (vii) staleness is strict at-or-before: an approval stamped EXACTLY at the receipt time
+    # is stale (it cannot postdate the failure it must bless).
+    equal_ts = {**human_after, "created_at": failure["created_at"]}
+    assert find_maintainer_approval([failure, equal_ts], "sparq[bot]", maintainers) is None
+
+    # (viii) with multiple receipts the NEWEST governs, independent of list order: an approval
+    # between two receipts blessed the older failure and is stale; one after both stands.
+    failure2 = {**failure, "body": f"x {ATTEMPT_MARKER} run=10 -->",
+                "created_at": "2026-07-12T00:00:00Z"}
+    after_both = {**human_after, "created_at": "2026-07-13T00:00:00Z"}
+    assert find_maintainer_approval([failure, human_after, failure2], "sparq[bot]", maintainers) is None
+    assert find_maintainer_approval([failure2, human_after, failure], "sparq[bot]", maintainers) is None
+    assert find_maintainer_approval(
+        [failure, human_after, failure2, after_both], "sparq[bot]", maintainers) is after_both
+
+    # (ix) reverify exit-3 wiring (review r1): the fail-closed guard itself, not just the pure
+    # helper. A stub trust-gate exits 3 (third-party author); real subprocess wiring, with only
+    # the GitHub API seams patched. Without fresh approval reverify must raise the approval
+    # error (NOT the generic gate error) and write no issue snapshot; with fresh approval it
+    # must rerun the gate --maintainer-approved and accept its "promoted" verdict.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = Path(tmp) / "gate.py"
+        gate.write_text(
+            "import sys\n"
+            "if '--maintainer-approved' in sys.argv:\n"
+            "    print('promoted')\n"
+            "    sys.exit(0)\n"
+            "sys.exit(3)\n",
+            encoding="utf-8",
+        )
+        issue_file = Path(tmp) / "issue.json"
+        item = {"state": "open", "user": {"login": "third-party"}, "body": "task",
+                "labels": [{"name": "status:ready"}]}
+        comments = [failure]
+        seams = {"_gh_json": lambda args, *, input_doc=None: dict(item),
+                 "_paginated": lambda repo, issue, resource: list(comments),
+                 "_is_human_maintainer": lambda repo, login: login == "jeswr"}
+        saved = {name: globals()[name] for name in seams}
+        globals().update(seams)
+        try:
+            refused = False
+            try:
+                reverify("o/r", 1, "third-party", body_sha("task"), str(gate),
+                         "sparq[bot]", str(issue_file))
+            except WorkerIssueError as exc:
+                refused = "no fresh maintainer approval" in str(exc)
+            assert refused
+            assert not issue_file.exists()
+            comments.append(human_after)
+            reverify("o/r", 1, "third-party", body_sha("task"), str(gate),
+                     "sparq[bot]", str(issue_file))
+            assert json.loads(issue_file.read_text(encoding="utf-8")) == item
+        finally:
+            globals().update(saved)
     print("worker-issue self-test PASSED")
 
 
