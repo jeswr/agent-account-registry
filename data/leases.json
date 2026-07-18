@@ -22,16 +22,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "dafc877e620f4035a7a0773bfc5f78c8",
-   "holder": "review:sparq-org/sparq#3449@dispatch-29647232301.1",
-   "package": "sparq-server",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784383439,
-   "expires_at": 1784384639
-  },
-  {
-   "account": "acct01",
    "claim_id": "a9bf318f35bb45a28e38f657ff96f4be",
    "holder": "review:sparq-org/sparq#3458@dispatch-29647232301.1",
    "package": "sparq-solid",
