@@ -778,6 +778,15 @@ def post_findings(repo, pr_number, verdict_file, round_n):
     only validated, length-capped fields are ever surfaced."""
     with open(verdict_file, encoding="utf-8") as handle:
         document = json.load(handle)
+
+    def _neutralize(text):
+        # sol r8 on #257: model-controlled text is republished under the App identity, and
+        # the audit-suppression check trusts App-authored markers — a prompt-injected
+        # reviewer could smuggle the current SHA marker into its verdict and suppress the
+        # real audit comment. Reserved marker prefixes are visibly defanged.
+        return str(text).replace("<!-- sparq-", "<!- sparq-")
+
+    document = json.loads(_neutralize(json.dumps(document)))
     lines = [
         "> 🤖 SPARQ agent — cross-provider review "
         f"round {round_n}: **{document['verdict']}**.",
@@ -1234,7 +1243,8 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     if head_sha != reviewed_sha:
         # Not an error: new commits landed between approve and arm; re-review binds to the new head.
         set_review_state(repo, pr_number, "needs")
-        _write_outputs({"armed": False, "head_moved": True})
+        _write_outputs({"armed": False, "head_moved": True,
+                        "arm_complete": False})
         print("live head advanced past the reviewed sha; returned to review:needs")
         return
     live_base = str((live.get("base") or {}).get("ref", ""))
@@ -1248,7 +1258,8 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # boundary), resolution REJECTS non-default-base PRs outright, and this pre-arm
         # check plus the head CAS bound everything GitHub's API allows us to bind.
         set_review_state(repo, pr_number, "needs")
-        _write_outputs({"armed": False, "head_moved": True, "base_moved": True})
+        _write_outputs({"armed": False, "head_moved": True, "base_moved": True,
+                        "arm_complete": False})
         print("live base ref differs from the reviewed base; returned to review:needs")
         return
     trust_hits = ()
@@ -1301,7 +1312,7 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # Deferred issue completion (locked decision 16): complete only on arm, not on publish.
         _load_worker_issue().set_status(repo, issue, "complete")
     _write_outputs({"armed": bool(arm), "head_moved": False,
-                    "trust_surface": bool(trust_hits)})
+                    "trust_surface": bool(trust_hits), "arm_complete": True})
     print(f"pull request marked ready{' and armed (auto-merge)' if arm else ''}")
 
 

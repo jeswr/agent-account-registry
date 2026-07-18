@@ -1352,7 +1352,7 @@ jobs:
         # sol r7 on #257: step SUCCESS is not enough — the head/base-race paths exit 0 with
         # armed=false after setting review:needs, and binding reviewed-sha there wedges the
         # sweep into skipping the pending re-review. Key on the armed OUTPUT.
-        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.armed == 'true')) }}
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
         run: |

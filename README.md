@@ -89,7 +89,7 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   (`sparq-org/sparq` already carries it). `scripts/triage.py` derives `role:site` from the exact
   UI-surface labels (`area:dashboard`, `dashboard`, `surface:frontend`). Implement it as a ROLE
   route, **never** a `match_labels` rule — the arm-side security classifier unions all
-  `match_labels` keywords, so UI keywords there would human-arm every UI PR.
+  `match_labels` keywords, so UI keywords there would security-classify every UI PR (post-Decision-7 revision: an audit trail, not a park).
 
 - **Frontier-tier agents author ALL CI/infrastructure work** (maintainer decision 2026-07-17):
   Claude Fable (`fable`) or GPT-5.6 sol (openai; wired alias `terra`) — explicitly including the
@@ -105,7 +105,7 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   (retried next tick, defer-not-fallback) instead of degrading tier — deliberately not
   `escalate = true`, which would flip a starved item to `needs:user`. Where an infra surface is
   also a trust surface (dispatch/worker/set-up-account/review-loop/groom), the security
-  `match_labels` override still wins (opus + human arm) — stricter than the frontier floor,
+  `match_labels` override still wins (opus + trust-surface audit; Decision 7 revised 2026-07-18) — stricter than the frontier floor,
   unchanged.
 
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
