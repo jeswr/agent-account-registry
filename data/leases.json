@@ -12,16 +12,6 @@
   },
   {
    "account": "acct4css",
-   "claim_id": "01ff2b5183314bc283d54f3ecc1de8cc",
-   "holder": "sparq-org/sparq#2766@dispatch-29631296781.1",
-   "package": "bench",
-   "role": "research",
-   "model": "fable",
-   "issued_at": 1784350553,
-   "expires_at": 1784356853
-  },
-  {
-   "account": "acct4css",
    "claim_id": "98420b4d03ed462b98803b33c5ccafcd",
    "holder": "sparq-org/sparq#2959@dispatch-29631296781.1",
    "package": "gui",
