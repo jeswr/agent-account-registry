@@ -655,6 +655,14 @@
    "model_alias": "terra",
    "exit_class": "unknown",
    "run_id": "29626275969.1"
+  },
+  {
+   "ts": 1784340155,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "terra",
+   "exit_class": "unknown",
+   "run_id": "29626279376.1"
   }
  ]
 }
