@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "Round 2's approval remains supported. The refresh path now preserves the semantic distinction between `None` and `Some(empty)`: a captured empty static baseline retains an already-materialized auth-view marker, while a bridged-only ledger reset removes the view after its last grant retracts. The three focused tests exercise the real `PodStore` materialize/refresh/decide paths and cover empty static materialization, never-materialized refresh, and bridged-only retraction. The combined server feature-matrix leg directly gates the feature interaction that exposed the defect. No correctness, soundness, test-validity, security, or prompt-injection issue is present in the diff.",
+ "verdict": "approve"
+}
