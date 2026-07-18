@@ -603,11 +603,17 @@ run_gate() {
 # state gate code can write is the target tree and its own scratch HOME, and no later
 # credentialed host step may resolve that HOME (worker.yml gives post-gate host steps a separate
 # fresh HOME the gate never sees — a hostile gate could otherwise plant ~/.gitconfig for the
-# token-bearing publish git). Residual channel, by design: the target tree itself — the gate
-# must read/build it, so an ENCODED credential copy stashed there stays readable; but that copy
-# is exposure the publish push would make public anyway, so the container adds no recovery
-# capability beyond what publish already exposes (the purge step's literal-fragment scan remains
-# the publish-path tripwire).
+# token-bearing publish git). Residual channel NOT contained here (do not read this as a
+# containment proof): the target tree itself — the gate must read/build it, so an ENCODED
+# credential copy a steered model stashed there stays readable (a literal scan cannot catch a
+# reversible encoding). Because this container still has outbound network and streams unredacted
+# stdout/stderr to the job log, target-controlled gate code can decode such a copy and exfiltrate
+# it IMMEDIATELY. That is strictly MORE than the publish path exposes: publish only stages a
+# literal-scanned diff into a DRAFT PR that a human must arm, whereas the gate's network/log
+# egress is real-time and reviewed by nobody. Fully closing it requires denying the gate ALL
+# egress AND ensuring the tree-writing model never holds a recoverable credential (credential
+# brokering) — a trust-plane rearchitecture tracked as a follow-up, NOT achievable by adding
+# another literal scan. The purge step's literal-fragment scan is only the publish-path tripwire.
 #
 # PURE: emit the hardened gate-container docker argv, one element per line. Extracted so the
 # self-test can prove the containment properties offline (exact mount set, allowlisted env,
