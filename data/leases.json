@@ -91,16 +91,6 @@
    "expires_at": 1784345882
   },
   {
-   "account": "acct02",
-   "claim_id": "c6c6a465e8474a66946a5f90f0ed29e7",
-   "holder": "sparq-org/sparq#3224@dispatch-29626100026.1",
-   "package": "sparq-policy",
-   "role": "impl",
-   "model": "sonnet",
-   "issued_at": 1784339870,
-   "expires_at": 1784346170
-  },
-  {
    "account": "acct05",
    "claim_id": "a6345b1ad41140d1bc80792fdb364550",
    "holder": "sparq-org/sparq#3187@dispatch-29626255287.1",
