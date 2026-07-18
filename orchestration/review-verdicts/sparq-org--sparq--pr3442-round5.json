@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "witness_abox merges every disjunct's frozen database into one Graph, but keeps IRI/literal constants shared. The stated inference that a retained query can produce a dropped disjunct D's frozen head tuple only via a homomorphism into D's instance is therefore false: a retained CQ may consume one fact from D's included instance and another fact from a different disjunct's instance through a shared constant. For example, with SELECT ?x, let dropped D be `{ ?x :p :c }`, retained E be `{ ?x :p :c . :c :q ?z }`, and another retained branch F be `{ :c :q ?x }`. D is not contained in E or F, but the combined witness includes D's `p(x_D,c)` and F's `q(c,x_F)`, so E recovers x_D and can hide D's removal. The current test uses disjoint variable-only joins and cannot expose this masking.",
+   "file": "crates/sparq-reason-ql/examples/ql_npd_requiem_bench.rs",
+   "fix_hint": "Check each raw/original disjunct independently on its own canonical database (or otherwise isolate instances so no cross-instance joins are possible), comparing raw and minimised answers for that database before timing. Add a regression using a shared fixed IRI bridge like the D/E/F construction and assert that dropping D is detected. Revise the documentation's disjointness/canonical-database claim to match the implemented guarantee.",
+   "severity": "major",
+   "title": "Unioned canonical instances can mask a wrongly dropped disjunct"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 5 found a new soundness gap in the witness equivalence gate that round 4 missed. The graph is the union of canonical instances for all original/raw/minimised disjuncts while constants are deliberately shared. A retained CQ can therefore combine a fact from the dropped disjunct's still-present canonical instance with facts from another instance and reproduce the dropped disjunct's projected tuple, even when the dropped CQ is not contained in the retained UCQ. Thus result-set agreement on this single union is not a complete detector for wrongly dropped disjuncts, contrary to the load-bearing claim. The existing regression covers a favorable all-variable join but not this cross-instance constant-bridge case. Because the benchmark advertises equivalence-before-timing as an enforced invariant, this is major and requires changes. Progress is regressing because round 4 had no findings and this round adds a major one.",
+ "verdict": "request_changes"
+}
