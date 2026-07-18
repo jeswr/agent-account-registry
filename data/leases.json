@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "acct01",
-   "claim_id": "61439cecc4e346e5b1f477988656542c",
-   "holder": "review:sparq-org/sparq#2494@dispatch-29622902023.1",
-   "package": "sparq-introspect",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784334238,
-   "expires_at": 1784335438
-  }
- ]
+ "leases": []
 }
