@@ -1015,7 +1015,7 @@ def _plan_actions(
     return actions, pull_actions, dead_claims
 
 
-def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
+def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int, int]:
     registry_repo = args.registry_repo
     if SAFE_REPO.fullmatch(registry_repo) is None:
         raise GroomError("registry repo must be a safe owner/name")
