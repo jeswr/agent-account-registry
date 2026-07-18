@@ -29,6 +29,16 @@
    "model": "terra",
    "issued_at": 1784383679,
    "expires_at": 1784384879
+  },
+  {
+   "account": "acct2css",
+   "claim_id": "60c097c78f224ea5bb6990a140769c3c",
+   "holder": "jeswr/agent-account-registry#107@dispatch-29647297008.1",
+   "package": "dispatch",
+   "role": "impl",
+   "model": "opus",
+   "issued_at": 1784383685,
+   "expires_at": 1784386385
   }
  ]
 }
