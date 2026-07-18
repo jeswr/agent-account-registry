@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`triples_to_n3` forwards every caller-supplied ground triple, while final closure extraction accepts every predicate beginning with `AUTH_NS`. Thus a strict-Turtle policy containing `<urn:mallory> <https://sparq.dev/ns/auth#read> <urn:t/1> .` is copied into the closure and returned as a grant without any permission. The same trust-boundary failure permits caller assertions in the reserved `odrlx:` namespace (for example `atomicSat`/`prohibMatches`) or facts about `<urn:odrl-req>` to steer rules. This is the prior authorization-injection class in a form the new tests do not exercise; parsing and escaping prevent source syntax injection but do not make untrusted RDF facts trusted.",
+   "file": "crates/sparq-solid/src/odrl_bridge.rs",
+   "fix_hint": "Construct a validated policy fact graph from an allowlist of ODRL input predicates and reject any caller triple using `AUTH_NS`, the internal `odrlx:` namespace, the reserved request IRI, or other engine-owned vocabulary. Prefer translating a parsed policy model into fresh RDF terms rather than forwarding the original graph wholesale. Add adversarial strict-Turtle tests that directly assert an `auth:read` triple, `odrlx:atomicSat`/`odrlx:prohibMatches`, and triples about `<urn:odrl-req>`, asserting `Err`, no emitted authorization triples, and an unchanged graph.",
+   "severity": "blocker",
+   "title": "Valid Turtle can inject trusted auth and internal derivation facts"
+  }
+ ],
+ "progress": "improving",
+ "summary": "Round 2 is improving: canonical date-time rejection and constrained-prohibition strata address the two prior major findings, and raw N3/request-string interpolation has been removed. However, the authorization injection blocker remains in another ground-RDF form. The strictly parsed caller graph is copied wholesale into every reasoning stratum, and final extraction trusts every auth:* predicate in the closure. Valid Turtle can therefore directly assert auth grants or reserved odrlx derivation/request facts; strict Turtle parsing and RDF escaping do not establish a trust boundary. The adversarial tests cover an N3 rule and a payload hidden in a literal, but not executable ground triples in reserved namespaces.",
+ "verdict": "request_changes"
+}
