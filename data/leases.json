@@ -151,16 +151,6 @@
    "expires_at": 1784346170
   },
   {
-   "account": "acct01",
-   "claim_id": "5224735a0e4246c6ac9d79540c960831",
-   "holder": "sparq-org/sparq#3349@dispatch-29626100026.1",
-   "package": "sparq-vectors",
-   "role": "ci",
-   "model": "terra",
-   "issued_at": 1784339882,
-   "expires_at": 1784346182
-  },
-  {
    "account": "acct2css",
    "claim_id": "8d4dbf3a7e3447df9b8f285f27c9e2a2",
    "holder": "sparq-org/sparq#2630@dispatch-29626184649.1",
