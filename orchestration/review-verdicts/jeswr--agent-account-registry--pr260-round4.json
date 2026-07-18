@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Both `for lb in ${{ join(github.event.issue.labels.*.name, ' ') }}` loops splice label names into the generated shell source without quoting or structured transport. GitHub label names may contain shell metacharacters; for example, a crafted label containing command substitution becomes executable shell when an admin later applies `set-up-account`. The actor/author permission check does not make every pre-existing label name safe: another collaborator can add a label before the trusted actor triggers the run. The injected command receives the workflow `GITHUB_TOKEN`, whose declared `contents: write` permission can mutate this trust-plane repository. This also violates the workflow's own stated structured-data handling approach.",
+   "file": ".github/workflows/set-up-account.yml",
+   "fix_hint": "Pass the labels through a structured channel (for example `toJSON(...)` in an environment variable) and parse the JSON in Python or jq; never interpolate label text into `run:` source. Validate targets with an exact repository-name grammar and add a regression/self-test covering spaces, quotes, `$()`, semicolons, and newlines in unrelated and target-prefixed label names. Carry derived targets between steps via a structured or safely encoded representation rather than a space-delimited shell string.",
+   "severity": "blocker",
+   "title": "Issue label names are interpolated directly into a privileged shell script"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The scoped grant and live-label equality checks remain sound, but the newly added target-label capture interpolates the issue's complete label list directly into a privileged shell script. A crafted pre-existing label can execute shell syntax when an administrator later applies set-up-account. Because this workflow has contents:write, that is a trust-plane command-injection path and must block approval. Round 3 recorded no issues, so this newly identified blocker makes progress regressing.",
+ "verdict": "request_changes"
+}
