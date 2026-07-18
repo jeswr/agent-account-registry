@@ -255,6 +255,11 @@ def _apply_backoff(entry, backoff):
     entry["backoff_until"] = until
     if isinstance(backoff.get("consecutive"), int):
         entry["backoff_consecutive"] = backoff["consecutive"]
+    if backoff.get("saturated") is True:
+        # model-health prune may have truncated a saturated chain to its BACKOFF_CHAIN_KEEP tail,
+        # so the consecutive count is a LOWER BOUND — usage-alert renders it "xN+", never an
+        # exact "xN" (PR #85 finding 2). STRICT is-True: a forged truthy string stays dropped.
+        entry["backoff_saturated"] = True
     if isinstance(backoff.get("last_signal"), str):
         entry["backoff_signal"] = backoff["last_signal"]
     return entry
@@ -487,6 +492,16 @@ def _self_test():
                                           "last_signal": "transient"}),
         {"exempt": True, "backoff_until": 2000, "backoff_consecutive": 2,
          "backoff_signal": "transient"})
+    #   a saturated (possibly chain-truncated) count carries the lower-bound flag through to the
+    #   snapshot entry (PR #85 finding 2); a forged non-bool flag is dropped (strict is-True)
+    chk("apply backoff: saturated count marked as a lower bound",
+        _apply_backoff({"exempt": True}, {"backoff_until": 2000, "consecutive": 6,
+                                          "saturated": True, "last_signal": "transient"}),
+        {"exempt": True, "backoff_until": 2000, "backoff_consecutive": 6,
+         "backoff_saturated": True, "backoff_signal": "transient"})
+    chk("apply backoff: forged non-bool saturated flag is dropped",
+        "backoff_saturated" in _apply_backoff(
+            {"exempt": True}, {"backoff_until": 2000, "saturated": "yes"}), False)
     chk("apply backoff: absent record leaves entry untouched",
         _apply_backoff({"exempt": True}, None), {"exempt": True})
     chk("apply backoff: forged/malformed record fails open (no crash)",
@@ -521,6 +536,37 @@ def _self_test():
     backoffs = _load_backoffs(mh, test_now + 60)
     chk("ledger round-trip: active backoff derived for the salted handle",
         backoffs.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_BASE_SECONDS)
+    #   retention regression (issue #82, fix-forward for #62): the backoff is derived AFTER
+    #   mh.prune, whose global newest-MAX_RECORDS cap used to evict a live rate-limit record
+    #   under a flood of later unrelated records — readmitting the capped account hours early.
+    #   End-to-end: a 5 h reset hint + 200+ later unrelated success records still enforce it.
+    flood_hit = dict(ledger_record, reset_hint="in 5 hours")
+    other = mh.account_hash("acct01", "s3cret")
+    flood = [{"ts": test_now + 100 + i, "provider": "anthropic", "account": other,
+              "model_alias": "haiku", "exit_class": "success", "run_id": str(i)}
+             for i in range(mh.MAX_RECORDS + 30)]
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump({"records": [flood_hit] + flood}, fh)
+        flood_path = fh.name
+    os.environ["MODEL_HEALTH_FILE"] = flood_path
+    flooded = _load_backoffs(mh, test_now + 1000)
+    chk("retention: live 5 h backoff survives 200+ later unrelated records end-to-end",
+        flooded.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_CAP_SECONDS)
+    os.unlink(flood_path)
+    #   a >6-hit (cap-saturated, possibly truncated) chain surfaces the lower-bound flag
+    #   end-to-end: ledger -> _load_backoffs -> _apply_backoff -> snapshot entry (PR #85 f.2)
+    sat_records = [dict(ledger_record, ts=test_now + i, run_id=str(i)) for i in range(7)]
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump({"records": sat_records}, fh)
+        sat_path = fh.name
+    os.environ["MODEL_HEALTH_FILE"] = sat_path
+    sat_backoff = _load_backoffs(mh, test_now + 100).get(hashed) or {}
+    chk("ledger round-trip: >6-hit chain flags saturated on the snapshot entry",
+        (sat_backoff.get("consecutive"), sat_backoff.get("saturated"),
+         _apply_backoff({"exempt": True}, sat_backoff).get("backoff_saturated")),
+        (7, True, True))
+    os.unlink(sat_path)
+    os.environ["MODEL_HEALTH_FILE"] = good_path
     #   (v) malformed ledger -> loud fail-open {} (never crashes the sweep). CAPTURED stderr
     #   (cross-provider review r1): un-captured, these intentional failures would emit REAL
     #   ::warning:: annotations on every workflow run (the step runs --self-test first) and

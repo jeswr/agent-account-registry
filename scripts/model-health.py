@@ -143,6 +143,13 @@ ZERO_DISPATCH_MIN = 3
 BACKOFF_BASE_SECONDS = 15 * 60
 BACKOFF_CAP_SECONDS = 5 * 3600
 BACKOFF_CLASSES = frozenset({CLASS_LIMIT, CLASS_TRANSIENT})
+# The consecutive-hit count at which the exponential arm saturates the 5 h cap (smallest n with
+# BASE * 2**(n-1) >= CAP). prune's active-backoff retention (issue #82) keeps at most this many
+# tail records of a live chain: past saturation, extra chain records cannot change the derived
+# backoff_until (and the last record's parseable hint, when present, overrides the exponential
+# anyway), so truncating there preserves the derived backoff EXACTLY while keeping the
+# MAX_RECORDS bound hard.
+BACKOFF_CHAIN_KEEP = 1 + (BACKOFF_CAP_SECONDS // BACKOFF_BASE_SECONDS - 1).bit_length()
 
 # --- provider status probe (issue #70). At decide time the classifier consults the provider's
 # PUBLIC Statuspage API — standard shape {"status": {"indicator": "none|minor|major|critical"}} —
@@ -219,13 +226,59 @@ def prune(records, now):
     """Keep the rolling window: drop records older than WINDOW_SECONDS — or stamped more than
     FUTURE_SKEW_SECONDS ahead of `now` (an implausibly-future forgery would never age out) — then
     cap to the most recent MAX_RECORDS. Sorted by ts so the window/consecutive logic below is well
-    defined."""
+    defined.
+
+    ACTIVE-BACKOFF RETENTION (issue #82, fix-forward for #62): the MAX_RECORDS cap is GLOBAL, but
+    account_backoffs derives backoff state from the PRUNED window (account-usage._load_backoffs
+    prunes before deriving) — so a flood of later unrelated records (e.g. a healthy anthropic
+    fleet's successes) could evict an openai account's live rate-limit record and readmit the
+    capped account long before its backoff expired. A record feeding a still-ACTIVE backoff is
+    therefore never evicted by the cap: for each account whose derived backoff_until > now, the
+    tail of its current consecutive chain (the limit/transient records since its last success,
+    truncated to BACKOFF_CHAIN_KEEP — past cap-saturation extra records cannot change the
+    derived backoff_until) is preserved. Earlier records cannot affect the derived state (a
+    success resets it), so re-deriving backoff_until on the pruned window is exact.
+
+    BOUND CONTRACT (PR #85 finding 1): preserved records spend the MAX_RECORDS budget first and
+    the newest non-preserved records fill only the REMAINING budget, so the total is bounded by
+    max(len(preserved), MAX_RECORDS) — never live-backoffs PLUS a full 200 of expired filler.
+    When the live-backoff set alone exceeds MAX_RECORDS (> MAX_RECORDS / BACKOFF_CHAIN_KEEP
+    simultaneously live chains), correctness wins over the cap — a live backoff is never
+    evicted — but NEVER silently: every expired/non-preserved record is evicted and a ::warning::
+    diagnostic surfaces the overshoot (that many simultaneously backed-off accounts is a
+    fleet-wide rate-limit saturation signal the maintainer must see, not a bookkeeping detail).
+    len(preserved) itself is bounded by live_accounts * BACKOFF_CHAIN_KEEP, and every backoff
+    expires within BACKOFF_CAP_SECONDS, so the overshoot is transient, not unbounded growth."""
     kept = [r for r in records if isinstance(r, dict)
             and isinstance(r.get("ts"), int)
             and (now - r["ts"]) <= WINDOW_SECONDS
             and r["ts"] <= now + FUTURE_SKEW_SECONDS]
     kept.sort(key=lambda r: r["ts"])
-    return kept[-MAX_RECORDS:]
+    if len(kept) <= MAX_RECORDS:
+        return kept
+    preserved = set()
+    active = account_backoffs(kept, now)
+    if active:
+        chains = {}                 # account -> indices of its current consecutive chain
+        for index, r in enumerate(kept):
+            acct, cls = r.get("account"), r.get("exit_class")
+            if cls == SUCCESS:
+                chains.pop(acct, None)      # a success resets the chain — and the derived state
+            elif cls in BACKOFF_CLASSES:
+                chains.setdefault(acct, []).append(index)
+        for acct in active:
+            preserved.update(chains.get(acct, ())[-BACKOFF_CHAIN_KEEP:])
+    budget = MAX_RECORDS - len(preserved)
+    if budget < 0:
+        # Live backoffs alone exceed the nominal cap: keep them all (correctness over the cap),
+        # evict everything else, and surface the overshoot — this many simultaneously
+        # backed-off accounts is a fleet-wide rate-limit saturation signal.
+        print(f"::warning::model-health: {len(active)} accounts hold live backoffs "
+              f"({len(preserved)} preserved records), exceeding the nominal MAX_RECORDS="
+              f"{MAX_RECORDS} cap — expired records evicted, live backoffs kept "
+              "(fleet-wide rate-limit saturation)", file=sys.stderr)
+    newest = [i for i in range(len(kept)) if i not in preserved][-budget:] if budget > 0 else []
+    return [kept[i] for i in sorted(preserved.union(newest))]
 
 
 def validate_ledger(document):
@@ -329,7 +382,9 @@ def account_backoffs(records, now):
     finding 1: a within-skew record at now+300 with a capped hint would otherwise end 5 minutes
     past the ceiling), so every returned backoff ends within now + BACKOFF_CAP_SECONDS — the cap
     is a hard bound on how long an account can be sidelined. Returns only ACTIVE backoffs:
-    {account_hash: {"backoff_until", "consecutive", "last_signal", "last_ts"}}."""
+    {account_hash: {"backoff_until", "consecutive", "saturated", "last_signal", "last_ts"}} —
+    `saturated` means consecutive >= BACKOFF_CHAIN_KEEP, where prune may have truncated the
+    chain, so the count is a lower bound (display "xN+", never an exact "xN")."""
     state = {}
     valid = []
     for record in records:
@@ -359,6 +414,11 @@ def account_backoffs(records, now):
             # a within-skew future ts (clock drift, <= now + FUTURE_SKEW_SECONDS) must not let a
             # capped hint/exponential end past the ceiling (cross-provider review r3 finding 1)
             state[acct] = {"backoff_until": int(until), "consecutive": consecutive,
+                           # At/past cap-saturation, prune may have truncated this chain to its
+                           # BACKOFF_CHAIN_KEEP tail, so a re-derived count is a LOWER BOUND —
+                           # a 20-hit chain re-derives as 6 (PR #85 finding 2). Consumers must
+                           # render a saturated count as "x6+", never as an exact "x6".
+                           "saturated": consecutive >= BACKOFF_CHAIN_KEEP,
                            "last_signal": cls, "last_ts": int(ts)}
         # other classes (auth/setup/unknown) neither extend nor clear a backoff
     return {acct: b for acct, b in state.items() if b["backoff_until"] > now}
@@ -1366,6 +1426,88 @@ def _self_test():
     old_new = [rec("anthropic", "a", CLASS_AUTH, dt=-(WINDOW_SECONDS + 10)),
                rec("anthropic", "a", CLASS_AUTH, dt=0)]
     chk("prune drops out-of-window", len(prune(old_new, now)), 1)
+
+    # ---- ACTIVE-BACKOFF RETENTION across the MAX_RECORDS cap (issue #82, fix-forward #62) ----
+    # End-to-end regression: an openai rate-limit hit with a 5 h reset hint, followed by 200+
+    # LATER unrelated records, must still be enforced after pruning — before the fix the global
+    # newest-MAX_RECORDS cap evicted the hit, so account_backoffs on the pruned window derived {}
+    # and the capped account was readmitted hours early.
+    hint_hit = [rec("openai", "codex01", "rate-limit", dt=0, reset="in 5 hours")]
+    flood = [rec("anthropic", f"bulk{i:03d}", SUCCESS, dt=100 + i)
+             for i in range(MAX_RECORDS + 30)]
+    window = prune(hint_hit + flood, now + 1000)
+    chk("live 5 h backoff survives a MAX_RECORDS flood of unrelated records",
+        account_backoffs(window, now + 1000).get(ah, {}).get("backoff_until"),
+        now + BACKOFF_CAP_SECONDS)
+    chk("retention keeps the window bounded at MAX_RECORDS", len(window), MAX_RECORDS)
+    # a short consecutive chain is preserved WHOLE, so the doubled multiplier re-derives exactly
+    chain = [rec("openai", "codex01", "rate-limit", dt=i * 30) for i in range(3)]
+    cb = account_backoffs(prune(chain + flood, now + 500), now + 500)
+    chk("consecutive chain preserved across the cap (multiplier intact)",
+        (cb.get(ah, {}).get("consecutive"), cb.get(ah, {}).get("backoff_until")),
+        (3, now + 60 + 4 * BACKOFF_BASE_SECONDS))
+    # a chain PAST cap-saturation keeps only its BACKOFF_CHAIN_KEEP tail — same derived
+    # backoff_until (the exponential is capped either way), bound stays hard
+    long_chain = [rec("openai", "codex01", "rate-limit", dt=i * 10) for i in range(20)]
+    lwindow = prune(long_chain + flood, now + 500)
+    chk("saturated chain truncates to its tail yet derives the same capped backoff",
+        (len(lwindow), account_backoffs(lwindow, now + 500).get(ah, {}).get("backoff_until")),
+        (MAX_RECORDS, now + 190 + BACKOFF_CAP_SECONDS))
+    chk("chain-keep is the cap-saturation count", BACKOFF_CHAIN_KEEP, 6)
+    # ...but truncation FLOORS the re-derived consecutive count at BACKOFF_CHAIN_KEEP (a 20-hit
+    # chain re-derives as 6 — PR #85 finding 2), so a saturated count is only a LOWER BOUND and
+    # the state says so; consumers render "x6+", never an exact "x6".
+    lb = account_backoffs(lwindow, now + 500).get(ah, {})
+    chk("truncated 20-hit chain: consecutive floors at chain-keep, flagged saturated",
+        (lb.get("consecutive"), lb.get("saturated")), (BACKOFF_CHAIN_KEEP, True))
+    lb_full = account_backoffs(long_chain, now + 500).get(ah, {})
+    chk("untruncated 20-hit chain: exact count, still flagged saturated (>= chain-keep)",
+        (lb_full.get("consecutive"), lb_full.get("saturated")), (20, True))
+    chk("short chain: exact count, NOT saturated",
+        (cb.get(ah, {}).get("consecutive"), cb.get(ah, {}).get("saturated")), (3, False))
+    # mutation guards: only a LIVE backoff earns retention — an expired one, or one already
+    # cleared by the account's own success, prunes normally (no unbounded pinning)
+    ewindow = prune(hint_hit + flood, now + BACKOFF_CAP_SECONDS + 2000)
+    chk("EXPIRED backoff record is not preserved (cap applies normally)",
+        (len(ewindow), any(r["account"] == ah for r in ewindow)), (MAX_RECORDS, False))
+    cleared = [rec("openai", "codex01", "rate-limit", dt=0),
+               rec("openai", "codex01", SUCCESS, dt=50)]
+    swindow = prune(cleared + flood, now + 1000)
+    chk("success-cleared backoff record is not preserved",
+        (len(swindow), any(r["account"] == ah for r in swindow)), (MAX_RECORDS, False))
+    # ---- cap EXCEEDED by live backoffs alone (PR #85 finding 1) ------------------------------
+    # When more than MAX_RECORDS records feed still-live backoffs (34 saturated 6-record chains
+    # already total 204), the nominal cap CANNOT hold: every live backoff survives (correctness
+    # over the cap), every expired/non-preserved record is evicted (the total is the preserved
+    # set, never preserved + expired filler), and the overshoot is surfaced LOUDLY as a
+    # fleet-wide saturation ::warning:: — never a silent bound violation.
+    import contextlib
+    import io
+    live_count = MAX_RECORDS + 10
+    live = [rec("openai", f"live{i:03d}", "rate-limit", dt=0) for i in range(live_count)]
+    # expired: rate-limit hits whose 15-min backoff lapsed hours ago (still inside the 48 h window)
+    lapsed = [rec("openai", f"dead{i:03d}", "rate-limit", dt=-7200 - i) for i in range(40)]
+    sat_err = io.StringIO()
+    with contextlib.redirect_stderr(sat_err):
+        sat_window = prune(live + lapsed, now + 60)
+    live_hashes = {account_hash(f"live{i:03d}", salt) for i in range(live_count)}
+    chk("cap-exceeded: every live backoff survives the prune (correctness over cap)",
+        sum(1 for r in sat_window if r["account"] in live_hashes), live_count)
+    chk("cap-exceeded: expired records all evicted — total bounded by the live set",
+        (len(sat_window), any(r["account"] not in live_hashes for r in sat_window)),
+        (live_count, False))
+    chk("cap-exceeded: every live backoff still derives on the pruned window",
+        len(account_backoffs(sat_window, now + 60)), live_count)
+    chk("cap-exceeded: saturation is SURFACED (::warning:: names the cap)",
+        ("::warning::" in sat_err.getvalue(), f"MAX_RECORDS={MAX_RECORDS}" in sat_err.getvalue()),
+        (True, True))
+    # ...and an ordinary over-cap prune (live set within budget) stays silent — the saturation
+    # warning must keep its operational signal, not fire on every routine bounded write.
+    quiet_err = io.StringIO()
+    with contextlib.redirect_stderr(quiet_err):
+        quiet = prune(many, now + MAX_RECORDS + 100)
+    chk("under-saturation prune emits no warning (bound still hard)",
+        (len(quiet), quiet_err.getvalue()), (MAX_RECORDS, ""))
 
     # ---- validate_ledger rejects a RAW handle (privacy enforced at read) --------------------
     chk("ledger read rejects raw-handle account", _raises(lambda: validate_ledger(
