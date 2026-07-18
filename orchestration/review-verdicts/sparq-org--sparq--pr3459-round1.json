@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`SketchIndex::most_similar` accepts any `usize`, but `ranked.truncate((4 * k).max(64))` overflows whenever `k > usize::MAX / 4`. With overflow checks this panics; without them it wraps, potentially truncating to a small candidate set and violating the documented selection budget. This is reachable without allocating `k` items: a caller can pass `usize::MAX` against even a tiny index.",
+   "file": "crates/sparq-sim/src/lib.rs",
+   "fix_hint": "Compute the budget with `k.saturating_mul(4).max(64)` (and apply the same overflow-safe pattern to any shared helper used by this path). Add a sketch-feature test that calls `most_similar` with `usize::MAX` on a small graph and verifies it does not panic and returns all available positive-score candidates in exact-score order.",
+   "severity": "major",
+   "title": "Unchecked `4 * k` overflows in the public sketch query path"
+  }
+ ],
+ "progress": null,
+ "summary": "The sketch index is well scoped and its tests exercise exact re-scoring, deterministic twin recall, and decline behavior, but the new public query path has an unchecked arithmetic overflow for a valid `usize` input. In debug/test builds this panics; in optimized builds it wraps and can silently retain far fewer candidates than the documented `max(4k, 64)`. The candidate budget must use saturating arithmetic and needs a boundary witness before approval.",
+ "verdict": "request_changes"
+}
