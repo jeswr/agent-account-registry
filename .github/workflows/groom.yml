@@ -83,28 +83,94 @@ jobs:
             exit 1
           fi
 
-      - name: Mint target-scoped maintenance App token (pinned)
-        id: target-token
+      # Per-owner target token mint (issue #168): policy enables targets under TWO distinct owners
+      # (sparq-org, jeswr), so a SINGLE App token scoped to one owner 404s every read and fails
+      # every write on the other owner's repo — aborting the sweep before dead leases are released.
+      # dispatch.yml already mints one token per owner; groom now does the same. groom.py
+      # --print-owner-repos (self-tested, review round 1) collects EVERY enabled repo per owner —
+      # not one representative repo, which would mint a token that 404s the owner's OTHER enabled
+      # repos — and fails LOUD unless the enabled owner set is exactly {sparq-org, jeswr}, so a
+      # policy change adding a third owner fails here instead of silently dropping that owner's
+      # token (which would reintroduce the wrong-owner-token bug). Repo names are not secret; tee
+      # keeps the minted scope visible in the run log.
+      - name: Resolve enabled target repos per owner from policy
+        id: owners
+        run: |
+          set -euo pipefail
+          python3 scripts/groom.py --print-owner-repos --policy-file policy/repos.toml \
+            | tee -a "$GITHUB_OUTPUT"
+
+      # Each mint is continue-on-error: a missing install for one owner only DEFERS that owner's
+      # issue/PR repair (groom.py skips it loudly); dead-lease release and the other owner's
+      # grooming still run — the whole sweep is never aborted by one owner's credential gap.
+      - name: Mint sparq-org target-scoped maintenance App token (pinned)
+        id: target-token-sparq
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
           owner: sparq-org
-          repositories: sparq
+          repositories: ${{ steps.owners.outputs.sparq_names }}
           permission-issues: write
           permission-pull-requests: write
 
+      - name: Mint jeswr target-scoped maintenance App token (pinned)
+        id: target-token-jeswr
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: ${{ steps.owners.outputs.jeswr_names }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      # The {owner: token} JSON map is assembled INSIDE this step from the mint outputs (review
+      # round 1): the assembled secret map never transits GITHUB_OUTPUT, and a mint that reported
+      # success without delivering a token fails LOUD here instead of silently deferring every
+      # target repair on every run. Failed/skipped mints stay absent from the map — that owner's
+      # grooming defers loudly inside groom.py, never a wrong-owner token.
       - name: Sweep dead leases, stale issues, exhausted attempts, and stale PRs
         env:
           REGISTRY_GH_TOKEN: ${{ github.token }}
-          TARGET_GH_TOKEN: ${{ steps.target-token.outputs.token }}
+          # Per-owner target App tokens (issue #168): groom.py resolves the token for each target
+          # repo's OWNER, so a repo under a second owner is never read/written with the wrong token.
+          SPARQ_TOKEN: ${{ steps.target-token-sparq.outputs.token }}
+          JESWR_TOKEN: ${{ steps.target-token-jeswr.outputs.token }}
+          SPARQ_MINT_OUTCOME: ${{ steps.target-token-sparq.outcome }}
+          JESWR_MINT_OUTCOME: ${{ steps.target-token-jeswr.outcome }}
           # An App INSTALLATION token cannot call GET /user; groom resolves the bot identity from
-          # the public /users/<slug>[bot] endpoint instead (the worker.yml canary fix).
-          APP_SLUG: ${{ steps.target-token.outputs.app-slug }}
+          # the public /users/<slug>[bot] endpoint instead (the worker.yml canary fix). The same App
+          # is installed on both owners, so the slug is identical — take it from whichever mint won.
+          APP_SLUG: ${{ steps.target-token-sparq.outputs.app-slug || steps.target-token-jeswr.outputs.app-slug }}
         run: |
           set -euo pipefail
           printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
-          printf '::add-mask::%s\n' "$TARGET_GH_TOKEN"
+          [[ -z "${SPARQ_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$SPARQ_TOKEN"
+          [[ -z "${JESWR_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$JESWR_TOKEN"
+          if [[ "${SPARQ_MINT_OUTCOME:-}" == "success" && -z "${SPARQ_TOKEN:-}" ]]; then
+            echo "::error::sparq-org token mint succeeded but no token reached this step"
+            exit 1
+          fi
+          if [[ "${JESWR_MINT_OUTCOME:-}" == "success" && -z "${JESWR_TOKEN:-}" ]]; then
+            echo "::error::jeswr token mint succeeded but no token reached this step"
+            exit 1
+          fi
+          TARGET_GH_TOKENS="$(python3 - <<'PY'
+          import json
+          import os
+
+          tokens = {}
+          if os.environ.get("SPARQ_TOKEN"):
+              tokens["sparq-org"] = os.environ["SPARQ_TOKEN"]
+          if os.environ.get("JESWR_TOKEN"):
+              tokens["jeswr"] = os.environ["JESWR_TOKEN"]
+          print(json.dumps(tokens, separators=(",", ":")))
+          PY
+          )"
+          export TARGET_GH_TOKENS
           python3 scripts/groom.py --self-test
           python3 scripts/groom.py \
             --registry-repo "$GITHUB_REPOSITORY" \
