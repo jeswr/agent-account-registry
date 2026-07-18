@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The changed status text says the decode-only direct decoder already ships as the default load path, but the Features section above still says this crate wraps the hdt crate 'for the binary decode rather than reimplementing the format' and calls it the 'wrapped reader.' The implementation context confirms load/load_reader use the local decode module and retain upstream Hdt decoding as an oracle/alternate conversion path. Since README.md is included as the crate-level documentation, users receive mutually exclusive descriptions of the core architecture.",
+   "file": "crates/sparq-hdt/README.md",
+   "fix_hint": "Update the existing Features bullet(s) in this README to describe the local direct decoder as the default binary ingest path and the hdt crate as the upstream-backed oracle/auxiliary path (and adjust 'wrapped reader' accordingly). Keep the supported-layout/rejection claims, but attribute them to the direct decoder rather than implying that default loads use hdt::Hdt::read.",
+   "severity": "major",
+   "title": "README still claims binary decoding is delegated to hdt"
+  }
+ ],
+ "progress": null,
+ "summary": "The upstream-version notes are internally plausible and consistent with the lockfile's hdt 0.7.3 resolution, but the README update is incomplete: it now correctly says the direct decoder is the default load path while the Features section still makes the opposite architectural claim. Because this README is also included as crate-level rustdoc, the contradiction ships on both documentation surfaces.",
+ "verdict": "request_changes"
+}
