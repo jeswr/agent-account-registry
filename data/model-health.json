@@ -999,6 +999,14 @@
    "model_alias": "fable",
    "exit_class": "success",
    "run_id": "29626483623.1"
+  },
+  {
+   "ts": 1784340888,
+   "provider": "anthropic",
+   "account": "58b7c92faa5b5ca5",
+   "model_alias": "sonnet",
+   "exit_class": "success",
+   "run_id": "29626589017.1"
   }
  ]
 }
