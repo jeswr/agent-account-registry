@@ -12,16 +12,6 @@
   },
   {
    "account": "acct03",
-   "claim_id": "3d00e75b7a6b43e0b1a71acf33fc50d9",
-   "holder": "jeswr/agent-account-registry#117@dispatch-29648748121.1",
-   "package": "dispatch",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784386368,
-   "expires_at": 1784389068
-  },
-  {
-   "account": "acct03",
    "claim_id": "d2eb2868a8454537a50882374ad4cb37",
    "holder": "jeswr/agent-account-registry#144@dispatch-29648748121.1",
    "package": "worker",
