@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "Round 4 finds no blocker, major, or other actionable defect. The guard remains fail-closed for missing or malformed secrets data, repository/default-branch lookup failures, absent or permissive environment policy, non-branch policy entries, and any policy set other than exactly the repository default branch. Both secret-bearing jobs remain environment-bound and transitively gated on a successful guard; plan-alert's explicit always() condition still requires guard success. The least-privilege permission map is statically asserted exactly, the API helper performs only read requests without echoing remote error content, and the self-tests exercise meaningful accept/reject paths plus secret-value non-disclosure. Inclusion in the full registry self-test suite makes the new guard non-vacuously enforced when touched. No hostile reviewer-directed instruction appears in the diff.",
+ "verdict": "approve"
+}
