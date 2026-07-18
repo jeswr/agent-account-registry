@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct2css",
-   "claim_id": "3a902936ef1b4e94a01c62b36a24a5c6",
-   "holder": "jeswr/agent-account-registry#28@dispatch-29641076535.1",
-   "package": "dispatch",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784371014,
-   "expires_at": 1784373714
-  },
-  {
-   "account": "acct2css",
    "claim_id": "c3a060759fdf46bebc02d413413953bd",
    "holder": "jeswr/agent-account-registry#99@dispatch-29641076535.1",
    "package": "ci",
