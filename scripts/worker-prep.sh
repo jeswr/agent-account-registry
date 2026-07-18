@@ -21,8 +21,11 @@ CREDENTIAL_FORMAT=${WORKER_CREDENTIAL_FORMAT:-}
 ACCOUNT_CREDENTIAL=${WORKER_ACCOUNT_CREDENTIAL:-}
 WORKER_ROOT=${WORKER_ROOT:-}
 
+# Privacy (locked decision 22b, [GPT-5.6 r4 #7]): this script runs in PUBLIC workflow logs on
+# both the single and batch paths — no message it prints (success OR die) may carry the raw
+# account handle; the handle travels only via env/GITHUB_ENV, never stdout/stderr.
 [[ "$ACCOUNT" =~ ^acct[0-9a-z]{2,}$ ]] || die 'WORKER_ACCOUNT must name one selected acctNN account'
-[[ -n "$ACCOUNT_CREDENTIAL" ]] || die "credential for selected account $ACCOUNT is missing"
+[[ -n "$ACCOUNT_CREDENTIAL" ]] || die 'credential for the selected account is missing'
 [[ -n "$WORKER_ROOT" && "$WORKER_ROOT" != / ]] || die 'WORKER_ROOT must be an isolated directory'
 
 case "$PROVIDER:$HARNESS" in
@@ -172,4 +175,7 @@ if [[ -n ${GITHUB_PATH:-} ]]; then
   printf '%s\n' "$BIN_DIR" >> "$GITHUB_PATH"
 fi
 
-printf 'worker-prep: prepared isolated HOME for %s with the pinned %s CLI\n' "$ACCOUNT" "$HARNESS"
+# The selected handle is deliberately NOT printed (redaction, [GPT-5.6 r4 #7]): worker-prep has
+# no PROVENANCE_SALT (the salt never enters a job that later runs the model), so a salted-hash
+# echo is impossible here and the handle-free harness line is the only safe success message.
+printf 'worker-prep: prepared isolated HOME for the selected account with the pinned %s CLI\n' "$HARNESS"

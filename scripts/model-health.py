@@ -810,15 +810,25 @@ def read_ledger(api, registry_repo):
     return validate_ledger(document), sha
 
 
-def append_record(api, registry_repo, record, now, retries=6):
-    """CAS-append one record and prune the window (bounded write). Retries on conflict exactly like
-    the lease-ledger writer. Returns the pruned record count on success."""
+def append_records(api, registry_repo, new_records, now, retries=6):
+    """[FABLE-5 r9 #4] CAS-append N records in ONE contents-API PUT and prune the window (bounded
+    write). Retries on conflict exactly like the lease-ledger writer. Returns the pruned record
+    count on success. One PUT for the whole batch is the point: a K-leg batch job that looped N
+    independent six-retry CAS appends could advance the hot ledger ref N times per batch while the
+    verdict committer got only its own six attempts — fan-in health telemetry must never out-write
+    the data it exists to observe."""
+    if not new_records:
+        return None  # nothing to append — never spend a CAS write on an empty batch
     for _ in range(retries):
         records, sha = read_ledger(api, registry_repo)
-        records = prune(records + [record], now)
+        records = prune(records + list(new_records), now)
+        head = new_records[0]
+        message = (f"model-health record ({head['provider']}/{head['exit_class']})"
+                   if len(new_records) == 1
+                   else f"model-health batch ({head['provider']}, {len(new_records)} records)")
         encoded = base64.b64encode(
             (json.dumps({"records": records}, indent=1) + "\n").encode()).decode()
-        body = {"message": f"model-health record ({record['provider']}/{record['exit_class']})",
+        body = {"message": message,
                 "content": encoded,
                 "branch": LEDGER_REF}  # pin the data-plane branch, never the protected default
         if sha:
@@ -831,6 +841,11 @@ def append_record(api, registry_repo, record, now, retries=6):
         if isinstance(result, dict) and isinstance(result.get("content"), dict):
             return len(records)
     raise HealthError("model-health ledger CAS conflicts did not settle")
+
+
+def append_record(api, registry_repo, record, now, retries=6):
+    """CAS-append one record (the single-record convenience over `append_records`)."""
+    return append_records(api, registry_repo, [record], now, retries=retries)
 
 
 class GitHubAPI:
@@ -1067,6 +1082,50 @@ def _cmd_record(args):
     return 0
 
 
+def _cmd_record_batch(args):
+    """[FABLE-5 r9 #4] Append a whole batch job's per-leg health records in ONE CAS write. The
+    items file is a JSON list of {exit_class, reset_hint, run_id} (registry-authored, one entry
+    per admitted leg — the caller synthesizes exit_class=unknown for a leg that never uploaded a
+    health artifact, e.g. a timed-out matrix job that could not run its always() capture step).
+    Per-item isolation: a malformed entry is skipped with a warning, never dropping the batch."""
+    salt = os.environ.get("PROVENANCE_SALT", "")
+    handle = os.environ.get("WORKER_ACCOUNT_HANDLE", args.account or "")
+    if not handle or not salt:
+        print("::warning::model-health record-batch: no account handle/salt — recording without "
+              "a per-account hash is unsafe; skipping (telemetry must never fail a run)")
+        return 0
+    account_h = account_hash(handle, salt)
+    try:
+        with open(args.items_file, encoding="utf-8") as fh:
+            items = json.load(fh)
+        if not isinstance(items, list):
+            raise ValueError("items file must hold a JSON list")
+    except (OSError, ValueError) as exc:
+        print(f"::error::model-health record-batch: items file unreadable ({exc})")
+        return 1
+    records = []
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            print(f"::warning::model-health record-batch: item #{index} malformed; skipped")
+            continue
+        records.append(make_record(
+            args.provider, account_h, args.model_alias,
+            str(item.get("exit_class") or "") or CLASS_UNKNOWN,
+            str(item.get("run_id") or ""), time.time(),
+            reset_hint=item.get("reset_hint") or None))
+    if not records:
+        print("model-health: batch held no recordable items; nothing to append")
+        return 0
+    try:
+        api = GitHubAPI(os.environ.get("GH_TOKEN") or os.environ.get("REGISTRY_ALERT_TOKEN") or "")
+        kept = append_records(api, os.environ["REGISTRY_REPO"], records, time.time())
+    except HealthError as exc:
+        print(f"::error::model-health record-batch failed ({exc})")
+        return 1
+    print(f"model-health: recorded {len(records)} record(s) in one CAS write (window={kept})")
+    return 0
+
+
 def _cmd_decide(args):
     salt = os.environ.get("PROVENANCE_SALT", "")
     maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
@@ -1111,6 +1170,17 @@ def main(argv):
     rec.add_argument("--run-id", default="")
     rec.add_argument("--reset-hint", default=None)
     rec.set_defaults(func=_cmd_record)
+
+    # [FABLE-5 r9 #4] One CAS write for a whole batch job's per-leg records.
+    recb = sub.add_parser("record-batch",
+                          help="append N health records in ONE CAS write (batch fan-in)")
+    recb.add_argument("--provider", required=True)
+    recb.add_argument("--account", default="",
+                      help="RAW handle (salted here; env WORKER_ACCOUNT_HANDLE preferred)")
+    recb.add_argument("--model-alias", default="")
+    recb.add_argument("--items-file", required=True,
+                      help="JSON list of {exit_class, reset_hint, run_id}")
+    recb.set_defaults(func=_cmd_record_batch)
 
     dec = sub.add_parser("decide", help="evaluate the window and upsert/close alerts")
     dec.add_argument("--policy-file", default="policy/repos.toml")
@@ -1525,6 +1595,9 @@ def _self_test():
     # ---- record exits NONZERO on CAS exhaustion (defect #8) ----------------------------------
     ok = _test_record_exit(chk) and ok
 
+    # ---- [FABLE-5 r9 #4] record-batch: N legs -> ONE CAS PUT; exhaustion NONZERO -------------
+    ok = _test_record_batch_cmd(chk) and ok
+
     # ---- decide exits NONZERO on an unreadable ledger (review r3) ----------------------------
     ok = _test_decide_exit(chk) and ok
 
@@ -1628,6 +1701,14 @@ def _test_cas(chk):
     chk("missing ledger BRANCH fails loud (never silently-empty)", missing_branch_loud, True)
     chk("missing ledger FILE on a present branch seeds empty (first-write path)",
         read_ledger(_StubAPI(seed=None), "o/r"), ([], None))
+    # ---- [FABLE-5 r9 #4] batch fan-in: a whole batch's records land in ONE CAS PUT ----
+    apib = _StubAPI(seed=[])
+    batch = [make_record("openai", account_hash("acct03", salt), "terra", cls, str(i), now + i)
+             for i, cls in enumerate(("success", "limit", "unknown"))]
+    chk("batch append records every leg", append_records(apib, "o/r", batch, now + 3), 3)
+    chk("batch append is ONE contents-API PUT, never one per record", apib._n, 1)
+    chk("empty batch appends nothing (no CAS write spent)",
+        (append_records(apib, "o/r", [], now + 4), apib._n), (None, 1))
     return True
 
 
@@ -1707,6 +1788,75 @@ def _test_record_exit(chk):
         chk("record exits nonzero on CAS exhaustion", _cmd_record(args), 1)
     finally:
         GitHubAPI = real_api
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_record_batch_cmd(chk):
+    """[FABLE-5 r9 #4] `record-batch` appends a whole batch's per-leg items in ONE CAS PUT (a
+    synthesized `unknown` for a never-uploaded leg records like any other item, a malformed item
+    is skipped without dropping the batch), and CAS exhaustion exits NONZERO like `record`."""
+    import argparse as _ap
+    import tempfile
+    global GitHubAPI
+    real_api = GitHubAPI
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "WORKER_ACCOUNT_HANDLE", "PROVENANCE_SALT",
+              "GH_TOKEN", "REGISTRY_ALERT_TOKEN")}
+    stub = _StubAPI(seed=[])
+
+    class _WiredAPI:
+        def __init__(self, token):
+            pass
+
+        def request(self, *a, **k):
+            return stub.request(*a, **k)
+
+    class _ExhaustAPI:
+        def __init__(self, token):
+            pass
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            if method == "GET":
+                return None
+            raise HealthConflict("stub: permanent CAS contention")
+
+    items_path = None
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", WORKER_ACCOUNT_HANDLE="acct01",
+                          PROVENANCE_SALT="s3cret", GH_TOKEN="tok")
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            json.dump([{"exit_class": "success", "run_id": "1.1.50"},
+                       {"exit_class": "unknown", "run_id": "1.1.51"},   # timed-out leg synth
+                       {"exit_class": "limit", "run_id": "1.1.52", "reset_hint": "5h"},
+                       "malformed-entry"], fh)
+            items_path = fh.name
+        args = _ap.Namespace(provider="openai", account="", model_alias="terra",
+                             items_file=items_path)
+        GitHubAPI = _WiredAPI
+        chk("record-batch exits zero on success", _cmd_record_batch(args), 0)
+        chk("record-batch lands every healthy item in ONE PUT",
+            (len(stub.records()), stub._n), (3, 1))
+        chk("record-batch records the synthesized unknown leg",
+            sorted(r["exit_class"] for r in stub.records()),
+            sorted([SUCCESS, CLASS_UNKNOWN, CLASS_LIMIT]))
+        chk("record-batch stores only the salted hash",
+            {r["account"] for r in stub.records()}, {account_hash("acct01", "s3cret")})
+        GitHubAPI = _ExhaustAPI
+        chk("record-batch exits nonzero on CAS exhaustion", _cmd_record_batch(args), 1)
+        args_bad = _ap.Namespace(provider="openai", account="", model_alias="terra",
+                                 items_file=items_path + ".missing")
+        chk("record-batch exits nonzero on an unreadable items file",
+            _cmd_record_batch(args_bad), 1)
+    finally:
+        GitHubAPI = real_api
+        if items_path:
+            os.unlink(items_path)
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)

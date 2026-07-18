@@ -40,8 +40,19 @@ def reclaim_expired(leases, now):
     return [x for x in leases if x.get("expires_at", 0) > now]
 
 
+def lease_slots(lease):
+    """Worker slots a lease occupies. A batch-review lease reserves `slots` = its in-job model-call
+    parallelism (K), so every capacity computation counts ACTUAL concurrent workers, not lease rows
+    ([GPT-5.6 r4 #3]: one K-parallel batch behind a 1-slot lease exceeded max_concurrent_workers).
+    Absent/malformed defaults to 1 (every pre-slots lease is a single worker)."""
+    try:
+        return max(1, int(lease.get("slots", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
 def active_for(leases, account):
-    return sum(1 for x in leases if x["account"] == account)
+    return sum(lease_slots(x) for x in leases if x["account"] == account)
 
 
 # ---- usage-aware eligibility + expiry-priority (dynamic backoff) --------------------------------
@@ -163,7 +174,8 @@ def _order_eligible_accounts(accounts, leases, usage, package, role):
     return ordered
 
 
-def choose_account(accounts, leases, model_chain, package, role, now, usage=None, margin=SAFETY_MARGIN):
+def choose_account(accounts, leases, model_chain, package, role, now, usage=None, margin=SAFETY_MARGIN,
+                   slots=1):
     """Return the account handle to claim, or None. `accounts`: list of dicts
     {handle, models:[...], max_concurrent_workers, available:bool}. Walks the model chain; within a
     model keeps accounts under their concurrency cap and — when live `usage` (a {handle: {status,
@@ -171,15 +183,42 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
     Orders eligible accounts by EXPIRY-PRIORITY: soonest whole-account weekly reset first (use credits
     before they reset), preserving CACHE AFFINITY, least-loaded, and handle order for equal or unknown
     resets. With `usage=None` the behaviour is the original cache-affinity-then-least-loaded selection
-    (backward compatible)."""
+    (backward compatible).
+
+    `slots` ([GPT-5.6 r4 #3]) is how many CONCURRENT workers the claim will actually run (a K-batch
+    reserves K): capacity admits an account only if active slot-weighted load + `slots` fits under
+    max_concurrent_workers, and the usage headroom requirement scales to `margin * slots` — K
+    parallel workers burn ~K times a single worker's per-window rate, so admitting them behind a
+    single-worker margin defeats the mid-run rate-limit protection the gate exists for.
+
+    [FABLE-5 r9 #6] Per-ACCOUNT single-batch EXCLUSIVITY: a batch lease (slots > 1) is only ever
+    granted on an account with NO other live lease, and no claim of any kind joins an account that
+    holds a live batch lease. A batch's outcome job performs the account's credential write-back
+    (`gh secret set`), which is serialized only WITHIN one batch — two co-resident batches (the old
+    two-4-slot-leases-under-a-cap-of-8 admission), or a single review racing a batch's outcome,
+    could interleave unconditional secret updates and let an older refresh generation overwrite a
+    newer one, stranding the account for every future claim. Exclusivity for the lease's whole TTL
+    (which covers the outcome job) removes the cross-run race entirely; capacity costs nothing in
+    practice because a batch already reserves K of the account's slots."""
     live = reclaim_expired(leases, now)
+    slots = max(1, int(slots))
+
+    def rotation_exclusive(account):
+        held = [lease for lease in live if lease.get("account") == account["handle"]]
+        if any(lease_slots(lease) > 1 for lease in held):
+            return False          # a live batch owns this account exclusively
+        return not (slots > 1 and held)   # a new batch requires an idle account
+
     for model in model_chain:
         serving = [a for a in accounts
                    if a.get("available", True) and model in a.get("models", [])
-                   and active_for(live, a["handle"]) < int(a.get("max_concurrent_workers", 4))]
+                   and rotation_exclusive(a)
+                   and active_for(live, a["handle"]) + slots
+                   <= int(a.get("max_concurrent_workers", 4))]
         if usage is not None:
             serving = [a for a in serving
-                       if usage_eligible(usage.get(a["handle"]), margin, model=model, now=now)]
+                       if usage_eligible(usage.get(a["handle"]), margin * slots, model=model,
+                                         now=now)]
         if not serving:
             continue
 
@@ -217,14 +256,15 @@ def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, ma
     return total
 
 
-def make_lease(account, holder, package, role, model, now, ttl):
+def make_lease(account, holder, package, role, model, now, ttl, slots=1):
     return {"account": account, "claim_id": None, "holder": holder, "package": package,
-            "role": role, "model": model, "issued_at": now, "expires_at": now + ttl}
+            "role": role, "model": model, "issued_at": now, "expires_at": now + ttl,
+            "slots": max(1, int(slots))}
 
 
-def apply_claim(leases, account, holder, package, role, model, now, ttl, claim_id):
+def apply_claim(leases, account, holder, package, role, model, now, ttl, claim_id, slots=1):
     live = reclaim_expired(leases, now)
-    lease = make_lease(account, holder, package, role, model, now, ttl)
+    lease = make_lease(account, holder, package, role, model, now, ttl, slots=slots)
     lease["claim_id"] = claim_id
     live.append(lease)
     return live, lease
@@ -375,13 +415,21 @@ def read_accounts(repo):
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
           account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None,
-          margin=SAFETY_MARGIN):
+          margin=SAFETY_MARGIN, slots=1):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free).
     Raises LeaseIOError when an account WAS eligible but the ledger write kept failing — that is an
     infrastructure failure (persistent CAS contention, or the contents-API PUT rejected outright,
     e.g. by a required-status-check branch protection on the ledger's branch), NOT a capacity
-    signal, and must not be reported as 'no eligible account' (issue #28)."""
+    signal, and must not be reported as 'no eligible account' (issue #28).
+
+    `slots` ([GPT-5.6 r4 #3]): the number of CONCURRENT workers this ONE lease will run (a
+    batch-review job runs K parallel model calls against its one claimed account). The whole
+    reservation is atomic — the single CAS PUT records a lease carrying `slots`, and every
+    capacity gate here (per-account max_concurrent_workers via choose_account, the shared
+    holder-prefix cap, and the usage-headroom margin, which scales to margin*slots) counts
+    slot-weighted workers, never lease rows."""
     import uuid
+    slots = max(1, int(slots))
     accounts = read_accounts(repo)
     if account_pool is not None:
         allowed = set(account_pool)
@@ -392,17 +440,31 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         key = holder_key(holder)
         if key and any(holder_key(lease.get("holder")) == key for lease in live):
             return None
-        if holder_prefix and not partition_available(live, holder_prefix, package):
+        # [FABLE-5 r9 #1] The package/global partition serializes WRITERS: two impl/fix workers in
+        # one package (or anything under a __global__ item) would race pushes to the same crate.
+        # Review claims are exempt — a review is READ-ONLY against a pinned head sha, so N
+        # same-package (or __global__-package) reviews are as safe concurrently as the K calls
+        # already running inside one batch. Partitioning reviews silently serialized a same-package
+        # backlog to ONE batch per tick (4 concurrent calls), voiding the >40-reviews-in-flight
+        # design point; review parallelism is bounded by the slot-weighted holder-prefix cap, each
+        # account's max_concurrent_workers, and the usage margin instead. Per-PR duplicate
+        # suppression stays with the holder_key check above, never the partition.
+        if holder_prefix and role != "review" \
+                and not partition_available(live, holder_prefix, package):
             return None
         if max_holder_concurrent is not None:
             if max_holder_concurrent <= 0 or not holder_prefix:
                 return None
+            # Slot-weighted: the prefix cap bounds concurrent WORKERS (e.g. parallel codex model
+            # calls under `review:`), so a K-slot batch consumes K of them, not 1.
             active_holders = sum(
-                1 for lease in live if str(lease.get("holder", "")).startswith(holder_prefix)
+                lease_slots(lease) for lease in live
+                if str(lease.get("holder", "")).startswith(holder_prefix)
             )
-            if active_holders >= max_holder_concurrent:
+            if active_holders + slots > max_holder_concurrent:
                 return None
-        acct = choose_account(accounts, live, model_chain, package, role, now, usage=usage, margin=margin)
+        acct = choose_account(accounts, live, model_chain, package, role, now, usage=usage,
+                              margin=margin, slots=slots)
         if acct is None:
             return None
         a = next(x for x in accounts if x["handle"] == acct)
@@ -410,17 +472,19 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         # the first chain-model the account merely SERVES would route fable onto an account whose fable
         # sub-quota is exhausted (choose_account admitted it only via a later, non-premium pass) — the exact
         # mid-run-failure the usage gate exists to prevent. When usage is supplied, require the model to
-        # also be usage_eligible; with usage=None this is the original chain-order pick (backward compatible).
+        # also be usage_eligible (at the same slot-scaled margin that admitted the account); with
+        # usage=None this is the original chain-order pick (backward compatible).
         if usage is not None:
             model = next((m for m in model_chain
-                          if m in a["models"] and usage_eligible(usage.get(acct), margin, model=m,
-                                                                 now=now)), None)
+                          if m in a["models"] and usage_eligible(usage.get(acct), margin * slots,
+                                                                 model=m, now=now)), None)
             if model is None:
                 return None  # no chain model is eligible for the admitted account (defensive; shouldn't happen)
         else:
             model = next((m for m in model_chain if m in a["models"]), model_chain[0])
         cid = uuid.uuid4().hex
-        live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
+        live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid,
+                                   slots=slots)
         if _write_ledger(repo, live, sha, f"claim {cid[:8]} {acct} {package}/{role}"):
             return {
                 "account": acct,
@@ -556,8 +620,42 @@ def _self_test():
           partition_available(mixed, "review:", "crate-b"), True)
     check("review lease invisible to the impl partition (partition cross-check)",
           partition_available([mixed[1]], "owner/repo#", "crate-a"), True)
-    check("same-crate reviews still serialize under the shared review: prefix",
+    check("partition_available itself still reports a same-crate review collision "
+          "(claim() bypasses it for the read-only review role)",
           partition_available(mixed, "review:", "crate-a"), False)
+
+    # ---- [FABLE-5 r9 #1] review claims are NOT package-partitioned ----
+    # Reviews are READ-ONLY against pinned heads: N same-package (or __global__) review leases are
+    # safe concurrently, and partitioning them silently collapsed a same-package backlog to ONE
+    # batch (4 concurrent calls) per tick — far under the >40-reviews design point. Writers
+    # (impl/fix) stay strictly partitioned.
+    same_pkg_review = [make_lease("acct01", "review:o/r#40@r.1", "crate-a", "review", "terra",
+                                  now, 100)]
+    two_accounts = [{"handle": "acct01", "models": ["terra"], "max_concurrent_workers": 3,
+                     "available": True, "secret_ref": "ACCT01_TOKEN"},
+                    {"handle": "acct02", "models": ["terra"], "max_concurrent_workers": 3,
+                     "available": True, "secret_ref": "ACCT02_TOKEN"}]
+    with _StubLedger(two_accounts, same_pkg_review):
+        same_pkg = claim("r", "crate-a", "review", ["terra"], "review:o/r#41@r.1", now,
+                         account_pool=["acct01", "acct02"], holder_prefix="review:",
+                         max_holder_concurrent=24)
+    check("a second SAME-package review claim is admitted (reviews are read-only)",
+          bool(same_pkg), True)
+    global_review = [make_lease("acct01", "review:o/r#40@r.1", "__global__", "review", "terra",
+                                now, 100)]
+    with _StubLedger(two_accounts, global_review):
+        past_global = claim("r", "crate-b", "review", ["terra"], "review:o/r#41@r.1", now,
+                            account_pool=["acct01", "acct02"], holder_prefix="review:",
+                            max_holder_concurrent=24)
+    check("a live __global__ review lease does not block other review claims",
+          bool(past_global), True)
+    with _StubLedger(two_accounts,
+                     [make_lease("acct01", "o/r#7@r.1", "crate-a", "impl", "terra", now, 100)]):
+        impl_same_pkg = claim("r", "crate-a", "impl", ["terra"], "o/r#9@r.1", now,
+                              account_pool=["acct01", "acct02"], holder_prefix="o/r#",
+                              max_holder_concurrent=24)
+    check("impl claims STAY package-partitioned (writers still serialize)",
+          impl_same_pkg, None)
 
     # Two live review leases for DISTINCT PRs are bounded by the SHARED `review:` prefix cap
     # (max_holder_concurrent=2 = the static codex slot bound; codex is usage-exempt so the CLI
@@ -799,6 +897,97 @@ def _self_test():
     check("claim assigns model consistent with the admitting pass (haiku, not fable)",
           claimed and claimed["model"], "haiku")
 
+    # ---- [GPT-5.6 r4 #3] K-slot batch reservation: capacity, holder cap and usage margin all
+    # count ACTUAL concurrent workers (slot-weighted), atomically in the one CAS claim ----
+    check("lease_slots defaults to 1 (pre-slots lease rows)", lease_slots({"account": "a"}), 1)
+    check("lease_slots malformed defaults to 1", lease_slots({"slots": "junk"}), 1)
+    check("lease_slots floor is 1", lease_slots({"slots": 0}), 1)
+    batch_lease = make_lease("acct05", "review:o/r#batch-1@run", "p", "review", "terra", now, 100,
+                             slots=4)
+    check("a K-slot lease weighs K in active_for", active_for([batch_lease], "acct05"), 4)
+    B = [{"handle": "acct05", "models": ["terra"], "max_concurrent_workers": 4, "available": True}]
+    one = [make_lease("acct05", "h", "p", "review", "terra", now, 100)]
+    check("K-batch over per-account capacity is refused (1 active + 4 > 4)",
+          choose_account(B, one, ["terra"], "p", "review", now, slots=4), None)
+    # [FABLE-5 r9 #6] Per-account single-batch EXCLUSIVITY: a batch performs the account's
+    # credential write-back at outcome time, so it must never share the account with ANY other
+    # lease — a co-resident writer could overwrite a newer refresh generation with an older one.
+    check("K-batch refused on an account with ANY live lease (rotation exclusivity)",
+          choose_account(B, one, ["terra"], "p", "review", now, slots=3), None)
+    B8 = [{"handle": "acct05", "models": ["terra"], "max_concurrent_workers": 8,
+           "available": True}]
+    check("K-batch admitted only on an IDLE account",
+          choose_account(B8, [], ["terra"], "p", "review", now, slots=4), "acct05")
+    check("a live batch lease excludes a second K-batch even under the account cap (4+4<=8)",
+          choose_account(B8, [batch_lease], ["terra"], "p", "review", now, slots=4), None)
+    check("a live K-slot lease blocks the next single claim (batch account is exclusive)",
+          choose_account(B, [batch_lease], ["terra"], "p", "review", now), None)
+    check("a live K-slot lease blocks a single claim even BELOW the account cap",
+          choose_account(B8, [batch_lease], ["terra"], "p", "review", now), None)
+    # usage headroom scales to margin*slots: headroom 0.30 admits 2 workers at margin 0.10 but
+    # never 4 (K parallel calls burn ~K times a single worker's rate).
+    tight = {"status": "allowed", "5h_util": 0.7, "5h_reset": 5000, "7d_util": 0.1, "7d_reset": 9000}
+    TU = [{"handle": "acct06", "models": ["haiku"], "max_concurrent_workers": 8, "available": True}]
+    check("K-batch margin scales: headroom 0.30 refuses slots=4 at margin 0.10",
+          choose_account(TU, [], ["haiku"], "p", "review", now, usage={"acct06": tight},
+                         margin=0.10, slots=4), None)
+    check("K-batch margin scales: headroom 0.30 admits slots=2 at margin 0.10",
+          choose_account(TU, [], ["haiku"], "p", "review", now, usage={"acct06": tight},
+                         margin=0.10, slots=2), "acct06")
+    # An exempt (codex) account stays governed reactively: a backoff excludes the batch too.
+    XB = [{"handle": "cx8", "models": ["terra"], "max_concurrent_workers": 8, "available": True}]
+    check("exempt account admits a K-batch (no windows to gate)",
+          choose_account(XB, [], ["terra"], "p", "review", now,
+                         usage={"cx8": {"exempt": True}}, slots=4), "cx8")
+    check("exempt account under ACTIVE backoff refuses the K-batch",
+          choose_account(XB, [], ["terra"], "p", "review", now,
+                         usage={"cx8": {"exempt": True, "backoff_until": now + 500}}, slots=4),
+          None)
+    # claim(): the ONE CAS write records the K-slot lease, and the shared holder-prefix cap is
+    # slot-weighted — a second K-batch that would push review: workers past the cap gets None.
+    # [FABLE-5 r9 #6] The first batch's lease sits on a DIFFERENT account (acct08): the shared
+    # prefix cap sums across accounts, while per-ACCOUNT exclusivity (tested above and below)
+    # forbids two batches on one account regardless of that cap.
+    slot_writes = []
+    with _StubLedger([{"handle": "acct07", "models": ["terra"], "max_concurrent_workers": 8,
+                       "available": True, "secret_ref": "ACCT07_TOKEN"}],
+                     [make_lease("acct08", "review:o/r#batch-9@r.1", "p", "review", "terra",
+                                 now, 100, slots=4)]):
+        globals()["_write_ledger"] = \
+            lambda repo, leases, sha, msg: slot_writes.append(leases) or True
+        batch_claim = claim("r", "crate-z", "review", ["terra"], "review:o/r#batch-2@r.1", now,
+                            account_pool=["acct07"], holder_prefix="review:",
+                            max_holder_concurrent=8, slots=4)
+    check("second K-batch under the slot-weighted holder cap succeeds (4 + 4 <= 8)",
+          bool(batch_claim), True)
+    check("the CAS-written lease records its K slots atomically",
+          [lease_slots(x) for x in slot_writes[-1]], [4, 4])
+    with _StubLedger([{"handle": "acct07", "models": ["terra"], "max_concurrent_workers": 8,
+                       "available": True, "secret_ref": "ACCT07_TOKEN"}],
+                     [make_lease("acct08", "review:o/r#batch-9@r.1", "p", "review", "terra",
+                                 now, 100, slots=4)]):
+        over_cap = claim("r", "crate-z", "review", ["terra"], "review:o/r#batch-2@r.1", now,
+                         account_pool=["acct07"], holder_prefix="review:",
+                         max_holder_concurrent=7, slots=4)
+    check("K-batch past the slot-weighted holder cap is refused (4 + 4 > 7)", over_cap, None)
+    # [FABLE-5 r9 #6] End-to-end through claim(): the SAME account already runs a batch — a second
+    # batch AND a single review are both refused there even though every cap has room, so the
+    # credential write-back of a batch outcome can never race another run on the account.
+    with _StubLedger([{"handle": "acct07", "models": ["terra"], "max_concurrent_workers": 8,
+                       "available": True, "secret_ref": "ACCT07_TOKEN"}],
+                     [make_lease("acct07", "review:o/r#batch-9@r.1", "p", "review", "terra",
+                                 now, 100, slots=4)]):
+        same_acct_batch = claim("r", "crate-z", "review", ["terra"],
+                                "review:o/r#batch-2@r.1", now, account_pool=["acct07"],
+                                holder_prefix="review:", max_holder_concurrent=24, slots=4)
+        same_acct_single = claim("r", "crate-z", "review", ["terra"],
+                                 "review:o/r#77@r.1", now, account_pool=["acct07"],
+                                 holder_prefix="review:", max_holder_concurrent=24)
+    check("claim(): a second batch on the SAME account is refused (account-exclusive rotation)",
+          same_acct_batch, None)
+    check("claim(): a single review never joins an account with a live batch lease",
+          same_acct_single, None)
+
     # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
     # Literal "ledger" on purpose: pointing either helper back at the default branch (or changing
     # the shipped REGISTRY_LEDGER_REF default) must turn these red.
@@ -872,6 +1061,8 @@ def main():
     ap.add_argument("--expected-holder-prefix", default="",
                     help="required holder prefix when inspecting a dispatcher claim")
     ap.add_argument("--ttl", type=int, default=3600, help="lease lifetime in seconds")
+    ap.add_argument("--slots", type=int, default=1,
+                    help="concurrent workers this one lease reserves (a K-batch passes K)")
     ap.add_argument("--repo", default="jeswr/agent-account-registry")
     args = ap.parse_args()
     if args.self_test:
@@ -884,13 +1075,13 @@ def main():
     if args.claim:
         chain = [m.strip() for m in args.models.split(",") if m.strip()]
         pool = [a.strip() for a in args.account_pool.split(",") if a.strip()]
-        if not chain or not pool or args.ttl <= 0:
-            print("claim requires non-empty --models/--account-pool and positive --ttl",
+        if not chain or not pool or args.ttl <= 0 or args.slots < 1:
+            print("claim requires non-empty --models/--account-pool, positive --ttl and --slots >= 1",
                   file=sys.stderr)
             return 2
         res = claim(args.repo, args.package, args.role, chain, args.holder, int(time.time()),
                     ttl=args.ttl, account_pool=pool, holder_prefix=args.holder_prefix,
-                    max_holder_concurrent=args.max_holder_concurrent)
+                    max_holder_concurrent=args.max_holder_concurrent, slots=args.slots)
         print(json.dumps(res) if res else "none-free")
         return 0 if res else 3
     if args.inspect:

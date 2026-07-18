@@ -1,0 +1,1885 @@
+# [FABLE-5] Batch-review worker — ONE job reviews a BATCH of worker draft PRs and writes ALL their
+# verdicts in ONE atomic Git-Data-API commit (worker-pr.py verdict-record-batch), instead of N
+# single-review jobs each doing a separate contended Contents-API commit. This is the throughput +
+# robustness rebuild described in orchestration/review-verdicts/README.md: it multiplies effective review
+# parallelism past the 40-slot account cap (1 batch job = up to BATCH_SIZE reviews, K in flight) AND
+# eliminates the inter-write contention that made concurrent single-review commits thrash the branch
+# head ("registry write for … kept conflicting", observed live on sparq-org--sparq--pr2521-round3).
+#
+# TRUST POSTURE — UNCHANGED per item (design §3/§7). The batch is composed downstream of dispatch's
+# per-PR hostile admission gate; EVERY per-PR invariant is re-asserted a THIRD time here, live, per
+# item, BEFORE that item's read-only model call: open + draft, same-repo App-bot worker head, live
+# head_sha == the manifest head_sha (no drift), head descends from the provenance-bound
+# worker-opened commit, human-hold labels excluded on the PR AND its provenance-bound source issue
+# (needs:*), label-derived security recomputed live (builtin keywords + the target routing's
+# match_labels), registry provenance present + agreeing, and the reviewer account/provider != the
+# item's implementer account/provider. [FABLE-5 round-2 #3] The SAME full posture is re-validated
+# a FOURTH time, live, per item at OUTCOME (label/arm) time — a batch runtime after admission —
+# and ready-and-arm re-checks human-hold + security labels once more before any undraft/latch;
+# the outcome/arm policy (max rounds, arm flag, security paths) is resolved from the TARGET
+# policy row (policy/repos.toml + protected routing), never global workflow vars.
+# [FABLE-5 r5] The dispatcher's claim is ADOPTED like the single path (worker.yml/review-fix.yml):
+# validated against the LIVE lease ledger + account catalog (holder prefix, pool, role/package
+# partition, model in the inverse review chain, provider, account, secret_ref == <ACCOUNT>_TOKEN)
+# BEFORE any App token is minted or any account secret is dereferenced, and a claim that failed
+# validation is NEVER released (the release job is gated on adoption). Each review leg resolves
+# the model + runs the policy-routed AGENT from the TARGET policy/routing resolution (never the
+# registry's routing mirror), exactly like the single path's resolve/selected steps.
+# A per-item failure NEVER sinks the batch (per-item try/except); the atomic commit records only the
+# healthy subset; failed items get no label/arm and re-plan next tick (their reviewed-sha marker is
+# never bound, so the sweep re-surfaces them). Verdict SCHEMA + label/arm/round-budget logic are the
+# single-review path's, reused verbatim per item. The reviewer model runs read-only, mutation-denied,
+# with NO GitHub token in its container. A trust-surface (security_paths) PR is human-armed as today.
+#
+# Coexistence: this is a NEW workflow. The single review-fix.yml path is unchanged and, with the
+# dispatch feature flag REVIEW_BATCH_ENABLED off, is the only path; both write the SAME canonical
+# verdict bytes and are mutually idempotent.
+name: review-batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Target owner/repository allowed by policy/repos.toml
+        required: true
+        type: string
+      impl_provider:
+        description: Implementer provider shared by every PR in the batch (anthropic|openai); fixes the inverse reviewer direction
+        required: true
+        type: choice
+        options: [anthropic, openai]
+      package:
+        description: Lease package partition shared by the batch
+        required: true
+        type: string
+      account:
+        description: Dispatcher-claimed account handle (ONE account for the whole batch)
+        required: true
+        type: string
+      claim_id:
+        description: Dispatcher-owned CAS claim to adopt (released once at the end)
+        required: true
+        type: string
+      reviewer_provider:
+        description: The claimed account's provider (must differ from impl_provider — cross-provider rule)
+        required: true
+        type: string
+      reviewer_model:
+        description: The claimed model alias resolved from the protected target routing catalog
+        required: true
+        type: string
+      secret_ref:
+        description: The secret name holding the claimed account credential
+        required: true
+        type: string
+      harness:
+        description: The claimed model harness (claude|codex)
+        required: false
+        default: ''
+        type: string
+      credential_format:
+        description: The claimed account credential format
+        required: false
+        default: ''
+        type: string
+      batch_k:
+        description: In-job parallel review calls against the one claimed account
+        required: false
+        default: '4'
+        type: string
+      manifest_b64:
+        description: base64(JSON list) of admitted review descriptors (pr_number, head_sha, head_branch, impl_provider, impl_account_h, issue, package, review_round, security)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  # [FABLE-5 round-2 #6] One batch per adopted CLAIM at a time. The account is the shared resource,
+  # but its RAW handle must never surface in the concurrency-group name (shown in the Actions
+  # UI/scheduling — no-raw-handle posture, locked decision 22). [FABLE-5 r9 #6] Account
+  # serialization is ENFORCED by the allocator, not assumed here: select-and-claim's
+  # choose_account grants a batch lease (slots > 1) only on an account with NO other live lease
+  # and refuses ANY claim on an account holding a live batch lease — so for the lease's whole TTL
+  # (which covers commit-outcome's single credential write-back) this batch is the account's only
+  # tenant, and two runs can never interleave `gh secret set` generations. Keying on the
+  # dispatcher's non-sensitive claim id therefore only dedups a double-dispatch of the same claim
+  # without leaking the handle. cancel-in-progress false so a running batch is never severed
+  # mid-review (a severed batch just re-plans).
+  group: review-batch-${{ inputs.target_repo }}-${{ inputs.claim_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ---- 1. Decode + validate the manifest and re-admit each item LIVE (no worker secrets). Emits a
+  #         JSON matrix of the items that pass admission; failed items are simply dropped (re-plan). --
+  resolve-batch:
+    name: Decode + re-admit the batch (no worker secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      issues: read   # [FABLE-5 r5 #2] lease adoption reads the live account catalog (issues)
+    outputs:
+      matrix: ${{ steps.admit.outputs.matrix }}
+      count: ${{ steps.admit.outputs.count }}
+      target_owner: ${{ steps.admit.outputs.target_owner }}
+      target_name: ${{ steps.admit.outputs.target_name }}
+      # [FABLE-5 r7 #4] The VALIDATED concurrency bound from lease adoption (== the live lease's
+      # slot reservation, asserted against batch_k AND manifest cardinality) — never the raw
+      # batch_k input.
+      batch_k: ${{ steps.adopt.outputs.validated_k }}
+      # [FABLE-5 r5 #1] The policy-resolved TARGET routing pointer + routed agent ride to every
+      # review leg (review-fix.yml `needs.resolve.outputs.routing/agent` convention) — the legs
+      # resolve the model from the TARGET catalog and export WORKER_AGENT to worker-live.sh.
+      routing: ${{ steps.policy.outputs.routing }}
+      agent: ${{ steps.policy.outputs.agent }}
+      # [FABLE-5 r5 #2] True only after the dispatcher claim VALIDATED against the live ledger;
+      # the release job is gated on it (never release a claim that failed validation).
+      claim_adopted: ${{ steps.adopt.outputs.claim_adopted }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # Provenance records are resolved ledger-FIRST ([GPT-5.6 r4] / issue #96: the protected
+      # default branch rejects every github.token write, so fix/provenance-ledger moves the
+      # provenance+verdict store to the unprotected `ledger` data-plane branch); the `registry`
+      # checkout above stays the legacy fallback for pre-migration records. Fails LOUD if the
+      # ledger branch is missing (dispatch.yml posture).
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry-ledger
+          ref: ledger
+          persist-credentials: false
+
+      # Trust guard (mirrors dispatch.yml): the ledger branch is DATA-ONLY — no workflow or
+      # script may ever ride in from it.
+      - name: Ledger checkout is data-only (trust guard)
+        run: |
+          set -euo pipefail
+          test ! -e registry-ledger/.github
+          test ! -e registry-ledger/scripts
+
+      # [FABLE-5 round-2 #3c] The target routing's `match_labels` keywords feed the LIVE security
+      # recompute (same classifier as review-fix's resolve step) — the plan manifest's `security`
+      # bit alone is stale the moment a label lands after planning.
+      - name: Checkout public target for protected routing data (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target-routing
+          persist-credentials: false
+
+      - name: Split the target owner/name
+        id: owner
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo '::error::unsafe target repo'; exit 1; }
+          printf 'target_owner=%s\n' "${TARGET_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          printf 'target_name=%s\n' "${TARGET_REPO##*/}" >> "$GITHUB_OUTPUT"
+
+      # [FABLE-5 r5 #1] TARGET policy resolution for the whole batch, exactly like the single
+      # path's resolve step (review-fix.yml `policy`): the review legs must run the
+      # policy-routed AGENT (worker-live.sh fails closed on an empty/missing WORKER_AGENT before
+      # any model call) against the policy-resolved TARGET routing — never the registry's own
+      # routing mirror — and the lease-adoption step below validates the dispatcher claim
+      # against the SAME resolved account pool + inverse review chain. Fail closed: an unknown
+      # target repo or unresolvable chain fails the whole batch here, before any App token is
+      # minted or account secret dereferenced.
+      - name: Resolve target policy + inverse review chain (role=review)
+        id: policy
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          IMPL_PROVIDER: ${{ inputs.impl_provider }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/policy-resolve.py \
+            --target-repo "$TARGET_REPO" \
+            --policy-file registry/policy/repos.toml \
+            --target-root target-routing \
+            --role review > "$RUNNER_TEMP/policy.json"
+          python3 - "$RUNNER_TEMP/policy.json" <<'PY'
+          import json, os, re, sys, tomllib
+          from pathlib import Path, PurePosixPath
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              policy = json.load(handle)
+          impl_provider = os.environ["IMPL_PROVIDER"]
+          target_root = Path("target-routing").resolve()
+          routing_path = target_root.joinpath(*PurePosixPath(policy["routing"]).parts).resolve()
+          try:
+              routing_path.relative_to(target_root)
+          except ValueError as exc:
+              raise SystemExit("resolved routing path escaped target checkout") from exc
+          with open(routing_path, "rb") as handle:
+              routing = tomllib.load(handle)
+
+          # The review chain is the INVERSE of the implementer's provider and is computed HERE,
+          # never via resolve() (whose role=review row is always [opus]) — review-fix.yml
+          # convention; resolve() supplies account_pool / agent / caps only. A CODEX alias with
+          # a missing/TBD provider_model stays resolvable (locked decision 14: worker-live.sh
+          # omits --model and the CLI default applies); a claude alias needs a concrete id.
+          review_chain = {"anthropic": ["terra"], "openai": ["opus"]}
+          models = routing.get("models", {})
+          chain = []
+          for alias in review_chain[impl_provider]:
+              meta = models.get(alias)
+              if not isinstance(meta, dict):
+                  continue
+              provider_model = meta.get("provider_model")
+              concrete = (isinstance(provider_model, str) and provider_model != "TBD"
+                          and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", provider_model))
+              codex_default = (meta.get("harness") == "codex"
+                               and provider_model in (None, "", "TBD"))
+              if concrete or codex_default:
+                  chain.append(alias)
+          if not chain:
+              raise SystemExit(
+                  "review chain unresolvable for this direction; refusing the batch")
+          values = {
+              "routing": policy["routing"],
+              "model_chain": ",".join(chain),
+              "account_pool": ",".join(policy["account_pool"]),
+              "agent": policy["agent"],
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+                      raise SystemExit(f"unsafe resolved value: {key}")
+                  output.write(f"{key}={value}\n")
+          print(f"review chain for {impl_provider}-implemented batch: {','.join(chain)}")
+          PY
+
+      # [FABLE-5 r5 #2] Adopt the dispatcher-owned CAS claim by VALIDATING it against the LIVE
+      # lease ledger BEFORE any App token is minted or any account secret is dereferenced —
+      # mirrors the single path's worker.yml/review-fix.yml adopt step. Asserted against the
+      # live lease + its live account row: holder prefix (a batch review claim for THIS target
+      # repo), account == the supplied input AND in the resolved pool, work partition (role ==
+      # review, package == the batch package), model == the supplied input AND in the inverse
+      # review chain, provider (present, == the supplied input, != the implementer provider),
+      # and secret_ref == <ACCOUNT>_TOKEN == the supplied input — so a malformed/manual
+      # dispatch can never route another account's secret into the legs. A claim that FAILS
+      # validation is NEVER released (the supplied id could name an unrelated ACTIVE lease;
+      # releasing it would sever that job mid-run — it just expires via TTL/groom), and the
+      # release job below is gated on this step's claim_adopted output for the same reason.
+      # `--inspect` itself fails closed (exit 3) on an unknown/expired claim or holder mismatch.
+      # [FABLE-5 r7 #4] The batch's ACTUAL matrix concurrency is bound to the adopted lease here:
+      # batch_k must be a well-formed positive integer (no silent default), and the live lease's
+      # `slots` reservation must equal min(manifest cardinality, batch_k) — the exact reservation
+      # the dispatcher made (slots = min(len(batch), REVIEW_BATCH_K)). A manual/malformed
+      # dispatch that inflates batch_k (which feeds max-parallel) or shrinks the reservation can
+      # therefore never run more concurrent model calls than the ledger reserved: the review
+      # job's max-parallel is capped by this step's VALIDATED value (the lease slots), never the
+      # raw input.
+      - name: Adopt the dispatcher lease (validate against the live ledger; no secret deref yet)
+        id: adopt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          IMPL_PROVIDER: ${{ inputs.impl_provider }}
+          EXPECTED_ACCOUNT: ${{ inputs.account }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+          EXPECTED_PACKAGE: ${{ inputs.package }}
+          EXPECTED_PROVIDER: ${{ inputs.reviewer_provider }}
+          EXPECTED_MODEL: ${{ inputs.reviewer_model }}
+          EXPECTED_SECRET_REF: ${{ inputs.secret_ref }}
+          EXPECTED_HARNESS: ${{ inputs.harness }}
+          EXPECTED_CREDENTIAL_FORMAT: ${{ inputs.credential_format }}
+          BATCH_K: ${{ inputs.batch_k }}
+          MANIFEST_B64: ${{ inputs.manifest_b64 }}
+          MODELS: ${{ steps.policy.outputs.model_chain }}
+          ACCOUNT_POOL: ${{ steps.policy.outputs.account_pool }}
+        run: |
+          set -euo pipefail
+          [[ "$CLAIM_ID" =~ ^[0-9a-f]{32}$ ]] || { echo '::error::unsafe or missing claim id'; exit 1; }
+          python3 registry/scripts/select-and-claim.py \
+            --inspect "$CLAIM_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --expected-holder-prefix "review:$TARGET_REPO#batch-" > "$RUNNER_TEMP/adopt.json"
+          python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
+          import base64, json, os, re, sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              claim = json.load(handle)
+          if not isinstance(claim, dict):
+              raise SystemExit("dispatcher claim is not adoptable (fail closed)")
+          # [FABLE-5 r7 #4] Bind matrix concurrency to the lease reservation. batch_k is a
+          # HOSTILE input (workflow_dispatch): a malformed value fails closed here rather than
+          # silently defaulting, and the lease's slot reservation must be EXACTLY the
+          # dispatcher's contract min(manifest cardinality, batch_k).
+          if not re.fullmatch(r"[1-9][0-9]*", os.environ.get("BATCH_K", "")):
+              raise SystemExit("batch_k is not a positive integer (fail closed)")
+          batch_k = int(os.environ["BATCH_K"])
+          try:
+              manifest = json.loads(base64.b64decode(os.environ["MANIFEST_B64"]))
+          except (ValueError, TypeError) as exc:
+              raise SystemExit("manifest is undecodable at adoption (fail closed)") from exc
+          if not isinstance(manifest, list) or not manifest:
+              raise SystemExit("manifest is empty/malformed at adoption (fail closed)")
+          try:
+              slots = int(claim.get("slots", 1))
+          except (TypeError, ValueError):
+              raise SystemExit("lease slots reservation is malformed (fail closed)")
+          if slots != min(len(manifest), batch_k):
+              raise SystemExit(
+                  f"lease reserves {slots} slot(s) but the dispatch asks for "
+                  f"min({len(manifest)}, {batch_k}) concurrent calls; refusing the batch")
+          account = claim.get("account")
+          model = claim.get("model")
+          claim_id = claim.get("claim_id")
+          secret_ref = claim.get("secret_ref")
+          provider = claim.get("provider") or ""
+          pool = os.environ["ACCOUNT_POOL"].split(",")
+          models = os.environ["MODELS"].split(",")
+          if account != os.environ["EXPECTED_ACCOUNT"] or account not in pool:
+              raise SystemExit("dispatcher claim account is outside resolved policy")
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", str(account)):
+              raise SystemExit("dispatcher claim account is unsafe")
+          if model != os.environ["EXPECTED_MODEL"] or model not in models:
+              raise SystemExit("dispatcher claim model is outside the resolved review chain")
+          if claim_id != os.environ["CLAIM_ID"] or not re.fullmatch(r"[0-9a-f]{32}", str(claim_id)):
+              raise SystemExit("dispatcher claim id is invalid")
+          if claim.get("role") != "review" or claim.get("package") != os.environ["EXPECTED_PACKAGE"]:
+              raise SystemExit("dispatcher claim work partition disagrees with the batch")
+          if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(
+                  r"[A-Z][A-Z0-9_]*", str(secret_ref)):
+              raise SystemExit("dispatcher claim secret_ref is unsafe")
+          if secret_ref != os.environ["EXPECTED_SECRET_REF"]:
+              raise SystemExit("supplied secret_ref disagrees with the live account record")
+          if not provider:
+              raise SystemExit("claimed account has no provider metadata; failing closed")
+          if provider != os.environ["EXPECTED_PROVIDER"]:
+              raise SystemExit("supplied reviewer_provider disagrees with the live account record")
+          if provider == os.environ["IMPL_PROVIDER"]:
+              raise SystemExit("reviewer provider equals implementer provider; refusing")
+          for env_key, claim_key in (("EXPECTED_HARNESS", "harness"),
+                                     ("EXPECTED_CREDENTIAL_FORMAT", "credential_format")):
+              supplied = os.environ.get(env_key, "")
+              if supplied and supplied != (claim.get(claim_key) or ""):
+                  raise SystemExit(f"supplied {claim_key} disagrees with the live account record")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("claim_adopted=true\n")
+              # [FABLE-5 r7 #4] The VALIDATED concurrency bound (== the lease's slot
+              # reservation) — the only value max-parallel may consume.
+              output.write(f"validated_k={slots}\n")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"dispatcher batch lease adopted: model={model}, claim={claim_id[:8]}, "
+                f"validated_k={slots}")
+          PY
+
+      - name: Mint read-only App token for live re-admission (no target contents write)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ steps.owner.outputs.target_owner }}
+          repositories: ${{ steps.owner.outputs.target_name }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-issues: read
+
+      - name: Decode the manifest and re-admit each PR live (fail closed per item)
+        id: admit
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          IMPL_PROVIDER: ${{ inputs.impl_provider }}
+          MANIFEST_B64: ${{ inputs.manifest_b64 }}
+          # The registry App bot's PR-author login (<app-slug>[bot]). Each admitted PR's author MUST
+          # equal this — the single dispatch path enforces `login == bot_login` (dispatch-claim.py);
+          # batching must re-assert the same per-PR trust gate. Empty (App slug unavailable) fails
+          # every item closed.
+          EXPECT_BOT_LOGIN: ${{ steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}
+          # [FABLE-5 r5 #2] The adopted reviewer account, for the per-item reviewer !=
+          # implementer ACCOUNT assertion on salted hashes (locked decision 22a — the single
+          # path's adopt step asserts this against its one PR; the batch asserts it per item
+          # against each provenance-bound impl_account_h). This job runs registry code only, so
+          # the salt never enters a job executing target code. A missing salt fails closed.
+          REVIEWER_ACCOUNT: ${{ inputs.account }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          # The provenance record is read from the registry checkout (root of trust), same as
+          # dispatch. head/label/author/state are read LIVE via the App token.
+        run: |
+          set -euo pipefail
+          printf 'target_owner=%s\n' "${TARGET_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          printf 'target_name=%s\n' "${TARGET_REPO##*/}" >> "$GITHUB_OUTPUT"
+          printf '%s' "$MANIFEST_B64" | base64 -d > "$RUNNER_TEMP/manifest.json"
+          python3 registry/scripts/worker-pr.py --self-test >/dev/null  # fail fast if the helper is broken
+          python3 - <<'PY'
+          import importlib.util, json, os, re, subprocess, sys, tomllib
+          from pathlib import Path, PurePosixPath
+
+          spec = importlib.util.spec_from_file_location(
+              "worker_pr", "registry/scripts/worker-pr.py")
+          worker_pr = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(worker_pr)
+
+          repo = os.environ["TARGET_REPO"]
+          impl_provider = os.environ["IMPL_PROVIDER"]
+          expect_bot_login = os.environ.get("EXPECT_BOT_LOGIN", "")
+          # [FABLE-5 r5 #2] Salted reviewer hash for the per-item cross-ACCOUNT assertion
+          # (mirrors the single path's adopt step; a missing salt fails the whole batch closed).
+          salt = os.environ.get("PROVENANCE_SALT", "")
+          if not salt:
+              raise SystemExit(
+                  "PROVENANCE_SALT is unavailable; refusing to admit any batch item")
+          reviewer_h = worker_pr.account_hash(os.environ["REVIEWER_ACCOUNT"], salt)
+
+          # [FABLE-5 round-2 #3c] Security keywords = builtin set + the TARGET routing's own
+          # match_labels (same union review-fix's resolve computes). A missing/unreadable routing
+          # degrades to the builtin set + trust:* prefix (fail closed: it can only under-EXTEND,
+          # and the OUTCOME job recomputes again with its own checkout before any label/arm).
+          routing_keywords = set()
+          try:
+              policy_doc = tomllib.loads(
+                  Path("registry/policy/repos.toml").read_text(encoding="utf-8"))
+              routing_ptr = policy_doc["repos"][repo]["routing"]
+              routing_doc = tomllib.loads(
+                  Path("target-routing").joinpath(*PurePosixPath(routing_ptr).parts)
+                  .read_text(encoding="utf-8"))
+              for route in routing_doc.get("route", []):
+                  for keyword in (route.get("match_labels") or []):
+                      if isinstance(keyword, str) and keyword:
+                          routing_keywords.add(keyword)
+          except (OSError, KeyError, tomllib.TOMLDecodeError):
+              pass
+          if not expect_bot_login.endswith("[bot]"):
+              # The App slug could not be resolved to a bot login: fail the WHOLE batch closed rather
+              # than admit PRs whose authorship can't be checked (the single path never runs without
+              # a bot_login to compare against).
+              raise SystemExit("registry App bot login unavailable; refusing to admit any batch item")
+          with open(os.environ["RUNNER_TEMP"] + "/manifest.json", encoding="utf-8") as fh:
+              manifest = json.load(fh)
+          if not isinstance(manifest, list) or not manifest:
+              raise SystemExit("batch manifest is empty or malformed")
+
+          HEAD_REF = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+$")
+          SHA = re.compile(r"^[0-9a-f]{40}$")
+          HUMAN_HOLD = {"review:needs-user", "needs:user"}
+
+          def gh_json(path):
+              out = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+              if out.returncode != 0:
+                  return None
+              try:
+                  return json.loads(out.stdout or "null")
+              except json.JSONDecodeError:
+                  return None
+
+          def gh_comments(number):
+              # [FABLE-5 r9 #7] FULL pagination (--paginate --slurp, the worker-pr.py comment
+              # reader's own convention): the trusted round markers this admission re-derives the
+              # round from may sit past page one on a long-lived PR.
+              out = subprocess.run(
+                  ["gh", "api", "--paginate", "--slurp",
+                   f"repos/{repo}/issues/{number}/comments?per_page=100"],
+                  capture_output=True, text=True)
+              if out.returncode != 0:
+                  return None
+              try:
+                  pages = json.loads(out.stdout or "null")
+              except json.JSONDecodeError:
+                  return None
+              if not isinstance(pages, list):
+                  return None
+              return [c for page in pages for c in (page if isinstance(page, list) else [])]
+
+          bot_login = None
+          admitted = []
+          for entry in manifest:
+              try:
+                  number = int(entry["pr_number"])
+                  head_sha = str(entry["head_sha"])
+                  if str(entry.get("impl_provider")) != impl_provider:
+                      print(f"drop #{number}: impl_provider disagrees with the batch")
+                      continue
+                  if not SHA.match(head_sha):
+                      print(f"drop #{number}: malformed manifest head sha")
+                      continue
+                  pull = gh_json(f"repos/{repo}/pulls/{number}")
+                  if not isinstance(pull, dict) or pull.get("state") != "open":
+                      print(f"drop #{number}: not open")
+                      continue
+                  if pull.get("draft") is not True:
+                      print(f"drop #{number}: no longer a draft")
+                      continue
+                  head = pull.get("head") or {}
+                  if (head.get("repo") or {}).get("full_name") != repo:
+                      print(f"drop #{number}: head is a fork / other repo")
+                      continue
+                  if not HEAD_REF.match(str(head.get("ref", ""))):
+                      print(f"drop #{number}: head is not a worker branch")
+                      continue
+                  if str(head.get("sha", "")) != head_sha:
+                      print(f"drop #{number}: head advanced since planning; re-plan")
+                      continue
+                  login = str((pull.get("user") or {}).get("login", ""))
+                  # Per-PR authorship gate (parity with the single path's `login != bot_login` defer):
+                  # the PR MUST be authored by the registry App bot. A same-repo head branch matching
+                  # the worker pattern is not sufficient — assert the author too (fail closed).
+                  if login != expect_bot_login:
+                      print(f"drop #{number}: PR author '{login}' is not the App bot")
+                      continue
+                  bot_login = bot_login or login
+                  labels = {lb.get("name") for lb in (pull.get("labels") or []) if isinstance(lb, dict)}
+                  if HUMAN_HOLD & labels:
+                      print(f"drop #{number}: human-owned")
+                      continue
+                  owner, name = repo.split("/", 1)
+                  # Ledger-FIRST provenance resolution with legacy default-branch fallback
+                  # (issue #96 / fix/provenance-ledger): new records land on the ledger branch.
+                  prov_rel = f"orchestration/provenance/{owner}--{name}--pr{number}.json"
+                  prov_path = next((p for p in (f"registry-ledger/{prov_rel}",
+                                                f"registry/{prov_rel}")
+                                    if os.path.isfile(p)), None)
+                  if prov_path is None:
+                      print(f"drop #{number}: no registry provenance record (fail closed)")
+                      continue
+                  with open(prov_path, encoding="utf-8") as fh:
+                      prov = json.load(fh)
+                  if prov.get("pr_number") != number or prov.get("impl_provider") != impl_provider:
+                      print(f"drop #{number}: provenance disagrees with the plan")
+                      continue
+                  impl_account_h = str(prov.get("impl_account_h", ""))
+                  if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
+                      print(f"drop #{number}: provenance lacks a salted account hash")
+                      continue
+                  # [FABLE-5 r5 #2] reviewer account != implementer account, per item, on the
+                  # PROVENANCE-bound hash (never the hostile manifest's copy) — the same salted
+                  # assertion the single path's adopt step makes for its one PR.
+                  if impl_account_h == reviewer_h:
+                      print(f"drop #{number}: reviewer account equals the implementer account")
+                      continue
+                  # [FABLE-5 round-2 #3b] reviewed-sha binding: the head about to be reviewed
+                  # must equal/descend from the provenance-bound worker-opened commit — the same
+                  # ancestry gate review-fix's resolve applies (fail closed on any drift).
+                  opened_sha = str(prov.get("head_sha_at_open", ""))
+                  if not SHA.match(opened_sha):
+                      print(f"drop #{number}: provenance head_sha_at_open is malformed")
+                      continue
+                  if opened_sha != head_sha:
+                      compare = gh_json(f"repos/{repo}/compare/{opened_sha}...{head_sha}")
+                      if (not isinstance(compare, dict)
+                              or compare.get("status") not in {"identical", "ahead"}):
+                          print(f"drop #{number}: head does not descend from the "
+                                "worker-opened commit")
+                          continue
+                  # [FABLE-5 round-2 #3a] The provenance-bound SOURCE ISSUE, re-read LIVE: a
+                  # needs:*-parked issue is human-owned — no autonomous review may run against
+                  # its PR (mirrors review-fix's resolve; an unreadable issue fails closed).
+                  issue = prov.get("issue")
+                  if not isinstance(issue, int) or issue <= 0:
+                      print(f"drop #{number}: provenance issue number is invalid")
+                      continue
+                  issue_data = gh_json(f"repos/{repo}/issues/{issue}")
+                  if not isinstance(issue_data, dict):
+                      print(f"drop #{number}: source issue unreadable (fail closed)")
+                      continue
+                  issue_labels = {lb.get("name")
+                                  for lb in (issue_data.get("labels") or [])
+                                  if isinstance(lb, dict) and isinstance(lb.get("name"), str)}
+                  if any(lb.startswith("needs:") for lb in issue_labels):
+                      print(f"drop #{number}: source issue is human-owned (needs:*)")
+                      continue
+                  # [FABLE-5 r9 #7] review_round is HOSTILE, potentially STALE manifest data:
+                  # admission previously int()-converted it, and the review leg RECORDED it
+                  # (round-record) before worker-live.sh's grammar check ever ran — a
+                  # malformed/manual dispatch could write an enormous bot-authored round marker
+                  # and force terminal budget exhaustion. Enforce the single path's
+                  # [1-9][0-9]{0,2} grammar HERE, before anything records it, AND re-derive the
+                  # EXPECTED round from live trusted comments exactly as the dispatcher does
+                  # (count_rounds over the bot's own markers, + 1): a mismatching manifest round
+                  # is stale or forged and defers the item to a fresh plan.
+                  raw_round = str(entry.get("review_round", ""))
+                  if not re.fullmatch(r"[1-9][0-9]{0,2}", raw_round):
+                      print(f"drop #{number}: review_round fails the [1-9][0-9]{{0,2}} grammar")
+                      continue
+                  review_round = int(raw_round)
+                  comments = gh_comments(number)
+                  if comments is None:
+                      print(f"drop #{number}: PR comments unreadable (fail closed)")
+                      continue
+                  expected_round = worker_pr.count_rounds(comments, login) + 1
+                  if review_round != expected_round:
+                      print(f"drop #{number}: manifest review_round {review_round} != "
+                            f"live-derived round {expected_round}; re-plan")
+                      continue
+                  # [FABLE-5 round-2 #3c] Label-derived security RECOMPUTED from the LIVE PR +
+                  # source-issue labels; unioned with the plan flag so a post-plan label can only
+                  # ESCALATE the posture, never relax it. The outcome job recomputes AGAIN at
+                  # label/arm time — this admission copy keeps the reviewer's own posture fresh.
+                  security_live = worker_pr.security_flagged(
+                      {lb for lb in labels if isinstance(lb, str)} | issue_labels,
+                      sorted(routing_keywords))
+                  admitted.append({
+                      "pr_number": number,
+                      "head_sha": head_sha,
+                      "head_branch": str(head.get("ref", "")),
+                      "impl_provider": impl_provider,
+                      "impl_alias": str(prov.get("impl_alias", "")),
+                      "impl_account_h": impl_account_h,
+                      "issue": issue,
+                      # The provenance-bound worker-opened commit rides into the matrix so the
+                      # review leg can re-assert the ancestry binding LIVE, immediately before
+                      # its model call ([GPT-5.6 r4 #6]).
+                      "opened_sha": opened_sha,
+                      # [FABLE-5 r9 #7] grammar-validated AND equal to the live-derived round.
+                      "review_round": review_round,
+                      "security": bool(entry.get("security", False)) or security_live,
+                      "bot_login": login,
+                  })
+              except (KeyError, ValueError, TypeError) as exc:
+                  print(f"drop item {entry!r}: {exc}")
+                  continue
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as fh:
+              fh.write("matrix=" + json.dumps({"include": admitted}) + "\n")
+              fh.write(f"count={len(admitted)}\n")
+          print(f"admitted {len(admitted)}/{len(manifest)} batch items")
+          PY
+
+  # ---- 2. K-parallel READ-ONLY reviews of the admitted items (one matrix leg per PR, bounded to K
+  #         via max-parallel). Each leg reuses the exact single-review contract; per-leg failure is
+  #         isolated (fail-fast off). Each leg lifts its VALIDATED verdict out-of-tree as an artifact. --
+  review:
+    name: Review PR ${{ matrix.pr_number }} (read-only, one of the batch)
+    needs: resolve-batch
+    if: ${{ needs.resolve-batch.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      issues: read   # [FABLE-5 r7 #4] per-leg lease re-inspection reads the live account catalog
+    strategy:
+      fail-fast: false
+      # [FABLE-5 r7 #4] Bound by the ADOPTION-VALIDATED lease reservation (== the live lease's
+      # `slots`, asserted against batch_k and manifest cardinality in resolve-batch) — a
+      # malformed dispatch can never fan out more concurrent model calls than the ledger reserved.
+      max-parallel: ${{ fromJSON(needs.resolve-batch.outputs.batch_k) }}
+      matrix: ${{ fromJSON(needs.resolve-batch.outputs.matrix) }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # Prior-round verdicts are resolved ledger-FIRST ([GPT-5.6 r4] / issue #96: batch verdicts
+      # land on the unprotected `ledger` data-plane branch — the protected default branch rejects
+      # every github.token write); the `registry` checkout above is the legacy fallback for
+      # pre-migration records.
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry-ledger
+          ref: ledger
+          persist-credentials: false
+
+      # Trust guard (mirrors dispatch.yml): the ledger branch is DATA-ONLY — no workflow or
+      # script may ever ride in from it.
+      - name: Ledger checkout is data-only (trust guard)
+        run: |
+          set -euo pipefail
+          test ! -e registry-ledger/.github
+          test ! -e registry-ledger/scripts
+
+      # [GPT-5.6 r4 #8] Least privilege for a READ-ONLY review leg: contents/pull-requests read
+      # (live re-admission + target checkout) plus issues WRITE only for the round-record marker
+      # comment. No pull-request write — the leg never labels, closes, or un-drafts anything;
+      # all mutation happens in the outcome job under its own split tokens.
+      - name: Mint review-scoped App token (reads + issue-comment write only)
+        id: app-token-review
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve-batch.outputs.target_owner }}
+          repositories: ${{ needs.resolve-batch.outputs.target_name }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: read
+
+      # [GPT-5.6 r4 #6] The COMPLETE per-PR admission, re-run LIVE in the leg immediately before
+      # any credential preparation, round recording, or model call — resolve-batch's admission is
+      # a runner-queue delay stale by now, and a head/author-only recheck let a PR that became
+      # closed/non-draft or acquired human-hold / source-issue needs:* labels in that window
+      # still be reviewed and mutated. Reuses worker-pr.py `outcome_item_revalidation` (the same
+      # posture the outcome job re-asserts a fourth time): open + draft + same-repo head, no
+      # human-hold PR labels, no needs:* on the provenance-bound source issue (unreadable fails
+      # closed), and the opened-sha ancestry binding — plus the leg-specific exact-head and
+      # App-bot-author asserts. Any failure fails the leg: no verdict, the PR re-plans.
+      - name: Verify target App identity + full live re-admission (fail closed)
+        id: target
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          APP_SLUG: ${{ steps.app-token-review.outputs.app-slug }}
+          PR_AUTHOR: ${{ matrix.bot_login }}
+          PR_NUMBER: ${{ matrix.pr_number }}
+          EXPECT_HEAD: ${{ matrix.head_sha }}
+          OPENED_SHA: ${{ matrix.opened_sha }}
+          SOURCE_ISSUE: ${{ matrix.issue }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]] || { echo '::error::target App token was not minted'; exit 1; }
+          printf '::add-mask::%s\n' "$GH_TOKEN"
+          repo_json="$(gh api "repos/$TARGET_REPO")"
+          default_branch="$(printf '%s' "$repo_json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["default_branch"])')"
+          [[ "$default_branch" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo '::error::unsafe default branch'; exit 1; }
+          [[ "$APP_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || { echo '::error::App slug unavailable'; exit 1; }
+          python3 - <<'PY'
+          import importlib.util, json, os, re, subprocess
+
+          spec = importlib.util.spec_from_file_location(
+              "worker_pr", "registry/scripts/worker-pr.py")
+          worker_pr = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(worker_pr)
+
+          repo = os.environ["TARGET_REPO"]
+          number = os.environ["PR_NUMBER"]
+          expect_head = os.environ["EXPECT_HEAD"]
+          opened_sha = os.environ["OPENED_SHA"]
+          expect_author = os.environ["APP_SLUG"] + "[bot]"
+
+          def gh_json(path):
+              out = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+              if out.returncode != 0:
+                  return None
+              try:
+                  return json.loads(out.stdout or "null")
+              except json.JSONDecodeError:
+                  return None
+
+          pull = gh_json(f"repos/{repo}/pulls/{number}")
+          if not isinstance(pull, dict):
+              raise SystemExit(f"PR #{number} unreadable (fail closed)")
+          head = pull.get("head") or {}
+          # Exact-head bind: the leg reviews the manifest head or nothing (stricter than the
+          # revalidation helper's descends-from check — a drifted head simply re-plans).
+          if str(head.get("sha", "")) != expect_head:
+              raise SystemExit(f"head drifted for #{number}; refusing")
+          if not re.match(r"^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$",
+                          str(head.get("ref", ""))):
+              raise SystemExit(f"#{number} head is not a worker branch; refusing")
+          live_author = str((pull.get("user") or {}).get("login", ""))
+          if live_author != expect_author:
+              raise SystemExit(f"#{number} author '{live_author}' is not the App bot; refusing")
+          if os.environ["PR_AUTHOR"] != expect_author:
+              raise SystemExit("admitted author disagrees with the App bot; refusing")
+          # The provenance-bound SOURCE ISSUE, re-read LIVE (unreadable fails closed).
+          issue_data = gh_json(f"repos/{repo}/issues/{os.environ['SOURCE_ISSUE']}")
+          if not isinstance(issue_data, dict):
+              raise SystemExit(f"#{number} source issue unreadable (fail closed)")
+          issue_labels = [lb.get("name") for lb in (issue_data.get("labels") or [])
+                          if isinstance(lb, dict) and isinstance(lb.get("name"), str)]
+          opened_to_reviewed = "identical"
+          if opened_sha != expect_head:
+              compare = gh_json(f"repos/{repo}/compare/{opened_sha}...{expect_head}")
+              opened_to_reviewed = str((compare or {}).get("status", ""))
+          # [FABLE-5 r9 #5] outcome_item_revalidation now asserts the live head EXACTLY equals
+          # the reviewed sha itself (no ancestry/compare argument — descending advances defer).
+          reason, _security = worker_pr.outcome_item_revalidation(
+              repo, pull, issue_labels, expect_head, opened_sha, opened_to_reviewed)
+          if reason:
+              raise SystemExit(f"#{number} failed live re-admission: {reason}")
+          print(f"live re-admission OK for #{number}")
+          PY
+          printf 'default_branch=%s\n' "$default_branch" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target default branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ steps.target.outputs.default_branch }}
+          path: target
+          token: ${{ steps.app-token-review.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # [FABLE-5 r5 #1] The catalog of record is the policy-resolved TARGET routing (the `target`
+      # checkout at the policy row's routing pointer resolved by resolve-batch), NEVER the
+      # registry's own orchestration/routing.toml mirror — mirrors review-fix.yml's `selected`
+      # step verbatim, plus the batch's standing cross-provider assert (one claimed account
+      # serves every item; impl_provider is uniform across the batch by construction).
+      - name: Resolve the claimed model against the policy-resolved TARGET routing
+        id: selected
+        env:
+          ROUTING_PATH: ${{ needs.resolve-batch.outputs.routing }}
+          LIVE_ACCOUNT: ${{ inputs.account }}
+          LIVE_MODEL: ${{ inputs.reviewer_model }}
+          LIVE_PROVIDER: ${{ inputs.reviewer_provider }}
+          LIVE_SECRET_REF: ${{ inputs.secret_ref }}
+          LIVE_HARNESS: ${{ inputs.harness }}
+          LIVE_CREDENTIAL_FORMAT: ${{ inputs.credential_format }}
+          IMPL_PROVIDER: ${{ inputs.impl_provider }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, tomllib
+          from pathlib import Path, PurePosixPath
+
+          target_root = Path(os.environ["GITHUB_WORKSPACE"], "target").resolve()
+          routing_path = target_root.joinpath(*PurePosixPath(os.environ["ROUTING_PATH"]).parts).resolve()
+          try:
+              routing_path.relative_to(target_root)
+          except ValueError as exc:
+              raise SystemExit("resolved routing path escaped target checkout") from exc
+          with open(routing_path, "rb") as handle:
+              routing = tomllib.load(handle)
+
+          account = os.environ["LIVE_ACCOUNT"]
+          model = os.environ["LIVE_MODEL"]
+          secret_ref = os.environ["LIVE_SECRET_REF"]
+          meta = routing.get("models", {}).get(model)
+          if not isinstance(meta, dict):
+              raise SystemExit("claimed model is missing from protected target routing")
+          # A codex alias may leave provider_model unset/TBD (locked decision 14): worker-live.sh
+          # then omits --model and the codex CLI default applies (the proven drain posture).
+          provider_model = meta.get("provider_model")
+          if meta.get("harness") == "codex" and provider_model in (None, "", "TBD"):
+              provider_model = "TBD"
+          values = {
+              "account": account,
+              "model": model,
+              "provider": meta.get("provider"),
+              "harness": meta.get("harness"),
+              "provider_model": provider_model,
+              "credential_format": meta.get("credential_format"),
+              "secret_ref": secret_ref,
+          }
+          if (values["provider"], values["harness"]) not in {
+              ("openai", "codex"), ("anthropic", "claude")
+          }:
+              raise SystemExit("claimed model has an unsupported provider/harness pair")
+          if values["credential_format"] not in {
+              "codex-auth-json", "claude-credentials-json", "claude-oauth-token", "anthropic-api-key"
+          }:
+              raise SystemExit("claimed model has an unsupported credential format")
+          for env_key, meta_key in (("LIVE_PROVIDER", "provider"), ("LIVE_HARNESS", "harness"),
+                                    ("LIVE_CREDENTIAL_FORMAT", "credential_format")):
+              claimed = os.environ[env_key]
+              if claimed and claimed != values[meta_key]:
+                  raise SystemExit(f"claimed account {meta_key} conflicts with protected routing")
+          if values["provider"] == os.environ["IMPL_PROVIDER"]:
+              raise SystemExit("reviewer provider would equal implementer provider (fail closed)")
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", str(account)):
+              raise SystemExit("unsafe selected account")
+          if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(r"[A-Z][A-Z0-9_]*", str(secret_ref)):
+              raise SystemExit("unsafe selected secret_ref")
+          for key, value in values.items():
+              if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+                  raise SystemExit(f"unsafe or missing selected value: {key}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"selected account resolved: model={model}, harness={values['harness']}")
+          PY
+
+      # [FABLE-5 r7 #4] Re-inspect the adopted lease in THIS leg, immediately before the account
+      # credential is dereferenced (the very next step's env): a matrix leg can sit queued behind
+      # max-parallel for an unbounded runner delay, and resolve-batch's adoption is stale by then.
+      # `--inspect` fails closed (exit 3) on an expired/reclaimed/unknown claim — a leg whose
+      # lease is gone re-plans instead of running on capacity the ledger no longer reserves —
+      # and the live lease must still name THIS batch's account/model/secret_ref (never a
+      # different account's credential). The leg additionally requires the remaining TTL to
+      # cover its own 25-minute budget (keep in sync with this job's timeout-minutes), so a
+      # lease can't expire and be re-claimed MID-review either. Renewal is deliberately NOT done
+      # here: a ledger-WRITE token never rides in a leg (the model_health job exists for exactly
+      # that split), and REVIEW_BATCH_TTL already budgets the full DAG wall-clock — a leg outside
+      # that budget must fail closed and re-plan, not extend its own lease unboundedly.
+      - name: Re-inspect the adopted lease before credential dereference (fail closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          EXPECTED_ACCOUNT: ${{ steps.selected.outputs.account }}
+          EXPECTED_MODEL: ${{ steps.selected.outputs.model }}
+          EXPECTED_SECRET_REF: ${{ steps.selected.outputs.secret_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$CLAIM_ID" =~ ^[0-9a-f]{32}$ ]] || { echo '::error::unsafe or missing claim id'; exit 1; }
+          python3 registry/scripts/select-and-claim.py \
+            --inspect "$CLAIM_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --expected-holder-prefix "review:$TARGET_REPO#batch-" > "$RUNNER_TEMP/leg-lease.json"
+          python3 - "$RUNNER_TEMP/leg-lease.json" <<'PY'
+          import json, os, sys, time
+
+          LEG_BUDGET = 25 * 60  # this job's timeout-minutes (keep in sync)
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              lease = json.load(handle)
+          if not isinstance(lease, dict):
+              raise SystemExit("adopted lease vanished before credential dereference (fail closed)")
+          for env_key, lease_key in (("EXPECTED_ACCOUNT", "account"),
+                                     ("EXPECTED_MODEL", "model"),
+                                     ("EXPECTED_SECRET_REF", "secret_ref")):
+              if lease.get(lease_key) != os.environ[env_key]:
+                  raise SystemExit(f"live lease {lease_key} no longer matches this batch; "
+                                   "refusing the credential")
+          try:
+              remaining = int(lease.get("expires_at", 0)) - int(time.time())
+          except (TypeError, ValueError):
+              raise SystemExit("live lease expiry is malformed (fail closed)")
+          if remaining < LEG_BUDGET:
+              raise SystemExit(
+                  f"lease has {remaining}s left, under this leg's {LEG_BUDGET}s budget; "
+                  "re-planning instead of risking a mid-review reclaim")
+          print(f"lease re-inspected: {remaining}s remaining covers the leg budget")
+          PY
+
+      - name: Prepare the read-only reviewer container (no GitHub token inside)
+        id: prepare
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
+          WORKER_ACCOUNT_CREDENTIAL: ${{ secrets[steps.selected.outputs.secret_ref] }}
+          WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
+          WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
+          WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+        run: bash registry/scripts/worker-prep.sh
+
+      - name: Record the review round before the model runs (bounded-crash accounting)
+        id: round
+        if: ${{ steps.prepare.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-pr.py round-record \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ matrix.pr_number }}" \
+            --round "${{ matrix.review_round }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT.${{ matrix.pr_number }}" \
+            --bot-login "${{ matrix.bot_login }}"
+
+      # [GPT-5.6 r4 #4] Prior-round context for the progress grade (maintainer directive
+      # 2026-07-17), exactly like the single path's stage-prior: without it every later-round
+      # batch prompt instructed the reviewer to return progress=null, silently disabling the
+      # progress-based budget mechanism for the whole batch lane. The registry verdict record is
+      # the trusted schema-validated source, resolved ledger-FIRST (issue #96) with the legacy
+      # default-branch checkout as fallback. Round 1 has no prior round, and a missing record
+      # degrades to progress=null — never a failure.
+      - name: Stage the prior-round verdict for the progress assessment
+        id: stage-prior
+        if: ${{ matrix.review_round != 1 && steps.round.outcome == 'success' }}
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          REVIEW_ROUND: ${{ matrix.review_round }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: |
+          set -euo pipefail
+          owner="${TARGET_REPO%%/*}"
+          name="${TARGET_REPO##*/}"
+          prior=$((REVIEW_ROUND - 1))
+          rel="orchestration/review-verdicts/${owner}--${name}--pr${{ matrix.pr_number }}-round${prior}.json"
+          if [[ -f "registry-ledger/$rel" ]]; then
+            record="registry-ledger/$rel"
+          else
+            record="registry/$rel"
+          fi
+          if [[ -f "$record" ]]; then
+            install -m 600 "$record" "$WORKER_ROOT/prior-verdict.json"
+            printf 'staged the round %s verdict for the progress comparison\n' "$prior"
+          else
+            printf '::warning::no registry verdict record for prior round %s; the reviewer will report progress=null\n' "$prior"
+          fi
+
+      - name: Run cross-provider review (read-only, verdict lifted out-of-tree)
+        id: review
+        if: ${{ steps.round.outcome == 'success' && (steps.stage-prior.outcome == 'success' || steps.stage-prior.outcome == 'skipped') }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_PR_NUMBER: ${{ matrix.pr_number }}
+          WORKER_PR_HEAD_BRANCH: ${{ matrix.head_branch }}
+          WORKER_PR_HEAD_SHA: ${{ matrix.head_sha }}
+          WORKER_REVIEW_FILE: ${{ runner.temp }}/registry-worker/review-verdict.json
+          WORKER_REVIEW_ROUND: ${{ matrix.review_round }}
+          WORKER_PRIOR_REVIEW_FILE: ${{ runner.temp }}/registry-worker/prior-verdict.json
+          WORKER_IMPL_PROVIDER: ${{ matrix.impl_provider }}
+          WORKER_IMPL_ALIAS: ${{ matrix.impl_alias }}
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
+          # [FABLE-5 r5 #1] The policy-routed agent, exactly like the single path's review step:
+          # worker-live.sh fails closed without it (empty agent / missing
+          # .claude/agents/<agent>.md in the target checkout reject the leg pre-model).
+          WORKER_AGENT: ${{ needs.resolve-batch.outputs.agent }}
+        run: bash ../registry/scripts/worker-live.sh review
+
+      # [FABLE-5 r7 #5] The provider CLI may refresh the account credential during the run (codex
+      # rotates its auth.json). K legs share the ONE claimed account, so per-leg unconditional
+      # `gh secret set` writes were a LOST-UPDATE race: a leg holding an OLDER refresh generation
+      # could finish last and overwrite a newer credential, stranding the account. The batch
+      # therefore does exactly ONE write-back, in the commit-outcome job: each leg only STAGES
+      # its rotated credential (encrypted — this registry is public and artifacts are readable
+      # with repo read access; the passphrase is REGISTRY_SECRETS_PAT, which already rides in
+      # review legs for the write-back it replaces and is available to commit-outcome), and the
+      # outcome job picks the NEWEST generation by the auth file's own refresh/expiry field and
+      # performs the single worker-live.sh write-back. An unchanged credential stages nothing.
+      - name: Stage a rotated account credential for the single batch write-back (encrypted)
+        id: stage-credential
+        if: ${{ always() && steps.prepare.outcome == 'success' && steps.review.outcome != 'skipped' }}
+        env:
+          PR_NUMBER: ${{ matrix.pr_number }}
+          CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+          REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
+        run: |
+          set -euo pipefail
+          # WORKER_CREDENTIAL_PATH/BASELINE come from worker-prep.sh via GITHUB_ENV.
+          [[ -n "${WORKER_CREDENTIAL_PATH:-}" && -f "$WORKER_CREDENTIAL_PATH" \
+             && -n "${WORKER_CREDENTIAL_BASELINE:-}" && -f "$WORKER_CREDENTIAL_BASELINE" ]] || {
+            echo '::warning::credential files unavailable; nothing to stage'; exit 0; }
+          if cmp -s -- "$WORKER_CREDENTIAL_BASELINE" "$WORKER_CREDENTIAL_PATH"; then
+            echo 'credential unchanged; nothing to stage'
+            exit 0
+          fi
+          if [[ -z "$REGISTRY_SECRETS_PAT" ]]; then
+            echo '::warning::credential rotated but REGISTRY_SECRETS_PAT is absent; cannot stage it'
+            exit 0
+          fi
+          out="$RUNNER_TEMP/rotated-credential"
+          mkdir -p "$out"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -pass env:REGISTRY_SECRETS_PAT \
+            -in "$WORKER_CREDENTIAL_PATH" -out "$out/credential.enc"
+          CAPTURED_AT="$(date -u +%s)" python3 - "$out/meta.json" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as fh:
+              json.dump({"pr_number": int(os.environ["PR_NUMBER"]),
+                         "credential_format": os.environ["CREDENTIAL_FORMAT"],
+                         "captured_at": int(os.environ["CAPTURED_AT"])}, fh)
+          PY
+          printf 'staged=true\n' >> "$GITHUB_OUTPUT"
+          echo 'rotated credential staged (encrypted) for the single batch write-back'
+
+      - name: Upload this leg's rotated-credential artifact
+        if: ${{ always() && steps.stage-credential.outputs.staged == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: batch-credential-${{ matrix.pr_number }}
+          path: ${{ runner.temp }}/rotated-credential
+          retention-days: 1
+          if-no-files-found: error
+
+      # [GPT-5.6 r4 #5] Model-access health (registry #32), single-path semantics per LEG:
+      # a successful review is `success`; a skipped model step after the batch claim is a
+      # pre-launch abort (admission/prep failure, step timeout) recorded as `unknown`
+      # (counted toward persistence, never a provider-outage); a FAILED launch records the
+      # sanitized WORKER_EXIT_CLASS worker-live.sh put in $GITHUB_ENV (+ WORKER_RESET_HINT on
+      # session-limit) — so rate-limit failures actually populate the reactive backoff the
+      # dispatcher consults. Lifted as a tiny artifact because matrix job outputs are
+      # last-writer-wins; the separate no-target-code model_health job records every leg's class.
+      # [FABLE-5 r9 #4] A JOB-level timeout/cancellation kills the leg before this always() step
+      # can run at all (no artifact is ever uploaded) — model_health covers that case by
+      # synthesizing exit_class=unknown from the ADMITTED matrix for any leg with no artifact,
+      # so this step only needs to handle aborts it can actually observe.
+      - name: Capture model exit class for the health record
+        if: ${{ always() }}
+        env:
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+        run: |
+          set -uo pipefail
+          if [[ "$REVIEW_OUTCOME" == "success" ]]; then
+            cls=success
+          elif [[ "$REVIEW_OUTCOME" == "skipped" ]]; then
+            cls=unknown   # pre-launch abort/cancellation: no host-observed CLI exit exists
+          else
+            cls="${WORKER_EXIT_CLASS:-unknown}"
+          fi
+          mkdir -p "$RUNNER_TEMP/health"
+          CLS="$cls" python3 - <<'PY'
+          import json, os
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "health", "health.json"), "w",
+                    encoding="utf-8") as fh:
+              json.dump({"exit_class": os.environ.get("CLS", "unknown"),
+                         "reset_hint": os.environ.get("WORKER_RESET_HINT", "")}, fh)
+          PY
+
+      - name: Upload this leg's health artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: batch-health-${{ matrix.pr_number }}
+          path: ${{ runner.temp }}/health
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Schema-validate the lifted verdict (host-side, no tokens)
+        id: verdict
+        if: ${{ steps.review.outcome == 'success' }}
+        run: |
+          python3 registry/scripts/worker-pr.py validate-verdict \
+            --verdict-file "$RUNNER_TEMP/registry-worker/review-verdict.json" \
+            --files-file "$RUNNER_TEMP/registry-worker/pr-files.txt"
+
+      # Package the validated verdict + diff file-list + the per-item facts the commit job needs as
+      # ONE artifact per PR. A failed leg uploads NOTHING, so the aggregate commit skips it (per-item
+      # isolation). reviewed_sha is the reviewed head (bound LAST, per PR, by the commit job).
+      - name: Stage this PR's verdict artifact for the atomic commit
+        id: stage
+        if: ${{ steps.verdict.outcome == 'success' }}
+        env:
+          PR_NUMBER: ${{ matrix.pr_number }}
+          REVIEW_ROUND: ${{ matrix.review_round }}
+          HEAD_SHA: ${{ matrix.head_sha }}
+          IMPL_PROVIDER: ${{ matrix.impl_provider }}
+          IMPL_ACCOUNT_H: ${{ matrix.impl_account_h }}
+          ISSUE: ${{ matrix.issue }}
+          SECURITY: ${{ matrix.security }}
+          BOT_LOGIN: ${{ matrix.bot_login }}
+          REVIEWER_PROVIDER: ${{ steps.selected.outputs.provider }}
+        run: |
+          set -euo pipefail
+          verdict="$RUNNER_TEMP/registry-worker/review-verdict.json"
+          files="$RUNNER_TEMP/registry-worker/pr-files.txt"
+          [[ "$(wc -c < "$verdict")" -le 262144 ]] || { echo '::error::verdict exceeds size cap'; exit 1; }
+          [[ "$(wc -c < "$files")" -le 262144 ]] || { echo '::error::diff file list exceeds size cap'; exit 1; }
+          out="$RUNNER_TEMP/item"
+          mkdir -p "$out"
+          cp "$verdict" "$out/verdict.json"
+          cp "$files" "$out/files.txt"
+          python3 - <<PY
+          import json, os
+          meta = {
+              "pr_number": int(os.environ["PR_NUMBER"]),
+              "review_round": int(os.environ["REVIEW_ROUND"]),
+              "reviewed_sha": os.environ["HEAD_SHA"],
+              "impl_provider": os.environ["IMPL_PROVIDER"],
+              "impl_account_h": os.environ["IMPL_ACCOUNT_H"],
+              "issue": (int(os.environ["ISSUE"]) if os.environ.get("ISSUE", "").isdigit() else None),
+              "security": os.environ.get("SECURITY", "false").lower() == "true",
+              "bot_login": os.environ["BOT_LOGIN"],
+              "reviewer_provider": os.environ["REVIEWER_PROVIDER"],
+          }
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "item", "meta.json"), "w", encoding="utf-8") as fh:
+              json.dump(meta, fh)
+          PY
+
+      - name: Upload this PR's verdict artifact
+        if: ${{ steps.stage.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: batch-verdict-${{ matrix.pr_number }}
+          path: ${{ runner.temp }}/item
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---- 2b. Model-access health (registry #32, [GPT-5.6 r4 #5]): consume every leg's sanitized
+  #          exit CLASS into the registry health ledger. A SEPARATE always()-guarded job — like the
+  #          single path's model_health — so the ledger-write token never rides in a leg.
+  #          [FABLE-5 r9 #4] The whole batch's records land in ONE CAS write (model-health.py
+  #          record-batch): the old per-leg loop ran up to eight independent six-retry CAS appends
+  #          against the hottest ref in the system, re-creating exactly the same-ref contention
+  #          this PR removes (one batch could advance the ledger ref eight times while its own
+  #          verdict commit had six attempts). Per-invocation accuracy is preserved — the single
+  #          write still carries one record per admitted leg. A leg with NO health artifact (a
+  #          TIMED-OUT/cancelled matrix job cannot run its later always() capture/upload steps) is
+  #          synthesized as exit_class=unknown from the ADMITTED matrix, so those legs are
+  #          recorded rather than silently absent. commit-outcome `needs` this job, so the two
+  #          remaining ledger-ref writers of the batch DAG are sequenced, never racing. ----
+  model_health:
+    name: Record model-access health (no target code runs here)
+    needs: [resolve-batch, review]
+    if: ${{ always() && needs.resolve-batch.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # CAS-append data/model-health.json (on the `ledger` branch) via github.token
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Download all per-leg health artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/health-items
+          pattern: batch-health-*
+
+      - name: Append ALL leg health records in ONE CAS write (salted account hash only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          # Raw handle + salt via env only (argv is echoed into public logs); model-health.py
+          # salts the handle so only the 16-hex hash reaches the ledger. No target code runs here.
+          WORKER_ACCOUNT_HANDLE: ${{ inputs.account }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          PROVIDER: ${{ inputs.reviewer_provider }}
+          MODEL_ALIAS: ${{ inputs.reviewer_model }}
+          # [FABLE-5 r9 #4] The ADMITTED matrix is the record roster, not the artifact listing:
+          # a timed-out/cancelled leg cannot run its always() capture/upload steps, so its
+          # missing artifact must synthesize an `unknown` record rather than vanish.
+          ADMITTED_MATRIX: ${{ needs.resolve-batch.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+
+          matrix = json.loads(os.environ.get("ADMITTED_MATRIX") or '{"include": []}')
+          items = []
+          synthesized = 0
+          for entry in matrix.get("include", []):
+              pr = entry.get("pr_number") if isinstance(entry, dict) else None
+              if not isinstance(pr, int):
+                  continue
+              path = os.path.join(os.environ["RUNNER_TEMP"], "health-items",
+                                  f"batch-health-{pr}", "health.json")
+              cls, hint = "", ""
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      doc = json.load(fh)
+                  if isinstance(doc, dict):
+                      cls = str(doc.get("exit_class") or "")
+                      hint = str(doc.get("reset_hint") or "")
+              except (OSError, ValueError):
+                  pass  # leg died before its capture step (timeout/cancel): synthesize below
+              if not cls:
+                  cls = "unknown"
+                  synthesized += 1
+              items.append({
+                  "exit_class": cls,
+                  "reset_hint": hint,
+                  "run_id": (f"{os.environ['GITHUB_RUN_ID']}."
+                             f"{os.environ['GITHUB_RUN_ATTEMPT']}.{pr}"),
+              })
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "health-batch.json"), "w",
+                    encoding="utf-8") as fh:
+              json.dump(items, fh)
+          print(f"model-health: staged {len(items)} leg record(s), "
+                f"{synthesized} synthesized as unknown (no uploaded artifact)")
+          PY
+          python3 registry/scripts/model-health.py record-batch \
+            --provider "$PROVIDER" \
+            --model-alias "$MODEL_ALIAS" \
+            --items-file "$RUNNER_TEMP/health-batch.json"
+
+  # ---- 3. ONE atomic verdict commit for the whole batch, then per-PR label/arm (no target code
+  #         runs here). Collect every leg's artifact, build the manifest, verdict-record-batch in ONE
+  #         Git-Data-API commit, then iterate the recorded PRs to apply the SINGLE-path outcome. ----
+  commit-outcome:
+    name: Atomic multi-verdict commit + per-PR outcome
+    # [FABLE-5 r9 #4] model_health in `needs` SEQUENCES the batch DAG's two ledger-ref writers:
+    # the (single) health CAS append fully lands before the verdict commit starts, so they never
+    # race the same ref. always() still runs this job when model_health fails — telemetry loss
+    # must never strand recorded verdicts without their label/arm outcome.
+    needs: [resolve-batch, review, model_health]
+    if: ${{ always() && needs.resolve-batch.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # write: the atomic verdict commit to the data-plane ref (github.token)
+      issues: write     # write: needs-user ops-alert upsert
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # Provenance records are resolved ledger-FIRST ([GPT-5.6 r4] / issue #96, same convention
+      # as resolve-batch); the `registry` checkout above is the legacy fallback.
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry-ledger
+          ref: ledger
+          persist-credentials: false
+
+      # Trust guard (mirrors dispatch.yml): the ledger branch is DATA-ONLY — no workflow or
+      # script may ever ride in from it.
+      - name: Ledger checkout is data-only (trust guard)
+        run: |
+          set -euo pipefail
+          test ! -e registry-ledger/.github
+          test ! -e registry-ledger/scripts
+
+      # [FABLE-5 round-2 #3d] The outcome/arm policy comes from the TARGET policy resolution
+      # (policy/repos.toml row + the target's protected routing), NOT global workflow vars —
+      # this checkout feeds policy-resolve.py and the routing match_labels security keywords.
+      - name: Checkout public target for protected routing + policy data (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target-routing
+          persist-credentials: false
+
+      - name: Download all per-PR verdict artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/items
+          pattern: batch-verdict-*
+
+      # [FABLE-5 r7 #5] EXACTLY ONE credential write-back per batch. The K legs share one
+      # rotating account credential; each leg that observed a rotation staged it encrypted
+      # (never a per-leg `gh secret set` — that was a lost-update race where an older refresh
+      # generation finishing last overwrote a newer one). Here the newest generation is chosen
+      # by the auth file's OWN refresh/expiry field (codex auth.json `last_refresh`, claude
+      # credentials `claudeAiOauth.expiresAt`; the leg's capture time is only the fallback
+      # tiebreak) and written back ONCE through the same validated worker-live.sh write-back
+      # the single path uses. always(): a verdict-pipeline failure must not lose a rotated
+      # credential — that would strand the account for every future claim.
+      - name: Download all per-leg rotated-credential artifacts
+        if: ${{ always() }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/credentials
+          pattern: batch-credential-*
+
+      - name: Write back the newest rotated credential (single serialized write)
+        if: ${{ always() }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/writeback
+          WORKER_ACCOUNT: ${{ inputs.account }}
+          WORKER_SECRET_REF: ${{ inputs.secret_ref }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dirs=("$RUNNER_TEMP"/credentials/batch-credential-*)
+          if [[ ${#dirs[@]} -eq 0 ]]; then
+            echo 'no leg staged a rotated credential; write-back not needed'
+            exit 0
+          fi
+          if [[ -z "$REGISTRY_SECRETS_PAT" ]]; then
+            echo '::warning::rotated credentials staged but REGISTRY_SECRETS_PAT is absent; skipping write-back'
+            exit 0
+          fi
+          printf '::add-mask::%s\n' "$REGISTRY_SECRETS_PAT"
+          mkdir -p "$WORKER_ROOT"
+          for d in "${dirs[@]}"; do
+            [[ -f "$d/credential.enc" && -f "$d/meta.json" ]] || continue
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -pass env:REGISTRY_SECRETS_PAT \
+              -in "$d/credential.enc" -out "$d/credential.dec" \
+              || { echo "::warning::undecryptable staged credential in $(basename "$d")"; continue; }
+          done
+          python3 - "$RUNNER_TEMP/credentials" "$WORKER_ROOT" <<'PY'
+          import json, os, sys
+          from datetime import datetime
+
+          cred_root, worker_root = sys.argv[1], sys.argv[2]
+
+          def iso_ts(value):
+              try:
+                  return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+              except (TypeError, ValueError):
+                  return None
+
+          def generation(path, fmt):
+              """The credential's OWN refresh generation, by format; None when it defines none."""
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      doc = json.load(fh)
+              except (OSError, ValueError, UnicodeDecodeError):
+                  return None
+              if not isinstance(doc, dict):
+                  return None
+              if fmt == "codex-auth-json":
+                  return iso_ts(doc.get("last_refresh"))
+              if fmt == "claude-credentials-json":
+                  oauth = doc.get("claudeAiOauth")
+                  if isinstance(oauth, dict):
+                      try:
+                          return float(oauth["expiresAt"])
+                      except (KeyError, TypeError, ValueError):
+                          return None
+              return None
+
+          candidates = []
+          for name in sorted(os.listdir(cred_root)):
+              d = os.path.join(cred_root, name)
+              dec, mf = os.path.join(d, "credential.dec"), os.path.join(d, "meta.json")
+              if not (os.path.isfile(dec) and os.path.isfile(mf)):
+                  continue
+              try:
+                  with open(mf, encoding="utf-8") as fh:
+                      meta = json.load(fh)
+                  fmt = str(meta["credential_format"])
+                  captured = int(meta["captured_at"])
+              except (OSError, ValueError, KeyError, TypeError):
+                  print(f"::warning::malformed staged credential meta in {name}; skipped")
+                  continue
+              gen = generation(dec, fmt)
+              candidates.append(((gen is not None, gen if gen is not None else 0.0, captured),
+                                 dec, fmt, meta.get("pr_number")))
+          if not candidates:
+              print("no decryptable staged credential; write-back skipped")
+              raise SystemExit(0)
+          candidates.sort(key=lambda c: c[0])
+          _, chosen, fmt, leg = candidates[-1]
+          with open(chosen, "rb") as src, open(
+                  os.path.join(worker_root, "credential-current"), "wb") as dst:
+              dst.write(src.read())
+          # An EMPTY baseline can never equal a real credential, so worker-live.sh write-back's
+          # unchanged-cmp gate always proceeds to its validation + single `gh secret set`.
+          open(os.path.join(worker_root, "credential-baseline"), "wb").close()
+          with open(os.path.join(worker_root, "credential-format"), "w",
+                    encoding="utf-8") as fh:
+              fh.write(fmt)
+          print(f"newest rotated credential chosen from leg #{leg} "
+                f"({len(candidates)} staged, format={fmt})")
+          PY
+          if [[ -f "$WORKER_ROOT/credential-current" ]]; then
+            WORKER_CREDENTIAL_PATH="$WORKER_ROOT/credential-current" \
+            WORKER_CREDENTIAL_BASELINE="$WORKER_ROOT/credential-baseline" \
+            WORKER_CREDENTIAL_FORMAT="$(cat "$WORKER_ROOT/credential-format")" \
+            bash registry/scripts/worker-live.sh write-back
+          fi
+
+      - name: Build the batch manifest + re-validate every verdict on fresh code
+        id: build
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          repo = os.environ["TARGET_REPO"]
+          items_dir = os.path.join(os.environ["RUNNER_TEMP"], "items")
+          manifest = []
+          if os.path.isdir(items_dir):
+              for name in sorted(os.listdir(items_dir)):
+                  d = os.path.join(items_dir, name)
+                  vf, ff, mf = (os.path.join(d, "verdict.json"),
+                                os.path.join(d, "files.txt"),
+                                os.path.join(d, "meta.json"))
+                  if not (os.path.isfile(vf) and os.path.isfile(ff) and os.path.isfile(mf)):
+                      continue
+                  # Re-validate the verdict on THIS fresh registry checkout before it is recorded.
+                  chk = subprocess.run(
+                      ["python3", "registry/scripts/worker-pr.py", "validate-verdict",
+                       "--verdict-file", vf, "--files-file", ff],
+                      capture_output=True, text=True)
+                  if chk.returncode != 0:
+                      print(f"drop {name}: verdict failed re-validation")
+                      continue
+                  with open(mf, encoding="utf-8") as fh:
+                      meta = json.load(fh)
+                  manifest.append({
+                      "target_repo": repo,
+                      "pr": meta["pr_number"],
+                      "round": meta["review_round"],
+                      "verdict_file": vf,
+                      "_meta": meta,
+                  })
+          out = os.environ["RUNNER_TEMP"] + "/batch-manifest.json"
+          # verdict-record-batch reads only target_repo/pr/round/verdict_file; keep _meta separately.
+          record_manifest = [{k: v for k, v in item.items() if k != "_meta"} for item in manifest]
+          with open(out, "w", encoding="utf-8") as fh:
+              json.dump(record_manifest, fh)
+          with open(os.environ["RUNNER_TEMP"] + "/meta-index.json", "w", encoding="utf-8") as fh:
+              json.dump({str(item["pr"]): item["_meta"] for item in manifest}, fh)
+          print(f"batch manifest: {len(manifest)} verdicts to commit")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"count={len(manifest)}\n")
+          PY
+
+      - name: Record ALL verdicts in ONE atomic Git-Data-API commit
+        id: commit
+        if: ${{ steps.build.outputs.count != '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The branch batch verdicts commit to: the unprotected `ledger` data-plane branch
+          # ([GPT-5.6 r4] / issue #96 — the protected default branch rejects EVERY github.token
+          # write, Contents-API and Git-Data-API alike, so a master-targeted commit can never
+          # land). Every verdict reader resolves records ledger-FIRST with a legacy
+          # default-branch fallback (dispatch-claim --ledger-root, review-fix/-batch
+          # stage steps), so verdicts land exactly where the readers look. Override for
+          # tests/migration only.
+          REGISTRY_VERDICT_REF: ${{ vars.REGISTRY_VERDICT_REF || 'ledger' }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/worker-pr.py verdict-record-batch \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --manifest "$RUNNER_TEMP/batch-manifest.json" \
+            --outcome-file "$RUNNER_TEMP/verdict-outcomes.json"
+          cat "$RUNNER_TEMP/verdict-outcomes.json"
+
+      # [GPT-5.6 r4 #8] Token split preserved from the single path: this OUTCOME token is
+      # LABEL-ONLY (findings comments, review labels, the reviewed-sha body marker — issue/PR
+      # write). No target contents or workflows write exists on this runner before some verdict
+      # actually decides 'arm'; the arm-scoped token below is minted only then.
+      - name: Mint outcome-scoped App token (PR labels/comments only, no target contents)
+        id: app-token-outcome
+        if: ${{ steps.build.outputs.count != '0' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve-batch.outputs.target_owner }}
+          repositories: ${{ needs.resolve-batch.outputs.target_name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Apply the per-PR outcome (findings, labels, reviewed-sha bind; arm queued)
+        id: outcome
+        if: ${{ steps.commit.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          # [FABLE-5 round-2 #3/#4] Which committed verdicts get an outcome, and under what trust:
+          # "written" AND "identical" are BOTH outcome-eligible — "identical" means the atomic
+          # commit already succeeded on a prior attempt and the job died before labels/arm, so a
+          # crash-recovery rerun must COMPLETE the outcome or the PR is stranded (verdict recorded,
+          # never labelled/armed). Only a different-content "conflict" is dropped (fail closed).
+          # Before ANY label/arm, each item's full trust posture is RE-VALIDATED LIVE (never from
+          # the stale plan manifest), and the outcome/arm policy comes from the TARGET policy
+          # resolution (policy/repos.toml + protected routing), never global workflow vars.
+          python3 - <<'PY'
+          import importlib.util, json, os, re, subprocess, sys, tomllib
+          from pathlib import Path, PurePosixPath
+
+          spec = importlib.util.spec_from_file_location(
+              "worker_pr", "registry/scripts/worker-pr.py")
+          worker_pr = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(worker_pr)
+
+          repo = os.environ["TARGET_REPO"]
+          rt = os.environ["RUNNER_TEMP"]
+          with open(rt + "/verdict-outcomes.json", encoding="utf-8") as fh:
+              outcomes = json.load(fh)
+          with open(rt + "/meta-index.json", encoding="utf-8") as fh:
+              meta_index = json.load(fh)
+
+          # [FABLE-5 round-2 #3d] TARGET policy resolution: max_review_rounds, arm_auto_merge and
+          # security_paths come from the policy row for THIS target. Fail closed: an unresolvable
+          # policy fails the whole outcome step — nothing is labelled/armed off defaults; the
+          # committed verdicts complete on the rerun/next tick.
+          pol = subprocess.run(
+              ["python3", "registry/scripts/policy-resolve.py",
+               "--target-repo", repo,
+               "--policy-file", "registry/policy/repos.toml",
+               "--target-root", "target-routing",
+               "--role", "review"],
+              capture_output=True, text=True)
+          if pol.returncode != 0:
+              print(pol.stderr, file=sys.stderr)
+              raise SystemExit("target policy resolution failed; refusing to label/arm")
+          policy = json.loads(pol.stdout)
+          max_rounds = str(int(policy["max_review_rounds"]))
+          arm_flag = "true" if policy["arm_auto_merge"] else "false"
+          surface = [p for p in policy.get("security_paths", []) if isinstance(p, str) and p]
+
+          # [FABLE-5 round-2 #3c] Security keywords for the LIVE label recompute: builtin set +
+          # the target routing's match_labels (an unreadable routing degrades to builtin +
+          # trust:* — it can only under-extend, and ready-and-arm re-checks live once more).
+          keywords = set()
+          try:
+              routing_doc = tomllib.loads(
+                  Path("target-routing").joinpath(
+                      *PurePosixPath(policy["routing"]).parts).read_text(encoding="utf-8"))
+              for route in routing_doc.get("route", []):
+                  for keyword in (route.get("match_labels") or []):
+                      if isinstance(keyword, str) and keyword:
+                          keywords.add(keyword)
+          except (OSError, KeyError, tomllib.TOMLDecodeError):
+              pass
+          keywords = sorted(keywords)
+
+          def gh_json(path):
+              out = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+              if out.returncode != 0:
+                  return None
+              try:
+                  return json.loads(out.stdout or "null")
+              except json.JSONDecodeError:
+                  return None
+
+          def compare_status(base, head_ref):
+              if base == head_ref:
+                  return "identical"
+              compare = gh_json(f"repos/{repo}/compare/{base}...{head_ref}")
+              return str((compare or {}).get("status", ""))
+
+          def run(args, capture_outputs=False):
+              """Run a worker-pr subcommand. When capture_outputs, hand it a PRIVATE GITHUB_OUTPUT
+              file and return (rc, parsed_outputs) so the caller can read the decision the single
+              path reads from steps.<id>.outputs — the batch has no per-item step, so it captures the
+              same key/value stream out-of-band."""
+              env = dict(os.environ)
+              out_file = None
+              if capture_outputs:
+                  out_file = os.path.join(rt, f"outputs-{os.getpid()}-{len(str(args))}.env")
+                  open(out_file, "w").close()
+                  env["GITHUB_OUTPUT"] = out_file
+              r = subprocess.run(["python3", "registry/scripts/worker-pr.py", *args], env=env)
+              parsed = {}
+              if out_file and os.path.isfile(out_file):
+                  with open(out_file, encoding="utf-8") as fh:
+                      for line in fh:
+                          if "=" in line:
+                              k, v = line.rstrip("\n").split("=", 1)
+                              parsed[k] = v
+                  os.remove(out_file)
+              return (r.returncode, parsed) if capture_outputs else r.returncode
+
+          failures = 0
+          arm_queue = []  # [GPT-5.6 r4 #8] arm-decided items, armed by the split arm-token step
+          for key, status in sorted(outcomes.items()):
+              # key = "<owner>/<name>#<pr>#<round>"
+              try:
+                  _, pr_round = key.rsplit("#", 1)
+                  pr_number = key.rsplit("#", 2)[1]
+              except ValueError:
+                  continue
+              # [FABLE-5 round-2 #4] written AND identical complete the outcome (identical = the
+              # commit landed on a prior attempt, the outcome did not — converge, don't strand);
+              # only a different-content conflict is dropped.
+              if not worker_pr.batch_outcome_eligible(status):
+                  print(f"skip {key}: verdict status={status} "
+                        "(different-content conflict; no label/arm)")
+                  continue
+              if status == "identical":
+                  print(f"{key}: verdict already recorded (crash-recovery rerun); "
+                        "completing the outcome")
+              meta = meta_index.get(pr_number)
+              if not meta:
+                  print(f"skip {key}: no meta for the committed verdict")
+                  continue
+              # [FABLE-5 round-2 #3] LIVE per-item trust re-admission at OUTCOME time: the plan
+              # manifest is a whole batch runtime stale — re-read the PR + provenance-bound source
+              # issue, re-assert the reviewed-sha/opened-sha ancestry binding, and RECOMPUTE the
+              # label-derived security posture before any label/arm (fail closed per item).
+              pull = gh_json(f"repos/{repo}/pulls/{pr_number}")
+              issue_labels = []
+              if meta.get("issue") is not None:
+                  issue_data = gh_json(f"repos/{repo}/issues/{meta['issue']}")
+                  if not isinstance(issue_data, dict):
+                      print(f"::warning::defer {key}: source issue unreadable (fail closed)")
+                      failures += 1
+                      continue
+                  issue_labels = [lb.get("name") for lb in (issue_data.get("labels") or [])
+                                  if isinstance(lb, dict) and isinstance(lb.get("name"), str)]
+              owner, name = repo.split("/", 1)
+              # Ledger-FIRST provenance resolution with legacy default-branch fallback
+              # (issue #96 / fix/provenance-ledger): new records land on the ledger branch.
+              prov_rel = f"{owner}--{name}--pr{pr_number}.json"
+              prov_path = next(
+                  (p for p in (Path("registry-ledger", "orchestration", "provenance", prov_rel),
+                               Path("registry", "orchestration", "provenance", prov_rel))
+                   if p.is_file()),
+                  Path("registry", "orchestration", "provenance", prov_rel))
+              try:
+                  prov = json.loads(prov_path.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  print(f"::warning::defer {key}: no registry provenance record (fail closed)")
+                  failures += 1
+                  continue
+              reviewed = str(meta["reviewed_sha"])
+              opened_sha = str(prov.get("head_sha_at_open", ""))
+              opened_to_reviewed = ""
+              if re.fullmatch(r"[0-9a-f]{40}", opened_sha):
+                  opened_to_reviewed = compare_status(opened_sha, reviewed)
+              # [FABLE-5 r9 #5] No reviewed->head compare any more: outcome_item_revalidation
+              # itself requires the LIVE head to EXACTLY equal the reviewed sha. A head that
+              # merely descends from the reviewed sha is an UNREVIEWED head — labelling it
+              # (review:changes) would make the dispatcher fix it against the old diff's
+              # findings, so any advance defers the item and the sweep re-plans a fresh review.
+              reason, security_live = worker_pr.outcome_item_revalidation(
+                  repo, pull, issue_labels, reviewed, opened_sha,
+                  opened_to_reviewed, extra_keywords=keywords)
+              if reason:
+                  print(f"defer {key}: {reason} (no label/arm this run)")
+                  continue
+              # A post-plan security label ESCALATES the posture; the plan flag never relaxes.
+              security = bool(meta.get("security")) or security_live
+              d = os.path.join(rt, "items", f"batch-verdict-{pr_number}")
+              vf, ff = os.path.join(d, "verdict.json"), os.path.join(d, "files.txt")
+              rn = str(meta["review_round"])
+              # 1) findings + label + escalation (review-outcome), reusing the single path verbatim.
+              #    Capture its `decision` output — the single path gates the arm step on it
+              #    (review-fix.yml: the ready-and-arm step runs only for decision == 'arm'), so the
+              #    batch must too; ready-and-arm has NO verdict guard of its own and would otherwise
+              #    un-draft + arm a request_changes PR.
+              args = ["review-outcome", "--repo", repo, "--pr", pr_number,
+                      "--verdict-file", vf, "--files-file", ff, "--round", rn,
+                      "--max-rounds", max_rounds,
+                      "--impl-provider", meta["impl_provider"],
+                      "--bot-login", meta["bot_login"],
+                      "--run-key", f'{os.environ["GITHUB_RUN_ID"]}.{os.environ["GITHUB_RUN_ATTEMPT"]}.{pr_number}']
+              if meta.get("issue") is not None:
+                  args += ["--issue", str(meta["issue"])]
+              if security:
+                  args.append("--security")
+              for p in surface:
+                  args += ["--surface-path", p]
+              rc, outputs = run(args, capture_outputs=True)
+              if rc != 0:
+                  print(f"::warning::review-outcome failed for #{pr_number}; it re-plans next tick")
+                  failures += 1
+                  continue
+              decision = outputs.get("decision", "")
+              # 2) [GPT-5.6 r4 #8] decision == 'arm' items are QUEUED for the separate arm step
+              #    (its own arm-scoped App token, minted only when this queue is non-empty —
+              #    preserving the single path's label-only vs arm-only token split; this step's
+              #    token cannot un-draft or latch anything). Their reviewed-sha bind is DEFERRED
+              #    to that step (single-path bind gate: bind only when `decision != arm || arm
+              #    succeeded`), so an arm failure leaves the head unbound and the sweep re-arms.
+              if decision == "arm":
+                  arm_queue.append({"pr": pr_number, "meta": meta, "round": rn})
+                  print(f"outcome labels applied for #{pr_number} (round {rn}); arm queued")
+                  continue
+              # 3) reviewed-sha bind LAST (terminal marker for this head) for the NON-arm
+              #    decisions (terminal changes/needs-user): a crash before it leaves
+              #    reviewed-sha != head so the sweep re-converges the PR.
+              run(["reviewed-sha", "set", "--repo", repo, "--pr", pr_number,
+                   "--sha", meta["reviewed_sha"]])
+              print(f"outcome applied for #{pr_number} (round {rn})")
+          if failures:
+              print(f"::warning::{failures} per-PR outcomes failed; those PRs re-plan next tick")
+          # Hand the arm step everything it needs (policy + routing already resolved here) so it
+          # re-resolves nothing and arms EXACTLY what this step's verdicts approved.
+          with open(rt + "/arm-queue.json", "w", encoding="utf-8") as fh:
+              json.dump({"arm_flag": arm_flag, "surface": surface, "keywords": keywords,
+                         "items": arm_queue}, fh)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"arm_needed={'true' if arm_queue else 'false'}\n")
+          PY
+
+      # [GPT-5.6 r4 #8] ARM-only token, minted ONLY when some verdict actually decided 'arm' —
+      # exactly the single path's `if: decision == 'arm'` arm-token gate. Until this point no
+      # token on this runner could write target contents or workflows.
+      - name: Mint arm-scoped App token (approve path only)
+        id: app-token-arm
+        if: ${{ steps.outcome.outputs.arm_needed == 'true' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve-batch.outputs.target_owner }}
+          repositories: ${{ needs.resolve-batch.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Ready + arm the approved items (host-only, one-shot, sha-bound, hash-asserted)
+        if: ${{ steps.outcome.outputs.arm_needed == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-arm.outputs.token }}
+          # Reviewer handle via env (never argv — argv is echoed into public logs); compared to
+          # the recorded implementer hash under PROVENANCE_SALT (locked decision 22a). This job
+          # runs no target code, so the salt cannot leak to hostile execution.
+          WORKER_REVIEWER_ACCOUNT: ${{ inputs.account }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          # Per queued item: ready-and-arm (HOST-only, sha-bound, hash-asserted, trust-surface +
+          # security gated — [FABLE-5 round-2 #3d/#3e] --arm from the TARGET policy row and the
+          # routing security keywords feed its own LIVE human-hold + security re-check), then the
+          # reviewed-sha bind LAST. ready-and-arm RAISES on a recoverable arm failure where the
+          # draft was restored — that item's bind is SKIPPED so the sweep re-arms it (single-path
+          # bind gate: `decision != arm || arm succeeded`), never a fully-reviewed-but-stranded
+          # draft. Per-item isolation: one failed arm never sinks the rest of the queue.
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          repo = os.environ["TARGET_REPO"]
+          rt = os.environ["RUNNER_TEMP"]
+          with open(rt + "/arm-queue.json", encoding="utf-8") as fh:
+              queue = json.load(fh)
+
+          def run(args):
+              return subprocess.run(
+                  ["python3", "registry/scripts/worker-pr.py", *args]).returncode
+
+          failures = 0
+          for item in queue.get("items", []):
+              pr_number = str(item["pr"])
+              meta = item["meta"]
+              arm_args = ["ready-and-arm", "--repo", repo, "--pr", pr_number,
+                          "--reviewed-sha", meta["reviewed_sha"],
+                          "--impl-provider", meta["impl_provider"],
+                          "--impl-account-h", meta["impl_account_h"],
+                          "--reviewer-provider", meta["reviewer_provider"],
+                          "--arm", queue["arm_flag"]]
+              if meta.get("issue") is not None:
+                  arm_args += ["--issue", str(meta["issue"])]
+              for p in queue.get("surface", []):
+                  arm_args += ["--surface-path", p]
+              for keyword in queue.get("keywords", []):
+                  arm_args += ["--security-keyword", keyword]
+              if run(arm_args) != 0:
+                  print(f"::warning::ready-and-arm failed for #{pr_number}; "
+                        "NOT binding reviewed-sha so the sweep re-arms it")
+                  failures += 1
+                  continue
+              run(["reviewed-sha", "set", "--repo", repo, "--pr", pr_number,
+                   "--sha", meta["reviewed_sha"]])
+              print(f"armed + bound #{pr_number} (round {item['round']})")
+          if failures:
+              print(f"::warning::{failures} arm(s) failed; the sweep re-arms those PRs")
+          PY
+
+  # ---- 4. Release the ONE batch lease — but ONLY a lease that PASSED adoption validation.
+  #         [FABLE-5 r5 #2] A supplied claim_id that failed (or never reached) the resolve-batch
+  #         adopt step is NEVER released: it could name an unrelated ACTIVE lease, and releasing
+  #         it would sever that job's account mid-run. An unadopted claim simply expires via its
+  #         TTL / groom-leases. ----
+  release:
+    name: Release the batch lease
+    needs: [resolve-batch, review, commit-outcome]
+    if: ${{ always() && needs.resolve-batch.outputs.claim_adopted == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Release CAS lease by claim id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+        run: |
+          set -euo pipefail
+          [[ "$CLAIM_ID" =~ ^[0-9a-f]{32}$ ]] || { echo '::error::unsafe or missing claim id'; exit 1; }
+          python3 registry/scripts/select-and-claim.py \
+            --release "$CLAIM_ID" \
+            --repo "$GITHUB_REPOSITORY"
+
+  # ---- 5. Re-ring the dispatcher (GITHUB_TOKEN runs emit no workflow_run events). ----
+  doorbell:
+    name: doorbell (re-ring dispatcher)
+    needs: [release]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    steps:
+      - name: Ring dispatch.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dispatch.yml -R "$GITHUB_REPOSITORY" || echo "::warning::doorbell ring failed (cron backstop covers this tick)"

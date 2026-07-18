@@ -123,10 +123,61 @@ FIX_CHAIN = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
 # earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
 # path does not usage-gate; codex accounts are usage-EXEMPT, so this shared `review:` prefix
 # cap IS the codex slot bound, and `fix:` bounds concurrent same-provider fix agents.
-REVIEW_MAX_CONCURRENT = 10
+# [FABLE-5 r7 #2] 10 -> 24 (maintainer decision: maximum realistic throughput). The pre-batch cap
+# of 10 assumed ONE review per lease; a K-slot batch lease reserves REVIEW_BATCH_K slots, so at 10
+# only floor(10/4)=2 full batches could coexist (16 assigned PRs, 8 concurrent calls) — far short
+# of the >40-review ask. At 24, floor(24/4)=6 full batches fit, covering a whole tick's
+# REVIEW_BATCH_JOBS_MAX and 6*8=48 assigned PRs. Codex rate limits are far from binding
+# (maintainer direction 2026-07-17) and per-account load stays bounded regardless of this shared
+# cap by each account's max_concurrent_workers in the catalog (choose_account counts slot-weighted
+# load per account).
+# [FABLE-5 r9 #1] Precision on the ">40" ask, so the numbers are never oversold: what exceeds 40
+# is reviews IN FLIGHT per tick (6 batches * 8 assigned = 48 admitted, leased, and completed
+# within one batch DAG); CONCURRENT MODEL CALLS are deliberately capped at 24 (= this shared
+# slot-weighted cap; each batch runs K=4 calls at a time over its 8 items). This holds for a
+# SAME-package or __global__ backlog too: review claims are exempt from the package/global lease
+# partition (select-and-claim.py claim() — reviews are read-only; the partition serializes
+# writers), so 48 PRs in one package still fill all 6 batches. The capacity self-test drives the
+# REAL allocator with every batch in the SAME package to pin exactly that.
+REVIEW_MAX_CONCURRENT = 24
 FIX_MAX_CONCURRENT = 8
 REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
 FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
+# [FABLE-5] Batch-review worker (design: orchestration/review-verdicts/README.md). ONE batch job claims ONE
+# account and runs up to REVIEW_BATCH_K in-job parallel review calls over up to REVIEW_BATCH_SIZE
+# admitted review items, then writes ALL their verdicts in ONE atomic Git-Data-API commit — so N
+# reviews cost ~1 commit instead of N contended single-file commits (the "kept conflicting" thrash,
+# e.g. sparq-org--sparq--pr2521-round3.json). [GPT-5.6 r4 #3] The one lease reserves
+# min(len(batch), K) SLOTS (select-and-claim slot-weighted capacity), so concurrent codex model
+# calls are ledger-bounded by the shared review: cap (REVIEW_MAX_CONCURRENT) and each account's
+# max_concurrent_workers — never K workers hiding behind a 1-slot lease. [FABLE-5 r9 #1] Stated
+# precisely: REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_SIZE = 48 reviews IN FLIGHT per tick (the >40
+# maintainer ask counts admitted-and-completing reviews), while CONCURRENT model calls are
+# deliberately bounded at REVIEW_MAX_CONCURRENT = 24 (jobs * K).
+REVIEW_BATCH_SIZE = 8          # review items per batch job
+REVIEW_BATCH_K = 4            # in-job parallel review calls against the one claimed account
+REVIEW_BATCH_JOBS_MAX = 6      # cap on batch jobs per tick (jobs*K stays within codex comfort)
+# [FABLE-5 round-2 #5] The batch lease TTL must cover the batch's ACTUAL wall-clock bound, not a
+# multiple of the single-review TTL: 2*REVIEW_TTL (40min) was reclaimable MID-review for an 8-item
+# K=4 batch (two sequential 25-min review waves alone are 50min, plus ~12min resolution/queue), so
+# groom-leases could free the account and a concurrent claim would reuse it while this batch was
+# still reviewing. Derive the bound from the review-batch.yml job budgets (keep these in sync with
+# its `timeout-minutes`): resolve + ceil(SIZE/K) sequential review waves + the outcome/commit job,
+# plus runner-queue slack between the jobs of the DAG. The cost of the longer TTL is only slower
+# crash recovery of the ONE batch slot — never a mid-review reclaim.
+REVIEW_BATCH_RESOLVE_BUDGET = 12 * 60   # review-batch.yml resolve-batch: timeout-minutes: 12
+REVIEW_BATCH_LEG_BUDGET = 25 * 60       # review-batch.yml per review leg: timeout-minutes: 25
+REVIEW_BATCH_OUTCOME_BUDGET = 20 * 60   # review-batch.yml commit-outcome: timeout-minutes: 20
+REVIEW_BATCH_QUEUE_SLACK = 15 * 60      # runner-queue/scheduling slack across the job DAG
+REVIEW_BATCH_WAVES = -(-REVIEW_BATCH_SIZE // REVIEW_BATCH_K)  # ceil: sequential review waves
+REVIEW_BATCH_TTL = (REVIEW_BATCH_RESOLVE_BUDGET
+                    + REVIEW_BATCH_WAVES * REVIEW_BATCH_LEG_BUDGET
+                    + REVIEW_BATCH_OUTCOME_BUDGET
+                    + REVIEW_BATCH_QUEUE_SLACK)
+# Feature flag: while off, the single-review path runs unchanged (full back-compat). When on,
+# admitted REVIEW-mode items are grouped into batch jobs; any item dispatch chooses not to batch
+# (e.g. a fix item) still uses the single path. Default OFF for a staged rollout.
+REVIEW_BATCH_ENABLED = os.environ.get("REVIEW_BATCH_ENABLED", "").lower() in {"1", "true", "yes"}
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
@@ -1055,6 +1106,41 @@ def _resolvable_chain(chain, routing):
     return usable
 
 
+def plan_review_batches(admitted, *, batch_size=REVIEW_BATCH_SIZE):
+    """[FABLE-5] PURE batching layer for the batch-review worker (unit-tested by --self-test).
+
+    Group ADMITTED review descriptors (each already passed the full per-item hostile admission gate
+    in `_dispatch_review_items`) into batch jobs. Every PR in a batch shares the SAME reviewer
+    direction and lease partition so one claimed account is valid for the whole batch:
+
+      - key by (impl_provider, package): impl_provider fixes the inverse REVIEW_CHAIN reviewer
+        provider (a batch's account must satisfy reviewer_provider != impl_provider for EVERY item),
+        and package keeps a batch cache-coherent ([FABLE-5 r9 #1]: review claims are EXEMPT from
+        the package/global lease partition — reviews are read-only — so same-package groups can
+        fill every batch the caps allow; the key is affinity, not a concurrency bound).
+      - each group is sliced into batches of at most `batch_size`.
+      - EVERY batch is returned ([FABLE-5 r9 #2]): the per-tick launch bound is applied by the
+        DISPATCH loop to successful dispatches, never here to candidates. The old pre-claim
+        truncation to `jobs_max` starved healthy work: if the first six sorted groups were
+        partition-blocked or their inverse provider had no eligible account, the deterministic
+        ordering re-selected the same six every tick and later groups were never even attempted.
+
+    Deterministic ordering (stable across ticks): groups sorted by (impl_provider, package); items
+    within a group kept in admission order (which preserves any priority ordering upstream). Returns
+    a list of batches, each a list of admitted descriptors — the batching NEVER weakens a per-item
+    check, it only amortises one claimed account across items that individually passed admission."""
+    groups = {}
+    for item in admitted:
+        key = (item["impl_provider"], item["package"])
+        groups.setdefault(key, []).append(item)
+    batches = []
+    for key in sorted(groups):
+        items = groups[key]
+        for start in range(0, len(items), batch_size):
+            batches.append(items[start:start + batch_size])
+    return batches
+
+
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
                            ledger_root=""):
@@ -1063,6 +1149,10 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     launched = 0
     script_dir = Path(__file__).resolve().parent
     max_rounds = int(policy.get("max_review_rounds", 3))
+    # [FABLE-5] When batching is enabled, admitted REVIEW-mode items are collected here (their full
+    # per-item hostile admission still runs verbatim inside the loop) and dispatched as batch jobs
+    # AFTER the loop; fix-mode items keep the single-job path. See plan_review_batches.
+    review_batch_candidates = []
     for item in review_items:
         number = item["pr_number"]
         try:
@@ -1340,6 +1430,22 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                f"the {mode} model chain for a {impl_provider}-implemented PR is "
                                "unresolvable in the target routing (no concrete provider model)")
                 continue
+            # [FABLE-5] Batch path: a fully-admitted REVIEW item is collected (not single-launched)
+            # so several such items share ONE claimed account + ONE atomic verdict commit. Every
+            # per-item check above already ran; fix-mode items fall through to the single path.
+            if REVIEW_BATCH_ENABLED and mode == "review":
+                review_batch_candidates.append({
+                    "pr_number": number,
+                    "head_sha": head_sha,
+                    "head_branch": head_ref,
+                    "impl_provider": impl_provider,
+                    "impl_account_h": impl_account_h,
+                    "issue": issue_number,
+                    "package": item["package"],
+                    "review_round": round_number,
+                    "security": bool(item["security"]),
+                })
+                continue
         except DispatchError as exc:
             print(f"defer review {repo}#{number}: revalidation failed ({exc}); skipped")
             continue
@@ -1429,6 +1535,127 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         # Privacy (locked decision 22b): public workflow logs never carry account handles.
         kind_note = "" if fix_kind == "verdict" else f"/{fix_kind}"
         print(f"dispatched {mode}{kind_note} {repo}#{number}: round={round_number}, "
+              f"claim={claim_id[:8]}")
+    # [FABLE-5] Batch review dispatch: group the fully-admitted review candidates and launch ONE
+    # batch job per group (up to REVIEW_BATCH_JOBS_MAX), each claiming ONE account + carrying a
+    # base64 manifest of its PRs. Any candidate not launched this tick re-plans next tick.
+    if REVIEW_BATCH_ENABLED and review_batch_candidates:
+        launched += _dispatch_review_batches(
+            review_batch_candidates, repo, routing, allocator, worker_pr,
+            registry_repo, workflow_ref, policy, usage, margin)
+    return launched
+
+
+def _dispatch_review_batches(candidates, repo, routing, allocator, worker_pr,
+                             registry_repo, workflow_ref, policy, usage, margin):
+    """[FABLE-5] Claim ONE account per batch + launch the batch-review workflow with a base64
+    manifest. Each candidate already passed the full per-item hostile admission in
+    `_dispatch_review_items`; here we only (a) group them (plan_review_batches), (b) claim one
+    account for the whole batch, (c) re-assert the CROSS-PROVIDER + cross-account invariant for
+    EVERY item in the batch (fail closed on any one), and (d) hand the batch to the workflow. The
+    batch is keyed by impl_provider so one reviewer-provider check covers all items.
+
+    [GPT-5.6 r4 #3] The ONE lease atomically reserves the batch's REAL concurrency: the workflow
+    runs up to min(len(batch), REVIEW_BATCH_K) parallel model calls against the claimed account,
+    so that many slots are claimed — under the SAME live `usage`/`margin` gates (Anthropic
+    headroom scaled per slot, codex reactive backoff) and the same per-account
+    max_concurrent_workers / shared review: cap the single path honours. usage=None/margin=0
+    here previously admitted a K-parallel batch behind a single 1-slot lease, bypassing all of
+    them."""
+    launched = 0
+    salt = os.environ.get("PROVENANCE_SALT", "")
+    for batch in plan_review_batches(candidates):
+        # [FABLE-5 r9 #2] The per-tick bound caps SUCCESSFUL dispatches, never candidates: a batch
+        # whose chain is unresolvable or whose claim comes back None consumes NOTHING of the
+        # budget, so later-sorted groups are still attempted this same tick instead of being
+        # starved forever by the deterministic ordering re-truncating to the same blocked prefix.
+        if launched >= REVIEW_BATCH_JOBS_MAX:
+            print(f"review batch budget reached ({REVIEW_BATCH_JOBS_MAX} dispatched); "
+                  "remaining batches re-plan next tick")
+            break
+        impl_provider = batch[0]["impl_provider"]
+        package = batch[0]["package"]
+        numbers = [entry["pr_number"] for entry in batch]
+        chain = _resolvable_chain(REVIEW_CHAIN[impl_provider], routing)
+        if not chain:
+            print(f"defer review batch {repo} {numbers}: reviewer chain unresolvable; re-plan")
+            continue
+        now = int(time.time())
+        holder = f"review:{repo}#batch-{numbers[0]}@dispatch-" \
+                 f"{os.environ.get('GITHUB_RUN_ID', 'local')}." \
+                 f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
+        slots = min(len(batch), REVIEW_BATCH_K)
+        try:
+            claim = allocator.claim(
+                registry_repo, package, "review", chain, holder, now,
+                ttl=REVIEW_BATCH_TTL, account_pool=policy["account_pool"],
+                holder_prefix="review:", max_holder_concurrent=REVIEW_MAX_CONCURRENT,
+                usage=usage, margin=margin, slots=slots)
+        except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            print(f"defer review batch {repo} {numbers}: lease alloc errored ({exc}); skipped")
+            continue
+        if claim is None:
+            print(f"defer review batch {repo} {numbers}: no eligible review lease free this tick")
+            continue
+        account = claim.get("account")
+        claim_id = claim.get("claim_id")
+        claim_provider = claim.get("provider")
+        # Cross-provider fail-closed re-assertion for EVERY item (one claimed account must satisfy
+        # reviewer_provider != impl_provider AND reviewer_account != impl_account for all of them).
+        violation = ""
+        if not isinstance(account, str) or not re.fullmatch(r"acct[0-9a-z]{2,}", account) \
+                or not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f]{32}", claim_id) \
+                or claim.get("model") not in chain:
+            violation = "allocator returned an unsafe/out-of-policy claim"
+        elif not claim_provider or claim_provider == impl_provider:
+            violation = "reviewer provider would equal implementer provider"
+        elif not salt:
+            violation = "PROVENANCE_SALT unavailable; cannot assert reviewer != implementer"
+        else:
+            reviewer_h = worker_pr.account_hash(account, salt)
+            if any(reviewer_h == entry["impl_account_h"] for entry in batch):
+                violation = "reviewer account would equal an implementer account in the batch"
+        if violation:
+            _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+            print(f"defer review batch {repo} {numbers}: {violation}; released + skipped")
+            continue
+        # The claimed account resolves (via the protected target routing) to a concrete reviewer
+        # model + secret_ref + provider — forwarded so the workflow's model container matches the
+        # single path exactly (routing.toml is keyed by MODEL alias, not account, so the account's
+        # resolved model rides along rather than being re-looked-up by handle).
+        claim_model = claim.get("model", "")
+        claim_secret_ref = claim.get("secret_ref", "")
+        claim_harness = claim.get("harness", "")
+        claim_credential_format = claim.get("credential_format", "")
+        # The manifest is a base64-encoded JSON list — validated char-by-char by the workflow (each
+        # field re-validated live in-job before that item's model call).
+        manifest_b64 = base64.b64encode(
+            json.dumps(batch, sort_keys=True).encode()).decode()
+        result = _run_gh([
+            "workflow", "run", "review-batch.yml",
+            "--repo", registry_repo,
+            "--ref", workflow_ref,
+            "-f", f"target_repo={repo}",
+            "-f", f"impl_provider={impl_provider}",
+            "-f", f"package={package}",
+            "-f", f"account={account}",
+            "-f", f"claim_id={claim_id}",
+            "-f", f"reviewer_provider={claim_provider}",
+            "-f", f"reviewer_model={claim_model}",
+            "-f", f"secret_ref={claim_secret_ref}",
+            "-f", f"harness={claim_harness}",
+            "-f", f"credential_format={claim_credential_format}",
+            "-f", f"batch_k={REVIEW_BATCH_K}",
+            "-f", f"manifest_b64={manifest_b64}",
+        ], check=False)
+        if result.returncode != 0:
+            released = _release_failed_dispatch(allocator, registry_repo, claim_id)
+            if not released:
+                print("::error::review-batch dispatch failed and its lease could not be released")
+            print(f"defer review batch {repo} {numbers}: dispatch failed; skipped")
+            continue
+        launched += 1
+        print(f"dispatched review BATCH {repo} {numbers}: {len(batch)} reviews, "
               f"claim={claim_id[:8]}")
     return launched
 
@@ -2638,6 +2865,218 @@ def _self_test():
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+
+            # [GPT-5.6 r4 / issue #96] ledger-FIRST record resolution with legacy fallback: a
+            # record present on the ledger checkout wins (that's where github.token can write
+            # post-#96), one only in the legacy default-branch checkout still resolves
+            # (pre-migration records), and an empty ledger_root degrades to legacy alone.
+            ledger_tmp = os.path.join(tmp, "ledger-root")
+            rel = wiring_worker_pr.verdict_path(repo, 41, 7)
+            ledger_rec = Path(ledger_tmp) / rel
+            ledger_rec.parent.mkdir(parents=True, exist_ok=True)
+            ledger_rec.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": False,
+                "summary": "s", "issues": [], "progress": "improving"}), encoding="utf-8")
+            assert record_file_path(ledger_tmp, tmp, rel) == ledger_rec
+            assert record_file_path("", tmp, rel) == Path(tmp) / rel
+            legacy_only = wiring_worker_pr.verdict_path(repo, 41, 5)  # written to tmp above
+            assert record_file_path(ledger_tmp, tmp, legacy_only) == Path(tmp) / legacy_only
+            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 7, [], bot,
+                                            ledger_root=ledger_tmp) == "improving"
+
+            # ---- [FABLE-5] _dispatch_review_batches wiring: the batch path re-implements the two
+            # trust-critical review invariants (reviewer_provider != impl_provider AND
+            # reviewer_account != any impl_account in the batch) over a batch loop, so a bug there
+            # would not be caught by the single-path _dispatch_review_items wiring above. Stub the
+            # allocator + workflow launch and assert: (a) a same-provider claim DEFERS + releases +
+            # launches nothing; (b) a claim whose account hash collides with a batch member's
+            # impl_account_h DEFERS + releases + launches nothing; (c) a clean cross-provider,
+            # cross-account claim LAUNCHES the review-batch workflow exactly once. ----
+            os.environ["PROVENANCE_SALT"] = "batch-salt"
+            batch_launch_calls = []
+
+            class BatchAllocator:
+                """Returns a preset claim once, then None; records every release and the claim
+                kwargs (so the K-slot/usage/margin threading is pinned, [GPT-5.6 r4 #3])."""
+                def __init__(self, claim):
+                    self._claim = claim
+                    self.releases = []
+                    self.claim_kwargs = []
+
+                def claim(self, *_a, **k):
+                    self.claim_kwargs.append(k)
+                    c, self._claim = self._claim, None
+                    return c
+
+                def release(self, _repo, claim_id, _now):
+                    self.releases.append(claim_id)
+                    return True
+
+            def fake_run_gh_batch(args, **_kwargs):
+                # Only the workflow launch reaches _run_gh in this path.
+                if args[:2] == ["workflow", "run"]:
+                    batch_launch_calls.append(args)
+                    return argparse.Namespace(returncode=0, stdout="", stderr="")
+                raise AssertionError(f"unexpected _run_gh in batch dispatch: {args}")
+
+            # Two anthropic-implemented candidates in one package -> one cross-provider (openai)
+            # review batch. impl_account_h values are two DISTINCT salted hashes of VALID handles
+            # (so the account-format gate passes and the collision gate is the one under test).
+            impl_acct_h = wiring_worker_pr.account_hash("acct11", "batch-salt")
+            other_impl_h = wiring_worker_pr.account_hash("acct12", "batch-salt")
+            batch_cands = [
+                {"pr_number": 50, "impl_provider": "anthropic", "package": "crate-a",
+                 "impl_account_h": impl_acct_h, "head_sha": "a" * 40, "review_round": 1},
+                {"pr_number": 51, "impl_provider": "anthropic", "package": "crate-a",
+                 "impl_account_h": other_impl_h, "head_sha": "b" * 40, "review_round": 1},
+            ]
+            # anthropic-implemented PRs are reviewed by the inverse REVIEW_CHAIN["anthropic"] ==
+            # ["terra"] (openai/codex); terra is resolvable as a codex default even with no model.
+            routing_batch = {"models": {"terra": {"provider_model": "TBD", "harness": "codex"}}}
+            valid_claim_id = "d" * 32
+
+            batch_usage = {"acct42": {"exempt": True}}
+
+            def run_batches(claim):
+                batch_launch_calls.clear()
+                alloc = BatchAllocator(claim)
+                real_run_gh = globals()["_run_gh"]
+                globals()["_run_gh"] = fake_run_gh_batch
+                try:
+                    launched = _dispatch_review_batches(
+                        batch_cands, repo, routing_batch, alloc, wiring_worker_pr,
+                        "reg/repo", "main", {"account_pool": []}, batch_usage, 0.15)
+                finally:
+                    globals()["_run_gh"] = real_run_gh
+                return launched, alloc
+
+            # (a) SAME-PROVIDER claim (anthropic-implemented batch requires an OPENAI reviewer, but
+            # the allocator handed back an anthropic reviewer): fail closed — defer, release, no
+            # launch. This is the cross-provider review guarantee the whole lane turns on.
+            same_prov = {"account": "acct09", "claim_id": valid_claim_id,
+                         "provider": "anthropic", "model": "terra"}
+            launched, alloc = run_batches(same_prov)
+            assert launched == 0, launched
+            assert batch_launch_calls == [], batch_launch_calls
+            assert alloc.releases == [valid_claim_id], alloc.releases
+
+            # (b) CROSS-account COLLISION: the claimed reviewer account (acct11) hashes to batch
+            # member #50's impl_account_h (an implementer would review its own PR) — fail closed.
+            # acct11 is a valid handle so the account-format gate passes and the COLLISION gate is
+            # the one exercised.
+            collide_claim = {"account": "acct11", "claim_id": valid_claim_id,
+                             "provider": "openai", "model": "terra"}
+            launched, alloc = run_batches(collide_claim)
+            assert launched == 0, launched
+            assert batch_launch_calls == [], batch_launch_calls
+            assert alloc.releases == [valid_claim_id], alloc.releases
+
+            # (c) CLEAN cross-provider + cross-account claim -> launch the batch exactly once.
+            good_claim = {"account": "acct42", "claim_id": valid_claim_id,
+                          "provider": "openai", "model": "terra",
+                          "secret_ref": "sref", "harness": "codex", "credential_format": "cf"}
+            launched, alloc = run_batches(good_claim)
+            assert launched == 1, launched
+            assert len(batch_launch_calls) == 1, batch_launch_calls
+            assert alloc.releases == [], alloc.releases  # a launched batch keeps its lease
+            launch_args = batch_launch_calls[0]
+            assert "review-batch.yml" in launch_args
+            assert "impl_provider=anthropic" in launch_args
+            assert "reviewer_provider=openai" in launch_args
+            # [GPT-5.6 r4 #3] the ONE claim reserves the batch's REAL concurrency under the LIVE
+            # usage/backoff gates: slots = min(len(batch), K), and usage/margin are the caller's
+            # (never the usage=None/margin=0 bypass that ignored backoff + max_concurrent_workers).
+            claim_kwargs = alloc.claim_kwargs[0]
+            assert claim_kwargs["slots"] == min(len(batch_cands), REVIEW_BATCH_K), claim_kwargs
+            assert claim_kwargs["usage"] is batch_usage, claim_kwargs
+            assert claim_kwargs["margin"] == 0.15, claim_kwargs
+            assert claim_kwargs["max_holder_concurrent"] == REVIEW_MAX_CONCURRENT, claim_kwargs
+
+            # ---- [FABLE-5 r9 #2] the launch budget caps SUCCESSFUL dispatches, never candidate
+            # batches: blocked/unavailable groups consume nothing, so a blocked prefix of the
+            # deterministic ordering can no longer starve later groups tick after tick. ----
+            class ScriptedAllocator:
+                """claim() follows a per-package script (None = deny); records every attempt."""
+                def __init__(self, decide):
+                    self._decide = decide
+                    self.attempts = []
+                    self.releases = []
+
+                def claim(self, _repo, package, _role, _chain, _holder, _now, **_k):
+                    self.attempts.append(package)
+                    return self._decide(package)
+
+                def release(self, _repo, claim_id, _now):
+                    self.releases.append(claim_id)
+                    return True
+
+            def ok_claim(reviewer_provider):
+                return {"account": "acct42", "claim_id": valid_claim_id,
+                        "provider": reviewer_provider,
+                        "model": "terra" if reviewer_provider == "openai" else "opus",
+                        "secret_ref": "sref", "harness": "codex", "credential_format": "cf"}
+
+            def scripted_cand(pr, provider, package):
+                return {"pr_number": pr, "impl_provider": provider, "package": package,
+                        "impl_account_h": impl_acct_h, "head_sha": "a" * 40,
+                        "head_branch": f"sparq-agent/issue-{pr}-1", "issue": pr,
+                        "review_round": 1, "security": False}
+
+            def run_scripted(cands, routing_arg, decide):
+                batch_launch_calls.clear()
+                alloc = ScriptedAllocator(decide)
+                real_run_gh = globals()["_run_gh"]
+                globals()["_run_gh"] = fake_run_gh_batch
+                try:
+                    launched = _dispatch_review_batches(
+                        cands, repo, routing_arg, alloc, wiring_worker_pr,
+                        "reg/repo", "main", {"account_pool": []}, batch_usage, 0.15)
+                finally:
+                    globals()["_run_gh"] = real_run_gh
+                return launched, alloc
+
+            # (d) UNAVAILABLE-FIRST: the first REVIEW_BATCH_JOBS_MAX sorted groups have no
+            # eligible account (claim None); the LAST group is claimable. The old candidate-side
+            # truncation never even attempted it (0 launches, forever); now every group is tried
+            # and the healthy one launches.
+            starved = [scripted_cand(60 + i, "anthropic", f"crate-p{i}")
+                       for i in range(REVIEW_BATCH_JOBS_MAX + 1)]
+            healthy_pkg = f"crate-p{REVIEW_BATCH_JOBS_MAX}"
+            launched, alloc = run_scripted(
+                starved, routing_batch,
+                lambda pkg: ok_claim("openai") if pkg == healthy_pkg else None)
+            assert launched == 1, launched
+            assert alloc.attempts == [f"crate-p{i}" for i in range(REVIEW_BATCH_JOBS_MAX + 1)], \
+                alloc.attempts
+            assert len(batch_launch_calls) == 1, batch_launch_calls
+            assert f"package={healthy_pkg}" in batch_launch_calls[0], batch_launch_calls
+            assert alloc.releases == [], alloc.releases
+
+            # (e) PROVIDER-MIXED: the anthropic-implemented groups sort FIRST but their inverse
+            # (terra) chain is unresolvable in this routing; the openai-implemented group's
+            # inverse (opus) IS resolvable. Unresolvable groups defer without touching the
+            # allocator or the budget, and the resolvable group still launches this tick.
+            routing_mixed = {"models": {"opus": {"provider_model": "claude-opus-4-8",
+                                                 "harness": "claude"}}}
+            provider_mixed = ([scripted_cand(70 + i, "anthropic", f"crate-m{i}")
+                               for i in range(REVIEW_BATCH_JOBS_MAX)]
+                              + [scripted_cand(80, "openai", "crate-z")])
+            launched, alloc = run_scripted(
+                provider_mixed, routing_mixed, lambda pkg: ok_claim("anthropic"))
+            assert launched == 1, launched
+            assert alloc.attempts == ["crate-z"], alloc.attempts
+            assert "impl_provider=openai" in batch_launch_calls[0], batch_launch_calls
+
+            # (f) the budget stops at REVIEW_BATCH_JOBS_MAX SUCCESSFUL dispatches: with more
+            # claimable groups than the budget, exactly jobs_max launch and the allocator is
+            # never asked for more (the rest re-plan next tick, never dropped).
+            plentiful = [scripted_cand(90 + i, "anthropic", f"crate-q{i}")
+                         for i in range(REVIEW_BATCH_JOBS_MAX + 2)]
+            launched, alloc = run_scripted(
+                plentiful, routing_batch, lambda pkg: ok_claim("openai"))
+            assert launched == REVIEW_BATCH_JOBS_MAX, launched
+            assert len(alloc.attempts) == REVIEW_BATCH_JOBS_MAX, alloc.attempts
+            assert len(batch_launch_calls) == REVIEW_BATCH_JOBS_MAX, batch_launch_calls
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io
@@ -2764,6 +3203,117 @@ def _self_test():
     assert escalate_starved(True, {"acct01": {}}, 1) is False
     assert escalate_starved(False, {"acct01": {}}, 0) is False
     assert escalate_starved(None, {"acct01": {}}, 0) is False
+
+    # ---- [FABLE-5] batch-review grouping (plan_review_batches). Admitted review descriptors are
+    # grouped by (impl_provider, package) and sliced to batch_size; every PR in a batch shares one
+    # reviewer direction so one claimed account covers it. [FABLE-5 r9 #2] NO candidate-side cap:
+    # the per-tick launch budget belongs to the dispatch loop (successful dispatches only). ----
+    def cand(pr, provider, package):
+        return {"pr_number": pr, "impl_provider": provider, "package": package,
+                "impl_account_h": "0" * 16, "head_sha": "a" * 40, "review_round": 1}
+
+    # a same-provider/same-package run of 3 items -> one batch of 3 (a batch never mixes direction).
+    single = plan_review_batches([cand(1, "anthropic", "crate-a"),
+                                  cand(2, "anthropic", "crate-a"),
+                                  cand(3, "anthropic", "crate-a")], batch_size=8)
+    assert len(single) == 1 and [e["pr_number"] for e in single[0]] == [1, 2, 3]
+    # DIFFERENT providers never share a batch (cross-provider account validity).
+    mixed = plan_review_batches([cand(1, "anthropic", "crate-a"),
+                                 cand(2, "openai", "crate-a"),
+                                 cand(3, "anthropic", "crate-a")], batch_size=8)
+    assert len(mixed) == 2
+    providers = {tuple(sorted({e["impl_provider"] for e in b})) for b in mixed}
+    assert providers == {("anthropic",), ("openai",)}
+    # DIFFERENT packages never share a batch (reviewer-direction/cache-affinity grouping).
+    by_pkg = plan_review_batches([cand(1, "anthropic", "crate-a"),
+                                  cand(2, "anthropic", "crate-b")], batch_size=8)
+    assert len(by_pkg) == 2
+    # batch_size slicing: 5 same-key items with size 2 -> [2, 2, 1], order preserved.
+    sliced = plan_review_batches([cand(i, "anthropic", "crate-a") for i in range(1, 6)],
+                                 batch_size=2)
+    assert [len(b) for b in sliced] == [2, 2, 1]
+    assert [e["pr_number"] for b in sliced for e in b] == [1, 2, 3, 4, 5]
+    # [FABLE-5 r9 #2] the planner returns EVERY batch — the old pre-claim truncation starved
+    # later-sorted groups whenever the first jobs_max groups were blocked (the launch budget is
+    # enforced against SUCCESSFUL dispatches in _dispatch_review_batches, tested below).
+    unbounded = plan_review_batches([cand(i, "anthropic", f"crate-{i:02d}") for i in range(1, 11)],
+                                    batch_size=1)
+    assert len(unbounded) == 10, len(unbounded)
+    # deterministic ordering across ticks: groups sorted by (impl_provider, package).
+    ordered = plan_review_batches([cand(1, "openai", "crate-z"),
+                                   cand(2, "anthropic", "crate-b"),
+                                   cand(3, "anthropic", "crate-a")], batch_size=8)
+    assert [b[0]["package"] for b in ordered] == ["crate-a", "crate-b", "crate-z"]
+    # [FABLE-5 r7 #2] The throughput the design turns on, exercised against the REAL allocator —
+    # not the vacuous jobs*SIZE arithmetic identity it replaces (which held even when the ledger
+    # admitted only 2 batches). Drive select-and-claim.claim() (IO stubbed to an in-memory CAS
+    # ledger) with the exact kwargs _dispatch_review_batches uses and count how many K-slot batch
+    # claims the slot-weighted `review:` prefix cap ACTUALLY admits at REVIEW_MAX_CONCURRENT.
+    # [FABLE-5 r9 #1] Every claim targets the SAME package — and the harshest one, __global__ —
+    # because that is the real backlog shape the r8 review proved the old test dodged: six
+    # artificial distinct packages hid that the package/global partition admitted ONE batch (4
+    # concurrent calls) for a same-package backlog. Reviews are partition-exempt now (read-only),
+    # so this asserts a single-package/global backlog still fills every batch the cap allows.
+    cap_alloc = _load_module("capacity_select_and_claim",
+                             Path(__file__).resolve().parent / "select-and-claim.py")
+    cap_ledger = {"leases": [], "sha": "sha-0"}
+
+    def cap_read_accounts(_repo):
+        # Plenty of codex accounts, each bounded at K workers (one full batch per account), so
+        # the SHARED review: cap — the invariant under test — is the binding constraint.
+        return [{"handle": f"acct{i:02d}", "models": ["terra"], "available": True,
+                 "max_concurrent_workers": REVIEW_BATCH_K, "secret_ref": f"ref{i}",
+                 "provider": "openai", "harness": "codex", "credential_format": "cf"}
+                for i in range(10, 30)]
+
+    def cap_read_ledger(_repo):
+        return json.loads(json.dumps(cap_ledger["leases"])), cap_ledger["sha"]
+
+    def cap_write_ledger(_repo, leases, sha, _msg):
+        if sha != cap_ledger["sha"]:
+            return False
+        cap_ledger["leases"] = leases
+        cap_ledger["sha"] = f"sha-{len(leases)}-{sum(cap_alloc.lease_slots(x) for x in leases)}"
+        return True
+
+    cap_alloc.read_accounts = cap_read_accounts
+    cap_alloc._read_ledger = cap_read_ledger
+    cap_alloc._write_ledger = cap_write_ledger
+    cap_now = 1_700_000_000
+    cap_slots = min(REVIEW_BATCH_SIZE, REVIEW_BATCH_K)
+    cap_admitted = 0
+    denied_at_cap = False
+    for i in range(REVIEW_BATCH_JOBS_MAX + 4):  # keep claiming PAST a full tick's batches
+        got = cap_alloc.claim(
+            "reg/repo", "__global__", "review", ["terra"],
+            f"review:t/r#batch-{i}@cap-test", cap_now,
+            ttl=REVIEW_BATCH_TTL, holder_prefix="review:",
+            max_holder_concurrent=REVIEW_MAX_CONCURRENT, slots=cap_slots)
+        if got is None:
+            denied_at_cap = True
+            break
+        cap_admitted += 1
+    # the cap is ENFORCED (the loop was denied, not exhausted) at exactly floor(cap / K) batches...
+    assert denied_at_cap, "review: prefix cap never bound — test is vacuous"
+    assert cap_admitted == REVIEW_MAX_CONCURRENT // cap_slots, cap_admitted
+    # ...a full tick's batches all fit concurrently, and the ADMITTED capacity (not a constant
+    # identity) covers the >40-review maintainer ask.
+    assert cap_admitted >= REVIEW_BATCH_JOBS_MAX, (cap_admitted, REVIEW_BATCH_JOBS_MAX)
+    assert cap_admitted * REVIEW_BATCH_SIZE > 40, cap_admitted * REVIEW_BATCH_SIZE
+    assert sum(cap_alloc.lease_slots(x) for x in cap_ledger["leases"]) <= REVIEW_MAX_CONCURRENT
+    # [GPT-5.6 r4 #3] a K-batch reserves K slot-weighted workers, so concurrent model calls are
+    # BOUND BY THE LEDGER at REVIEW_MAX_CONCURRENT (the codex comfort cap) — one batch must fit.
+    assert REVIEW_BATCH_K <= REVIEW_MAX_CONCURRENT
+    # [FABLE-5 round-2 #5] the lease outlives the batch's ACTUAL wall-clock bound (not merely the
+    # single-review TTL): ceil(SIZE/K) sequential review waves at the 25-min leg budget, plus the
+    # 12-min resolve and 20-min outcome job budgets (literals mirror review-batch.yml
+    # timeout-minutes), plus non-trivial queue slack — so the observed 50min(two waves)+12min case
+    # can never be reclaimed and concurrently reused MID-review.
+    waves = -(-REVIEW_BATCH_SIZE // REVIEW_BATCH_K)
+    actual_bound = 12 * 60 + waves * 25 * 60 + 20 * 60
+    assert REVIEW_BATCH_TTL >= actual_bound + 5 * 60, (REVIEW_BATCH_TTL, actual_bound)
+    assert REVIEW_BATCH_TTL >= 62 * 60  # the live-observed 50min+12min batch fits
+    assert REVIEW_BATCH_TTL >= REVIEW_TTL
 
     print("dispatch-claim self-test PASSED")
 

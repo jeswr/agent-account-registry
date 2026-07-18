@@ -104,6 +104,19 @@ VERDICT_DIR = "orchestration/review-verdicts"
 # the lease ledger (select-and-claim.py) and model-health CAS append. Keep in sync with
 # groom.py / select-and-claim.py / model-health.py LEDGER_REF.
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
+# [FABLE-5] Branch the atomic multi-verdict commit targets: the unprotected `ledger` data-plane
+# branch — the SAME convention as the lease ledger (select-and-claim LEDGER_REF) and model-health.
+# [GPT-5.6 r4 / issue #96, verified live]: the registry default branch (master) is PROTECTED by a
+# required `gate` status check, so EVERY github.token write to it — Contents-API PUT or
+# Git-Data-API ref PATCH alike — is permanently rejected; a batch that targeted master could never
+# record a verdict. The fix/provenance-ledger migration moves the provenance+verdict store to the
+# ledger branch wholesale; until every record has migrated, READERS resolve records ledger-FIRST
+# with a legacy default-branch-checkout fallback (dispatch-claim `record_file_path`,
+# review-fix.yml / review-batch.yml stage steps), so pre-migration verdicts stay visible while new
+# batch verdicts land where github.token can actually write. Overridable via REGISTRY_VERDICT_REF
+# for tests/migration only. The CAS retry (re-read + re-filter per attempt) handles a raced head —
+# see `_registry_write_many`.
+VERDICT_REF = os.environ.get("REGISTRY_VERDICT_REF", "ledger")
 
 
 class WorkerPrError(RuntimeError):
@@ -376,6 +389,67 @@ def human_owned(labels):
     "Human attention required" marker) is human-owned terminal: no autonomous disarm, redraft,
     fix push, or review may touch it until a human clears the label."""
     return any(label in HUMAN_OWNED_LABELS for label in labels)
+
+
+# [FABLE-5 round-2 #4] Verdict-write statuses that COMPLETE the per-PR outcome (label/arm/bind).
+# "written" is the first-run commit; "identical" means the atomic commit already SUCCEEDED on a
+# prior attempt but the job died before the outcome (crash-recovery rerun) — the outcome must be
+# re-run (after the FRESH live re-validation below) or the PR is stranded forever with a recorded
+# verdict and no label/arm. Only a DIFFERENT-content "conflict" is dropped (fail closed: a
+# recorded verdict is never rewritten and never actioned from mismatched bytes).
+BATCH_OUTCOME_ELIGIBLE_STATUSES = frozenset({"written", "identical"})
+
+
+def batch_outcome_eligible(status):
+    return status in BATCH_OUTCOME_ELIGIBLE_STATUSES
+
+
+def outcome_item_revalidation(repo, pull, issue_labels, reviewed_sha, opened_sha,
+                              opened_to_reviewed, extra_keywords=()):
+    """[FABLE-5 round-2 #3] Per-item LIVE trust re-admission at OUTCOME time (label/arm). The plan
+    manifest is up to a whole batch runtime stale by now, so every posture bit is re-derived from
+    live data, mirroring what the single path validates in its resolve step: open draft, same-repo
+    head, no human-hold PR label, no needs:* on the provenance-bound SOURCE issue, provenance
+    head_sha_at_open ancestry (the reviewed sha equals/descends from the worker-opened commit),
+    and the live head being EXACTLY the reviewed sha. `opened_to_reviewed` is the gh compare
+    `status` string the caller fetched ("identical" when the shas are equal, no API call needed).
+
+    [FABLE-5 r9 #5] Exact-equality on the live head, not ancestry: accepting a head that merely
+    DESCENDS from the reviewed sha let a stale request_changes verdict label the newer,
+    never-reviewed head `review:changes`, whereupon the dispatcher immediately emitted a fix run
+    fed by findings from the old diff. ready-and-arm protected only the approval side. Any head
+    advance — descending or rewritten — now defers the item; the sweep re-plans a fresh review of
+    the new head, so no outcome mutation ever binds a verdict to bytes it did not judge.
+
+    Returns (defer_reason or None, security_live). security_live is the label-derived security
+    posture RECOMPUTED from the LIVE PR + source-issue labels (builtin keywords + trust:* +
+    `extra_keywords` from the target routing's match_labels) — a security label added after
+    planning must block auto-arm, so callers union it with the planned flag (labels can only
+    ESCALATE the posture at outcome time, never relax it). Fail closed: any anomaly defers the
+    item (no label/arm; the sweep re-plans it) rather than acting on stale trust."""
+    if not isinstance(pull, dict) or pull.get("state") != "open":
+        return "PR is not open", False
+    head = pull.get("head") or {}
+    if (head.get("repo") or {}).get("full_name") != repo:
+        return "PR head is a fork / other repo", False
+    labels = {label.get("name") for label in (pull.get("labels") or [])
+              if isinstance(label, dict) and isinstance(label.get("name"), str)}
+    issue_label_set = {label for label in issue_labels if isinstance(label, str)}
+    security_live = security_flagged(labels | issue_label_set, extra_keywords)
+    if pull.get("draft") is not True:
+        return "PR is no longer a draft", security_live
+    if human_owned(labels):
+        return "PR is human-owned (review:needs-user / needs:user)", security_live
+    if any(label.startswith("needs:") for label in issue_label_set):
+        return "source issue is human-owned (needs:*)", security_live
+    if not re.fullmatch(r"[0-9a-f]{40}", str(opened_sha or "")):
+        return "provenance head_sha_at_open is malformed", security_live
+    if opened_sha != reviewed_sha and opened_to_reviewed not in {"identical", "ahead"}:
+        return "reviewed sha does not descend from the worker-opened commit", security_live
+    head_sha = str(head.get("sha", ""))
+    if head_sha != reviewed_sha:
+        return "live head is not exactly the reviewed sha", security_live
+    return None, security_live
 
 
 def validate_verdict(document, diff_files):
@@ -872,6 +946,180 @@ def _registry_put_file(registry_repo, path, document, message, retries=6):
         f"last API error: {last_error or 'unknown'}")
 
 
+def _canonical_verdict_bytes(document):
+    """The canonical on-registry bytes for a verdict/data document. IDENTICAL to what
+    `_registry_put_file` writes today (indent=1, sort_keys=True, trailing newline) so a batch
+    commit and a single-file PUT produce byte-identical blobs and are mutually idempotent."""
+    return json.dumps(document, indent=1, sort_keys=True) + "\n"
+
+
+def _git_data_read_ref(registry_repo, ref):
+    """Return (ref_sha, base_tree_sha) for `refs/heads/{ref}`. A MISSING verdict branch fails LOUD:
+    the verdict branch MUST be the writable `ledger` data-plane branch every ledger-first reader
+    consumes (issue #96: the protected default branch rejects all github.token writes), so a 404
+    here means the ledger branch is missing or REGISTRY_VERDICT_REF is misconfigured, not a benign
+    empty branch — recording verdicts to a branch nothing reads would silently break the
+    review→fix loop."""
+    probe = _run_gh(["api", f"repos/{registry_repo}/git/ref/heads/{ref}"], check=False)
+    if probe.returncode != 0:
+        if "HTTP 404" in probe.stderr:
+            raise WorkerPrError(
+                f"verdict branch '{ref}' does not exist — create the `ledger` data-plane branch "
+                "from master (see data/README.md); REGISTRY_VERDICT_REF must name the branch the "
+                "ledger-first verdict readers consume")
+        raise WorkerPrError(f"could not read verdict ref '{ref}'")
+    try:
+        ref_doc = json.loads(probe.stdout)
+        ref_sha = ref_doc["object"]["sha"]
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkerPrError(f"verdict ref '{ref}' response is malformed") from exc
+    commit = _gh_json(["api", f"repos/{registry_repo}/git/commits/{ref_sha}"])
+    try:
+        base_tree_sha = commit["tree"]["sha"]
+    except (KeyError, TypeError) as exc:
+        raise WorkerPrError(f"verdict ref '{ref}' base commit is malformed") from exc
+    return ref_sha, base_tree_sha
+
+
+def _git_data_existing_bytes(registry_repo, ref, path):
+    """The current bytes at `path` on `ref`, or None if absent. Used for the per-file
+    idempotency compare (absent / byte-identical / different) that mirrors `_registry_put_file`."""
+    probe = _run_gh(
+        ["api", f"repos/{registry_repo}/contents/{path}?ref={ref}"], check=False)
+    if probe.returncode != 0:
+        if "HTTP 404" in probe.stderr:
+            return None
+        raise WorkerPrError(f"registry file {path} probe on '{ref}' failed")
+    try:
+        meta = json.loads(probe.stdout)
+        return base64.b64decode("".join(meta["content"].split())).decode()
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkerPrError(f"registry file {path} is unreadable") from exc
+
+
+def _registry_write_many(registry_repo, files, message, *, ref=None, retries=6):
+    """[FABLE-5] Atomically write N registry data files in ONE Git-Data-API commit, eliminating the
+    per-file Contents-API write contention that made concurrent single-review commits thrash the
+    branch head ("registry write for … kept conflicting", e.g. sparq-org--sparq--pr2521-round3.json).
+
+    `files` is a list of (path, document) pairs. Returns a per-file result dict
+    {path: "written" | "identical" | "conflict"} so the caller can label/arm only the successfully
+    recorded items. Per-file idempotency exactly matches `_registry_put_file`, and — crucially — the
+    absent/identical/different decision is RE-DERIVED against the freshly-read ref on EVERY CAS
+    attempt (never hoisted out of the loop), so a concurrent writer that lands a DIFFERENT verdict at
+    one of our paths between attempts is detected and dropped, not clobbered:
+      - absent on the ref            -> the blob is included in the tree ("written");
+      - byte-identical already there -> the blob is OMITTED ("identical"; nothing to commit);
+      - DIFFERENT content already    -> FAIL CLOSED for that file ("conflict"): it is dropped from
+                                        the tree, gets no label/arm, and is NEVER silently rewritten
+                                        (the invariant holds on the WINNING attempt, not just the
+                                        first); the commit still proceeds for the healthy items.
+    If, after that per-attempt filter, no file needs writing, NO commit is made (empty-tree
+    short-circuit) and the last-computed result map is returned.
+
+    A non-fast-forward ref update (another writer advanced the head between our read and our PATCH)
+    triggers a CAS retry: re-read the ref, RE-RUN the idempotency filter against the new tree, re-base
+    the content-addressed blobs for the paths that still need writing, re-commit, re-update. The
+    default target ref (VERDICT_REF) is the `ledger` data-plane branch — the hottest ref in the
+    system (lease claim/release, model-health, groom all advance it; issue #96: the protected
+    default branch rejects github.token writes outright) — so the retry budget matches the lease
+    writer's (6), NOT a one-writer-per-tick assumption. The concurrency group keyed on the claim id
+    does NOT serialize batch jobs under different claims writing the same ref, so real same-ref
+    contention is expected and the per-attempt re-filter makes it safe."""
+    ref = ref or VERDICT_REF
+    # Canonicalize + content-address every candidate blob ONCE (the bytes are ref-independent, so a
+    # CAS rebase reuses the blob shas without re-POSTing). The absent/identical/different decision is
+    # NOT precomputed here — it is re-derived per attempt against the live ref inside the loop.
+    canonical = [(path, _canonical_verdict_bytes(document)) for path, document in files]
+    # [FABLE-5 r9 #3] BOTH record locations gate EVERY path, exactly like `_registry_put_file`
+    # (sol r1 on #100): the legacy pre-migration DEFAULT-branch copy is probed once per path
+    # (master records are immutable, so once is sound) before any ledger commit may include it. A
+    # DIVERGENT legacy record fails that path closed ("conflict") even when the ledger ref has no
+    # copy yet — without this, the batch writer could land a ledger verdict whose content differs
+    # from the existing legacy verdict, and every ledger-first reader plus the outcome job would
+    # silently switch to the new meaning. A byte-identical legacy record with no ledger copy is
+    # idempotent success ("identical"): nothing to commit, exactly the single writer's return.
+    legacy_state = {}
+    for path, body in canonical:
+        legacy, _legacy_sha = _probe_registry_file(registry_repo, path)
+        legacy_state[path] = ("absent" if legacy is None
+                              else "identical" if legacy == body else "conflict")
+    blob_shas = {}
+
+    def blob_sha_for(path, body):
+        if path not in blob_shas:
+            blob = _gh_json(
+                ["api", "-X", "POST", f"repos/{registry_repo}/git/blobs", "--input", "-"],
+                input_doc={"content": body, "encoding": "utf-8"})
+            sha = blob.get("sha") if isinstance(blob, dict) else None
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+                raise WorkerPrError(f"git blob create for {path} returned no sha")
+            blob_shas[path] = sha
+        return blob_shas[path]
+
+    last_exc = None
+    result = {}
+    for _ in range(max(1, retries)):
+        # Re-read the ref AND re-run the per-file idempotency filter against THIS attempt's ref state.
+        # Doing the filter inside the loop is load-bearing: a concurrent writer that recorded a
+        # DIFFERENT verdict at one of our paths since the previous read is now observed and dropped
+        # (conflict), so the fast-forward we are about to take can never overwrite it.
+        ref_sha, base_tree_sha = _git_data_read_ref(registry_repo, ref)
+        result = {}
+        to_write = []  # (path, canonical_bytes) still needing a commit on the fresh ref
+        for path, body in canonical:
+            if legacy_state[path] == "conflict":
+                # A divergent legacy default-branch record: never write, never claim success —
+                # regardless of the ledger ref's state ([FABLE-5 r9 #3], mirrors the single
+                # writer's pre-loop raise).
+                result[path] = "conflict"
+                continue
+            existing = _git_data_existing_bytes(registry_repo, ref, path)
+            if existing is None:
+                if legacy_state[path] == "identical":
+                    # Byte-identical pre-migration record, no ledger copy: idempotent success
+                    # (the single writer returns False here — nothing to commit).
+                    result[path] = "identical"
+                else:
+                    to_write.append((path, body))
+                    result[path] = "written"
+            elif existing == body:
+                result[path] = "identical"  # idempotent success — nothing to commit
+            else:
+                result[path] = "conflict"   # fail closed: never rewrite a recorded verdict
+        if not to_write:
+            return result  # fully idempotent (or all-conflict) on the fresh ref: ZERO commits
+        tree_entries = [
+            {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha_for(path, body)}
+            for path, body in to_write
+        ]
+        tree = _gh_json(
+            ["api", "-X", "POST", f"repos/{registry_repo}/git/trees", "--input", "-"],
+            input_doc={"base_tree": base_tree_sha, "tree": tree_entries})
+        tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+        if not isinstance(tree_sha, str) or not tree_sha:
+            raise WorkerPrError("git tree create returned no sha")
+        commit = _gh_json(
+            ["api", "-X", "POST", f"repos/{registry_repo}/git/commits", "--input", "-"],
+            input_doc={"message": message, "tree": tree_sha, "parents": [ref_sha]})
+        commit_sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(commit_sha, str) or not commit_sha:
+            raise WorkerPrError("git commit create returned no sha")
+        patch = _run_gh(
+            ["api", "-X", "PATCH", f"repos/{registry_repo}/git/refs/heads/{ref}",
+             "-f", f"sha={commit_sha}", "-F", "force=false"],
+            check=False)
+        if patch.returncode == 0:
+            return result
+        # A non-fast-forward (422) means another writer advanced the ref between our read and our
+        # PATCH. Loop: re-read, RE-FILTER (so a concurrent same-path verdict is now a conflict, not a
+        # clobber), re-base the still-needed blobs, re-commit, re-update.
+        last_exc = patch.stderr
+    raise WorkerPrError(
+        f"batch verdict commit to '{ref}' kept conflicting (non-fast-forward): {last_exc or ''}"
+        .strip())
+
+
 def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_provider, impl_alias,
                       impl_account_h, issue, run_key, verify_bot_login=None):
     """Write the registry provenance record (the review loop's root of trust).
@@ -924,6 +1172,41 @@ def verdict_record(registry_repo, target_repo, pr_number, round_n, verdict_file)
         f"review verdict {target_repo}#{pr_number} round {round_n}")
     print(f"verdict {'recorded' if created else 'already recorded'} "
           f"for {target_repo}#{pr_number} round {round_n}")
+
+
+def verdict_record_batch(registry_repo, items, *, ref=None):
+    """[FABLE-5] Record MANY review verdicts in ONE atomic Git-Data-API commit (the batch-review
+    worker's write path). `items` is a list of dicts, each carrying a `target_repo`, `pr` (int),
+    `round` (int) and either `verdict_file` (path to read) or an inline `document`. Returns the
+    per-file result map from `_registry_write_many` keyed by the caller's (target_repo, pr, round)
+    so the batch job labels/arms only the successfully recorded PRs, and drops the fail-closed
+    (different-content) ones — exactly matching the single-file semantics, but with ~1 commit per
+    batch instead of N contended single-file commits."""
+    files = []
+    index = {}  # verdict_path -> (target_repo, pr, round)
+    for item in items:
+        target_repo = item["target_repo"]
+        pr_number = int(item["pr"])
+        round_n = int(item["round"])
+        if "document" in item:
+            document = item["document"]
+        else:
+            with open(item["verdict_file"], encoding="utf-8") as handle:
+                document = json.load(handle)
+        path = verdict_path(target_repo, pr_number, round_n)
+        files.append((path, document))
+        index[path] = (target_repo, pr_number, round_n)
+    prs = ", ".join(f"{t}#{p} r{r}" for _, (t, p, r) in sorted(index.items()))
+    message = f"batch review verdicts ({len(files)}): {prs}"
+    written = _registry_write_many(registry_repo, files, message, ref=ref)
+    outcomes = {}
+    for path, status in written.items():
+        outcomes[index[path]] = status
+        target_repo, pr_number, round_n = index[path]
+        recorded = {"written": "recorded", "identical": "already recorded",
+                    "conflict": "CONFLICT (fail-closed, not rewritten)"}[status]
+        print(f"verdict {recorded} for {target_repo}#{pr_number} round {round_n}")
+    return outcomes
 
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
@@ -1177,7 +1460,7 @@ def disarm(repo, pr_number, when):
 
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
-                  reviewer_account, arm, issue=None, surface_paths=None):
+                  reviewer_account, arm, issue=None, surface_paths=None, security_keywords=()):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval).
 
@@ -1211,6 +1494,37 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         set_review_state(repo, pr_number, "needs")
         _write_outputs({"armed": False, "head_moved": True})
         print("live head advanced past the reviewed sha; returned to review:needs")
+        return
+    # [FABLE-5 round-2 #3e] LIVE label re-admission before any undraft/latch. The approval was
+    # decided from labels read earlier (up to a whole batch runtime earlier on the batch path);
+    # a human-hold or security label added since must stand the arm down — a benign-FILE but
+    # security-LABELLED or human-owned PR is never undrafted/armed.
+    labels = {label.get("name") for label in (live.get("labels") or [])
+              if isinstance(label, dict) and isinstance(label.get("name"), str)}
+    if human_owned(labels):
+        _write_outputs({"armed": False, "head_moved": False, "human_hold": True})
+        print("live PR is human-owned (review:needs-user / needs:user); refusing to ready/arm")
+        return
+    issue_labels = set()
+    if issue:
+        issue_live = _gh_json(["api", f"repos/{repo}/issues/{issue}"])
+        issue_labels = {label.get("name") for label in (issue_live.get("labels") or [])
+                        if isinstance(label, dict) and isinstance(label.get("name"), str)}
+        if any(label.startswith("needs:") for label in issue_labels):
+            _write_outputs({"armed": False, "head_moved": False, "human_hold": True})
+            print("live source issue is human-owned (needs:*); refusing to ready/arm")
+            return
+    if security_flagged(labels | issue_labels, security_keywords):
+        # Mirrors decide_review's security posture: had the label been present at review time the
+        # decision would have been needs-user, never arm. Escalate the same way — the automated
+        # review is complete, the arm click is a human's.
+        alert_repo, alert_token = _alert_route()
+        needs_user(repo, pr_number,
+                   "a security label appeared on the PR or its source issue after review "
+                   "planning; human arm decision required",
+                   issue=issue, alert_repo=alert_repo, alert_token=alert_token)
+        _write_outputs({"armed": False, "head_moved": False, "security_hold": True})
+        print("live security label: withheld ready/arm; escalated to human (review:needs-user)")
         return
     if arm:
         # Live trust-surface re-derivation BEFORE any undraft/latch (renamed-path safe).
@@ -2095,6 +2409,157 @@ def _self_test():
     finally:
         wiring_globals.update(real_disarm_io)
 
+    # ---- [FABLE-5 round-2 #4] batch outcome eligibility: an "identical" verdict write means the
+    # atomic commit already succeeded and only the outcome is missing (commit -> crash -> rerun);
+    # it MUST re-run the label/arm or the PR is stranded. Only different-content conflicts drop. --
+    check("written verdicts complete the outcome", batch_outcome_eligible("written"), True)
+    check("identical verdicts complete the outcome (crash-recovery rerun)",
+          batch_outcome_eligible("identical"), True)
+    check("conflict verdicts never label/arm", batch_outcome_eligible("conflict"), False)
+
+    # ---- [FABLE-5 round-2 #3] OUTCOME-time live re-admission (pure): every posture bit is
+    # re-derived from live data, and label-derived security is RECOMPUTED live ----
+    open_sha, head_now = "1" * 40, "2" * 40
+
+    def live_pr(*, state="open", draft=True, labels=(), head_sha=head_now, head_repo="o/r"):
+        return {"state": state, "draft": draft,
+                "labels": [{"name": name} for name in labels],
+                "head": {"sha": head_sha, "repo": {"full_name": head_repo}}}
+
+    def reval(**kw):
+        params = dict(pull=live_pr(head_sha=open_sha), issue_labels=[],
+                      reviewed_sha=open_sha, opened_sha=open_sha,
+                      opened_to_reviewed="identical", extra_keywords=())
+        params.update(kw)
+        return outcome_item_revalidation("o/r", params["pull"], params["issue_labels"],
+                                         params["reviewed_sha"], params["opened_sha"],
+                                         params["opened_to_reviewed"], params["extra_keywords"])
+
+    check("clean live item admits", reval(), (None, False))
+    # [FABLE-5 r9 #5] EXACT live-head equality: even a DESCENDING head advance defers every
+    # outcome mutation — a stale request_changes must never label a newer, unreviewed head
+    # (the dispatcher would instantly dispatch a fix against findings from the old diff).
+    check("descending head advance DEFERS (no outcome mutation on an unreviewed head)",
+          reval(pull=live_pr())[0], "live head is not exactly the reviewed sha")
+    check("closed PR defers", reval(pull=live_pr(state="closed"))[0], "PR is not open")
+    check("undrafted PR defers", reval(pull=live_pr(head_sha=open_sha, draft=False))[0],
+          "PR is no longer a draft")
+    check("fork head defers", reval(pull=live_pr(head_sha=open_sha, head_repo="evil/r"))[0],
+          "PR head is a fork / other repo")
+    check("live human-hold label defers",
+          reval(pull=live_pr(head_sha=open_sha, labels=("review:needs-user",)))[0],
+          "PR is human-owned (review:needs-user / needs:user)")
+    check("live needs:* source issue defers", reval(issue_labels=["needs:design"])[0],
+          "source issue is human-owned (needs:*)")
+    check("malformed opened sha fails closed", reval(opened_sha="")[0],
+          "provenance head_sha_at_open is malformed")
+    check("non-descending reviewed sha defers",
+          reval(opened_sha="3" * 40, opened_to_reviewed="diverged")[0],
+          "reviewed sha does not descend from the worker-opened commit")
+    check("rewritten live head defers",
+          reval(pull=live_pr(head_sha="4" * 40))[0],
+          "live head is not exactly the reviewed sha")
+    check("post-plan security label recomputes LIVE (routing keyword, source issue)",
+          reval(issue_labels=["area:worker"], extra_keywords=("area:worker",)), (None, True))
+    check("post-plan trust:* label recomputes LIVE (PR label)",
+          reval(pull=live_pr(head_sha=open_sha, labels=("trust:dispatch",))), (None, True))
+
+    # ---- [FABLE-5 round-2 #3e] ready_and_arm LIVE re-admission wiring: a human-hold or security
+    # label (PR or provenance-bound source issue) added after the review decision stands the arm
+    # down BEFORE any undraft; the benign path still readies + arms ----
+    arm_net = {}
+    arm_calls = []
+    arm_outputs = {}
+    real_arm_io = {name: wiring_globals[name]
+                   for name in ("_gh_json", "_run_gh", "_write_outputs", "set_review_state",
+                                "needs_user", "_alert_route", "_load_worker_issue",
+                                "_pr_changed_files")}
+
+    def fake_arm_gh_json(args, **_kwargs):
+        path = args[1] if len(args) > 1 else ""
+        if path.startswith("repos/o/r/pulls/"):
+            return arm_net["live"]
+        if path.startswith("repos/o/r/issues/"):
+            return arm_net["issue"]
+        raise WorkerPrError(f"unexpected API path {path}")
+
+    def fake_arm_run_gh(args, **_kwargs):
+        arm_calls.append(" ".join(args))
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    class _FakeWorkerIssue:
+        @staticmethod
+        def set_status(repo, issue, status):
+            arm_calls.append(f"issue-status:{status}")
+
+    def run_arm(pr_labels=(), issue_labels=(), head=None, keywords=(), arm=True):
+        arm_calls.clear()
+        arm_outputs.clear()
+        arm_net.clear()
+        arm_net["live"] = {"state": "open",
+                           "labels": [{"name": name} for name in pr_labels],
+                           "head": {"sha": head or rev_sha}}
+        arm_net["issue"] = {"labels": [{"name": name} for name in issue_labels]}
+        ready_and_arm("o/r", 41, rev_sha, "anthropic", "f" * 16, "openai",
+                      "acctrev", arm, issue=7, security_keywords=keywords)
+
+    prior_salt = os.environ.get("PROVENANCE_SALT")
+    try:
+        os.environ["PROVENANCE_SALT"] = "self-test-salt"
+        wiring_globals["_gh_json"] = fake_arm_gh_json
+        wiring_globals["_run_gh"] = fake_arm_run_gh
+        wiring_globals["_write_outputs"] = arm_outputs.update
+        wiring_globals["set_review_state"] = (
+            lambda repo, pr, state: arm_calls.append(f"state:{state}"))
+        wiring_globals["needs_user"] = (
+            lambda repo, pr, reason, **kwargs: arm_calls.append(f"needs-user:{reason}"))
+        wiring_globals["_alert_route"] = lambda: (None, None)
+        wiring_globals["_load_worker_issue"] = lambda: _FakeWorkerIssue
+        wiring_globals["_pr_changed_files"] = lambda repo, pr: ["src/lib.rs"]
+
+        run_arm()
+        check("benign arm readies then arms",
+              [call for call in arm_calls if call.startswith("pr ")],
+              ["pr ready 41 -R o/r", "pr merge 41 -R o/r --squash --auto"])
+        check("benign arm reports armed", arm_outputs.get("armed"), True)
+
+        run_arm(pr_labels=("needs:user",))
+        check("live human-hold PR label stands the arm down (no undraft)",
+              (arm_outputs.get("human_hold"),
+               any(call.startswith("pr ") for call in arm_calls)), (True, False))
+
+        run_arm(issue_labels=("needs:info",))
+        check("live needs:* source issue stands the arm down (no undraft)",
+              (arm_outputs.get("human_hold"),
+               any(call.startswith("pr ") for call in arm_calls)), (True, False))
+
+        run_arm(pr_labels=("trust:worker",))
+        check("live trust:* label withholds the arm and escalates to a human",
+              (arm_outputs.get("security_hold"),
+               any(call.startswith("needs-user:") for call in arm_calls),
+               any(call.startswith("pr ") for call in arm_calls)), (True, True, False))
+
+        run_arm(issue_labels=("area:worker",), keywords=("area:worker",))
+        check("routing-keyword security label on the SOURCE ISSUE blocks the arm",
+              (arm_outputs.get("security_hold"),
+               any(call.startswith("pr ") for call in arm_calls)), (True, False))
+
+        run_arm(pr_labels=("trust:worker",), arm=False)
+        check("security label blocks even a ready-only (arm=false) run",
+              (arm_outputs.get("security_hold"),
+               any(call.startswith("pr ") for call in arm_calls)), (True, False))
+
+        run_arm(head="d" * 40)
+        check("moved head still returns to review:needs (regression)",
+              (arm_outputs.get("head_moved"), "state:needs" in arm_calls,
+               any(call.startswith("pr ") for call in arm_calls)), (True, True, False))
+    finally:
+        if prior_salt is None:
+            os.environ.pop("PROVENANCE_SALT", None)
+        else:
+            os.environ["PROVENANCE_SALT"] = prior_salt
+        wiring_globals.update(real_arm_io)
+
     check("fix pushed re-reviews", decide_fix(False, True, True, True, 0, 0), "re-review")
     check("first nochange stays", decide_fix(False, False, True, False, 1, 0), "stay-changes")
     check("second nochange stops", decide_fix(False, False, True, False, 2, 0), "needs-user")
@@ -2106,7 +2571,300 @@ def _self_test():
           "orchestration/provenance/sparq-org--sparq--pr12.json")
     check("verdict path", verdict_path("sparq-org/sparq", 12, 2),
           "orchestration/review-verdicts/sparq-org--sparq--pr12-round2.json")
+    # Literal "ledger" on purpose ([GPT-5.6 r4] / issue #96): pointing the batch verdict writer
+    # back at the protected default branch (whose required gate check rejects every github.token
+    # write) must turn this red. Env override is for tests/migration only.
+    if not os.environ.get("REGISTRY_VERDICT_REF"):
+        check("batch verdicts default to the ledger data-plane branch", VERDICT_REF, "ledger")
     check("label colours cover review namespace", set(LABEL_COLOURS), set(REVIEW_LABELS))
+
+    # ---- [FABLE-5] atomic multi-verdict Git-Data-API commit (the load-bearing robustness test).
+    # A fake registry with gh stubbed: prove N verdict files land in ONE commit, byte-identical is
+    # skipped (idempotent), different-content fails closed (never rewritten) while the rest commit,
+    # a CAS-loser (non-fast-forward) retries once and succeeds, and an all-idempotent batch makes
+    # ZERO commits. This mirrors _registry_put_file's absent/identical/different semantics at the
+    # batch level — a bug here could silently drop a verdict, so it is unit-pinned. ----
+    real_batch_io = {name: wiring_globals[name] for name in ("_run_gh", "_gh_json")}
+
+    class FakeRegistry:
+        """A faithful-enough Git-Data-API + Contents-API model for ONE branch that enforces the
+        real non-fast-forward rule: `PATCH refs/heads/{ref}` with force=false REJECTS any commit
+        whose recorded PARENT != the current ref head. That is the only reason the CAS retry exists,
+        so the fake must model it via parent-vs-head validation (not a bare advance counter), or a
+        regression that drops the in-loop re-read/re-base would pass undetected.
+
+        `existing` seeds already-present files (canonical bytes). `on_before_patch` is a callable
+        invoked with `self` immediately BEFORE each PATCH is evaluated — a test uses it to simulate
+        a CONCURRENT writer landing a commit on the ref inside the CAS window (same-path different
+        verdict, or a disjoint file), which advances the head and makes THIS PATCH non-fast-forward.
+        It fires once per PATCH until it returns a falsey value (so the first attempt loses, the
+        retry — after re-read + re-filter — wins)."""
+        def __init__(self, existing=None, on_before_patch=None, legacy=None):
+            self.files = dict(existing or {})   # path -> canonical bytes (the current ref tree)
+            # [FABLE-5 r9 #3] path -> canonical bytes on the DEFAULT branch (the immutable legacy
+            # pre-migration records); a contents GET WITHOUT ?ref= reads here, mirroring the real
+            # API's default-branch resolution.
+            self.legacy_files = dict(legacy or {})
+            self.blobs = {}                      # blob sha -> content bytes
+            self.ref_sha = "0" * 40
+            # commit/tree sha -> {path: bytes}; commit sha resolves to its own tree in this model.
+            self.trees = {"0" * 40: dict(self.files)}
+            self.parents = {"0" * 40: None}      # commit sha -> parent sha (for the ff check)
+            self.on_before_patch = on_before_patch
+            self.commits = 0
+            self.blob_posts = 0
+            self.patch_attempts = 0
+            self.commit_parents = []             # parent sha the client used on each commit POST
+            self._n = 0
+
+        def _sha(self, seed):
+            self._n += 1
+            return hashlib.sha1(f"{seed}:{self._n}".encode()).hexdigest()
+
+        def concurrent_commit(self, files):
+            """Model an external writer committing `files` (path -> canonical bytes) onto the ref,
+            advancing the head. Used by tests to seed a same-path or disjoint concurrent write in
+            the CAS window."""
+            tree = dict(self.files)
+            tree.update(files)
+            new_sha = self._sha("external")
+            self.trees[new_sha] = tree
+            self.parents[new_sha] = self.ref_sha
+            self.ref_sha = new_sha
+            self.files = tree
+
+        def run_gh(self, args, **_kwargs):
+            # gh arg layouts: ["api", "<path>", ...] or ["api", "-X", "<VERB>", "<path>", ...].
+            verb = args[2] if args[:2] == ["api", "-X"] else "GET"
+            path = args[3] if args[:2] == ["api", "-X"] else (args[1] if len(args) > 1 else "")
+            if verb == "PATCH":
+                # refs/heads/<ref> PATCH: sha=<commit> force=false.
+                self.patch_attempts += 1
+                new_sha = next(p.split("=", 1)[1] for p in args if p.startswith("sha="))
+                if self.on_before_patch is not None:
+                    # A concurrent writer may land here, advancing the head so our parent is stale.
+                    if not self.on_before_patch(self):
+                        self.on_before_patch = None
+                # REAL non-fast-forward semantics: reject unless the commit's PARENT is the current
+                # head. The fake NEVER accepts a commit built on a stale parent.
+                if self.parents.get(new_sha) != self.ref_sha:
+                    return argparse.Namespace(returncode=1, stdout="",
+                                              stderr="HTTP 422: Update is not a fast forward")
+                self.ref_sha = new_sha
+                self.files = dict(self.trees[new_sha])
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            if path.startswith("repos/") and "/contents/" in path:
+                # GET contents/<path>[?ref=<ref>] — with ?ref= this is the idempotency probe
+                # against the CURRENT ref tree; withOUT it, the legacy DEFAULT-branch probe
+                # ([FABLE-5 r9 #3]). The "sha" field rides along for _probe_registry_file.
+                rel_query = path.split("/contents/", 1)[1]
+                rel, _, query = rel_query.partition("?")
+                store = self.files if "ref=" in query else self.legacy_files
+                if rel in store:
+                    content = base64.b64encode(store[rel].encode()).decode()
+                    return argparse.Namespace(
+                        returncode=0,
+                        stdout=json.dumps({"content": content, "sha": "f" * 40}), stderr="")
+                return argparse.Namespace(returncode=1, stdout="", stderr="HTTP 404: Not Found")
+            if path.endswith(f"/git/ref/heads/{VERDICT_REF}"):
+                return argparse.Namespace(
+                    returncode=0,
+                    stdout=json.dumps({"object": {"sha": self.ref_sha}}), stderr="")
+            raise WorkerPrError(f"unexpected run_gh path {path}")
+
+        def gh_json(self, args, *, input_doc=None, **_kwargs):
+            path = args[3] if args[:2] == ["api", "-X"] else (args[1] if len(args) > 1 else "")
+            if path.endswith("/git/blobs"):
+                self.blob_posts += 1
+                sha = self._sha(input_doc["content"])
+                self.blobs[sha] = base64.b64decode(input_doc["content"]) \
+                    if input_doc.get("encoding") == "base64" else input_doc["content"].encode()
+                return {"sha": sha}
+            if "/git/commits/" in path:
+                commit_sha = path.rsplit("/", 1)[1]
+                return {"tree": {"sha": commit_sha}}  # commit sha == its tree sha in this model
+            if path.endswith("/git/trees"):
+                base = input_doc["base_tree"]
+                tree = dict(self.trees.get(base, {}))
+                for entry in input_doc["tree"]:
+                    tree[entry["path"]] = self.blobs[entry["sha"]].decode()
+                tree_sha = self._sha("tree")
+                self.trees[tree_sha] = tree
+                return {"sha": tree_sha}
+            if path.endswith("/git/commits"):
+                self.commits += 1
+                tree_sha = input_doc["tree"]
+                parent = (input_doc.get("parents") or [None])[0]
+                self.commit_parents.append(parent)
+                commit_sha = self._sha("commit")
+                self.trees[commit_sha] = dict(self.trees[tree_sha])  # commit resolves to its tree
+                self.parents[commit_sha] = parent                    # record parent for the ff check
+                return {"sha": commit_sha}
+            raise WorkerPrError(f"unexpected gh_json path {path}")
+
+    def run_batch(reg, files, message, retries=6):
+        wiring_globals["_run_gh"] = reg.run_gh
+        wiring_globals["_gh_json"] = reg.gh_json
+        try:
+            return _registry_write_many("reg/registry", files, message, retries=retries)
+        finally:
+            wiring_globals.update(real_batch_io)
+
+    def advance_once(new_files):
+        """An on_before_patch that fires the concurrent commit exactly once (first PATCH loses)."""
+        state = {"fired": False}
+
+        def hook(reg):
+            if state["fired"]:
+                return False
+            state["fired"] = True
+            reg.concurrent_commit(new_files)
+            return False  # one-shot: the retry PATCH is unobstructed
+        return hook
+
+    vpath = lambda pr, rn: verdict_path("o/r", pr, rn)  # noqa: E731
+    vdoc = lambda vd: {"verdict": vd, "injection_detected": False, "summary": "s", "issues": []}
+    approve, reject = vdoc("approve"), vdoc("request_changes")
+
+    # (1) N fresh files -> ONE commit, all "written", N blobs posted.
+    reg = FakeRegistry()
+    res = run_batch(reg, [(vpath(1, 1), approve), (vpath(2, 1), reject),
+                          (vpath(3, 1), approve)],
+                    "batch of 3")
+    check("batch: 3 fresh verdicts all written",
+          [res[vpath(1, 1)], res[vpath(2, 1)], res[vpath(3, 1)]],
+          ["written", "written", "written"])
+    check("batch: 3 files land in exactly ONE commit", reg.commits, 1)
+    check("batch: one blob POSTed per file", reg.blob_posts, 3)
+    check("batch: all three paths present on the ref after commit",
+          all(vpath(p, 1) in reg.files for p in (1, 2, 3)), True)
+
+    # (2) byte-identical existing -> OMITTED (idempotent), no commit at all.
+    seeded = {vpath(1, 1): _canonical_verdict_bytes(approve)}
+    reg = FakeRegistry(existing=seeded)
+    res = run_batch(reg, [(vpath(1, 1), approve)], "idempotent re-run")
+    check("batch: byte-identical is idempotent-skipped", res[vpath(1, 1)], "identical")
+    check("batch: fully-idempotent re-run makes ZERO commits", reg.commits, 0)
+    check("batch: idempotent re-run POSTs no blobs", reg.blob_posts, 0)
+
+    # (3) DIFFERENT existing content -> fail closed for THAT file, others still commit.
+    seeded = {vpath(1, 1): _canonical_verdict_bytes(reject)}  # recorded a DIFFERENT verdict
+    reg = FakeRegistry(existing=seeded)
+    res = run_batch(reg, [(vpath(1, 1), approve), (vpath(2, 1), approve)],
+                    "one conflict, one fresh")
+    check("batch: different-content fails closed (not rewritten)",
+          res[vpath(1, 1)], "conflict")
+    check("batch: conflicting file is NOT overwritten on the ref",
+          reg.files[vpath(1, 1)], _canonical_verdict_bytes(reject))
+    check("batch: the healthy file still commits alongside a conflict",
+          (res[vpath(2, 1)], vpath(2, 1) in reg.files), ("written", True))
+    check("batch: a mixed batch still makes exactly one commit", reg.commits, 1)
+
+    # (4) CAS loser: a concurrent writer lands a DISJOINT file inside the CAS window, advancing the
+    # head so our first PATCH is non-fast-forward; the retry re-reads, re-bases on the NEW tree, and
+    # succeeds. This proves the retry re-reads the ref (finding #8): a stale-parent commit would be
+    # rejected by the ff check forever, so a success here requires the in-loop re-read + re-base.
+    disjoint = {vpath(100, 1): _canonical_verdict_bytes(approve)}  # some OTHER writer's verdict
+    reg = FakeRegistry(on_before_patch=advance_once(disjoint))
+    res = run_batch(reg, [(vpath(9, 1), approve), (vpath(9, 2), reject)], "cas-loser retries")
+    check("batch: CAS-loser still records both verdicts",
+          [res[vpath(9, 1)], res[vpath(9, 2)]], ["written", "written"])
+    check("batch: CAS retry re-uses content-addressed blobs (no re-POST)",
+          reg.blob_posts, 2)
+    check("batch: both files present after the CAS retry",
+          all(vpath(9, rn) in reg.files for rn in (1, 2)), True)
+    check("batch: the concurrent writer's disjoint file survives (not clobbered)",
+          reg.files[vpath(100, 1)], _canonical_verdict_bytes(approve))
+    check("batch: two PATCH attempts were made (first lost, retry won)", reg.patch_attempts, 2)
+    # The retry MUST have committed on the concurrent writer's advanced head, not the stale one:
+    # the two commit POSTs used DIFFERENT parents (finding #8 — no stale-parent re-commit).
+    check("batch: the retry re-based on the advanced head (distinct commit parents)",
+          len(set(reg.commit_parents)) == 2, True)
+
+    # (4b) SAME-PATH concurrent DIFFERENT verdict inside the CAS window: a concurrent writer records
+    # a DIFFERENT verdict at one of OUR paths after our first read but before our PATCH. The retry
+    # MUST re-run the idempotency filter against the fresh ref, observe the different content, and
+    # FAIL CLOSED for that path (never overwrite the other writer's verdict) — findings #2/#5. Before
+    # the fix this path was silently clobbered because the filter was hoisted out of the CAS loop.
+    reg = FakeRegistry(on_before_patch=advance_once(
+        {vpath(9, 1): _canonical_verdict_bytes(reject)}))  # concurrent writer: DIFFERENT verdict
+    res = run_batch(reg, [(vpath(9, 1), approve), (vpath(9, 2), reject)], "same-path race")
+    check("batch: same-path concurrent DIFFERENT verdict fails closed on retry",
+          res[vpath(9, 1)], "conflict")
+    check("batch: the concurrent writer's same-path verdict is NOT overwritten",
+          reg.files[vpath(9, 1)], _canonical_verdict_bytes(reject))
+    check("batch: the OTHER batch path still commits after the same-path conflict",
+          (res[vpath(9, 2)], vpath(9, 2) in reg.files), ("written", True))
+
+    # (4c) SAME-PATH concurrent IDENTICAL verdict: the concurrent writer recorded the SAME bytes we
+    # were going to write — the retry's re-filter reports "identical" (idempotent), not a clobber.
+    reg = FakeRegistry(on_before_patch=advance_once(
+        {vpath(9, 1): _canonical_verdict_bytes(approve)}))  # concurrent writer: SAME verdict
+    res = run_batch(reg, [(vpath(9, 1), approve), (vpath(9, 2), reject)], "same-path identical race")
+    check("batch: same-path concurrent IDENTICAL verdict is idempotent on retry",
+          res[vpath(9, 1)], "identical")
+    check("batch: same-path identical race still records the other path",
+          res[vpath(9, 2)], "written")
+
+    # (4d) [FABLE-5 r9 #3] LEGACY default-branch records gate the batch exactly like the single
+    # writer: a DIVERGENT legacy verdict fails that path closed even though the ledger ref has no
+    # copy — the batch must never write a ledger verdict whose meaning differs from the existing
+    # legacy record (ledger-first readers + the outcome job would silently adopt the new content).
+    reg = FakeRegistry(legacy={vpath(1, 1): _canonical_verdict_bytes(reject)})
+    res = run_batch(reg, [(vpath(1, 1), approve), (vpath(2, 1), approve)],
+                    "legacy divergence")
+    check("batch: divergent LEGACY record fails closed (never shadowed on the ledger)",
+          (res[vpath(1, 1)], vpath(1, 1) in reg.files), ("conflict", False))
+    check("batch: the healthy path still commits alongside a legacy conflict",
+          (res[vpath(2, 1)], vpath(2, 1) in reg.files), ("written", True))
+    # (4e) byte-identical legacy record with NO ledger copy -> idempotent success, ZERO commits
+    # (mirrors the single writer's already-recorded return; nothing is duplicated to the ledger).
+    reg = FakeRegistry(legacy={vpath(1, 1): _canonical_verdict_bytes(approve)})
+    res = run_batch(reg, [(vpath(1, 1), approve)], "legacy identical")
+    check("batch: identical LEGACY record is idempotent success",
+          res[vpath(1, 1)], "identical")
+    check("batch: identical legacy record makes ZERO commits", reg.commits, 0)
+    # (4f) divergent legacy + identical LEDGER copy: still "conflict" — success is only claimable
+    # when EVERY existing copy matches (sol r1 on #100, same rule as _registry_put_file).
+    reg = FakeRegistry(existing={vpath(1, 1): _canonical_verdict_bytes(approve)},
+                       legacy={vpath(1, 1): _canonical_verdict_bytes(reject)})
+    res = run_batch(reg, [(vpath(1, 1), approve)], "legacy vs ledger divergence")
+    check("batch: divergent legacy beats an identical ledger copy (fail closed)",
+          res[vpath(1, 1)], "conflict")
+
+    # (5) persistent non-fast-forward beyond the retry budget -> raise (no silent loss). A writer
+    # that keeps advancing the head on EVERY PATCH (never returns falsey) starves the CAS budget.
+    def always_advance(reg):
+        reg.concurrent_commit({vpath(500, 1): _canonical_verdict_bytes(approve)})
+        return True  # keep obstructing every attempt
+
+    reg = FakeRegistry(on_before_patch=always_advance)
+    try:
+        run_batch(reg, [(vpath(5, 1), approve)], "always-loses")
+    except WorkerPrError as exc:
+        check("batch: persistent non-ff raises after the retry budget",
+              "kept conflicting" in str(exc), True)
+    else:
+        check("batch: persistent non-ff raises after the retry budget", "no raise", "raised")
+
+    # (6) verdict_record_batch wraps the writer, keys outcomes by (repo,pr,round), reads files.
+    reg = FakeRegistry()
+    with tempfile.TemporaryDirectory() as bt:
+        vf1, vf2 = Path(bt) / "a.json", Path(bt) / "b.json"
+        vf1.write_text(json.dumps(approve), encoding="utf-8")
+        vf2.write_text(json.dumps(reject), encoding="utf-8")
+        wiring_globals["_run_gh"] = reg.run_gh
+        wiring_globals["_gh_json"] = reg.gh_json
+        try:
+            outcomes = verdict_record_batch("reg/registry", [
+                {"target_repo": "o/r", "pr": 7, "round": 1, "verdict_file": str(vf1)},
+                {"target_repo": "o/r", "pr": 8, "round": 2, "verdict_file": str(vf2)},
+            ])
+        finally:
+            wiring_globals.update(real_batch_io)
+    check("verdict_record_batch keys outcomes by (repo,pr,round)",
+          [outcomes[("o/r", 7, 1)], outcomes[("o/r", 8, 2)]], ["written", "written"])
+    check("verdict_record_batch commits the batch atomically", reg.commits, 1)
 
     # Privacy (locked decision 22a): salted hash is 16-hex, deterministic, salt-sensitive, and
     # never the raw handle; missing salt fails closed.
@@ -2205,6 +2963,17 @@ def main():
     vrec.add_argument("--round", required=True, type=int)
     vrec.add_argument("--verdict-file", required=True)
 
+    # [FABLE-5] Atomic multi-verdict commit for the batch-review worker. --manifest is a JSON file:
+    # a list of {"target_repo","pr","round","verdict_file"} entries (one per reviewed PR). ALL are
+    # written in ONE Git-Data-API commit to VERDICT_REF; per-file idempotency + different-content
+    # fail-closed match the single verdict-record path. Prints a JSON outcome map so the caller
+    # labels/arms only the successfully recorded PRs. --outcome-file writes that map for the job.
+    vbat = subparsers.add_parser("verdict-record-batch")
+    vbat.add_argument("--registry-repo", required=True)
+    vbat.add_argument("--manifest", required=True)
+    vbat.add_argument("--ref", default=None, help="verdict data-plane branch (default VERDICT_REF)")
+    vbat.add_argument("--outcome-file", default=None)
+
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
@@ -2225,6 +2994,11 @@ def main():
     # security_paths). Empty -> DEFAULT_TRUST_SURFACE_PATHS (fail closed, never silently absent).
     arm.add_argument("--surface-path", action="append", default=[],
                      help="trust-surface path/prefix (repeatable; from policy security_paths)")
+    # [FABLE-5 round-2 #3e] Extra security-label keywords for the LIVE arm-time label re-check
+    # (from the target routing's match_labels, like review-fix's resolve-time classifier).
+    # Empty -> the built-in SECURITY_KEYWORDS + the trust:* prefix still apply.
+    arm.add_argument("--security-keyword", action="append", default=[],
+                     help="extra security label keyword (repeatable; from routing match_labels)")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -2312,6 +3086,19 @@ def main():
         elif args.command == "verdict-record":
             verdict_record(args.registry_repo, args.target_repo, args.pr, args.round,
                            args.verdict_file)
+        elif args.command == "verdict-record-batch":
+            with open(args.manifest, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            if not isinstance(manifest, list) or not manifest:
+                raise WorkerPrError("verdict-record-batch manifest must be a non-empty list")
+            outcomes = verdict_record_batch(args.registry_repo, manifest, ref=args.ref)
+            # Emit a stable JSON outcome map (string keys "<target_repo>#<pr>#<round>") the batch
+            # job iterates to label/arm ONLY the recorded PRs (fail-closed drops the "conflict"s).
+            outcome_map = {f"{t}#{p}#{r}": status for (t, p, r), status in outcomes.items()}
+            payload = json.dumps(outcome_map, sort_keys=True)
+            if args.outcome_file:
+                Path(args.outcome_file).write_text(payload + "\n", encoding="utf-8")
+            print(payload)
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
@@ -2323,7 +3110,8 @@ def main():
                           args.impl_account_h, args.reviewer_provider,
                           os.environ.get("WORKER_REVIEWER_ACCOUNT", ""),
                           args.arm == "true", issue=args.issue,
-                          surface_paths=args.surface_path or None)
+                          surface_paths=args.surface_path or None,
+                          security_keywords=tuple(args.security_keyword))
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":

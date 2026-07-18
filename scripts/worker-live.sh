@@ -1318,7 +1318,11 @@ PY
   esac
   GH_TOKEN="$pat" /usr/bin/gh secret set "$secret_ref" --repo "$registry_repo" < "$current"
   write_output rotated true
-  printf 'worker-live: wrote the full refreshed credential back to %s\n' "$secret_ref"
+  # [FABLE-5 r9 #8] Handle-free success line: the secret reference is ${ACCOUNT^^}_TOKEN, so
+  # printing it published the raw account handle in public logs (no-raw-handle posture, locked
+  # decision 22). The claimed-account binding was already asserted above; nothing identifying
+  # may reach stdout here.
+  printf 'worker-live: wrote the full refreshed credential back to the claimed account secret\n'
 }
 
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
