@@ -104,18 +104,19 @@ VERDICT_DIR = "orchestration/review-verdicts"
 # the lease ledger (select-and-claim.py) and model-health CAS append. Keep in sync with
 # groom.py / select-and-claim.py / model-health.py LEDGER_REF.
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
-# [FABLE-5] Branch the atomic multi-verdict commit targets. This MUST be the same branch every
-# verdict READER consumes, or batch verdicts become invisible and the review→fix loop silently
-# breaks: `dispatch-claim.latest_recorded_progress` + the fix-dispatch gate read the verdict from
-# the `--registry-root registry` (default-branch) checkout, and `review-fix.yml` stages the prior
-# verdict from `registry/orchestration/review-verdicts/...` (also the default branch). The single
-# path (`_registry_put_file`) writes verdicts to the default branch via the Contents API, so the
-# batch writer pins the default branch too — one branch for every read and every write. Overridable
-# via REGISTRY_VERDICT_REF only if the readers are migrated in lockstep (data/README.md). Writing
-# the verdict tree via the Git-Data-API to the default branch has the SAME contention profile as
-# the single path's Contents-API PUT it replaces; the CAS retry (re-read + re-filter per attempt)
-# handles a raced head — see `_registry_write_many`.
-VERDICT_REF = os.environ.get("REGISTRY_VERDICT_REF", "master")
+# [FABLE-5] Branch the atomic multi-verdict commit targets: the unprotected `ledger` data-plane
+# branch — the SAME convention as the lease ledger (select-and-claim LEDGER_REF) and model-health.
+# [GPT-5.6 r4 / issue #96, verified live]: the registry default branch (master) is PROTECTED by a
+# required `gate` status check, so EVERY github.token write to it — Contents-API PUT or
+# Git-Data-API ref PATCH alike — is permanently rejected; a batch that targeted master could never
+# record a verdict. The fix/provenance-ledger migration moves the provenance+verdict store to the
+# ledger branch wholesale; until every record has migrated, READERS resolve records ledger-FIRST
+# with a legacy default-branch-checkout fallback (dispatch-claim `record_file_path`,
+# review-fix.yml / review-batch.yml stage steps), so pre-migration verdicts stay visible while new
+# batch verdicts land where github.token can actually write. Overridable via REGISTRY_VERDICT_REF
+# for tests/migration only. The CAS retry (re-read + re-filter per attempt) handles a raced head —
+# see `_registry_write_many`.
+VERDICT_REF = os.environ.get("REGISTRY_VERDICT_REF", "ledger")
 
 
 class WorkerPrError(RuntimeError):
@@ -948,15 +949,18 @@ def _canonical_verdict_bytes(document):
 
 def _git_data_read_ref(registry_repo, ref):
     """Return (ref_sha, base_tree_sha) for `refs/heads/{ref}`. A MISSING verdict branch fails LOUD:
-    the verdict branch MUST be the branch every reader consumes (the registry default branch by
-    default), so a 404 here means a misconfigured REGISTRY_VERDICT_REF, not a benign empty branch —
-    recording verdicts to a branch nothing reads would silently break the review→fix loop."""
+    the verdict branch MUST be the writable `ledger` data-plane branch every ledger-first reader
+    consumes (issue #96: the protected default branch rejects all github.token writes), so a 404
+    here means the ledger branch is missing or REGISTRY_VERDICT_REF is misconfigured, not a benign
+    empty branch — recording verdicts to a branch nothing reads would silently break the
+    review→fix loop."""
     probe = _run_gh(["api", f"repos/{registry_repo}/git/ref/heads/{ref}"], check=False)
     if probe.returncode != 0:
         if "HTTP 404" in probe.stderr:
             raise WorkerPrError(
-                f"verdict branch '{ref}' does not exist — REGISTRY_VERDICT_REF must name the "
-                "branch the verdict readers consume (the registry default branch)")
+                f"verdict branch '{ref}' does not exist — create the `ledger` data-plane branch "
+                "from master (see data/README.md); REGISTRY_VERDICT_REF must name the branch the "
+                "ledger-first verdict readers consume")
         raise WorkerPrError(f"could not read verdict ref '{ref}'")
     try:
         ref_doc = json.loads(probe.stdout)
@@ -1010,11 +1014,12 @@ def _registry_write_many(registry_repo, files, message, *, ref=None, retries=6):
     A non-fast-forward ref update (another writer advanced the head between our read and our PATCH)
     triggers a CAS retry: re-read the ref, RE-RUN the idempotency filter against the new tree, re-base
     the content-addressed blobs for the paths that still need writing, re-commit, re-update. The
-    default target ref (VERDICT_REF) is the registry default branch — the hottest ref in the system
-    (lease claim/release, model-health, groom all advance it) — so the retry budget matches the lease
-    writer's (6), NOT a one-writer-per-tick assumption. The concurrency group
-    review-batch-<target>-<account> does NOT serialize batch jobs on different accounts writing the
-    same ref, so real same-ref contention is expected and the per-attempt re-filter makes it safe."""
+    default target ref (VERDICT_REF) is the `ledger` data-plane branch — the hottest ref in the
+    system (lease claim/release, model-health, groom all advance it; issue #96: the protected
+    default branch rejects github.token writes outright) — so the retry budget matches the lease
+    writer's (6), NOT a one-writer-per-tick assumption. The concurrency group keyed on the claim id
+    does NOT serialize batch jobs under different claims writing the same ref, so real same-ref
+    contention is expected and the per-attempt re-filter makes it safe."""
     ref = ref or VERDICT_REF
     # Canonicalize + content-address every candidate blob ONCE (the bytes are ref-independent, so a
     # CAS rebase reuses the blob shas without re-POSTing). The absent/identical/different decision is
@@ -2535,6 +2540,11 @@ def _self_test():
           "orchestration/provenance/sparq-org--sparq--pr12.json")
     check("verdict path", verdict_path("sparq-org/sparq", 12, 2),
           "orchestration/review-verdicts/sparq-org--sparq--pr12-round2.json")
+    # Literal "ledger" on purpose ([GPT-5.6 r4] / issue #96): pointing the batch verdict writer
+    # back at the protected default branch (whose required gate check rejects every github.token
+    # write) must turn this red. Env override is for tests/migration only.
+    if not os.environ.get("REGISTRY_VERDICT_REF"):
+        check("batch verdicts default to the ledger data-plane branch", VERDICT_REF, "ledger")
     check("label colours cover review namespace", set(LABEL_COLOURS), set(REVIEW_LABELS))
 
     # ---- [FABLE-5] atomic multi-verdict Git-Data-API commit (the load-bearing robustness test).

@@ -128,12 +128,15 @@ FIX_MAX_CONCURRENT = 8
 REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
 FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
 # [FABLE-5] Batch-review worker (design: orchestration/review-verdicts/README.md). ONE batch job claims ONE
-# account (ONE `review:` slot) and runs up to REVIEW_BATCH_K in-job parallel review calls over up to
-# REVIEW_BATCH_SIZE admitted review items, then writes ALL their verdicts in ONE atomic Git-Data-API
-# commit — so N reviews cost 1 slot + ~1 commit instead of N slots + N contended single-file commits
-# (the "kept conflicting" thrash, e.g. sparq-org--sparq--pr2521-round3.json). Effective review
-# parallelism = REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_SIZE (>40, the maintainer ask) while concurrent
-# codex model calls = REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_K stays within the ~10-parallel comfort.
+# account and runs up to REVIEW_BATCH_K in-job parallel review calls over up to REVIEW_BATCH_SIZE
+# admitted review items, then writes ALL their verdicts in ONE atomic Git-Data-API commit — so N
+# reviews cost ~1 commit instead of N contended single-file commits (the "kept conflicting" thrash,
+# e.g. sparq-org--sparq--pr2521-round3.json). [GPT-5.6 r4 #3] The one lease reserves
+# min(len(batch), K) SLOTS (select-and-claim slot-weighted capacity), so concurrent codex model
+# calls are ledger-bounded by the shared review: cap (REVIEW_MAX_CONCURRENT) and each account's
+# max_concurrent_workers — never K workers hiding behind a 1-slot lease. Effective review
+# parallelism stays REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_SIZE (>40, the maintainer ask) because
+# reviews per job (SIZE) exceed concurrent calls per job (K).
 REVIEW_BATCH_SIZE = 8          # review items per batch job
 REVIEW_BATCH_K = 4            # in-job parallel review calls against the one claimed account
 REVIEW_BATCH_JOBS_MAX = 6      # cap on batch jobs per tick (jobs*K stays within codex comfort)
@@ -1519,18 +1522,26 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     if REVIEW_BATCH_ENABLED and review_batch_candidates:
         launched += _dispatch_review_batches(
             review_batch_candidates, repo, routing, allocator, worker_pr,
-            registry_repo, workflow_ref, policy)
+            registry_repo, workflow_ref, policy, usage, margin)
     return launched
 
 
 def _dispatch_review_batches(candidates, repo, routing, allocator, worker_pr,
-                             registry_repo, workflow_ref, policy):
+                             registry_repo, workflow_ref, policy, usage, margin):
     """[FABLE-5] Claim ONE account per batch + launch the batch-review workflow with a base64
     manifest. Each candidate already passed the full per-item hostile admission in
     `_dispatch_review_items`; here we only (a) group them (plan_review_batches), (b) claim one
     account for the whole batch, (c) re-assert the CROSS-PROVIDER + cross-account invariant for
     EVERY item in the batch (fail closed on any one), and (d) hand the batch to the workflow. The
-    batch is keyed by impl_provider so one reviewer-provider check covers all items."""
+    batch is keyed by impl_provider so one reviewer-provider check covers all items.
+
+    [GPT-5.6 r4 #3] The ONE lease atomically reserves the batch's REAL concurrency: the workflow
+    runs up to min(len(batch), REVIEW_BATCH_K) parallel model calls against the claimed account,
+    so that many slots are claimed — under the SAME live `usage`/`margin` gates (Anthropic
+    headroom scaled per slot, codex reactive backoff) and the same per-account
+    max_concurrent_workers / shared review: cap the single path honours. usage=None/margin=0
+    here previously admitted a K-parallel batch behind a single 1-slot lease, bypassing all of
+    them."""
     launched = 0
     salt = os.environ.get("PROVENANCE_SALT", "")
     for batch in plan_review_batches(candidates):
@@ -1545,12 +1556,13 @@ def _dispatch_review_batches(candidates, repo, routing, allocator, worker_pr,
         holder = f"review:{repo}#batch-{numbers[0]}@dispatch-" \
                  f"{os.environ.get('GITHUB_RUN_ID', 'local')}." \
                  f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
+        slots = min(len(batch), REVIEW_BATCH_K)
         try:
             claim = allocator.claim(
                 registry_repo, package, "review", chain, holder, now,
                 ttl=REVIEW_BATCH_TTL, account_pool=policy["account_pool"],
                 holder_prefix="review:", max_holder_concurrent=REVIEW_MAX_CONCURRENT,
-                usage=None, margin=0)
+                usage=usage, margin=margin, slots=slots)
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             print(f"defer review batch {repo} {numbers}: lease alloc errored ({exc}); skipped")
             continue
@@ -2826,6 +2838,24 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert alloc.chains == [["fable", "sonnet"]], alloc.chains
 
+            # [GPT-5.6 r4 / issue #96] ledger-FIRST record resolution with legacy fallback: a
+            # record present on the ledger checkout wins (that's where github.token can write
+            # post-#96), one only in the legacy default-branch checkout still resolves
+            # (pre-migration records), and an empty ledger_root degrades to legacy alone.
+            ledger_tmp = os.path.join(tmp, "ledger-root")
+            rel = wiring_worker_pr.verdict_path(repo, 41, 7)
+            ledger_rec = Path(ledger_tmp) / rel
+            ledger_rec.parent.mkdir(parents=True, exist_ok=True)
+            ledger_rec.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": False,
+                "summary": "s", "issues": [], "progress": "improving"}), encoding="utf-8")
+            assert record_file_path(ledger_tmp, tmp, rel) == ledger_rec
+            assert record_file_path("", tmp, rel) == Path(tmp) / rel
+            legacy_only = wiring_worker_pr.verdict_path(repo, 41, 5)  # written to tmp above
+            assert record_file_path(ledger_tmp, tmp, legacy_only) == Path(tmp) / legacy_only
+            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 7, [], bot,
+                                            ledger_root=ledger_tmp) == "improving"
+
             # ---- [FABLE-5] _dispatch_review_batches wiring: the batch path re-implements the two
             # trust-critical review invariants (reviewer_provider != impl_provider AND
             # reviewer_account != any impl_account in the batch) over a batch loop, so a bug there
@@ -2838,12 +2868,15 @@ def _self_test():
             batch_launch_calls = []
 
             class BatchAllocator:
-                """Returns a preset claim once, then None; records every release."""
+                """Returns a preset claim once, then None; records every release and the claim
+                kwargs (so the K-slot/usage/margin threading is pinned, [GPT-5.6 r4 #3])."""
                 def __init__(self, claim):
                     self._claim = claim
                     self.releases = []
+                    self.claim_kwargs = []
 
-                def claim(self, *_a, **_k):
+                def claim(self, *_a, **k):
+                    self.claim_kwargs.append(k)
                     c, self._claim = self._claim, None
                     return c
 
@@ -2874,6 +2907,8 @@ def _self_test():
             routing_batch = {"models": {"terra": {"provider_model": "TBD", "harness": "codex"}}}
             valid_claim_id = "d" * 32
 
+            batch_usage = {"acct42": {"exempt": True}}
+
             def run_batches(claim):
                 batch_launch_calls.clear()
                 alloc = BatchAllocator(claim)
@@ -2882,7 +2917,7 @@ def _self_test():
                 try:
                     launched = _dispatch_review_batches(
                         batch_cands, repo, routing_batch, alloc, wiring_worker_pr,
-                        "reg/repo", "main", {"account_pool": []})
+                        "reg/repo", "main", {"account_pool": []}, batch_usage, 0.15)
                 finally:
                     globals()["_run_gh"] = real_run_gh
                 return launched, alloc
@@ -2920,6 +2955,14 @@ def _self_test():
             assert "review-batch.yml" in launch_args
             assert "impl_provider=anthropic" in launch_args
             assert "reviewer_provider=openai" in launch_args
+            # [GPT-5.6 r4 #3] the ONE claim reserves the batch's REAL concurrency under the LIVE
+            # usage/backoff gates: slots = min(len(batch), K), and usage/margin are the caller's
+            # (never the usage=None/margin=0 bypass that ignored backoff + max_concurrent_workers).
+            claim_kwargs = alloc.claim_kwargs[0]
+            assert claim_kwargs["slots"] == min(len(batch_cands), REVIEW_BATCH_K), claim_kwargs
+            assert claim_kwargs["usage"] is batch_usage, claim_kwargs
+            assert claim_kwargs["margin"] == 0.15, claim_kwargs
+            assert claim_kwargs["max_holder_concurrent"] == REVIEW_MAX_CONCURRENT, claim_kwargs
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io
@@ -3086,7 +3129,9 @@ def _self_test():
     assert [b[0]["package"] for b in ordered] == ["crate-a", "crate-b", "crate-z"]
     # the throughput identity the design turns on: jobs*SIZE effective reviews > the 40-slot ask.
     assert REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_SIZE > 40
-    assert REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_K <= REVIEW_MAX_CONCURRENT + 20  # codex comfort
+    # [GPT-5.6 r4 #3] a K-batch reserves K slot-weighted workers, so concurrent model calls are
+    # BOUND BY THE LEDGER at REVIEW_MAX_CONCURRENT (the codex comfort cap) — one batch must fit.
+    assert REVIEW_BATCH_K <= REVIEW_MAX_CONCURRENT
     # [FABLE-5 round-2 #5] the lease outlives the batch's ACTUAL wall-clock bound (not merely the
     # single-review TTL): ceil(SIZE/K) sequential review waves at the 25-min leg budget, plus the
     # 12-min resolve and 20-min outcome job budgets (literals mirror review-batch.yml
