@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-2 diff remains correct and complete. It re-derives the source issue's live route through the shared resolver, fails closed when that route cannot yield an in-provider fix tier, combines the route-implied floor with the durable escalation pin by choosing the stricter ladder tier, and applies the resulting floor consistently to allocator eligibility and the fix worker's model_pin. The tests are non-vacuous: their pure assertions cover default, trust-surface, CI, cross-provider, combined-floor, and failure cases, while the end-to-end claim-chain assertions distinguish this behavior from the former provider-wide FIX_CHAIN behavior. No trust check, audit binding, permission boundary, token-handling path, or match-label set is weakened, and the diff contains no reviewer-directed prompt injection.",
+ "verdict": "approve"
+}
