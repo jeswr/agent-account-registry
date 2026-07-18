@@ -1279,6 +1279,14 @@
    "model_alias": "fable",
    "exit_class": "success",
    "run_id": "29626898850.1"
+  },
+  {
+   "ts": 1784341820,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "terra",
+   "exit_class": "success",
+   "run_id": "29627059042.1"
   }
  ]
 }
