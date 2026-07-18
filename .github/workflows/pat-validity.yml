@@ -1,9 +1,12 @@
 # [FABLE-5] Weekly REGISTRY_SECRETS_PAT validity probe (issue #37): a rotated/expired PAT used to
 # be discovered only when set-up-account or the rotation write-back actually ran `gh secret set` —
-# i.e. while a human was waiting on onboarding. This probes ahead of time (GET /user + the Actions
-# secrets public-key read, the exact read `gh secret set` performs) and upserts ONE rolling
-# `from:agent` alert issue on invalid/insufficient-scope/near-expiry; network-unknown never alerts and never
-# closes an existing alert (no false alarms, no false recoveries). The token is never printed.
+# i.e. while a human was waiting on onboarding. This probes ahead of time: GET /user, the Actions
+# secrets public-key read, then an AUTHORITATIVE `gh secret set` on the disposable canary secret
+# REGISTRY_PAT_PROBE_CANARY (review r3: the public-key read needs only Secrets: read, so it alone
+# would bless a read-only PAT that onboarding's write still breaks on; the canary holds no secret
+# material and is overwritten weekly). Upserts ONE rolling `from:agent` alert issue on
+# invalid/insufficient-scope/near-expiry; network-unknown never alerts and never closes an
+# existing alert (no false alarms, no false recoveries). The token is never printed.
 name: pat-validity
 on:
   schedule:
@@ -41,7 +44,10 @@ jobs:
           # ONLY the probed PAT enters this step — never toJSON(secrets).
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
           # The alert issue is written with the ambient token (issues:write above), NOT the PAT —
-          # a broken PAT must still be able to page the maintainer.
+          # a broken PAT must still be able to page the maintainer. The canary WRITE probe runs
+          # the other way round: the script strips this ambient token from the child `gh` env and
+          # authenticates with the probed PAT alone, so ambient credentials can never mask a
+          # read-only PAT.
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
         run: python3 scripts/pat-validity.py

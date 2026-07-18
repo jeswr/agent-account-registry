@@ -6,11 +6,18 @@
 # expire silently on a calendar) was discovered exactly when a new account was being onboarded,
 # the one moment a human is waiting on the flow. This probe runs on a weekly cron instead.
 #
-# Probe targets (the minimal reads the pipeline actually needs):
+# Probe targets (what the pipeline actually needs, in dependency order):
 #   1. GET /user                                    — does the token authenticate at all
-#   2. GET /repos/{repo}/actions/secrets/public-key — the exact read `gh secret set` performs
-#      before encrypting a secret, so it exercises precisely the Secrets access the PAT exists
-#      for, without writing anything.
+#   2. GET /repos/{repo}/actions/secrets/public-key — the read `gh secret set` performs before
+#      encrypting a secret.
+#   3. `gh secret set` on a DEDICATED DISPOSABLE CANARY secret (REGISTRY_PAT_PROBE_CANARY).
+#      Review r3 #1: the public-key GET needs only `Secrets: read`, while the `gh secret set`
+#      that onboarding and the rotation write-back actually run needs `Secrets: write` — so a
+#      read-only PAT passed probes 1–2 and was declared healthy (even auto-closing the rolling
+#      alert) while onboarding stayed broken. Only a real write is authoritative for write
+#      permission, so the probe overwrites a canary secret that exists solely for this purpose:
+#      it holds NO secret material (a fixed marker string) and is rewritten by every probe run.
+#      A read that succeeds without a completed write verdict is never `valid`.
 # The expiry header (github-authentication-token-expiration) is inspected where available so a
 # calendar expiry is flagged BEFORE it lands: a valid PAT within EXPIRY_WARN_DAYS of expiry
 # becomes `expiring-soon`, which upserts the SAME rolling alert issue — a ::warning annotation
@@ -26,7 +33,8 @@
 # DOCUMENTED discriminator is the error body's message ("You have exceeded a secondary rate
 # limit"), so the JSON error message is inspected alongside the headers. A throttle-shaped
 # secrets 403 is network-unknown, never insufficient-scope. Only 401 (invalid), an
-# authenticated-but-denied secrets read (insufficient-scope), and near-expiry alert.
+# authenticated-but-denied secrets read OR canary write (insufficient-scope), and near-expiry
+# alert.
 #
 # Alerting mirrors usage-alert.py: ONE rolling `from:agent` issue, upserted by exact title —
 # edited when open, REOPENED (never duplicated) when closed, closed with a comment on recovery.
@@ -41,9 +49,11 @@
 # no request material can echo.
 #
 # Pure classify()/probe()/upsert_alert() are unit-tested against recorded-shape fixtures
-# (--self-test, every verdict path exercised); the CLI wraps them over urllib + `gh`.
+# (--self-test, every verdict path exercised — including a read-only PAT: read 200 + write 403);
+# the CLI wraps them over urllib + `gh`.
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -52,6 +62,10 @@ import urllib.request
 from datetime import datetime, timezone
 
 API = "https://api.github.com"
+# The write probe's target: a secret that exists ONLY to be overwritten by this probe. Its value
+# is a fixed non-secret marker — nothing reads it, so probing it risks nothing real.
+CANARY_SECRET = "REGISTRY_PAT_PROBE_CANARY"
+CANARY_VALUE = "pat-validity write-probe canary - holds no secret material"
 ALERT_TITLE = "🔑 REGISTRY_SECRETS_PAT is invalid or under-scoped — secret writes will fail"
 ALERT_LABEL = "from:agent"
 EXPIRY_HEADER = "github-authentication-token-expiration"
@@ -127,21 +141,65 @@ def _throttled(resp):
     carry x-ratelimit-remaining: 0 and secondary limits usually retry-after — but a secondary
     403 can arrive with NO retry-after and NONZERO remaining quota; there the docs say the error
     MESSAGE is the discriminator ("You have exceeded a secondary rate limit", legacy "abuse
-    detection mechanism"), so the retained body message is checked too."""
+    detection mechanism"), so the retained body message is checked too. The write probe's
+    responses come from gh stderr and carry NO headers, so its primary-limit marker is the
+    documented message ("API rate limit exceeded") as well."""
     headers = resp.get("headers") or {}
     message = (resp.get("message") or "").lower()
     return (headers.get("x-ratelimit-remaining") == "0"
             or "retry-after" in headers
             or "secondary rate limit" in message
-            or "abuse detection" in message)
+            or "abuse detection" in message
+            or "api rate limit exceeded" in message)
 
 
-def classify(user, secrets):
-    """(verdict, detail) from the two probe responses. FAIL-CLOSED against false alarms: only a
-    definitive credential signal (401) or an authenticated-but-denied secrets read (403/404 after
-    a 200 /user) alerts; every throttling-shaped or server-side status is network-unknown —
-    including a secrets 403 whose headers OR error-body message say rate limit rather than
-    missing scope."""
+def _write_env(token):
+    """Child env for the canary `gh secret set`: ONLY the probed PAT may authenticate. GH_TOKEN
+    outranks every other gh auth source, and the ambient workflow token (GITHUB_TOKEN) is
+    dropped so it can never mask a broken PAT by authenticating the write itself. GH_DEBUG is
+    stripped because gh under GH_DEBUG=api dumps request headers — Authorization included — to
+    the stderr this probe retains."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GH_DEBUG", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN")}
+    env["GH_TOKEN"] = token
+    return env
+
+
+def _secret_write(token, repo, run=subprocess.run):
+    """The authoritative write probe (review r3 #1): `gh secret set` on the disposable canary
+    secret — the EXACT operation onboarding performs, exercising `Secrets: write` which the
+    public-key GET (read-only) cannot. Returns the same response shape as _get() so classify()
+    treats it uniformly: {"status", "headers": {}, "message"} on an HTTP verdict, {"status":
+    None, "error": …} when nothing conclusive happened. gh's stderr is retained ONLY as the
+    throttle-vs-denial discriminator; it never carries the token (the PAT travels via GH_TOKEN
+    in the child env and GH_DEBUG is stripped) and is never echoed into details or logs. The
+    canary value goes via stdin — never argv — purely to keep the repo's no-secrets-in-argv
+    convention, though the value is not secret."""
+    try:
+        result = run(["gh", "secret", "set", CANARY_SECRET, "-R", repo, "--app", "actions"],
+                     input=CANARY_VALUE, capture_output=True, text=True,
+                     env=_write_env(token), timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"status": None, "error": type(exc).__name__}
+    if result.returncode == 0:
+        return {"status": 204, "headers": {}, "message": ""}
+    match = re.search(r"HTTP (\d{3})", result.stderr or "")
+    if match is None:
+        # gh died without an HTTP verdict (DNS, timeout, binary trouble) — proves nothing.
+        return {"status": None, "error": f"gh secret set rc={result.returncode}, no HTTP status"}
+    return {"status": int(match.group(1)), "headers": {},
+            "message": (result.stderr or "")[:300]}
+
+
+def classify(user, secrets, write=None):
+    """(verdict, detail) from the three probe responses. FAIL-CLOSED against false alarms: only
+    a definitive credential signal (401) or an authenticated-but-denied secrets read/write
+    (403/404 after a 200 /user) alerts; every throttling-shaped or server-side status is
+    network-unknown — including a 403 whose headers OR error message say rate limit rather than
+    missing scope. FAIL-CLOSED against false health too (review r3 #1): a 200 public-key read
+    only proves `Secrets: read`; `valid` additionally requires the canary write to have
+    SUCCEEDED, so a read-only PAT is insufficient-scope and a read-success with no completed
+    write verdict is network-unknown, never valid."""
     status = user.get("status")
     if status is None:
         return NETWORK_UNKNOWN, (f"GET /user did not complete "
@@ -159,8 +217,30 @@ def classify(user, secrets):
         return NETWORK_UNKNOWN, (f"secrets public-key read did not complete "
                                  f"({secrets.get('error', 'network error')}) — PAT state unknown")
     if sstatus == 200:
-        return VALID, ("authenticates and can read the Actions secrets public key "
-                       "(the exact read `gh secret set` performs)")
+        write = write or {}
+        wstatus = write.get("status")
+        if wstatus is None:
+            # Read success alone is NEVER valid — that is exactly the read-only false positive.
+            return NETWORK_UNKNOWN, (f"secrets read succeeded but the canary write did not "
+                                     f"complete ({write.get('error', 'no write result')}) — "
+                                     "write permission unknown")
+        if wstatus in (201, 204):
+            return VALID, ("authenticates, reads the Actions secrets public key, AND wrote the "
+                           f"disposable canary secret {CANARY_SECRET} — the exact write "
+                           "`gh secret set` performs")
+        if wstatus == 401:
+            return INVALID, "canary secret write returned 401 — the PAT is revoked or expired"
+        if wstatus == 403 and _throttled(write):
+            return NETWORK_UNKNOWN, ("canary secret write returned a throttle-shaped 403 "
+                                     "(rate limited per its documented error message) — not a "
+                                     "credential verdict")
+        if wstatus in (403, 404):
+            return INSUFFICIENT, (f"authenticates and READS the secrets public key, but the "
+                                  f"canary secret write returned {wstatus} — the PAT is "
+                                  "read-only (Secrets: read) where `gh secret set` needs "
+                                  "Secrets: write")
+        return NETWORK_UNKNOWN, (f"canary secret write returned {wstatus} — "
+                                 "not a credential verdict")
     if sstatus == 401:
         return INVALID, "secrets public-key read returned 401 — the PAT is revoked or expired"
     if sstatus == 403 and _throttled(secrets):
@@ -205,13 +285,15 @@ def _malformed(token):
     return not token.isascii() or any(ord(c) <= 32 or ord(c) == 127 for c in token)
 
 
-def probe(token, repo, fetch=_get, now=None):
-    """Full probe -> {"verdict", "detail", "expires_at", "days_left"}. The secrets read only
-    runs after a 200 /user (no point scoping a token that doesn't authenticate). An absent or
-    malformed secret IS the alert-worthy condition set-up-account's preflight fails on —
-    verdict invalid, zero requests. A valid PAT within EXPIRY_WARN_DAYS of its calendar expiry
-    downgrades to expiring-soon so the rolling alert (not just a log line) pages ahead of
-    the break."""
+def probe(token, repo, fetch=_get, write=_secret_write, now=None):
+    """Full probe -> {"verdict", "detail", "expires_at", "days_left"}. Staged: the secrets read
+    only runs after a 200 /user, and the canary WRITE only after a 200 read (no writes on a
+    token already known dead, denied, or throttled). An absent or malformed secret IS the
+    alert-worthy condition set-up-account's preflight fails on — verdict invalid, zero
+    requests. A valid PAT within EXPIRY_WARN_DAYS of its calendar expiry downgrades to
+    expiring-soon so the rolling alert (not just a log line) pages ahead of the break; a
+    read-only PAT stays insufficient-scope regardless of expiry (broken now beats broken
+    soon)."""
     if not token:
         return {"verdict": INVALID,
                 "detail": "REGISTRY_SECRETS_PAT is not set (or empty) on the registry repo",
@@ -223,14 +305,16 @@ def probe(token, repo, fetch=_get, now=None):
                            "(value withheld)"),
                 "expires_at": None, "days_left": None}
     user = fetch(f"{API}/user", token)
-    secrets = None
+    secrets = written = None
     if user.get("status") == 200:
         secrets = fetch(f"{API}/repos/{repo}/actions/secrets/public-key", token)
-    verdict, detail = classify(user, secrets)
+        if secrets.get("status") == 200:
+            written = write(token, repo)
+    verdict, detail = classify(user, secrets, written)
     expires_at, days_left = _expiry(user.get("headers"), now)
     if verdict == VALID and days_left is not None and days_left <= EXPIRY_WARN_DAYS:
         verdict = EXPIRING
-        detail = (f"the PAT still authenticates and reads the secrets public key, but its "
+        detail = (f"the PAT still authenticates and writes the canary secret, but its "
                   f"calendar expiry is ~{days_left} days away — rotate it before onboarding "
                   "breaks")
     return {"verdict": verdict, "detail": detail,
@@ -319,7 +403,7 @@ def upsert_alert(verdict, body, repo):
             ops.append("edit")
     elif number is not None and state == "OPEN":  # valid -> recovery
         _gh(["issue", "comment", str(number), "-R", repo, "--body",
-             "✅ Recovered — the PAT authenticates and the secrets public-key read succeeds. "
+             "✅ Recovered — the PAT authenticates and the canary secret write succeeds. "
              "Auto-closing."], check=True)
         _gh(["issue", "close", str(number), "-R", repo], check=True)
         ops += ["comment", "close"]
@@ -395,9 +479,45 @@ def _self_test():
     S_404 = {"status": 404, "headers": {"content-type": "application/json; charset=utf-8"}}
     S_502 = {"status": 502, "headers": {}}
     NET_FAIL = {"status": None, "error": "TimeoutError"}
+    # Write-probe fixtures in _secret_write's response shape: status parsed from gh stderr,
+    # NO headers (gh doesn't expose them), message = retained stderr.
+    W_OK = {"status": 204, "headers": {}, "message": ""}
+    W_CREATED = {"status": 201, "headers": {}, "message": ""}
+    W_401 = {"status": 401, "headers": {},
+             "message": "HTTP 401: Bad credentials (https://api.github.com/...)"}
+    W_DENIED = {"status": 403, "headers": {},
+                "message": ("HTTP 403: Resource not accessible by personal access token "
+                            "(https://api.github.com/repos/o/r/actions/secrets/...)")}
+    W_404 = {"status": 404, "headers": {},
+             "message": "HTTP 404: Not Found (https://api.github.com/...)"}
+    W_PRIMARY = {"status": 403, "headers": {},
+                 "message": "HTTP 403: API rate limit exceeded for user ID 1."}
+    W_SECONDARY = {"status": 403, "headers": {}, "message": f"HTTP 403: {SECONDARY_MSG}"}
+    W_NET = {"status": None, "error": "gh secret set rc=4, no HTTP status"}
 
-    # --- classify: every verdict path, fail-closed edges included.
-    chk("valid", classify(U_OK, S_OK)[0], VALID)
+    # --- classify: every verdict path, fail-closed edges included. `valid` REQUIRES the canary
+    # write (review r3 #1): the public-key GET needs only Secrets: read, so read-success alone
+    # must never be declared healthy.
+    chk("valid: read 200 + canary write 204", classify(U_OK, S_OK, W_OK)[0], VALID)
+    chk("valid: a first-ever canary write answers 201", classify(U_OK, S_OK, W_CREATED)[0],
+        VALID)
+    chk("READ-ONLY PAT: read 200 + write 403 denial -> insufficient (the review r3 #1 false "
+        "positive)", classify(U_OK, S_OK, W_DENIED)[0], INSUFFICIENT)
+    chk("read 200 + write 404 -> insufficient", classify(U_OK, S_OK, W_404)[0], INSUFFICIENT)
+    chk("read 200 + write 401 -> invalid (died mid-probe)",
+        classify(U_OK, S_OK, W_401)[0], INVALID)
+    chk("network-unknown: write 403 with the primary-limit message is NOT scope",
+        classify(U_OK, S_OK, W_PRIMARY)[0], NETWORK_UNKNOWN)
+    chk("network-unknown: write 403 with the secondary-limit message is NOT scope",
+        classify(U_OK, S_OK, W_SECONDARY)[0], NETWORK_UNKNOWN)
+    chk("network-unknown: write never completed — read success alone is NEVER valid",
+        classify(U_OK, S_OK, W_NET)[0], NETWORK_UNKNOWN)
+    chk("network-unknown: write result absent entirely — read success alone is NEVER valid",
+        classify(U_OK, S_OK)[0], NETWORK_UNKNOWN)
+    chk("retained gh stderr never echoes into the detail",
+        "NEVER-IN-DETAIL" in classify(U_OK, S_OK, {"status": 403, "headers": {},
+                                                   "message": "HTTP 403: NEVER-IN-DETAIL"})[1],
+        False)
     chk("invalid: /user 401", classify(U_401, None)[0], INVALID)
     chk("invalid: secrets 401 (died mid-probe)", classify(U_OK, U_401)[0], INVALID)
     chk("insufficient: secrets 403", classify(U_OK, S_403)[0], INSUFFICIENT)
@@ -419,8 +539,9 @@ def _self_test():
     chk("network-unknown: secrets 5xx", classify(U_OK, S_502)[0], NETWORK_UNKNOWN)
     chk("network-unknown: secrets timeout", classify(U_OK, NET_FAIL)[0], NETWORK_UNKNOWN)
 
-    # --- probe orchestration: fetch order, short-circuit, expiry, redaction.
+    # --- probe orchestration: fetch/write order, short-circuit, expiry, redaction.
     fetched = []
+    writes = []
 
     def fake_fetch(responses):
         def fetch(url, token):
@@ -429,44 +550,72 @@ def _self_test():
             return responses[len(fetched) - 1]
         return fetch
 
+    def fake_write(resp):
+        def wr(token, repo):
+            chk_token_holder.append(token)
+            writes.append(repo)
+            return resp
+        return wr
+
     chk_token_holder = []
     now = datetime(2026, 7, 17, 4, 33, 41, tzinfo=timezone.utc)
-    r = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK, S_OK]), now=now)
-    chk("probe valid end-to-end", r["verdict"], VALID)
-    chk("probe hits /user then the secrets public-key read",
-        fetched, [f"{API}/user", f"{API}/repos/o/r/actions/secrets/public-key"])
+    r = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK, S_OK]), write=fake_write(W_OK), now=now)
+    chk("probe valid end-to-end (read AND canary write)", r["verdict"], VALID)
+    chk("probe hits /user, the secrets public-key read, then the canary write",
+        (fetched, writes),
+        ([f"{API}/user", f"{API}/repos/o/r/actions/secrets/public-key"], ["o/r"]))
     chk("expiry header inspected (15 days out)", r["days_left"], 15.0)
-    fetched.clear()
-    r401 = probe(SENTINEL, "o/r", fetch=fake_fetch([U_401]), now=now)
-    chk("probe 401 short-circuits (no secrets read on a dead token)",
-        (r401["verdict"], fetched), (INVALID, [f"{API}/user"]))
-    fetched.clear()
-    rmiss = probe("", "o/r", fetch=fake_fetch([]))
-    chk("absent secret -> invalid, zero fetches", (rmiss["verdict"], fetched), (INVALID, []))
+    fetched.clear(), writes.clear()
+    r_ro = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK, S_OK]), write=fake_write(W_DENIED),
+                 now=now)
+    chk("probe read-only PAT end-to-end -> insufficient (review r3 #1)",
+        r_ro["verdict"], INSUFFICIENT)
+    fetched.clear(), writes.clear()
+    r401 = probe(SENTINEL, "o/r", fetch=fake_fetch([U_401]), write=fake_write(W_OK), now=now)
+    chk("probe 401 short-circuits (no secrets read, no write, on a dead token)",
+        (r401["verdict"], fetched, writes), (INVALID, [f"{API}/user"], []))
+    fetched.clear(), writes.clear()
+    r_noread = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK, S_403]), write=fake_write(W_OK),
+                     now=now)
+    chk("denied read never attempts the write (no canary churn on a broken PAT)",
+        (r_noread["verdict"], writes), (INSUFFICIENT, []))
+    fetched.clear(), writes.clear()
+    rmiss = probe("", "o/r", fetch=fake_fetch([]), write=fake_write(W_OK))
+    chk("absent secret -> invalid, zero fetches, zero writes",
+        (rmiss["verdict"], fetched, writes), (INVALID, [], []))
     # Near-expiry transitions (review r1 #5): the 15-day probe above stays VALID (just above
     # the 14-day threshold); at and below it the verdict downgrades to expiring-soon so
     # upsert_alert pages via the rolling issue instead of a green-run log line.
-    fetched.clear()
-    r_soon = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK_SOON, S_OK]), now=now)
+    fetched.clear(), writes.clear()
+    r_soon = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK_SOON, S_OK]), write=fake_write(W_OK),
+                   now=now)
     chk("8 days out -> expiring-soon", (r_soon["verdict"], r_soon["days_left"]), (EXPIRING, 8.0))
-    fetched.clear()
-    r_edge = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK_EDGE, S_OK]), now=now)
+    fetched.clear(), writes.clear()
+    r_edge = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK_EDGE, S_OK]), write=fake_write(W_OK),
+                   now=now)
     chk("exactly 14.0 days -> expiring-soon (boundary inclusive)", r_edge["verdict"], EXPIRING)
+    fetched.clear(), writes.clear()
+    r_ro_soon = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK_SOON, S_OK]),
+                      write=fake_write(W_DENIED), now=now)
+    chk("read-only trumps near-expiry (broken now beats broken soon)",
+        r_ro_soon["verdict"], INSUFFICIENT)
     # A header-injecting token is rejected BEFORE any request is built (review r1 #3):
     # http.client would otherwise raise a ValueError embedding the complete credential.
-    fetched.clear()
-    rbad = probe(f"github_pat_{SENTINEL}\r\nX-Inject: 1", "o/r", fetch=fake_fetch([]))
-    chk("CR/LF token -> invalid, zero fetches (never enters a header)",
-        (rbad["verdict"], fetched), (INVALID, []))
+    fetched.clear(), writes.clear()
+    rbad = probe(f"github_pat_{SENTINEL}\r\nX-Inject: 1", "o/r", fetch=fake_fetch([]),
+                 write=fake_write(W_OK))
+    chk("CR/LF token -> invalid, zero fetches, zero writes (never enters a header)",
+        (rbad["verdict"], fetched, writes), (INVALID, [], []))
     # Redaction: the verdict JSON and the alert body must never carry the token.
     chk("verdict JSON never contains the token",
-        SENTINEL in json.dumps(r) + json.dumps(r401) + json.dumps(rmiss)
+        SENTINEL in json.dumps(r) + json.dumps(r_ro) + json.dumps(r401) + json.dumps(rmiss)
         + json.dumps(r_soon) + json.dumps(rbad), False)
     chk("alert body never contains the token",
         SENTINEL in render_alert(r401, "o/r") + render_alert(rmiss, "o/r")
-        + render_alert(r_soon, "o/r") + render_alert(rbad, "o/r"), False)
-    chk("fetch received the token (probe is non-vacuous)",
-        all(t == SENTINEL for t in chk_token_holder) and len(chk_token_holder) == 7, True)
+        + render_alert(r_ro, "o/r") + render_alert(r_soon, "o/r") + render_alert(rbad, "o/r"),
+        False)
+    chk("fetch AND write probes received the token (probe is non-vacuous)",
+        all(t == SENTINEL for t in chk_token_holder) and len(chk_token_holder) == 18, True)
 
     # --- expiry parsing edges.
     chk("iso expiry parses", _expiry({EXPIRY_HEADER: "2026-07-18T04:33:41Z"}, now)[1], 1.0)
@@ -531,6 +680,59 @@ def _self_test():
                 os.environ[key] = val
     chk("main() with CR/LF token: rc=1 and the token never reaches stdout/stderr",
         (main_rc, SENTINEL in captured.getvalue()), (1, False))
+
+    # --- _secret_write: parses gh's exit into the response shape classify() consumes, and
+    # authenticates the child with ONLY the probed PAT (the live half of review r3 #1).
+    class _Proc:
+        def __init__(self, returncode=0, stderr=""):
+            self.returncode, self.stdout, self.stderr = returncode, "", stderr
+
+    seen = {}
+
+    def probe_run(result):
+        def run(argv, **kw):
+            seen["argv"], seen["kw"] = list(argv), kw
+            return result
+        return run
+
+    saved_env = {k: os.environ.get(k) for k in ("GH_DEBUG", "GITHUB_TOKEN")}
+    os.environ["GH_DEBUG"] = "api"  # would make gh dump auth headers to the retained stderr
+    os.environ["GITHUB_TOKEN"] = "ambient-token-must-not-authenticate-the-probe"
+    try:
+        w_ok = _secret_write(SENTINEL, "o/r", run=probe_run(_Proc(0)))
+    finally:
+        for key, val in saved_env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+    chk("_secret_write: rc 0 -> write-succeeded verdict",
+        w_ok, {"status": 204, "headers": {}, "message": ""})
+    chk("_secret_write: targets the canary via gh, value on STDIN (never argv)",
+        (seen["argv"], seen["kw"].get("input")),
+        (["gh", "secret", "set", CANARY_SECRET, "-R", "o/r", "--app", "actions"], CANARY_VALUE))
+    env = seen["kw"].get("env") or {}
+    chk("_secret_write: child env holds ONLY the probed PAT (ambient token + GH_DEBUG stripped)",
+        (env.get("GH_TOKEN"), "GITHUB_TOKEN" in env, "GH_DEBUG" in env),
+        (SENTINEL, False, False))
+    w_denied = _secret_write(SENTINEL, "o/r", run=probe_run(_Proc(1,
+        "gh: HTTP 403: Resource not accessible by personal access token (https://x)")))
+    chk("_secret_write: gh 403 stderr -> status parsed, message retained for discrimination",
+        (w_denied["status"], "not accessible" in w_denied["message"]), (403, True))
+    chk("_secret_write end-to-end: a live-parsed read-only denial classifies insufficient",
+        classify(U_OK, S_OK, w_denied)[0], INSUFFICIENT)
+    w_limit = _secret_write(SENTINEL, "o/r", run=probe_run(_Proc(1,
+        f"gh: HTTP 403: {SECONDARY_MSG}")))
+    chk("_secret_write end-to-end: a live-parsed throttled 403 classifies network-unknown",
+        classify(U_OK, S_OK, w_limit)[0], NETWORK_UNKNOWN)
+    w_dead = _secret_write(SENTINEL, "o/r", run=probe_run(_Proc(4, "dial tcp: lookup failed")))
+    chk("_secret_write: nonzero rc with NO HTTP status is inconclusive, never a verdict",
+        (w_dead["status"], "error" in w_dead), (None, True))
+
+    def raise_run(argv, **kw):
+        raise OSError(f"boom {SENTINEL}")
+    chk("_secret_write: runner exception reduces to its class name (never the message)",
+        _secret_write(SENTINEL, "o/r", run=raise_run), {"status": None, "error": "OSError"})
 
     # --- upsert: idempotent rolling issue against a stubbed gh (usage-alert.py pattern).
     class _Run:
