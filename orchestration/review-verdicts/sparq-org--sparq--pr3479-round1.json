@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The wrapper extracts `check_s` from `ore_bench`, but `check_s` starts only after `extract()` and `profiles_from_extraction()` have completed. HermiT and Openllet are timed around the entire `java -jar` command, including JVM startup, ontology loading/parsing, and reasoning. The emitted sparq mode nevertheless says `parse once, extract \u2192 profile \u2192 ALCH tableau`, and the registry/research record describes a consistency wall-time comparison. Verdict agreement does not make these timing scopes comparable; resulting envelopes would present a systematically narrower sparq measurement as the same metric.",
+   "file": "scripts/bench/reason-dl-same-box.sh",
+   "fix_hint": "Define and enforce one comparable timing boundary. For an end-to-end CLI benchmark, measure the complete sparq process around invoking `ore_bench` (including input loading/parsing/extraction/profile/tableau), just as for the JVM CLIs. Alternatively build equivalent warm/in-process adapters for every engine and label that distinct metric precisely. Update the envelope mode/metric and methodology to match the actual boundary, and add a smoke/assertion that verifies the selected timing field corresponds to that boundary.",
+   "severity": "major",
+   "title": "Sparq and competitor timings measure different scopes"
+  }
+ ],
+ "progress": null,
+ "summary": "The smoke fixtures exercise meaningful reasoner paths, but the full comparison records non-comparable timings. The sparq value placed in `consistency_s` is only the tableau check after extraction and profile computation, while HermiT/Openllet values include their full CLI invocation, parsing, and reasoning. This contradicts the documented in-process extract/profile/tableau mode and the benchmark's stated consistency wall-time metric, so the harness cannot support a sound same-box comparison as implemented.",
+ "verdict": "request_changes"
+}
