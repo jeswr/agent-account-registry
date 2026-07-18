@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "collect_bgps descends through Filter and Join-with-Values but witness_abox freezes variables independently of filter expressions and VALUES bindings. As the module documentation itself notes, those modifiers may reject the frozen bindings. Thus an admitted gathered query can produce empty raw and minimized result sets even when minimization wrongly drops a non-subsumed disjunct, yet assert_ucq_equivalence passes and a timing row is emitted. This contradicts the benchmark/research claim that UCQ equivalence is enforced before every timing row; merely documenting the caveat does not make the gate sound.",
+   "file": "crates/sparq-reason-ql/examples/ql_npd_requiem_bench.rs",
+   "fix_hint": "Either synthesize modifier-compatible canonical instances (apply VALUES bindings and choose constants satisfying supported FILTERs), or fail closed / require --abox whenever a gathered query contains FILTER or VALUES. Add a regression using a filtered or VALUES-constrained UCQ where the current witness makes both a raw query and a deliberately wrong minimized query empty, then show the revised path detects the mismatch or refuses witness mode. Align the benchmark and research claims with the resulting guarantee.",
+   "severity": "major",
+   "title": "FILTER and VALUES can still make the witness equivalence gate vacuous"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "Round 2 substantially repairs the query-only-predicate and multi-atom-BGP vacuity with per-disjunct canonical instances and a meaningful dropped-disjunct regression. However, the gather path still admits FILTER and VALUES wrappers while acknowledging that their frozen bindings may reject every generated witness. For such admitted queries, raw and minimized rewrites can again agree on an empty result despite an answer-changing minimization, so the advertised equivalence-before-timing invariant remains incomplete. Because one major form of the prior soundness finding remains, progress is stagnant under the required scale.",
+ "verdict": "request_changes"
+}
