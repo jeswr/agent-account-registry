@@ -41,16 +41,6 @@
    "expires_at": 1784345841
   },
   {
-   "account": "acct2css",
-   "claim_id": "2bd8c97523944c85aabfff0659c9d3fc",
-   "holder": "sparq-org/sparq#2585@dispatch-29625933900.1",
-   "package": "bench-canonical",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784339544,
-   "expires_at": 1784345844
-  },
-  {
    "account": "acct4css",
    "claim_id": "47bc25446eeb4067ad42c30c2e8a4688",
    "holder": "sparq-org/sparq#2592@dispatch-29625933900.1",
