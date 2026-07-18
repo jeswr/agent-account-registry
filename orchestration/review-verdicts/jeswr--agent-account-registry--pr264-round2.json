@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The secrets-guard job declares only `contents: read`. With an explicit `permissions` map, unspecified permissions are set to none, so its GITHUB_TOKEN lacks `actions: read`. GitHub's environment and deployment-branch-policy REST reads used by `dispatch-secrets-guard.py` require Actions repository read permission. Both calls therefore fail closed as intended, but they fail on every legitimate tick; CLAIM and plan-alert remain permanently skipped even after the maintainer configures and migrates the secrets. The stubbed self-test cannot catch this because its fake `gh` accepts the calls without modeling token authorization.",
+   "file": ".github/workflows/dispatch.yml",
+   "fix_hint": "Grant the guard job the minimum `actions: read` permission (retaining `contents: read` only if checkout requires it), and add a workflow-level/static assertion that the permission remains present so the live authorization dependency cannot silently become a permanent-denial condition.",
+   "severity": "major",
+   "title": "Guard token cannot read the environment settings it must verify"
+  }
+ ],
+ "progress": "improving",
+ "summary": "Round 2 materially improves the prior patch: repository-scope secret emptiness and the environment branch policy are now checked before either secret-bearing job, with meaningful fail-closed self-tests. However, the guard's explicitly narrowed GITHUB_TOKEN does not have the Actions read permission required to read the environment and deployment-branch-policy endpoints it depends on. In the declared workflow this makes those GETs fail and permanently skips CLAIM and plan-alert, so the proposed gate is not operationally complete.",
+ "verdict": "request_changes"
+}
