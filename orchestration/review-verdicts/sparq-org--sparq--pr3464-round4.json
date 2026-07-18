@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 3's major secret-memory-hygiene finding is fixed. Capability now implements Drop, and that Drop path zeroizes both raw publisher_sk and admin_sk seed arrays via zeroize before their storage is released; read_secret remains protected by Secret32's existing zeroize-on-drop implementation. The focused test exercises the exact helper invoked by Drop for both capability variants and would catch omission of either seed field. No new blocker or major correctness, soundness, test-validity, or security issue is evident in the round-4 diff. The crate's external-audit and production-use limitations remain clearly and consistently disclosed.",
+ "verdict": "approve"
+}
