@@ -1,0 +1,36 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "read_struct_map tracks ordering only among positive keys and accepts negative extension keys anywhere, including duplicates. Its comment also says negative keys sort before positive keys, but for same-width integer encodings the encoded bytes put major type 0 (for example 0x01) before major type 1 (0x20). More generally, RFC 8949 core deterministic map ordering is by encoded-key length and then bytewise lexical order. Consequently multiple byte encodings of the same logical struct are accepted despite the load-bearing claim that decode validates canonical CBOR. The cbor_negative_extension_key_is_skipped test explicitly supplies -1 before +1 and therefore blesses a non-canonical order.",
+   "file": "crates/sparq-e2ee-ng/src/cbor.rs",
+   "fix_hint": "Capture each key's raw encoded bytes (or implement the exact length-first/bytewise comparator for the supported integer keys) and require every map key, positive or negative, to be strictly increasing; this also rejects duplicate negative keys. Reverse the extension test order and add rejection tests for negative-before-positive and duplicate negative keys.",
+   "severity": "major",
+   "title": "Map decoding does not enforce RFC 8949 deterministic key order"
+  },
+  {
+   "body": "PublicGrant::decode_from silently sorts and deduplicates the decoded authority array via canon_authorities. Thus arrays with duplicate or out-of-order authority tokens are accepted and re-encode to different bytes. This contradicts the documented canonical decode contract and creates an acceptance-set mismatch around the bytes used for cap_id and signatures: a non-canonical received grant is normalized before signing_bytes/verification rather than rejected.",
+   "file": "crates/sparq-e2ee-ng/src/capability.rs",
+   "fix_hint": "Require the decoded authority vector to already equal its sorted, deduplicated form and return Error::NonCanonical otherwise. Add tests proving duplicate and out-of-order authority arrays are rejected rather than normalized.",
+   "severity": "major",
+   "title": "Capability decode accepts non-canonical authority arrays"
+  },
+  {
+   "body": "Capability::validate checks only that publisher_sk and publisher_pub are both present when publish authority exists. It never derives the public key from publisher_sk and compares it with grant.publisher_pub. A decoded bearer capability can therefore pass validation while its secret authorizes signatures under key A and its admin-signed public grant/broker registration binds key B. The secret-capability round-trip test uses matching keys but has no mismatch rejection case.",
+   "file": "crates/sparq-e2ee-ng/src/capability.rs",
+   "fix_hint": "Derive SecretSigningKey::from_seed(sk).public().to_bytes() during validation and require constant-time equality with grant.publisher_pub, returning Separation on mismatch. Add a decode/validate test that combines two distinct publisher keypairs and must fail.",
+   "severity": "major",
+   "title": "Publisher secret is not checked against the signed publisher public key"
+  },
+  {
+   "body": "wrap_with and unwrap feed every X25519 result directly into HKDF without checking SharedSecret::was_contributory(). Low-order recipient or ephemeral public keys can produce the all-zero shared secret, making the derived wrap key depend only on public context. In particular, unwrap accepts an attacker-supplied low-order ephemeral key instead of failing closed, which violates the claimed recipient-only recovery boundary.",
+   "file": "crates/sparq-e2ee-ng/src/wrap.rs",
+   "fix_hint": "Reject non-contributory exchanges before key derivation on both sealing and opening paths. This requires making wrap/wrap_with fallible (or validating RecipientPublicKey at construction) and returning BadKey/Decrypt as appropriate. Add low-order/all-zero public-key tests for both directions.",
+   "severity": "major",
+   "title": "X25519 wrapping accepts non-contributory all-zero shared secrets"
+  }
+ ],
+ "progress": null,
+ "summary": "The crate is carefully caveated as research-grade, but the new security-critical primitives are not sound as scoped. The deterministic-CBOR decoder accepts encodings that violate its own canonicality contract, recipient wrapping does not reject non-contributory X25519 exchanges, and secret capability validation does not prove that the embedded publisher secret matches the signed public key. These are load-bearing defects, and the current tests either omit them or explicitly bless a non-canonical key order.",
+ "verdict": "request_changes"
+}
