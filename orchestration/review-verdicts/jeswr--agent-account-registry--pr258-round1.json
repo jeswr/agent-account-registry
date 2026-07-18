@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_dispatch_review_items` catches allocator `RuntimeError`, `SubprocessError`, and `JSONDecodeError`, prints a defer message, and continues, but it has no access to `defer_reasons` and never increments `lease-error`. Its caller only adds the returned launch count. If a tick has one or more review/fix items, every allocator claim fails because the lease ledger is unavailable, and no worker item independently records a lease error, the final summary reports `ledger=ok` and `_ledger_rot_zeroed_dispatch(...)` returns false. The claim step therefore stays green despite a zero-dispatch ledger failure. The helper-only assertions cannot detect this integration gap.",
+   "file": "scripts/dispatch-claim.py",
+   "fix_hint": "Propagate review/fix allocator lease errors into the tick's shared `defer_reasons` (or return an equivalent error count/status from `_dispatch_review_items`) before writing the final summary and applying the fail-loud predicate. Add a non-vacuous dispatch-level self-test covering an all-review/fix frontier whose allocator raises, asserting `ledger=error` and a failing dispatch outcome; also cover mixed partial success if that is intentionally non-fatal.",
+   "severity": "major",
+   "title": "Review/fix lease failures bypass ledger health and fail-loud handling"
+  }
+ ],
+ "progress": null,
+ "summary": "The new fail-loud behavior is incomplete. Worker-item allocator exceptions increment `lease-error`, but review/fix allocator exceptions are swallowed inside `_dispatch_review_items` without updating the shared defer histogram. Consequently, a tick whose ready frontier consists of review/fix work can suffer ledger I/O/CAS/auth failures, dispatch nothing, emit `ledger=ok`, and finish successfully\u2014the precise silent failure this PR claims to eliminate. The added self-tests exercise only synthetic counters and do not cover that dispatch path.",
+ "verdict": "request_changes"
+}
