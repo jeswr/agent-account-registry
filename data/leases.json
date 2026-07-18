@@ -41,16 +41,6 @@
    "expires_at": 1784395310
   },
   {
-   "account": "acct4css",
-   "claim_id": "2f4a5542d0644bce9ab270aac655cf4b",
-   "holder": "fix:jeswr/agent-account-registry#229@dispatch-29651708285.1",
-   "package": "groom",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784391728,
-   "expires_at": 1784395328
-  },
-  {
    "account": "acct07",
    "claim_id": "7bad97694ead4043b33fb5903c57717e",
    "holder": "fix:jeswr/agent-account-registry#231@dispatch-29651708285.1",
