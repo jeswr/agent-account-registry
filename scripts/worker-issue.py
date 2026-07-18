@@ -63,8 +63,12 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
     matches APPROVAL_RE, created strictly after the bot's most recent attempt receipt (the
     failure being retried). `status:ready` is written by the automation itself (triage/groom/
     the deferred-retry transition below) and is therefore NEVER approval evidence. Bot and App
-    logins never count as human, whatever they comment. `is_human_maintainer(login)` supplies
-    the trusted-set probe so this stays pure and self-testable.
+    logins never count as human, whatever they comment — and neither does a comment whose
+    `performed_via_github_app` is non-null: an App driving a maintainer's user token posts as
+    user.type=User under the maintainer's own login, so the user-shaped filters and the
+    collaborator probe all pass; only the App attribution field betrays that no human typed it.
+    `is_human_maintainer(login)` supplies the trusted-set probe so this stays pure and
+    self-testable.
     """
     bot = bot_login.casefold()
     last_failure = max(
@@ -80,7 +84,8 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
         if (not login
                 or str(user.get("type", "")).casefold() == "bot"
                 or login.casefold().endswith("[bot]")
-                or login.casefold() == bot):
+                or login.casefold() == bot
+                or comment.get("performed_via_github_app") is not None):
             continue
         if not APPROVAL_RE.search(str(comment.get("body", ""))):
             continue
@@ -408,6 +413,18 @@ def _self_test():
                 "body": "approved", "created_at": "2026-07-11T00:00:00Z"}
     assert find_maintainer_approval([failure, app_typed], "sparq[bot]", trust_all) is None
     assert find_maintainer_approval([failure, suffixed], "sparq[bot]", trust_all) is None
+    # An App wielding a maintainer's user token (review r2): the comment is user.type=User under
+    # the maintainer's own login — every user-shaped filter passes and the collaborator probe
+    # would confirm it — but performed_via_github_app is non-null. Must be rejected, and ONLY
+    # the App-attribution check can be doing the rejecting under trust_all.
+    app_on_behalf = {**human_after,
+                     "performed_via_github_app": {"id": 7, "slug": "registry-app"}}
+    assert find_maintainer_approval([failure, app_on_behalf], "sparq[bot]", trust_all) is None
+    # The check is non-null attribution, not key presence: the JSON-null the API returns for a
+    # genuinely human comment must still pass.
+    explicit_null = {**human_after, "performed_via_github_app": None}
+    assert find_maintainer_approval(
+        [failure, explicit_null], "sparq[bot]", trust_all) is explicit_null
     # The worker's own login never self-approves, even typed User with no [bot] suffix.
     own_receipt = {"user": {"login": "sparq-svc", "type": "User"},
                    "body": f"x {ATTEMPT_MARKER} run=9 -->", "created_at": "2026-07-10T00:00:00Z"}
