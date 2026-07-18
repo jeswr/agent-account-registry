@@ -1042,9 +1042,10 @@ run_review() {
 # commit preserves both sides, keeps ancestry intact, and re-enters review as a plain push.
 _begin_conflict_merge() {
   local default_branch=$1
-  # An explicit ident: the runner has none configured, and even a --no-commit merge REFUSES
-  # to start without one ("fatal: empty ident name", 4 red fix runs 2026-07-18 19:1x) — the
-  # model never commits, and the eventual push identity comes from the publish path.
+  # An explicit ident: the runner has none configured, and its git (2.54) refuses to START
+  # even a --no-commit merge without one ("fatal: empty ident name", 4 red fix runs
+  # 2026-07-18 19:1x; git <=2.43 tolerates it) — the model never commits, and the eventual
+  # push identity comes from the publish path.
   git -c user.name="sparq-worker" \
       -c user.email="sparq-worker@users.noreply.github.com" \
       merge --no-ff --no-commit "origin/$default_branch" || true
@@ -1490,23 +1491,34 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   # commit (ancestry from the worker-opened commit preserved — no history rewrite). ---
   local fixture="$tmp/mergefix"
   git init -q -b main "$fixture"
-  git -C "$fixture" config user.name t
-  git -C "$fixture" config user.email t@example.invalid
+  # NO repo/global identity anywhere in this fixture (sol r1 on #270): fixture commits use
+  # command-scoped -c idents, and _begin_conflict_merge runs with HOME/system config
+  # neutralized and ident env vars UNSET (a set-but-empty GIT_COMMITTER_NAME overrides -c
+  # config and dies "empty ident name (for <>)" even WITH the fix). Newer git (runner 2.54)
+  # resolves committer ident strictly at merge start, so on CI removing the production inline
+  # ident turns this red; git <=2.43 starts a --no-commit merge identity-less, so the
+  # discrimination bites on the runner's git, not necessarily an older local one.
+  _fixgit() { git -C "$fixture" -c user.name=t -c user.email=t@example.invalid "$@"; }
   printf 'base\n' > "$fixture/f.txt"
-  git -C "$fixture" add . && git -C "$fixture" commit -qm base
-  git -C "$fixture" switch -qc feat
+  _fixgit add . && _fixgit commit -qm base
+  _fixgit switch -qc feat
   printf 'feature side\n' > "$fixture/f.txt"
-  git -C "$fixture" commit -qam feat
+  _fixgit commit -qam feat
   local feat_sha
   feat_sha=$(git -C "$fixture" rev-parse HEAD)
-  git -C "$fixture" switch -q main
+  _fixgit switch -q main
   printf 'main side\n' > "$fixture/f.txt"
-  git -C "$fixture" commit -qam main
+  _fixgit commit -qam main
   local main_sha
   main_sha=$(git -C "$fixture" rev-parse HEAD)
   git -C "$fixture" update-ref refs/remotes/origin/main "$main_sha"
-  git -C "$fixture" switch -q feat
-  ( cd "$fixture" && _begin_conflict_merge main ) >/dev/null 2>&1
+  _fixgit switch -q feat
+  # `|| true`: a regression (merge refuses to start) must surface as a FAIL from the chk
+  # below, not a silent set -e abort of the whole self-test with the die swallowed.
+  ( cd "$fixture" &&
+    unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL &&
+    export HOME="$tmp/no-home" XDG_CONFIG_HOME="$tmp/no-home" GIT_CONFIG_NOSYSTEM=1 &&
+    _begin_conflict_merge main ) >/dev/null 2>&1 || true
   chk "conflict merge starts without committing" \
     "$( [[ -f "$fixture/.git/MERGE_HEAD" ]] && git -C "$fixture" rev-parse HEAD )" "$feat_sha"
   chk "conflict markers land in the worktree" \
@@ -1519,7 +1531,7 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   git -C "$fixture" add -A
   chk "a resolved tree passes the staged check" \
     "$( (git -C "$fixture" diff --cached --check >/dev/null 2>&1 && echo ok) || echo refused)" "ok"
-  git -C "$fixture" commit -qm merged
+  _fixgit commit -qm merged || true # a failure here surfaces via the two-parent chk below
   chk "commit under MERGE_HEAD is a two-parent merge" \
     "$(git -C "$fixture" rev-parse HEAD^1 HEAD^2 | paste -sd' ' -)" "$feat_sha $main_sha"
   chk "both sides survive the resolution" \
