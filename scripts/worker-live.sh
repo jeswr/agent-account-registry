@@ -1042,7 +1042,12 @@ run_review() {
 # commit preserves both sides, keeps ancestry intact, and re-enters review as a plain push.
 _begin_conflict_merge() {
   local default_branch=$1
-  git merge --no-ff --no-commit "origin/$default_branch" || true
+  # An explicit ident: the runner has none configured, and even a --no-commit merge REFUSES
+  # to start without one ("fatal: empty ident name", 4 red fix runs 2026-07-18 19:1x) — the
+  # model never commits, and the eventual push identity comes from the publish path.
+  git -c user.name="sparq-worker" \
+      -c user.email="sparq-worker@users.noreply.github.com" \
+      merge --no-ff --no-commit "origin/$default_branch" || true
   [[ -f "$(git rev-parse --git-dir)/MERGE_HEAD" ]] ||
     die 'conflict merge did not start (base may no longer be conflicting)'
 }
