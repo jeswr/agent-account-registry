@@ -19,7 +19,11 @@
 #             ledger, bounded to a rolling window (last MAX_RECORDS / WINDOW_HOURS; pruned on write).
 #   decide  — reads the record window (+ the enabled provider->account fleet) and returns alert
 #             ACTIONS. Idempotent: exactly ONE open alert issue per (condition, provider), updated
-#             not duplicated (a hidden marker in the body keys the upsert).
+#             not duplicated (a hidden marker in the body keys the upsert). decide also probes the
+#             provider's PUBLIC Statuspage API (issue #70) and annotates firing outage/transient
+#             alerts with `provider-status:` — operational means a transient burst is likely
+#             SELF-INDUCED over-parallelization; degraded/outage means a known provider incident.
+#             The probe FAILS OPEN to `unknown` and can NEVER suppress an alert.
 #
 # Privacy (locked decision 22): NO raw account handle ever appears in a record, a log line, or an
 # alert body — only the 16-hex salted hash (reuse worker-pr.account_hash). The public workflow log
@@ -120,6 +124,27 @@ TRANSIENT_WINDOW_SECONDS = 15 * 60
 # ZERO-DISPATCH: >=3 consecutive ticks that planned work but launched nothing — a persistent
 # inability to place ready work (capacity/access), not a single quiet tick.
 ZERO_DISPATCH_MIN = 3
+
+# --- provider status probe (issue #70). At decide time the classifier consults the provider's
+# PUBLIC Statuspage API — standard shape {"status": {"indicator": "none|minor|major|critical"}} —
+# to tell a provider-side incident apart from self-induced over-parallelization. The probe is
+# ANNOTATION ONLY: it can reframe an alert body but must NEVER flip `fire` off — a probe failure
+# or a green status page never suppresses an alert (fail-open, mutation-checked in --self-test).
+# These are public unauthenticated endpoints: no secret enters the request, no account handle
+# enters the URL, and the response feeds only the fixed indicator->status fold below.
+PROVIDER_STATUS_URLS = {
+    "anthropic": "https://status.claude.com/api/v2/status.json",
+    "openai": "https://status.openai.com/api/v2/status.json",
+}
+STATUS_PROBE_TIMEOUT_SECONDS = 10
+STATUS_OPERATIONAL = "operational"
+STATUS_DEGRADED = "degraded"    # indicator: minor
+STATUS_OUTAGE = "outage"        # indicator: major / critical
+STATUS_UNKNOWN = "unknown"      # probe unreachable/malformed, or an unrecognised indicator
+_INDICATOR_MAP = {"none": STATUS_OPERATIONAL, "minor": STATUS_DEGRADED,
+                  "major": STATUS_OUTAGE, "critical": STATUS_OUTAGE}
+# The alert conditions that carry the provider-status annotation.
+PROBED_CONDITIONS = frozenset({"provider-outage", "persistent-transient"})
 
 ALERT_LABEL = "ops-alert"
 MARKER_PREFIX = "model-health-alert"   # hidden HTML marker keying the idempotent upsert
@@ -392,9 +417,107 @@ def render_body(action, maintainer):
         lines.append(f"🚨 **The dispatcher planned ready work but launched NOTHING.** "
                      f"{action['reason']}. Ready issues exist but no worker started — a capacity, "
                      "access, or lease-contention problem, not an empty backlog.")
+    advice = _status_advice(action)
+    if advice:
+        lines.append(advice)
     lines.append(f"\n@{maintainer} — this issue updates itself and closes automatically on the "
                  "first successful model launch for this provider.")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------------------------
+# provider status probe (issue #70) — pure fold + fail-open fetch + decide-time annotation
+# ---------------------------------------------------------------------------------------------
+def classify_status_payload(payload):
+    """PURE fold of a Statuspage status.json document into (status, raw_indicator). Any shape
+    surprise — non-dict payload, missing keys, non-string or unrecognised indicator — is
+    `unknown`, never an exception: the probe must not be able to break `decide`."""
+    if not isinstance(payload, dict):
+        return STATUS_UNKNOWN, ""
+    status = payload.get("status")
+    indicator = status.get("indicator") if isinstance(status, dict) else None
+    if not isinstance(indicator, str):
+        return STATUS_UNKNOWN, ""
+    return _INDICATOR_MAP.get(indicator, STATUS_UNKNOWN), indicator
+
+
+def _fetch_status_json(url):
+    """GET one of the two fixed PROVIDER_STATUS_URLS (never a caller-built URL) with a hard
+    10s timeout; any transport or parse failure raises HealthError for the fail-open above."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+    request = Request(url, headers={"User-Agent": "registry-model-health"})
+    try:
+        with urlopen(request, timeout=STATUS_PROBE_TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode())
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        # ValueError covers both JSONDecodeError and UnicodeDecodeError.
+        raise HealthError("provider status probe failed") from exc
+
+
+def probe_provider_status(provider, fetch=None):
+    """(status, indicator) from the provider's public status page. FAIL-OPEN (mutation-checked):
+    an unmapped provider, an unreachable API, or a malformed body all return ('unknown', '') —
+    and the caller must never suppress an alert on that basis."""
+    url = PROVIDER_STATUS_URLS.get(provider)
+    if not url:
+        return STATUS_UNKNOWN, ""
+    try:
+        payload = (fetch or _fetch_status_json)(url)
+    except HealthError:
+        return STATUS_UNKNOWN, ""
+    return classify_status_payload(payload)
+
+
+def annotate_provider_status(actions, probe=None):
+    """Attach provider_status/status_indicator to the FIRING outage/transient actions, one probe
+    per provider per decide tick (cached; a quiet tick makes NO network call). ANNOTATION ONLY:
+    `fire` is never touched here — a green status page reframes the alert as self-induced, it
+    does not silence it."""
+    cache = {}
+    for action in actions:
+        if action["condition"] not in PROBED_CONDITIONS or not action["fire"]:
+            continue
+        provider = action["provider"]
+        if provider not in cache:
+            cache[provider] = (probe or probe_provider_status)(provider)
+        action["provider_status"], action["status_indicator"] = cache[provider]
+    return actions
+
+
+def _status_display(status, indicator):
+    """`degraded (minor)` / `outage (major|critical)`; operational/unknown carry no qualifier."""
+    if status in (STATUS_DEGRADED, STATUS_OUTAGE) and indicator:
+        return f"{status} ({indicator})"
+    return status
+
+
+def _status_advice(action):
+    """The provider-status annotation line for an alert body, or None when the action was not
+    probed. operational + transient burst -> SELF-INDUCED + shed parallelism; degraded/outage ->
+    known-incident framing + harder backoff; unknown -> state the fail-open explicitly."""
+    status = action.get("provider_status")
+    if not status:
+        return None
+    head = ("\n`provider-status: "
+            f"{_status_display(status, action.get('status_indicator') or '')}`")
+    if status == STATUS_OPERATIONAL:
+        if action["condition"] == "persistent-transient":
+            return (head + " — **likely SELF-INDUCED.** The provider's public status page "
+                    "reports no incident, so this burst is most consistent with over-"
+                    "parallelization on our side (concurrent workers sharing the same rate-limit "
+                    "windows). SHED PARALLELISM — run fewer concurrent workers on this provider — "
+                    "rather than retrying at the same width.")
+        return (head + " — the status page is green while every launch fails, which points at "
+                "our side (expired tokens / exhausted credits), not a provider incident.")
+    if status in (STATUS_DEGRADED, STATUS_OUTAGE):
+        return (head + " — **known provider incident.** The status page confirms a provider-side "
+                "problem, so this is not local misbehaviour: back off HARDER (longer retry "
+                "spacing, reduced dispatch width) and wait out the incident before blaming "
+                "accounts or tokens.")
+    return (head + " — the status API probe failed, so provider health is unverified. This alert "
+            "fails OPEN: it is NEVER suppressed on a probe failure — treat the failures as "
+            "possibly provider-side.")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -713,6 +836,9 @@ def _cmd_decide(args):
     provider_accounts = _enabled_provider_accounts(
         api, registry_repo, args.policy_file, salt)
     actions = classify_records(records, provider_accounts, now)
+    # Issue #70: annotate firing outage/transient actions with the provider's public status —
+    # AFTER classification, so a probe result can reframe an alert but never decide one.
+    annotate_provider_status(actions)
     repo, token = _alert_target()
     for action in actions:
         # Only touch the tracker when there is something to do (fire) or an OPEN alert to recover;
@@ -947,6 +1073,10 @@ def _self_test():
         _provider_of("harness: claude\nprovider: anthropic\nmodels: [fable]"), "anthropic")
     chk("provider absent -> empty", _provider_of("models: [x]"), "")
     ok = _test_fleet(chk) and ok
+
+    # ---- provider status probe + annotation (issue #70) --------------------------------------
+    ok = _test_provider_status(chk) and ok
+    ok = _test_decide_annotation(chk) and ok
 
     print("model-health self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
@@ -1200,6 +1330,146 @@ def _test_fleet(chk):
     chk("fleet emits no raw handle", "acct01" not in json.dumps(sorted(
         h for hs in got.values() for h in hs)), True)
     chk("fleet empty without salt", empty, {})
+    return True
+
+
+def _test_provider_status(chk):
+    """Provider status probe (issue #70): recorded Statuspage fixtures for ALL FOUR indicators
+    plus the unreachable path. FAIL-OPEN is mutation-checked: a raising fetch must fold to
+    ('unknown', '') — deleting the except in probe_provider_status crashes this test red — and
+    annotation must never flip `fire` off, whatever the probe says."""
+    # Recorded fixture: the real status.claude.com/status.openai.com /api/v2/status.json shape.
+    def fixture(indicator, description):
+        return {"page": {"id": "23dnwm3xnarn", "name": "Claude",
+                         "url": "https://status.claude.com", "updated_at": "2026-07-17T00:00:00Z"},
+                "status": {"indicator": indicator, "description": description}}
+
+    chk("indicator none -> operational",
+        classify_status_payload(fixture("none", "All Systems Operational")),
+        (STATUS_OPERATIONAL, "none"))
+    chk("indicator minor -> degraded",
+        classify_status_payload(fixture("minor", "Partially Degraded Service")),
+        (STATUS_DEGRADED, "minor"))
+    chk("indicator major -> outage",
+        classify_status_payload(fixture("major", "Partial System Outage")),
+        (STATUS_OUTAGE, "major"))
+    chk("indicator critical -> outage",
+        classify_status_payload(fixture("critical", "Major System Outage")),
+        (STATUS_OUTAGE, "critical"))
+    chk("novel indicator -> unknown (fail-open fold)",
+        classify_status_payload(fixture("maintenance", "x"))[0], STATUS_UNKNOWN)
+    chk("malformed payload -> unknown",
+        classify_status_payload({"status": "green"}), (STATUS_UNKNOWN, ""))
+    chk("non-dict payload -> unknown",
+        classify_status_payload(None), (STATUS_UNKNOWN, ""))
+
+    # probe: URL pinning + FAIL-OPEN on unreachable (the mutation check)
+    calls = []
+
+    def ok_fetch(url):
+        calls.append(url)
+        return fixture("minor", "d")
+
+    def unreachable(url):
+        raise HealthError("stub: connection timed out")
+
+    chk("probe anthropic folds the fetched indicator",
+        probe_provider_status("anthropic", fetch=ok_fetch), (STATUS_DEGRADED, "minor"))
+    chk("probe openai hits its own recorded URL",
+        (probe_provider_status("openai", fetch=ok_fetch), calls[-1]),
+        ((STATUS_DEGRADED, "minor"), "https://status.openai.com/api/v2/status.json"))
+    chk("probe pins the recorded anthropic URL",
+        calls[0], "https://status.claude.com/api/v2/status.json")
+    chk("UNREACHABLE fails OPEN to unknown (mutation: drop the except -> crashes red)",
+        probe_provider_status("anthropic", fetch=unreachable), (STATUS_UNKNOWN, ""))
+    chk("unmapped provider -> unknown without any fetch",
+        probe_provider_status("fleet", fetch=unreachable), (STATUS_UNKNOWN, ""))
+
+    # annotation: firing outage/transient only, one probe per provider, fire NEVER touched
+    probes = []
+
+    def probe(provider):
+        probes.append(provider)
+        return STATUS_OPERATIONAL, "none"
+
+    actions = [
+        {"condition": "persistent-transient", "provider": "anthropic", "fire": True, "reason": "r"},
+        {"condition": "provider-outage", "provider": "anthropic", "fire": True, "reason": "r"},
+        {"condition": "provider-capped", "provider": "anthropic", "fire": True, "reason": "r"},
+        {"condition": "persistent-transient", "provider": "openai", "fire": False, "reason": "r"},
+    ]
+    annotate_provider_status(actions, probe=probe)
+    chk("one probe per provider, none for quiet/unprobed conditions", probes, ["anthropic"])
+    chk("only firing outage/transient actions are annotated",
+        [a.get("provider_status") for a in actions],
+        [STATUS_OPERATIONAL, STATUS_OPERATIONAL, None, None])
+    chk("operational NEVER suppresses: fire flags untouched by annotation",
+        [a["fire"] for a in actions], [True, True, True, False])
+
+    # body rendering: SELF-INDUCED / known-incident / fail-open framings
+    def body(cond, status, indicator):
+        return render_body({"condition": cond, "provider": "anthropic", "fire": True,
+                            "reason": "5 transient API failures in 15 min",
+                            "provider_status": status, "status_indicator": indicator}, "m")
+
+    green = body("persistent-transient", STATUS_OPERATIONAL, "none")
+    chk("operational burst is labelled SELF-INDUCED", "SELF-INDUCED" in green, True)
+    chk("...with shed-parallelism advice", "SHED PARALLELISM" in green, True)
+    chk("...and the provider-status annotation", "provider-status: operational" in green, True)
+    minor = body("persistent-transient", STATUS_DEGRADED, "minor")
+    chk("degraded carries the qualified annotation",
+        "provider-status: degraded (minor)" in minor, True)
+    chk("degraded uses known-incident framing + harder backoff",
+        ("known provider incident" in minor, "back off HARDER" in minor), (True, True))
+    crit = body("provider-outage", STATUS_OUTAGE, "critical")
+    chk("critical outage carries the qualified annotation",
+        "provider-status: outage (critical)" in crit, True)
+    chk("outage uses known-incident framing", "known provider incident" in crit, True)
+    green_outage = body("provider-outage", STATUS_OPERATIONAL, "none")
+    chk("operational outage points at credentials/credits, not the provider",
+        "expired tokens" in green_outage, True)
+    unknown = body("persistent-transient", STATUS_UNKNOWN, "")
+    chk("unknown states the fail-open (never suppressed)",
+        ("provider-status: unknown" in unknown, "NEVER suppressed" in unknown), (True, True))
+    plain = render_body({"condition": "persistent-transient", "provider": "anthropic",
+                         "fire": True, "reason": "r"}, "m")
+    chk("unprobed action renders no provider-status line", "provider-status" in plain, False)
+    return True
+
+
+def _test_decide_annotation(chk):
+    """decide WIRES the probe (deleting the annotate_provider_status call in _cmd_decide turns
+    this red): a firing persistent-transient action reaches the alert upsert already carrying
+    provider-status, with the network probe and gh upsert both stubbed out."""
+    import argparse as _ap
+    global GitHubAPI, probe_provider_status, _upsert_alert
+    real_api, real_probe, real_upsert = GitHubAPI, probe_provider_status, _upsert_alert
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "GH_TOKEN", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN")}
+    now, salt, seen = int(time.time()), "s3cret", []
+    burst = [make_record("anthropic", account_hash("acct01", salt), "fable",
+                         CLASS_TRANSIENT, str(i), now - 300 + i * 60) for i in range(5)]
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", GH_TOKEN="tok")
+        os.environ.pop("ALERT_REPO", None)
+        os.environ.pop("ALERT_TOKEN", None)
+        stub = _StubAPI(seed=burst)
+        GitHubAPI = lambda token: stub
+        probe_provider_status = lambda provider, fetch=None: (STATUS_OPERATIONAL, "none")
+        _upsert_alert = lambda action, repo, token, maintainer: seen.append(action)
+        rc = _cmd_decide(_ap.Namespace(policy_file="/nonexistent/repos.toml"))
+        fired = [a for a in seen
+                 if a["condition"] == "persistent-transient" and a["fire"]]
+        chk("decide exits 0 and fires the transient alert", (rc, len(fired)), (0, 1))
+        chk("decide-time annotation reaches the upsert",
+            (fired or [{}])[0].get("provider_status"), STATUS_OPERATIONAL)
+    finally:
+        GitHubAPI, probe_provider_status, _upsert_alert = real_api, real_probe, real_upsert
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     return True
 
 
