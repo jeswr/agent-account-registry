@@ -21,16 +21,6 @@
    "expires_at": 1784387032
   },
   {
-   "account": "acct01",
-   "claim_id": "a9bf318f35bb45a28e38f657ff96f4be",
-   "holder": "review:sparq-org/sparq#3458@dispatch-29647232301.1",
-   "package": "sparq-solid",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784383446,
-   "expires_at": 1784384646
-  },
-  {
    "account": "acct03",
    "claim_id": "3649f84358fe4be0abe1e06ad5112ba0",
    "holder": "fix:sparq-org/sparq#3461@dispatch-29647232301.1",
