@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Adding `environment: dispatch-secrets` does not by itself enforce a default-branch-only policy or remove access to repository-level secrets. The new comment expressly says the required environment setup and movement of every consumed secret are only a tracked follow-up and that the binding is currently an inert no-op. Therefore an attacker-controlled workflow dispatched at another ref can remove the environment binding and still read the existing repository secrets; even retaining the binding is safe only if the environment's deployment policy has already been configured. A trust-plane security fix cannot land in a known default-allow intermediate state.",
+   "file": ".github/workflows/dispatch.yml",
+   "fix_hint": "Make deployment atomic with the repository-settings change: first create `dispatch-secrets` with a default-branch-only deployment policy and migrate every secret consumed by both jobs out of repository scope, then land/enable this workflow binding only after a verifiable check confirms those settings. Add a fail-closed validation or documented automated settings assertion so the protection cannot silently regress. If those settings are already applied, provide repository-verifiable evidence and remove the inaccurate 'tracked follow-up' / 'inert no-op' claim.",
+   "severity": "blocker",
+   "title": "Secret-exfiltration guard is inert until unverified out-of-band configuration"
+  }
+ ],
+ "progress": null,
+ "summary": "The workflow annotations correctly identify the arbitrary-ref workflow_dispatch threat, but this patch does not actually close it. It only attaches two jobs to a named environment while explicitly deferring creation, default-branch restriction, and migration of the secrets to an untracked follow-up. Until all of those out-of-band settings are in place, a collaborator-dispatched branch workflow can still receive repository-level secrets, so the proposed guard is permissive rather than fail-closed.",
+ "verdict": "request_changes"
+}
