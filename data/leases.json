@@ -149,6 +149,16 @@
    "model": "opus",
    "issued_at": 1784342775,
    "expires_at": 1784349075
+  },
+  {
+   "account": "acct04",
+   "claim_id": "335b936c6da7418fb266fd815fe6f3af",
+   "holder": "sparq-org/sparq#3186@dispatch-29627530436.1",
+   "package": "sparq-server-http",
+   "role": "impl",
+   "model": "fable",
+   "issued_at": 1784342779,
+   "expires_at": 1784349079
   }
  ]
 }
