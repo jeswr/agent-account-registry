@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change cleanly removes the obsolete per-repository dispatch mode from the documented schema, both live policy rows, the resolver's required-field/validation/output contract, and all affected self-test fixtures. Repository-wide read-only inspection found no remaining consumer of the resolved `dispatch` field and no remaining policy `dispatch` key or cron/doorbell mode contract outside historical research/review records. Unknown policy fields remain rejected, all other required fields and fail-closed validations are preserved, and the existing self-test fixtures continue to exercise the real resolver. No correctness, soundness, security, or vacuous-test defect is evident in the diff.",
+ "verdict": "approve"
+}
