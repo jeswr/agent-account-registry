@@ -14,6 +14,12 @@
 # is silently invisible to the allocator), the broker validates its own registration through the
 # real read_accounts parser, and the handle is appended to policy/repos.toml account_pool with a
 # contents-API compare-and-swap (rebase-retry) so no human policy edit is left dangling.
+#
+# STALE-SNAPSHOT fix (#186): the handle/secret in `meta` are picked BEFORE a login lasting up to
+# ~13 min, and concurrency serializes only this workflow's own runs — not manual account creation
+# or other writers. So the store step re-reads live state (issue titles + secret names) and re-derives
+# the slot immediately before the irreversible `gh secret set`, failing closed if it cannot prove the
+# slot is free; downstream steps consume that reserved slot via steps.store.outputs, not the snapshot.
 name: set-up-account
 on:
   issues:
@@ -78,6 +84,9 @@ jobs:
           # The models line the allocator requires (read_accounts drops model-less accounts),
           # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
           if [ "$prov" = openai ]; then models='[terra]'; else models='[fable, opus, sonnet, haiku]'; fi
+          # handle/secret here are only a PRE-LOGIN RESERVATION HINT: the login below can take ~13 min,
+          # during which another (non-serialized) writer may claim this number, so the store step
+          # re-reads live state and re-validates the reservation before writing (#186).
           n=$(gh issue list -R "${{ github.repository }}" --state all --json title \
                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]|max // 0' 2>/dev/null || echo 0)
           {
@@ -113,16 +122,49 @@ jobs:
           fi
           if wait "$BR"; then echo "status=ok" >> "$GITHUB_OUTPUT"; else echo "status=fail" >> "$GITHUB_OUTPUT"; fi
 
-      - name: Store token (REGISTRY secret — where workers read it) + register (github.token)
+      - name: Reserve (re-read live state) + store token + register — fail closed on a taken slot
+        id: store
         if: steps.login.outputs.status == 'ok'
         env:
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
           PROVIDER: ${{ steps.meta.outputs.provider }}
           MODELS: ${{ steps.meta.outputs.models }}
-          HANDLE: ${{ steps.meta.outputs.handle }}
-          SECRET_NAME: ${{ steps.meta.outputs.secret }}
+          RESERVED_HANDLE: ${{ steps.meta.outputs.handle }}
         run: |
           set -euo pipefail
+          # #186 stale-snapshot fix. `meta` picked the handle/secret from a snapshot taken BEFORE a
+          # login that lasts up to ~13 min, and this workflow's concurrency group serializes only its
+          # OWN runs — NOT manual account creation or other writers. So that slot may now be taken;
+          # proceeding blind would OVERWRITE a live credential (`gh secret set` is an upsert) and mint
+          # a DUPLICATE acctNN issue title (GitHub permits duplicate titles). Re-read live state here,
+          # immediately before the irreversible write, and re-derive the slot from the union of every
+          # acctNN issue title (ANY state) and every ACCTNN_TOKEN secret name so it is free in BOTH
+          # namespaces. If either listing fails we CANNOT prove the slot is free -> fail closed. The
+          # pre-login reservation is REUSED when still free (so a retry converges on the same slot);
+          # only a real collision bumps to max(taken)+1.
+          if ! taken_issues=$(gh issue list -R "${{ github.repository }}" --state all --limit 500 \
+                 --json title \
+                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]'); then
+            echo "::error::could not list account issues to validate the reservation — refusing to store (fail closed)"; exit 1
+          fi
+          if ! taken_secrets=$(GH_TOKEN="$REGISTRY_PAT" gh secret list -R "${{ github.repository }}" \
+                 --json name \
+                 --jq '[.[].name|select(test("^ACCT[0-9]+_TOKEN$"))|ltrimstr("ACCT")|rtrimstr("_TOKEN")|tonumber]'); then
+            echo "::error::could not list existing secrets to validate the reservation — refusing to store (fail closed)"; exit 1
+          fi
+          reserved=${RESERVED_HANDLE#acct}; reserved=$((10#$reserved))
+          # Keep the reservation if it is still free in BOTH namespaces; otherwise take the next slot
+          # above everything taken (always free). Retries re-derive identically.
+          n=$(jq -n --argjson i "$taken_issues" --argjson s "$taken_secrets" --argjson r "$reserved" \
+                'if (($i + $s) | index($r)) then (([$i[], $s[], 0] | max) + 1) else $r end')
+          HANDLE=$(printf 'acct%02d' "$n")
+          SECRET_NAME=$(printf 'ACCT%02d_TOKEN' "$n")
+          # Invariant guard before the irreversible upsert: the chosen slot MUST be free in both
+          # namespaces. Never silently overwrite a credential or duplicate a title.
+          if jq -e -n --argjson i "$taken_issues" --argjson s "$taken_secrets" --argjson n "$n" \
+               '($i + $s) | index($n)' >/dev/null; then
+            echo "::error::reserved slot $HANDLE is already taken after re-read — refusing to overwrite (fail closed)"; exit 1
+          fi
           # The secret lives on THIS registry repo: worker.yml resolves secrets[secret_ref] here,
           # the dispatch usage probe reads registry secrets, and the rotation write-back targets the
           # registry too. Never echo the token — gh reads the file.
@@ -134,11 +176,16 @@ jobs:
             --title "$HANDLE" \
             --label "provider:$PROVIDER" --label status:available \
             --body "$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nnotes: registered via set-up-account broker\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME")"
+          # Publish the RESERVED slot so every downstream step uses it, not the stale pre-login snapshot.
+          {
+            printf 'handle=%s\n' "$HANDLE"
+            printf 'secret=%s\n' "$SECRET_NAME"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Validate the registration through the real allocator parser
         if: steps.login.outputs.status == 'ok'
         env:
-          NEW_HANDLE: ${{ steps.meta.outputs.handle }}
+          NEW_HANDLE: ${{ steps.store.outputs.handle }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -166,7 +213,7 @@ jobs:
       - name: Append the handle to policy account_pool (contents-API CAS, rebase-retry)
         if: steps.login.outputs.status == 'ok'
         env:
-          NEW_HANDLE: ${{ steps.meta.outputs.handle }}
+          NEW_HANDLE: ${{ steps.store.outputs.handle }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -233,7 +280,7 @@ jobs:
         run: |
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
           gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-            --body "✅ Account **${{ steps.meta.outputs.handle }}** registered: secret \`${{ steps.meta.outputs.secret }}\` on \`${{ github.repository }}\` (format \`$fmt\`), \`models: ${{ steps.meta.outputs.models }}\`, appended to \`policy/repos.toml\` account_pool, validated via read_accounts. Closing." || true
+            --body "✅ Account **${{ steps.store.outputs.handle }}** registered: secret \`${{ steps.store.outputs.secret }}\` on \`${{ github.repository }}\` (format \`$fmt\`), \`models: ${{ steps.meta.outputs.models }}\`, appended to \`policy/repos.toml\` account_pool, validated via read_accounts. Closing." || true
           gh issue close "${{ github.event.issue.number }}" -R "${{ github.repository }}" || true
 
       - name: Report failure
