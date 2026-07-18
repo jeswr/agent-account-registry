@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The `Determine provider + targets` step loads `scripts/grant-account.py` with importlib, but the pinned `actions/checkout` step still occurs afterward. A fresh GitHub-hosted runner does not have the PR repository contents in `GITHUB_WORKSPACE` before checkout, so `exec_module` raises FileNotFoundError and the workflow cannot process any setup request. This is fail-closed, but it makes the feature nonfunctional.",
+   "file": ".github/workflows/set-up-account.yml",
+   "fix_hint": "Move the pinned checkout step ahead of the first import of scripts/grant-account.py (while retaining the existing trust/preflight ordering as appropriate), or make provider/target parsing available without reading a checkout file. Add a workflow-level/static regression check that establishes checkout precedes every step that reads repository paths.",
+   "severity": "major",
+   "title": "Grant helper is imported before the repository is checked out"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The round-5 exact-postcondition defect is fixed: the all-present path now calls verify_grant, and the self-test includes both a valid no-op and a duplicate-handle refusal. However, the newly extracted helper is imported in the metadata step before actions/checkout runs. On a fresh GitHub-hosted runner the repository files are not present yet, so scripts/grant-account.py cannot be loaded and every otherwise-authorized setup run fails before login. This is regressing relative to round 5 because the prior finding is resolved but a new major workflow correctness failure is present.",
+ "verdict": "request_changes"
+}
