@@ -41,16 +41,6 @@
    "expires_at": 1784346560
   },
   {
-   "account": "acct2css",
-   "claim_id": "2b68d041c882459ebecdfe3de1b02e36",
-   "holder": "sparq-org/sparq#2983@dispatch-29626494323.1",
-   "package": "sparq-mpc",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784340654,
-   "expires_at": 1784346954
-  },
-  {
    "account": "acct04",
    "claim_id": "d8579a0fd50947628a42754abf949ec3",
    "holder": "sparq-org/sparq#3386@dispatch-29626494323.1",
