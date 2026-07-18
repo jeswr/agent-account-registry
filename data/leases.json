@@ -89,16 +89,6 @@
    "model": "terra",
    "issued_at": 1784382271,
    "expires_at": 1784383471
-  },
-  {
-   "account": "acct07",
-   "claim_id": "47be2fc97d4d4b0a8417c1926d05d89f",
-   "holder": "jeswr/agent-account-registry#216@dispatch-29646588666.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "fable",
-   "issued_at": 1784382284,
-   "expires_at": 1784384984
   }
  ]
 }
