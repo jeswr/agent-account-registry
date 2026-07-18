@@ -61,16 +61,6 @@
    "expires_at": 1784350354
   },
   {
-   "account": "acct05",
-   "claim_id": "5233d89e1a284411b5a2c2b84831936c",
-   "holder": "sparq-org/sparq#3399@dispatch-29628165371.1",
-   "package": "js",
-   "role": "ci",
-   "model": "fable",
-   "issued_at": 1784344062,
-   "expires_at": 1784350362
-  },
-  {
    "account": "acct06",
    "claim_id": "6d66060da5eb4ccd887a9e0af2388f6f",
    "holder": "sparq-org/sparq#3153@dispatch-29628271933.1",
