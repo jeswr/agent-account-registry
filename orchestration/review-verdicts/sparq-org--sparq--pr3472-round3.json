@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Both round-2 major findings are resolved. T-box candidate generation now follows reverse transitive subclass/subproperty closures, deduplicates candidates per inferred signature element, and the new feature-gated retrieval test exercises the real most_similar path with sibling subproperties while disabling profile and lexical fallbacks, so it cannot pass through an unrelated tier. The lexical metric now constructs windows over Unicode scalar values, uses character counts for its short-string path, and includes assertions whose expected scores differ from byte-trigram behavior. The changes remain behind default-off features and the public configuration is documented in the matching skill. No correctness, soundness, test-validity, or security issue is apparent in the supplied diff.",
+ "verdict": "approve"
+}
