@@ -122,16 +122,6 @@
   },
   {
    "account": "acct3css",
-   "claim_id": "e791e4a44114425fa570dee0f56f663e",
-   "holder": "sparq-org/sparq#2832@dispatch-29625933900.1",
-   "package": "trust",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784339573,
-   "expires_at": 1784345873
-  },
-  {
-   "account": "acct3css",
    "claim_id": "888d8a39ae194e64b2e9ebd015e39119",
    "holder": "sparq-org/sparq#2845@dispatch-29625933900.1",
    "package": "sparq-trust",
