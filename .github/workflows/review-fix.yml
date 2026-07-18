@@ -540,10 +540,18 @@ jobs:
           # concurrent reviews to the static codex slot count (codex is usage-exempt; the CLI
           # claim path does not usage-gate, so this static cap IS the bound — by design).
           if [[ "$MODE" == review ]]; then
-            prefix="review:"; cap=10; ttl=1200; role=review
+            prefix="review:"; role=review
           else
-            prefix="fix:"; cap=3; ttl=3600; role=fix
+            prefix="fix:"; role=fix
           fi
+          # Single source of truth for the per-prefix cap + TTL (issue #167): the dispatcher reads
+          # select-and-claim.LEASE_CONFIG via lease_limit(); this self-claim path reads the SAME
+          # table through `--lease-config`, so the two launch paths for one PR can never drift to
+          # conflicting capacity. Fail closed unless the emitted config is two positive integers.
+          lease_cfg="$(python3 registry/scripts/select-and-claim.py --lease-config "$prefix")"
+          cap="${lease_cfg%% *}"; ttl="${lease_cfg##* }"
+          [[ "$cap" =~ ^[1-9][0-9]*$ && "$ttl" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::invalid lease config '$lease_cfg' for prefix $prefix"; exit 1; }
           holder="$prefix$TARGET_REPO#$PR_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           set +e
           python3 registry/scripts/select-and-claim.py \
