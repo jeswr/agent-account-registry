@@ -99,6 +99,16 @@
    "model": "sonnet",
    "issued_at": 1784342965,
    "expires_at": 1784349265
+  },
+  {
+   "account": "acct03",
+   "claim_id": "a3cd3bca981d4ebc87015b268e127531",
+   "holder": "sparq-org/sparq#2755@dispatch-29627707368.1",
+   "package": "bench",
+   "role": "impl",
+   "model": "fable",
+   "issued_at": 1784343127,
+   "expires_at": 1784349427
   }
  ]
 }
