@@ -455,6 +455,66 @@ def decide_disarm(armed, draft, head_sha, reviewed_sha, when):
     return actions
 
 
+# Issue #69: bound on the first-parent walk from a live head back to its reviewed sha. The
+# pr-freshness update-branch automation adds a handful of merge commits between reviews; a
+# longer chain is ambiguity and fails closed to the normal mismatch disarm.
+CARRY_FORWARD_CHAIN_LIMIT = 20
+
+
+def merge_only_advance(head_sha, reviewed_sha, commit_parents, limit=CARRY_FORWARD_CHAIN_LIMIT):
+    """Issue #69 half 1, SHAPE check (pure): walk the FIRST-parent chain from the live head
+    down to the reviewed sha. The advance qualifies for carry-forward only when every
+    intervening commit is a two-parent merge — the head moved exclusively by merging
+    something in (update-branch), never by new work commits. Returns the ordered
+    [(merge_sha, second_parent_sha), ...] pairs (head first) for the caller to verify each
+    second parent against the default branch, or None on ANY other shape: a non-merge or
+    octopus commit, an unknown/malformed commit, or a chain longer than `limit` (fail
+    closed — the normal mismatch disarm proceeds). Shape alone cannot rule out an evil
+    merge, so the caller must ALSO hold diff-identity (diff_fingerprint) before rebinding."""
+    if head_sha == reviewed_sha:
+        return []
+    pairs = []
+    current = head_sha
+    while current != reviewed_sha:
+        if len(pairs) >= limit:
+            return None
+        parents = commit_parents.get(current)
+        if (not isinstance(parents, (list, tuple)) or len(parents) != 2
+                or not all(isinstance(parent, str) and parent for parent in parents)):
+            return None
+        pairs.append((current, parents[1]))
+        current = parents[0]
+    return pairs
+
+
+def diff_fingerprint(files):
+    """Issue #69 half 1, CONTENT check (pure): a canonical fingerprint of a compare-API
+    file list (the PR's diff vs its merge base). Equal fingerprints before and after the
+    advance mean the reviewed CONTENT is unchanged: a merge that alters what the PR does
+    to any file changes that file's patch (context lines included, so a default-branch
+    edit to a PR-touched file is caught even when the merge auto-resolved cleanly) or its
+    head blob sha. Returns None when the list or any entry is malformed, or an entry
+    carries neither a blob sha nor a patch (unfingerprintable => fail closed)."""
+    if not isinstance(files, list):
+        return None
+    rows = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            return None
+        name = entry.get("filename")
+        sha = entry.get("sha")
+        patch = entry.get("patch")
+        if not isinstance(name, str) or not name:
+            return None
+        if not isinstance(sha, str) and not isinstance(patch, str):
+            return None
+        rows.append((name, str(entry.get("status") or ""),
+                     str(entry.get("previous_filename") or ""),
+                     sha if isinstance(sha, str) else "",
+                     patch if isinstance(patch, str) else ""))
+    return tuple(sorted(rows))
+
+
 def decide_review(verdict, has_blockers, injection, round_n, max_rounds, security,
                   budget_action="needs-user"):
     """The review-verdict state machine. Every path arms once, requests one fix round, or stops
@@ -862,6 +922,83 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     print(f"needs-user recorded: {reason}")
 
 
+def _merge_only_carry_forward(repo, head_sha, reviewed_sha, default_branch):
+    """Issue #69 half 1, LIVE side: True only when BOTH halves hold — (a) the first-parent
+    chain from the live head reaches the reviewed sha through two-parent merges whose
+    second parents are each reachable from the default branch (compare status
+    identical/behind), and (b) the PR's diff vs its merge base is identical before and
+    after the advance (diff_fingerprint). Any API failure, truncated compare file list
+    (the API caps at 300), or ambiguity returns False — fail closed, the normal mismatch
+    disarm proceeds and the sweep re-reviews the new head instead."""
+    try:
+        listing = _gh_json(["api", f"repos/{repo}/commits?sha={head_sha}&per_page=100"])
+        if not isinstance(listing, list):
+            return False
+        commit_parents = {}
+        for entry in listing:
+            if not isinstance(entry, dict) or not isinstance(entry.get("sha"), str):
+                continue
+            commit_parents[entry["sha"]] = [
+                parent.get("sha") for parent in (entry.get("parents") or [])
+                if isinstance(parent, dict)]
+        pairs = merge_only_advance(head_sha, reviewed_sha, commit_parents)
+        if not pairs:
+            return False
+        for _, second_parent in pairs:
+            probe = _gh_json(["api", f"repos/{repo}/compare/{default_branch}...{second_parent}"])
+            if not isinstance(probe, dict) or probe.get("status") not in ("identical", "behind"):
+                return False
+        fingerprints = []
+        for sha in (reviewed_sha, head_sha):
+            compared = _gh_json(["api", f"repos/{repo}/compare/{default_branch}...{sha}"])
+            files = compared.get("files") if isinstance(compared, dict) else None
+            if not isinstance(files, list) or len(files) >= 300:
+                return False
+            fingerprints.append(diff_fingerprint(files))
+        return fingerprints[0] is not None and fingerprints[0] == fingerprints[1]
+    except WorkerPrError:
+        return False
+
+
+def _merge_queue_state(repo, pr_number):
+    """Issue #69 half 2: (node_id, queued) for a pull request. Merge-queue membership is
+    GraphQL-only — the REST document disarm otherwise reads never exposes mergeQueueEntry,
+    and `gh pr merge --disable-auto` hard-fails on a queued PR (the 2026-07-17 incident).
+    Raises WorkerPrError on any API/shape failure (fail closed: the caller surfaces a
+    structured per-PR error rather than guessing an unqueued state)."""
+    owner, name = repo.split("/", 1)
+    query = ("query($owner:String!,$name:String!,$number:Int!){"
+             "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+             "id mergeQueueEntry{id}}}}")
+    doc = _gh_json(["api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+                    "-f", f"name={name}", "-F", f"number={pr_number}"])
+    pull = None
+    if isinstance(doc, dict):
+        repository = (doc.get("data") or {}).get("repository") or {}
+        pull = repository.get("pullRequest")
+    if not isinstance(pull, dict) or not pull.get("id"):
+        raise WorkerPrError("merge-queue state query returned a malformed pull request")
+    return str(pull["id"]), pull.get("mergeQueueEntry") is not None
+
+
+def _queue_disarm_mutation(mutation, node_id):
+    """One GraphQL disarm mutation for a QUEUED pull request (issue #69 half 2):
+    dequeuePullRequest takes the PR node id as `id`, disablePullRequestAutoMerge as
+    `pullRequestId`. Raises a concise WorkerPrError on failure — disarm() converts it
+    into the structured per-PR error its dispatch caller skips per item."""
+    if mutation == "dequeuePullRequest":
+        query = "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}"
+    elif mutation == "disablePullRequestAutoMerge":
+        query = ("mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id})"
+                 "{clientMutationId}}")
+    else:
+        raise WorkerPrError("unknown merge-queue disarm mutation")
+    result = _run_gh(["api", "graphql", "-f", f"query={query}", "-f", f"id={node_id}"],
+                     check=False)
+    if result.returncode != 0:
+        raise WorkerPrError(f"GraphQL {mutation} failed for the queued pull request")
+
+
 def disarm(repo, pr_number, when):
     """Defuse a worker PR's GitHub-side arm/ready state, fail-closed on LIVE data only (the plan
     row that requested this is hostile — every precondition is re-derived from the API here).
@@ -874,7 +1011,18 @@ def disarm(repo, pr_number, when):
     NOT consult the issue, because retracting a latch that would merge a never-reviewed tree is
     the safety invariant and must not be blocked by work-item parking. when=mismatch requires
     (armed OR ready-but-unarmed) AND head != reviewed-sha (registry issue #42 invariant —
-    matching SHAs are NEVER disarmed)."""
+    matching SHAs are NEVER disarmed).
+
+    Issue #69: a mismatch is FIRST tested for merge-only carry-forward — the pr-freshness
+    update-branch automation advances heads with default-branch merge commits, and a
+    content-identical advance REBINDS the reviewed-sha marker instead of disarming (both the
+    chain shape and the diff-vs-merge-base identity must verify; anything else falls through
+    to the disarm). The armed bit is derived from REST auto-merge OR live merge-queue
+    membership (GraphQL — invisible to REST): a queued PR disarms via dequeuePullRequest +
+    disablePullRequestAutoMerge, never `gh pr merge --disable-auto` (which fails on queued
+    PRs). Any API failure past the guards surfaces as ONE structured per-PR error (a
+    disarm_error output row + a per-PR exit message) so the dispatch caller's per-item
+    handling skips exactly this PR and sibling enumeration continues."""
     live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
     if not isinstance(live, dict) or live.get("state") != "open":
         _write_outputs({"disarmed": False})
@@ -915,21 +1063,57 @@ def disarm(repo, pr_number, when):
     if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         raise WorkerPrError("live head sha is malformed")
     reviewed = reviewed_sha_of(live.get("body") or "") or "none"
-    actions = decide_disarm(live.get("auto_merge") is not None, live.get("draft") is True,
-                            head_sha, reviewed, when)
-    if not actions:
-        _write_outputs({"disarmed": False})
-        print(f"disarm no-op ({when}): the live PR state does not require it")
-        return
-    for action in actions:
-        if action == "disable-auto":
-            _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--disable-auto"])
-            print("auto-merge disabled (stale arm latch removed)")
-        elif action == "redraft":
-            _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"])
-            print("pull request returned to draft for the review sweep")
-        else:
-            set_review_state(repo, pr_number, "needs")
+    # Issue #69 half 1: before treating the divergence as a disarmable mismatch, test whether
+    # the head advanced ONLY by default-branch merge commits with the PR's diff-vs-merge-base
+    # unchanged. The reviewed CONTENT is then intact — rebind the marker to the new head and
+    # leave the arm state alone. Every check is live and fail-closed: any real content
+    # change, unknown shape, or API failure falls through to the normal disarm below.
+    if when == "mismatch" and reviewed != "none" and head_sha != reviewed:
+        default_branch = str(((live.get("base") or {}).get("repo") or {})
+                             .get("default_branch") or "")
+        if default_branch and _merge_only_carry_forward(repo, head_sha, reviewed,
+                                                        default_branch):
+            set_reviewed_sha(repo, pr_number, head_sha)
+            _write_outputs({"disarmed": False, "carried_forward": True})
+            print("reviewed-sha carried forward: the head advanced only by verified "
+                  "default-branch merge commits and the diff vs the merge base is unchanged")
+            return
+    try:
+        # Issue #69 half 2: queued PRs are never drafts, so a drafted PR skips the GraphQL
+        # probe; for the rest, merge-queue membership counts as ARMED (REST auto_merge alone
+        # misses a directly-queued PR whose latch would merge a never-reviewed tree).
+        node_id, queued = "", False
+        if live.get("draft") is not True:
+            node_id, queued = _merge_queue_state(repo, pr_number)
+        actions = decide_disarm((live.get("auto_merge") is not None) or queued,
+                                live.get("draft") is True, head_sha, reviewed, when)
+        if not actions:
+            _write_outputs({"disarmed": False})
+            print(f"disarm no-op ({when}): the live PR state does not require it")
+            return
+        for action in actions:
+            if action == "disable-auto":
+                if queued:
+                    _queue_disarm_mutation("dequeuePullRequest", node_id)
+                    print("merge-queue entry removed (GraphQL dequeue)")
+                    if live.get("auto_merge") is not None:
+                        _queue_disarm_mutation("disablePullRequestAutoMerge", node_id)
+                        print("auto-merge disabled (GraphQL; the PR was queued)")
+                else:
+                    _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--disable-auto"])
+                    print("auto-merge disabled (stale arm latch removed)")
+            elif action == "redraft":
+                _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"])
+                print("pull request returned to draft for the review sweep")
+            else:
+                set_review_state(repo, pr_number, "needs")
+    except WorkerPrError as exc:
+        # Issue #69 half 2: the structured per-PR error — one sanitized output row plus a
+        # per-PR exit message. The dispatch caller maps the nonzero exit to a per-item
+        # DispatchError and skips exactly this PR; siblings keep enumerating.
+        reason = " ".join(str(exc).split())[:200] or "disarm failed"
+        _write_outputs({"disarmed": False, "disarm_error": reason})
+        raise WorkerPrError(f"disarm {repo}#{pr_number}: {reason}") from exc
     _write_outputs({"disarmed": True})
     print(f"disarm applied ({when}): {','.join(actions)}")
 
@@ -1446,6 +1630,44 @@ def _self_test():
     else:
         check("disarm rejects an unknown mode", "accepted", "rejected")
 
+    # ---- issue #69 half 1: merge-only carry-forward, pure SHAPE + CONTENT halves ----
+    rev_sha, mid_sha, top_sha = "a" * 40, "b" * 40, "c" * 40
+    main_1, main_2 = "d" * 40, "e" * 40
+    check("merge-only chain yields head-first merge pairs",
+          merge_only_advance(top_sha, rev_sha,
+                             {top_sha: [mid_sha, main_2], mid_sha: [rev_sha, main_1]}),
+          [(top_sha, main_2), (mid_sha, main_1)])
+    check("identical head is an empty advance", merge_only_advance(rev_sha, rev_sha, {}), [])
+    check("a plain work commit on the chain fails closed",
+          merge_only_advance(top_sha, rev_sha,
+                             {top_sha: [mid_sha, main_2], mid_sha: [rev_sha]}), None)
+    check("an octopus merge fails closed",
+          merge_only_advance(top_sha, rev_sha, {top_sha: [rev_sha, main_1, main_2]}), None)
+    check("an unknown commit fails closed", merge_only_advance(top_sha, rev_sha, {}), None)
+    check("a malformed parent entry fails closed",
+          merge_only_advance(top_sha, rev_sha, {top_sha: [None, main_1]}), None)
+    check("an over-limit chain fails closed",
+          merge_only_advance(top_sha, rev_sha, {top_sha: [top_sha, main_1]}, limit=3), None)
+
+    fp_row = {"filename": "src/a.rs", "status": "modified", "sha": "f" * 40,
+              "patch": "@@ -1 +1 @@\n-x\n+y"}
+    fp_other = {"filename": "src/b.rs", "status": "added", "sha": "0" * 40, "patch": "+z"}
+    check("diff fingerprint is order-insensitive",
+          diff_fingerprint([fp_row, fp_other]) == diff_fingerprint([fp_other, dict(fp_row)]),
+          True)
+    check("a patch change breaks diff identity",
+          diff_fingerprint([fp_row])
+          == diff_fingerprint([dict(fp_row, patch="@@ -1 +1 @@\n-x\n+CHANGED")]), False)
+    check("a status change breaks diff identity",
+          diff_fingerprint([fp_row]) == diff_fingerprint([dict(fp_row, status="removed")]),
+          False)
+    check("a binary file (sha, no patch) fingerprints",
+          diff_fingerprint([{"filename": "img.png", "status": "added", "sha": "1" * 40}])
+          is not None, True)
+    check("a file with neither sha nor patch fails closed",
+          diff_fingerprint([{"filename": "x", "status": "modified"}]), None)
+    check("a malformed file list fails closed", diff_fingerprint("nope"), None)
+
     # ---- review_outcome wiring (monkeypatched I/O): exhaustion consults decide_budget — an
     # extension records the pin (model path) or not (progress path) and stays review:changes;
     # the terminal path escalates once with the budget-aware reason ----
@@ -1504,6 +1726,126 @@ def _self_test():
                   "round budget is exhausted" in terminal[1][1], True)
     finally:
         wiring_globals.update(real_io)
+
+    # ---- disarm wiring (monkeypatched I/O), issue #69: a merge-only advance carries the
+    # binding forward with the arm intact; a real content change still disarms; a QUEUED
+    # mismatch takes the GraphQL dequeue path (never `gh pr merge`); a queue-API failure
+    # surfaces as ONE structured per-PR error the dispatch caller can skip per item ----
+    net = {}
+    disarm_calls = []
+    fake_outputs = {}
+    real_disarm_io = {name: wiring_globals[name]
+                      for name in ("_gh_json", "_run_gh", "_write_outputs",
+                                   "set_review_state", "set_reviewed_sha")}
+    head_69, main_tip = "b" * 40, "c" * 40
+    base_file = {"filename": "src/a.rs", "status": "modified", "sha": "e" * 40,
+                 "patch": "@@ -1 +1 @@\n-x\n+y"}
+    merge_advance = [{"sha": head_69, "parents": [{"sha": rev_sha}, {"sha": main_tip}]}]
+    plain_advance = [{"sha": head_69, "parents": [{"sha": "9" * 40}]}]
+    identical_compares = {f"main...{main_tip}": {"status": "behind", "files": []},
+                          f"main...{rev_sha}": {"status": "diverged",
+                                                "files": [dict(base_file)]},
+                          f"main...{head_69}": {"status": "diverged",
+                                                "files": [dict(base_file)]}}
+
+    def fake_gh_json(args, **_kwargs):
+        path = args[1] if len(args) > 1 else ""
+        if path == "graphql":
+            disarm_calls.append("queue-probe")
+            return {"data": {"repository": {"pullRequest": {
+                "id": "PR_node69",
+                "mergeQueueEntry": {"id": "MQE_1"} if net.get("queued") else None}}}}
+        if path.startswith("repos/o/r/pulls/"):
+            return net["live"]
+        if path.startswith("repos/o/r/commits?"):
+            return net["commits"]
+        if path.startswith("repos/o/r/compare/"):
+            return net["compare"][path.split("compare/", 1)[1]]
+        raise WorkerPrError(f"unexpected API path {path}")
+
+    def fake_run_gh(args, **_kwargs):
+        disarm_calls.append(" ".join(args))
+        failing = net.get("fail_mutation", "")
+        code = 1 if failing and any(failing in part for part in args) else 0
+        return argparse.Namespace(returncode=code, stdout="", stderr="")
+
+    def run_disarm(**overrides):
+        disarm_calls.clear()
+        fake_outputs.clear()
+        net.clear()
+        net.update({
+            "live": {"state": "open", "draft": False,
+                     "auto_merge": {"merge_method": "squash"},
+                     "user": {"login": "sparq[bot]"}, "labels": [],
+                     "body": f"pr body\n\n<!-- sparq-reviewed-sha:{rev_sha} -->\n",
+                     "head": {"sha": head_69, "ref": "sparq-agent/issue-7-fix",
+                              "repo": {"full_name": "o/r"}},
+                     "base": {"repo": {"default_branch": "main"}}},
+            "commits": [dict(row) for row in merge_advance],
+            "compare": {key: json.loads(json.dumps(doc))
+                        for key, doc in identical_compares.items()},
+        }, **overrides)
+        disarm("o/r", 41, "mismatch")
+
+    try:
+        wiring_globals["_gh_json"] = fake_gh_json
+        wiring_globals["_run_gh"] = fake_run_gh
+        wiring_globals["_write_outputs"] = fake_outputs.update
+        wiring_globals["set_review_state"] = (
+            lambda repo, pr, state: disarm_calls.append(f"state:{state}"))
+        wiring_globals["set_reviewed_sha"] = (
+            lambda repo, pr, sha: disarm_calls.append(f"rebind:{sha}"))
+
+        run_disarm()  # merge-only advance, identical diff => rebind, arm left intact
+        check("carry-forward rebinds to the live head",
+              f"rebind:{head_69}" in disarm_calls, True)
+        check("carry-forward never disarms or probes the queue",
+              [call for call in disarm_calls if call != f"rebind:{head_69}"], [])
+        check("carry-forward outputs stay un-disarmed",
+              (fake_outputs.get("disarmed"), fake_outputs.get("carried_forward")),
+              (False, True))
+
+        evil = json.loads(json.dumps(identical_compares))
+        evil[f"main...{head_69}"]["files"][0]["patch"] = "@@ -1 +1 @@\n-x\n+EVIL"
+        run_disarm(compare=evil)  # same merge shape, DIFFERENT content => normal disarm
+        check("content change under a merge still disarms (REST path)",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls
+               and "pr ready 41 -R o/r --undo" in disarm_calls
+               and "state:needs" in disarm_calls
+               and f"rebind:{head_69}" not in disarm_calls), True)
+        check("content change reports disarmed", fake_outputs.get("disarmed"), True)
+
+        run_disarm(queued=True, commits=[dict(row) for row in plain_advance])
+        check("queued mismatch dequeues via GraphQL",
+              any("dequeuePullRequest" in call for call in disarm_calls), True)
+        check("queued mismatch disables auto-merge via GraphQL",
+              any("disablePullRequestAutoMerge" in call for call in disarm_calls), True)
+        check("queued mismatch never calls gh pr merge",
+              any(call.startswith("pr merge") for call in disarm_calls), False)
+        check("dequeue precedes the auto-merge disable",
+              "dequeuePullRequest" in next(
+                  call for call in disarm_calls
+                  if "dequeuePullRequest" in call or "disablePullRequestAutoMerge" in call),
+              True)
+        check("queued mismatch still redrafts",
+              "pr ready 41 -R o/r --undo" in disarm_calls, True)
+
+        try:
+            run_disarm(queued=True, commits=[dict(row) for row in plain_advance],
+                       fail_mutation="dequeuePullRequest")
+        except WorkerPrError as exc:
+            check("queue API failure raises the structured per-PR error",
+                  str(exc).startswith("disarm o/r#41:"), True)
+        else:
+            check("queue API failure raises the structured per-PR error",
+                  "no error", "raised")
+        check("queue API failure records a skippable output row",
+              (fake_outputs.get("disarmed"), bool(fake_outputs.get("disarm_error"))),
+              (False, True))
+        check("queue API failure never redrafts past the failure",
+              "pr ready 41 -R o/r --undo" in disarm_calls, False)
+    finally:
+        wiring_globals.update(real_disarm_io)
 
     check("fix pushed re-reviews", decide_fix(False, True, True, True, 0, 0), "re-review")
     check("first nochange stays", decide_fix(False, False, True, False, 1, 0), "stay-changes")
