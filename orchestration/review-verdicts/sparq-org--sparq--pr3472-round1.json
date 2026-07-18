@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "fill_lexical_fallback computes prefix_len from String::len() (bytes) and then slices &query_key[..prefix_len]. For a valid Unicode local name whose third byte is inside a multi-byte character (for example a key beginning with `a\u00e9`), byte offset 3 is not a UTF-8 character boundary and Rust panics. IRIs and their local-name suffixes are not restricted to ASCII, so most_similar must not panic on this input.",
+   "file": "crates/sparq-sim/src/lib.rs",
+   "fix_hint": "Choose the prefix boundary with char_indices (or avoid string slicing/prefix filtering entirely), and add a feature-gated test using a non-ASCII IRI local name that calls most_similar without panicking and returns the expected candidate. Ensure the boundary remains valid for all UTF-8 strings.",
+   "severity": "major",
+   "title": "Lexical fallback can panic on UTF-8 local names"
+  },
+  {
+   "body": "The implementation scans only dictionary keys starting with the query's first three bytes. Trigram Jaccard does not require a shared prefix: names such as `xalice` and `alice` share several trigrams and have a positive score, but they occupy different prefix ranges and can never be returned. This contradicts the API/docs claim that the tier fills slots with entities having high local-name trigram-Jaccard similarity; it silently restricts that metric to same-prefix candidates. The added test is vacuous with respect to this invariant because every expected lexical match starts with `ali`.",
+   "file": "crates/sparq-sim/src/lib.rs",
+   "fix_hint": "Generate candidates from a trigram-to-ID index (or scan the lexical index if acceptable) so every entity sharing at least one trigram can be scored, then add a test where the best positive-Jaccard match has a different first trigram/prefix. If prefix-only behavior is intentional, rename and document the narrower metric instead of claiming general trigram-Jaccard fallback.",
+   "severity": "major",
+   "title": "Three-byte prefix scan makes trigram-Jaccard fallback incomplete"
+  }
+ ],
+ "progress": null,
+ "summary": "The new lexical fallback is not correct for its documented domain. It can panic on valid non-ASCII IRI local names, and its prefix-restricted scan omits candidates that have positive trigram-Jaccard similarity but do not share the first three bytes. The tests cover only ASCII names sharing a prefix, so neither defect is exercised.",
+ "verdict": "request_changes"
+}
