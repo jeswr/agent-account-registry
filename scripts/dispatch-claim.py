@@ -1788,10 +1788,43 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     # launched count + defer-reason histogram.
     _write_dispatch_summary(planned, dispatched, defer_reasons)
 
+    # Fail LOUD on ledger rot (issue #28): a tick that launched NOTHING because the lease ledger
+    # errored (CAS failures, unreadable ledger, auth) is byte-identical to a genuinely empty
+    # frontier if it stays green — infra rot can then zero the fleet for hours with nothing
+    # alerting. When the ledger errored AND nothing dispatched, fail the run so the tick is not
+    # mistaken for a quiet backlog. The `ledger=error` field surfaces the same signal on a tick
+    # that still dispatched (partial ledger flakiness), but that tick does NOT fail — dispatching
+    # is demonstrably working and per-item resilience must hold.
+    if _ledger_rot_zeroed_dispatch(dispatched, defer_reasons):
+        raise DispatchError(
+            f"lease ledger errored on {defer_reasons['lease-error']} item(s) and NOTHING "
+            "dispatched this tick — failing loud so ledger rot is not read as an empty frontier")
+
+
+def _ledger_rot_zeroed_dispatch(dispatched, defer_reasons):
+    """Issue #28 fail-loud boundary: True IFF the lease ledger errored this tick AND nothing
+    launched — the exact case that is byte-identical to an empty frontier and so must fail the run
+    rather than stay green. A tick that dispatched at least one item returns False even with ledger
+    errors present (dispatching works; per-item resilience holds); a zero-dispatch tick with NO
+    ledger error (a genuinely empty/contended frontier) also returns False."""
+    return dispatched == 0 and bool(defer_reasons.get("lease-error", 0))
+
+
+def _ledger_health(defer_reasons):
+    """Lease-ledger health for a tick (issue #28): 'error' if ANY item's claim raised a lease-
+    ledger I/O error this tick (CAS failure, unreadable ledger, auth) — the coarse signal that
+    tells a zero-dispatch tick caused by ledger rot apart from a genuinely empty frontier — else
+    'ok'. Derived from the same `lease-error` defer counter dispatch() folds in; no ledger contents
+    or account handles leak into it."""
+    return "error" if defer_reasons.get("lease-error", 0) else "ok"
+
 
 def _write_dispatch_summary(planned, dispatched, defer_reasons):
     """Zero-dispatch visibility (registry #28/#32): emit a compact, privacy-safe summary
-    ({planned, dispatched, defer_reasons histogram}) for the CLAIM step to render + record. NO
+    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram}) for the CLAIM step to
+    render + record. `frontier_size` is the ready-frontier size the tick observed (== planned) and
+    `ledger` is ok|error — together they let the run summary distinguish an empty frontier from a
+    lease-ledger failure (issue #28), which both otherwise present as a green 0-dispatch tick. NO
     issue numbers or account handles — only coarse category counts. Best-effort file write; a
     failure here must never fail dispatch. Called at claim START (planned only — review defect #6)
     and again at the end with the launched counts."""
@@ -1801,6 +1834,7 @@ def _write_dispatch_summary(planned, dispatched, defer_reasons):
     try:
         with open(summary_path, "w", encoding="utf-8") as handle:
             json.dump({"planned": planned, "dispatched": dispatched,
+                       "frontier_size": planned, "ledger": _ledger_health(defer_reasons),
                        "defer_reasons": dict(defer_reasons)}, handle)
     except OSError as exc:
         print(f"::warning::dispatch summary write failed ({exc}); continuing")
@@ -1934,6 +1968,23 @@ def _self_test():
         with open(summary_file, encoding="utf-8") as handle:
             recorded = json.load(handle)
     assert recorded["defer_reasons"]["snapshot-skip:check-runs-overflow"] == 1
+    # Issue #28: the summary carries the ready-frontier size and lease-ledger health so a
+    # 0-dispatch tick can be told apart from a ledger failure. A snapshot-skip-only tick has a
+    # HEALTHY ledger (no lease-error), so ledger == "ok".
+    assert recorded["frontier_size"] == 5, recorded
+    assert recorded["ledger"] == "ok", recorded
+    # _ledger_health flips to "error" exactly when a lease-error is folded in, and stays "ok"
+    # otherwise (an empty histogram or non-ledger defers must NOT masquerade as ledger rot).
+    assert _ledger_health(Counter()) == "ok"
+    assert _ledger_health(Counter({"no-eligible-account": 4})) == "ok"
+    assert _ledger_health(Counter({"lease-error": 1})) == "error"
+    # Fail-loud boundary (issue #28): ONLY a zero-dispatch tick whose ledger errored fails the run.
+    # An empty/contended frontier (no lease-error) stays green, and a tick that dispatched at least
+    # one item stays green even with ledger errors present (dispatching demonstrably works).
+    assert _ledger_rot_zeroed_dispatch(0, Counter({"lease-error": 2})) is True
+    assert _ledger_rot_zeroed_dispatch(0, Counter()) is False
+    assert _ledger_rot_zeroed_dispatch(0, Counter({"no-eligible-account": 3})) is False
+    assert _ledger_rot_zeroed_dispatch(3, Counter({"lease-error": 2})) is False
     assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"})
     assert _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"})
     assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"})
