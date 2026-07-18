@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 3 fixes the prior blocker. Parsed policy terms are now rejected before reasoning if any RDF position mentions the auth/internal SPARQ namespaces, SWAP built-in namespaces, the reserved request IRI, or odrl:Request; this closes both direct auth-grant forwarding and forged odrlx/request derivations. The added inj5-inj8 tests exercise the real public materialization path, require Err, and verify the destination graph remains unchanged. The validation occurs before any reason_n3 invocation or graph mutation, and the existing strict-Turtle parsing plus RDF-term serialization continues to prevent source-syntax injection. No new correctness, soundness, test-validity, or security issue is evident in the supplied diff.",
+ "verdict": "approve"
+}
