@@ -21,16 +21,6 @@
    "expires_at": 1784396458
   },
   {
-   "account": "acct4css",
-   "claim_id": "2104b91c3e4d48e886f6cf7aa0e88617",
-   "holder": "jeswr/agent-account-registry#246@dispatch-29652449024.1",
-   "package": "dashboard",
-   "role": "ci",
-   "model": "fable",
-   "issued_at": 1784393055,
-   "expires_at": 1784395755
-  },
-  {
    "account": "acct03",
    "claim_id": "a1af537820064d25a0016c2a80f1ab85",
    "holder": "fix:sparq-org/sparq#3442@dispatch-29652726292.1",
