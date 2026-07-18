@@ -569,6 +569,27 @@ def filter_busy_area_items(items, repo, pulls, issue_labels):
     return kept
 
 
+def is_enumerable_provenance(record, pr_number):
+    """True iff a PARSED provenance record passes EVERY record-shape check the review loop
+    applies before claiming target PR ``pr_number``: the PLAN admission in
+    enumerate_review_items (dict shape, matching ``pr_number``, registered ``impl_provider``)
+    PLUS the CLAIM-time record checks (well-formed 40-hex ``head_sha_at_open``, salted 16-hex
+    ``impl_account_h`` — locked decision 22a). A record failing ANY of these is rejected or
+    deferred by this module, so the review loop never drives the PR carrying it.
+
+    SHARED source of truth with groom.py's draft age-park carve-out: groom treats a stale
+    draft worker PR as review-loop-owned (and so exempt from the terminal needs:user park)
+    ONLY when this returns True. Importing this single predicate is what keeps the two
+    decisions from drifting — change the admission schema HERE and groom follows."""
+    return bool(
+        isinstance(record, dict)
+        and record.get("pr_number") == pr_number
+        and record.get("impl_provider") in IMPL_PROVIDERS
+        and SAFE_SHA.fullmatch(str(record.get("head_sha_at_open", "")))
+        and re.fullmatch(r"[0-9a-f]{16}", str(record.get("impl_account_h", "")))
+    )
+
+
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
                            pr_status=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
@@ -1930,6 +1951,33 @@ def _self_test():
     # known bot login pins authorship exactly
     assert enumerate_review_items(repo, pulls[:1], provenance, [], issue_labels, now,
                                   bot_login="another[bot]") == []
+
+    # ---- is_enumerable_provenance (shared with groom.py's draft age-park carve-out) ----
+    # Known-good: exactly the fixtures the enumerator admits above.
+    assert is_enumerable_provenance(provenance[41], 41)
+    assert is_enumerable_provenance(provenance[42], 42)
+    # PLAN-side parity: a record the enumerator refuses is never valid for the predicate.
+    mismatched = {**provenance[41], "pr_number": 40}
+    assert enumerate_review_items(repo, pulls[:1], {41: mismatched}, [],
+                                  issue_labels, now) == []
+    assert not is_enumerable_provenance(mismatched, 41)
+    bad_provider = {**provenance[41], "impl_provider": "mallory"}
+    assert enumerate_review_items(repo, pulls[:1], {41: bad_provider}, [],
+                                  issue_labels, now) == []
+    assert not is_enumerable_provenance(bad_provider, 41)
+    assert not is_enumerable_provenance("not-a-dict", 41)
+    assert not is_enumerable_provenance({}, 41)
+    # CLAIM-side parity: PLAN still enumerates these (the record checks run at claim time,
+    # with an actionable defer message), but CLAIM defers them every tick — the predicate is
+    # deliberately the STRICTER union, matching what the loop will actually drive to a claim.
+    bad_sha = {**provenance[41], "head_sha_at_open": "not-a-sha"}
+    assert enumerate_review_items(repo, pulls[:1], {41: bad_sha}, [], issue_labels, now) != []
+    assert not is_enumerable_provenance(bad_sha, 41)
+    bad_hash = {**provenance[41], "impl_account_h": "raw-handle@example"}
+    assert enumerate_review_items(repo, pulls[:1], {41: bad_hash}, [], issue_labels, now) != []
+    assert not is_enumerable_provenance(bad_hash, 41)
+    assert not is_enumerable_provenance(
+        {key: value for key, value in provenance[41].items() if key != "impl_account_h"}, 41)
 
     # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
     runs = [
