@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly recognizes the canonical model-health ledger, reuses the existing fail-closed ledger validator and shared exit-class constants, selects the newest record per provider/model, bounds output, omits account hashes, and preserves legacy model-health normalization. The self-test is non-vacuous: it verifies newest-record precedence, class-to-status folding, omission of model-less fleet signals, generated-at behavior, and rejection of a malformed account identifier. No trust check is weakened and no actionable correctness or security issue is supported by the diff.",
+ "verdict": "approve"
+}
