@@ -1503,6 +1503,14 @@
    "model_alias": "fable",
    "exit_class": "success",
    "run_id": "29627229959.1"
+  },
+  {
+   "ts": 1784342915,
+   "provider": "anthropic",
+   "account": "9e13ea21abf27e68",
+   "model_alias": "fable",
+   "exit_class": "success",
+   "run_id": "29627054234.1"
   }
  ]
 }
