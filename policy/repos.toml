@@ -24,7 +24,6 @@
 #   gate_profile           = "none" | "lint-only" | "crate-scoped" | "workspace"
 #   arm_auto_merge         = bool
 #   max_attempts           = positive integer
-#   dispatch               = "cron" | "cron+doorbell"
 #   trust                  = "collaborators"
 # Optional cross-provider review-loop fields (defaults in policy-resolve.py):
 #   max_review_rounds        = positive integer (default 3)  # BASE review<->fix rounds; on
@@ -48,7 +47,6 @@ arm_auto_merge = true         # arming now actually happens — ONLY in the revi
 require_usage = true          # hold (fail-closed) if the usage probe is unavailable
 usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH windows
 max_attempts = 3              # per-issue worker attempts (also bounds the deferred-retry loop)
-dispatch = "cron"
 trust = "collaborators"
 max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total (see header)
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
@@ -77,7 +75,6 @@ arm_auto_merge = true         # allow_auto_merge is enabled live (B1); the FINAL
 require_usage = true          # hold (fail-closed) if the usage probe is unavailable
 usage_safety_margin = 0.05    # small python jobs — 15% headroom over-delayed registry claims (2026-07-17); sparq keeps 0.15
 max_attempts = 3
-dispatch = "cron"
 trust = "collaborators"
 max_review_rounds = 3
 review_queue_ttl_minutes = 30
