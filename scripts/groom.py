@@ -48,6 +48,10 @@ STALE_PARK_V2_RE = re.compile(
     r"parked_at:(?P<parked_at>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{8,15}(?:Z|[+-][0-9]{2}:[0-9]{2})) -->"
 )
 UNPARK_MARKER = "<!-- registry-groom-stale-pr-unpark:v1 -->"
+# A head sha is only trusted as a full lowercase 40-hex commit id. Anything else (empty,
+# truncated, or arbitrary text in a malformed API response) must never be read as "the branch
+# moved" — a fabricated head would otherwise count as progress and lift a park.
+HEAD_SHA_RE = re.compile(r"[0-9a-f]{40}")
 # The authoritative aggregator check-run on the target (sparq's `ci-summary / gate` job). Keep in
 # sync with dispatch-claim.py CI_GATE_CHECK. Fleet recovery means THIS check went green on the
 # parked head — an unrelated green matrix leg proves nothing while the required gate is still red.
@@ -420,9 +424,10 @@ def unpark_reason(
           the label-event timeline shows the CURRENT needs:user application was performed by the
           bot itself (a human remove-then-reapply makes the label human-owned even while groom's
           park comment remains the latest marker);
-      (b) no non-bot comment or review landed after that park (a human who engaged owns the PR);
-      (c) the staleness cause has cleared — a new head sha, OR the authoritative gate check
-          (CI_GATE_CHECK) whose LATEST run completed successfully on this head after the park
+      (b) no non-bot comment or review landed at or after that park's second (a human who
+          engaged owns the PR; sub-second order is unknowable, so same-second blocks);
+      (c) the staleness cause has cleared — a new well-formed head sha, OR the authoritative
+          gate check (CI_GATE_CHECK) whose LATEST run completed successfully on this head after the park
           (fleet recovery; an unrelated green matrix leg is never recovery), OR a now-clean
           merge state;
       (d) review:needs-user (the review loop's terminal escalation) is absent — that label is
@@ -448,10 +453,13 @@ def unpark_reason(
     ):
         return None
     bot = bot_login.casefold()
+    # >= not >: _epoch truncates to whole seconds, so sub-second ordering inside the park's
+    # second is unknowable — a human comment/review stamped in the SAME second as the park must
+    # block (fail closed) rather than be assumed to precede it.
     for comment in comments:
         if (
             str(comment.get("user", {}).get("login", "")).casefold() != bot
-            and _epoch(comment.get("created_at"), "pull request comment") > park.at
+            and _epoch(comment.get("created_at"), "pull request comment") >= park.at
         ):
             return None
     for review in reviews:
@@ -460,10 +468,14 @@ def unpark_reason(
             continue
         submitted = review.get("submitted_at")
         # A non-bot review without a parseable timestamp blocks unpark (fail conservative).
-        if not isinstance(submitted, str) or _epoch(submitted, "pull request review") > park.at:
+        if not isinstance(submitted, str) or _epoch(submitted, "pull request review") >= park.at:
             return None
     head_sha = pull.get("head", {}).get("sha", "")
-    if park.sha is not None and isinstance(head_sha, str) and head_sha and head_sha != park.sha:
+    # Fail closed on a malformed head sha: it can never prove a new commit, and the gate
+    # check-runs (keyed to this sha) and merge state describe a head we cannot identify.
+    if not isinstance(head_sha, str) or HEAD_SHA_RE.fullmatch(head_sha) is None:
+        return None
+    if park.sha is not None and head_sha != park.sha:
         return "the branch has a new head commit"
     if pull.get("draft") is not True and pull.get("mergeable_state") == "clean":
         return "the merge state is now clean"
@@ -867,19 +879,43 @@ def _apply_labels(
     return bool(add or remove)
 
 
-def _unpark_writes(api: GitHubAPI, repo: str, number: int, body: str) -> None:
-    """Consumption-marker-then-delabel, in that order — the unpark must fail conservatively.
-    If the label DELETE fails after the marker posts, the park record is already consumed and
-    the PR simply stays parked until a human lifts it. The reverse order opens a window (label
-    gone, park record still live) in which a needs:user applied later by a human could be
-    attributed to groom by a subsequent sweep and stolen."""
+def _unpark_writes(api: GitHubAPI, repo: str, number: int, bot_login: str, body: str) -> bool:
+    """Consumption-marker, fresh label-ownership re-proof, then delabel — in that order; True
+    only when the label was actually removed.
+
+    Marker before DELETE: if the DELETE fails after the marker posts, the park record is
+    already consumed and the PR simply stays parked until a human lifts it. The reverse order
+    opens a window (label gone, park record still live) in which a needs:user applied later by
+    a human could be attributed to groom by a subsequent sweep and stolen.
+
+    Re-proof before DELETE: the sweep's unpark decision was taken from a timeline read that is
+    seconds stale by write time — a human who removed and re-applied needs:user in between owns
+    the CURRENT application, and label DELETE-by-name is unconditional (no If-Match), so groom
+    must re-read the timeline immediately before deleting and fail closed if the latest
+    application is no longer its own. Failing here leaves the marker posted and the label
+    intact: the park record is consumed, the human's label stands, and no later sweep can
+    attribute it to groom. Only a groom-owned hold label distinct from needs:user could close
+    the residual re-read→DELETE instant entirely; until that migration, this re-proof is the
+    tightest ownership check the API offers."""
     api.request("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body})
     print(f"WRITE unpark comment repo={repo} pr={number}")
+    timeline = [
+        event
+        for event in api.paginate(f"/repos/{repo}/issues/{number}/timeline")
+        if isinstance(event, dict)
+    ]
+    if not bot_owns_current_label(timeline, "needs:user", bot_login):
+        print(
+            f"SKIP unpark {repo}#{number}: needs:user changed hands between the sweep's "
+            "decision and the write — the label now stands as human-owned"
+        )
+        return False
     api.request(
         "DELETE",
         f"/repos/{repo}/issues/{number}/labels/{quote('needs:user', safe='')}",
     )
     print(f"WRITE remove label repo={repo} issue={number} label=needs:user")
+    return True
 
 
 def _fresh_issue(api: GitHubAPI, repo: str, number: int) -> dict[str, Any] | None:
@@ -1185,7 +1221,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         if label_changed or park is None or (park.sha is not None and park.sha != head_sha):
             marker = (
                 park_marker(head_sha, now)
-                if isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                if isinstance(head_sha, str) and HEAD_SHA_RE.fullmatch(head_sha)
                 else STALE_PR_MARKER
             )
             body = (
@@ -1240,7 +1276,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             ]
             head_sha = detail.get("head", {}).get("sha")
             check_runs: list[dict[str, Any]] = []
-            if isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            if isinstance(head_sha, str) and HEAD_SHA_RE.fullmatch(head_sha):
                 runs_doc = target_api.request(
                     "GET", gate_check_runs_path(repo, head_sha)
                 )
@@ -1262,8 +1298,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 "`needs:user` or any `review:needs-user` is never touched by grooming.\n\n"
                 f"{UNPARK_MARKER}"
             )
-            _unpark_writes(target_api, repo, number, body)
-            unparked += 1
+            if _unpark_writes(target_api, repo, number, bot_login, body):
+                unparked += 1
 
     reclaimed = _release_claims(registry_api, registry_repo, dead_claims)
     print(
@@ -1738,6 +1774,47 @@ def _self_test() -> int:
         ),
         None,
     )
+    # Epoch truncation: sub-second order inside the park's second is unknowable, so same-second
+    # human activity must block — with a strict > these two cases would unpark ("new head").
+    same_second = datetime.fromtimestamp(park_at, timezone.utc).isoformat()
+    check(
+        "no unpark: a human comment in the same second as the park blocks",
+        unpark_reason(
+            parked_pull, parked_labels, park,
+            [park_comment, {"user": {"login": "human"}, "created_at": same_second}],
+            [], [], bot_labeled, "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: a human review in the same second as the park blocks",
+        unpark_reason(
+            parked_pull, parked_labels, park, [park_comment],
+            [{"user": {"login": "human"}, "submitted_at": same_second}], [],
+            bot_labeled, "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: a malformed head sha is never a new commit (fail closed)",
+        unpark_reason(
+            {**parked_pull, "head": {"ref": "sparq-agent/issue-7-99-1", "sha": "not-a-github-sha"}},
+            parked_labels, park, [park_comment], [], [], bot_labeled, "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: a missing head sha blocks even a clean merge state",
+        unpark_reason(
+            {
+                **parked_pull,
+                "head": {"ref": "sparq-agent/issue-7-99-1", "sha": ""},
+                "mergeable_state": "clean",
+            },
+            parked_labels, park, [park_comment], [], [], bot_labeled, "app[bot]",
+        ),
+        None,
+    )
     check(
         "no unpark: review:needs-user stays strictly human-owned",
         unpark_reason(
@@ -1767,21 +1844,47 @@ def _self_test() -> int:
     )
 
     class _OrderStub:
-        def __init__(self):
+        def __init__(self, timeline):
+            self.timeline = timeline
             self.calls: list[tuple[str, str]] = []
 
         def request(self, method, path, body=None, **_kwargs):
             self.calls.append((method, path))
             return {}
 
-    order_stub = _OrderStub()
-    _unpark_writes(order_stub, "o/r", 5, "unparking body")
+        def paginate(self, path):
+            self.calls.append(("GET", path))
+            return self.timeline
+
+    order_stub = _OrderStub(bot_labeled)
     check(
-        "unpark is marker-then-delabel (consumption marker posts before the DELETE)",
+        "unpark removes the label once a fresh timeline re-proves bot ownership",
+        _unpark_writes(order_stub, "o/r", 5, "app[bot]", "unparking body"),
+        True,
+    )
+    check(
+        "unpark is marker, fresh ownership re-read, then delabel — in that order",
         order_stub.calls,
         [
             ("POST", "/repos/o/r/issues/5/comments"),
+            ("GET", "/repos/o/r/issues/5/timeline"),
             ("DELETE", "/repos/o/r/issues/5/labels/needs%3Auser"),
+        ],
+    )
+    # Decision→write race: a human removed and re-applied needs:user after the sweep decided to
+    # unpark but before the DELETE. The fresh re-read must catch it and never issue the DELETE.
+    stolen_stub = _OrderStub(human_relabel)
+    check(
+        "no delabel: needs:user changed hands between the unpark decision and the write",
+        _unpark_writes(stolen_stub, "o/r", 5, "app[bot]", "unparking body"),
+        False,
+    )
+    check(
+        "the raced unpark consumed the park record (marker posted) but issued no DELETE",
+        stolen_stub.calls,
+        [
+            ("POST", "/repos/o/r/issues/5/comments"),
+            ("GET", "/repos/o/r/issues/5/timeline"),
         ],
     )
     check(
