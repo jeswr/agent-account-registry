@@ -895,16 +895,20 @@ def _open_blockers(repo, body):
     """Issue #102 readiness leg: re-derive `Blocked-by: #N` from the LIVE body and confirm every
     referenced issue is closed, using registry-owned code — CLAIM never trusts the planner's
     open-blocker count. Returns the sorted list of blocker numbers still OPEN. Fail-closed: a
-    blocker whose live state cannot be fetched raises DispatchError (the item then defers, per the
-    per-item resilience in dispatch()), so a row CLAIM cannot prove unblocked is never dispatched."""
+    blocker whose live state cannot be fetched, or whose state is anything other than exactly
+    "open"/"closed", raises DispatchError (the item then defers, per the per-item resilience in
+    dispatch()), so a row CLAIM cannot prove unblocked is never dispatched."""
     numbers = sorted({int(match) for match in BLOCKED_BY_RE.findall(body)})
     still_open = []
     for number in numbers:
         blocker = _gh_json(["api", f"repos/{repo}/issues/{number}"])
-        if not isinstance(blocker, dict) or "state" not in blocker:
-            raise DispatchError(f"blocker {repo}#{number} state is unreadable")
-        if str(blocker.get("state")).lower() == "open":
+        state = blocker.get("state") if isinstance(blocker, dict) else None
+        if state == "open":
             still_open.append(number)
+        elif state != "closed":
+            # null/"unknown"/non-string states are NOT proof of closure — fail closed rather
+            # than dispatch a row whose blocker cannot be confirmed resolved.
+            raise DispatchError(f"blocker {repo}#{number} state is unreadable")
     return still_open
 
 
@@ -2089,6 +2093,15 @@ def _self_test():
         raise AssertionError("unreadable blocker must fail closed")
     except DispatchError:
         pass
+    # fail-closed: a PRESENT but malformed blocker state is not proof of closure — every
+    # non-open/closed value raises rather than dispatching (null, unexpected enum, wrong type,
+    # and case drift from the exact REST lowercase values all refuse)
+    for bad_state in (None, "unknown", "OPEN", "Closed", 1, ["open"]):
+        try:
+            match_with(ready_issue(ready_labels, blk_body), {42: {"state": bad_state}}, blk_item)
+            raise AssertionError(f"malformed blocker state {bad_state!r} must fail closed")
+        except DispatchError:
+            pass
     # the parser is byte-identical to the ready engine's blocker regex (no silent divergence)
     assert BLOCKED_BY_RE.findall("Blocked-by: #7 and blocked-by:#8") == ["7", "8"]
     # A DRAFT worker PR must land in linked_open_prs (dedupes issue re-dispatch) while the SAME PR
