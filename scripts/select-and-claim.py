@@ -360,21 +360,34 @@ def _parse_account(body):
 
 
 def read_accounts(repo):
-    """The account catalog from the open account issues (title=handle, YAML body, status:available)."""
-    out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
-                "--json", "title,body,labels"]).stdout
+    """The account catalog from the open account issues (title=handle, YAML body, status:available).
+
+    Fully paginated + strictly validated (sol r11): `gh issue list --limit 500` silently DROPS
+    older account entries past 500 open issues, and a top-level non-list (e.g. {}) coerced to
+    empty made coverage_ok=true while the dashboard rendered accounts unknown — the semantic
+    coverage denominator must never be silently lossy."""
+    out = _run(["gh", "api", "--paginate", "--slurp",
+                f"repos/{repo}/issues?state=open&per_page=100",
+                "-q", "[.[][] | select(.pull_request | not) | "
+                      "{title: .title, body: .body, labels: [.labels[] | {name: .name}]}]"
+                ]).stdout
     if not (out or "").strip():
-        # rc 0 with ZERO bytes is a truncated read, not an empty catalog — gh prints "[]" for
-        # one. Coercing it to [] fails open everywhere downstream ([FABLE-5] round-9 audit: the
-        # claim path would report "no eligible account" as a capacity signal, and the usage
-        # probe's semantic-coverage gate would read an expectation of 0 — an empty snapshot as
-        # health). Garbled non-empty output already raises via json.loads below.
+        # rc 0 with ZERO bytes is a truncated read, not an empty catalog — the query prints
+        # "[]" for one. Coercing it to [] fails open everywhere downstream ([FABLE-5] round-9
+        # audit + sol r11): the claim path would report "no eligible account" as a capacity
+        # signal, and the usage probe's semantic-coverage gate would read an expectation of 0.
         raise LeaseIOError("registry account catalog read returned no payload")
+    items = json.loads(out)
+    if not isinstance(items, list):
+        raise LeaseIOError("registry account catalog payload is not a list")
     accounts = []
-    for it in json.loads(out):
+    for it in items:
+        if not isinstance(it, dict) or not isinstance(it.get("title"), str):
+            raise LeaseIOError("registry account catalog item is malformed")
         a = _parse_account(it.get("body"))
         a["handle"] = it["title"].strip()
-        a["available"] = any(lb["name"] == "status:available" for lb in it.get("labels", []))
+        a["available"] = any(lb.get("name") == "status:available"
+                             for lb in it.get("labels", []) if isinstance(lb, dict))
         if a["handle"] and a["models"]:
             accounts.append(a)
     return accounts
@@ -875,6 +888,26 @@ def _self_test():
     subprocess.run = _fake_catalog("[]")
     try:
         check("a genuinely empty '[]' catalog still reads as empty", read_accounts("o/r"), [])
+    finally:
+        subprocess.run = real_run
+    # sol r11: a non-list payload ({} etc.) must RAISE, never read as an empty catalog — it
+    # made coverage_ok=true while the dashboard rendered real accounts unknown.
+    subprocess.run = _fake_catalog("{}")
+    try:
+        try:
+            read_accounts("o/r")
+            check("non-list catalog payload raises (fail closed)", "no error", "LeaseIOError")
+        except LeaseIOError:
+            check("non-list catalog payload raises (fail closed)", "LeaseIOError", "LeaseIOError")
+    finally:
+        subprocess.run = real_run
+    subprocess.run = _fake_catalog('[{"body": "x"}]')
+    try:
+        try:
+            read_accounts("o/r")
+            check("malformed catalog item raises (fail closed)", "no error", "LeaseIOError")
+        except LeaseIOError:
+            check("malformed catalog item raises (fail closed)", "LeaseIOError", "LeaseIOError")
     finally:
         subprocess.run = real_run
 
