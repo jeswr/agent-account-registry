@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The new workflow commentary states exact +16.7% and +8.3% growth figures. The reviewer contract prohibits hard-coded performance numbers, and these historical values are not load-bearing to explaining why the missing CI invocation is a bug. Keeping them here creates stale, non-canonical performance evidence in a durable workflow comment.",
+   "file": ".github/workflows/zk-toolchain.yml",
+   "fix_hint": "Replace the exact percentages with qualitative wording such as 'grew well past the checked-in 3% regression tolerance'; make the corresponding change in the duplicated gate_count.rs module documentation.",
+   "severity": "major",
+   "title": "Remove hard-coded gate-growth percentages"
+  }
+ ],
+ "progress": null,
+ "summary": "The workflow change correctly closes the coverage gap by running the non-ignored gate-count and catalog test binaries after the pinned nargo/bb toolchain is installed. However, the added documentation embeds hard-coded performance/gate-growth percentages, contrary to the repository's review policy; those figures will also become stale independently of the code and snapshots.",
+ "verdict": "request_changes"
+}
