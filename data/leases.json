@@ -172,16 +172,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "512f9129371a43218c0b58aec8548d50",
-   "holder": "sparq-org/sparq#2871@dispatch-29626184649.1",
-   "package": "ci-fragments",
-   "role": "impl",
-   "model": "terra",
-   "issued_at": 1784340024,
-   "expires_at": 1784346324
-  },
-  {
-   "account": "acct01",
    "claim_id": "5d31d8c8a5f449238140b84299b856be",
    "holder": "sparq-org/sparq#3013@dispatch-29626184649.1",
    "package": "deps",
