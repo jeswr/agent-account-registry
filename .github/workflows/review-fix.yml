@@ -1310,8 +1310,8 @@ jobs:
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
-          # [OPUS-4.8] B3: the LIVE trust-surface arm gate re-derives the PR diff and, if it
-          # touches one of these paths, withholds auto-arm and escalates to a human.
+          # [OPUS-4.8] B3, revised per Decision 7 (2026-07-18): the LIVE trust-surface
+          # derivation now feeds the SHA-bound pre-arm AUDIT trail instead of a human park.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
         run: |
           set -euo pipefail
@@ -1325,6 +1325,7 @@ jobs:
             --reviewer-provider "${{ needs.claim.outputs.provider }}"
             --arm "${{ needs.resolve.outputs.arm_auto_merge }}"
             --issue "${{ needs.resolve.outputs.issue }}"
+            --bot-login "${{ needs.resolve.outputs.bot_login }}"
           )
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")

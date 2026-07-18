@@ -1203,7 +1203,7 @@ def disarm(repo, pr_number, when):
 
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
-                  reviewer_account, arm, issue=None, surface_paths=None):
+                  reviewer_account, arm, issue=None, surface_paths=None, bot_login=""):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval).
 
@@ -1243,14 +1243,20 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # POST-arm audit trail below (label + comment applied only after a SUCCESSFUL arm,
         # with checked failures — sol r1 on #257).
         surfaces = tuple(surface_paths) if surface_paths else DEFAULT_TRUST_SURFACE_PATHS
-        live_files = _pr_changed_files(repo, pr_number)
-        trust_hits = trust_surface_paths_touched(live_files, surfaces)
+        # SHA-BOUND snapshot (sol r3): the mutable PR files endpoint is ABA-racable
+        # (A -> benign B -> A force-push between the head check and this read would hide
+        # the hits while the CAS still accepts A). The compare at the immutable
+        # reviewed_sha cannot change under us.
+        base_ref = str((live.get("base") or {}).get("ref", "")) or "main"
+        trust_hits = trust_surface_paths_touched(
+            _files_at_sha(repo, base_ref, reviewed_sha), surfaces)
     if arm and trust_hits:
         # Durable audit BEFORE the merge latch can fire (sol r2 on #257): auto-merge can
         # complete immediately, and a post-merge crash would leave an armed trust diff with
         # no audit trail (reconciliation only walks open PRs). The comment/label are
         # SHA-bound and idempotent, so an arm failure + re-review re-audits the new head.
-        _apply_trust_surface_audit(repo, pr_number, trust_hits, reviewed_sha)
+        _apply_trust_surface_audit(repo, pr_number, trust_hits, reviewed_sha,
+                                   bot_login=bot_login)
     _run_gh(["pr", "ready", str(pr_number), "-R", repo])
     if arm:
         # Atomic SHA-bound arm (sol r2): GitHub's own CAS — the latch only sets if the head
@@ -1284,7 +1290,26 @@ TRUST_AUDIT_MARKER_PREFIX = "<!-- sparq-trust-audit:v1 sha="
 TRUST_AUDIT_MARKER = TRUST_AUDIT_MARKER_PREFIX  # back-compat alias for tests/greps
 
 
-def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha):
+def _files_at_sha(repo, base_ref, sha):
+    """Changed-file names from the IMMUTABLE base...sha compare (paginated) — the SHA-bound
+    counterpart of the mutable PR files endpoint, for decisions that must bind to the
+    reviewed head (sol r3 on #257)."""
+    files = []
+    page = 1
+    while True:
+        doc = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{sha}"
+                              f"?per_page=100&page={page}"])
+        rows = doc.get("files") if isinstance(doc, dict) else None
+        if not rows:
+            break
+        files.extend(str(r.get("filename", "")) for r in rows if isinstance(r, dict))
+        if len(rows) < 100:
+            break
+        page += 1
+    return files
+
+
+def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha, bot_login=""):
     """Durable PRE-arm audit trail for an arming trust-plane diff (Decision 7 revision,
     hardened per sol r2 on #257): the label + ONE idempotent comment listing the touched
     security paths, SHA-BOUND — the idempotency marker carries the reviewed sha and only a
@@ -1300,15 +1325,18 @@ def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha):
                  "--color", "D93F0B"], check=False)
         _run_gh(["pr", "edit", str(pr_number), "-R", repo, "--add-label", "trust-surface"])
     existing = _paginated_comments(repo, pr_number)
-    if not any(marker in str(c.get("body", ""))
-               and str(c.get("user", {}).get("login", "")).endswith("[bot]")
-               for c in existing):
-        body = ("> \U0001F916 SPARQ agent\n\nArming on cross-provider approve. "
-                "Trust-surface audit trail: " + ", ".join(hits[:8]) + " @ "
+    # Only the EXACT App identity may suppress a re-post (sol r3: any-[bot] let a foreign
+    # issues-write bot pre-seed the marker); with no bot_login supplied, nothing suppresses
+    # (fail toward a duplicate audit, never toward a missing one).
+    if not (bot_login and any(
+            marker in str(c.get("body", ""))
+            and str(c.get("user", {}).get("login", "")) == bot_login
+            for c in existing)):
+        body = ("> 🤖 SPARQ agent\n\nArming on cross-provider approve. "
+                "Trust-surface audit trail (complete): " + ", ".join(hits) + " @ "
                 + reviewed_sha[:12] + ". Post-merge review welcome; revert-and-reopen is "
                 "the escalation path.\n\n" + marker)
-        _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body",
-                 body.encode().decode("unicode_escape")])
+        _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body", body])
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
@@ -2233,7 +2261,15 @@ def _self_test():
         "_paginated_comments", "needs_user", "_write_outputs")}
 
     def raa_gh_json(args, **_kw):
-        return {"state": "open", "head": {"sha": raa_state["head"]}}
+        path = args[1] if len(args) > 1 else ""
+        if "/compare/" in path:
+            # the SHA-bound snapshot (sol r3): only the reviewed sha's compare carries hits
+            sha_in_path = path.split("...", 1)[1].split("?", 1)[0]
+            files = ([{"filename": "scripts/worker-pr.py"}]
+                     if sha_in_path == "b" * 40 else [])
+            return {"files": files}
+        return {"state": "open", "head": {"sha": raa_state["head"]},
+                "base": {"ref": "main"}}
 
     def raa_run_gh(args, **kw):
         raa_calls.append(" ".join(args))
@@ -2254,7 +2290,8 @@ def _self_test():
         globals()["_paginated_comments"] = lambda repo, pr: list(comments)
         globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
         globals()["_write_outputs"] = raa_outputs.update
-        ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True)
+        ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
+                      bot_login="sparq[bot]")
 
     try:
         sha = "b" * 40
@@ -2286,6 +2323,13 @@ def _self_test():
         run_raa(comments=(human_marker,))
         check("a non-bot marker does NOT suppress the audit",
               any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        foreign_bot = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{sha} -->",
+                       "user": {"login": "other-ci[bot]"}}
+        run_raa(comments=(foreign_bot,))
+        check("a FOREIGN bot marker does NOT suppress the audit (exact App pin, sol r3)",
+              any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        check("the audit snapshot is SHA-bound (compare at reviewed sha, not the PR endpoint)",
+              raa_outputs.get("trust_surface"), True)
         run_raa(head_ok=False)
         check("head race returns to review:needs with NO arm and NO audit",
               ("state:needs" in raa_calls,
@@ -2395,6 +2439,8 @@ def main():
     # security_paths). Empty -> DEFAULT_TRUST_SURFACE_PATHS (fail closed, never silently absent).
     arm.add_argument("--surface-path", action="append", default=[],
                      help="trust-surface path/prefix (repeatable; from policy security_paths)")
+    arm.add_argument("--bot-login", default="",
+                     help="the App bot login (exact audit-marker suppression identity)")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -2493,7 +2539,8 @@ def main():
                           args.impl_account_h, args.reviewer_provider,
                           os.environ.get("WORKER_REVIEWER_ACCOUNT", ""),
                           args.arm == "true", issue=args.issue,
-                          surface_paths=args.surface_path or None)
+                          surface_paths=args.surface_path or None,
+                          bot_login=args.bot_login)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":
