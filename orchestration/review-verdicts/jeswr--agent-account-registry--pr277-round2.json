@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves all three prior major findings. Exhaustion suppression now requires an open PR that matches the target repository, App-bot identity, worker marker, worker branch, valid shared review-loop provenance schema, PR number, and exact provenance/branch issue binding; loose branch/body linkage no longer grants the exemption. The defer path re-lists open PRs immediately at the mutation boundary and skips the terminal label transition when a qualifying PR appeared after planning. The self-test is non-vacuous: it covers arbitrary body linkage, fork and author/marker/provenance failures, issue-binding mismatch, unresolved bot identity, plan-time admitted versus unadmitted behavior, a PR appearing only on the boundary read with no writes, and the inverse no-PR case where both defer label mutations must occur. No new blocker, major, or lower-severity defect is supported by the diff-scoped evidence.",
+ "verdict": "approve"
+}
