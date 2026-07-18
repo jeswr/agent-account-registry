@@ -203,14 +203,52 @@ def _gh_json(args):
         raise BackfillError("GitHub returned malformed JSON") from exc
 
 
-def _load_worker_pr():
-    path = Path(__file__).resolve().parent / "worker-pr.py"
-    spec = importlib.util.spec_from_file_location("registry_worker_pr", path)
+def _load_script_module(filename, module_name):
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
-        raise BackfillError("cannot load worker-pr.py")
+        raise BackfillError(f"cannot load {filename}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_worker_pr():
+    return _load_script_module("worker-pr.py", "registry_worker_pr")
+
+
+def _load_dispatch_claim():
+    """The review loop's OWN admission schema (dispatch-claim.provenance_admission_error) —
+    IMPORTED, never replicated (same posture as groom), so backfill's "already recorded"
+    judgement and the review loop's "will this record be admitted" judgement cannot drift."""
+    return _load_script_module("dispatch-claim.py", "registry_dispatch_claim")
+
+
+def effective_record_body(probe, ledger_ref):
+    """The EFFECTIVE existing-record body for a PR — ledger-first — or None when neither copy
+    exists. Readers consume the ledger copy FIRST (issue #96), so a present ledger record is
+    judged AS-IS; the master fallback covers ONLY the clean ledger 404 (the pre-outage
+    migration case — mirrors groom.worker_pr_provenance_enumerable). ``probe(ref=...)``
+    returns (body, sha), (None, None) on a clean 404, and RAISES on any other failure — a
+    transient/permission ledger error must never fall through to master and let a possibly
+    divergent or invisible primary record count as recorded (sol #217)."""
+    body, _sha = probe(ref=ledger_ref)
+    if body is not None:
+        return body
+    body, _sha = probe(ref=None)
+    return body
+
+
+def existing_record_admission_error(body, pr_number, admission_error):
+    """Why an existing record body does NOT admit target PR ``pr_number``, or None when it
+    passes the review loop's full admission (sol #217: a successful Contents response used to
+    short-circuit UNDECODED, so a malformed/mismatched record — which every reader rejects —
+    was skipped as "already recorded" and the PR stayed fail-closed invisible forever)."""
+    try:
+        record = json.loads(body)
+    except ValueError:
+        return "the record is not valid JSON"
+    return admission_error(record, pr_number)
 
 
 def _ensure_draft(target_repo, number, is_draft, apply_changes):
@@ -232,6 +270,7 @@ def _ensure_draft(target_repo, number, is_draft, apply_changes):
 
 def backfill(target_repo, registry_repo, routing_file, apply_changes):
     worker_pr = _load_worker_pr()
+    admission_error = _load_dispatch_claim().provenance_admission_error
     import tomllib
     with open(routing_file, "rb") as handle:
         routing = tomllib.load(handle)
@@ -265,18 +304,34 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         issue, run_id, attempt = parsed
         record_path = worker_pr.provenance_path(target_repo, number)
         # Post-outage records live on the `ledger` data-plane branch (issue #96); pre-outage
-        # ones on master. Either counts as already-recorded.
-        probe = _run_gh(
-            ["api", f"repos/{registry_repo}/contents/{record_path}?ref={worker_pr.LEDGER_REF}"],
-            check=False)
-        if probe.returncode != 0:
-            probe = _run_gh(["api", f"repos/{registry_repo}/contents/{record_path}"],
-                            check=False)
-        if probe.returncode == 0:
-            skipped += 1
-            print(f"skip #{number}: provenance already recorded")
-            # Still reconcile the draft state (an earlier pass may have crashed between the two).
-            _ensure_draft(target_repo, number, is_draft, apply_changes)
+        # ones on master. "Already recorded" is claimable ONLY when the effective ledger-first
+        # record decodes and passes the review loop's admission for THIS PR (sol #217): a
+        # non-404 probe failure defers the PR (worker_pr._probe_registry_file raises — unknown
+        # never counts as recorded), and a present-but-inadmissible record is NEEDS-HUMAN,
+        # never a skip (this script never rewrites an existing record).
+        pr_probe = lambda ref=None: worker_pr._probe_registry_file(  # noqa: E731
+            registry_repo, record_path, ref=ref)
+        try:
+            body = effective_record_body(pr_probe, worker_pr.LEDGER_REF)
+        except worker_pr.WorkerPrError as exc:
+            needs_human += 1
+            print(f"NEEDS-HUMAN #{number}: cannot establish whether provenance is already "
+                  f"recorded ({exc}); leaving untouched — rerun once the registry probe "
+                  "succeeds")
+            continue
+        if body is not None:
+            record_error = existing_record_admission_error(body, number, admission_error)
+            if record_error is None:
+                skipped += 1
+                print(f"skip #{number}: provenance already recorded")
+                # Still reconcile the draft state (an earlier pass may have crashed between
+                # the two).
+                _ensure_draft(target_repo, number, is_draft, apply_changes)
+                continue
+            needs_human += 1
+            print(f"NEEDS-HUMAN #{number}: an existing provenance record is present but NOT "
+                  f"admissible by the review loop ({record_error}); a human must repair or "
+                  "remove it before this PR becomes visible")
             continue
 
         # The worker RUN LOG is the only accepted identity source (no trailer fallback: trailers
@@ -442,6 +497,54 @@ def _self_test():
     check("non-dict pull fails closed", flatten_pull_pages([[1]]), None)
     check("empty slurp is an empty list", flatten_pull_pages([]), [])
     check("forged worker-job lines alone resolve nothing", ident(forged), None)
+
+    # --- effective ledger-first record + admission before any skip (sol #217) ------------------
+    # The REAL review-loop admission function, imported — not a replica — so these red if the
+    # schema and this gate ever drift apart.
+    admission = _load_dispatch_claim().provenance_admission_error
+    valid_record = {"pr_number": 41, "impl_provider": "anthropic", "impl_alias": "fable",
+                    "impl_account_h": "ab" * 8, "issue": 7, "head_sha_at_open": "ab" * 20}
+    check("valid matching record admits (skip allowed)",
+          existing_record_admission_error(json.dumps(valid_record), 41, admission), None)
+    check("undecodable record body never counts as recorded",
+          existing_record_admission_error("{not json", 41, admission),
+          "the record is not valid JSON")
+    check("record bound to a DIFFERENT PR never counts as recorded",
+          existing_record_admission_error(json.dumps(valid_record), 42, admission) is None,
+          False)
+    check("legacy raw-handle record is surfaced, not skipped",
+          existing_record_admission_error(
+              json.dumps({**valid_record, "impl_account_h": "someuser"}), 41, admission)
+          is None, False)
+
+    probes = []
+
+    def stub_probe(ledger, master):
+        def probe(ref=None):
+            probes.append(ref)
+            result = ledger if ref is not None else master
+            if isinstance(result, Exception):
+                raise result
+            return result, None
+        return probe
+
+    check("present ledger record is judged AS-IS",
+          effective_record_body(stub_probe("L", "M"), "ledger"), "L")
+    check("  ...and master is NEVER consulted past it", probes, ["ledger"])
+    probes.clear()
+    check("clean ledger 404 falls back to the master copy",
+          effective_record_body(stub_probe(None, "M"), "ledger"), "M")
+    check("  ...probed ledger first, then master", probes, ["ledger", None])
+    probes.clear()
+    check("no copy anywhere means no record (backfill proceeds)",
+          effective_record_body(stub_probe(None, None), "ledger"), None)
+    try:
+        effective_record_body(stub_probe(RuntimeError("HTTP 403"), "M"), "ledger")
+        probe_error_raised = False
+    except RuntimeError:
+        probe_error_raised = True
+    check("non-404 ledger failure RAISES — never falls through to master (sol #217)",
+          probe_error_raised, True)
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
