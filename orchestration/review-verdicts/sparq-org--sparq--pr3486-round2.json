@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves both prior major findings. report.py now validates suite presence and exact query-name sets before computing any deltas, removes stale summary.json on structural or row-count failure, and test_report.py exercises passing input plus truncated, extra-query, missing-suite, stale-summary, and row-count-drift cases through the real report entry point. bolt.sh now gives attached server profiling a bounded lifecycle by running perf in the background, executing the workload separately, interrupting and waiting for perf before stopping the server, covering cleanup with a trap, and rejecting an empty server perf.data file. No new correctness, soundness, test-validity, or security issue is evident in the diff.",
+ "verdict": "approve"
+}
