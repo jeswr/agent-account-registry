@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Replica::apply still checks dot-to-quad conflicts only against self.state.store(). After the original quad is removed, apply accepts a delta reusing that known dot under another quad; apply_absorbs_reused_removed_dot_without_reviving_it explicitly asserts Ok. Although the causal-context tombstone makes this particular join a no-op, CRDT-WIRE-4 says that if a received dot is already known under another quad, the envelope MUST be rejected. Harmless materialization is not equivalent to required fail-closed wire validation, and the model claims to implement that validation. The prior round's finding therefore remains at the same severity.",
+   "file": "crates/sparq-crdt/src/origin.rs",
+   "fix_hint": "Retain durable dot-to-quad provenance (or equivalent receiver journal validation metadata) after removal and consult it before joining received adds. Change the historical regression to assert rejection and unchanged state after add(q1,d), removal(d), then forged add(q2,d). Ensure snapshot/catch-up and compaction retain or reconstruct the provenance needed to enforce the same rejection. If the intended protocol truly permits absorbing historical reuse, amend the normative proposal first and stop claiming exact CRDT-WIRE-4 transcription; the current code cannot redefine the cited MUST requirement locally.",
+   "severity": "major",
+   "title": "Historical dot reuse is still accepted contrary to CRDT-WIRE-4"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "Round 2 does not resolve the prior major finding. The new explanation and regression test demonstrate that historical dot reuse is harmless to the current materialized state, but the normative CRDT-WIRE-4 requirement is rejection, not merely non-revival: a received dot already known under another quad MUST cause the envelope to be rejected. Replica::apply still searches only the live store and the new test explicitly expects acceptance after removal. The implementation and test therefore contradict the cited proposal and the crate's claim to transcribe/model its receiver validation. Progress is stagnant because the same major defect remains, now documented as intentional rather than fixed.",
+ "verdict": "request_changes"
+}
