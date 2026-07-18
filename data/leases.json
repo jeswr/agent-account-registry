@@ -22,16 +22,6 @@
   },
   {
    "account": "acct03",
-   "claim_id": "389c2cf8fc914a038f9b945c01640e64",
-   "holder": "fix:sparq-org/sparq#3488@dispatch-29647982307.1",
-   "package": "bench",
-   "role": "fix",
-   "model": "opus",
-   "issued_at": 1784384945,
-   "expires_at": 1784388545
-  },
-  {
-   "account": "acct03",
    "claim_id": "dfa3f6359fd841a9aba89f6f079e5ad4",
    "holder": "fix:sparq-org/sparq#3472@dispatch-29648122985.1",
    "package": "sparq-sim",
