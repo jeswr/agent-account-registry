@@ -69,16 +69,6 @@
    "model": "sonnet",
    "issued_at": 1784382623,
    "expires_at": 1784386223
-  },
-  {
-   "account": "acct01",
-   "claim_id": "f790d7d5303b40efb2ee3b4f1e34f90a",
-   "holder": "review:sparq-org/sparq#3479@dispatch-29646790356.1",
-   "package": "sparq-reason-dl",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784382632,
-   "expires_at": 1784383832
   }
  ]
 }
