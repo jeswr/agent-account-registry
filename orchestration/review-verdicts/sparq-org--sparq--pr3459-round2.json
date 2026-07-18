@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves the prior major finding: `SketchIndex::most_similar` now computes the candidate budget with `k.saturating_mul(4).max(64)`, so every valid `usize` input avoids the debug panic and release-mode wraparound. The added `huge_k_does_not_overflow_candidate_budget` test invokes the real public sketch query path with `usize::MAX` on a small graph and verifies all positive-score candidates are returned in exact-score order. The fix is scoped, the feature remains default-off, and no new correctness, soundness, test-validity, or security issue is evident in the diff.",
+ "verdict": "approve"
+}
