@@ -10,6 +10,12 @@
 name: dispatch
 
 on:
+  # workflow_dispatch is REQUIRED — it is the worker/review doorbell (see the workflow_run note
+  # below and the `doorbell` jobs in worker.yml / review-fix.yml). It ALSO accepts an arbitrary
+  # branch/tag ref and GitHub runs the workflow file AT that ref, so a collaborator could manually
+  # dispatch a modified branch copy of this workflow. That is why every secret-bearing job here
+  # (claim, plan-alert) is bound to the default-branch-only `dispatch-secrets` environment: it is
+  # the only server-side lever that survives an attacker-controlled workflow file (issue #101).
   workflow_dispatch:
   schedule:
     # Explicit minutes (not */10): GitHub degrades wildcard schedules under load — measured
@@ -544,6 +550,24 @@ jobs:
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # SECRET-EXFIL GUARD (issue #101). This job holds the App private key, every repository secret
+    # (toJSON(secrets)), the per-account ACCT*_TOKEN credentials, the alert token, and a write
+    # GITHUB_TOKEN. Because `workflow_dispatch` (top of file) accepts an arbitrary ref and GitHub
+    # runs the file AT that ref, a collaborator could dispatch a modified branch copy of this
+    # workflow and exfiltrate all of it. An in-file `if:` on the ref cannot stop that — the
+    # attacker controls the whole file at their ref. A protected environment is the only lever
+    # that survives, because it is enforced by repo settings, not the workflow file: bind this
+    # job to `dispatch-secrets`, whose deployment-branch policy admits the DEFAULT BRANCH ONLY.
+    # A run from any other ref then either (a) keeps this line and is refused by the branch
+    # policy, or (b) strips it and sees EMPTY secrets (they live in the environment, not at repo
+    # level) — no exfiltration either way. Every legitimate trigger runs from the default branch
+    # (schedule; workflow_run; the doorbell rings `gh workflow run dispatch.yml` with no --ref),
+    # so none are starved. REQUIRED maintainer settings for this to bite — until they are applied
+    # the binding is an inert no-op (repo-level secrets stay reachable from the default branch and
+    # nothing breaks): create the `dispatch-secrets` environment, restrict its deployment branches
+    # to the default branch only, and MOVE every secret this job and plan-alert consume out of
+    # repo scope into it (tracked follow-up).
+    environment: dispatch-secrets
     permissions:
       actions: write
       contents: write
@@ -905,6 +929,12 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): this job reads ALERT_TOKEN/ALERT_REPO (the private-alert
+    # routing secrets), so it is reachable by the same arbitrary-ref workflow_dispatch exfil
+    # vector as CLAIM. Bind it to the same default-branch-only `dispatch-secrets` environment
+    # where those secrets live. It only ever runs from the default branch (schedule/workflow_run/
+    # doorbell), so the branch policy never starves it.
+    environment: dispatch-secrets
     permissions:
       contents: read  # minimum for the sparse checkout below — the job runs a script from the repo
       issues: write   # upsert/close the rolling plan-failure ops-alert issue
