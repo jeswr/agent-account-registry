@@ -62,16 +62,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "9634bb17e9d946b4b2e573e0b98cb23d",
-   "holder": "review:jeswr/agent-account-registry#235@dispatch-29651967254.1",
-   "package": "review-loop",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784392223,
-   "expires_at": 1784393423
-  },
-  {
-   "account": "acct01",
    "claim_id": "cdea443aae21427f9bad8cc925bc27ce",
    "holder": "review:jeswr/agent-account-registry#236@dispatch-29651967254.1",
    "package": "set-up-account",
