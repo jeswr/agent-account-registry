@@ -8,6 +8,11 @@ permissions: {}
 jobs:
   fingerprint:
     runs-on: ubuntu-latest
+    # SECRET-EXFIL GUARD (issue #101): reads toJSON(secrets) (ACCT_* probe subset), which lives
+    # in the `dispatch-secrets` environment (deployment-branch policy: default branch only) —
+    # full rationale on the `claim` job in dispatch.yml. Without this binding the probe would
+    # silently see an EMPTY subset once the repo-scope secrets are migrated.
+    environment: dispatch-secrets
     steps:
       # Least-exposure filter (audit-2026-07-17, issue #41): only this tiny inline step ever sees the
       # full secrets map; the fingerprint step below receives ONLY the ACCT_* worker-token subset via a

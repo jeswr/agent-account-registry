@@ -7,6 +7,10 @@ permissions: {}
 jobs:
   whoami:
     runs-on: ubuntu-latest
+    # SECRET-EXFIL GUARD (issue #101): reads ACCT02_TOKEN, which lives in the `dispatch-secrets`
+    # environment (deployment-branch policy: default branch only) — full rationale on the `claim`
+    # job in dispatch.yml. A dispatch from any non-default ref is refused server-side.
+    environment: dispatch-secrets
     steps:
       - name: Resolve acct02 email (email only; token never printed)
         env:

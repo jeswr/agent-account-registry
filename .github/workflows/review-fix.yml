@@ -490,6 +490,10 @@ jobs:
     if: ${{ needs.resolve.outputs.unresolvable != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: write
       issues: read
@@ -736,6 +740,11 @@ jobs:
     if: ${{ needs.claim.outputs.acquired == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.mode == 'review' && 25 || 60 }}
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + the per-account
+    # secrets[secret_ref] credential, which live in the `dispatch-secrets` environment
+    # (deployment-branch policy: default branch only) — full rationale on the `claim` job in
+    # dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       # READ ONLY — in fix mode this job executes model-authored target code HOST-side (the
       # cargo gate), so no registry-WRITE token may exist anywhere in its blast radius. The
@@ -1204,6 +1213,10 @@ jobs:
     if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + PROVENANCE_SALT, which
+    # live in the `dispatch-secrets` environment (deployment-branch policy: default branch only)
+    # — full rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: write   # write: record the validated verdict in the registry (github.token)
       issues: write     # write: ops-alert upsert in the registry on needs-user escalation
@@ -1392,6 +1405,10 @@ jobs:
     if: ${{ needs.resolve.outputs.unresolvable == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: read
       issues: write   # write: ops-alert upsert in the registry
@@ -1441,6 +1458,10 @@ jobs:
     needs: [resolve, claim, run]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: write   # CAS-append data/model-health.json (on the `ledger` branch) via github.token
     steps:

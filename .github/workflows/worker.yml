@@ -507,6 +507,11 @@ jobs:
     needs: [resolve, claim]
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(needs.resolve.outputs.worker_timeout_minutes) }}
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + the per-account
+    # secrets[secret_ref] credential, which live in the `dispatch-secrets` environment
+    # (deployment-branch policy: default branch only) — full rationale on the `claim` job in
+    # dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       # READ ONLY — this job executes model-authored target code HOST-side (the cargo gate), so
       # no registry-WRITE token may exist anywhere in its blast radius. The implementer
@@ -1042,6 +1047,10 @@ jobs:
     needs: [resolve, claim, worker]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT + REGISTRY_ADMIN_APP_ID/KEY, which
+    # live in the `dispatch-secrets` environment (deployment-branch policy: default branch only)
+    # — full rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: write   # registry provenance file via github.token — never in the worker job
     steps:
@@ -1101,6 +1110,10 @@ jobs:
     needs: [resolve, claim, worker]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: write   # CAS-append data/model-health.json (on the `ledger` branch) via github.token
     steps:
