@@ -57,6 +57,31 @@ def claim_from_log(log_text):
     return (match.group(1), match.group(2)) if match else None
 
 
+# Post-migration identity source (the #96 outage population: worker succeeded, the provenance
+# JOB failed on the protected-master write, so no record exists and the worker log carries no
+# handle). The failed provenance job's OWN log section still shows its env echo
+# (`WORKER_IMPL_ACCOUNT: acctNN`) and command echo (`--impl-alias "<alias>"`). TRUST SCOPE: in
+# `gh run view --log` output every line is prefixed `<job>\t<step>\t<timestamp> <content>`, and
+# these patterns ANCHOR on a job name containing "provenance" — that job runs NO target/model
+# code, so a hostile model printing a lookalike line lands under the WORKER job's prefix and
+# can never match (same fail-closed posture as the no-trailer rule below).
+PROV_JOB_ACCOUNT_RE = re.compile(
+    r"(?mi)^[^\t]*provenance[^\t]*\t[^\t]*\t\S+\s+WORKER_IMPL_ACCOUNT:\s*(acct[0-9a-z]{2,})\s*$")
+PROV_JOB_ALIAS_RE = re.compile(
+    r'(?mi)^[^\t]*provenance[^\t]*\t[^\t]*\t\S+\s+--impl-alias\s+"?([A-Za-z0-9][A-Za-z0-9_.-]*)"?')
+
+
+def provenance_job_identity_from_log(log_text):
+    """(account, model_alias) from the FAILED provenance job's log section, or None. Requires
+    BOTH the env echo and the command echo inside provenance-job-prefixed lines; ambiguity
+    (differing repeated matches) fails closed to None."""
+    accounts = set(PROV_JOB_ACCOUNT_RE.findall(log_text or ""))
+    aliases = set(PROV_JOB_ALIAS_RE.findall(log_text or ""))
+    if len(accounts) == 1 and len(aliases) == 1:
+        return accounts.pop(), aliases.pop()
+    return None
+
+
 def provider_of(alias, routing):
     meta = (routing.get("models") or {}).get(alias)
     provider = meta.get("provider") if isinstance(meta, dict) else None
@@ -157,14 +182,16 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         run_key = f"backfill:{run_id}"
         log = _run_gh(["run", "view", run_id, "--repo", registry_repo, "--log"], check=False)
         if log.returncode == 0:
-            found = claim_from_log(log.stdout)
+            found = (claim_from_log(log.stdout)
+                     or provenance_job_identity_from_log(log.stdout))
             if found:
                 account, alias = found
         if alias is None or account is None:
             needs_human += 1
-            print(f"NEEDS-HUMAN #{number}: worker run {run_id} log is unavailable or has no "
-                  "claim line; leaving fail-closed invisible (record provenance manually only "
-                  "after a human establishes the implementer identity)")
+            print(f"NEEDS-HUMAN #{number}: worker run {run_id} log is unavailable, or has "
+                  "neither a claim line nor a provenance-job env echo; leaving fail-closed "
+                  "invisible (record provenance manually only after a human establishes the "
+                  "implementer identity)")
             continue
         provider = provider_of(alias, routing)
         if provider is None:
@@ -225,6 +252,25 @@ def _self_test():
     routing = {"models": {"terra": {"provider": "openai"}, "fable": {"provider": "anthropic"}}}
     check("provider lookup", provider_of("terra", routing), "openai")
     check("unknown alias provider", provider_of("ghost", routing), None)
+    prov_job = "Record implementer provenance (no target code runs here)"
+    prov_log = (f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44.23Z   "
+                "WORKER_IMPL_ACCOUNT: acct2css\n"
+                f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44.04Z   "
+                '--impl-alias "fable" \\\n')
+    check("provenance-job env echo parses", provenance_job_identity_from_log(prov_log),
+          ("acct2css", "fable"))
+    forged = ("Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
+              "WORKER_IMPL_ACCOUNT: acct99zz\n"
+              "Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
+              '--impl-alias "opus"\n')
+    check("worker-job forgery cannot match (job-prefix anchor)",
+          provenance_job_identity_from_log(forged), None)
+    check("forged lines mixed into a real log fail closed (ambiguity)",
+          provenance_job_identity_from_log(
+              prov_log + prov_log.replace("acct2css", "acct3xx")), None)
+    check("claim line takes precedence shape",
+          claim_from_log("lease claimed: account=acct02, model=fable, claim=x"),
+          ("acct02", "fable"))
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
