@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The per-owner credential change remains correct and complete. Enabled repositories are validated and grouped by owner, and the workflow fails closed if the enabled owner set drifts from its static mint steps. Each mint receives every enabled repository for its owner; failures defer only that owner's target-side grooming while registry-side dead-lease cleanup continues, and successful mints with empty token outputs fail loudly. Tokens are masked, the assembled map does not cross GITHUB_OUTPUT, and target reads and writes consistently select the repository owner's client. Missing-owner routes defer rather than falling back to another owner's credential. The added self-tests are non-vacuous and cover distinct-owner routing, missing-owner deferral, malformed maps, complete mint scope, unsafe names, and owner drift. No findings from round 3 have reappeared, and I found no new diff-supported correctness, soundness, test-validity, or security issue.",
+ "verdict": "approve"
+}
