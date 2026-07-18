@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "parse_envelope checks only that trustx:question has exactly one IRI and stores it in TrustRequirements. That value is never compared with, derived from, or used to resolve the query string by rewrite_query, evaluate_contract, or verify_response. Consequently, a caller can reuse TR naming question A with an unrelated supported query B, and both holder evaluation and verifier re-check accept the pairing. This contradicts the public claim that trustx:question binds TR to Q and leaves the three-part contract unauthenticated at its top-level query/requirements seam. Existing tests only assert that urn:q1 was parsed; none changes the query while retaining the same question IRI and expects rejection.",
+   "file": "crates/sparq-trust/src/expression.rs",
+   "fix_hint": "Define an authoritative question-binding mechanism and enforce it fail-closed. For example, resolve the named question IRI from trusted input and require its canonical query to equal Q, or define the question IRI as a digest/identifier over a canonical query representation and verify it. Add a negative test pairing a TR for question A with query B and assert rejection. If trustx:question is intentionally only an opaque label, remove all claims that it binds TR to Q and document that caller-owned trust boundary explicitly, though that weakens the stated contract.",
+   "severity": "major",
+   "title": "trustx:question is not bound to the query in the envelope"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 1's method-policy substitution issue is materially fixed: MethodPrecheck now carries a policy IRI, evaluate_contract rejects a mismatch, and the negative policy-A/policy-B test exercises that path. The required skill documentation was also added. However, the analogous top-level envelope binding remains absent: trustx:question is described as binding TR to Q, but parse_envelope merely requires and stores an arbitrary IRI, and neither parsing, rewriting, evaluation, nor verification relates it to the supplied query. A requirements document intended for one question can therefore be paired with another supported query while the implementation and documentation claim the binding exists. Because this is a new major finding despite the two prior findings being resolved, progress is regressing under the mandated scale.",
+ "verdict": "request_changes"
+}
