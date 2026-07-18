@@ -29,6 +29,16 @@
    "model": "opus",
    "issued_at": 1784380742,
    "expires_at": 1784381942
+  },
+  {
+   "account": "acct03",
+   "claim_id": "e1c4610c4f3442e781da540c73218d31",
+   "holder": "review:sparq-org/sparq#3438@dispatch-29645854760.1",
+   "package": "sparq-hdt",
+   "role": "review",
+   "model": "opus",
+   "issued_at": 1784380747,
+   "expires_at": 1784381947
   }
  ]
 }
