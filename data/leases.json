@@ -12,16 +12,6 @@
   },
   {
    "account": "acct2css",
-   "claim_id": "1473d1a655f8429cb7c458cf971ed116",
-   "holder": "sparq-org/sparq#3258@dispatch-29628980616.1",
-   "package": "knowledge-graph",
-   "role": "ci",
-   "model": "fable",
-   "issued_at": 1784345737,
-   "expires_at": 1784352037
-  },
-  {
-   "account": "acct2css",
    "claim_id": "3b5ce1c7ecf54cd3a92859c94e9a6923",
    "holder": "sparq-org/sparq#2959@dispatch-29629064753.1",
    "package": "gui",
