@@ -1,0 +1,716 @@
+# [FABLE-5] Batch-review worker — ONE job reviews a BATCH of worker draft PRs and writes ALL their
+# verdicts in ONE atomic Git-Data-API commit (worker-pr.py verdict-record-batch), instead of N
+# single-review jobs each doing a separate contended Contents-API commit. This is the throughput +
+# robustness rebuild described in research/batch-review-worker.md: it multiplies effective review
+# parallelism past the 40-slot account cap (1 batch job = up to BATCH_SIZE reviews, K in flight) AND
+# eliminates the inter-write contention that made concurrent single-review commits thrash the branch
+# head ("registry write for … kept conflicting", observed live on sparq-org--sparq--pr2521-round3).
+#
+# TRUST POSTURE — UNCHANGED per item (design §3/§7). The batch is composed downstream of dispatch's
+# per-PR hostile admission gate; EVERY per-PR invariant is re-asserted a THIRD time here, live, per
+# item, BEFORE that item's read-only model call: open + draft, same-repo App-bot worker head, live
+# head_sha == the manifest head_sha (no drift), human-hold labels excluded, registry provenance
+# present + agreeing, and the reviewer account/provider != the item's implementer account/provider.
+# A per-item failure NEVER sinks the batch (per-item try/except); the atomic commit records only the
+# healthy subset; failed items get no label/arm and re-plan next tick (their reviewed-sha marker is
+# never bound, so the sweep re-surfaces them). Verdict SCHEMA + label/arm/round-budget logic are the
+# single-review path's, reused verbatim per item. The reviewer model runs read-only, mutation-denied,
+# with NO GitHub token in its container. A trust-surface (security_paths) PR is human-armed as today.
+#
+# Coexistence: this is a NEW workflow. The single review-fix.yml path is unchanged and, with the
+# dispatch feature flag REVIEW_BATCH_ENABLED off, is the only path; both write the SAME canonical
+# verdict bytes and are mutually idempotent.
+name: review-batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Target owner/repository allowed by policy/repos.toml
+        required: true
+        type: string
+      impl_provider:
+        description: Implementer provider shared by every PR in the batch (anthropic|openai); fixes the inverse reviewer direction
+        required: true
+        type: choice
+        options: [anthropic, openai]
+      package:
+        description: Lease package partition shared by the batch
+        required: true
+        type: string
+      account:
+        description: Dispatcher-claimed account handle (ONE account for the whole batch)
+        required: true
+        type: string
+      claim_id:
+        description: Dispatcher-owned CAS claim to adopt (released once at the end)
+        required: true
+        type: string
+      reviewer_provider:
+        description: The claimed account's provider (must differ from impl_provider — cross-provider rule)
+        required: true
+        type: string
+      reviewer_model:
+        description: The claimed model alias resolved from the protected target routing catalog
+        required: true
+        type: string
+      secret_ref:
+        description: The secret name holding the claimed account credential
+        required: true
+        type: string
+      harness:
+        description: The claimed model harness (claude|codex)
+        required: false
+        default: ''
+        type: string
+      credential_format:
+        description: The claimed account credential format
+        required: false
+        default: ''
+        type: string
+      batch_k:
+        description: In-job parallel review calls against the one claimed account
+        required: false
+        default: '4'
+        type: string
+      manifest_b64:
+        description: base64(JSON list) of admitted review descriptors (pr_number, head_sha, head_branch, impl_provider, impl_account_h, issue, package, review_round, security)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  # One batch per (target, account) at a time — the account is the shared resource. cancel-in-progress
+  # false so a running batch is never severed mid-review (a severed batch just re-plans, but avoid it).
+  group: review-batch-${{ inputs.target_repo }}-${{ inputs.account }}
+  cancel-in-progress: false
+
+jobs:
+  # ---- 1. Decode + validate the manifest and re-admit each item LIVE (no worker secrets). Emits a
+  #         JSON matrix of the items that pass admission; failed items are simply dropped (re-plan). --
+  resolve-batch:
+    name: Decode + re-admit the batch (no worker secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.admit.outputs.matrix }}
+      count: ${{ steps.admit.outputs.count }}
+      target_owner: ${{ steps.admit.outputs.target_owner }}
+      target_name: ${{ steps.admit.outputs.target_name }}
+      batch_k: ${{ steps.admit.outputs.batch_k }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Split the target owner/name
+        id: owner
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo '::error::unsafe target repo'; exit 1; }
+          printf 'target_owner=%s\n' "${TARGET_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          printf 'target_name=%s\n' "${TARGET_REPO##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint read-only App token for live re-admission (no target contents write)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ steps.owner.outputs.target_owner }}
+          repositories: ${{ steps.owner.outputs.target_name }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-issues: read
+
+      - name: Decode the manifest and re-admit each PR live (fail closed per item)
+        id: admit
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          IMPL_PROVIDER: ${{ inputs.impl_provider }}
+          MANIFEST_B64: ${{ inputs.manifest_b64 }}
+          BATCH_K: ${{ inputs.batch_k }}
+          # The provenance record is read from the registry checkout (root of trust), same as
+          # dispatch. head/label/author/state are read LIVE via the App token.
+        run: |
+          set -euo pipefail
+          printf 'target_owner=%s\n' "${TARGET_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          printf 'target_name=%s\n' "${TARGET_REPO##*/}" >> "$GITHUB_OUTPUT"
+          k="${BATCH_K:-4}"
+          [[ "$k" =~ ^[1-9][0-9]*$ ]] || k=4
+          printf 'batch_k=%s\n' "$k" >> "$GITHUB_OUTPUT"
+          printf '%s' "$MANIFEST_B64" | base64 -d > "$RUNNER_TEMP/manifest.json"
+          python3 registry/scripts/worker-pr.py --self-test >/dev/null  # fail fast if the helper is broken
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
+
+          repo = os.environ["TARGET_REPO"]
+          impl_provider = os.environ["IMPL_PROVIDER"]
+          with open(os.environ["RUNNER_TEMP"] + "/manifest.json", encoding="utf-8") as fh:
+              manifest = json.load(fh)
+          if not isinstance(manifest, list) or not manifest:
+              raise SystemExit("batch manifest is empty or malformed")
+
+          HEAD_REF = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+$")
+          SHA = re.compile(r"^[0-9a-f]{40}$")
+          HUMAN_HOLD = {"review:needs-user", "needs:user"}
+
+          def gh_json(path):
+              out = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+              if out.returncode != 0:
+                  return None
+              try:
+                  return json.loads(out.stdout or "null")
+              except json.JSONDecodeError:
+                  return None
+
+          bot_login = None
+          admitted = []
+          for entry in manifest:
+              try:
+                  number = int(entry["pr_number"])
+                  head_sha = str(entry["head_sha"])
+                  if str(entry.get("impl_provider")) != impl_provider:
+                      print(f"drop #{number}: impl_provider disagrees with the batch")
+                      continue
+                  if not SHA.match(head_sha):
+                      print(f"drop #{number}: malformed manifest head sha")
+                      continue
+                  pull = gh_json(f"repos/{repo}/pulls/{number}")
+                  if not isinstance(pull, dict) or pull.get("state") != "open":
+                      print(f"drop #{number}: not open")
+                      continue
+                  if pull.get("draft") is not True:
+                      print(f"drop #{number}: no longer a draft")
+                      continue
+                  head = pull.get("head") or {}
+                  if (head.get("repo") or {}).get("full_name") != repo:
+                      print(f"drop #{number}: head is a fork / other repo")
+                      continue
+                  if not HEAD_REF.match(str(head.get("ref", ""))):
+                      print(f"drop #{number}: head is not a worker branch")
+                      continue
+                  if str(head.get("sha", "")) != head_sha:
+                      print(f"drop #{number}: head advanced since planning; re-plan")
+                      continue
+                  login = str((pull.get("user") or {}).get("login", ""))
+                  bot_login = bot_login or login
+                  labels = {lb.get("name") for lb in (pull.get("labels") or []) if isinstance(lb, dict)}
+                  if HUMAN_HOLD & labels:
+                      print(f"drop #{number}: human-owned")
+                      continue
+                  owner, name = repo.split("/", 1)
+                  prov_path = f"registry/orchestration/provenance/{owner}--{name}--pr{number}.json"
+                  if not os.path.isfile(prov_path):
+                      print(f"drop #{number}: no registry provenance record (fail closed)")
+                      continue
+                  with open(prov_path, encoding="utf-8") as fh:
+                      prov = json.load(fh)
+                  if prov.get("pr_number") != number or prov.get("impl_provider") != impl_provider:
+                      print(f"drop #{number}: provenance disagrees with the plan")
+                      continue
+                  impl_account_h = str(prov.get("impl_account_h", ""))
+                  if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
+                      print(f"drop #{number}: provenance lacks a salted account hash")
+                      continue
+                  admitted.append({
+                      "pr_number": number,
+                      "head_sha": head_sha,
+                      "head_branch": str(head.get("ref", "")),
+                      "impl_provider": impl_provider,
+                      "impl_alias": str(prov.get("impl_alias", "")),
+                      "impl_account_h": impl_account_h,
+                      "issue": prov.get("issue"),
+                      "review_round": int(entry.get("review_round", 1)),
+                      "security": bool(entry.get("security", False)),
+                      "bot_login": login,
+                  })
+              except (KeyError, ValueError, TypeError) as exc:
+                  print(f"drop item {entry!r}: {exc}")
+                  continue
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as fh:
+              fh.write("matrix=" + json.dumps({"include": admitted}) + "\n")
+              fh.write(f"count={len(admitted)}\n")
+          print(f"admitted {len(admitted)}/{len(manifest)} batch items")
+          PY
+
+  # ---- 2. K-parallel READ-ONLY reviews of the admitted items (one matrix leg per PR, bounded to K
+  #         via max-parallel). Each leg reuses the exact single-review contract; per-leg failure is
+  #         isolated (fail-fast off). Each leg lifts its VALIDATED verdict out-of-tree as an artifact. --
+  review:
+    name: Review PR ${{ matrix.pr_number }} (read-only, one of the batch)
+    needs: resolve-batch
+    if: ${{ needs.resolve-batch.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.resolve-batch.outputs.batch_k) }}
+      matrix: ${{ fromJSON(needs.resolve-batch.outputs.matrix) }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Mint review-scoped App token (no target contents write)
+        id: app-token-review
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve-batch.outputs.target_owner }}
+          repositories: ${{ needs.resolve-batch.outputs.target_name }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Verify target App identity + PR authorship (fail closed)
+        id: target
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          APP_SLUG: ${{ steps.app-token-review.outputs.app-slug }}
+          PR_AUTHOR: ${{ matrix.bot_login }}
+          PR_NUMBER: ${{ matrix.pr_number }}
+          EXPECT_HEAD: ${{ matrix.head_sha }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]] || { echo '::error::target App token was not minted'; exit 1; }
+          printf '::add-mask::%s\n' "$GH_TOKEN"
+          repo_json="$(gh api "repos/$TARGET_REPO")"
+          default_branch="$(printf '%s' "$repo_json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["default_branch"])')"
+          [[ "$default_branch" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo '::error::unsafe default branch'; exit 1; }
+          # Re-assert the LIVE head has not drifted since admission (fail closed → this leg produces
+          # no verdict, the PR re-plans; never review a stale head).
+          live_head="$(gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" -q .head.sha)"
+          [[ "$live_head" == "$EXPECT_HEAD" ]] || { echo "::error::head drifted for #$PR_NUMBER; refusing"; exit 1; }
+          printf 'default_branch=%s\n' "$default_branch" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target default branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ steps.target.outputs.default_branch }}
+          path: target
+          token: ${{ steps.app-token-review.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the claimed model to a concrete provider model (protected routing catalog)
+        id: selected
+        env:
+          LIVE_ACCOUNT: ${{ inputs.account }}
+          LIVE_MODEL: ${{ inputs.reviewer_model }}
+          LIVE_PROVIDER: ${{ inputs.reviewer_provider }}
+          LIVE_SECRET_REF: ${{ inputs.secret_ref }}
+          LIVE_HARNESS: ${{ inputs.harness }}
+          LIVE_CREDENTIAL_FORMAT: ${{ inputs.credential_format }}
+          IMPL_PROVIDER: ${{ inputs.impl_provider }}
+        run: |
+          set -euo pipefail
+          # routing.toml is keyed by MODEL alias (not account). The dispatcher already claimed the
+          # account and forwarded its resolved model + secret_ref; resolve the concrete provider
+          # model from the PROTECTED [models] catalog exactly like the single path's `selected` step,
+          # and fail closed if the reviewer provider would equal the implementer provider.
+          python3 - <<'PY'
+          import json, os, re, tomllib
+          from pathlib import Path
+
+          routing_path = Path(os.environ["GITHUB_WORKSPACE"], "registry", "orchestration", "routing.toml")
+          if not routing_path.is_file():
+              raise SystemExit("protected routing.toml is missing from the registry checkout")
+          with open(routing_path, "rb") as fh:
+              routing = tomllib.load(fh)
+          account = os.environ["LIVE_ACCOUNT"]
+          model = os.environ["LIVE_MODEL"]
+          provider = os.environ["LIVE_PROVIDER"]
+          secret_ref = os.environ["LIVE_SECRET_REF"]
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", account):
+              raise SystemExit("claimed account handle is unsafe")
+          if provider == os.environ["IMPL_PROVIDER"] or provider not in {"anthropic", "openai"}:
+              raise SystemExit("reviewer provider would equal implementer provider (fail closed)")
+          meta = routing.get("models", {}).get(model)
+          if not isinstance(meta, dict):
+              raise SystemExit("claimed model is missing from protected target routing")
+          if meta.get("provider") != provider:
+              raise SystemExit("claimed model/provider disagree with the protected routing")
+          # A codex alias may leave provider_model unset/TBD: worker-live.sh then omits --model and
+          # the codex CLI default applies (the proven drain posture).
+          provider_model = meta.get("provider_model")
+          if meta.get("harness") == "codex" and provider_model in (None, "", "TBD"):
+              provider_model = "TBD"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"account={account}\n")
+              out.write(f"provider={provider}\n")
+              out.write(f"model={model}\n")
+              out.write(f"provider_model={provider_model or ''}\n")
+              out.write(f"harness={meta.get('harness','')}\n")
+              out.write(f"secret_ref={secret_ref}\n")
+              out.write(f"credential_format={meta.get('credential_format','')}\n")
+          print(f"resolved review account -> provider={provider} model={model}")
+          PY
+
+      - name: Prepare the read-only reviewer container (no GitHub token inside)
+        id: prepare
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
+          WORKER_ACCOUNT_CREDENTIAL: ${{ secrets[steps.selected.outputs.secret_ref] }}
+          WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
+          WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
+          WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+        run: bash registry/scripts/worker-prep.sh
+
+      - name: Record the review round before the model runs (bounded-crash accounting)
+        id: round
+        if: ${{ steps.prepare.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-pr.py round-record \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ matrix.pr_number }}" \
+            --round "${{ matrix.review_round }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT.${{ matrix.pr_number }}" \
+            --bot-login "${{ matrix.bot_login }}"
+
+      - name: Run cross-provider review (read-only, verdict lifted out-of-tree)
+        id: review
+        if: ${{ steps.round.outcome == 'success' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_PR_NUMBER: ${{ matrix.pr_number }}
+          WORKER_PR_HEAD_BRANCH: ${{ matrix.head_branch }}
+          WORKER_PR_HEAD_SHA: ${{ matrix.head_sha }}
+          WORKER_REVIEW_FILE: ${{ runner.temp }}/registry-worker/review-verdict.json
+          WORKER_REVIEW_ROUND: ${{ matrix.review_round }}
+          WORKER_IMPL_PROVIDER: ${{ matrix.impl_provider }}
+          WORKER_IMPL_ALIAS: ${{ matrix.impl_alias }}
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
+        run: bash ../registry/scripts/worker-live.sh review
+
+      - name: Schema-validate the lifted verdict (host-side, no tokens)
+        id: verdict
+        if: ${{ steps.review.outcome == 'success' }}
+        run: |
+          python3 registry/scripts/worker-pr.py validate-verdict \
+            --verdict-file "$RUNNER_TEMP/registry-worker/review-verdict.json" \
+            --files-file "$RUNNER_TEMP/registry-worker/pr-files.txt"
+
+      # Package the validated verdict + diff file-list + the per-item facts the commit job needs as
+      # ONE artifact per PR. A failed leg uploads NOTHING, so the aggregate commit skips it (per-item
+      # isolation). reviewed_sha is the reviewed head (bound LAST, per PR, by the commit job).
+      - name: Stage this PR's verdict artifact for the atomic commit
+        id: stage
+        if: ${{ steps.verdict.outcome == 'success' }}
+        env:
+          PR_NUMBER: ${{ matrix.pr_number }}
+          REVIEW_ROUND: ${{ matrix.review_round }}
+          HEAD_SHA: ${{ matrix.head_sha }}
+          IMPL_PROVIDER: ${{ matrix.impl_provider }}
+          IMPL_ACCOUNT_H: ${{ matrix.impl_account_h }}
+          ISSUE: ${{ matrix.issue }}
+          SECURITY: ${{ matrix.security }}
+          BOT_LOGIN: ${{ matrix.bot_login }}
+          REVIEWER_PROVIDER: ${{ steps.selected.outputs.provider }}
+        run: |
+          set -euo pipefail
+          verdict="$RUNNER_TEMP/registry-worker/review-verdict.json"
+          files="$RUNNER_TEMP/registry-worker/pr-files.txt"
+          [[ "$(wc -c < "$verdict")" -le 262144 ]] || { echo '::error::verdict exceeds size cap'; exit 1; }
+          [[ "$(wc -c < "$files")" -le 262144 ]] || { echo '::error::diff file list exceeds size cap'; exit 1; }
+          out="$RUNNER_TEMP/item"
+          mkdir -p "$out"
+          cp "$verdict" "$out/verdict.json"
+          cp "$files" "$out/files.txt"
+          python3 - <<PY
+          import json, os
+          meta = {
+              "pr_number": int(os.environ["PR_NUMBER"]),
+              "review_round": int(os.environ["REVIEW_ROUND"]),
+              "reviewed_sha": os.environ["HEAD_SHA"],
+              "impl_provider": os.environ["IMPL_PROVIDER"],
+              "impl_account_h": os.environ["IMPL_ACCOUNT_H"],
+              "issue": (int(os.environ["ISSUE"]) if os.environ.get("ISSUE", "").isdigit() else None),
+              "security": os.environ.get("SECURITY", "false").lower() == "true",
+              "bot_login": os.environ["BOT_LOGIN"],
+              "reviewer_provider": os.environ["REVIEWER_PROVIDER"],
+          }
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "item", "meta.json"), "w", encoding="utf-8") as fh:
+              json.dump(meta, fh)
+          PY
+
+      - name: Upload this PR's verdict artifact
+        if: ${{ steps.stage.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: batch-verdict-${{ matrix.pr_number }}
+          path: ${{ runner.temp }}/item
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---- 3. ONE atomic verdict commit for the whole batch, then per-PR label/arm (no target code
+  #         runs here). Collect every leg's artifact, build the manifest, verdict-record-batch in ONE
+  #         Git-Data-API commit, then iterate the recorded PRs to apply the SINGLE-path outcome. ----
+  commit-outcome:
+    name: Atomic multi-verdict commit + per-PR outcome
+    needs: [resolve-batch, review]
+    if: ${{ always() && needs.resolve-batch.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # write: the atomic verdict commit to the data-plane ref (github.token)
+      issues: write     # write: needs-user ops-alert upsert
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Download all per-PR verdict artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/items
+          pattern: batch-verdict-*
+
+      - name: Build the batch manifest + re-validate every verdict on fresh code
+        id: build
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          repo = os.environ["TARGET_REPO"]
+          items_dir = os.path.join(os.environ["RUNNER_TEMP"], "items")
+          manifest = []
+          if os.path.isdir(items_dir):
+              for name in sorted(os.listdir(items_dir)):
+                  d = os.path.join(items_dir, name)
+                  vf, ff, mf = (os.path.join(d, "verdict.json"),
+                                os.path.join(d, "files.txt"),
+                                os.path.join(d, "meta.json"))
+                  if not (os.path.isfile(vf) and os.path.isfile(ff) and os.path.isfile(mf)):
+                      continue
+                  # Re-validate the verdict on THIS fresh registry checkout before it is recorded.
+                  chk = subprocess.run(
+                      ["python3", "registry/scripts/worker-pr.py", "validate-verdict",
+                       "--verdict-file", vf, "--files-file", ff],
+                      capture_output=True, text=True)
+                  if chk.returncode != 0:
+                      print(f"drop {name}: verdict failed re-validation")
+                      continue
+                  with open(mf, encoding="utf-8") as fh:
+                      meta = json.load(fh)
+                  manifest.append({
+                      "target_repo": repo,
+                      "pr": meta["pr_number"],
+                      "round": meta["review_round"],
+                      "verdict_file": vf,
+                      "_meta": meta,
+                  })
+          out = os.environ["RUNNER_TEMP"] + "/batch-manifest.json"
+          # verdict-record-batch reads only target_repo/pr/round/verdict_file; keep _meta separately.
+          record_manifest = [{k: v for k, v in item.items() if k != "_meta"} for item in manifest]
+          with open(out, "w", encoding="utf-8") as fh:
+              json.dump(record_manifest, fh)
+          with open(os.environ["RUNNER_TEMP"] + "/meta-index.json", "w", encoding="utf-8") as fh:
+              json.dump({str(item["pr"]): item["_meta"] for item in manifest}, fh)
+          print(f"batch manifest: {len(manifest)} verdicts to commit")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"count={len(manifest)}\n")
+          PY
+
+      - name: Record ALL verdicts in ONE atomic Git-Data-API commit
+        id: commit
+        if: ${{ steps.build.outputs.count != '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The verdict data-plane branch (off the protected default). Must be seeded from master once.
+          REGISTRY_VERDICT_REF: ${{ vars.REGISTRY_VERDICT_REF || 'ledger' }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/worker-pr.py verdict-record-batch \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --manifest "$RUNNER_TEMP/batch-manifest.json" \
+            --outcome-file "$RUNNER_TEMP/verdict-outcomes.json"
+          cat "$RUNNER_TEMP/verdict-outcomes.json"
+
+      - name: Mint outcome-scoped App token (labels/comments/arm)
+        id: app-token-outcome
+        if: ${{ steps.build.outputs.count != '0' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve-batch.outputs.target_owner }}
+          repositories: ${{ needs.resolve-batch.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Apply the per-PR outcome (findings, labels, arm, reviewed-sha bind)
+        if: ${{ steps.commit.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          WORKER_REVIEWER_ACCOUNT: ${{ inputs.account }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          SECURITY_PATHS_B64: ${{ vars.REGISTRY_SECURITY_PATHS_B64 || 'W10=' }}
+          MAX_REVIEW_ROUNDS: ${{ vars.MAX_REVIEW_ROUNDS || '3' }}
+          ARM_AUTO_MERGE: ${{ vars.ARM_AUTO_MERGE || 'true' }}
+        run: |
+          set -euo pipefail
+          # Only the verdicts that atomically COMMITTED (written) get an outcome; "identical" is an
+          # idempotent re-run (already handled a prior tick) and "conflict" fails closed (no label).
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          repo = os.environ["TARGET_REPO"]
+          rt = os.environ["RUNNER_TEMP"]
+          with open(rt + "/verdict-outcomes.json", encoding="utf-8") as fh:
+              outcomes = json.load(fh)
+          with open(rt + "/meta-index.json", encoding="utf-8") as fh:
+              meta_index = json.load(fh)
+
+          # SECURITY_PATHS_B64 -> a repeatable --surface-path list (trust-surface human-arm gate).
+          surface = []
+          try:
+              raw = subprocess.run(["base64", "-d"], input=os.environ.get("SECURITY_PATHS_B64", "W10="),
+                                   capture_output=True, text=True).stdout
+              surface = [p for p in (json.loads(raw or "[]")) if isinstance(p, str) and p]
+          except Exception:
+              surface = []
+
+          def run(args):
+              r = subprocess.run(["python3", "registry/scripts/worker-pr.py", *args])
+              return r.returncode
+
+          failures = 0
+          for key, status in sorted(outcomes.items()):
+              # key = "<owner>/<name>#<pr>#<round>"
+              try:
+                  _, pr_round = key.rsplit("#", 1)
+                  pr_number = key.rsplit("#", 2)[1]
+              except ValueError:
+                  continue
+              if status != "written":
+                  print(f"skip {key}: verdict status={status} (no label/arm)")
+                  continue
+              meta = meta_index.get(pr_number)
+              if not meta:
+                  print(f"skip {key}: no meta for the committed verdict")
+                  continue
+              d = os.path.join(rt, "items", f"batch-verdict-{pr_number}")
+              vf, ff = os.path.join(d, "verdict.json"), os.path.join(d, "files.txt")
+              rn = str(meta["review_round"])
+              # 1) findings + label + escalation (review-outcome), reusing the single path verbatim.
+              args = ["review-outcome", "--repo", repo, "--pr", pr_number,
+                      "--verdict-file", vf, "--files-file", ff, "--round", rn,
+                      "--max-rounds", os.environ.get("MAX_REVIEW_ROUNDS", "3"),
+                      "--impl-provider", meta["impl_provider"],
+                      "--bot-login", meta["bot_login"],
+                      "--run-key", f'{os.environ["GITHUB_RUN_ID"]}.{os.environ["GITHUB_RUN_ATTEMPT"]}.{pr_number}']
+              if meta.get("issue") is not None:
+                  args += ["--issue", str(meta["issue"])]
+              if meta.get("security"):
+                  args.append("--security")
+              for p in surface:
+                  args += ["--surface-path", p]
+              if run(args) != 0:
+                  print(f"::warning::review-outcome failed for #{pr_number}; it re-plans next tick")
+                  failures += 1
+                  continue
+              # 2) ready-and-arm — HOST-only, sha-bound, hash-asserted, trust-surface + security gated.
+              #    On approve only; the single path's exact gate. A withheld arm (security surface)
+              #    is a human's click, exactly as today.
+              arm_args = ["ready-and-arm", "--repo", repo, "--pr", pr_number,
+                          "--reviewed-sha", meta["reviewed_sha"],
+                          "--impl-provider", meta["impl_provider"],
+                          "--impl-account-h", meta["impl_account_h"],
+                          "--reviewer-provider", meta["reviewer_provider"],
+                          "--arm", os.environ.get("ARM_AUTO_MERGE", "true")]
+              if meta.get("issue") is not None:
+                  arm_args += ["--issue", str(meta["issue"])]
+              for p in surface:
+                  arm_args += ["--surface-path", p]
+              # ready-and-arm is idempotent + no-ops on a request_changes verdict, so it is safe to
+              # always call; it only arms on a schema-valid approve with all gates satisfied.
+              run(arm_args)
+              # 3) reviewed-sha bind LAST (terminal marker for this head): a crash before it leaves
+              #    reviewed-sha != head so the sweep re-converges the PR.
+              run(["reviewed-sha", "set", "--repo", repo, "--pr", pr_number,
+                   "--sha", meta["reviewed_sha"]])
+              print(f"outcome applied for #{pr_number} (round {rn})")
+          if failures:
+              print(f"::warning::{failures} per-PR outcomes failed; those PRs re-plan next tick")
+          PY
+
+  # ---- 4. Always release the ONE batch lease. ----
+  release:
+    name: Release the batch lease
+    needs: [resolve-batch, review, commit-outcome]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Release CAS lease by claim id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+        run: |
+          set -euo pipefail
+          [[ "$CLAIM_ID" =~ ^[0-9a-f]{32}$ ]] || { echo '::error::unsafe or missing claim id'; exit 1; }
+          python3 registry/scripts/select-and-claim.py \
+            --release "$CLAIM_ID" \
+            --repo "$GITHUB_REPOSITORY"
+
+  # ---- 5. Re-ring the dispatcher (GITHUB_TOKEN runs emit no workflow_run events). ----
+  doorbell:
+    name: doorbell (re-ring dispatcher)
+    needs: [release]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    steps:
+      - name: Ring dispatch.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dispatch.yml -R "$GITHUB_REPOSITORY" || echo "::warning::doorbell ring failed (cron backstop covers this tick)"
