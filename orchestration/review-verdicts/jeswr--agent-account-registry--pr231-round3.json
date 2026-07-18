@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The model had the live credential and a writable target, while the purge scan concedes that an encoded copy in that target evades detection. `_gate_container_argv` then mounts the target read-write into the target-controlled gate. The container has no `--network none`, its stdout/stderr is deliberately streamed unredacted to the job log, and it can write newly decoded material back into the target. Because the workflow's only credential scan runs before this gate and `publish_pr` later stages the entire tree, hostile gate code can recover an encoded credential and exfiltrate it through network/log output or place its plaintext in the post-scan publish set. Read-only rootfs, dropped capabilities, and isolation from runner temp do not constrain these channels.",
+   "file": "scripts/worker-live.sh",
+   "fix_hint": "Remove the condition that lets one actor receive both the live credential and write access to data later readable by hostile target code. For example, broker credential use outside the model's writable trust domain. The gate must also have no outbound network or unredacted output channel and must not be able to introduce unvalidated publishable changes; merely adding another literal scan cannot prove containment against reversible encodings. Add self-tests that fail when these gate egress/write restrictions are absent.",
+   "severity": "blocker",
+   "title": "Sandbox still exposes model-stashed credentials to hostile gate code"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "The new container does isolate the gate from runner-temp and inherited job state, but it does not close the round-2 credential channel. The model previously possessed the live credential while it could write the target. It can preserve that credential encoded in the target; the pre-gate literal scan explicitly cannot detect this. The hostile gate then receives the same target read-write, can decode the credential, and can print it to the unredacted job log, transmit it over the container's unrestricted network, or write the decoded value into the target after the only scan. The subsequent publish stages every target change. Thus the prior blocker remains materially unresolved despite improved host isolation.",
+ "verdict": "request_changes"
+}
