@@ -903,7 +903,14 @@ jobs:
           TARGET_DIR: ${{ github.workspace }}/target
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
-        run: bash ../registry/scripts/worker-live.sh gate
+          # [FABLE-5] Capture the gate's own stdout+stderr to a file OUTSIDE WORKER_ROOT (the
+          # cleanup step wipes WORKER_ROOT) so that on a gate crash the failure-signal step can
+          # preserve the actual error — e.g. run 29634738177 lost the exit-101 `package ID
+          # specification` message and needed log archaeology. pipefail keeps the gate's exit code.
+          GATE_LOG: ${{ runner.temp }}/gate-output.log
+        run: |
+          set -o pipefail
+          bash ../registry/scripts/worker-live.sh gate 2>&1 | tee "$GATE_LOG"
 
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
@@ -978,16 +985,83 @@ jobs:
             --status "$status" ||
             printf '%s\n' "::warning::Could not set final target issue state to $status"
 
+      # [FABLE-5] Stage a BOUNDED, credential-safe diagnostics bundle BEFORE the WORKER_ROOT wipe
+      # (defect #3, run 29634738177): when the model SUCCEEDED but a later step crashed (the gate's
+      # exit-101 `package ID specification` crash), the work + diagnosis were lost and the next case
+      # needed log archaeology. Cleanup runs `always()` and deletes WORKER_ROOT, so we copy out the
+      # signal FIRST. Privacy: we preserve ONLY the host/cargo GATE_LOG (no model transcript) and the
+      # already-sanitized error-signals.log (CLI stderr + harness `[error]`-prefixed lines only, per
+      # _run_headless_harness) — NEVER model-output.log (raw transcript is withheld to protect
+      # credentials). continue-on-error so a diagnostics hiccup never changes the job's outcome.
+      - name: Stage live-attempt diagnostics (bounded, credential-safe)
+        id: diag
+        if: ${{ always() && !inputs.dry_run }}
+        continue-on-error: true
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          GATE_LOG: ${{ runner.temp }}/gate-output.log
+          DIAG_DIR: ${{ runner.temp }}/live-attempt-diagnostics
+        run: |
+          set -uo pipefail
+          mkdir -p "$DIAG_DIR"
+          # bounded tail of the host-side gate output (the exact crash text, e.g. the exit-101
+          # `package ID specification ... did not match any packages`).
+          if [[ -f "$GATE_LOG" ]]; then
+            tail -c 65536 "$GATE_LOG" > "$DIAG_DIR/gate-output.tail.log" || true
+          fi
+          # sanitized model error signals only (no transcript) — the same file model-health reads.
+          if [[ -f "$WORKER_ROOT/error-signals.log" ]]; then
+            tail -c 16384 "$WORKER_ROOT/error-signals.log" > "$DIAG_DIR/model-error-signals.tail.log" || true
+          fi
+          # sanitized usage telemetry (numeric fields only, already privacy-scrubbed) for context.
+          if [[ -f "$WORKER_ROOT/usage-telemetry.json" ]]; then
+            cp "$WORKER_ROOT/usage-telemetry.json" "$DIAG_DIR/usage-telemetry.json" || true
+          fi
+          if [[ -n "$(ls -A "$DIAG_DIR" 2>/dev/null)" ]]; then
+            echo "have_diag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_diag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload live-attempt diagnostics artifact
+        if: ${{ always() && !inputs.dry_run && steps.diag.outputs.have_diag == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-attempt-diagnostics-${{ inputs.issue_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-attempt-diagnostics
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Cleanup isolated worker state
         if: ${{ always() }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
         run: rm -rf -- "$WORKER_ROOT"
 
+      # [FABLE-5] Fail-SOFT preservation (defect #3): the primary lost-work signal is the gate crash
+      # itself (whose exit code already fails the job via the `gate` step) and the diagnostics
+      # artifact staged above. This step only annotates; it must NEVER mask or supersede that primary
+      # signal, so the annotation body is wrapped and the step's own bookkeeping cannot fail the job
+      # in a way that hides the real cause. It still exits nonzero to keep the failure surfaced when
+      # the model produced work but no PR opened.
       - name: Preserve live-attempt failure signal
         if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' && steps.trust.outcome == 'success' && steps.pr.outcome != 'success' }}
+        env:
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          MODEL_OUTCOME: ${{ steps.model.outcome }}
+          HAVE_DIAG: ${{ steps.diag.outputs.have_diag }}
         run: |
-          echo '::error::Live worker attempt did not open its target pull request.'
+          set -uo pipefail
+          echo '::error::Live worker attempt did not open its target pull request (model outcome='"${MODEL_OUTCOME:-?}"', gate outcome='"${GATE_OUTCOME:-?}"').'
+          if [[ "${MODEL_OUTCOME:-}" == "success" && "${GATE_OUTCOME:-}" != "success" ]]; then
+            echo '::error::The model produced work but the local gate did not pass — the model output was NOT lost silently; see the live-attempt-diagnostics artifact for the gate error tail.'
+          fi
+          if [[ "${HAVE_DIAG:-}" == "true" ]]; then
+            echo 'Diagnostics preserved as the live-attempt-diagnostics-'"${{ inputs.issue_number }}"' artifact (gate-output tail + sanitized model error signals).'
+          else
+            echo '::warning::No diagnostics bundle was staged for this failed attempt.'
+          fi
           exit 1
 
   # Provenance is REGISTRY-recorded and is the review loop's root of trust: the review sweep
