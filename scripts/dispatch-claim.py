@@ -2039,6 +2039,7 @@ def _self_test():
                     {"complete": True, "items": []}), encoding="utf-8")
             saved_argv = list(sys.argv)
             saved_target_root = os.environ.get("TARGET_ROOT")
+            saved_github_output = os.environ.get("GITHUB_OUTPUT")
             saved_cwd = os.getcwd()
             try:
                 # phase 1: the ACTUAL index-sensitive PLAN heredoc (builds issue-plan.json +
@@ -2047,7 +2048,8 @@ def _self_test():
                 os.environ["TARGET_ROOT"] = str(target_root)
                 exec(compile(plan_code, "dispatch.yml#plan-heredoc", "exec"), {})
                 # phase 2: the ACTUAL assemble heredoc (registry code only, local data), which
-                # ends by running claim_mod.validate_plan on the assembled document
+                # ends by running claim_mod.validate_plan on the assembled document. GITHUB_OUTPUT
+                # captures the degraded job outputs the alarm/recover jobs consume (round-5 P1).
                 work = tmp / "work"
                 (work / "registry" / "scripts").mkdir(parents=True)
                 shutil.copy(repo_root / "scripts" / "dispatch-claim.py",
@@ -2056,10 +2058,14 @@ def _self_test():
                 (work / "registry-ledger" / "data" / "leases.json").write_text(
                     json.dumps({"leases": []}), encoding="utf-8")
                 plan_file = work / "plan.json"
+                gh_output_file = tmp / "github-output.txt"
+                os.environ["GITHUB_OUTPUT"] = str(gh_output_file)
                 sys.argv = ["-", str(out), str(plan_file)]
                 os.chdir(work)
                 exec(compile(assemble_code, "dispatch.yml#assemble-heredoc", "exec"), {})
-                return json.loads(plan_file.read_text(encoding="utf-8"))
+                gh_output = gh_output_file.read_text(encoding="utf-8") \
+                    if gh_output_file.is_file() else ""
+                return json.loads(plan_file.read_text(encoding="utf-8")), gh_output
             finally:
                 os.chdir(saved_cwd)
                 sys.argv = saved_argv
@@ -2067,6 +2073,10 @@ def _self_test():
                     os.environ.pop("TARGET_ROOT", None)
                 else:
                     os.environ["TARGET_ROOT"] = saved_target_root
+                if saved_github_output is None:
+                    os.environ.pop("GITHUB_OUTPUT", None)
+                else:
+                    os.environ["GITHUB_OUTPUT"] = saved_github_output
 
     e2e_policy_row = {"enabled": True, "routing": "orchestration/routing.toml",
                       "account_pool": ["acct01"], "max_concurrent": 1,
@@ -2077,7 +2087,12 @@ def _self_test():
         "registry_policy_resolve_e2e", Path(__file__).resolve().parent / "policy-resolve.py")
     e2e_repos = ["example/alpha", "example/beta", "example/gamma"]
     for degraded_index in (0, len(e2e_repos) - 1):     # FIRST and LAST target degraded
-        e2e_plan = _run_degraded_pipeline(degraded_index, e2e_repos)
+        e2e_plan, e2e_gh_output = _run_degraded_pipeline(degraded_index, e2e_repos)
+        # The degraded surface is a JOB OUTPUT (round-5 P1): the always() alarm job raises the
+        # non-terminal `repo-degraded` row from it and recover gates on `degraded == '0'`, so
+        # the REAL heredoc must emit both lines — a silent partial PLAN goes red here.
+        assert "degraded=1\n" in e2e_gh_output, e2e_gh_output
+        assert f"degraded_repos={e2e_repos[degraded_index]}\n" in e2e_gh_output, e2e_gh_output
         # original order + indices preserved: the degraded repo is PLANNED-BUT-EMPTY in place
         assert [entry["target_repo"] for entry in e2e_plan["repositories"]] == e2e_repos, \
             f"degraded index {degraded_index} must not reorder/unplan the manifest"

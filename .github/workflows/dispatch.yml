@@ -50,6 +50,16 @@ jobs:
     name: PLAN (unprivileged, secret-free target half)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Degraded-target surface (round-5 P1: a repo whose listing persistently fails — 403/404/5xx
+    # after retries — was planned EMPTY inside a GREEN partial PLAN, visible only in buried logs;
+    # a permanent failure could starve that target indefinitely). The assemble step emits these
+    # outputs so the `alarm` job raises a NON-TERMINAL `repo-degraded` row on the rolling alert
+    # and the `recover` job refuses to treat a degraded tick as fully healthy (the heal path: a
+    # later tick that snapshots EVERY target cleanly runs recover, whose run-start-bounded prune
+    # then clears the repo-degraded rows).
+    outputs:
+      degraded: ${{ steps.assemble.outputs.degraded }}
+      degraded_repos: ${{ steps.assemble.outputs.degraded_repos }}
     # contents:read exists ONLY for (a) the snapshot-helper registry checkout + the authenticated
     # snapshot step it feeds, both of which run BEFORE any target code executes (the token lives
     # in the snapshot step's own env), and (b) the registry checkout in the assemble step, which
@@ -401,11 +411,13 @@ jobs:
           test ! -e registry-ledger/scripts
 
       - name: Assemble and validate the v2 plan (registry code only, no tokens, local data)
+        id: assemble
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP" "$RUNNER_TEMP/plan.json" <<'PY'
           import importlib.util
           import json
+          import os
           from pathlib import Path
           import re
           import sys
@@ -450,6 +462,22 @@ jobs:
           for skip in degraded_skips:
               print(f"::warning::SNAPSHOT repo {skip['repo']} DEGRADED: {skip['reason']}")
           snapshot_skips.extend(degraded_skips)
+          # Surface the degradation OUT-OF-BAND (round-5 P1: buried in snapshot_skips, a
+          # persistently-degraded target stayed externally silent inside a green partial PLAN):
+          # emit the count + repo list as job outputs for the always() `alarm` job (non-terminal
+          # `repo-degraded` row) and the `recover` gate. fold_degraded_repos already SAFE_REPO-
+          # validated every name, and the shape is re-checked here before entering the LINE-BASED
+          # output file (a hostile name must never inject an output line).
+          degraded_names = sorted({skip["repo"] for skip in degraded_skips
+                                   if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/"
+                                                   r"[A-Za-z0-9][A-Za-z0-9_.-]*", skip["repo"])})
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if github_output:
+              with open(github_output, "a", encoding="utf-8") as output_handle:
+                  # the COUNT is every degradation (fail closed: an entry whose name failed the
+                  # re-check still gates recover); the NAME list is the validated subset only
+                  output_handle.write(f"degraded={len(degraded_skips)}\n")
+                  output_handle.write("degraded_repos=" + ",".join(degraded_names) + "\n")
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
@@ -914,11 +942,18 @@ jobs:
   # below (pipeline-alarm.py --resolve), keeping ONE failure channel with recovery detection.
   alarm:
     needs: [plan, claim]
+    # Fires on any hard failure/cancel/skip — AND (round-5 P1) on a GREEN tick whose PLAN was
+    # only PARTIAL: a target whose listing persistently fails is planned empty, counts zero
+    # items, and would otherwise starve in total external silence while every run stays green.
+    # That degradation gets its own NON-TERMINAL `repo-degraded` row (the run itself is not
+    # reddened — the primary jobs really did succeed for the other targets).
     if: >-
       ${{ always() && (
         needs.plan.result == 'failure' || needs.plan.result == 'cancelled' ||
         needs.claim.result == 'failure' || needs.claim.result == 'cancelled' ||
-        needs.claim.result == 'skipped'
+        needs.claim.result == 'skipped' ||
+        (needs.plan.result == 'success' &&
+         needs.plan.outputs.degraded != '' && needs.plan.outputs.degraded != '0')
       ) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -931,6 +966,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Alarm on PLAN crash (claim skipped) or CLAIM failure
+        if: >-
+          ${{ needs.plan.result == 'failure' || needs.plan.result == 'cancelled' ||
+              needs.claim.result == 'failure' || needs.claim.result == 'cancelled' ||
+              needs.claim.result == 'skipped' }}
         uses: ./.github/actions/pipeline-alarm
         with:
           job-name: ${{ (needs.plan.result == 'failure' || needs.plan.result == 'cancelled') && 'plan' || 'claim' }}
@@ -943,6 +982,30 @@ jobs:
           registry-token: ${{ github.token }}
           alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           alert-token: ${{ secrets.ALERT_TOKEN || '' }}
+      # [FABLE-5] Round-5 P1: the degraded-target out-of-band alarm. NON-TERMINAL — the tick is
+      # green and stays green — but LOUD: the rolling alert carries a `repo-degraded` row naming
+      # the starved target(s), and `recover` (gated on degraded == '0') will not clear it until a
+      # tick snapshots every target cleanly. Both steps can fire in one run (plan green + partial
+      # while claim failed): two distinct rows, both accurate.
+      - name: Alarm on a persistently-degraded target snapshot (green partial PLAN, non-terminal)
+        if: >-
+          ${{ needs.plan.result == 'success' &&
+              needs.plan.outputs.degraded != '' && needs.plan.outputs.degraded != '0' }}
+        uses: ./.github/actions/pipeline-alarm
+        with:
+          job-name: plan
+          job-result: failure
+          failure-class: repo-degraded
+          detail: >-
+            target snapshot DEGRADED (planned empty, fail-closed) for
+            ${{ needs.plan.outputs.degraded }} repo(s):
+            ${{ needs.plan.outputs.degraded_repos }} — a persistent per-repo listing failure
+            (403/404/5xx after retries, or a >5000-entry overflow) starves that target while the
+            run stays green; heals automatically once a dispatch tick snapshots every target
+            cleanly
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
 
   # [FABLE-5] Auto-close-on-heal (ported from PR #51's plan-alert recovery, generalized). On a
   # HEALTHY dispatch tick (plan+claim both succeeded), prune dispatch's rows from the rolling alert
@@ -951,12 +1014,25 @@ jobs:
   # fail-soft) and, with no open alert, does only a bare `gh issue list` (cheap green tick).
   recover:
     needs: [plan, claim]
-    if: ${{ always() && needs.plan.result == 'success' && needs.claim.result == 'success' }}
+    # `degraded == '0'` (round-5 P1): a green-but-PARTIAL tick (a target planned empty because
+    # its listing failed) is NOT a fully-healthy tick — running --resolve on it would clear
+    # prior dispatch alerts (including the freshly-raised `repo-degraded` row's predecessors)
+    # on the strength of a run that never observed the degraded target at all. The exact-'0'
+    # comparison is itself fail-closed: a missing/empty output (assemble crashed mid-way)
+    # skips recovery too.
+    if: >-
+      ${{ always() && needs.plan.result == 'success' && needs.claim.result == 'success' &&
+          needs.plan.outputs.degraded == '0' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
       issues: write
+      # actions:read — --resolve prunes only rows OLDER than this run's START (run_started_at
+      # from the runs API; round-5 P1: the recover job's own execution time let a failure that
+      # landed during an overlapping run be pruned as recovered). Without it the script SKIPS
+      # recovery (fail closed).
+      actions: read
     steps:
       - name: Checkout private registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

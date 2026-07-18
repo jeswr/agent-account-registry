@@ -33,7 +33,11 @@ inputs:
       `alarm` (default) records a failure. `resolve` is the HEALTHY-tick recovery path
       (pipeline-alarm.py --resolve): prunes this workflow's rows from the rolling alert and
       auto-closes it once the ledger empties. Wire `resolve` from an all-jobs-succeeded recover
-      job so a recovered workflow's stale rows never pin the alert open forever.
+      job so a recovered workflow's stale rows never pin the alert open forever. The resolve
+      path prunes only rows OLDER than this run's START time (run_started_at from the runs API
+      — an overlapping run's concurrent failure must survive), so the calling job needs
+      `actions: read`; without it the script SKIPS recovery (fail closed) rather than pruning
+      against a too-late boundary.
     required: false
     default: "alarm"
   job-name:
@@ -61,6 +65,14 @@ inputs:
     description: "true if the run was cancelled/timed-out (pass ${{ cancelled() }})."
     required: false
     default: "false"
+  failure-class:
+    description: >-
+      Optional EXPLICIT failure class for the ledger row, for conditions the job-result signals
+      cannot express — e.g. dispatch's non-terminal `repo-degraded` alarm raised from a green
+      run whose PLAN silently planned a target empty. Empty (default) derives the class from
+      job-result/cancelled as usual. Sanitized like every other field.
+    required: false
+    default: ""
   registry-token:
     description: >-
       Token to READ the registry (for the pinned checkout) and WRITE the alert issue. Pass
@@ -115,6 +127,7 @@ runs:
         ALARM_FAILED_STEP: ${{ inputs.failed-step }}
         ALARM_DETAIL: ${{ inputs.detail }}
         ALARM_CANCELLED: ${{ inputs.cancelled }}
+        ALARM_FAILURE_CLASS: ${{ inputs.failure-class }}
       run: |
         set -uo pipefail
         printf '::add-mask::%s\n' "$ALARM_GH_TOKEN"
