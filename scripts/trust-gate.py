@@ -79,11 +79,37 @@ def _cli_exit_tests():
         # untrusted -> exit 3 (fail closed, NEVER a crash exit).
         ("fetch failure fails closed to 3",
          run_cli("--author", "x", "--repo", "invalid/definitely-not-a-repo-000", "--fetch"), 3),
+        # Malformed invocations are hard errors (exit 2), never actionable verdicts.
+        ("missing author is a hard error",
+         run_cli("--permission", "write"), 2),
+        ("approval without author is a hard error",
+         run_cli("--maintainer-approved"), 2),
+        ("--fetch without --repo is a hard error",
+         run_cli("--author", "x", "--fetch"), 2),
+        ("--fetch with --permission is a hard error",
+         run_cli("--author", "x", "--repo", "o/r", "--fetch", "--permission", "write"), 2),
     ]
     for name, got, want in checks:
         good = got == want
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: exit {got} (want {want})")
+    # Hermetic SUCCESSFUL fetch (sol r2): a fake `gh` on PATH returns admin — --fetch must
+    # print trusted and exit 0. Without this, a broken endpoint (fetch always "none") passes
+    # every self-test while recreating the defer-all outage.
+    import tempfile
+    with tempfile.TemporaryDirectory() as fake_bin:
+        fake_gh = os.path.join(fake_bin, "gh")
+        with open(fake_gh, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\necho admin\n")
+        os.chmod(fake_gh, 0o755)
+        env = dict(os.environ, PATH=fake_bin + os.pathsep + os.environ.get("PATH", ""))
+        r = subprocess.run([sys.executable, os.path.abspath(__file__),
+                            "--author", "x", "--repo", "o/r", "--fetch"],
+                           capture_output=True, text=True, env=env)
+        good = r.returncode == 0 and r.stdout.strip() == "trusted"
+        ok = ok and good
+        print(f"  {'ok  ' if good else 'FAIL'} hermetic successful fetch -> trusted/0: "
+              f"exit {r.returncode} out {r.stdout.strip()!r} (want 0 'trusted')")
     return ok
 
 
@@ -125,9 +151,24 @@ def main():
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
-    perm = args.permission
-    if args.fetch and args.repo and args.author:
+    # Fail closed on malformed invocations (sol r2 on registry #227): an absent author must
+    # never combine with a supplied permission/approval into an actionable verdict, and the
+    # permission source must be EXPLICIT — exactly one of --fetch (with --repo) or
+    # --permission. An incomplete --fetch silently falling back to --permission recreated the
+    # trusted-by-accident shape this gate exists to prevent.
+    if not args.author.strip():
+        print("error: --author is required and must be nonempty", file=sys.stderr)
+        return 2
+    if args.fetch:
+        if not args.repo.strip():
+            print("error: --fetch requires --repo", file=sys.stderr)
+            return 2
+        if args.permission:
+            print("error: --fetch and --permission are mutually exclusive", file=sys.stderr)
+            return 2
         perm = fetch_permission(args.repo, args.author)
+    else:
+        perm = args.permission
     bots = [b for b in args.bot.split(",") if b.strip()]
     v = verdict(args.author, perm, args.maintainer_approved, bots)
     print(v)
