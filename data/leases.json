@@ -182,16 +182,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "aadd19df0f2c481190a46f2d72c0ccdd",
-   "holder": "sparq-org/sparq#3228@dispatch-29626100026.1",
-   "package": "sparq-reason",
-   "role": "impl",
-   "model": "terra",
-   "issued_at": 1784339873,
-   "expires_at": 1784346173
-  },
-  {
-   "account": "acct01",
    "claim_id": "34d8ab11aa94441ca566b1d4dc7a359a",
    "holder": "sparq-org/sparq#3253@dispatch-29626100026.1",
    "package": "knowledge-graph",
