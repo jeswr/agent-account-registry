@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The observability integration remains correct, substantive, and fail-closed. The optional snapshot is hidden only when absent; malformed JSON or an invalid schema fails the build, privacy-sensitive lease labels fail loudly, raw known handles are checked across the finished document, evidence URLs are constrained, and non-finite values are rejected both during normalization and at serialization. The golden and rejection-path self-tests exercise meaningful wrong-answer cases rather than passing vacuously. No blocker, major, or other actionable diff-scoped issue is supported. With no findings in either round 2 or round 3, progress is stagnant under the required scale.",
+ "verdict": "approve"
+}
