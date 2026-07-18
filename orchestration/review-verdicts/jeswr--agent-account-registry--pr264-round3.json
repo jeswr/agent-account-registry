@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 3 resolves the prior major finding: the secrets-guard job now has the load-bearing `actions: read` permission needed for its environment and deployment-branch-policy REST reads, while retaining only the `contents: read` needed for sparse checkout. The added static self-test checks the live workflow permission map exactly, including both rejection directions for a missing job/map and rejection of permission widening. The runtime guard remains fail-closed for malformed secrets data, API failures, missing environments, and any policy shape other than one branch-type rule exactly matching the repository default branch. Both secret-bearing jobs depend on the successful guard and are environment-bound, and the test suite exercises non-vacuous accept/reject and no-secret-value-output paths. No hostile reviewer-directed instruction was found in the diff.",
+ "verdict": "approve"
+}
