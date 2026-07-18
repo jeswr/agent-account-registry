@@ -1135,6 +1135,14 @@
    "model_alias": "terra",
    "exit_class": "unknown",
    "run_id": "29626799132.1"
+  },
+  {
+   "ts": 1784341208,
+   "provider": "anthropic",
+   "account": "9e13ea21abf27e68",
+   "model_alias": "opus",
+   "exit_class": "success",
+   "run_id": "29626585642.1"
   }
  ]
 }
