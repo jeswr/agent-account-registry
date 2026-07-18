@@ -1059,6 +1059,11 @@ jobs:
           WORKER_IMPL_ACCOUNT: ${{ needs.claim.outputs.account }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
+          # --route-constraint persists the ORIGINAL route's model chain (sol review r3
+          # finding 2): the PRE-HOSTILE resolve job's policy output for the issue's labels at
+          # publication — immutable once recorded; every later fix-ladder derivation
+          # (dispatch-claim CLAIM, review-fix.yml resolve) intersects with it so live label
+          # edits can only narrow a PR's allowed fix tiers, never widen them.
           python3 registry/scripts/worker-pr.py provenance-record \
             --registry-repo "$GITHUB_REPOSITORY" \
             --target-repo "${{ inputs.target_repo }}" \
@@ -1067,6 +1072,7 @@ jobs:
             --impl-alias "${{ needs.claim.outputs.model }}" \
             --issue "${{ inputs.issue_number }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --route-constraint "${{ needs.resolve.outputs.model_chain }}" \
             --verify-bot-login "${{ needs.worker.outputs.bot_login }}"
 
       - name: Mint App token for the review-state stamp

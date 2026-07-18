@@ -15,10 +15,13 @@
 # Trust posture (locked decisions):
 # - The implementer identity comes ONLY from the registry provenance record written at publish
 #   time (orchestration/provenance/...); commit trailers and PR body markers are audit-only.
-# - mode=review claims the provider OPPOSITE the CONTENT author (sol audit 2026-07-18: the
-#   successful-push author marker bound to the live head, else the provenance implementer),
-#   asserted fail-closed at claim AND script layer; the reviewer model is read-only (mutation=deny,
-#   no GitHub token in the container) and its verdict is VOID unless the tree is byte-identical.
+# - mode=review claims the provider OPPOSITE the CONTENT author (sol audit 2026-07-18, hardened
+#   r3: the successful-push author marker bound EXACTLY to the live head, a proven merge-only
+#   content-identical advance of the last marked push, or — only when no push was ever recorded —
+#   the provenance implementer; an unmarked, unproven head fails resolve for a human, never a
+#   latest-marker guess), asserted fail-closed at claim AND script layer; the reviewer model is
+#   read-only (mutation=deny, no GitHub token in the container) and its verdict is VOID unless
+#   the tree is byte-identical.
 # - Arming (gh pr ready + gh pr merge --auto) happens ONLY here, host-side, one-shot, gated on a
 #   schema-valid approve verdict + reviewer provider != content author provider + reviewer
 #   account != implementer account (salted hashes) + the armed head SHA equalling the reviewed
@@ -376,11 +379,17 @@ jobs:
           # against the LIVE head here — the dispatcher's content_provider input is an
           # UNAUTHENTICATED hint that is only cross-checked, never trusted. The successful-push
           # author markers (bot-authored, bound to their pushed sha) are the durable source;
-          # no marker => the provenance implementer authored the content. The fix ladder is
-          # the unified escalation ladder intersected with the ORIGINAL route's chain for the
-          # source issue's labels (an opus-only trust surface stays opus-only; a frontier-only
-          # ci PR never falls below frontier). Everything fails CLOSED: unreadable routing,
-          # conflicting markers, or an unknown author alias stop the run here.
+          # no marker => the provenance implementer authored the content, and a head bound to
+          # NO marker is accepted ONLY via the merge-only carry-forward probe against the PR's
+          # ACTUAL base ref (sol review r3 finding 1: the head advanced from the last recorded
+          # push purely by base-branch merges with a byte-identical diff — never a latest-
+          # marker guess for an ordinary unmarked commit). The fix ladder is the unified
+          # escalation ladder intersected with the provenance record's ORIGINAL route
+          # constraint (persisted at publication — immutable) AND the live re-derivation from
+          # the source issue's current labels, so live labels only ever NARROW the recorded
+          # constraint (r3 finding 2: removing a trust-surface label cannot widen an
+          # opus-only PR to the default ladder). Everything fails CLOSED: unreadable routing,
+          # conflicting/unproven markers, or an unknown author alias stop the run here.
           worker_pr_spec = importlib.util.spec_from_file_location(
               "registry_worker_pr", Path("registry", "scripts", "worker-pr.py"))
           worker_pr = importlib.util.module_from_spec(worker_pr_spec)
@@ -400,9 +409,13 @@ jobs:
           except (OSError, KeyError, tomllib.TOMLDecodeError) as exc:
               raise SystemExit(f"cannot load target routing for the content/route "
                                f"derivation (fail closed): {exc}")
+          base_ref = str((pull.get("base") or {}).get("ref") or "")
           try:
               author_alias = worker_pr.content_author_alias(
-                  worker_pr.fix_push_authors(pr_comments, author), head_sha)
+                  worker_pr.fix_push_authors(pr_comments, author), head_sha,
+                  carry_forward=lambda marked_sha: bool(base_ref)
+                  and worker_pr._merge_only_carry_forward(repo, head_sha, marked_sha,
+                                                          base_ref))
           except worker_pr.WorkerPrError as exc:
               raise SystemExit(f"content author derivation failed (fail closed): {exc}")
           if author_alias is None:
@@ -422,7 +435,7 @@ jobs:
                                "forged review direction")
           try:
               fix_ladder = worker_pr.constrained_ladder(
-                  impl_provider,
+                  impl_provider, record["route_constraint"],
                   worker_pr.route_fix_constraint(set(issue_labels), routing_doc))
           except worker_pr.WorkerPrError as exc:
               raise SystemExit(f"route-constraint derivation failed (fail closed): {exc}")
@@ -837,6 +850,58 @@ jobs:
               --release "$CLAIM_ID" \
               --repo "$GITHUB_REPOSITORY" || true
             exit 1
+          fi
+
+  # Dispatcher-lease backstop (sol review r3 finding 3): a resolve-time validation failure
+  # (stale/forged content_provider cross-check, provenance admission, missing ledger branch)
+  # fails the `resolve` job, so `claim` never runs and the `release` job's acquired-guard skips
+  # it — before this job, the dispatcher-preclaimed lease dangled until its TTL/groom. Runs
+  # ALWAYS when a dispatcher claim_id was supplied and the claim job did NOT adopt it (adopted
+  # leases are the `release` job's to free; the adopt/skip steps' own inline releases make this
+  # a no-op via the inspection guard). HOLDER INSPECTION is the safety guard: only a lease whose
+  # holder carries THIS PR's dispatcher prefix (`review:`/`fix:<repo>#<pr>@dispatch-`) is ever
+  # released — never the workflow's own self-claimed holder (`...@<run_id>`) nor any other
+  # run's lease — and a missing/expired/mismatched lease exits quietly (rc=3, nothing to do).
+  cleanup:
+    name: Release a stranded dispatcher lease
+    needs: [resolve, claim]
+    if: ${{ always() && inputs.claim_id != '' && needs.claim.outputs.acquired != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Inspect the holder and release the dispatcher-owned lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          [[ "$CLAIM_ID" =~ ^[0-9a-f]{32}$ ]] || { echo '::error::unsafe dispatcher claim id'; exit 1; }
+          prefix="review:"
+          [[ "$MODE" == fix ]] && prefix="fix:"
+          # Privacy (locked decision 22b): the inspect JSON carries the account handle — it
+          # never reaches the public log; only the pass/fail exit drives the release.
+          if python3 registry/scripts/select-and-claim.py \
+              --inspect "$CLAIM_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@dispatch-" \
+              > /dev/null; then
+            python3 registry/scripts/select-and-claim.py \
+              --release "$CLAIM_ID" \
+              --repo "$GITHUB_REPOSITORY"
+            printf 'stranded dispatcher lease released (claim=%s)\n' "${CLAIM_ID:0:8}"
+          else
+            printf 'no live dispatcher-held lease for this PR; nothing to release\n'
           fi
 
   run:

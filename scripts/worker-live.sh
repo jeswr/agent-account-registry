@@ -694,6 +694,11 @@ registry_selftest_gate() {
   printf 'worker-live: registry-selftest gate passed (%s suite run(s))\n' "$ran"
 }
 
+# Commit-trailer attribution for EVERY alias the routing catalog can dispatch — implementation
+# chains AND the unified fix ladder opus<luna<fable<sol (sol review r3 finding 4: sol/luna fix
+# pushes previously died here as "unknown model alias" and shipped an empty Co-Authored-By
+# trailer). The die stays fail-closed for a genuinely unknown alias; the host self-test pins
+# every catalog mapping so a new routing alias cannot land without its trailer.
 coauthor_for() {
   case "$1" in
     fable) printf '%s' 'Claude Fable 5 <noreply@anthropic.com>' ;;
@@ -701,6 +706,8 @@ coauthor_for() {
     sonnet) printf '%s' 'Claude Sonnet 4.6 <noreply@anthropic.com>' ;;
     haiku) printf '%s' 'Claude Haiku 4.5 <noreply@anthropic.com>' ;;
     terra) printf '%s' 'GPT-5.6 <noreply@openai.com>' ;;
+    sol) printf '%s' 'GPT-5.6 Sol <noreply@openai.com>' ;;
+    luna) printf '%s' 'GPT-5.6 Luna <noreply@openai.com>' ;;
     *) die 'unknown model alias for commit provenance' ;;
   esac
 }
@@ -1360,6 +1367,34 @@ self_test() {
   mapfile -t model_args < <(_provider_model_args codex gpt-5.6-codex)
   chk "codex concrete provider model pins --model" \
     "${model_args[*]-}" "--model gpt-5.6-codex"
+
+  # --- commit-trailer attribution covers EVERY dispatchable catalog alias (sol review r3
+  # finding 4): the unified fix ladder opus<luna<fable<sol pushes under any of its tiers, so a
+  # ladder alias missing here died mid-push and shipped an empty Co-Authored-By trailer.
+  # An unknown alias must still die (fail closed), never emit an empty trailer. ---
+  chk "coauthor maps fable" "$(coauthor_for fable)" \
+    'Claude Fable 5 <noreply@anthropic.com>'
+  chk "coauthor maps opus" "$(coauthor_for opus)" \
+    'Claude Opus 4.8 (1M context) <noreply@anthropic.com>'
+  chk "coauthor maps sonnet" "$(coauthor_for sonnet)" \
+    'Claude Sonnet 4.6 <noreply@anthropic.com>'
+  chk "coauthor maps haiku" "$(coauthor_for haiku)" \
+    'Claude Haiku 4.5 <noreply@anthropic.com>'
+  chk "coauthor maps terra" "$(coauthor_for terra)" 'GPT-5.6 <noreply@openai.com>'
+  chk "coauthor maps sol (fix-ladder tier)" "$(coauthor_for sol)" \
+    'GPT-5.6 Sol <noreply@openai.com>'
+  chk "coauthor maps luna (fix-ladder tier)" "$(coauthor_for luna)" \
+    'GPT-5.6 Luna <noreply@openai.com>'
+  chk "coauthor never emits an empty trailer for an unknown alias" \
+    "$( (coauthor_for gpt-omega) 2>/dev/null || echo refused)" "refused"
+  # every alias in the shipped routing catalog resolves to a non-empty trailer (a new
+  # [models.<alias>] entry without a coauthor mapping turns this red before it can dispatch)
+  local catalog_alias catalog_ok=ok
+  for catalog_alias in $(sed -n 's/^\[models\.\([a-z0-9_-]*\)\]$/\1/p' \
+      orchestration/routing.toml 2>/dev/null); do
+    (coauthor_for "$catalog_alias") >/dev/null 2>&1 || catalog_ok="missing:$catalog_alias"
+  done
+  chk "every routing-catalog alias has a coauthor mapping" "$catalog_ok" "ok"
 
   # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
   cat > "$tmp/claude.log" <<'LOG'

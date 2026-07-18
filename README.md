@@ -83,8 +83,8 @@ a rolling `data/cache-affinity.json`), never in the public repos.
 
 - **UI/front-end surfaces route to the openai/codex model chain** (original-builder ownership:
   **GPT-5.6 built the registry dashboard, `e4098b9`**). Repos onboarded to the registry inherit
-  this default. Machine-readable form: the `role = "site"` route (`model_chain = ["terra",
-  "fable", "sonnet"]`) in this repo's `orchestration/routing.toml`; when onboarding a new target
+  this default. Machine-readable form: the `role = "site"` route (`model_chain = ["sol",
+  "fable", "opus"]`) in this repo's `orchestration/routing.toml`; when onboarding a new target
   repo in `policy/repos.toml`, mirror that route into the target's own routing table
   (`sparq-org/sparq` already carries it). `scripts/triage.py` derives `role:site` from the exact
   UI-surface labels (`area:dashboard`, `dashboard`, `surface:frontend`). Implement it as a ROLE
@@ -92,13 +92,13 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   `match_labels` keywords, so UI keywords there would human-arm every UI PR.
 
 - **Frontier-tier agents author ALL CI/infrastructure work** (maintainer decision 2026-07-17):
-  Claude Fable (`fable`) or GPT-5.6 sol (openai; wired alias `terra`) — explicitly including the
+  Claude Fable (`fable`) or GPT-5.6 Sol (openai; wired alias `sol`) — explicitly including the
   self-draining pipeline infrastructure itself (dispatch, workers, gate aggregators,
-  `.github/workflows`, orchestration scripts). Cheaper tiers (sonnet/haiku) no longer author
-  infra; cross-provider review is unchanged (whichever provider's frontier writes, the other
-  reviews). Machine-readable form: the `role = "ci"` route (`model_chain = ["fable", "terra"]`)
-  in this repo's `orchestration/routing.toml`; mirror a frontier-only ci chain into each
-  onboarded target's routing table (`sparq-org/sparq` carries it, sparq PR #3422).
+  `.github/workflows`, orchestration scripts). Cheaper tiers (sonnet/haiku/terra) no longer
+  author infra; cross-provider review is unchanged (whichever provider's frontier writes, the
+  other reviews). Machine-readable form: the `role = "ci"` route (`model_chain = ["fable",
+  "sol"]`) in this repo's `orchestration/routing.toml`; mirror a frontier-only ci chain into
+  each onboarded target's routing table (`sparq-org/sparq` carries it, sparq PR #3422).
   `scripts/triage.py` derives `role:ci` from the exact infra-surface labels (`area:ci`,
   `area:workflows`). The chain is frontier-ONLY rather than floor-pinned: the routing schema has
   no floor/pin field, and chain exhaustion at the claim step already **defers** the item
@@ -107,6 +107,19 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   also a trust surface (dispatch/worker/set-up-account/review-loop/groom), the security
   `match_labels` override still wins (opus + human arm) — stricter than the frontier floor,
   unchanged.
+
+- **`terra` and `sonnet` are docs-only** (maintainer decision 2026-07-18): the cheap tiers
+  author NOTHING but documentation. They may appear only in the `role = "docs"` route's
+  `model_chain` (here: `["haiku", "sonnet", "terra", "fable"]`) — never in `[defaults]`, a
+  `match_labels` security rule, or any other role's chain. This is machine-enforced:
+  `scripts/route-resolve.py` `validate_routing()` **rejects** any routing table naming either
+  alias outside `role = "docs"`, so a violating table fails loudly at PLAN time instead of
+  silently routing. When onboarding a target repo, do **not** copy older guidance that placed
+  `terra` in site/ci/impl chains — use `sol` (GPT-5.6 Sol) or `luna` (GPT-5.6 Luna) for
+  openai-side implementation, fix-ladder, and review work, and keep `terra` confined to the
+  docs chain. The unified fix-escalation ladder is `opus < luna < fable < sol`
+  (cross-provider, ascending capability); legacy `sonnet`/`terra` pins translate to the
+  ladder bottom (`opus`).
 
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 
@@ -169,7 +182,9 @@ secret_ref: ACCT05_TOKEN
 notes: "claude setup-token (long-lived, non-rotating). [your-marker]"'
 ```
 For an **OpenAI** account: `provider: openai`, `harness: codex`, `credential_format: codex-auth-json`,
-`models: [terra]` (or the concrete GPT alias), `secret_ref: ACCTNN_TOKEN`.
+`models: [terra, sol, luna]` (every openai catalog alias the account can serve — `sol`/`luna`
+carry review + fix-ladder work; `terra` is docs-only routing, see the standing rules above),
+`secret_ref: ACCTNN_TOKEN`.
 
 ### Step 4 — label the issue (REQUIRED — no label ⇒ not `available` ⇒ never selected)
 

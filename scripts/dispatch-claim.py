@@ -114,15 +114,18 @@ BUSY_OR_GATED = {
 # else still gates (locked decision 20).
 DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
 # Cross-provider chains (locked decisions 14/17, revised by maintainer 2026-07-18 + sol audit):
-# the REVIEW chain is keyed by the CONTENT author's provider (the successful-push author marker
-# bound to the live head, else the provenance implementer) and lists strictly OPPOSITE-provider
-# reviewers, strongest first — an anthropic model only reviews codex-authored content and vice
-# versa. The FIX chain is the UNIFIED cross-provider escalation ladder in ascending capability
-# order opus < luna < fable < sol (worker_pr.ESCALATION_LADDERS), INTERSECTED per PR with the
-# ORIGINAL route's model chain (worker_pr.constrained_ladder — an opus-only trust-surface PR is
-# only ever fixed by opus; a frontier-only ci PR never falls below frontier). Computed HERE,
-# never through policy-resolve.resolve() (whose role=review row is always [opus]); resolve()
-# supplies account_pool/caps/gate/arm only.
+# the REVIEW chain is keyed by the CONTENT author's provider — the successful-push author marker
+# bound EXACTLY to the live head, a proven merge-only content-identical advance of the last
+# marked push (carry-forward machinery), or, when NO push was ever recorded, the provenance
+# implementer; an unmarked, unproven head escalates to a human (sol review r3 finding 1 — never
+# a latest-marker guess) — and lists strictly OPPOSITE-provider reviewers, strongest first: an
+# anthropic model only reviews codex-authored content and vice versa. The FIX chain is the
+# UNIFIED cross-provider escalation ladder in ascending capability order opus < luna < fable <
+# sol (worker_pr.ESCALATION_LADDERS), INTERSECTED per PR with the provenance record's ORIGINAL
+# route constraint AND its live re-derivation (worker_pr.constrained_ladder — live labels only
+# ever narrow: an opus-only trust-surface PR is only ever fixed by opus; a frontier-only ci PR
+# never falls below frontier). Computed HERE, never through policy-resolve.resolve() (whose
+# role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
 REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["fable", "opus"]}
 # Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
 # 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
@@ -600,7 +603,11 @@ def provenance_admission_error(record, pr_number):
       the ``repos/<repo>/issues/<issue>`` read crash the run into the lease-expiry retry loop),
     - well-formed 40-hex ``head_sha_at_open`` (CLAIM ancestry check, review-fix.yml resolve),
     - salted 16-hex ``impl_account_h`` (locked decision 22a; CLAIM reviewer!=implementer
-      assertion, review-fix.yml resolve).
+      assertion, review-fix.yml resolve),
+    - non-empty safe-atom ``route_constraint`` list (sol review r3 finding 2; the ORIGINAL
+      route's model chain persisted at publication — CLAIM and review-fix.yml resolve
+      intersect every live fix-ladder derivation with it so live labels can only narrow,
+      never widen, a PR's allowed fix tiers).
 
     EVERY consumer calls this ONE function — enumerate_review_items (PLAN), the CLAIM record
     re-read below, review-fix.yml's resolve step (imports this module from the registry
@@ -635,6 +642,12 @@ def provenance_admission_error(record, pr_number):
     opened_sha = record.get("head_sha_at_open")
     if not isinstance(opened_sha, str) or not SAFE_SHA.fullmatch(opened_sha):
         return "provenance head sha is malformed"
+    route_constraint = record.get("route_constraint")
+    if (not isinstance(route_constraint, list) or not route_constraint
+            or any(not isinstance(alias, str) or not SAFE_ATOM.fullmatch(alias)
+                   for alias in route_constraint)):
+        return ("provenance route constraint is missing or invalid (pre-constraint records "
+                "must be re-recorded via backfill-provenance.py)")
     return None
 
 
@@ -1215,18 +1228,21 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             impl_provider = record["impl_provider"]
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
-            # Route-constrained fix ladder (sol audit 2026-07-18): RE-DERIVED per PR every tick
-            # from the source issue's live labels against the plan-sha routing, then intersected
-            # with the unified ladder — an opus-only trust-surface PR may only be fixed by opus,
-            # and a frontier-only ci PR never falls below frontier. An empty intersection is a
-            # loud human hand-off, never a silent widening to the full ladder.
+            # Route-constrained fix ladder (sol audit 2026-07-18, hardened by sol review r3
+            # finding 2): the ORIGINAL constraint is the provenance record's route_constraint
+            # — persisted at publication, immutable — intersected with the unified ladder AND
+            # with the live re-derivation from the source issue's current labels, so live
+            # labels can only NARROW the recorded constraint (a stricter label added later
+            # still bites) and NEVER widen it (removing a trust-surface label no longer widens
+            # an originally opus-only PR to the default ladder). An empty intersection, an
+            # unknown/ambiguous role, or an unreadable routing is a loud human hand-off.
             try:
                 fix_ladder = worker_pr.constrained_ladder(
-                    impl_provider,
+                    impl_provider, record["route_constraint"],
                     worker_pr.route_fix_constraint(issue_labels, routing))
             except worker_pr.WorkerPrError as exc:
                 _pr_needs_user(script_dir, repo, number, issue_number,
-                               f"the original route constraint for this PR is unresolvable "
+                               f"the route constraint for this PR is unresolvable "
                                f"({exc}); a human must fix or re-route it")
                 continue
             # Round budget via the PURE decide_budget (maintainer directive 2026-07-17): the
@@ -1318,17 +1334,26 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # markers, which also record no-change/gate-failed attempts and so can span
                 # providers within one round (an opus attempt + a luna success previously
                 # read as "conflicting providers" and parked). No author marker => the
-                # provenance implementer authored the head. Conflicting markers or an alias
-                # the target routing does not name are hostile/corrupt marker data — loud
-                # human hand-off, never a guessed review direction.
+                # provenance implementer authored the head. A head that carries markers but
+                # is bound to NONE of them (sol review r3 finding 1) is accepted ONLY via the
+                # merge-only carry-forward probe against the PR's ACTUAL base ref (the head
+                # advanced from the last recorded push purely by base-branch merges with a
+                # byte-identical diff vs the merge base — issue #69/#81 machinery); anything
+                # else — conflicting markers, an unmarked/unproven head, or an alias the
+                # target routing does not name — is a loud human hand-off, never a guessed
+                # review direction.
+                base_ref = str((pull.get("base") or {}).get("ref") or "")
                 try:
                     author_alias = worker_pr.content_author_alias(
-                        worker_pr.fix_push_authors(comments, bot_login), head_sha)
-                except worker_pr.WorkerPrError:
+                        worker_pr.fix_push_authors(comments, bot_login), head_sha,
+                        carry_forward=lambda marked_sha: bool(base_ref)
+                        and worker_pr._merge_only_carry_forward(
+                            repo, head_sha, marked_sha, base_ref))
+                except worker_pr.WorkerPrError as exc:
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   "cannot derive the content provider for the review "
-                                   "direction (conflicting successful-push author markers); "
-                                   "a human must inspect this PR's fix-author markers")
+                                   f"cannot derive the content provider for the review "
+                                   f"direction ({exc}); a human must inspect this PR's "
+                                   "fix-author markers")
                     continue
                 if author_alias is not None:
                     author_provider = str(
@@ -2031,10 +2056,11 @@ def _self_test():
     provenance = {
         41: {"pr_number": 41, "head_sha_at_open": sha_a, "impl_provider": "anthropic",
              "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 7,
-             "recorded_at_run": "1.1"},
+             "recorded_at_run": "1.1",
+             "route_constraint": ["opus", "luna", "fable", "sol"]},
         42: {"pr_number": 42, "head_sha_at_open": sha_a, "impl_provider": "openai",
              "impl_alias": "terra", "impl_account_h": "cd" * 8, "issue": 9,
-             "recorded_at_run": "2.1"},
+             "recorded_at_run": "2.1", "route_constraint": ["opus"]},
     }
     issue_labels = {7: ["area:crate-a", "role:impl"], 9: ["area:sparq-zk", "role:impl"]}
     pulls = [
@@ -2137,6 +2163,15 @@ def _self_test():
         {key: value for key, value in provenance[41].items() if key != "impl_alias"})
     assert _rejected_everywhere({**provenance[41], "impl_alias": "no spaces allowed"})
     assert _rejected_everywhere({**provenance[41], "impl_alias": 5})       # non-string
+    # Sol review r3 finding 2: the ORIGINAL route constraint is a REQUIRED record field — a
+    # record without it (pre-constraint legacy: re-record via backfill-provenance.py) or with
+    # a malformed one is inadmissible everywhere, exactly like a legacy raw-handle record.
+    assert _rejected_everywhere(
+        {key: value for key, value in provenance[41].items() if key != "route_constraint"})
+    assert _rejected_everywhere({**provenance[41], "route_constraint": []})       # empty
+    assert _rejected_everywhere({**provenance[41], "route_constraint": "opus"})   # non-list
+    assert _rejected_everywhere({**provenance[41], "route_constraint": ["ok", 5]})
+    assert _rejected_everywhere({**provenance[41], "route_constraint": ["no spaces"]})
     assert _rejected_everywhere(
         {key: value for key, value in provenance[41].items() if key != "issue"})
     assert _rejected_everywhere({**provenance[41], "issue": 0})
@@ -2426,7 +2461,7 @@ def _self_test():
                 "mergeable": mergeable, "auto_merge": auto_merge,
                 "head": {"ref": "sparq-agent/issue-7-1-1", "sha": sha_a,
                          "repo": {"full_name": repo}},
-                "base": {"repo": {"default_branch": "main"}},
+                "base": {"ref": "main", "repo": {"default_branch": "main"}},
                 "user": {"login": bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
@@ -2751,6 +2786,27 @@ def _self_test():
             assert alloc.chains == [["sol"]], alloc.chains
             fake["issue_labels"] = ["area:crate-a"]
 
+            # ---- the RECORDED original constraint is immutable (sol review r3 finding 2):
+            # a stripped trust-surface label (live labels now resolve the default ladder)
+            # can NEVER widen an originally opus-only PR — the offered chain stays [opus] ----
+            ledger_record.write_text(json.dumps(
+                {**provenance[41], "route_constraint": ["opus"]}), encoding="utf-8")
+            fake["comments"] = round_markers(2)
+            write_verdict(2, None, root=wiring_ledger_root)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["opus"]], alloc.chains
+            # a record missing the constraint (pre-migration shape) is inadmissible: no
+            # dispatch, no mutation — the PLAN-side enumeration already refuses it, and this
+            # CLAIM-side re-read parks nothing silently (defer prints only)
+            ledger_record.write_text(json.dumps(
+                {key: value for key, value in provenance[41].items()
+                 if key != "route_constraint"}), encoding="utf-8")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [] and alloc.chains == [], (helper_calls, alloc.chains)
+            ledger_record.write_text(json.dumps(provenance[41]), encoding="utf-8")
+
             # ---- content-keyed review direction from PUSH-AUTHOR markers (sol audit): an
             # opus ATTEMPT + a luna SUCCESS in one round no longer parks — the sha-bound
             # author marker names the single actual content author ----
@@ -2774,13 +2830,29 @@ def _self_test():
             run_items([author_review_item], allocator=alloc, routing=routing_ok)
             assert helper_calls == [], helper_calls
             assert alloc.chains == [["sol", "luna"]], alloc.chains
-            # the head advanced past the last push (base merges): the LATEST push author
-            # still owns the content
+            # the head advanced past the last push WITHOUT a proven merge-only advance (sol
+            # review r3 finding 1): the direction is NEVER guessed from the latest marker —
+            # loud park, and the probe ran against the LAST marked sha + the ACTUAL base ref
             fake["comments"] = round_markers(2) + [
                 bot_comment(f"a {fix_author} round=2 model=luna sha={sha_b} run=2.1 -->")]
+            real_carry = wiring_worker_pr._merge_only_carry_forward
+            probe_calls = []
+            wiring_worker_pr._merge_only_carry_forward = (
+                lambda *args: probe_calls.append(args) or False)
             alloc = FakeAllocator()
             run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+            assert probe_calls == [(repo, sha_a, sha_b, "main")], probe_calls
+            # ... while a PROVEN merge-only, content-identical advance (the existing issue
+            # #69/#81 carry-forward machinery) keeps the LAST push author owning the content
+            wiring_worker_pr._merge_only_carry_forward = lambda *args: True
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
             assert alloc.chains == [["fable", "opus"]], alloc.chains
+            wiring_worker_pr._merge_only_carry_forward = real_carry
             # a forged NON-bot author marker is inert (bot-login trust filter)
             fake["comments"] = round_markers(2) + [
                 {"user": {"login": "mallory"},

@@ -207,14 +207,21 @@ def fix_push_authors(comments, bot_login):
     return authors
 
 
-def content_author_alias(authors, head_sha):
+def content_author_alias(authors, head_sha, carry_forward=None):
     """The model alias that authored the CONTENT at `head_sha`, from the ordered successful-push
     author markers (fix_push_authors). None => no fix ever pushed, the provenance implementer
-    authored the content. Preference order: a marker bound to EXACTLY this head; otherwise the
-    LATEST recorded push author (the head can advance past the last push only via base-branch
-    merges — every loop push records a marker — so the last push author still owns the content).
-    Two markers binding the SAME sha to different models is corrupt/forged marker data and
-    raises (fail closed: the caller escalates to a human, never guesses a review direction)."""
+    authored the content. The ONLY accepted bindings (sol review r3 finding 1):
+    - a marker bound to EXACTLY this head sha, or
+    - `carry_forward(last_marked_sha)` returning True — the caller-supplied probe over the
+      existing merge-only carry-forward machinery (_merge_only_carry_forward), proving the head
+      advanced from the LAST recorded push solely by base-branch merge commits with a
+      byte-identical diff vs the merge base, so the last push author still owns the content.
+    There is deliberately NO latest-marker or implementer fallback for an unmarked head: an
+    ordinary (non-merge) descendant commit passes the ancestry checks, so guessing its author
+    from an unrelated marker could flip the review direction to the content author's own
+    provider. Any unmarked, unproven head raises — the caller escalates to a human, never
+    guesses a review direction. Two markers binding the SAME sha to different models is
+    corrupt/forged marker data and raises for the same reason."""
     if not authors:
         return None
     by_sha = {}
@@ -224,21 +231,33 @@ def content_author_alias(authors, head_sha):
         raise WorkerPrError("conflicting successful-push author markers for one head sha")
     if head_sha in by_sha:
         return next(iter(by_sha[head_sha]))
-    return authors[-1][1]
+    if carry_forward is not None and carry_forward(authors[-1][2]):
+        return authors[-1][1]
+    raise WorkerPrError(
+        "the live head carries no successful-push author marker and is not a proven "
+        "merge-only, content-identical advance of the last recorded push")
 
 
 def route_fix_constraint(labels, routing):
-    """The ORIGINAL route's model chain for a PR's source-issue labels (sol audit 2026-07-18):
-    the same first-match-wins precedence as route-resolve.py / policy-resolve.py — a
-    match_labels (security) rule matches if any keyword is a substring of any label, else the
-    role row, else [defaults]. The unified fix ladder must be INTERSECTED with this chain
-    (constrained_ladder below): an opus-only trust-surface PR may only be fixed by opus, and a
-    frontier-only ci PR never falls below frontier. Returns the winning model_chain list
-    (possibly empty when the routing document is malformed — the caller fails closed)."""
+    """The route's model chain for a PR's source-issue labels (sol audit 2026-07-18): the same
+    first-match-wins precedence as route-resolve.py / policy-resolve.py — a match_labels
+    (security) rule matches if any keyword is a substring of any label, else the role row, else
+    [defaults]. The unified fix ladder must be INTERSECTED with this chain (constrained_ladder
+    below): an opus-only trust-surface PR may only be fixed by opus, and a frontier-only ci PR
+    never falls below frontier. Fail-closed role handling (sol review r3 finding 2): MULTIPLE
+    role:* labels raise (never a silent alphabetical pick), and a role label that matches NO
+    route row raises (never a silent [defaults] fallback that could widen an unrecognized —
+    possibly stricter — role to the default ladder); [defaults] applies only when the issue
+    carries no role label at all. Returns the winning model_chain list (possibly empty when
+    the routing document is malformed — the caller fails closed)."""
     if not isinstance(routing, dict):
         return []
     labels = {label for label in labels if isinstance(label, str)}
-    role = next((label[5:] for label in sorted(labels) if label.startswith("role:")), None)
+    roles = sorted(label[5:] for label in labels if label.startswith("role:"))
+    if len(roles) > 1:
+        raise WorkerPrError("multiple role:* labels on the source issue; refusing to pick a "
+                            "route constraint silently")
+    role = roles[0] if roles else None
     routes = routing.get("route", [])
     for rule in routes if isinstance(routes, list) else []:
         if not isinstance(rule, dict):
@@ -250,20 +269,30 @@ def route_fix_constraint(labels, routing):
                 return list(rule.get("model_chain") or [])
         elif role is not None and rule.get("role") == role:
             return list(rule.get("model_chain") or [])
+    if role is not None:
+        raise WorkerPrError(f"role '{role}' matches no route row; refusing the defaults "
+                            "fallback for an unknown role")
     defaults = routing.get("defaults")
     return list(defaults.get("model_chain") or []) if isinstance(defaults, dict) else []
 
 
-def constrained_ladder(provider, route_chain):
+def constrained_ladder(provider, route_chain, live_chain=None):
     """Intersect the provider's unified fix escalation ladder with the ORIGINAL route's model
-    chain (after LEGACY_TIERS translation), preserving ladder order. Raises when the
-    intersection is empty (fail closed: a PR whose route names no ladder tier must go to a
-    human, never silently run the full ladder)."""
+    chain (after LEGACY_TIERS translation), preserving ladder order. When `live_chain` is given
+    (the route re-derived from the source issue's LIVE labels), the allowed set is additionally
+    intersected with it — live labels may only NARROW the recorded original constraint, never
+    widen it (sol review r3 finding 2: removing a trust-surface label must not widen an
+    originally opus-only PR to the default ladder). Raises when the intersection is empty (fail
+    closed: a PR whose route names no ladder tier must go to a human, never silently run the
+    full ladder)."""
     ladder = ESCALATION_LADDERS.get(provider)
     if not ladder:
         raise WorkerPrError("unknown provider for the escalation ladder")
     allowed = {LEGACY_TIERS.get(model, model) for model in route_chain
                if isinstance(model, str)}
+    if live_chain is not None:
+        allowed &= {LEGACY_TIERS.get(model, model) for model in live_chain
+                    if isinstance(model, str)}
     constrained = [tier for tier in ladder if tier in allowed]
     if not constrained:
         raise WorkerPrError("the original route's model chain shares no tier with the fix "
@@ -998,7 +1027,7 @@ def _registry_put_file(registry_repo, path, document, message, retries=6):
 
 
 def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_provider, impl_alias,
-                      impl_account_h, issue, run_key, verify_bot_login=None):
+                      impl_account_h, issue, run_key, route_constraint, verify_bot_login=None):
     """Write the registry provenance record (the review loop's root of trust).
 
     Privacy (locked decision 22a): the record stores ONLY the salted account hash, never the raw
@@ -1006,11 +1035,21 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
     must be an open, bot-authored, same-repo PR whose head branch is bound to `issue` — because
     the calling job receives pr_number from a worker job that executed hostile target code, the
     reported number is verified against trusted inputs before anything is recorded, and the head
-    sha is taken from the API (never from the hostile job's outputs)."""
+    sha is taken from the API (never from the hostile job's outputs).
+
+    `route_constraint` (sol review r3 finding 2) is the ORIGINAL route's model chain resolved at
+    publication (the worker resolve job's pre-hostile policy output) — the immutable allowed-tier
+    set every later fix-ladder derivation intersects with, so removing a source-issue label can
+    only ever NARROW a PR's fix ladder, never widen it. Required + validated here: an immutable
+    record with a junk constraint would brick the PR's review loop at every admission."""
     if impl_provider not in {"anthropic", "openai"}:
         raise WorkerPrError("impl_provider must be anthropic or openai")
     if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h or ""):
         raise WorkerPrError("impl_account_h must be a 16-hex salted account hash")
+    if (not isinstance(route_constraint, list) or not route_constraint
+            or any(not isinstance(alias, str) or not SAFE_ALIAS_RE.fullmatch(alias)
+                   for alias in route_constraint)):
+        raise WorkerPrError("route_constraint must be a non-empty list of safe model aliases")
     if verify_bot_login:
         pull = _gh_json(["api", f"repos/{target_repo}/pulls/{pr_number}"])
         if pull.get("state") != "open":
@@ -1034,6 +1073,7 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
         "impl_account_h": impl_account_h,
         "issue": issue,
         "recorded_at_run": run_key,
+        "route_constraint": list(route_constraint),
     }
     created = _registry_put_file(
         registry_repo, provenance_path(target_repo, pr_number), document,
@@ -1865,8 +1905,29 @@ def _self_test():
           content_author_alias(authors, sha_q), "luna")
     check("an earlier pushed head resolves its own author",
           content_author_alias(authors, sha_p), "opus")
-    check("head advanced past the last push: the latest push author governs",
-          content_author_alias(authors, "3" * 40), "luna")
+    # Sol review r3 finding 1: an UNMARKED head gets NO latest-marker guess — without a proven
+    # merge-only content-identical advance the derivation raises and the caller escalates.
+    try:
+        content_author_alias(authors, "3" * 40)
+    except WorkerPrError:
+        check("unmarked head without carry-forward proof fails closed", "rejected", "rejected")
+    else:
+        check("unmarked head without carry-forward proof fails closed", "accepted", "rejected")
+    probed = []
+    check("proven merge-only advance keeps the LAST push author",
+          content_author_alias(authors, "3" * 40,
+                               carry_forward=lambda sha: probed.append(sha) or True), "luna")
+    check("the carry-forward probe runs against the LAST marked sha", probed, [sha_q])
+    try:
+        content_author_alias(authors, "3" * 40, carry_forward=lambda sha: False)
+    except WorkerPrError:
+        check("a refuted carry-forward probe fails closed", "rejected", "rejected")
+    else:
+        check("a refuted carry-forward probe fails closed", "accepted", "rejected")
+    check("an exact-sha marker never consults the carry-forward probe",
+          content_author_alias(authors, sha_q,
+                               carry_forward=lambda sha: (_ for _ in ()).throw(
+                                   AssertionError("probe must not run"))), "luna")
     check("no push authors means implementer-authored content",
           content_author_alias([], "3" * 40), None)
     try:
@@ -1899,10 +1960,26 @@ def _self_test():
           route_fix_constraint({"role:ci", "area:worker"}, constraint_routing), ["opus"])
     check("role route matches when no security rule fires",
           route_fix_constraint({"role:ci", "area:ci"}, constraint_routing), ["fable", "sol"])
-    check("defaults apply when nothing matches",
+    check("defaults apply when NO role label is present",
           route_fix_constraint({"area:usage"}, constraint_routing), ["fable", "sol", "opus"])
     check("malformed routing yields an empty constraint (caller fails closed)",
           route_fix_constraint({"area:usage"}, {"route": "nope"}), [])
+    # Sol review r3 finding 2: no silent role handling — an unknown role NEVER falls back to
+    # [defaults], and multiple role labels are never silently reduced to an alphabetical pick.
+    try:
+        route_fix_constraint({"role:mystery", "area:usage"}, constraint_routing)
+    except WorkerPrError:
+        check("unknown role fails closed (no defaults fallback)", "rejected", "rejected")
+    else:
+        check("unknown role fails closed (no defaults fallback)", "accepted", "rejected")
+    try:
+        route_fix_constraint({"role:ci", "role:docs"}, constraint_routing)
+    except WorkerPrError:
+        check("multiple role labels fail closed (no silent pick)", "rejected", "rejected")
+    else:
+        check("multiple role labels fail closed (no silent pick)", "accepted", "rejected")
+    check("a security rule still wins over an unknown role (match precedes the role check)",
+          route_fix_constraint({"role:mystery", "area:worker"}, constraint_routing), ["opus"])
     check("opus-only trust surface constrains the ladder to opus",
           constrained_ladder("anthropic", ["opus"]), ["opus"])
     check("frontier-only ci never falls below frontier",
@@ -1919,6 +1996,22 @@ def _self_test():
         check("no shared ladder tier fails closed", "rejected", "rejected")
     else:
         check("no shared ladder tier fails closed", "accepted", "rejected")
+    # Sol review r3 finding 2: the RECORDED original constraint is immutable — a live
+    # re-derivation can only NARROW it (intersection), never widen it. Removing a
+    # trust-surface label (live=defaults) must not widen an originally opus-only PR.
+    check("live labels may narrow the recorded constraint",
+          constrained_ladder("anthropic", ["fable", "sol", "opus"], ["opus"]), ["opus"])
+    check("live labels can NEVER widen the recorded constraint",
+          constrained_ladder("anthropic", ["opus"], ["fable", "sol", "opus"]), ["opus"])
+    check("unchanged live labels keep the recorded constraint",
+          constrained_ladder("anthropic", ["fable", "sol"], ["fable", "sol"]),
+          ["fable", "sol"])
+    try:
+        constrained_ladder("anthropic", ["opus"], ["fable", "sol"])
+    except WorkerPrError:
+        check("disjoint recorded/live constraints fail closed", "rejected", "rejected")
+    else:
+        check("disjoint recorded/live constraints fail closed", "accepted", "rejected")
 
     # decide_disarm (issue #42): the sweep invariant acts on mismatch when the PR is armed OR
     # ready-but-unarmed (interrupted-disarm crash-window re-entry); matching SHAs are NEVER
@@ -2556,6 +2649,10 @@ def main():
                            "WORKER_IMPL_ACCOUNT with env PROVENANCE_SALT")
     prov.add_argument("--issue", required=True, type=int)
     prov.add_argument("--run-key", required=True)
+    prov.add_argument("--route-constraint", required=True,
+                      help="CSV of the ORIGINAL route's model chain resolved at publication "
+                           "(the worker resolve job's pre-hostile policy output); persisted so "
+                           "live labels can only ever narrow the fix ladder")
     prov.add_argument("--verify-bot-login", default="")
 
     vrec = subparsers.add_parser("verdict-record")
@@ -2680,7 +2777,9 @@ def main():
                 os.environ.get("PROVENANCE_SALT", ""))
             provenance_record(args.registry_repo, args.target_repo, args.pr, args.head_sha,
                               args.impl_provider, args.impl_alias, impl_account_h, args.issue,
-                              args.run_key, verify_bot_login=args.verify_bot_login)
+                              args.run_key,
+                              [alias for alias in args.route_constraint.split(",") if alias],
+                              verify_bot_login=args.verify_bot_login)
         elif args.command == "verdict-record":
             verdict_record(args.registry_repo, args.target_repo, args.pr, args.round,
                            args.verdict_file)

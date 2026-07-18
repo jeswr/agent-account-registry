@@ -1360,6 +1360,7 @@ def _self_test() -> int:
             "impl_alias": "fable",
             "impl_account_h": "ab" * 8,
             "issue": 7,
+            "route_constraint": ["fable", "sol", "opus"],
         }
         record_path.write_text(json.dumps(valid_record), encoding="utf-8")
         check(
@@ -1415,6 +1416,12 @@ def _self_test() -> int:
             ("issue", -7),  # negative issue number
             ("issue", True),  # bool is not an issue number (str(True) breaks the issues/ read)
             ("issue", "7"),  # string is not an int
+            # Sol review r3 finding 2: the ORIGINAL route constraint is a required field —
+            # a record without a valid one is review-REJECTED, so groom must park, not
+            # preserve (pre-constraint records re-record via backfill-provenance.py).
+            ("route_constraint", []),  # empty constraint
+            ("route_constraint", "opus"),  # non-list constraint
+            ("route_constraint", ["no spaces"]),  # unsafe alias member
         ):
             record_path.write_text(
                 json.dumps({**valid_record, field: bad_value}), encoding="utf-8"
@@ -1424,7 +1431,7 @@ def _self_test() -> int:
                 worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
                 False,
             )
-        for missing in ("impl_alias", "issue"):
+        for missing in ("impl_alias", "issue", "route_constraint"):
             record_path.write_text(
                 json.dumps({k: v for k, v in valid_record.items() if k != missing}),
                 encoding="utf-8",

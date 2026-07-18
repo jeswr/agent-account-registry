@@ -23,6 +23,7 @@ prints a handle either.
 """
 
 import argparse
+import base64
 import importlib.util
 import json
 import os
@@ -275,6 +276,23 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         if probe.returncode == 0:
             skipped += 1
             print(f"skip #{number}: provenance already recorded")
+            # An EXISTING record that predates the required route_constraint field (sol review
+            # r3 finding 2) is inadmissible by every consumer, and records are immutable —
+            # this script must not silently dead-end the operator the admission error sent
+            # here. Loud hand-off: a human deletes the stale record (a registry-maintainer
+            # action) and re-runs this backfill, which then records the complete shape.
+            try:
+                meta = json.loads(probe.stdout)
+                body = base64.b64decode("".join(meta["content"].split())).decode()
+                if "route_constraint" not in json.loads(body):
+                    needs_human += 1
+                    print(f"NEEDS-HUMAN #{number}: the recorded provenance predates the "
+                          "required route_constraint field; records are immutable, so a "
+                          "human must delete the stale record and re-run this backfill")
+            except (KeyError, ValueError, json.JSONDecodeError):
+                needs_human += 1
+                print(f"NEEDS-HUMAN #{number}: the recorded provenance is unreadable; a "
+                      "human must inspect it")
             # Still reconcile the draft state (an earlier pass may have crashed between the two).
             _ensure_draft(target_repo, number, is_draft, apply_changes)
             continue
@@ -324,16 +342,37 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
             print(f"skip #{number}: first commit sha is malformed")
             continue
 
+        # Reconstruct the route constraint for the record (sol review r3 finding 2 made it a
+        # REQUIRED field): the best available original is the SOURCE issue's current labels
+        # resolved through the routing table — for this pre-migration population the labels
+        # predate the record, so this is the closest attestable original. An unresolvable
+        # route (unknown/ambiguous role, empty chain) stays fail-closed invisible for a human.
+        try:
+            issue_data = _gh_json(["api", f"repos/{target_repo}/issues/{issue}"])
+            issue_labels = {label.get("name")
+                            for label in (issue_data.get("labels") or [])
+                            if isinstance(label, dict)}
+            route_constraint = worker_pr.route_fix_constraint(issue_labels, routing)
+        except (worker_pr.WorkerPrError, BackfillError, AttributeError):
+            route_constraint = []
+        if not route_constraint:
+            needs_human += 1
+            print(f"NEEDS-HUMAN #{number}: the route constraint for issue #{issue} is "
+                  "unresolvable from its labels; record provenance manually after a human "
+                  "establishes the original route")
+            continue
+
         impl_account_h = worker_pr.account_hash(account, salt)
         if apply_changes:
             worker_pr.provenance_record(registry_repo, target_repo, number, opened_sha,
-                                        provider, alias, impl_account_h, issue, run_key)
+                                        provider, alias, impl_account_h, issue, run_key,
+                                        route_constraint)
             written += 1
         else:
             # Privacy: never print the raw handle, only the (public-anyway) salted hash.
             print(f"DRY-RUN #{number}: would record impl={provider}/{alias} "
                   f"account_h={impl_account_h} issue=#{issue} opened={opened_sha[:8]} "
-                  f"({run_key})")
+                  f"route={','.join(route_constraint)} ({run_key})")
             written += 1
         _ensure_draft(target_repo, number, is_draft, apply_changes)
     mode = "recorded" if apply_changes else "would record"
@@ -442,6 +481,22 @@ def _self_test():
     check("non-dict pull fails closed", flatten_pull_pages([[1]]), None)
     check("empty slurp is an empty list", flatten_pull_pages([]), [])
     check("forged worker-job lines alone resolve nothing", ident(forged), None)
+    # route_constraint is a REQUIRED provenance field (sol review r3 finding 2): the backfill
+    # reconstructs it via worker-pr's shared resolver, and an unresolvable route (e.g. an
+    # unknown role) stays fail-closed for a human — never a guessed/defaulted constraint.
+    worker_pr = _load_worker_pr()
+    check("route constraint derives via the shared resolver",
+          worker_pr.route_fix_constraint(
+              {"role:docs"},
+              {"route": [{"role": "docs", "model_chain": ["haiku", "sonnet"]}]}),
+          ["haiku", "sonnet"])
+    try:
+        worker_pr.route_fix_constraint(
+            {"role:mystery"}, {"defaults": {"model_chain": ["fable"]}})
+    except worker_pr.WorkerPrError:
+        check("unknown role stays fail-closed for a human", "rejected", "rejected")
+    else:
+        check("unknown role stays fail-closed for a human", "accepted", "rejected")
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
