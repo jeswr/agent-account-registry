@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The assembly step calls ::add-mask:: for SPARQ_TOKEN and JESWR_TOKEN and then writes a JSON string containing those same values to GITHUB_OUTPUT. GitHub Actions explicitly prevents a value from being set as an output after it has been masked (and secret-bearing outputs may be suppressed). Consequently steps.token-map.outputs.tokens can be empty, causing groom.py to see no target credentials and defer all target repairs on every run. The workflow can still succeed, so this becomes a persistent silent loss of maintenance rather than a loud credential failure.",
+   "file": ".github/workflows/groom.yml",
+   "fix_hint": "Do not transport the newly assembled secret map through GITHUB_OUTPUT after masking its components. Construct the map inside the sweep step from the original token action outputs supplied as environment variables, mask them there, and invoke groom.py in the same step; alternatively use a GitHub-supported secret transport that is not a step output. Add a workflow-level test/assertion proving two distinct token values reach the process without appearing in logs.",
+   "severity": "major",
+   "title": "Masked tokens cannot be republished through the token-map step output"
+  },
+  {
+   "body": "The policy parser stores only the first repository name for each owner via owners.setdefault(owner, name), and each App-token mint receives that single name. groom.py then treats the resulting owner client as valid for every enabled repository under that owner. If policy contains two enabled repositories for sparq-org or jeswr, requests to the non-representative repository use a token that is not scoped to it and can 404, aborting the sweep before lease cleanup. The exact-owner-set assertion does not constrain the number of repositories per owner, so this is a supported policy shape and not fail-closed.",
+   "file": ".github/workflows/groom.yml",
+   "fix_hint": "Collect all enabled repository names per owner and pass the complete repository list in the corresponding create-github-app-token input, or fail loudly unless each expected owner has exactly one enabled repository. Add a self-test or workflow test with two enabled repositories under one owner that proves both are covered (or that configuration is rejected before minting).",
+   "severity": "major",
+   "title": "Each owner token is scoped to only one arbitrary enabled repository"
+  }
+ ],
+ "progress": null,
+ "summary": "The per-owner routing in groom.py is fail-closed and its focused unit checks are meaningful, but the workflow does not reliably deliver the credentials that routing depends on. It masks each token before embedding it in a new step output, which GitHub Actions does not permit, and it scopes each owner token to only one representative repository even though the policy model permits multiple enabled repositories per owner. Either problem can make valid enabled targets silently defer forever or can abort grooming on a 404. These are major correctness issues in the trust-plane credential path.",
+ "verdict": "request_changes"
+}
