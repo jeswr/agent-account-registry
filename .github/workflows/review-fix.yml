@@ -155,7 +155,7 @@ jobs:
           # arbitrary provider_model (the concrete id is still resolved from the protected
           # target routing BY ALIAS, and the provider-ladder membership is re-checked against
           # the provenance-bound implementer provider in the resolve step below).
-          if model_pin and model_pin not in {"sonnet", "fable", "opus", "terra"}:
+          if model_pin and model_pin not in {"sonnet", "fable", "opus", "terra", "sol"}:
               raise SystemExit("model_pin must be empty or an escalation-ladder tier")
           if mode == "review" and model_pin:
               raise SystemExit("review mode takes no model pin")
@@ -413,7 +413,7 @@ jobs:
           # the proven codex drain passes no --model flag (CLI default), and worker-live.sh omits
           # --model in that case — so an unpinned terra never stalls the common
           # anthropic-implemented direction. A claude alias still needs a concrete id.
-          review_chain = {"anthropic": ["terra"], "openai": ["opus"]}
+          review_chain = {"anthropic": ["sol"], "openai": ["opus"]}
           fix_chain = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
           # Escalation ladders in ascending order — mirrors worker-pr.py ESCALATION_LADDERS
           # (maintainer directive 2026-07-17). A pinned fix-model FLOOR replaces the default

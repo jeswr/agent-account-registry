@@ -43,12 +43,21 @@ credential_format = "claude-oauth-token"
 [models.terra]
 provider = "openai"
 harness = "codex"
-provider_model = "gpt-5.6-sol"  # maintainer 2026-07-18: GPT-5.6 sol for reviews (terra=review model for anthropic-authored PRs)
+provider_model = ""                    # EMPTY = omit --model: the codex CLI default tracks the account's
                                        # supported model. A literal placeholder here ("TBD") reached
                                        # `codex exec --model TBD` in every terra fleet worker -> API 400 /
                                        # degraded no-tool-call fallback ("model produced no repository
                                        # changes", 8/8 uniform 2026-07-18). Set a concrete id only once
                                        # verified against the worker account type.
+credential_format = "codex-auth-json"
+[models.sol]
+provider = "openai"
+harness = "codex"
+provider_model = "gpt-5.6-sol"         # THE cross-provider REVIEW model (maintainer 2026-07-18): the
+                                       # REVIEW_CHAIN routes reviews of anthropic-authored PRs to `sol`.
+                                       # Distinct alias from `terra` (a different GPT model, which stays
+                                       # the openai IMPL/fix alias); id probed working on the worker
+                                       # account type 2026-07-18.
 credential_format = "codex-auth-json"
 
 [defaults]

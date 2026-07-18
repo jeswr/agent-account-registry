@@ -116,7 +116,7 @@ DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
 # Cross-provider chains (locked decisions 14/17): the review chain is the INVERSE of the
 # implementer's provider and is computed HERE, never through policy-resolve.resolve() (whose
 # role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
-REVIEW_CHAIN = {"anthropic": ["terra"], "openai": ["opus"]}
+REVIEW_CHAIN = {"anthropic": ["sol"], "openai": ["opus"]}
 FIX_CHAIN = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
 # Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
 # 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
@@ -2468,6 +2468,7 @@ def _self_test():
                 "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
                 "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
                 "terra": {"provider_model": "TBD", "harness": "codex"},
+                "sol": {"provider_model": "gpt-5.6-sol", "harness": "codex"},
             }}
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
                         check_runs=gate_green, issue_labels=["area:crate-a"])
@@ -2574,7 +2575,7 @@ def _self_test():
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert helper_calls == [], helper_calls
-            assert alloc.chains == [["terra"]], alloc.chains
+            assert alloc.chains == [["sol"]], alloc.chains
 
             # flip-goes-red: the same posture whose latest fix ran BELOW the recorded opus
             # floor (a pin violation / forged marker) mints NO re-review — with the top tier
