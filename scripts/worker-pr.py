@@ -390,6 +390,61 @@ def human_owned(labels):
     return any(label in HUMAN_OWNED_LABELS for label in labels)
 
 
+# [FABLE-5 round-2 #4] Verdict-write statuses that COMPLETE the per-PR outcome (label/arm/bind).
+# "written" is the first-run commit; "identical" means the atomic commit already SUCCEEDED on a
+# prior attempt but the job died before the outcome (crash-recovery rerun) — the outcome must be
+# re-run (after the FRESH live re-validation below) or the PR is stranded forever with a recorded
+# verdict and no label/arm. Only a DIFFERENT-content "conflict" is dropped (fail closed: a
+# recorded verdict is never rewritten and never actioned from mismatched bytes).
+BATCH_OUTCOME_ELIGIBLE_STATUSES = frozenset({"written", "identical"})
+
+
+def batch_outcome_eligible(status):
+    return status in BATCH_OUTCOME_ELIGIBLE_STATUSES
+
+
+def outcome_item_revalidation(repo, pull, issue_labels, reviewed_sha, opened_sha,
+                              opened_to_reviewed, reviewed_to_head, extra_keywords=()):
+    """[FABLE-5 round-2 #3] Per-item LIVE trust re-admission at OUTCOME time (label/arm). The plan
+    manifest is up to a whole batch runtime stale by now, so every posture bit is re-derived from
+    live data, mirroring what the single path validates in its resolve step: open draft, same-repo
+    head, no human-hold PR label, no needs:* on the provenance-bound SOURCE issue, provenance
+    head_sha_at_open ancestry (the reviewed sha equals/descends from the worker-opened commit),
+    and the reviewed sha still being an ancestor of / equal to the live head (a rewritten branch
+    invalidates the review). `opened_to_reviewed` / `reviewed_to_head` are the gh compare `status`
+    strings the caller fetched ("identical" when the shas are equal, no API call needed).
+
+    Returns (defer_reason or None, security_live). security_live is the label-derived security
+    posture RECOMPUTED from the LIVE PR + source-issue labels (builtin keywords + trust:* +
+    `extra_keywords` from the target routing's match_labels) — a security label added after
+    planning must block auto-arm, so callers union it with the planned flag (labels can only
+    ESCALATE the posture at outcome time, never relax it). Fail closed: any anomaly defers the
+    item (no label/arm; the sweep re-plans it) rather than acting on stale trust."""
+    if not isinstance(pull, dict) or pull.get("state") != "open":
+        return "PR is not open", False
+    head = pull.get("head") or {}
+    if (head.get("repo") or {}).get("full_name") != repo:
+        return "PR head is a fork / other repo", False
+    labels = {label.get("name") for label in (pull.get("labels") or [])
+              if isinstance(label, dict) and isinstance(label.get("name"), str)}
+    issue_label_set = {label for label in issue_labels if isinstance(label, str)}
+    security_live = security_flagged(labels | issue_label_set, extra_keywords)
+    if pull.get("draft") is not True:
+        return "PR is no longer a draft", security_live
+    if human_owned(labels):
+        return "PR is human-owned (review:needs-user / needs:user)", security_live
+    if any(label.startswith("needs:") for label in issue_label_set):
+        return "source issue is human-owned (needs:*)", security_live
+    if not re.fullmatch(r"[0-9a-f]{40}", str(opened_sha or "")):
+        return "provenance head_sha_at_open is malformed", security_live
+    if opened_sha != reviewed_sha and opened_to_reviewed not in {"identical", "ahead"}:
+        return "reviewed sha does not descend from the worker-opened commit", security_live
+    head_sha = str(head.get("sha", ""))
+    if head_sha != reviewed_sha and reviewed_to_head not in {"identical", "ahead"}:
+        return "live head no longer descends from the reviewed sha", security_live
+    return None, security_live
+
+
 def validate_verdict(document, diff_files):
     """Schema-validate a reviewer verdict. The reviewer read hostile PR content, so every field is
     enum/length-capped and file paths must be inside the PR diff file set. Raises on any violation
@@ -1370,7 +1425,7 @@ def disarm(repo, pr_number, when):
 
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
-                  reviewer_account, arm, issue=None, surface_paths=None):
+                  reviewer_account, arm, issue=None, surface_paths=None, security_keywords=()):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval).
 
@@ -1404,6 +1459,37 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         set_review_state(repo, pr_number, "needs")
         _write_outputs({"armed": False, "head_moved": True})
         print("live head advanced past the reviewed sha; returned to review:needs")
+        return
+    # [FABLE-5 round-2 #3e] LIVE label re-admission before any undraft/latch. The approval was
+    # decided from labels read earlier (up to a whole batch runtime earlier on the batch path);
+    # a human-hold or security label added since must stand the arm down — a benign-FILE but
+    # security-LABELLED or human-owned PR is never undrafted/armed.
+    labels = {label.get("name") for label in (live.get("labels") or [])
+              if isinstance(label, dict) and isinstance(label.get("name"), str)}
+    if human_owned(labels):
+        _write_outputs({"armed": False, "head_moved": False, "human_hold": True})
+        print("live PR is human-owned (review:needs-user / needs:user); refusing to ready/arm")
+        return
+    issue_labels = set()
+    if issue:
+        issue_live = _gh_json(["api", f"repos/{repo}/issues/{issue}"])
+        issue_labels = {label.get("name") for label in (issue_live.get("labels") or [])
+                        if isinstance(label, dict) and isinstance(label.get("name"), str)}
+        if any(label.startswith("needs:") for label in issue_labels):
+            _write_outputs({"armed": False, "head_moved": False, "human_hold": True})
+            print("live source issue is human-owned (needs:*); refusing to ready/arm")
+            return
+    if security_flagged(labels | issue_labels, security_keywords):
+        # Mirrors decide_review's security posture: had the label been present at review time the
+        # decision would have been needs-user, never arm. Escalate the same way — the automated
+        # review is complete, the arm click is a human's.
+        alert_repo, alert_token = _alert_route()
+        needs_user(repo, pr_number,
+                   "a security label appeared on the PR or its source issue after review "
+                   "planning; human arm decision required",
+                   issue=issue, alert_repo=alert_repo, alert_token=alert_token)
+        _write_outputs({"armed": False, "head_moved": False, "security_hold": True})
+        print("live security label: withheld ready/arm; escalated to human (review:needs-user)")
         return
     if arm:
         # Live trust-surface re-derivation BEFORE any undraft/latch (renamed-path safe).
@@ -2288,6 +2374,156 @@ def _self_test():
     finally:
         wiring_globals.update(real_disarm_io)
 
+    # ---- [FABLE-5 round-2 #4] batch outcome eligibility: an "identical" verdict write means the
+    # atomic commit already succeeded and only the outcome is missing (commit -> crash -> rerun);
+    # it MUST re-run the label/arm or the PR is stranded. Only different-content conflicts drop. --
+    check("written verdicts complete the outcome", batch_outcome_eligible("written"), True)
+    check("identical verdicts complete the outcome (crash-recovery rerun)",
+          batch_outcome_eligible("identical"), True)
+    check("conflict verdicts never label/arm", batch_outcome_eligible("conflict"), False)
+
+    # ---- [FABLE-5 round-2 #3] OUTCOME-time live re-admission (pure): every posture bit is
+    # re-derived from live data, and label-derived security is RECOMPUTED live ----
+    open_sha, head_now = "1" * 40, "2" * 40
+
+    def live_pr(*, state="open", draft=True, labels=(), head_sha=head_now, head_repo="o/r"):
+        return {"state": state, "draft": draft,
+                "labels": [{"name": name} for name in labels],
+                "head": {"sha": head_sha, "repo": {"full_name": head_repo}}}
+
+    def reval(**kw):
+        params = dict(pull=live_pr(head_sha=open_sha), issue_labels=[],
+                      reviewed_sha=open_sha, opened_sha=open_sha,
+                      opened_to_reviewed="identical", reviewed_to_head="identical",
+                      extra_keywords=())
+        params.update(kw)
+        return outcome_item_revalidation("o/r", params["pull"], params["issue_labels"],
+                                         params["reviewed_sha"], params["opened_sha"],
+                                         params["opened_to_reviewed"],
+                                         params["reviewed_to_head"], params["extra_keywords"])
+
+    check("clean live item admits", reval(), (None, False))
+    check("descending head advance still admits (labels apply; arm re-checks the head)",
+          reval(pull=live_pr(), reviewed_to_head="ahead"), (None, False))
+    check("closed PR defers", reval(pull=live_pr(state="closed"))[0], "PR is not open")
+    check("undrafted PR defers", reval(pull=live_pr(head_sha=open_sha, draft=False))[0],
+          "PR is no longer a draft")
+    check("fork head defers", reval(pull=live_pr(head_sha=open_sha, head_repo="evil/r"))[0],
+          "PR head is a fork / other repo")
+    check("live human-hold label defers",
+          reval(pull=live_pr(head_sha=open_sha, labels=("review:needs-user",)))[0],
+          "PR is human-owned (review:needs-user / needs:user)")
+    check("live needs:* source issue defers", reval(issue_labels=["needs:design"])[0],
+          "source issue is human-owned (needs:*)")
+    check("malformed opened sha fails closed", reval(opened_sha="")[0],
+          "provenance head_sha_at_open is malformed")
+    check("non-descending reviewed sha defers",
+          reval(opened_sha="3" * 40, opened_to_reviewed="diverged")[0],
+          "reviewed sha does not descend from the worker-opened commit")
+    check("rewritten live head defers",
+          reval(pull=live_pr(), reviewed_to_head="diverged")[0],
+          "live head no longer descends from the reviewed sha")
+    check("post-plan security label recomputes LIVE (routing keyword, source issue)",
+          reval(issue_labels=["area:worker"], extra_keywords=("area:worker",)), (None, True))
+    check("post-plan trust:* label recomputes LIVE (PR label)",
+          reval(pull=live_pr(head_sha=open_sha, labels=("trust:dispatch",))), (None, True))
+
+    # ---- [FABLE-5 round-2 #3e] ready_and_arm LIVE re-admission wiring: a human-hold or security
+    # label (PR or provenance-bound source issue) added after the review decision stands the arm
+    # down BEFORE any undraft; the benign path still readies + arms ----
+    arm_net = {}
+    arm_calls = []
+    arm_outputs = {}
+    real_arm_io = {name: wiring_globals[name]
+                   for name in ("_gh_json", "_run_gh", "_write_outputs", "set_review_state",
+                                "needs_user", "_alert_route", "_load_worker_issue",
+                                "_pr_changed_files")}
+
+    def fake_arm_gh_json(args, **_kwargs):
+        path = args[1] if len(args) > 1 else ""
+        if path.startswith("repos/o/r/pulls/"):
+            return arm_net["live"]
+        if path.startswith("repos/o/r/issues/"):
+            return arm_net["issue"]
+        raise WorkerPrError(f"unexpected API path {path}")
+
+    def fake_arm_run_gh(args, **_kwargs):
+        arm_calls.append(" ".join(args))
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    class _FakeWorkerIssue:
+        @staticmethod
+        def set_status(repo, issue, status):
+            arm_calls.append(f"issue-status:{status}")
+
+    def run_arm(pr_labels=(), issue_labels=(), head=None, keywords=(), arm=True):
+        arm_calls.clear()
+        arm_outputs.clear()
+        arm_net.clear()
+        arm_net["live"] = {"state": "open",
+                           "labels": [{"name": name} for name in pr_labels],
+                           "head": {"sha": head or rev_sha}}
+        arm_net["issue"] = {"labels": [{"name": name} for name in issue_labels]}
+        ready_and_arm("o/r", 41, rev_sha, "anthropic", "f" * 16, "openai",
+                      "acctrev", arm, issue=7, security_keywords=keywords)
+
+    prior_salt = os.environ.get("PROVENANCE_SALT")
+    try:
+        os.environ["PROVENANCE_SALT"] = "self-test-salt"
+        wiring_globals["_gh_json"] = fake_arm_gh_json
+        wiring_globals["_run_gh"] = fake_arm_run_gh
+        wiring_globals["_write_outputs"] = arm_outputs.update
+        wiring_globals["set_review_state"] = (
+            lambda repo, pr, state: arm_calls.append(f"state:{state}"))
+        wiring_globals["needs_user"] = (
+            lambda repo, pr, reason, **kwargs: arm_calls.append(f"needs-user:{reason}"))
+        wiring_globals["_alert_route"] = lambda: (None, None)
+        wiring_globals["_load_worker_issue"] = lambda: _FakeWorkerIssue
+        wiring_globals["_pr_changed_files"] = lambda repo, pr: ["src/lib.rs"]
+
+        run_arm()
+        check("benign arm readies then arms",
+              [call for call in arm_calls if call.startswith("pr ")],
+              ["pr ready 41 -R o/r", "pr merge 41 -R o/r --squash --auto"])
+        check("benign arm reports armed", arm_outputs.get("armed"), True)
+
+        run_arm(pr_labels=("needs:user",))
+        check("live human-hold PR label stands the arm down (no undraft)",
+              (arm_outputs.get("human_hold"),
+               any(call.startswith("pr ") for call in arm_calls)), (True, False))
+
+        run_arm(issue_labels=("needs:info",))
+        check("live needs:* source issue stands the arm down (no undraft)",
+              (arm_outputs.get("human_hold"),
+               any(call.startswith("pr ") for call in arm_calls)), (True, False))
+
+        run_arm(pr_labels=("trust:worker",))
+        check("live trust:* label withholds the arm and escalates to a human",
+              (arm_outputs.get("security_hold"),
+               any(call.startswith("needs-user:") for call in arm_calls),
+               any(call.startswith("pr ") for call in arm_calls)), (True, True, False))
+
+        run_arm(issue_labels=("area:worker",), keywords=("area:worker",))
+        check("routing-keyword security label on the SOURCE ISSUE blocks the arm",
+              (arm_outputs.get("security_hold"),
+               any(call.startswith("pr ") for call in arm_calls)), (True, False))
+
+        run_arm(pr_labels=("trust:worker",), arm=False)
+        check("security label blocks even a ready-only (arm=false) run",
+              (arm_outputs.get("security_hold"),
+               any(call.startswith("pr ") for call in arm_calls)), (True, False))
+
+        run_arm(head="d" * 40)
+        check("moved head still returns to review:needs (regression)",
+              (arm_outputs.get("head_moved"), "state:needs" in arm_calls,
+               any(call.startswith("pr ") for call in arm_calls)), (True, True, False))
+    finally:
+        if prior_salt is None:
+            os.environ.pop("PROVENANCE_SALT", None)
+        else:
+            os.environ["PROVENANCE_SALT"] = prior_salt
+        wiring_globals.update(real_arm_io)
+
     check("fix pushed re-reviews", decide_fix(False, True, True, True, 0, 0), "re-review")
     check("first nochange stays", decide_fix(False, False, True, False, 1, 0), "stay-changes")
     check("second nochange stops", decide_fix(False, False, True, False, 2, 0), "needs-user")
@@ -2682,6 +2918,11 @@ def main():
     # security_paths). Empty -> DEFAULT_TRUST_SURFACE_PATHS (fail closed, never silently absent).
     arm.add_argument("--surface-path", action="append", default=[],
                      help="trust-surface path/prefix (repeatable; from policy security_paths)")
+    # [FABLE-5 round-2 #3e] Extra security-label keywords for the LIVE arm-time label re-check
+    # (from the target routing's match_labels, like review-fix's resolve-time classifier).
+    # Empty -> the built-in SECURITY_KEYWORDS + the trust:* prefix still apply.
+    arm.add_argument("--security-keyword", action="append", default=[],
+                     help="extra security label keyword (repeatable; from routing match_labels)")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -2793,7 +3034,8 @@ def main():
                           args.impl_account_h, args.reviewer_provider,
                           os.environ.get("WORKER_REVIEWER_ACCOUNT", ""),
                           args.arm == "true", issue=args.issue,
-                          surface_paths=args.surface_path or None)
+                          surface_paths=args.surface_path or None,
+                          security_keywords=tuple(args.security_keyword))
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":

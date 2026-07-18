@@ -9,8 +9,15 @@
 # TRUST POSTURE — UNCHANGED per item (design §3/§7). The batch is composed downstream of dispatch's
 # per-PR hostile admission gate; EVERY per-PR invariant is re-asserted a THIRD time here, live, per
 # item, BEFORE that item's read-only model call: open + draft, same-repo App-bot worker head, live
-# head_sha == the manifest head_sha (no drift), human-hold labels excluded, registry provenance
-# present + agreeing, and the reviewer account/provider != the item's implementer account/provider.
+# head_sha == the manifest head_sha (no drift), head descends from the provenance-bound
+# worker-opened commit, human-hold labels excluded on the PR AND its provenance-bound source issue
+# (needs:*), label-derived security recomputed live (builtin keywords + the target routing's
+# match_labels), registry provenance present + agreeing, and the reviewer account/provider != the
+# item's implementer account/provider. [FABLE-5 round-2 #3] The SAME full posture is re-validated
+# a FOURTH time, live, per item at OUTCOME (label/arm) time — a batch runtime after admission —
+# and ready-and-arm re-checks human-hold + security labels once more before any undraft/latch;
+# the outcome/arm policy (max rounds, arm flag, security paths) is resolved from the TARGET
+# policy row (policy/repos.toml + protected routing), never global workflow vars.
 # A per-item failure NEVER sinks the batch (per-item try/except); the atomic commit records only the
 # healthy subset; failed items get no label/arm and re-plan next tick (their reviewed-sha marker is
 # never bound, so the sweep re-surfaces them). Verdict SCHEMA + label/arm/round-budget logic are the
@@ -81,9 +88,13 @@ on:
 permissions: {}
 
 concurrency:
-  # One batch per (target, account) at a time — the account is the shared resource. cancel-in-progress
-  # false so a running batch is never severed mid-review (a severed batch just re-plans, but avoid it).
-  group: review-batch-${{ inputs.target_repo }}-${{ inputs.account }}
+  # [FABLE-5 round-2 #6] One batch per adopted CLAIM at a time. The account is the shared resource,
+  # but its RAW handle must never surface in the concurrency-group name (shown in the Actions
+  # UI/scheduling — no-raw-handle posture, locked decision 22); the CAS lease already serializes
+  # the account (one live lease per account), so keying on the dispatcher's non-sensitive claim id
+  # dedups a double-dispatch of the same claim without leaking the handle. cancel-in-progress
+  # false so a running batch is never severed mid-review (a severed batch just re-plans).
+  group: review-batch-${{ inputs.target_repo }}-${{ inputs.claim_id }}
   cancel-in-progress: false
 
 jobs:
@@ -106,6 +117,16 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
+          persist-credentials: false
+
+      # [FABLE-5 round-2 #3c] The target routing's `match_labels` keywords feed the LIVE security
+      # recompute (same classifier as review-fix's resolve step) — the plan manifest's `security`
+      # bit alone is stale the moment a label lands after planning.
+      - name: Checkout public target for protected routing data (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target-routing
           persist-credentials: false
 
       - name: Split the target owner/name
@@ -155,11 +176,36 @@ jobs:
           printf '%s' "$MANIFEST_B64" | base64 -d > "$RUNNER_TEMP/manifest.json"
           python3 registry/scripts/worker-pr.py --self-test >/dev/null  # fail fast if the helper is broken
           python3 - <<'PY'
-          import json, os, re, subprocess, sys
+          import importlib.util, json, os, re, subprocess, sys, tomllib
+          from pathlib import Path, PurePosixPath
+
+          spec = importlib.util.spec_from_file_location(
+              "worker_pr", "registry/scripts/worker-pr.py")
+          worker_pr = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(worker_pr)
 
           repo = os.environ["TARGET_REPO"]
           impl_provider = os.environ["IMPL_PROVIDER"]
           expect_bot_login = os.environ.get("EXPECT_BOT_LOGIN", "")
+
+          # [FABLE-5 round-2 #3c] Security keywords = builtin set + the TARGET routing's own
+          # match_labels (same union review-fix's resolve computes). A missing/unreadable routing
+          # degrades to the builtin set + trust:* prefix (fail closed: it can only under-EXTEND,
+          # and the OUTCOME job recomputes again with its own checkout before any label/arm).
+          routing_keywords = set()
+          try:
+              policy_doc = tomllib.loads(
+                  Path("registry/policy/repos.toml").read_text(encoding="utf-8"))
+              routing_ptr = policy_doc["repos"][repo]["routing"]
+              routing_doc = tomllib.loads(
+                  Path("target-routing").joinpath(*PurePosixPath(routing_ptr).parts)
+                  .read_text(encoding="utf-8"))
+              for route in routing_doc.get("route", []):
+                  for keyword in (route.get("match_labels") or []):
+                      if isinstance(keyword, str) and keyword:
+                          routing_keywords.add(keyword)
+          except (OSError, KeyError, tomllib.TOMLDecodeError):
+              pass
           if not expect_bot_login.endswith("[bot]"):
               # The App slug could not be resolved to a bot login: fail the WHOLE batch closed rather
               # than admit PRs whose authorship can't be checked (the single path never runs without
@@ -238,6 +284,44 @@ jobs:
                   if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
                       print(f"drop #{number}: provenance lacks a salted account hash")
                       continue
+                  # [FABLE-5 round-2 #3b] reviewed-sha binding: the head about to be reviewed
+                  # must equal/descend from the provenance-bound worker-opened commit — the same
+                  # ancestry gate review-fix's resolve applies (fail closed on any drift).
+                  opened_sha = str(prov.get("head_sha_at_open", ""))
+                  if not SHA.match(opened_sha):
+                      print(f"drop #{number}: provenance head_sha_at_open is malformed")
+                      continue
+                  if opened_sha != head_sha:
+                      compare = gh_json(f"repos/{repo}/compare/{opened_sha}...{head_sha}")
+                      if (not isinstance(compare, dict)
+                              or compare.get("status") not in {"identical", "ahead"}):
+                          print(f"drop #{number}: head does not descend from the "
+                                "worker-opened commit")
+                          continue
+                  # [FABLE-5 round-2 #3a] The provenance-bound SOURCE ISSUE, re-read LIVE: a
+                  # needs:*-parked issue is human-owned — no autonomous review may run against
+                  # its PR (mirrors review-fix's resolve; an unreadable issue fails closed).
+                  issue = prov.get("issue")
+                  if not isinstance(issue, int) or issue <= 0:
+                      print(f"drop #{number}: provenance issue number is invalid")
+                      continue
+                  issue_data = gh_json(f"repos/{repo}/issues/{issue}")
+                  if not isinstance(issue_data, dict):
+                      print(f"drop #{number}: source issue unreadable (fail closed)")
+                      continue
+                  issue_labels = {lb.get("name")
+                                  for lb in (issue_data.get("labels") or [])
+                                  if isinstance(lb, dict) and isinstance(lb.get("name"), str)}
+                  if any(lb.startswith("needs:") for lb in issue_labels):
+                      print(f"drop #{number}: source issue is human-owned (needs:*)")
+                      continue
+                  # [FABLE-5 round-2 #3c] Label-derived security RECOMPUTED from the LIVE PR +
+                  # source-issue labels; unioned with the plan flag so a post-plan label can only
+                  # ESCALATE the posture, never relax it. The outcome job recomputes AGAIN at
+                  # label/arm time — this admission copy keeps the reviewer's own posture fresh.
+                  security_live = worker_pr.security_flagged(
+                      {lb for lb in labels if isinstance(lb, str)} | issue_labels,
+                      sorted(routing_keywords))
                   admitted.append({
                       "pr_number": number,
                       "head_sha": head_sha,
@@ -245,9 +329,9 @@ jobs:
                       "impl_provider": impl_provider,
                       "impl_alias": str(prov.get("impl_alias", "")),
                       "impl_account_h": impl_account_h,
-                      "issue": prov.get("issue"),
+                      "issue": issue,
                       "review_round": int(entry.get("review_round", 1)),
-                      "security": bool(entry.get("security", False)),
+                      "security": bool(entry.get("security", False)) or security_live,
                       "bot_login": login,
                   })
               except (KeyError, ValueError, TypeError) as exc:
@@ -514,6 +598,16 @@ jobs:
           path: registry
           persist-credentials: false
 
+      # [FABLE-5 round-2 #3d] The outcome/arm policy comes from the TARGET policy resolution
+      # (policy/repos.toml row + the target's protected routing), NOT global workflow vars —
+      # this checkout feeds policy-resolve.py and the routing match_labels security keywords.
+      - name: Checkout public target for protected routing + policy data (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target-routing
+          persist-credentials: false
+
       - name: Download all per-PR verdict artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -613,15 +707,24 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
           WORKER_REVIEWER_ACCOUNT: ${{ inputs.account }}
           TARGET_REPO: ${{ inputs.target_repo }}
-          SECURITY_PATHS_B64: ${{ vars.REGISTRY_SECURITY_PATHS_B64 || 'W10=' }}
-          MAX_REVIEW_ROUNDS: ${{ vars.MAX_REVIEW_ROUNDS || '3' }}
-          ARM_AUTO_MERGE: ${{ vars.ARM_AUTO_MERGE || 'true' }}
         run: |
           set -euo pipefail
-          # Only the verdicts that atomically COMMITTED (written) get an outcome; "identical" is an
-          # idempotent re-run (already handled a prior tick) and "conflict" fails closed (no label).
+          # [FABLE-5 round-2 #3/#4] Which committed verdicts get an outcome, and under what trust:
+          # "written" AND "identical" are BOTH outcome-eligible — "identical" means the atomic
+          # commit already succeeded on a prior attempt and the job died before labels/arm, so a
+          # crash-recovery rerun must COMPLETE the outcome or the PR is stranded (verdict recorded,
+          # never labelled/armed). Only a different-content "conflict" is dropped (fail closed).
+          # Before ANY label/arm, each item's full trust posture is RE-VALIDATED LIVE (never from
+          # the stale plan manifest), and the outcome/arm policy comes from the TARGET policy
+          # resolution (policy/repos.toml + protected routing), never global workflow vars.
           python3 - <<'PY'
-          import json, os, subprocess, sys
+          import importlib.util, json, os, re, subprocess, sys, tomllib
+          from pathlib import Path, PurePosixPath
+
+          spec = importlib.util.spec_from_file_location(
+              "worker_pr", "registry/scripts/worker-pr.py")
+          worker_pr = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(worker_pr)
 
           repo = os.environ["TARGET_REPO"]
           rt = os.environ["RUNNER_TEMP"]
@@ -630,14 +733,55 @@ jobs:
           with open(rt + "/meta-index.json", encoding="utf-8") as fh:
               meta_index = json.load(fh)
 
-          # SECURITY_PATHS_B64 -> a repeatable --surface-path list (trust-surface human-arm gate).
-          surface = []
+          # [FABLE-5 round-2 #3d] TARGET policy resolution: max_review_rounds, arm_auto_merge and
+          # security_paths come from the policy row for THIS target. Fail closed: an unresolvable
+          # policy fails the whole outcome step — nothing is labelled/armed off defaults; the
+          # committed verdicts complete on the rerun/next tick.
+          pol = subprocess.run(
+              ["python3", "registry/scripts/policy-resolve.py",
+               "--target-repo", repo,
+               "--policy-file", "registry/policy/repos.toml",
+               "--target-root", "target-routing",
+               "--role", "review"],
+              capture_output=True, text=True)
+          if pol.returncode != 0:
+              print(pol.stderr, file=sys.stderr)
+              raise SystemExit("target policy resolution failed; refusing to label/arm")
+          policy = json.loads(pol.stdout)
+          max_rounds = str(int(policy["max_review_rounds"]))
+          arm_flag = "true" if policy["arm_auto_merge"] else "false"
+          surface = [p for p in policy.get("security_paths", []) if isinstance(p, str) and p]
+
+          # [FABLE-5 round-2 #3c] Security keywords for the LIVE label recompute: builtin set +
+          # the target routing's match_labels (an unreadable routing degrades to builtin +
+          # trust:* — it can only under-extend, and ready-and-arm re-checks live once more).
+          keywords = set()
           try:
-              raw = subprocess.run(["base64", "-d"], input=os.environ.get("SECURITY_PATHS_B64", "W10="),
-                                   capture_output=True, text=True).stdout
-              surface = [p for p in (json.loads(raw or "[]")) if isinstance(p, str) and p]
-          except Exception:
-              surface = []
+              routing_doc = tomllib.loads(
+                  Path("target-routing").joinpath(
+                      *PurePosixPath(policy["routing"]).parts).read_text(encoding="utf-8"))
+              for route in routing_doc.get("route", []):
+                  for keyword in (route.get("match_labels") or []):
+                      if isinstance(keyword, str) and keyword:
+                          keywords.add(keyword)
+          except (OSError, KeyError, tomllib.TOMLDecodeError):
+              pass
+          keywords = sorted(keywords)
+
+          def gh_json(path):
+              out = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+              if out.returncode != 0:
+                  return None
+              try:
+                  return json.loads(out.stdout or "null")
+              except json.JSONDecodeError:
+                  return None
+
+          def compare_status(base, head_ref):
+              if base == head_ref:
+                  return "identical"
+              compare = gh_json(f"repos/{repo}/compare/{base}...{head_ref}")
+              return str((compare or {}).get("status", ""))
 
           def run(args, capture_outputs=False):
               """Run a worker-pr subcommand. When capture_outputs, hand it a PRIVATE GITHUB_OUTPUT
@@ -669,13 +813,60 @@ jobs:
                   pr_number = key.rsplit("#", 2)[1]
               except ValueError:
                   continue
-              if status != "written":
-                  print(f"skip {key}: verdict status={status} (no label/arm)")
+              # [FABLE-5 round-2 #4] written AND identical complete the outcome (identical = the
+              # commit landed on a prior attempt, the outcome did not — converge, don't strand);
+              # only a different-content conflict is dropped.
+              if not worker_pr.batch_outcome_eligible(status):
+                  print(f"skip {key}: verdict status={status} "
+                        "(different-content conflict; no label/arm)")
                   continue
+              if status == "identical":
+                  print(f"{key}: verdict already recorded (crash-recovery rerun); "
+                        "completing the outcome")
               meta = meta_index.get(pr_number)
               if not meta:
                   print(f"skip {key}: no meta for the committed verdict")
                   continue
+              # [FABLE-5 round-2 #3] LIVE per-item trust re-admission at OUTCOME time: the plan
+              # manifest is a whole batch runtime stale — re-read the PR + provenance-bound source
+              # issue, re-assert the reviewed-sha/opened-sha ancestry binding, and RECOMPUTE the
+              # label-derived security posture before any label/arm (fail closed per item).
+              pull = gh_json(f"repos/{repo}/pulls/{pr_number}")
+              issue_labels = []
+              if meta.get("issue") is not None:
+                  issue_data = gh_json(f"repos/{repo}/issues/{meta['issue']}")
+                  if not isinstance(issue_data, dict):
+                      print(f"::warning::defer {key}: source issue unreadable (fail closed)")
+                      failures += 1
+                      continue
+                  issue_labels = [lb.get("name") for lb in (issue_data.get("labels") or [])
+                                  if isinstance(lb, dict) and isinstance(lb.get("name"), str)]
+              owner, name = repo.split("/", 1)
+              prov_path = Path("registry", "orchestration", "provenance",
+                               f"{owner}--{name}--pr{pr_number}.json")
+              try:
+                  prov = json.loads(prov_path.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  print(f"::warning::defer {key}: no registry provenance record (fail closed)")
+                  failures += 1
+                  continue
+              reviewed = str(meta["reviewed_sha"])
+              opened_sha = str(prov.get("head_sha_at_open", ""))
+              opened_to_reviewed = ""
+              if re.fullmatch(r"[0-9a-f]{40}", opened_sha):
+                  opened_to_reviewed = compare_status(opened_sha, reviewed)
+              live_head = str(((pull or {}).get("head") or {}).get("sha", ""))
+              reviewed_to_head = ""
+              if re.fullmatch(r"[0-9a-f]{40}", live_head):
+                  reviewed_to_head = compare_status(reviewed, live_head)
+              reason, security_live = worker_pr.outcome_item_revalidation(
+                  repo, pull, issue_labels, reviewed, opened_sha,
+                  opened_to_reviewed, reviewed_to_head, extra_keywords=keywords)
+              if reason:
+                  print(f"defer {key}: {reason} (no label/arm this run)")
+                  continue
+              # A post-plan security label ESCALATES the posture; the plan flag never relaxes.
+              security = bool(meta.get("security")) or security_live
               d = os.path.join(rt, "items", f"batch-verdict-{pr_number}")
               vf, ff = os.path.join(d, "verdict.json"), os.path.join(d, "files.txt")
               rn = str(meta["review_round"])
@@ -686,13 +877,13 @@ jobs:
               #    un-draft + arm a request_changes PR.
               args = ["review-outcome", "--repo", repo, "--pr", pr_number,
                       "--verdict-file", vf, "--files-file", ff, "--round", rn,
-                      "--max-rounds", os.environ.get("MAX_REVIEW_ROUNDS", "3"),
+                      "--max-rounds", max_rounds,
                       "--impl-provider", meta["impl_provider"],
                       "--bot-login", meta["bot_login"],
                       "--run-key", f'{os.environ["GITHUB_RUN_ID"]}.{os.environ["GITHUB_RUN_ATTEMPT"]}.{pr_number}']
               if meta.get("issue") is not None:
                   args += ["--issue", str(meta["issue"])]
-              if meta.get("security"):
+              if security:
                   args.append("--security")
               for p in surface:
                   args += ["--surface-path", p]
@@ -708,16 +899,21 @@ jobs:
               #    (changes / needs-user) review-outcome already set the terminal state, so we bind
               #    reviewed-sha and move on — never un-drafting a request_changes PR.
               if decision == "arm":
+                  # [FABLE-5 round-2 #3d/#3e] --arm from the TARGET policy row; the routing
+                  # security keywords feed ready-and-arm's own LIVE human-hold + security label
+                  # re-check (the last line of defense before any undraft/latch).
                   arm_args = ["ready-and-arm", "--repo", repo, "--pr", pr_number,
                               "--reviewed-sha", meta["reviewed_sha"],
                               "--impl-provider", meta["impl_provider"],
                               "--impl-account-h", meta["impl_account_h"],
                               "--reviewer-provider", meta["reviewer_provider"],
-                              "--arm", os.environ.get("ARM_AUTO_MERGE", "true")]
+                              "--arm", arm_flag]
                   if meta.get("issue") is not None:
                       arm_args += ["--issue", str(meta["issue"])]
                   for p in surface:
                       arm_args += ["--surface-path", p]
+                  for keyword in keywords:
+                      arm_args += ["--security-keyword", keyword]
                   # ready-and-arm RAISES (rc != 0) on a recoverable arm failure where the draft was
                   # restored for the sweep to retry. Matching the single path's bind gate
                   # (review-fix.yml binds reviewed-sha only when `decision != arm || arm succeeded`),

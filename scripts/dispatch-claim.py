@@ -137,9 +137,23 @@ FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
 REVIEW_BATCH_SIZE = 8          # review items per batch job
 REVIEW_BATCH_K = 4            # in-job parallel review calls against the one claimed account
 REVIEW_BATCH_JOBS_MAX = 6      # cap on batch jobs per tick (jobs*K stays within codex comfort)
-# A batch's TTL covers ceil(SIZE/K) sequential model-latency waves, floored at the single-review TTL
-# so a crashed batch still frees its ONE slot fast.
-REVIEW_BATCH_TTL = max(REVIEW_TTL, -(-REVIEW_BATCH_SIZE // REVIEW_BATCH_K) * REVIEW_TTL)
+# [FABLE-5 round-2 #5] The batch lease TTL must cover the batch's ACTUAL wall-clock bound, not a
+# multiple of the single-review TTL: 2*REVIEW_TTL (40min) was reclaimable MID-review for an 8-item
+# K=4 batch (two sequential 25-min review waves alone are 50min, plus ~12min resolution/queue), so
+# groom-leases could free the account and a concurrent claim would reuse it while this batch was
+# still reviewing. Derive the bound from the review-batch.yml job budgets (keep these in sync with
+# its `timeout-minutes`): resolve + ceil(SIZE/K) sequential review waves + the outcome/commit job,
+# plus runner-queue slack between the jobs of the DAG. The cost of the longer TTL is only slower
+# crash recovery of the ONE batch slot — never a mid-review reclaim.
+REVIEW_BATCH_RESOLVE_BUDGET = 12 * 60   # review-batch.yml resolve-batch: timeout-minutes: 12
+REVIEW_BATCH_LEG_BUDGET = 25 * 60       # review-batch.yml per review leg: timeout-minutes: 25
+REVIEW_BATCH_OUTCOME_BUDGET = 20 * 60   # review-batch.yml commit-outcome: timeout-minutes: 20
+REVIEW_BATCH_QUEUE_SLACK = 15 * 60      # runner-queue/scheduling slack across the job DAG
+REVIEW_BATCH_WAVES = -(-REVIEW_BATCH_SIZE // REVIEW_BATCH_K)  # ceil: sequential review waves
+REVIEW_BATCH_TTL = (REVIEW_BATCH_RESOLVE_BUDGET
+                    + REVIEW_BATCH_WAVES * REVIEW_BATCH_LEG_BUDGET
+                    + REVIEW_BATCH_OUTCOME_BUDGET
+                    + REVIEW_BATCH_QUEUE_SLACK)
 # Feature flag: while off, the single-review path runs unchanged (full back-compat). When on,
 # admitted REVIEW-mode items are grouped into batch jobs; any item dispatch chooses not to batch
 # (e.g. a fix item) still uses the single path. Default OFF for a staged rollout.
@@ -3073,6 +3087,15 @@ def _self_test():
     # the throughput identity the design turns on: jobs*SIZE effective reviews > the 40-slot ask.
     assert REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_SIZE > 40
     assert REVIEW_BATCH_JOBS_MAX * REVIEW_BATCH_K <= REVIEW_MAX_CONCURRENT + 20  # codex comfort
+    # [FABLE-5 round-2 #5] the lease outlives the batch's ACTUAL wall-clock bound (not merely the
+    # single-review TTL): ceil(SIZE/K) sequential review waves at the 25-min leg budget, plus the
+    # 12-min resolve and 20-min outcome job budgets (literals mirror review-batch.yml
+    # timeout-minutes), plus non-trivial queue slack — so the observed 50min(two waves)+12min case
+    # can never be reclaimed and concurrently reused MID-review.
+    waves = -(-REVIEW_BATCH_SIZE // REVIEW_BATCH_K)
+    actual_bound = 12 * 60 + waves * 25 * 60 + 20 * 60
+    assert REVIEW_BATCH_TTL >= actual_bound + 5 * 60, (REVIEW_BATCH_TTL, actual_bound)
+    assert REVIEW_BATCH_TTL >= 62 * 60  # the live-observed 50min+12min batch fits
     assert REVIEW_BATCH_TTL >= REVIEW_TTL
 
     print("dispatch-claim self-test PASSED")
