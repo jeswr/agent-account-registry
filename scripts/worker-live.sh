@@ -19,6 +19,15 @@ safe_atom() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
 }
 
+# PURE: emit codex --model argv elements, one per line, from a normalized routing value.
+# Empty/TBD select the CLI default; non-codex argv is built separately.
+_provider_model_args() {
+  local harness=$1 provider_model=$2
+  if [[ "$harness" == codex && -n "$provider_model" && "$provider_model" != TBD ]]; then
+    printf '%s\n' --model "$provider_model"
+  fi
+}
+
 require_target() {
   TARGET_DIR=${TARGET_DIR:-}
   [[ -n "$TARGET_DIR" && -d "$TARGET_DIR/.git" ]] || die 'TARGET_DIR is not a Git checkout'
@@ -279,7 +288,7 @@ _run_headless_harness() {
         # --model only when the routing pins a concrete id; otherwise the codex CLI default
         # (the configuration the proven drain runs).
         local -a model_args=()
-        [[ -n "$provider_model" ]] && model_args+=(--model "$provider_model")
+        mapfile -t model_args < <(_provider_model_args "$harness" "$provider_model")
         "${container[@]}" "$image" /opt/model-cli/node_modules/.bin/codex exec \
           "${model_args[@]}" \
           --dangerously-bypass-approvals-and-sandbox \
@@ -1222,9 +1231,10 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to %s\n' "$secret_ref"
 }
 
-# Non-vacuous host-side self-test: telemetry extraction (claude stream-json + codex --json
-# fixtures, privacy: no transcript content crosses) and task-prompt prefix stability (byte-identical
-# static head across two different issues, variance only below the marker).
+# Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
+# stream-json + codex --json fixtures, privacy: no transcript content crosses), and task-prompt
+# prefix stability (byte-identical static head across two different issues, variance only below
+# the marker).
 self_test() {
   local tmp
   tmp=$(mktemp -d)
@@ -1240,6 +1250,19 @@ self_test() {
       failures=$((failures + 1))
     fi
   }
+
+  # --- terra provider-model argv contract. Claude empty is rejected upstream by the
+  # _run_headless_harness normalization, so it never reaches this flag builder. ---
+  local -a model_args=()
+  mapfile -t model_args < <(_provider_model_args codex "")
+  chk "codex empty provider model omits --model" "${model_args[*]-}" ""
+
+  mapfile -t model_args < <(_provider_model_args codex TBD)
+  chk "codex TBD provider model omits --model" "${model_args[*]-}" ""
+
+  mapfile -t model_args < <(_provider_model_args codex gpt-5.6-codex)
+  chk "codex concrete provider model pins --model" \
+    "${model_args[*]-}" "--model gpt-5.6-codex"
 
   # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
   cat > "$tmp/claude.log" <<'LOG'
