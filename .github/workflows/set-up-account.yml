@@ -27,6 +27,14 @@
 # scripts/grant-account.py (regression-tested by the registry-selftest gate), and both the write
 # and the no-op path verify the parsed postcondition before reporting success.
 #
+# LIVE-AUTHORIZATION fix (review round 2 of #260): the target set in `meta` is a PRE-LOGIN
+# snapshot of the event payload, and login can take ~13 min — a maintainer removing or replacing
+# a `target:` label mid-login is a revocation the snapshot cannot see. Immediately before editing
+# policy/repos.toml the grant step re-fetches the issue's CURRENT labels through the API (as
+# structured JSON, never inline event interpolation) and refuses unless the live-derived target
+# set is non-empty and EXACTLY equals the captured set (grant-account.py verify_live_targets,
+# regression-tested by the gate).
+#
 # STALE-SNAPSHOT fix (#186, hardened after review round 1 of #236): the handle/secret in `meta`
 # are only a pre-login HINT. A re-read before the write is still a TOCTOU check, so the store step
 # instead takes ATOMIC ownership of the slot by creating `refs/acct-claims/<handle>` — git ref
@@ -311,11 +319,16 @@ jobs:
       # lives in scripts/grant-account.py — imported here like the read_accounts validation step —
       # so the registry-selftest gate regression-tests it; every success path below re-checks the
       # parsed postcondition (handle present in every target pool).
+      # Review round 2 of #260: the captured target set is only the pre-login SNAPSHOT — before
+      # any policy edit, the step re-fetches the issue's live labels and refuses unless they
+      # still authorize exactly that set (a target label removed/replaced mid-login must revoke,
+      # not grant).
       - name: Grant the handle to the authorized target account_pools (contents-API CAS, rebase-retry)
         if: steps.login.outputs.status == 'ok'
         env:
           NEW_HANDLE: ${{ steps.store.outputs.handle }}
           TARGET_REPOS: ${{ steps.meta.outputs.targets }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -347,6 +360,25 @@ jobs:
                   ["gh", "api", *args], capture_output=True, text=True, check=False,
                   input=json.dumps(input_doc) if input_doc is not None else None)
               return result
+
+          # #260 r2: `targets` is a PRE-LOGIN snapshot of the event payload, and the login
+          # above can take ~13 min, during which a maintainer may remove or replace a
+          # `target:` label to revoke or redirect this request. Re-derive the target set from
+          # the issue's CURRENT labels through the API (structured JSON — never inline event
+          # interpolation) and refuse unless it is non-empty and EXACTLY the captured set
+          # (verify_live_targets, regression-tested by the gate). Fetch failure = the live
+          # authorization cannot be proven = refuse.
+          issue_number = os.environ["ISSUE_NUMBER"]
+          if not re.fullmatch(r"[0-9]+", issue_number):
+              raise SystemExit("unsafe issue number")
+          live = gh_api(["--paginate", "--slurp",
+                         f"repos/{repo}/issues/{issue_number}/labels?per_page=100"])
+          if live.returncode != 0:
+              raise SystemExit(
+                  "could not fetch the issue's live labels — refusing to grant (fail closed)")
+          live_names = [lb["name"] for page in json.loads(live.stdout) for lb in page]
+          ga.verify_live_targets(targets, live_names)
+          print(f"live target labels re-verified at write time: {' '.join(sorted(targets))}")
 
           for attempt in range(6):
               meta = gh_api([f"repos/{repo}/contents/{path}"])

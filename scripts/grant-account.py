@@ -33,6 +33,36 @@ def pool_of(repos_doc, name):
     return list((repos_doc.get(name) or {}).get("account_pool") or [])
 
 
+def targets_from_labels(label_names):
+    """The target-repo set a list of issue label names authorizes: every
+    `target:<owner>/<name>` label (the same shape the broker's pre-login capture
+    matches — `target:*/*`). Every other label authorizes nothing."""
+    return {
+        name[len("target:"):]
+        for name in label_names
+        if name.startswith("target:") and "/" in name[len("target:"):]
+    }
+
+
+def verify_live_targets(captured, live_label_names):
+    """The write-time authorization re-check (#260 review round 2): the captured target set
+    is a PRE-LOGIN snapshot of the event payload, and login can take ~13 min, during which a
+    maintainer may remove or replace a `target:` label to revoke or redirect the request.
+    The grant must therefore reflect the issue's CURRENT labels: the live-derived target set
+    must be non-empty and EXACTLY equal the captured set — anything else (revoked, replaced,
+    or even widened mid-login) refuses. Raises SystemExit (fail closed)."""
+    live = targets_from_labels(live_label_names)
+    if not live:
+        raise SystemExit(
+            "the live issue no longer carries any target:<owner>/<name> label — target "
+            "authorization was revoked during login; refusing to grant (fail closed)")
+    if live != set(captured):
+        raise SystemExit(
+            f"the live issue's target labels authorize {sorted(live)} but the pre-login "
+            f"snapshot captured {sorted(set(captured))} — authorization changed during "
+            "login; refusing to grant (fail closed)")
+
+
 def pending_targets(repos_doc, targets, handle):
     """The targets whose PARSED account_pool does not contain `handle`. This is the only
     membership test: quoted-handle text elsewhere in the raw array body (a comment, a
@@ -189,6 +219,25 @@ def _self_test():
     doubled = dict(before, **{"o/single": {"account_pool": ["acct01", "acct02", "acct09", "acct09"]}})
     raises("verify refuses a double-appended handle",
            lambda: verify_grant(before, doubled, ["o/single"], "acct09"))
+
+    # --- THE #260 r2 regression: the grant must re-check the issue's LIVE target labels at
+    # write time. The captured set is a pre-login snapshot; a target label removed, replaced,
+    # or added during the ~13-min login must refuse the grant, never silently proceed.
+    live = ["set-up-account", "provider:openai", "target:o/single", "target:o/empty"]
+    chk("target derivation matches the pre-login capture shape",
+        targets_from_labels(live), {"o/single", "o/empty"})
+    chk("non-target and slash-less labels authorize nothing",
+        targets_from_labels(["target:noslash", "provider:openai", "o/em"]), set())
+    verify_live_targets(["o/single", "o/empty"], live)
+    print("  ok   verify_live_targets accepts an unchanged live target set")
+    raises("all target labels removed mid-login refuses (revocation)",
+           lambda: verify_live_targets(["o/single"], ["set-up-account", "provider:openai"]))
+    raises("target label replaced mid-login refuses",
+           lambda: verify_live_targets(["o/single"], ["set-up-account", "target:o/other"]))
+    raises("one of several target labels removed mid-login refuses",
+           lambda: verify_live_targets(["o/single", "o/empty"], ["target:o/single"]))
+    raises("target label added mid-login refuses (exact match, not subset)",
+           lambda: verify_live_targets(["o/single"], ["target:o/single", "target:o/other"]))
 
     print("grant-account self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
