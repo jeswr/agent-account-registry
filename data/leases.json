@@ -229,6 +229,16 @@
    "model": "fable",
    "issued_at": 1784340232,
    "expires_at": 1784346532
+  },
+  {
+   "account": "acct01",
+   "claim_id": "b7a6d83201924a4191fff802069444dd",
+   "holder": "sparq-org/sparq#3110@dispatch-29626255287.1",
+   "package": "sparq-algos",
+   "role": "impl",
+   "model": "terra",
+   "issued_at": 1784340239,
+   "expires_at": 1784346539
   }
  ]
 }
