@@ -9,6 +9,16 @@
    "model": "fable",
    "issued_at": 1784356318,
    "expires_at": 1784362618
+  },
+  {
+   "account": "acct4css",
+   "claim_id": "c3827d289314450c9e83b64a9acb5bb6",
+   "holder": "sparq-org/sparq#3292@dispatch-29634080568.1",
+   "package": "gui",
+   "role": "impl",
+   "model": "fable",
+   "issued_at": 1784356322,
+   "expires_at": 1784362622
   }
  ]
 }
