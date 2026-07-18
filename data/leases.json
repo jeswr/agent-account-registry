@@ -12,16 +12,6 @@
   },
   {
    "account": "acct07",
-   "claim_id": "fdff61ea3e7c4baebb3f08fe10bd2880",
-   "holder": "fix:jeswr/agent-account-registry#235@dispatch-29657379035.1",
-   "package": "review-loop",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784402302,
-   "expires_at": 1784405902
-  },
-  {
-   "account": "acct07",
    "claim_id": "46fd81f7a62246a99bd3b6baae4c07d4",
    "holder": "fix:jeswr/agent-account-registry#256@dispatch-29657379035.1",
    "package": "ci",
