@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The report only compares row counts when a baseline query is present in the variant (`if vs is None or q not in vs: ... continue`) and computes geomeans over the intersection. It never requires identical suite/query key sets, and a wholly missing suite is also skipped. Consequently, a truncated variant output can pass the claimed hard correctness differential, while omitted slow queries can bias the performance verdict upward. Extra variant queries are likewise ignored.",
+   "file": "bench/pgo/report.py",
+   "fix_hint": "Before producing deltas, require every measured variant to contain every baseline suite and require each suite's query-name set to equal the baseline set. Add explicit mismatches for missing/extra suites and queries, fail before calculating a gate-worthy geomean, and add focused tests showing that missing, extra, and truncated TSV data exit nonzero.",
+   "severity": "major",
+   "title": "Correctness gate silently accepts missing and extra query results"
+  },
+  {
+   "body": "The server BOLT profile runs `perf record -p $SERVER_PID ... -- python3 serve_driver.py ...` and calls `stop_server` only after `perf record` returns. PID-attach recording normally follows the attached process until it exits; the server remains alive waiting for the later `stop_server`, so this ordering can hang. Combining an attach target and a workload command is also perf-version-sensitive and does not provide a clear bounded recording lifecycle.",
+   "file": "bench/pgo/bolt.sh",
+   "fix_hint": "Use a bounded attach lifecycle: start `perf record -p $SERVER_PID` in the background, run the driver separately, then signal/interrupt perf and wait for it before stopping the server (with traps covering both PIDs). Alternatively launch and exercise the server under a wrapper whose termination unambiguously ends perf. Validate the produced server perf.data is nonempty before perf2bolt.",
+   "severity": "major",
+   "title": "Attached server perf recording has no reliable termination path"
+  }
+ ],
+ "progress": null,
+ "summary": "The harness is thoughtfully scoped and labels its measurements honestly, but its advertised hard correctness gate is incomplete: missing or extra query results are not treated as mismatches. A truncated or otherwise incomplete optimized run can therefore pass and can also produce an artificially favorable geomean. The BOLT server profiling command also combines PID attachment with a workload command in a way that can prevent the recording from terminating before the script stops the attached server. These defects make the evaluation incomplete as submitted.",
+ "verdict": "request_changes"
+}
