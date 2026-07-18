@@ -1,0 +1,29 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`policy_ttl` is concatenated verbatim with trusted rule text and passed to `reason_n3`. Although the API documents this as raw Turtle, N3 accepts implication rules, so a caller can supply syntactically valid N3/Turtle-extension content that directly derives `auth:*` grants. `serialize_request_n3` also interpolates public `Request` strings into `<...>` and quoted literals without RDF escaping, permitting source termination and injected triples/rules. This is an authorization bypass, not merely a parse failure.",
+   "file": "crates/sparq-solid/src/odrl_bridge.rs",
+   "fix_hint": "Parse `policy_ttl` strictly as Turtle into RDF terms and serialize only the parsed ground graph with a standards-compliant RDF serializer; reject any non-Turtle constructs. Build request triples as RDF terms and serialize them with proper IRI/literal escaping rather than string interpolation. Add adversarial tests containing `=>`, `>`, quotes, backslashes, and newlines and assert fail-closed behavior with no auth triples.",
+   "severity": "blocker",
+   "title": "Caller-controlled Turtle and request fields are injected into executable N3"
+  },
+  {
+   "body": "The rules compare lexical forms with `string:notGreaterThan`. XSD dateTime equality/order is value-based: equivalent instants can use different offsets and lexical forms, and fractional seconds/offset lengths also defeat lexicographic ordering. The public function claims decision equivalence for `odrl:dateTime` lteq/gteq, but the tests cover only fixed-length `Z` values, so they do not establish that invariant and valid policies can be incorrectly granted or denied.",
+   "file": "crates/sparq-solid/rules/odrl-a.n3",
+   "fix_hint": "Use the same parsed XSD dateTime value comparison as the Rust evaluator, or explicitly validate and reject every lexical form outside a documented canonical UTC subset before reasoning. Add differential boundary cases with timezone offsets, fractional seconds, and equivalent instants represented by different lexical forms.",
+   "severity": "major",
+   "title": "Lexical dateTime comparison is not equivalent to XSD dateTime semantics"
+  },
+  {
+   "body": "`prohibMatches` is derived only when a prohibition has no `odrl:constraint`. Therefore a prohibition using any of the advertised supported atomic or logical constraints can never emit a deny and cannot suppress a matching permission. The Rust bridge evaluates prohibition constraints, so this violates the documented decision-equivalence and can widen access. The differential corpus tests only unconstrained prohibitions and cannot catch the defect.",
+   "file": "crates/sparq-solid/rules/odrl-b.n3",
+   "fix_hint": "Implement constrained-prohibition satisfaction with the same atomic/or/and semantics and stratified fail-closed handling as permissions, then derive `prohibMatches` for satisfied constrained prohibitions. Add positive and negative differential tests for constrained prohibitions, including a matching permission to verify deny-overrides.",
+   "severity": "major",
+   "title": "Constrained prohibitions are silently ignored"
+  }
+ ],
+ "progress": null,
+ "summary": "The new authorization path is not safe or decision-equivalent as claimed. It embeds caller-controlled policy and request values directly into executable N3, allowing rule/source injection, and its temporal and prohibition semantics diverge from the Rust evaluator outside the narrow happy-path corpus. The differential tests omit the load-bearing adversarial and constrained-prohibition cases.",
+ "verdict": "request_changes"
+}
