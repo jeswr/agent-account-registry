@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "witness_abox derives assertions only from a limited set of TBox axiom positions. A query predicate that is absent from those positions receives no assertion, and one independent assertion per class/property does not generally satisfy multi-atom joins or shared-variable patterns. Consequently both the raw and minimized UCQs can return the empty set even when they differ semantically. This contradicts the file's load-bearing claim that every reachable predicate is populated and that the differential is non-vacuous; the smoke cases do not cover arbitrary gathered queries.",
+   "file": "crates/sparq-reason-ql/examples/ql_npd_requiem_bench.rs",
+   "fix_hint": "Build the witness data per query/rewritten disjunct, not from the TBox alone: include predicates occurring in the original, raw, and minimized UCQs and generate compatible bindings that satisfy each CQ's shared-variable structure (including literals where required). Alternatively require a real ABox for equivalence and label witness-only runs as lacking a sound equivalence gate. Add a regression test where a query-only predicate and a multi-atom join would currently make both sides empty, with deliberately different raw/minimized queries demonstrating that the improved gate detects the mismatch. Update the research and benchmark claims to match the actual guarantee.",
+   "severity": "major",
+   "title": "Gather-mode equivalence gate can be vacuous"
+  }
+ ],
+ "progress": null,
+ "summary": "The harness is careful about regime labelling and fixture assertions, but its gather-mode equivalence gate does not meet its stated non-vacuity invariant. The synthesized witness graph omits query predicates that are absent from the TBox and generally does not construct witnesses satisfying joins, so raw and minimized rewrites can agree only because both return an empty set. That makes the principal pre-timing soundness check vacuous for valid benchmark queries and can allow an answer-changing minimization through while the harness reports agreement.",
+ "verdict": "request_changes"
+}
