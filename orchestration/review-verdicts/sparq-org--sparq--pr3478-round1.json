@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "resolve_imports adds the seed with blank labels unchanged, then renames the first resolved document's blank node `b0` to `i0_b0`. If the seed already contains a distinct blank node whose label is `i0_b0`, Dict interning collapses them into one node. This violates the documented RDF-merge/standardise-apart guarantee and can join unrelated SHACL property-shape triples, producing incorrect validation behavior. The current resolve_imports test's seed uses `b0`, so it cannot detect this collision.",
+   "file": "crates/sparq-shacl/src/imports.rs",
+   "fix_hint": "Allocate fresh blank-node identifiers against the union dictionary rather than relying only on an ordinal prefix (or first collect seed labels and choose a namespace proven disjoint). Add a resolve_imports regression test where the seed contains `_:i0_b0` and the imported graph contains `_:b0`, and assert that the two shapes remain distinct through the real validation path.",
+   "severity": "major",
+   "title": "Imported blank nodes can collide with seed blank nodes"
+  }
+ ],
+ "progress": null,
+ "summary": "The import traversal, cycle guard, and acceptance coverage are generally coherent, but resolve_imports does not actually guarantee that imported blank nodes are standardised apart from the seed graph. Its ordinal-prefix scheme can generate a label already present in the seed, silently merging distinct RDF nodes and changing the assembled shapes graph. The existing test uses a non-colliding seed label and therefore does not exercise this load-bearing invariant.",
+ "verdict": "request_changes"
+}
