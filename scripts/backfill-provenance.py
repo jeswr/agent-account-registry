@@ -93,7 +93,7 @@ def run_identity_from_log(log_text, target_repo, pr_number, issue):
     identity = (anchored["account"], anchored["alias"])
     if legacy is not None and legacy != identity:
         return None
-    return identity
+    return anchored["account"], anchored["alias"], anchored["provider"]
 
 
 # Post-migration identity source (the #96 outage population: worker succeeded, the provenance
@@ -111,6 +111,9 @@ def _prov_job_field(name, value_pattern):
 
 PROV_JOB_ACCOUNT_RE = _prov_job_field("WORKER_IMPL_ACCOUNT:", r"(acct[0-9a-z]{2,})\s*$")
 PROV_JOB_ALIAS_RE = _prov_job_field("--impl-alias", r'"?([A-Za-z0-9][A-Za-z0-9_.-]*)"?')
+# The PROVIDER is also run-bound (sol r3): deriving it from TODAY's mutable routing lets a
+# routing remap flip a historical anthropic run to openai and defeat the cross-provider gate.
+PROV_JOB_PROVIDER_RE = _prov_job_field("--impl-provider", r'"?(anthropic|openai)"?')
 # PR-binding fields (sol r2): the provenance job's command echo names the exact PR it was
 # recording — required to match the live PR, so a forged/reused run id in a head branch can
 # never transplant another PR's identity.
@@ -124,6 +127,7 @@ def provenance_job_identity_from_log(log_text):
     job's log section, None when the section/fields are absent, or AMBIGUOUS when any field
     has differing repeated matches (tamper evidence). Every field is required."""
     fields = {"account": PROV_JOB_ACCOUNT_RE, "alias": PROV_JOB_ALIAS_RE,
+              "provider": PROV_JOB_PROVIDER_RE,
               "target_repo": PROV_JOB_TARGET_RE, "pr": PROV_JOB_PR_RE,
               "issue": PROV_JOB_ISSUE_RE}
     out = {}
@@ -246,10 +250,11 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         run_key = f"backfill:{run_id}.{attempt}"
         log = _run_gh(["run", "view", run_id, "--attempt", attempt,
                        "--repo", registry_repo, "--log"], check=False)
+        echo_provider = None
         if log.returncode == 0:
             found = run_identity_from_log(log.stdout, target_repo, number, issue)
             if found:
-                account, alias = found
+                account, alias, echo_provider = found
         if alias is None or account is None:
             needs_human += 1
             print(f"NEEDS-HUMAN #{number}: worker run {run_id} attempt {attempt} log is "
@@ -262,6 +267,15 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         if provider is None:
             needs_human += 1
             print(f"NEEDS-HUMAN #{number}: alias {alias!r} has no provider in routing")
+            continue
+        if provider != echo_provider:
+            # sol r3: the run's own --impl-provider echo is authoritative for HISTORY; a
+            # disagreement means today's routing was remapped since the run — recording
+            # today's provider could flip the cross-provider reviewer gate.
+            needs_human += 1
+            print(f"NEEDS-HUMAN #{number}: the run recorded provider {echo_provider!r} but "
+                  f"today's routing maps {alias!r} to {provider!r}; a human must resolve the "
+                  "remap before this identity is recorded")
             continue
         commits = _gh_json(["api", f"repos/{target_repo}/pulls/{number}/commits?per_page=100"])
         if not isinstance(commits, list) or not commits:
@@ -306,15 +320,15 @@ def _self_test():
     claim_job = "Claim live account lease"
     check("claim line parses (claim-job-anchored)",
           claim_from_log(f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
-                         "lease claimed: account=acct02, model=fable, claim=deadbeef\n"),
-          ("acct02", "fable"))
+                         "lease claimed: account=acct0fx3, model=fable, claim=deadbeef\n"),
+          ("acct0fx3", "fable"))
     check("adopt line parses (claim-job-anchored)",
           claim_from_log(f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
-                         "dispatcher lease adopted: account=acct01, model=terra, claim=ab"),
-          ("acct01", "terra"))
+                         "dispatcher lease adopted: account=acct0fx4, model=terra, claim=ab"),
+          ("acct0fx4", "terra"))
     check("UNANCHORED claim line no longer matches (worker-job forgery class)",
           claim_from_log("Run live target worker (DRAFT, review pending)\tmodel\t"
-                         "2026-07-18T09:03:04Z lease claimed: account=acct99zz, "
+                         "2026-07-18T09:03:04Z lease claimed: account=acct0fx9, "
                          "model=terra, claim=ff"), None)
     check("no claim line", claim_from_log("nothing here"), None)
     # Trailer-derived identity is REJECTED by construction: there is no code path from a commit
@@ -326,44 +340,49 @@ def _self_test():
     check("unknown alias provider", provider_of("ghost", routing), None)
     prov_job = "Record implementer provenance (no target code runs here)"
 
-    def prov_lines(account="acct2css", alias="fable", target="sparq-org/sparq",
-                   pr=3459, issue=3404):
+    def prov_lines(account="acct0fx1", alias="fable", provider="anthropic",
+                   target="sparq-org/sparq", pr=3459, issue=3404):
         step = f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44Z   "
         return (f"{step}WORKER_IMPL_ACCOUNT: {account}\n"
                 f'{step}--target-repo "{target}" \\\n'
                 f'{step}--pr "{pr}" \\\n'
+                f'{step}--impl-provider "{provider}" \\\n'
                 f'{step}--impl-alias "{alias}" \\\n'
                 f'{step}--issue "{issue}" \\\n')
 
     prov_log = prov_lines()
-    bound = {"account": "acct2css", "alias": "fable", "target_repo": "sparq-org/sparq",
-             "pr": 3459, "issue": 3404}
+    bound = {"account": "acct0fx1", "alias": "fable", "provider": "anthropic",
+             "target_repo": "sparq-org/sparq", "pr": 3459, "issue": 3404}
     check("provenance-job echo parses ALL binding fields",
           provenance_job_identity_from_log(prov_log), bound)
     forged = ("Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
-              "WORKER_IMPL_ACCOUNT: acct99zz\n"
+              "WORKER_IMPL_ACCOUNT: acct0fx9\n"
               "Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
               '--impl-alias "opus"\n')
     check("worker-job forgery cannot match (job-prefix anchor)",
           provenance_job_identity_from_log(forged), None)
     check("conflicting repeats are AMBIGUOUS, not absent",
           provenance_job_identity_from_log(
-              prov_log + prov_lines(account="acct3css")) is AMBIGUOUS, True)
+              prov_log + prov_lines(account="acct0fx2")) is AMBIGUOUS, True)
     check("partial fields are AMBIGUOUS (never a half-bound identity)",
           provenance_job_identity_from_log(
-              f"{prov_job}\ts\t2026-07-18T09:10:44Z   WORKER_IMPL_ACCOUNT: acct2css\n")
+              f"{prov_job}\ts\t2026-07-18T09:10:44Z   WORKER_IMPL_ACCOUNT: acct0fx1\n")
           is AMBIGUOUS, True)
     claim_ok = (f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
-                "lease claimed: account=acct2css, model=fable, claim=x\n")
+                "lease claimed: account=acct0fx1, model=fable, claim=x\n")
     ident = lambda log, pr=3459, issue=3404: run_identity_from_log(
         log, "sparq-org/sparq", pr, issue)
-    check("bound identity resolves", ident(prov_log), ("acct2css", "fable"))
+    check("bound identity resolves with the RUN's provider", ident(prov_log),
+          ("acct0fx1", "fable", "anthropic"))
     check("agreeing legacy corroboration keeps it", ident(claim_ok + prov_log),
-          ("acct2css", "fable"))
+          ("acct0fx1", "fable", "anthropic"))
+    check("provider conflicts are AMBIGUOUS",
+          provenance_job_identity_from_log(
+              prov_log + prov_lines(provider="openai")) is AMBIGUOUS, True)
     check("DISAGREEING trusted sources fail closed",
-          ident(claim_ok.replace("acct2css", "acct3css") + prov_log), None)
+          ident(claim_ok.replace("acct0fx1", "acct0fx2") + prov_log), None)
     check("AMBIGUOUS legacy claims fail closed even with a clean anchored source (sol r2)",
-          ident(claim_ok + claim_ok.replace("acct2css", "acct3css") + prov_log), None)
+          ident(claim_ok + claim_ok.replace("acct0fx1", "acct0fx2") + prov_log), None)
     check("claim-only identity is NEVER sufficient (unbound to the PR)",
           ident(claim_ok), None)
     check("PR-binding mismatch fails closed (reused run id)", ident(prov_log, pr=9999), None)
