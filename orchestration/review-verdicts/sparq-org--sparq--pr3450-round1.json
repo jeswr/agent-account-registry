@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The new bullet says the aggregate MAC means batched `mac_check` authenticates the whole linear circuit, without stating that this malicious-with-abort construction is research-grade and pending external accredited-cryptographer sign-off under `sq-qhy4`. It can also be read as saying `auth_sum` itself authenticates/checks the aggregate, although the helper only propagates MAC shares and never invokes `mac_check`. This violates the repository's live privacy-claims rule for MPC claims.",
+   "file": "skills/mpc/SKILL.md",
+   "fix_hint": "Explicitly say that `auth_sum` only preserves the MAC relation for same-session, honestly formed inputs, that tamper detection requires the caller to include the result in a successful batched `mac_check` before relying on/opening it, and that the malicious-with-abort security claim remains research-grade/not externally audited pending `sq-qhy4`. Apply the same qualification to the new public rustdoc's 'malicious comes free' wording.",
+   "severity": "major",
+   "title": "Authenticated-SUM claim omits the required MPC audit caveat"
+  }
+ ],
+ "progress": null,
+ "summary": "The fold implementation is straightforward and the tests exercise both the non-empty and empty paths, but the new public documentation makes an uncaveated malicious-security/authentication claim on an MPC surface. Repository policy requires such claims to state the research-grade, not-externally-audited status (sq-qhy4), and the helper itself only preserves MAC shares; it does not perform the batched MAC check needed to detect tampering.",
+ "verdict": "request_changes"
+}
