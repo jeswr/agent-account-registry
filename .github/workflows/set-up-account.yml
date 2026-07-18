@@ -202,10 +202,20 @@ jobs:
           if ! printf '%s' "$probe" | grep -q 'HTTP 404'; then
             echo "::error::could not prove $SECRET_NAME is absent — refusing to store (fail closed)"; exit 1
           fi
-          # The secret lives on THIS registry repo: worker.yml resolves secrets[secret_ref] here,
-          # the dispatch usage probe reads registry secrets, and the rotation write-back targets the
-          # registry too. Never echo the token — gh reads the file.
-          GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" -R "${{ github.repository }}" < "$LOGIN_DIR/token"
+          # Post-#101 the canonical home is the `dispatch-secrets` environment: probe it too
+          # (BOTH scopes must 404 — a repo-scope stray would trip the secrets-guard, an env
+          # stray means the claim protocol was bypassed).
+          if envprobe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/environments/dispatch-secrets/secrets/$SECRET_NAME" 2>&1); then
+            echo "::error::secret $SECRET_NAME already exists in the dispatch-secrets environment despite an owned claim — refusing to overwrite (fail closed)"; exit 1
+          fi
+          if ! printf '%s' "$envprobe" | grep -q 'HTTP 404'; then
+            echo "::error::could not prove $SECRET_NAME is absent from the dispatch-secrets environment — refusing to store (fail closed)"; exit 1
+          fi
+          # The secret lives on THIS registry repo, in the `dispatch-secrets` ENVIRONMENT
+          # (post-#101): worker.yml/review-fix.yml resolve secrets[secret_ref] from env-bound
+          # jobs, and the rotation write-back targets the same environment. A repo-scope write
+          # would re-trip the secrets-guard. Never echo the token — gh reads the file.
+          GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" -R "${{ github.repository }}" --env dispatch-secrets < "$LOGIN_DIR/token"
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
           harness=$([ "$PROVIDER" = openai ] && echo codex || echo claude)
           # registry issue + comment use the workflow's own github.token (same-owner)

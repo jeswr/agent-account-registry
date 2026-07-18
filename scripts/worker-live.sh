@@ -1323,9 +1323,12 @@ PY
       ;;
     *) die 'unsafe credential format for write-back' ;;
   esac
-  GH_TOKEN="$pat" /usr/bin/gh secret set "$secret_ref" --repo "$registry_repo" < "$current"
+  # --env: post-#101 the canonical secret home is the `dispatch-secrets` environment; a
+  # repo-scope write would re-trip the secrets-guard AND leave the env copy stale (the
+  # env-bound consumers would keep resolving the pre-rotation token).
+  GH_TOKEN="$pat" /usr/bin/gh secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$current"
   write_output rotated true
-  printf 'worker-live: wrote the full refreshed credential back to %s\n' "$secret_ref"
+  printf 'worker-live: wrote the full refreshed credential back to %s (env dispatch-secrets)\n' "$secret_ref"
 }
 
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
