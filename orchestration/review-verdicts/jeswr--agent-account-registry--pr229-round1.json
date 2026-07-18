@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_is_cas_conflict` returns true for any stderr containing `HTTP 422`, although 422 is not uniquely a create-if-absent race; it also represents ordinary request validation failures. This contradicts `_write_ledger`'s stated contract that validation errors raise immediately. Such a failure is retried six times and then becomes `-1`, `None`, or `False` depending on the caller, obscuring a persistent configuration/payload error as CAS contention. The self-test cements the over-broad classification by supplying only the status code and labeling it a create race.",
+   "file": "scripts/select-and-claim.py",
+   "fix_hint": "Distinguish the specific create-race response from other 422 responses using structured response details or a narrowly verified error signature; otherwise raise `LeaseIOError`. Add a self-test for a non-race 422 validation response that must fail loud, alongside the create-race case.",
+   "severity": "major",
+   "title": "All HTTP 422 validation failures are misclassified as CAS conflicts"
+  },
+  {
+   "body": "The assertion only requires `_backoff_delay` to remain within `[0, ceiling]`. Implementations that always return 0, always return the ceiling, or always return half the ceiling all pass, so the test does not establish the claimed full-jitter behavior.",
+   "file": "scripts/select-and-claim.py",
+   "fix_hint": "Stub `random.uniform` with a sentinel-returning fake and assert that `_backoff_delay(attempt)` calls it with exactly `(0, _backoff_ceiling(attempt))` and propagates its result.",
+   "severity": "minor",
+   "title": "The full-jitter test can pass for deterministic non-jitter delays"
+  }
+ ],
+ "progress": null,
+ "summary": "The retry/backoff placement is sound and the conflict/retry tests exercise the main control flow, but the new error classifier does not meet its fail-loud contract: it treats every HTTP 422 response as a CAS race. GitHub can return 422 for non-race validation failures, so those failures are silently converted into retries and ultimately into the callers' generic CAS-exhaustion result. The jitter self-test also checks only bounds, not that full jitter is actually used.",
+ "verdict": "request_changes"
+}
