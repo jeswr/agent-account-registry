@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 1's major finding is resolved. `BridgeLedger::refresh` now preserves the `Option` distinction explicitly: only `Some(...)` static baselines may preserve an empty auth-view marker, while `None` routes an empty reset through removal. The new `bridged_only_retraction_returns_to_unloaded` regression test exercises the previously missing real path by creating a bridged-only grant, withdrawing it, refreshing the ledger, and asserting the store returns to `AclStatus::Unloaded`. The existing empty-static-closure test covers the converse `Some(empty)` behavior. The combined-feature matrix leg also directly gates the feature interaction that exposed the original regression. No correctness, soundness, test-validity, or security issues remain in the diff.",
+ "verdict": "approve"
+}
