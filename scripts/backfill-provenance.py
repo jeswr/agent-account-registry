@@ -109,9 +109,18 @@ def run_identity_from_log(log_text, target_repo, pr_number, issue, live_author):
 # these patterns ANCHOR on a job name containing "provenance" — that job runs NO target/model
 # code, so a hostile model printing a lookalike line lands under the WORKER job's prefix and
 # can never match (same fail-closed posture as the no-trailer rule below).
+# The Actions runner wraps every `run:` SCRIPT line in cyan SGR controls, and `gh run view
+# --log` caret-sanitizes them (`^[[36;1m ... ^[[0m`) instead of stripping (sol r6 — with a
+# synthetic-fixture false green, the six command fields matched NOTHING in a real log and
+# every outage PR went AMBIGUOUS/needs-human). Accept an optional raw-ESC or caret-sanitized
+# SGR wrapper before the field; env echoes (WORKER_IMPL_ACCOUNT) are runner-emitted, unwrapped.
+_SGR_PREFIX = r"(?:(?:\^\[|\x1b)\[[0-9;]*m)?\s*"
+
+
 def _prov_job_field(name, value_pattern):
     return re.compile(
-        r"(?mi)^[^\t]*provenance[^\t]*\t[^\t]*\t\S+\s+" + name + r"\s*" + value_pattern)
+        r"(?mi)^[^\t]*provenance[^\t]*\t[^\t]*\t\S+\s+" + _SGR_PREFIX + name
+        + r"\s*" + value_pattern)
 
 
 PROV_JOB_ACCOUNT_RE = _prov_job_field("WORKER_IMPL_ACCOUNT:", r"(acct[0-9a-z]{2,})\s*$")
@@ -370,22 +379,28 @@ def _self_test():
     prov_job = "Record implementer provenance (no target code runs here)"
 
     def prov_lines(account="acct0fx1", alias="fable", provider="anthropic",
-                   target="sparq-org/sparq", pr=3459, issue=3404):
-        step = f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44Z   "
-        return (f"{step}WORKER_IMPL_ACCOUNT: {account}\n"
-                f'{step}--target-repo "{target}" \\\n'
-                f'{step}--pr "{pr}" \\\n'
-                f'{step}--impl-provider "{provider}" \\\n'
-                f'{step}--impl-alias "{alias}" \\\n'
-                f'{step}--issue "{issue}" \\\n'
-                f'{step}--verify-bot-login "sparq-orchestrator[bot]"\n')
+                   target="sparq-org/sparq", pr=3459, issue=3404, wrap=True):
+        # wrap=True reproduces the LITERAL `gh run view --log` shape: command echoes carry
+        # caret-sanitized SGR wrappers + a trailing continuation backslash (sol r6); the env
+        # echo line is runner-emitted and unwrapped.
+        step = f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44Z "
+        o, c, bs = ("^[[36;1m  ", " \\^[[0m", "") if wrap else ("", " \\", "")
+        return (f"{step}  WORKER_IMPL_ACCOUNT: {account}\n"
+                f'{step}{o}--target-repo "{target}"{c}\n'
+                f'{step}{o}--pr "{pr}"{c}\n'
+                f'{step}{o}--impl-provider "{provider}"{c}\n'
+                f'{step}{o}--impl-alias "{alias}"{c}\n'
+                f'{step}{o}--issue "{issue}"{c}\n'
+                f'{step}{o}--verify-bot-login "sparq-orchestrator[bot]"{c}\n')
 
     prov_log = prov_lines()
     bound = {"account": "acct0fx1", "alias": "fable", "provider": "anthropic",
              "bot_login": "sparq-orchestrator[bot]",
              "target_repo": "sparq-org/sparq", "pr": 3459, "issue": 3404}
-    check("provenance-job echo parses ALL binding fields",
+    check("provenance-job echo parses ALL binding fields (REAL caret-SGR log shape)",
           provenance_job_identity_from_log(prov_log), bound)
+    check("unwrapped (raw-print) shape still parses",
+          provenance_job_identity_from_log(prov_lines(wrap=False)), bound)
     forged = ("Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
               "WORKER_IMPL_ACCOUNT: acct0fx9\n"
               "Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
