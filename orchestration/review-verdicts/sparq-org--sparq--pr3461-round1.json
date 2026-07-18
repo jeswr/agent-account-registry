@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Replica::apply searches only self.state.store() for an existing dot-to-quad association. After an observed removal, that dot remains known in the causal context but disappears from store, so applying a delta whose store maps the same dot to another quad passes this check and check_invariants(), then makes the forged quad live. This violates CRDT-WIRE-4 ('already known under another quad' must be rejected) and CRDT-DOT-1's no-reuse rule. The test apply_rejects_dot_reuse_under_a_different_quad is non-vacuous for a live original mapping but does not exercise the removed/historical case.",
+   "file": "crates/sparq-crdt/src/origin.rs",
+   "fix_hint": "Preserve durable dot-to-quad provenance (or equivalent journal validation state) beyond removal and consult it before joining any received add. Add a regression test that applies q1/d, applies a removal of d, then attempts q2/d and asserts rejection with the replica state unchanged. Ensure snapshot/catch-up retains enough provenance to enforce the same check after restart or compaction.",
+   "severity": "major",
+   "title": "Dot reuse is accepted after the original quad is removed"
+  }
+ ],
+ "progress": null,
+ "summary": "The dotted-set join and bounded convergence coverage are generally coherent, and the documentation appropriately limits the evidence claim. However, CRDT-WIRE-4 dot-reuse rejection is incomplete: Replica::apply checks a received live dot only against the receiver's current live store. Once the original quad has been removed, the causal context retains the dot but no longer retains its quad association, so a forged delta can reuse that known dot under a different quad and be accepted. The existing test covers only reuse while the original dot remains live, leaving the required historical-reuse case untested.",
+ "verdict": "request_changes"
+}
