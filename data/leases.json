@@ -89,6 +89,16 @@
    "model": "fable",
    "issued_at": 1784391728,
    "expires_at": 1784395328
+  },
+  {
+   "account": "acct07",
+   "claim_id": "7bad97694ead4043b33fb5903c57717e",
+   "holder": "fix:jeswr/agent-account-registry#231@dispatch-29651708285.1",
+   "package": "worker",
+   "role": "fix",
+   "model": "fable",
+   "issued_at": 1784391733,
+   "expires_at": 1784395333
   }
  ]
 }
