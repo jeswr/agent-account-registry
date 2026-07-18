@@ -159,6 +159,16 @@
    "model": "opus",
    "issued_at": 1784339576,
    "expires_at": 1784345876
+  },
+  {
+   "account": "acct3css",
+   "claim_id": "888d8a39ae194e64b2e9ebd015e39119",
+   "holder": "sparq-org/sparq#2845@dispatch-29625933900.1",
+   "package": "sparq-trust",
+   "role": "impl",
+   "model": "fable",
+   "issued_at": 1784339579,
+   "expires_at": 1784345879
   }
  ]
 }
