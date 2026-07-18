@@ -45,13 +45,14 @@ STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
 # registry checkout root (groom.yml), so the directory is reachable relatively.
 PROVENANCE_DIR = "orchestration/provenance"
 # Reason for age-parking a draft worker PR that has NO VALID registry provenance record —
-# missing, unreadable, or schema-invalid (bad pr_number/provider/head-sha/account-hash). Such a
-# draft is owned by NO automated loop: dispatch-claim fails closed on every one of those cases
-# (missing/mismatched records at PLAN, malformed sha/hash at CLAIM — its is_enumerable_provenance
-# is the shared predicate), and groom's issue-side orphan repair skips it (an open draft links its
-# source issue). Age-parking to needs:user is the human hand-off — the closure guarantee that no
-# draft is ever silently stranded. Phrased to read after "…threshold, and {reason}." in the park
-# comment.
+# missing, unreadable, or schema-invalid (bad pr_number/provider/alias/issue/head-sha/
+# account-hash). Such a draft is owned by NO automated loop: dispatch-claim's PLAN, its CLAIM
+# re-read, and review-fix.yml's resolve step all fail closed on every one of those cases via the
+# ONE shared admission function (dispatch-claim.provenance_admission_error, surfaced here as
+# is_enumerable_provenance), and groom's issue-side orphan repair skips it (an open draft links
+# its source issue). Age-parking to needs:user is the human hand-off — the closure guarantee that
+# no draft is ever silently stranded. Phrased to read after "…threshold, and {reason}." in the
+# park comment.
 ORPHAN_DRAFT_REASON = (
     "the worker pull request is still a draft with no valid registry provenance record, so the "
     "review loop (which fails closed on missing or invalid provenance) will never pick it up"
@@ -315,7 +316,9 @@ def worker_pr_provenance_enumerable(
     """True when the registry provenance record for target PR ``repo#number`` exists on disk
     AND is valid by the review loop's OWN admission schema (dispatch-claim.
     is_enumerable_provenance: JSON object, matching pr_number, registered impl provider,
-    well-formed 40-hex head sha, salted 16-hex account hash).
+    safe-atom impl alias, positive-int issue, well-formed 40-hex head sha, salted 16-hex
+    account hash — the COMPLETE field set; see provenance_admission_error, the one function
+    every consumer calls).
 
     Mirrors worker-pr.provenance_path / dispatch-claim's review lookup: the record lives at
     ``orchestration/provenance/<owner>--<name>--pr<N>.json`` in the registry checkout, which is
@@ -389,9 +392,10 @@ def stale_worker_pr_reason(
         if has_valid_provenance:
             return None
         # A DRAFT with NO VALID provenance record is a GENUINE ORPHAN owned by no automated
-        # loop: the review loop fails closed on a missing/mismatched record at PLAN and on a
-        # malformed sha/hash at CLAIM (the shared dispatch-claim.is_enumerable_provenance
-        # predicate — validity here means EXACTLY what that loop will admit), and groom's
+        # loop: the review loop's PLAN, CLAIM, and review-fix.yml resolve all fail closed on a
+        # missing/mismatched/malformed record via the ONE shared admission function
+        # (dispatch-claim.provenance_admission_error, called here as is_enumerable_provenance —
+        # validity means EXACTLY what that loop will admit, alias and issue included), and groom's
         # issue-side orphan repair skips it too (an open draft links its source issue, so
         # `number in links`). Keeping the age-park for exactly this case preserves master's
         # closure guarantee — a human hand-off instead of silence — without re-arming the
@@ -1329,10 +1333,13 @@ def _self_test() -> int:
         record_dir = registry_root / PROVENANCE_DIR
         record_dir.mkdir(parents=True)
         record_path = record_dir / "owner--repo--pr99.json"
+        # COMPLETE by the review path's full requirement set — including impl_alias (safe
+        # atom) and issue (positive int), the two fields the round-3 partial predicate missed.
         valid_record = {
             "pr_number": 99,
             "head_sha_at_open": "1" * 40,
             "impl_provider": "anthropic",
+            "impl_alias": "fable",
             "impl_account_h": "ab" * 8,
             "issue": 7,
         }
@@ -1368,12 +1375,31 @@ def _self_test() -> int:
             ("impl_provider", "mallory"),  # unregistered provider
             ("head_sha_at_open", "not-a-sha"),  # malformed opened-head sha
             ("impl_account_h", "raw-handle@x"),  # not the salted 16-hex hash (decision 22a)
+            # Round-3 finding: review-fix.yml's resolve rejects these two, so a draft carrying
+            # them is review-REJECTED — groom must park, not preserve. Each keys the matching
+            # field check in dispatch-claim.provenance_admission_error (dropping it reds here).
+            ("impl_alias", "no spaces allowed"),  # not a safe atom (resolve-step requirement)
+            ("impl_alias", 5),  # non-string alias
+            ("issue", 0),  # not a positive issue number
+            ("issue", -7),  # negative issue number
+            ("issue", True),  # bool is not an issue number (str(True) breaks the issues/ read)
+            ("issue", "7"),  # string is not an int
         ):
             record_path.write_text(
                 json.dumps({**valid_record, field: bad_value}), encoding="utf-8"
             )
             check(
-                f"provenance validity: schema-invalid {field} -> False (park)",
+                f"provenance validity: schema-invalid {field}={bad_value!r} -> False (park)",
+                worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
+                False,
+            )
+        for missing in ("impl_alias", "issue"):
+            record_path.write_text(
+                json.dumps({k: v for k, v in valid_record.items() if k != missing}),
+                encoding="utf-8",
+            )
+            check(
+                f"provenance validity: missing {missing} -> False (park)",
                 worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
                 False,
             )
