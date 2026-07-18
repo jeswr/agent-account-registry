@@ -12,16 +12,6 @@
   },
   {
    "account": "acct03",
-   "claim_id": "a7d331364f5a48c28103fd8eb76f48bd",
-   "holder": "jeswr/agent-account-registry#169@dispatch-29664537291.1",
-   "package": "groom",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784415950,
-   "expires_at": 1784418650
-  },
-  {
-   "account": "acct03",
    "claim_id": "08f8b363bcf7435f806c0b148394bf05",
    "holder": "fix:jeswr/agent-account-registry#235@dispatch-29664579875.1",
    "package": "review-loop",
