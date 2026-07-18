@@ -1155,8 +1155,17 @@ def disarm(repo, pr_number, when):
                             _queue_disarm_mutation("disablePullRequestAutoMerge", node_id)
                             print("auto-merge disabled (GraphQL; the PR was queued)")
                     else:
-                        _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--disable-auto"])
-                        print("auto-merge disabled (stale arm latch removed)")
+                        # Idempotent re-entry (2026-07-18 defer-loop): an interrupted disarm
+                        # leaves auto-merge already OFF; `gh pr merge --disable-auto` then
+                        # errors ("Can't disable auto-merge"), the partial-disarm failure
+                        # re-defers the review EVERY tick, and the PR strands. Same guard the
+                        # queued path already uses.
+                        if live.get("auto_merge") is not None:
+                            _run_gh(["pr", "merge", str(pr_number), "-R", repo,
+                                     "--disable-auto"])
+                            print("auto-merge disabled (stale arm latch removed)")
+                        else:
+                            print("auto-merge already off (idempotent disarm re-entry)")
                 elif action == "redraft":
                     _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"])
                     print("pull request returned to draft for the review sweep")
