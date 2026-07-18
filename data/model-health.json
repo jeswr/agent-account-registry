@@ -903,6 +903,14 @@
    "model_alias": "sonnet",
    "exit_class": "unknown",
    "run_id": "29626494216.1"
+  },
+  {
+   "ts": 1784340638,
+   "provider": "anthropic",
+   "account": "58b7c92faa5b5ca5",
+   "model_alias": "sonnet",
+   "exit_class": "success",
+   "run_id": "29626182154.1"
   }
  ]
 }
