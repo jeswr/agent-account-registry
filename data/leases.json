@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct03",
-   "claim_id": "0f2883b761764ad8a56da87df3bc719d",
-   "holder": "review:sparq-org/sparq#3437@dispatch-29645854760.1",
-   "package": "sparq-vectors",
-   "role": "review",
-   "model": "opus",
-   "issued_at": 1784380742,
-   "expires_at": 1784381942
-  },
-  {
    "account": "acct4css",
    "claim_id": "42c2bd1df91e419098303e14c35303b1",
    "holder": "fix:sparq-org/sparq#3436@dispatch-29645979189.1",
