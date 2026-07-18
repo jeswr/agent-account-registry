@@ -843,3 +843,56 @@ jobs:
           set -uo pipefail
           python3 registry/scripts/usage-alert.py --self-test
           python3 registry/scripts/usage-alert.py
+
+  # FAIL-LOUD alert for a HARD PLAN failure (issue #38). Every always()/ops-alert step above lives
+  # INSIDE the claim job, which is `needs: plan` — so when PLAN itself fails or is cancelled (e.g.
+  # sustained snapshot 403s), claim is SKIPPED and none of them run: a persistent PLAN failure means
+  # ZERO dispatching fleet-wide yet presents only as skipped jobs on a cron nobody watches. This
+  # standalone job keys on `needs.plan.result` and, on failure/cancelled, upserts a rolling
+  # `ops-alert` issue @-mentioning the maintainer via the SAME ALERT_REPO/ALERT_TOKEN routing the
+  # account-availability alert uses (locked decision 22c). It never runs when plan succeeds, so a
+  # healthy tick auto-closes any prior open plan-alert. No token or snapshot data reaches this job
+  # (it downloads no PLAN artifact); it only reads the plan JOB RESULT.
+  plan-alert:
+    name: ALERT (hard PLAN-job failure)
+    needs: plan
+    # Runs every tick (always()) so a healthy PLAN can auto-close a prior alert; scripts/plan-alert.py
+    # keys on needs.plan.result — close happens ONLY on an explicit success (a skipped PLAN is not a
+    # recovery, review r1), and a success tick with no open alert does only a bare `gh issue list`,
+    # so a green tick stays cheap and side-effect-free.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read  # minimum for the sparse checkout below — the job runs a script from the repo
+      issues: write   # upsert/close the rolling plan-failure ops-alert issue
+    steps:
+      # Codex r4 privilege review: the job DOES need a checkout (the alert logic lives in
+      # scripts/plan-alert.py), but only that one file — sparse-checkout scopes the working copy
+      # to it, pinned and with no persisted token, so nothing else from the repo reaches this job.
+      - name: Check out ONLY scripts/plan-alert.py (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: scripts/plan-alert.py
+          sparse-checkout-cone-mode: false
+
+      - name: Alert maintainer that the dispatch PLAN job hard-failed
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c): scripts/plan-alert.py routes to a maintainer-set
+          # PRIVATE ALERT_REPO only when ALERT_TOKEN can write there (usage-alert.py's audited
+          # _alert_route semantics, issue #39); otherwise the registry repo. The body carries no
+          # account handles (a PLAN failure is target-planner-side), so that fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/plan-alert.py --self-test
+          python3 registry/scripts/plan-alert.py
