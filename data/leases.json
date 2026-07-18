@@ -19,6 +19,16 @@
    "model": "fable",
    "issued_at": 1784397508,
    "expires_at": 1784401108
+  },
+  {
+   "account": "acct01",
+   "claim_id": "3219bfc4312d4960b339466b0c24d400",
+   "holder": "review:sparq-org/sparq#3515@dispatch-29654949298.1",
+   "package": "sparq-hdt",
+   "role": "review",
+   "model": "terra",
+   "issued_at": 1784397719,
+   "expires_at": 1784398919
   }
  ]
 }
