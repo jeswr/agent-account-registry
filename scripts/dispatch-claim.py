@@ -122,10 +122,15 @@ DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
 NON_DISPATCHABLE = "kind:epic"
 BLOCKED_BY_RE = re.compile(r"[Bb]locked-by:\s*#([0-9]+)")
 # Cross-provider chains (locked decisions 14/17): the review chain is the INVERSE of the
-# implementer's provider and is computed HERE, never through policy-resolve.resolve() (whose
+# CONTENT author's provider and is computed HERE, never through policy-resolve.resolve() (whose
 # role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
-REVIEW_CHAIN = {"anthropic": ["terra"], "openai": ["opus"]}
-FIX_CHAIN = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
+# Model policy (maintainer directive 2026-07-18): sol — the codex-side frontier model — is THE
+# reviewer of anthropic-authored content (luna is its fallback); opus stays lead reviewer of
+# openai-authored content (proven verdict quality + the security-surface doctrine). terra and
+# sonnet are DOCS-ONLY models and must NEVER appear in a review/fix chain (asserted in
+# _self_test; review-fix.yml + worker-pr.py ESCALATION_LADDERS enforce the same).
+REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
+FIX_CHAIN = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
 # Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
 # 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
 # earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
@@ -1082,7 +1087,7 @@ def _resolvable_chain(chain, routing):
     needs a concrete provider_model. A CODEX alias is resolvable even with a missing/TBD
     provider_model: the proven codex drain passes NO --model flag (codex CLI default; the
     operator config pins only reasoning effort), and worker-live.sh omits --model in that case —
-    so an unpinned terra never turns into the common-case liveness stop of every
+    so an unpinned sol/luna never turns into the common-case liveness stop of every
     anthropic-implemented PR escalating to needs-user. An empty result means the direction is
     genuinely unresolvable and the caller must escalate to a human immediately (never
     silent-queue)."""
@@ -1388,7 +1393,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 round_number = rounds
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
-                # (e.g. terra provider_model unset). Never silent-queue: hand to a human.
+                # (e.g. sol/luna not yet in the target routing catalog). Never silent-queue:
+                # hand to a human.
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the {mode} model chain for a {impl_provider}-implemented PR is "
                                "unresolvable in the target routing (no concrete provider model)")
@@ -1884,6 +1890,14 @@ def _write_dispatch_summary(planned, dispatched, defer_reasons):
 
 
 def _self_test():
+    # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are DOCS-ONLY
+    # models — they must never appear in any review/fix chain (review-fix.yml asserts the same
+    # over its own chain tables, worker-pr.py over ESCALATION_LADDERS).
+    docs_only = {"terra", "sonnet"}
+    for name, table in (("REVIEW_CHAIN", REVIEW_CHAIN), ("FIX_CHAIN", FIX_CHAIN)):
+        offenders = docs_only & {alias for chain in table.values() for alias in chain}
+        assert not offenders, f"docs-only model in {name}: {sorted(offenders)}"
+
     fixture = {
         "schema": SCHEMA,
         "generated_at": "2026-07-16T12:00:00Z",
@@ -1895,7 +1909,7 @@ def _self_test():
                 "priority": 1,
                 "package": "crate-a",
                 "role": "impl",
-                "model_chain": ["fable", "terra"],
+                "model_chain": ["fable", "sol"],
                 "agent": "repo-impl",
                 "escalate": False,
                 "labels": ["area:crate-a", "priority:P1", "role:impl", "status:ready"],
@@ -1907,7 +1921,7 @@ def _self_test():
                 "priority": 2,
                 "package": "crate-b",
                 "role": "impl",
-                "model_chain": ["fable", "terra"],
+                "model_chain": ["fable", "sol"],
                 "agent": "repo-impl",
                 "escalate": False,
                 "labels": ["area:crate-b", "priority:P2", "role:impl", "status:deferred"],
@@ -2177,7 +2191,7 @@ def _self_test():
              "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 7,
              "recorded_at_run": "1.1"},
         42: {"pr_number": 42, "head_sha_at_open": sha_a, "impl_provider": "openai",
-             "impl_alias": "terra", "impl_account_h": "cd" * 8, "issue": 9,
+             "impl_alias": "sol", "impl_account_h": "cd" * 8, "issue": 9,
              "recorded_at_run": "2.1"},
     }
     issue_labels = {7: ["area:crate-a", "role:impl"], 9: ["area:sparq-zk", "role:impl"]}
@@ -2641,7 +2655,7 @@ def _self_test():
 
             # ---- round-budget escalation (directive 2026-07-17): decide_budget replaces the
             # flat rounds>=max needs-user at CLAIM, the fix chain honours the pinned floor, and
-            # a starved pinned chain DEFERS (defer-not-fallback: sonnet is never re-offered) ----
+            # a starved pinned chain DEFERS (defer-not-fallback: fable is never re-offered) ----
             class FakeAllocator:
                 def __init__(self):
                     self.chains = []
@@ -2672,21 +2686,21 @@ def _self_test():
                         "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
                         "security": False, "context": ""}
             routing_ok = {"models": {
-                "sonnet": {"provider_model": "claude-sonnet-4-6", "harness": "claude"},
                 "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
                 "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
-                "terra": {"provider_model": "TBD", "harness": "codex"},
+                "sol": {"provider_model": "TBD", "harness": "codex"},
+                "luna": {"provider_model": "TBD", "harness": "codex"},
             }}
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
                         check_runs=gate_green, issue_labels=["area:crate-a"])
             fix_model = wiring_worker_pr.FIX_MODEL_MARKER
             pin_marker = wiring_worker_pr.MODEL_PIN_MARKER
 
-            # ACT: base budget spent on sonnet -> extension, fable pin converged, and a chain
-            # WITHOUT sonnet; the None claim then defers with a missed marker, NOT needs-user
+            # ACT: base budget spent on fable -> extension, opus pin converged, and a chain
+            # WITHOUT fable; the None claim then defers with a missed marker, NOT needs-user
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=2 model=sonnet run=2.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=2 model=fable run=2.9 -->")]
             write_verdict(3, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -2694,8 +2708,8 @@ def _self_test():
                 ("worker-pr.py", "record-model-pin"),
                 ("worker-pr.py", "record-marker")], helper_calls
             pin_args = helper_calls[0][1]
-            assert pin_args[pin_args.index("--tier") + 1] == "fable", pin_args
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert pin_args[pin_args.index("--tier") + 1] == "opus", pin_args
+            assert alloc.chains == [["opus"]], alloc.chains
 
             # DO-NOTHING flip: under budget -> no pin call, the DEFAULT fix chain is offered
             fake["comments"] = round_markers(2)
@@ -2704,7 +2718,7 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
 
             # a recorded bot pin governs the chain even under budget (the floor never lowers) ...
             fake["comments"] = round_markers(2) + [
@@ -2718,11 +2732,11 @@ def _self_test():
                  "body": f"z {pin_marker} round=1 tier=opus run=6.6 -->"}]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
 
             # top tier ran + latest verdict improving -> progress extension (pin floor kept)
             fake["comments"] = round_markers(4) + [
-                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
                 bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->"),
                 bot_comment(f"z {pin_marker} round=3 tier=opus run=3.9 -->")]
             write_verdict(4, "improving")
@@ -2734,7 +2748,7 @@ def _self_test():
 
             # flip-goes-red: top tier + stagnant -> the loud terminal needs-user, no claim
             fake["comments"] = round_markers(4) + [
-                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
                 bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
             write_verdict(4, "stagnant")
             alloc = FakeAllocator()
@@ -2745,7 +2759,7 @@ def _self_test():
 
             # hard cap: 6 rounds stop even with a weaker tier + an improving grade
             fake["comments"] = round_markers(6) + [
-                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->")]
             write_verdict(6, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -2755,7 +2769,7 @@ def _self_test():
             # a corrupt bot-authored pin tier is LOUD (needs-user) — silently ignoring it
             # would run the unpinned chain, the exact fall-back-down the pin forbids
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
                 bot_comment(f"z {pin_marker} round=1 tier=gpt-omega run=1.1 -->")]
             write_verdict(3, "improving")
             alloc = FakeAllocator()
@@ -2782,7 +2796,7 @@ def _self_test():
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert helper_calls == [], helper_calls
-            assert alloc.chains == [["terra"]], alloc.chains
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
 
             # flip-goes-red: the same posture whose latest fix ran BELOW the recorded opus
             # floor (a pin violation / forged marker) mints NO re-review — with the top tier
@@ -2845,7 +2859,7 @@ def _self_test():
             write_verdict(2, None, root=wiring_ledger_root)
             alloc = FakeAllocator()
             launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
             # a deferring (None-claim) allocator is contention, NOT ledger rot: no lease-error,
             # ledger stays ok, and the zero-dispatch tick stays green
             assert launched == 0 and reasons["lease-error"] == 0, (launched, reasons)
@@ -2911,19 +2925,19 @@ def _self_test():
 
     # Inverse-chain resolvability (locked decision 14): a CODEX alias with a missing/TBD
     # provider_model resolves to the CLI default (the proven drain passes no --model flag), so
-    # the common anthropic->terra direction is live from day one; a CLAUDE alias still needs a
+    # the common anthropic->sol direction is live from day one; a CLAUDE alias still needs a
     # concrete id; an alias absent from routing stays unresolvable.
-    routing = {"models": {"terra": {"provider_model": "TBD", "harness": "codex"},
+    routing = {"models": {"sol": {"provider_model": "TBD", "harness": "codex"},
                           "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
                           "fable": {"provider_model": "TBD", "harness": "claude"}}}
-    assert _resolvable_chain(["terra"], routing) == ["terra"]
+    assert _resolvable_chain(["sol"], routing) == ["sol"]
     assert _resolvable_chain(["opus"], routing) == ["opus"]
     assert _resolvable_chain(["fable"], routing) == []
     assert _resolvable_chain(["ghost"], routing) == []
-    del routing["models"]["terra"]["provider_model"]
-    assert _resolvable_chain(["terra"], routing) == ["terra"]
-    routing["models"]["terra"]["provider_model"] = "gpt-5.6-codex"
-    assert _resolvable_chain(["terra"], routing) == ["terra"]
+    del routing["models"]["sol"]["provider_model"]
+    assert _resolvable_chain(["sol"], routing) == ["sol"]
+    routing["models"]["sol"]["provider_model"] = "gpt-5.6-codex"
+    assert _resolvable_chain(["sol"], routing) == ["sol"]
 
     # ---- CLAIM disarm application (issue #42): runs per-item-resilient and token-gated; the
     # live precondition re-derivation itself lives in worker-pr.py disarm (tested there) ----

@@ -695,13 +695,19 @@ registry_selftest_gate() {
   printf 'worker-live: registry-selftest gate passed (%s suite run(s))\n' "$ran"
 }
 
+# Model naming (maintainer directive 2026-07-18): sol is the codex-side FRONTIER model
+# (GPT-5.6 sol/codex); terra is a DIFFERENT, sonnet-class GPT model that older comments
+# misnamed "GPT-5.6 sol". terra + sonnet are docs-only, but they stay in this provenance map:
+# it labels WHOEVER authored a commit (docs lanes included) — it is not a review/fix chain.
 coauthor_for() {
   case "$1" in
     fable) printf '%s' 'Claude Fable 5 <noreply@anthropic.com>' ;;
     opus) printf '%s' 'Claude Opus 4.8 (1M context) <noreply@anthropic.com>' ;;
     sonnet) printf '%s' 'Claude Sonnet 4.6 <noreply@anthropic.com>' ;;
     haiku) printf '%s' 'Claude Haiku 4.5 <noreply@anthropic.com>' ;;
-    terra) printf '%s' 'GPT-5.6 <noreply@openai.com>' ;;
+    sol) printf '%s' 'GPT-5.6 Sol <noreply@openai.com>' ;;
+    luna) printf '%s' 'GPT Luna <noreply@openai.com>' ;;
+    terra) printf '%s' 'GPT Terra <noreply@openai.com>' ;;
     *) die 'unknown model alias for commit provenance' ;;
   esac
 }
@@ -1348,8 +1354,9 @@ self_test() {
     fi
   }
 
-  # --- terra provider-model argv contract. Claude empty is rejected upstream by the
-  # _run_headless_harness normalization, so it never reaches this flag builder. ---
+  # --- codex provider-model argv contract (sol/luna, and terra on docs lanes). Claude empty
+  # is rejected upstream by the _run_headless_harness normalization, so it never reaches this
+  # flag builder. ---
   local -a model_args=()
   mapfile -t model_args < <(_provider_model_args codex "")
   chk "codex empty provider model omits --model" "${model_args[*]-}" ""
