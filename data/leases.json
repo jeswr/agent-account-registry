@@ -52,16 +52,6 @@
   },
   {
    "account": "acct06",
-   "claim_id": "d04aa40829e84c91b66bf115beeeec63",
-   "holder": "sparq-org/sparq#3159@dispatch-29628507983.1",
-   "package": "zk-xpath",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784344819,
-   "expires_at": 1784351119
-  },
-  {
-   "account": "acct06",
    "claim_id": "364c58383eea4d82985550f1b66a2d1f",
    "holder": "sparq-org/sparq#3394@dispatch-29628583824.1",
    "package": "zk",
