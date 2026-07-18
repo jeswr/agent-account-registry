@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-3 diff remains correct and complete. Canonical {\"records\": [...]} ledgers are routed to the shared model-health validator and shared exit-class constants; validator rejection is converted into a loud DashboardError. The normalization selects the newest record for each sanitized provider/model pair, bounds output to 20 pairs, omits model-less fleet signals and account hashes, and preserves the ledger-wide newest timestamp for generated_at. The self-test is non-vacuous: it verifies same-pair newest-record precedence, status folding, model-less omission, generated_at semantics, and rejection of a malformed account hash. Legacy normalization remains tested, and no trust check or security boundary is weakened.",
+ "verdict": "approve"
+}
