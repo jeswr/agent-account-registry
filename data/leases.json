@@ -72,16 +72,6 @@
   },
   {
    "account": "acct05",
-   "claim_id": "785a52e1cad642769a90ad08a2778210",
-   "holder": "sparq-org/sparq#2630@dispatch-29625933900.1",
-   "package": "js",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784339556,
-   "expires_at": 1784345856
-  },
-  {
-   "account": "acct05",
    "claim_id": "78edfa6d203e4168853a4c52a8debeb3",
    "holder": "sparq-org/sparq#2478@dispatch-29625933900.1",
    "package": "sparq-substrate",
