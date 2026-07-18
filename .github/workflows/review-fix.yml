@@ -95,6 +95,7 @@ jobs:
       target_name: ${{ steps.inputs.outputs.target_name }}
       head_branch: ${{ steps.pr.outputs.head_branch }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
+      base_ref: ${{ steps.pr.outputs.base_ref }}
       pr_author: ${{ steps.pr.outputs.pr_author }}
       impl_provider: ${{ steps.pr.outputs.impl_provider }}
       impl_alias: ${{ steps.pr.outputs.impl_alias }}
@@ -354,6 +355,7 @@ jobs:
           values = {
               "head_branch": head_branch,
               "head_sha": head_sha,
+              "base_ref": str((pull.get("base") or {}).get("ref", "")),
               "pr_author": author,
               "impl_provider": impl_provider,
               "impl_alias": impl_alias,
@@ -1272,6 +1274,7 @@ jobs:
             --issue "${{ needs.resolve.outputs.issue }}"
             --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
+            --reviewed-base "${{ needs.resolve.outputs.base_ref }}"
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
@@ -1326,6 +1329,7 @@ jobs:
             --arm "${{ needs.resolve.outputs.arm_auto_merge }}"
             --issue "${{ needs.resolve.outputs.issue }}"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
+            --reviewed-base "${{ needs.resolve.outputs.base_ref }}"
           )
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
@@ -1361,7 +1365,8 @@ jobs:
             --pr "${{ inputs.pr_number }}" \
             --round "${{ inputs.review_round }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
-            --bot-login "${{ needs.resolve.outputs.pr_author }}" \
+            --bot-login "${{ needs.resolve.outputs.pr_author }}"
+            --reviewed-base "${{ needs.resolve.outputs.base_ref }}" \
             --model "${{ needs.claim.outputs.model }}" \
             --injection "${{ needs.run.outputs.injection_detected == 'true' && 'true' || 'false' }}" \
             --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \

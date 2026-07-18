@@ -1203,7 +1203,8 @@ def disarm(repo, pr_number, when):
 
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
-                  reviewer_account, arm, issue=None, surface_paths=None, bot_login=""):
+                  reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
+                  reviewed_base=""):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval).
 
@@ -1235,6 +1236,15 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         set_review_state(repo, pr_number, "needs")
         _write_outputs({"armed": False, "head_moved": True})
         print("live head advanced past the reviewed sha; returned to review:needs")
+        return
+    live_base = str((live.get("base") or {}).get("ref", ""))
+    if reviewed_base and live_base != reviewed_base:
+        # Base retarget changes the EFFECTIVE diff without moving the head, and
+        # --match-head-commit cannot see it (sol r5 on #257) — the approval bound a
+        # different comparison; re-review against the new base.
+        set_review_state(repo, pr_number, "needs")
+        _write_outputs({"armed": False, "head_moved": True, "base_moved": True})
+        print("live base ref differs from the reviewed base; returned to review:needs")
         return
     trust_hits = ()
     if arm:
@@ -1294,7 +1304,7 @@ TRUST_AUDIT_MARKER_PREFIX = "<!-- sparq-trust-audit:v1 sha="
 TRUST_AUDIT_MARKER = TRUST_AUDIT_MARKER_PREFIX  # back-compat alias for tests/greps
 
 
-COMPARE_FILES_CAP = 300  # GitHub returns changed files ONLY on compare page 1, capped at 300
+COMPARE_FILES_CAP = 100  # API max per_page; files appear ONLY on compare page 1 (hard 300 cap)
 FILES_TRUNCATED_SENTINEL = "(compare file inventory truncated/unavailable - assumed trust-surface)"
 
 
@@ -2301,7 +2311,7 @@ def _self_test():
         globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
         globals()["_write_outputs"] = raa_outputs.update
         ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
-                      bot_login="sparq[bot]")
+                      bot_login="sparq[bot]", reviewed_base=raa_state.get("reviewed_base", "main"))
 
     try:
         sha = "b" * 40
@@ -2359,6 +2369,13 @@ def _self_test():
                   _files_at_sha("o/r", "main", "b" * 40), [FILES_TRUNCATED_SENTINEL])
         finally:
             globals()["_gh_json"] = real_files_gh
+        raa_state["reviewed_base"] = "release"  # live fake serves base ref "main"
+        run_raa()
+        check("base retarget returns to review:needs with NO arm and NO audit (sol r5)",
+              ("state:needs" in raa_calls,
+               any("merge" in c for c in raa_calls),
+               any("trust-surface" in c for c in raa_calls)), (True, False, False))
+        raa_state["reviewed_base"] = "main"
         run_raa(head_ok=False)
         check("head race returns to review:needs with NO arm and NO audit",
               ("state:needs" in raa_calls,
@@ -2470,6 +2487,8 @@ def main():
                      help="trust-surface path/prefix (repeatable; from policy security_paths)")
     arm.add_argument("--bot-login", default="",
                      help="the App bot login (exact audit-marker suppression identity)")
+    arm.add_argument("--reviewed-base", default="",
+                     help="the base ref the review compared against (arm re-validates it)")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -2569,7 +2588,7 @@ def main():
                           os.environ.get("WORKER_REVIEWER_ACCOUNT", ""),
                           args.arm == "true", issue=args.issue,
                           surface_paths=args.surface_path or None,
-                          bot_login=args.bot_login)
+                          bot_login=args.bot_login, reviewed_base=args.reviewed_base)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":
