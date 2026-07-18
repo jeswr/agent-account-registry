@@ -884,26 +884,34 @@ jobs:
         id: purge
         # Credential-safety (registry #124): the write-back step above has already persisted any
         # rotated credential to the registry secret, so from here on NOTHING legitimately needs the
-        # live account credential — yet the next steps run target-CONTROLLED cargo (build scripts /
-        # tests) host-side. Previously the prepare step's HOME, raw account handle, and credential
+        # live account credential — yet the next step runs target-CONTROLLED cargo (build scripts /
+        # tests). Previously the prepare step's HOME, raw account handle, and credential
         # paths persisted in $GITHUB_ENV through the gate, so a hostile build script could read or
         # exfiltrate the full/rotated credential. Delete the whole credential tree (the isolated
         # HOME, the rotation baseline, any source copy) AND the model process's persisted
         # stdout/stderr logs (review r1: the model held the live credential, so its emitted streams
-        # are potential credential COPIES readable by the unsandboxed gate), hand the gate a FRESH
-        # credential-free HOME, and scrub the inherited account handle + credential-path vars from
-        # the job env BEFORE any target-controlled process runs. Fail closed: the Rust-toolchain and
-        # gate steps below run only when this step succeeded, so a failed purge blocks all target
-        # code.
+        # are potential credential COPIES), hand later HOST steps a FRESH credential-free HOME, and
+        # scrub the inherited account handle + credential-path vars from the job env BEFORE any
+        # target-controlled process runs. Review r2: this deletion is NOT the containment boundary —
+        # the gate itself now runs inside the hardened model container (worker-live.sh
+        # gate-sandboxed below), which cannot read runner temp or inherit this job's env regardless
+        # of what a steered model stashed. The purge stays load-bearing anyway: no credential-bearing
+        # state may exist anywhere on this runner while hostile code executes, and post-gate host
+        # steps must inherit a scrubbed env. Fail closed: the gate step below runs only when this
+        # step succeeded, so a failed purge blocks all target code.
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
         run: |
           set -euo pipefail
-          gate_home="$WORKER_ROOT/gate-home"
-          rm -rf -- "$gate_home"
-          mkdir -p -- "$gate_home"
-          chmod 700 "$gate_home"
+          # host-home is for LATER HOST steps (publish/follow-ups/final-state) ONLY. The gate
+          # container gets its OWN scratch HOME (gate-home, created by gate-sandboxed): hostile
+          # gate code can write its home freely (e.g. plant a ~/.gitconfig with a code-executing
+          # knob), so the token-bearing publish git must never resolve a HOME the gate could touch.
+          host_home="$WORKER_ROOT/host-home"
+          rm -rf -- "$host_home"
+          mkdir -p -- "$host_home"
+          chmod 700 "$host_home"
           # Credential-CONTAINMENT tripwire (review r1): the model ran with the live credential AND
           # a writable target mount, so a steered model could also copy the credential INTO the
           # target tree — which publish would push publicly and hostile gate code could read.
@@ -914,8 +922,11 @@ jobs:
           # materialized format (sk-ant-*, JWT segments, base64url refresh tokens, account UUIDs)
           # yields such runs, while the credential files' JSON key names / URLs / timestamps never
           # reach 24 unbroken chars, so legitimate model edits cannot collide. NOTE: this scan is a
-          # tripwire, not a containment proof — an ENCODED copy evades it; the enforceable boundary
-          # (running the gate in a sandbox that cannot read runner temp) is a filed follow-up.
+          # tripwire, not a containment proof — an ENCODED copy evades it. The enforceable boundary
+          # against the GATE is the sandbox container below (worker-live.sh gate-sandboxed): the
+          # gate cannot read runner temp, model artifacts, or job env at all. This scan remains the
+          # PUBLISH-path tripwire: a literal credential copy in the pushed diff or the follow-ups
+          # file must block the run before anything is published.
           patterns="$WORKER_ROOT/.credential-scan-patterns"
           : > "$patterns"
           chmod 600 "$patterns"
@@ -972,46 +983,42 @@ jobs:
             echo "::error::credential-containment scan failed; blocking the gate and publish"
             exit 1
           fi
-          # Repoint HOME/CODEX_HOME at the fresh credential-free directory the gate (and later host
-          # steps) will use, and blank the account handle + credential paths so no later step (the
-          # gate, publish) inherits a pointer to a credential. WORKER_PROVIDER/HARNESS/
-          # CREDENTIAL_FORMAT are intentionally kept — publish still needs the provider, and none of
-          # them name a secret or a credential path.
+          # Repoint HOME/CODEX_HOME at the fresh credential-free host-home for later HOST steps
+          # (never the gate container's scratch home — see above), and blank the account handle +
+          # credential paths so no later step inherits a pointer to a credential. WORKER_PROVIDER/
+          # HARNESS/CREDENTIAL_FORMAT are intentionally kept — publish still needs the provider, and
+          # none of them name a secret or a credential path.
           {
-            printf 'HOME=%s\n' "$gate_home"
-            printf 'CODEX_HOME=%s\n' "$gate_home/.codex"
+            printf 'HOME=%s\n' "$host_home"
+            printf 'CODEX_HOME=%s\n' "$host_home/.codex"
             printf 'WORKER_ACCOUNT=\n'
             printf 'WORKER_CREDENTIAL_PATH=\n'
             printf 'WORKER_CREDENTIAL_BASELINE=\n'
           } >> "$GITHUB_ENV"
           printf 'worker: account credential and model output logs purged, env scrubbed before the target-controlled gate\n'
 
-      - name: Ensure a Rust toolchain for the crate-scoped gate
-        # [OPUS-4.8] The gate runs `cargo clippy/test` directly on the runner; a stock ubuntu-latest may
-        # have rustup with NO default toolchain set (and the target may pin one via rust-toolchain.toml),
-        # which fails the gate with "rustup could not choose a version of cargo". Set one up in the target
-        # dir so a rust-toolchain.toml pin is honoured; harmless for non-cargo gate profiles.
-        # Gated on `purge` (registry #124): this reads the target's rust-toolchain.toml, so it runs
-        # only after the account credential has been deleted and its env scrubbed.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' && steps.purge.outcome == 'success' }}
-        working-directory: target
-        run: |
-          set -uo pipefail
-          command -v rustup >/dev/null 2>&1 || { echo '::error::rustup not found on the runner'; exit 1; }
-          rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
-          rustup show >/dev/null 2>&1 || true      # installs a rust-toolchain.toml-pinned toolchain if present
-          rustup component add clippy rustfmt >/dev/null 2>&1 || true
-          cargo --version; rustc --version
+      # The host-side "Ensure a Rust toolchain" step was REMOVED here (registry #124, review r2):
+      # its trailing `cargo --version` resolved the toolchain through the TARGET's
+      # rust-toolchain.toml (which can even path-pin a target-controlled binary) — exactly the
+      # "target-controlled toolchain runs on the host" class the sandboxed gate exists to prevent.
+      # The gate container image ships its own pinned Rust toolchain instead.
 
-      - name: Run policy-selected local gate
+      - name: Run policy-selected local gate in the model sandbox container
         id: gate
-        # Gated on `purge` (registry #124): this runs target-CONTROLLED cargo host-side, so it must
-        # start only after the account credential is deleted and its env is scrubbed. A failed purge
-        # leaves the credential reachable, so it fail-closes the gate rather than exposing it.
+        # Review r2 (registry #124): deleting known credential paths + scanning literal fragments is
+        # enumeration, not a boundary — so target-controlled gate code no longer runs on the host at
+        # all. worker-live.sh gate-sandboxed re-runs `worker-live.sh gate` INSIDE the hardened model
+        # container (read-only FS, cap-drop ALL, no-new-privileges): its only mounts are the target
+        # tree (nested .git ro), a fresh scratch HOME, and the registry scripts (ro), and its env is
+        # an explicit allowlist — it cannot read runner temp, model artifacts, $GITHUB_ENV, or any
+        # credential-bearing state, whatever a steered model may have stashed, and it inherits no
+        # credential-related environment. Still gated on `purge` (a failed purge blocks all target
+        # code), and gate-sandboxed itself refuses to start if the credential tree survived.
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' && steps.purge.outcome == 'success' }}
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
           # [OPUS-4.8] Credential-safety (security review, finding #3): do NOT `tee` the gate's own
@@ -1021,7 +1028,7 @@ jobs:
           # file before any tail bounded it. The gate's stream is already surfaced verbatim in the
           # GitHub job log (streamed off-runner, not a local file), which is a sufficient and safe
           # crash signal. The failure-class annotation below reads only host-derived step outcomes.
-        run: bash ../registry/scripts/worker-live.sh gate
+        run: bash ../registry/scripts/worker-live.sh gate-sandboxed
 
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
@@ -1098,8 +1105,8 @@ jobs:
 
       # [OPUS-4.8] The diagnostics ARTIFACT was DROPPED for credential-safety (security review,
       # finding #1). Rationale: the `gate` step above runs target-CONTROLLED cargo (build scripts /
-      # tests) host-side (the account credential is now deleted and its env scrubbed before that gate
-      # — registry #124 — but the cargo process is still hostile). Any file the artifact bundled
+      # tests) — now inside the sandbox container (registry #124, review r2), but the cargo process
+      # is still hostile and still writes the mounted target tree. Any file the artifact bundled
       # lived at a path that hostile cargo could write to (it could plant credentials
       # or a raw model transcript into the predictable diagnostics dir), and the artifact uploaded the
       # directory WHOLESALE — an exfiltration channel. Even the "expected" files were unsafe: the gate

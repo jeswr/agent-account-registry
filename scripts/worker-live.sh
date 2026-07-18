@@ -591,6 +591,109 @@ run_gate() {
   esac
 }
 
+# Sandboxed gate launcher (registry #124, review r2). Deleting known credential paths
+# and scanning for literal token fragments is ENUMERATION, not a boundary: a steered model could
+# stash an (encoded) credential copy at any runner-readable path, and the gate runs
+# target-CONTROLLED build/test code. So the gate gets the SAME OS-level boundary the model ran
+# behind — the hardened worker container (read-only FS, cap-drop ALL, no-new-privileges), whose
+# ONLY mounts are the target tree (rw, nested .git ro), a fresh scratch HOME, and the registry
+# scripts (ro), and whose environment is the explicit allowlist below. It cannot read runner
+# temp, model artifacts, $GITHUB_ENV/runner command files, or any credential-bearing state, and
+# it inherits no job environment. The reverse direction is bounded too: the ONLY host-visible
+# state gate code can write is the target tree and its own scratch HOME, and no later
+# credentialed host step may resolve that HOME (worker.yml gives post-gate host steps a separate
+# fresh HOME the gate never sees — a hostile gate could otherwise plant ~/.gitconfig for the
+# token-bearing publish git). Residual channel, by design: the target tree itself — the gate
+# must read/build it, so an ENCODED credential copy stashed there stays readable; but that copy
+# is exposure the publish push would make public anyway, so the container adds no recovery
+# capability beyond what publish already exposes (the purge step's literal-fragment scan remains
+# the publish-path tripwire).
+#
+# PURE: emit the hardened gate-container docker argv, one element per line. Extracted so the
+# self-test can prove the containment properties offline (exact mount set, allowlisted env,
+# nothing token- or credential-shaped crossing).
+_gate_container_argv() {
+  local target_dir=$1 gate_home=$2 scripts_dir=$3 image=$4 profile=$5 packages=$6 user_spec=$7
+  printf '%s\n' \
+    docker run --rm \
+    --user "$user_spec" \
+    --workdir /workspace \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --pids-limit 512 \
+    --tmpfs /tmp:rw,nosuid,nodev,exec,size=1g \
+    --mount "type=bind,src=$target_dir,dst=/workspace" \
+    --mount "type=bind,src=$target_dir/.git,dst=/workspace/.git,readonly" \
+    --mount "type=bind,src=$gate_home,dst=/home/worker" \
+    --mount "type=bind,src=$scripts_dir,dst=/registry-scripts,readonly" \
+    --env HOME=/home/worker \
+    --env CARGO_HOME=/home/worker/.cargo \
+    --env RUSTUP_HOME=/usr/local/rustup \
+    --env TARGET_DIR=/workspace \
+    --env "GATE_PROFILE=$profile" \
+    --env "WORKER_PACKAGES=$packages" \
+    --env PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    "$image" bash /registry-scripts/worker-live.sh gate
+}
+
+# PURE: print every credential-bearing path still present under WORKER_ROOT, one per line
+# (empty output = purged). The sandboxed gate REFUSES to start while any survives: the container
+# could not read them anyway, but a surviving tree means the purge contract was broken, and then
+# NOTHING target-controlled may run on this runner (fail closed, defense in depth with the
+# workflow's purge-outcome step gating).
+_gate_credential_leftovers() {
+  local root=$1 p
+  for p in "$root/home" "$root/.credential-baseline" "$root/.selected-credential"; do
+    [[ ! -e "$p" ]] || printf '%s\n' "$p"
+  done
+}
+
+run_gate_sandboxed() {
+  local worker_root=${WORKER_ROOT:-}
+  local target_dir=${TARGET_DIR:-}
+  local profile=${GATE_PROFILE:-}
+  local packages=${WORKER_PACKAGES:-}
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  [[ -n "$target_dir" && -d "$target_dir/.git" ]] || die 'TARGET_DIR is not a Git checkout'
+  safe_atom "$profile" || die 'unsafe gate profile'
+  if [[ -n "$packages" ]]; then
+    local -a package_list=()
+    local atom
+    IFS=',' read -r -a package_list <<< "$packages"
+    for atom in "${package_list[@]}"; do
+      [[ -z "$atom" ]] || safe_atom "$atom" || die "unsafe package atom $atom"
+    done
+  fi
+  local leftovers
+  leftovers="$(_gate_credential_leftovers "$worker_root")"
+  [[ -z "$leftovers" ]] ||
+    die "credential material survived the purge; refusing to run the gate: ${leftovers//$'\n'/ }"
+  # A fresh scratch HOME for the gate container ONLY. Later credentialed host steps must never
+  # resolve this directory as HOME (see the launcher comment above); it is also a cold cargo
+  # cache by design — the model's cache lived beside the credential HOME and was purged.
+  local gate_home="$worker_root/gate-home"
+  rm -rf -- "$gate_home"
+  mkdir -p -- "$gate_home"
+  chmod 700 "$gate_home"
+  local image='registry-worker-model:reg3'
+  local image_context="$worker_root/image-context"
+  mkdir -p "$image_context"
+  docker build --quiet \
+    --file "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
+    --tag "$image" "$image_context" >/dev/null
+  local -a container=()
+  mapfile -t container < <(_gate_container_argv \
+    "$target_dir" "$gate_home" "$SCRIPT_DIR" "$image" "$profile" "$packages" "$(id -u):$(id -g)")
+  # Same defensive invariant as the model launcher: nothing GitHub-token-shaped crosses.
+  local argv_item
+  for argv_item in "${container[@]}"; do
+    [[ "$argv_item" != GH_TOKEN* && "$argv_item" != GITHUB_* ]] ||
+      die 'refusing to forward a GitHub token env into the gate container'
+  done
+  "${container[@]}"
+}
+
 # [OPUS-4.8] The registry-selftest gate body (extracted so the host self-test can exercise its
 # PURE selectors — touched-file classification + the suite list — without a live cargo/gh call).
 # FULL_SELFTEST_SUITE mirrors the scripts every recent registry wave self-tests; every touched
@@ -1551,6 +1654,52 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   chk "registry gate suite includes pat-validity (review r2 #3 — not just when touched)" \
     "$(grep -c 'self:pat-validity.py' <<< "${sel//,/$'\n'}" || true)" "1"
 
+  # --- sandboxed gate containment (registry #124, review r2): the gate-container argv IS the
+  # OS boundary between target-controlled gate code and the runner's credential-bearing state.
+  # Prove BOTH directions: (accept) exactly the four required mounts plus the allowlisted env
+  # cross the boundary; (reject) nothing token/credential-shaped crosses, and a surviving
+  # credential tree refuses the gate. Widening the mount set, leaking job env, or dropping the
+  # hardening flags turns these red. ---
+  local -a gate_argv=()
+  mapfile -t gate_argv < <(_gate_container_argv \
+    /tgt /wr/gate-home /reg/scripts img:g crate-scoped sparq-core 1000:1000)
+  chk "gate container carries exactly four bind mounts (target, ro .git, scratch home, ro scripts)" \
+    "$(printf '%s\n' "${gate_argv[@]}" | grep -c '^type=bind,' || true)" "4"
+  chk "gate container mounts the target rw and its nested .git read-only" \
+    "$(printf '%s\n' "${gate_argv[@]}" | grep -c \
+      -e '^type=bind,src=/tgt,dst=/workspace$' \
+      -e '^type=bind,src=/tgt/\.git,dst=/workspace/\.git,readonly$' || true)" "2"
+  chk "gate container HOME is the fresh scratch gate home" \
+    "$(printf '%s\n' "${gate_argv[@]}" | grep -c \
+      -e '^type=bind,src=/wr/gate-home,dst=/home/worker$' \
+      -e '^HOME=/home/worker$' || true)" "2"
+  chk "gate container mounts the registry scripts read-only" \
+    "$(printf '%s\n' "${gate_argv[@]}" | grep -c \
+      '^type=bind,src=/reg/scripts,dst=/registry-scripts,readonly$' || true)" "1"
+  chk "gate container is read-only, cap-dropped, and no-new-privileges" \
+    "$(printf '%s\n' "${gate_argv[@]}" | grep -c \
+      -e '^--read-only$' -e '^--cap-drop$' -e '^no-new-privileges$' || true)" "3"
+  chk "nothing token- or credential-shaped crosses into the gate container" \
+    "$(printf '%s\n' "${gate_argv[@]}" | grep -c -E \
+      'GH_TOKEN|GITHUB_|ANTHROPIC|CLAUDE|OPENAI|CODEX|ACCOUNT|CREDENTIAL' || true)" "0"
+  chk "gate container env carries only the validated profile and package atoms" \
+    "$(printf '%s\n' "${gate_argv[@]}" | grep -c \
+      -e '^GATE_PROFILE=crate-scoped$' -e '^WORKER_PACKAGES=sparq-core$' || true)" "2"
+  chk "gate container runs the inner gate from the read-only registry mount" \
+    "$(printf '%s\n' "${gate_argv[@]}" | tail -n 3 | paste -sd' ' -)" \
+    "bash /registry-scripts/worker-live.sh gate"
+  local gate_root="$tmp/gate-root"
+  mkdir -p "$gate_root/home/.claude"
+  chk "a surviving credential HOME is detected (preflight must refuse the gate)" \
+    "$(_gate_credential_leftovers "$gate_root")" "$gate_root/home"
+  : > "$gate_root/.credential-baseline"
+  chk "a surviving rotation baseline is detected too" \
+    "$(_gate_credential_leftovers "$gate_root" | paste -sd',' -)" \
+    "$gate_root/home,$gate_root/.credential-baseline"
+  rm -rf -- "$gate_root/home" "$gate_root/.credential-baseline"
+  chk "a purged worker root passes the leftover preflight" \
+    "$(_gate_credential_leftovers "$gate_root")" ""
+
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
   # REAL membership semantics: sparq's root workspace excludes gui/src-tauri (a standalone
@@ -1673,11 +1822,12 @@ TOML
 case "${1:-}" in
   model) run_model ;;
   gate) run_gate ;;
+  gate-sandboxed) run_gate_sandboxed ;;
   publish) publish_pr ;;
   review) run_review ;;
   fix) run_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|gate-sandboxed|publish|review|fix|push-fix|write-back|self-test>' ;;
 esac
