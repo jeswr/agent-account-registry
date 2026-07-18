@@ -11,16 +11,6 @@
    "expires_at": 1784348926
   },
   {
-   "account": "acct2css",
-   "claim_id": "6f02b91f50ca4ccba566b1dd4ac9e4bd",
-   "holder": "sparq-org/sparq#2767@dispatch-29627530436.1",
-   "package": "upstream",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784342769,
-   "expires_at": 1784349069
-  },
-  {
    "account": "acct02",
    "claim_id": "70dbbb7a9ade4d86860d5f1e608d90fc",
    "holder": "sparq-org/sparq#3403@dispatch-29627622795.1",
