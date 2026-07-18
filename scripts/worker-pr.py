@@ -1214,13 +1214,11 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     PR stays visible to the sweep for a bounded re-review instead of stalling non-draft/unarmed
     forever; if even the undo fails, this escalates to review:needs-user (never silent).
 
-    [OPUS-4.8] B3 / defects #2,#4: DEFENSE-IN-DEPTH trust-surface arm gate re-derived on LIVE
-    data. Even if the upstream review-outcome decided `arm`, this — the last mutation before the
-    latch — re-reads the PR's changed files from the API at the reviewed head and, if ANY touches
-    a gate-weakening / orchestration-control path (renamed paths included, since the check is live
-    against the actual diff, not the planning-time list), WITHHOLDS auto-arm and escalates to a
-    human (review:needs-user). The PR is NOT undrafted/armed; the automated review already ran, the
-    final arm click is a human's for gate-weakening paths regardless of issue labels."""
+    [OPUS-4.8] B3, REVISED per Decision 7 (maintainer 2026-07-18): the trust-surface set is
+    still re-derived on LIVE changed files (renamed-path safe), but a hit no longer withholds
+    the arm — approve IS the arm decision on every surface. The hits feed the POST-arm audit
+    trail (_apply_trust_surface_audit: trust-surface label + one idempotent marker comment),
+    applied only after a successful live arm, with loud failures."""
     if reviewer_provider == impl_provider:
         raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
@@ -1238,20 +1236,15 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         _write_outputs({"armed": False, "head_moved": True})
         print("live head advanced past the reviewed sha; returned to review:needs")
         return
+    trust_hits = ()
     if arm:
         # Live trust-surface re-derivation BEFORE any undraft/latch (renamed-path safe).
+        # Decision 7 REVISED (maintainer 2026-07-18): a hit no longer parks — it feeds the
+        # POST-arm audit trail below (label + comment applied only after a SUCCESSFUL arm,
+        # with checked failures — sol r1 on #257).
         surfaces = tuple(surface_paths) if surface_paths else DEFAULT_TRUST_SURFACE_PATHS
         live_files = _pr_changed_files(repo, pr_number)
-        hits = trust_surface_paths_touched(live_files, surfaces)
-        if hits:
-            alert_repo, alert_token = _alert_route()
-            needs_user(repo, pr_number,
-                       "trust-surface change approved by cross-provider review; human arm "
-                       f"required (diff touches: {', '.join(hits[:8])})",
-                       issue=issue, alert_repo=alert_repo, alert_token=alert_token)
-            _write_outputs({"armed": False, "head_moved": False, "trust_surface": True})
-            print("trust-surface diff: withheld auto-arm; escalated to human (review:needs-user)")
-            return
+        trust_hits = trust_surface_paths_touched(live_files, surfaces)
     _run_gh(["pr", "ready", str(pr_number), "-R", repo])
     if arm:
         merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto"],
@@ -1270,11 +1263,39 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
                        issue=issue, alert_repo=alert_repo, alert_token=alert_token)
             raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated")
     set_review_state(repo, pr_number, "pass")
+    if arm and trust_hits:
+        _apply_trust_surface_audit(repo, pr_number, trust_hits)
     if issue:
         # Deferred issue completion (locked decision 16): complete only on arm, not on publish.
         _load_worker_issue().set_status(repo, issue, "complete")
-    _write_outputs({"armed": bool(arm), "head_moved": False})
+    _write_outputs({"armed": bool(arm), "head_moved": False,
+                    "trust_surface": bool(trust_hits)})
     print(f"pull request marked ready{' and armed (auto-merge)' if arm else ''}")
+
+
+TRUST_AUDIT_MARKER = "<!-- sparq-trust-audit:v1 -->"
+
+
+def _apply_trust_surface_audit(repo, pr_number, hits):
+    """Durable post-arm audit trail for an armed trust-plane diff (Decision 7 revision):
+    the label + ONE idempotent comment listing the touched security paths. Runs only after
+    a SUCCESSFUL arm; failures are LOUD (raise) — an armed trust diff without its audit
+    trail violates the revised contract; the sweep's crash-window semantics retry it
+    (reviewed-sha binds after this step)."""
+    label = _run_gh(["pr", "edit", str(pr_number), "-R", repo,
+                     "--add-label", "trust-surface"], check=False)
+    if label.returncode != 0:
+        _run_gh(["label", "create", "trust-surface", "-R", repo,
+                 "--description", "Armed trust-plane diff - post-merge audit trail",
+                 "--color", "D93F0B"], check=False)
+        _run_gh(["pr", "edit", str(pr_number), "-R", repo, "--add-label", "trust-surface"])
+    existing = _paginated_comments(repo, pr_number)
+    if not any(TRUST_AUDIT_MARKER in str(c.get("body", "")) for c in existing):
+        body = ("> \U0001F916 SPARQ agent\n\nARMED on cross-provider approve. "
+                "Trust-surface audit trail: " + ", ".join(hits[:8]) + ". Post-merge review "
+                "welcome; revert-and-reopen is the escalation path.\n\n" + TRUST_AUDIT_MARKER)
+        _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body",
+                 body.encode().decode("unicode_escape")])
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
@@ -1338,17 +1359,8 @@ def review_outcome(args):
                    alert_repo=alert_repo, alert_token=alert_token)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
-        # narrowly-minted arm token; nothing to mutate here EXCEPT the post-merge audit
-        # trail for trust surfaces (Decision 7 revision): label + one comment listing the
-        # touched security paths so an armed trust-plane diff is auditable at a glance.
-        if trust_surface or security:
-            hits = ", ".join(surface_hits[:8]) if trust_surface else "security-labelled issue"
-            _run_gh(["pr", "edit", str(args.pr), "-R", args.repo,
-                     "--add-label", "trust-surface"], check=False)
-            _run_gh(["pr", "comment", str(args.pr), "-R", args.repo, "--body",
-                     "> 🤖 SPARQ agent\n\nARMED on cross-provider approve. "
-                     f"Trust-surface audit trail: {hits}. Post-merge review welcome; "
-                     "revert-and-reopen is the escalation path."], check=False)
+        # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
+        # THERE, after a successful live arm with checked failures (sol r1 on #257).
         print("verdict approved: arm step will run under the arm-scoped token")
 
 
@@ -2197,6 +2209,68 @@ def _self_test():
     check("alert route honours ALERT_REPO", _alert_route(), ("private/alerts", "t1"))
     for key in ("REGISTRY_REPO", "REGISTRY_ALERT_TOKEN", "ALERT_REPO", "ALERT_TOKEN"):
         os.environ.pop(key, None)
+    # ---- ready_and_arm wiring (Decision 7 revision, sol r1 on #257): approved trust-surface
+    # diffs ARM with a post-arm audit; head races and arm failures never audit ----
+    os.environ.setdefault("PROVENANCE_SALT", "selftest-salt")
+    raa_calls = []
+    raa_outputs = {}
+    raa_state = {}
+    real_raa = {name: globals()[name] for name in (
+        "_gh_json", "_run_gh", "_pr_changed_files", "set_review_state",
+        "_paginated_comments", "needs_user", "_write_outputs")}
+
+    def raa_gh_json(args, **_kw):
+        return {"state": "open", "head": {"sha": raa_state["head"]}}
+
+    def raa_run_gh(args, **kw):
+        raa_calls.append(" ".join(args))
+        if "merge" in args and raa_state.get("merge_fails"):
+            if kw.get("check", True):
+                raise WorkerPrError("GitHub API request failed for merge")
+            return argparse.Namespace(returncode=1, stdout="", stderr="")
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    def run_raa(head_ok=True, merge_fails=False, comments=()):
+        raa_calls.clear(); raa_outputs.clear()
+        sha = "b" * 40
+        raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails)
+        globals()["_gh_json"] = raa_gh_json
+        globals()["_run_gh"] = raa_run_gh
+        globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
+        globals()["set_review_state"] = lambda repo, pr, s: raa_calls.append(f"state:{s}")
+        globals()["_paginated_comments"] = lambda repo, pr: list(comments)
+        globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
+        globals()["_write_outputs"] = raa_outputs.update
+        ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True)
+
+    try:
+        run_raa()
+        check("approved trust-surface diff ARMS (Decision 7 revision)",
+              (any("merge" in c for c in raa_calls), raa_outputs.get("armed"),
+               raa_outputs.get("trust_surface")), (True, True, True))
+        audit_i = next(i for i, c in enumerate(raa_calls) if "trust-surface" in c)
+        merge_i = next(i for i, c in enumerate(raa_calls) if "merge" in c)
+        check("audit trail applies AFTER the successful arm", audit_i > merge_i, True)
+        check("audit comment carries the idempotency marker",
+              any(TRUST_AUDIT_MARKER in c for c in raa_calls), True)
+        run_raa(comments=({"body": f"x {TRUST_AUDIT_MARKER}"},))
+        check("audit comment is idempotent (marker present -> no second comment)",
+              any(TRUST_AUDIT_MARKER in c for c in raa_calls), False)
+        run_raa(head_ok=False)
+        check("head race returns to review:needs with NO arm and NO audit",
+              ("state:needs" in raa_calls,
+               any("merge" in c for c in raa_calls),
+               any("trust-surface" in c for c in raa_calls)), (True, False, False))
+        try:
+            run_raa(merge_fails=True)
+            check("arm failure raises (draft restored path)", "no error", "raised")
+        except WorkerPrError:
+            check("arm failure raises (draft restored path)", "raised", "raised")
+        check("failed arm never audits",
+              any("trust-surface" in c for c in raa_calls), False)
+    finally:
+        globals().update(real_raa)
+
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
