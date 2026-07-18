@@ -12,16 +12,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "a6355972298d401ebfe95c50be818f2b",
-   "holder": "review:sparq-org/sparq#3478@dispatch-29653521657.1",
-   "package": "sparq-shacl",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784395084,
-   "expires_at": 1784396284
-  },
-  {
-   "account": "acct01",
    "claim_id": "3968fd90d57f48e89cb2cd75daebe3ff",
    "holder": "review:jeswr/agent-account-registry#260@dispatch-29653838643.1",
    "package": "set-up-account",
