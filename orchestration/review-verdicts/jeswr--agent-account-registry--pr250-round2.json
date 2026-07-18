@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The prior major finding is resolved soundly. Threshold values and review-round means now require finiteness, the self-test exercises JSON-overflow-style positive infinity in both paths, and `json.dump(..., allow_nan=False)` provides a final fail-closed serialization backstop. The added observability normalization, privacy checks, optional-file behavior, rendering, and workflow wiring are coherent; the tests are substantive rather than vacuous. No blocker or major issue remains in the diff.",
+ "verdict": "approve"
+}
