@@ -118,15 +118,11 @@ DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
 # role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
 REVIEW_CHAIN = {"anthropic": ["terra"], "openai": ["opus"]}
 FIX_CHAIN = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
-# Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
-# 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
-# earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
-# path does not usage-gate; codex accounts are usage-EXEMPT, so this shared `review:` prefix
-# cap IS the codex slot bound, and `fix:` bounds concurrent same-provider fix agents.
-REVIEW_MAX_CONCURRENT = 10
-FIX_MAX_CONCURRENT = 8
-REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
-FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
+# Per-prefix lease caps + TTLs live in ONE place — select-and-claim.LEASE_CONFIG, read here via
+# allocator.lease_limit() and by the review-fix.yml self-claim path via `--lease-config` (issue
+# #167, locked decision 9). Keeping the numbers out of this file is deliberate: the dispatcher and
+# the workflow are the two launch paths for the same work, so a single source is what stops them
+# drifting to conflicting capacity (codex is usage-exempt, so those static caps ARE the bound).
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
@@ -1300,7 +1296,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     continue
                 mode, role = "review", "review"
                 chain = _resolvable_chain(REVIEW_CHAIN[impl_provider], routing)
-                holder_prefix, cap, ttl = "review:", REVIEW_MAX_CONCURRENT, REVIEW_TTL
+                holder_prefix = "review:"
+                cap, ttl = allocator.lease_limit(holder_prefix)
                 round_number = rounds + 1
             elif repair_state:
                 # GAP-A/B autonomous repair (reuse mode=fix, same-provider chain). The live
@@ -1318,7 +1315,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    f"{round_number}; a human must unstick this PR")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
-                holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
+                holder_prefix = "fix:"
+                cap, ttl = allocator.lease_limit(holder_prefix)
             else:
                 if rounds < 1:
                     print(f"defer review {repo}#{number}: review:changes with no recorded round")
@@ -1342,7 +1340,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     continue
                 mode, role = "fix", "fix"
                 chain = _resolvable_chain(fix_aliases, routing)
-                holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
+                holder_prefix = "fix:"
+                cap, ttl = allocator.lease_limit(holder_prefix)
                 round_number = rounds
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
@@ -2425,6 +2424,9 @@ def _self_test():
         wiring_ledger_root = str(Path(tmp) / "ledger")
         wiring_worker_pr = _load_module(
             "registry_worker_pr_wiring", Path(__file__).resolve().parent / "worker-pr.py")
+        wiring_alloc = _load_module(
+            "registry_select_and_claim_wiring",
+            Path(__file__).resolve().parent / "select-and-claim.py")
         record_file = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, 41)
         record_file.parent.mkdir(parents=True)
         record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
@@ -2473,6 +2475,10 @@ def _self_test():
             # flat rounds>=max needs-user at CLAIM, the fix chain honours the pinned floor, and
             # a starved pinned chain DEFERS (defer-not-fallback: sonnet is never re-offered) ----
             class FakeAllocator:
+                # Delegate the caps to the REAL single source (issue #167) so this test can never
+                # silently drift from the LEASE_CONFIG table the dispatcher actually reads.
+                lease_limit = staticmethod(wiring_alloc.lease_limit)
+
                 def __init__(self):
                     self.chains = []
 

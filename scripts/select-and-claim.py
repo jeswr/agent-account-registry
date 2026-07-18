@@ -29,6 +29,29 @@ LEDGER_PATH = "data/leases.json"
 # tests/migration only; every reader and writer threads this single constant.
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 
+# ---- canonical worker-slot concurrency (issue #167) ---------------------------------------------
+# ONE source of truth for the per-prefix review/fix lease caps + TTLs. BOTH launch paths for the
+# same PR read this table, so they can never drift to conflicting capacity semantics again: the
+# privileged dispatcher (dispatch-claim.py) imports this module and calls lease_limit(); the
+# review-fix.yml self-claim path shells `select-and-claim.py --lease-config <prefix>`. Caps were
+# re-raised per maintainer direction 2026-07-17 (codex rate limits are far from binding; 10+
+# parallel agents are fine). codex accounts are usage-EXEMPT and the CLI claim path does not
+# usage-gate, so these static caps ARE the concurrency bound. TTLs differ by role: a crashed
+# reviewer must free the scarce codex slot fast (short review TTL), while a fix runs the crate
+# gate (cargo), which can be slow (longer fix TTL).
+LEASE_CONFIG = {
+    "review:": {"max_concurrent": 10, "ttl": 1200},
+    "fix:": {"max_concurrent": 8, "ttl": 3600},
+}
+
+
+def lease_limit(holder_prefix):
+    """Canonical (max_concurrent, ttl) for a `review:`/`fix:` holder prefix — the single table
+    both the dispatcher and the workflow claim path read (issue #167). An unknown prefix fails
+    closed with KeyError rather than inventing a permissive default."""
+    cfg = LEASE_CONFIG[holder_prefix]
+    return cfg["max_concurrent"], cfg["ttl"]
+
 
 class LeaseIOError(RuntimeError):
     """A fail-closed ledger/catalog error that never includes credential material."""
@@ -559,6 +582,19 @@ def _self_test():
     check("same-crate reviews still serialize under the shared review: prefix",
           partition_available(mixed, "review:", "crate-a"), False)
 
+    # ---- single-source lease caps (issue #167): the dispatcher (lease_limit) and the workflow
+    # (`--lease-config`, the SAME resolver) read ONE table, so identical work cannot get
+    # conflicting capacity. Pin the values so a one-sided edit that reintroduces the drift turns
+    # this red, and confirm an unknown prefix fails closed (KeyError), never a permissive default.
+    check("fix lease limit is the single canonical (cap, ttl)", lease_limit("fix:"), (8, 3600))
+    check("review lease limit is the single canonical (cap, ttl)",
+          lease_limit("review:"), (10, 1200))
+    try:
+        lease_limit("bogus:")
+        check("unknown lease prefix fails closed", "no exception", "KeyError")
+    except KeyError:
+        check("unknown lease prefix fails closed", "KeyError", "KeyError")
+
     # Two live review leases for DISTINCT PRs are bounded by the SHARED `review:` prefix cap
     # (max_holder_concurrent=2 = the static codex slot bound; codex is usage-exempt so the CLI
     # usage=None path is acceptable). A third claim must come back None, an impl claim must not.
@@ -855,6 +891,9 @@ def _self_test():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--lease-config", metavar="PREFIX",
+                    help="print `<max_concurrent> <ttl>` for a review:/fix: holder PREFIX — the "
+                         "single source of truth the workflow claim path reads (issue #167)")
     ap.add_argument("--reclaim", action="store_true", help="CAS-remove expired leases (cron)")
     ap.add_argument("--claim", action="store_true", help="claim a lease")
     ap.add_argument("--inspect", metavar="CLAIM_ID", help="inspect an active lease for worker adoption")
@@ -876,6 +915,14 @@ def main():
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
+    if args.lease_config is not None:
+        try:
+            cap, ttl = lease_limit(args.lease_config)
+        except KeyError:
+            print(f"unknown lease prefix: {args.lease_config!r}", file=sys.stderr)
+            return 2
+        print(f"{cap} {ttl}")
+        return 0
     import time
     if args.reclaim:
         n = reclaim(args.repo, int(time.time()))
