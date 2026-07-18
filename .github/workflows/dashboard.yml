@@ -117,3 +117,38 @@ jobs:
       - name: Deploy GitHub Pages (pinned)
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+
+  # [FABLE-5] Loud-fail alarm — the dashboard is the maintainer's PRIMARY visibility surface and
+  # runs UNATTENDED every 15m (build → deploy). It had no alarm: a silent build/deploy crash lets
+  # the dashboard go stale silently (directly counter to this PR's visibility goal). This job-level
+  # alarm records a build OR deploy failure/cancel to the same rolling pipeline-failure issue.
+  alarm:
+    needs: [build, deploy]
+    if: >-
+      ${{ always() && (
+        needs.build.result == 'failure' || needs.build.result == 'cancelled' ||
+        needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled' ||
+        needs.deploy.result == 'skipped'
+      ) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          # Deploy is `needs: build`, so a build crash SKIPS deploy — surface whichever failed.
+          job-name: ${{ (needs.build.result == 'failure' || needs.build.result == 'cancelled') && 'build' || 'deploy' }}
+          job-result: ${{ (needs.build.result == 'failure' || needs.build.result == 'cancelled') && needs.build.result || needs.deploy.result }}
+          cancelled: ${{ needs.build.result == 'cancelled' || needs.deploy.result == 'cancelled' }}
+          detail: >-
+            dashboard tick: build=${{ needs.build.result }} deploy=${{ needs.deploy.result }} —
+            the maintainer's primary visibility surface failed to rebuild/redeploy and is going stale
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}

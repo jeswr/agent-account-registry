@@ -14,16 +14,21 @@
 #   (a) CLASSIFY {workflow, job, failed-step, failure-class} from the run context (the GitHub-
 #       provided env + the caller-passed job results). No secrets are read to classify.
 #   (b) CAPTURE a BOUNDED, CREDENTIAL-SAFE diagnostic tail. It NEVER emits a raw model transcript,
-#       an account handle, or a token — it reuses worker-live.sh's posture: only a short, redacted,
-#       host-observable summary line. A diagnostic input that even LOOKS like a credential is
-#       redacted before it can reach the issue body (see _sanitize / SECRET_PATTERNS).
+#       an account handle (`acctNN`), a worker-account email, or a token — it reuses worker-live.sh's
+#       posture: only a short, redacted, host-observable summary line. A diagnostic input that even
+#       LOOKS like a credential OR an account identity (email / `acctNN`) is redacted, and every
+#       markdown-active / ledger-delimiter char is stripped, before it can reach the issue body or
+#       the hidden JSON ledger — enforced HERE (see _sanitize / SECRET_PATTERNS), not merely by
+#       which callers exist today, and locked by --self-test (a leak mutation goes RED).
 #   (c) RAISE a LOUD, DEDUPED, maintainer-visible alert: a SINGLE rolling "⚠️ pipeline failures"
 #       issue (label `pipeline-alert`), keyed by a hidden HTML body marker (the model-health.py
 #       upsert pattern), carrying a compact table (class × count × last-seen × run-link). A recurring
 #       failure UPDATES the rolling record — it never spams a new issue. This shares the ledger
 #       alert-channel philosophy with the throughput observability work (PR #93 `throughput-alert`):
 #       one failure surface, one throughput surface, both rolling+deduped, both @-mentioning the
-#       maintainer — never two mechanisms fighting.
+#       maintainer — never two mechanisms fighting. On a HEALTHY run (`--resolve`) the workflow's
+#       rows are pruned and the issue auto-closes once the ledger empties (PR #51's plan-alert
+#       auto-close-on-heal, GENERALIZED here to every workflow — this script supersedes plan-alert).
 #   (d) FAIL-SOFT. The alarm can NEVER mask or replace the primary failure. main() ALWAYS exits 0
 #       (it is a diagnostic reporter, not a gate — a nonzero here would REPLACE the real failure's
 #       red X with the alarm's own). Its own internal failure degrades to a plain `::error::`
@@ -64,14 +69,28 @@ GH_TIMEOUT_S = 45            # per gh call
 SECRET_PATTERNS = [
     re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}"),                 # GitHub PAT / App / OAuth / refresh
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),               # fine-grained PAT
+    re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"),                 # Anthropic-style key (before sk-)
     re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),                     # OpenAI-style key
-    re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"),                 # Anthropic-style key
     re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,}"),  # JWT
     re.compile(r"(?i)\b(token|secret|password|passwd|api[_-]?key|bearer|authorization)\b"
                r"\s*[:=]\s*\S+"),                              # key: value credential lines
+    # Account identity is a credential-adjacent PII shape the repo traffics in (acctNN handles +
+    # worker-account emails, cf account-usage.py / backfill-provenance.py). The alarm body is an
+    # operational failure report, NOT an identity ledger, so redact BOTH the `acctNN` handle and
+    # any email before either can reach the issue body (the docstring's "never an account handle"
+    # guarantee is enforced HERE, not merely by which callers exist today).
+    re.compile(r"(?i)\bacct[0-9]{1,4}\b"),                     # acctNN worker-account handle
+    re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),  # email address (PII)
     re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"),                   # long base64-ish blobs (token-shaped)
 ]
 _REDACTED = "[redacted]"
+
+# Markdown-active + ledger-delimiter characters a detail cell must never carry into the rolling
+# issue body. Stripping these makes an arbitrary future caller's `detail` incapable of (a) injecting
+# a clickable link / image / @-mention into the maintainer-facing issue, or (b) forging the hidden
+# `<!-- pipeline-alarm:ledger ... -->` delimiters to truncate/wipe the accumulated JSON ledger on
+# the next tick. Backtick/pipe were already stripped (table-breaking); this widens the set.
+_MARKDOWN_ACTIVE = "`|<>[]!@"
 
 
 def _now(now=None):
@@ -87,8 +106,15 @@ def _sanitize(text):
     s = str(text)
     for pat in SECRET_PATTERNS:
         s = pat.sub(_REDACTED, s)
-    # single line, printable only, bounded
-    s = "".join(ch if (ch.isprintable() and ch not in "`|") else " " for ch in s)
+    # Neutralize the hidden-ledger delimiters BEFORE per-char stripping so a detail carrying a
+    # forged `<!-- pipeline-alarm:ledger ... -->` pair can never truncate/wipe the accumulated JSON
+    # ledger on the next _parse_ledger tick. (Char-stripping alone would break the `<!--` but the
+    # `pipeline-alarm:ledger` word-run would survive; kill the whole marker token explicitly.)
+    for marker in (LEDGER_MARKER_OPEN, LEDGER_MARKER_CLOSE, MARKER, "pipeline-alarm:ledger"):
+        s = s.replace(marker, "[marker]")
+    # single line, printable only, bounded; strip markdown-active + table-breaking chars so a
+    # detail can never inject a link/image/mention or forge a delimiter into the issue body
+    s = "".join(ch if (ch.isprintable() and ch not in _MARKDOWN_ACTIVE) else " " for ch in s)
     s = re.sub(r"\s+", " ", s).strip()
     if len(s) > MAX_DETAIL_LEN:
         s = s[:MAX_DETAIL_LEN - 1].rstrip() + "…"
@@ -217,9 +243,10 @@ def render_body(ledger, maintainer):
         lines.append(f"- `{_sanitize(r.get('workflow','?'))}`/`{_sanitize(r.get('job','?'))}`"
                      f"{loc}: {detail}")
     lines.append("")
-    lines.append("_This issue auto-updates each failing tick and is safe to close once resolved; "
-                 "it reopens on the next failure. Recovery is not auto-detected (a failure alarm is "
-                 "loud-on-fail, quiet-on-heal)._")
+    lines.append("_This issue auto-updates each failing tick and reopens on the next failure. "
+                 "Recovery IS auto-detected: a healthy run of a workflow prunes its rows, and the "
+                 "issue auto-closes once the ledger empties (ported from the plan-alert #51 "
+                 "auto-close-on-heal, generalized to every workflow)._")
     # hidden ledger for the next tick
     lines.append("")
     lines.append(f"{LEDGER_MARKER_OPEN}")
@@ -316,6 +343,61 @@ def upsert_alarm(new_row, repo, token, maintainer):
     return False
 
 
+def _resolve_ledger(ledger, workflow):
+    """Drop every row whose `workflow` matches `workflow` (a workflow just ran healthy, so its
+    prior failures are recovered). Returns (kept_rows, dropped_count). Recovery is WORKFLOW-scoped
+    because the rolling issue is fleet-wide: a healthy `dispatch` tick must not close an alert that
+    a still-failing `worker` also owns. Ported from PR #51's plan-alert auto-close-on-heal, but
+    applied to whichever workflow just recovered rather than only PLAN."""
+    wf = _sanitize(workflow) if workflow else ""
+    if not wf:
+        return list(ledger), 0
+    kept = [r for r in ledger if _sanitize(r.get("workflow", "")) != wf]
+    return kept, len(ledger) - len(kept)
+
+
+def resolve_alarm(workflow, repo, token, maintainer):
+    """Auto-close-on-heal (PR #51's recovery behavior, generalized): on a HEALTHY run of `workflow`,
+    prune that workflow's rows from the rolling ledger. If rows remain (other workflows still
+    failing) the issue is refreshed; if the ledger empties, the rolling issue is COMMENTED + CLOSED
+    (it reopens on the next failure). A green tick with no open alert is a cheap no-op (one list).
+    Fail-soft: every gh rc is checked, never raises, returns a bool for the self-test."""
+    if not repo or not token:
+        # No target to read/close — nothing to do on a healthy tick (do NOT redden: success path).
+        return False
+    num, body = _find_rolling_issue(repo, token, "open")
+    if num is None:
+        # No open alert for this fleet — a healthy tick is a cheap no-op (matches #51's
+        # green-tick-is-side-effect-free posture).
+        return False
+    ledger = _parse_ledger(body)
+    kept, dropped = _resolve_ledger(ledger, workflow)
+    if dropped == 0:
+        # This workflow had no open failure rows; leave the alert untouched (another workflow owns
+        # it). Never close an issue whose failures we did not just recover.
+        return False
+    if kept:
+        rendered = render_body(_prune(kept), maintainer)
+        rc = _gh(["issue", "edit", str(num), "-R", repo, "--body", rendered], token).returncode
+        if rc == 0:
+            print(f"::warning::pipeline-alarm: {_sanitize(workflow)} recovered — pruned its rows "
+                  f"from the rolling alert (#{num}); other workflows still failing")
+            return True
+        print("::error::pipeline-alarm: pruning the recovered rows FAILED (retries next tick)")
+        return False
+    # Ledger emptied: every recorded failure has recovered → comment + close (reopens on next fail).
+    _gh(["issue", "comment", str(num), "-R", repo, "--body",
+         f"✅ Recovered — `{_sanitize(workflow)}` succeeded and no pipeline failures remain in the "
+         "ledger. Auto-closing; this issue reopens on the next failure."], token)
+    rc = _gh(["issue", "close", str(num), "-R", repo], token).returncode
+    if rc == 0:
+        print(f"::warning::pipeline-alarm: all pipeline failures recovered — closed the rolling "
+              f"alert (#{num})")
+        return True
+    print("::error::pipeline-alarm: closing the recovered alert FAILED (retries next tick)")
+    return False
+
+
 def build_row(now=None):
     """Assemble the failure row from the run context env. All sources are GitHub-provided run
     metadata (workflow/job/run ids) + caller-passed job signals — no secret is read."""
@@ -343,10 +425,25 @@ def build_row(now=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Unified loud-fail pipeline alarm")
     parser.add_argument("--self-test", action="store_true", help="run the self-test suite")
+    parser.add_argument("--resolve", action="store_true",
+                        help="HEALTHY-tick recovery: prune this workflow's rows from the rolling "
+                             "alert and auto-close it once the ledger empties (PR #51's "
+                             "auto-close-on-heal, generalized to any recovered workflow)")
     args = parser.parse_args(argv)
     if args.self_test:
         return _self_test()
     maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
+    if args.resolve:
+        # Recovery path: a workflow just ran healthy. This NEVER redddens (it is the success tick)
+        # and is fail-soft, so a recovery-write hiccup can't turn a green run red.
+        try:
+            workflow = os.environ.get("GITHUB_WORKFLOW", "")
+            repo, token = _resolve_alert_target()
+            resolve_alarm(workflow, repo, token, maintainer)
+        except Exception as exc:  # noqa: BLE001 — recovery must never redden a healthy run
+            print(f"::warning::pipeline-alarm: recovery step errored ({exc}); the alert (if any) "
+                  "will be re-evaluated next healthy tick — the run itself stays green")
+        return 0
     try:
         row = build_row()
         repo, token = _resolve_alert_target()
@@ -405,26 +502,63 @@ def _self_test():
         "Authorization: Bearer " + "e" * 50,
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghij",
         "A" * 60,  # long base64-ish blob
+        "j99379855@example.com",   # worker-account email (PII) — the "never a handle" claim
+        "acct04",                  # acctNN worker-account handle
     ]
     for i, leak in enumerate(leaks):
         san = _sanitize(f"error near {leak} happened")
         ok(f"sanitize scrubs secret #{i} ({leak[:8]}…)",
            leak not in san and "hunter2secretvalue" not in san)
-    # sanitize also strips table-breaking chars + bounds length
+    # the account-handle / email guarantee the docstring makes must hold for the bare handle too,
+    # not only when embedded in a sentence. Assert the IDENTITY local-part/handle is REDACTED (not
+    # merely that the `@`/handle char was stripped): the email pattern, not char-stripping, is what
+    # must remove the PII — otherwise `jmwright.045 gmail.com` still leaks who ran the job.
+    ok("sanitize REDACTS a worker-account email local-part (not just strips @)",
+       "jmwright.045" not in _sanitize("worker jmwright.045@gmail.com failed"))
+    ok("sanitize REDACTS the email domain user", "j99379855" not in _sanitize("acct j99379855@example.com"))
+    ok("sanitize scrubs a bare acctNN handle", "acct02" not in _sanitize("acct02"))
+    ok("sanitize scrubs an acctNN handle in a key=value form",
+       "acct04" not in _sanitize("account acct04=capped"))
+    # sanitize also strips table-breaking + markdown-active chars + bounds length
     ok("sanitize strips backtick/pipe", "`" not in _sanitize("a`b|c") and "|" not in _sanitize("a`b|c"))
+    ok("sanitize strips markdown link/image/mention chars",
+       all(c not in _sanitize("click [here](x) ![img](y) @everyone <b>") for c in "[]!@<>"))
+    # a detail can NEVER forge the hidden ledger delimiters (would truncate/wipe the JSON ledger)
+    ok("sanitize neutralizes a forged ledger-marker pair",
+       LEDGER_MARKER_OPEN not in _sanitize(f"{LEDGER_MARKER_OPEN} evil {LEDGER_MARKER_CLOSE}")
+       and "pipeline-alarm:ledger" not in _sanitize(f"{LEDGER_MARKER_OPEN} evil"))
     ok("sanitize bounds length", len(_sanitize("x" * 5000)) <= MAX_DETAIL_LEN)
     chk("sanitize blank -> placeholder", _sanitize(""), "(no diagnostic captured)")
     chk("sanitize None -> placeholder", _sanitize(None), "(no diagnostic captured)")
 
-    # a full row's rendered body must ALSO be leak-free even if the ledger was tampered upstream
+    # a full row's rendered body must ALSO be leak-free even if the ledger was tampered upstream —
+    # and in EVERY free-text field, not only `detail` (locks the render_body/_sanitize_row re-scrub
+    # against a mutation that skips the non-detail fields; that mutation previously stayed green).
     tampered = [{
-        "workflow": "worker", "job": "run", "failure_class": "job-failure", "count": 1,
+        "workflow": "wf-" + "ghp_" + "w" * 36, "job": "job-" + "ghp_" + "j" * 36,
+        "failure_class": "cls-" + "ghp_" + "f" * 36, "count": 1,
         "last_seen": "2026-07-18T11:00:00Z", "run_url": "https://x/1",
-        "failed_step": "model", "detail": "ghp_" + "z" * 36 + " leaked",
+        "failed_step": "step-" + "ghp_" + "s" * 36, "detail": "ghp_" + "z" * 36 + " leaked",
     }]
     rendered = render_body(tampered, "jeswr")
-    ok("render_body re-sanitizes a tampered ledger detail",
-       ("ghp_" + "z" * 36) not in rendered)
+    for fld, tok in (("detail", "ghp_" + "z" * 36), ("workflow", "ghp_" + "w" * 36),
+                     ("job", "ghp_" + "j" * 36), ("failure_class", "ghp_" + "f" * 36),
+                     ("failed_step", "ghp_" + "s" * 36)):
+        ok(f"render_body re-sanitizes a tampered ledger {fld} field", tok not in rendered)
+    # the hidden JSON ledger block persisted for the next tick must be leak-free in every field too
+    persisted = json.dumps(_prune([dict(tampered[0])]))
+    for fld, tok in (("workflow", "ghp_" + "w" * 36), ("job", "ghp_" + "j" * 36),
+                     ("failed_step", "ghp_" + "s" * 36)):
+        ok(f"persisted ledger re-sanitizes {fld}", tok not in persisted)
+    # a forged ledger-marker planted in a field must not survive into the rendered body either
+    forged = render_body([{
+        "workflow": f"w{LEDGER_MARKER_CLOSE}", "job": "j", "failure_class": "job-failure",
+        "count": 1, "last_seen": "2026-07-18T11:00:00Z", "run_url": "https://x/1",
+        "failed_step": "", "detail": f"{LEDGER_MARKER_OPEN} forged",
+    }], "jeswr")
+    # exactly ONE real ledger block delimiter pair may exist in the body (our own)
+    ok("a forged marker in a field cannot inject a 2nd ledger open delimiter",
+       forged.count(LEDGER_MARKER_OPEN) == 1)
 
     # --- dedupe (LOAD-BEARING): a recurrence bumps the row in place, never a second row ----------
     r1 = {"workflow": "dispatch", "job": "plan", "failure_class": "job-failure",
@@ -597,6 +731,106 @@ def _self_test():
        upsert_alarm({"workflow": "w", "job": "j", "failure_class": "job-failure",
                      "detail": "d", "run_url": "", "last_seen": "2026-07-18T12:00:00Z"},
                     "", "", "jeswr") is False)
+
+    # --- resolve/heal (LOAD-BEARING: ported PR #51 auto-close-on-heal, generalized) -------------
+    # _resolve_ledger prunes ONLY the recovered workflow's rows (recovery is workflow-scoped
+    # because the rolling issue is fleet-wide).
+    mixed = [
+        {"workflow": "dispatch", "job": "plan", "failure_class": "upstream-skip", "count": 3},
+        {"workflow": "worker", "job": "run", "failure_class": "job-failure", "count": 1},
+    ]
+    kept, dropped = _resolve_ledger(mixed, "dispatch")
+    chk("resolve prunes ONLY the recovered workflow's rows", dropped, 1)
+    ok("resolve leaves other workflows' rows intact",
+       len(kept) == 1 and kept[0]["workflow"] == "worker")
+    _, dropped_none = _resolve_ledger(mixed, "groom")
+    chk("resolve of a workflow with no rows drops nothing (never touches others)", dropped_none, 0)
+    _, dropped_blank = _resolve_ledger(mixed, "")
+    chk("resolve with no workflow name is a no-op (never mass-prunes)", dropped_blank, 0)
+
+    # resolve_alarm against a stubbed gh: a healthy tick that EMPTIES the ledger COMMENTS + CLOSES;
+    # a healthy tick that leaves other rows only EDITS; a green tick with no open alert is a no-op.
+    def make_resolve_gh(open_body):
+        seen = []
+
+        def fake(args, token, capture=False):
+            seen.append(list(args))
+            verb = args[1] if len(args) > 1 else ""
+            if verb == "list":
+                state = args[args.index("--state") + 1] if "--state" in args else ""
+                if state == "open" and open_body is not None:
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps([{"number": 5, "body": open_body}]), "")
+                return subprocess.CompletedProcess(args, 0, "[]", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return fake, seen
+
+    # (i) sole-owner recovery empties the ledger -> comment + close
+    sole = render_body([{"workflow": "dispatch", "job": "plan", "failure_class": "upstream-skip",
+                         "count": 2, "last_seen": "2026-07-18T10:00:00Z",
+                         "run_url": "https://x/1", "detail": "d"}], "jeswr")
+    fake, seen = make_resolve_gh(sole)
+    globals()["_gh"] = fake
+    try:
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr")
+        closes = sum(1 for c in seen if c[:2] == ["issue", "close"])
+        comments = sum(1 for c in seen if c[:2] == ["issue", "comment"])
+        chk("healthy tick that empties the ledger CLOSES the alert", closes, 1)
+        ok("close is preceded by a recovery comment", comments >= 1)
+    finally:
+        globals()["_gh"] = real_gh
+
+    # (ii) recovery with another workflow still failing -> EDIT (prune), never close
+    twowf = render_body([
+        {"workflow": "dispatch", "job": "plan", "failure_class": "upstream-skip", "count": 1,
+         "last_seen": "2026-07-18T10:00:00Z", "run_url": "https://x/1", "detail": "d"},
+        {"workflow": "worker", "job": "run", "failure_class": "job-failure", "count": 1,
+         "last_seen": "2026-07-18T10:05:00Z", "run_url": "https://x/2", "detail": "d"},
+    ], "jeswr")
+    fake, seen = make_resolve_gh(twowf)
+    globals()["_gh"] = fake
+    try:
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr")
+        closes = sum(1 for c in seen if c[:2] == ["issue", "close"])
+        edits = sum(1 for c in seen if c[:2] == ["issue", "edit"])
+        chk("recovery with a still-failing workflow does NOT close", closes, 0)
+        ok("recovery with a still-failing workflow EDITS (prunes its rows)", edits >= 1)
+        # and the pruned body must no longer carry the recovered workflow's row
+        pruned_body = next((c[c.index("--body") + 1] for c in seen
+                            if c[:2] == ["issue", "edit"] and "--body" in c), "")
+        remaining = _parse_ledger(pruned_body)
+        ok("pruned ledger drops the recovered workflow, keeps the other",
+           all(r.get("workflow") != "dispatch" for r in remaining)
+           and any(r.get("workflow") == "worker" for r in remaining))
+    finally:
+        globals()["_gh"] = real_gh
+
+    # (iii) green tick with NO open alert -> cheap no-op (one list, no mutation)
+    fake, seen = make_resolve_gh(None)
+    globals()["_gh"] = fake
+    try:
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr")
+        muts = sum(1 for c in seen if c[:2] in (["issue", "close"], ["issue", "edit"],
+                                                ["issue", "comment"]))
+        chk("green tick with no open alert makes zero mutations", muts, 0)
+    finally:
+        globals()["_gh"] = real_gh
+
+    # (iv) --resolve mode never reddens: main(['--resolve']) exits 0 even if _gh explodes
+    saved = dict(os.environ)
+    try:
+        os.environ.update({"REGISTRY_REPO": "jeswr/x", "GH_TOKEN": "tok",
+                           "GITHUB_WORKFLOW": "dispatch"})
+
+        def boom_resolve(*a, **k):
+            raise RuntimeError("simulated gh catastrophe on the healthy tick")
+        globals()["_gh"] = boom_resolve
+        rc = main(["--resolve"])
+        chk("main --resolve exits 0 even if recovery errors (never reddens a green run)", rc, 0)
+    finally:
+        globals()["_gh"] = real_gh
+        os.environ.clear()
+        os.environ.update(saved)
 
     if failures:
         print("pipeline-alarm --self-test FAILED:")

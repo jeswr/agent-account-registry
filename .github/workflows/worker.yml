@@ -1196,14 +1196,26 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/pipeline-alarm
         with:
-          job-name: ${{ needs.worker.result == 'failure' && 'worker' || (needs.claim.result == 'failure' && 'claim' || (needs.resolve.result == 'failure' && 'resolve' || 'worker-post')) }}
+          # [FABLE-5] Name the job from WHICHEVER job actually failed/was cancelled, so distinct
+          # failure modes get distinct ledger rows instead of collapsing every post-run failure
+          # (provenance/model_health/release/doorbell) into one indistinguishable `worker-post`
+          # bucket where _merge_row would overwrite each other's diagnostic detail after the first.
+          job-name: >-
+            ${{ (needs.resolve.result == 'failure' || needs.resolve.result == 'cancelled') && 'resolve'
+             || (needs.claim.result == 'failure' || needs.claim.result == 'cancelled') && 'claim'
+             || (needs.worker.result == 'failure' || needs.worker.result == 'cancelled') && 'worker'
+             || (needs.provenance.result == 'failure' || needs.provenance.result == 'cancelled') && 'provenance'
+             || (needs.model_health.result == 'failure' || needs.model_health.result == 'cancelled') && 'model_health'
+             || (needs.release.result == 'failure' || needs.release.result == 'cancelled') && 'release'
+             || (needs.doorbell.result == 'failure' || needs.doorbell.result == 'cancelled') && 'doorbell'
+             || 'worker-post' }}
           job-result: failure
           cancelled: ${{ contains(needs.*.result, 'cancelled') }}
           detail: >-
             worker run: resolve=${{ needs.resolve.result }} claim=${{ needs.claim.result }}
             worker=${{ needs.worker.result }} provenance=${{ needs.provenance.result }}
             model_health=${{ needs.model_health.result }} release=${{ needs.release.result }}
-            — an implementation attempt failed
+            doorbell=${{ needs.doorbell.result }} — an implementation attempt failed
           registry-token: ${{ github.token }}
           alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           alert-token: ${{ secrets.ALERT_TOKEN || '' }}

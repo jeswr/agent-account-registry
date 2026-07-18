@@ -1473,13 +1473,27 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/pipeline-alarm
         with:
-          job-name: ${{ needs.run.result == 'failure' && 'run' || (needs.claim.result == 'failure' && 'claim' || (needs.resolve.result == 'failure' && 'resolve' || 'review-fix-post')) }}
+          # [FABLE-5] Name the job from WHICHEVER job actually failed/was cancelled, so distinct
+          # failure modes get distinct ledger rows instead of collapsing every post-run failure
+          # (outcome/unresolvable/model_health/release/doorbell) into one indistinguishable
+          # `review-fix-post` bucket where _merge_row would overwrite each other's detail.
+          job-name: >-
+            ${{ (needs.resolve.result == 'failure' || needs.resolve.result == 'cancelled') && 'resolve'
+             || (needs.claim.result == 'failure' || needs.claim.result == 'cancelled') && 'claim'
+             || (needs.run.result == 'failure' || needs.run.result == 'cancelled') && 'run'
+             || (needs.outcome.result == 'failure' || needs.outcome.result == 'cancelled') && 'outcome'
+             || (needs.unresolvable.result == 'failure' || needs.unresolvable.result == 'cancelled') && 'unresolvable'
+             || (needs.model_health.result == 'failure' || needs.model_health.result == 'cancelled') && 'model_health'
+             || (needs.release.result == 'failure' || needs.release.result == 'cancelled') && 'release'
+             || (needs.doorbell.result == 'failure' || needs.doorbell.result == 'cancelled') && 'doorbell'
+             || 'review-fix-post' }}
           job-result: failure
           cancelled: ${{ contains(needs.*.result, 'cancelled') }}
           detail: >-
             review-fix run (mode=${{ inputs.mode }}): resolve=${{ needs.resolve.result }}
             claim=${{ needs.claim.result }} run=${{ needs.run.result }}
-            outcome=${{ needs.outcome.result }} — a cross-provider review/fix attempt failed
+            outcome=${{ needs.outcome.result }} unresolvable=${{ needs.unresolvable.result }}
+            — a cross-provider review/fix attempt failed
           registry-token: ${{ github.token }}
           alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           alert-token: ${{ secrets.ALERT_TOKEN || '' }}
