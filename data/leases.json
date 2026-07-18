@@ -89,6 +89,16 @@
    "model": "terra",
    "issued_at": 1784382080,
    "expires_at": 1784383280
+  },
+  {
+   "account": "acct4css",
+   "claim_id": "3f05aa58d4ac4da0b3a332fbdf5bf588",
+   "holder": "fix:sparq-org/sparq#3472@dispatch-29646515969.1",
+   "package": "sparq-sim",
+   "role": "fix",
+   "model": "fable",
+   "issued_at": 1784382085,
+   "expires_at": 1784385685
   }
  ]
 }
