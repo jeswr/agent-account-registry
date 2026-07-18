@@ -21,16 +21,6 @@
    "expires_at": 1784384779
   },
   {
-   "account": "acct3css",
-   "claim_id": "0b6918cf615641cb95c3d11b85ae9ac5",
-   "holder": "fix:sparq-org/sparq#3451@dispatch-29646004745.1",
-   "package": "sparq-trust",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784381186,
-   "expires_at": 1784384786
-  },
-  {
    "account": "acct06",
    "claim_id": "11913d8d1f7642efadc6029a0bf44249",
    "holder": "fix:sparq-org/sparq#3456@dispatch-29646138956.1",
