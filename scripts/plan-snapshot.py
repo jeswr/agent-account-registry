@@ -244,9 +244,41 @@ def _pr_status_snapshot(fetch, claim, repo, pulls):
 
 
 def snapshot_targets(fetch, claim, repos, out_dir):
+    """Per-repo degradation (registry pipeline-failure-visibility, audit modes #2/#3): the
+    repo-level issues/pulls listing was SWEEP-FATAL — one repo's real 5xx/403/429/timeout (after
+    retries), a non-list page, or a target legitimately grown past the 5000-entry ceiling raised a
+    FetchError that killed PLAN for EVERY target (and, because CLAIM's always() alarm steps are
+    skipped on a PLAN crash, silenced the whole tick). Now a repo whose listing fails writes an
+    INCOMPLETE snapshot (`complete: False` + `snapshot_error`) for ITSELF and the sweep continues to
+    the other target; the downstream planner skips that repo with a recorded reason routed into
+    `snapshot_skips`, so it surfaces in the always() alarm instead of dying silently. A degraded
+    repo emits ZERO ready rows (fail-closed): a listing we could not complete must never look
+    empty-and-therefore-groomable to a downstream consumer."""
+    degraded = 0
     for index, repo in enumerate(repos):
-        issues = _paginated(fetch, f"/repos/{repo}/issues?state=open")
-        pulls = _paginated(fetch, f"/repos/{repo}/pulls?state=open")
+        try:
+            issues = _paginated(fetch, f"/repos/{repo}/issues?state=open")
+            pulls = _paginated(fetch, f"/repos/{repo}/pulls?state=open")
+        except FetchError as exc:
+            # Per-repo degrade: mark THIS repo incomplete (fail-closed: no items) and keep going.
+            # The recorded reason is the STABLE token dispatch-claim.py allowlists
+            # (`repo-degraded:listing-failed` after the assemble step's fold) — raw exception
+            # text would mint a dynamic reason validate_plan rejects, re-killing the sweep this
+            # degradation exists to save. The human diagnostic stays in the ::warning:: line.
+            degraded += 1
+            reason = "listing-failed"
+            print(f"::warning::SNAPSHOT repo {repo} DEGRADED (listing failed): {exc}")
+            Path(out_dir, f"raw-issues-{index}.json").write_text(
+                json.dumps({"complete": False, "items": [], "snapshot_error": reason}),
+                encoding="utf-8")
+            Path(out_dir, f"raw-pulls-{index}.json").write_text(
+                json.dumps({"complete": False, "items": [], "snapshot_error": reason}),
+                encoding="utf-8")
+            Path(out_dir, f"raw-prstatus-{index}.json").write_text(
+                json.dumps({"complete": False, "items": {}, "skips": [],
+                            "snapshot_error": reason}),
+                encoding="utf-8")
+            continue
         Path(out_dir, f"raw-issues-{index}.json").write_text(
             json.dumps({"complete": True, "items": issues}), encoding="utf-8")
         Path(out_dir, f"raw-pulls-{index}.json").write_text(
@@ -257,7 +289,14 @@ def snapshot_targets(fetch, claim, repos, out_dir):
         Path(out_dir, f"raw-prstatus-{index}.json").write_text(
             json.dumps({"complete": True, "items": status_items, "skips": skips}),
             encoding="utf-8")
-    print(f"SNAPSHOT complete for {len(repos)} target repo(s)")
+    if degraded == len(repos) and repos:
+        # EVERY target failed to list — that is a fleet-wide fetch outage, not a per-repo blip;
+        # keep the sweep FATAL so the dispatch alarm job fires on the PLAN failure (a silently
+        # all-empty plan would look like a healthy empty backlog).
+        raise SystemExit(
+            f"every target repo ({len(repos)}) failed its listing — fleet-wide fetch failure")
+    print(f"SNAPSHOT complete for {len(repos)} target repo(s) "
+          f"({degraded} degraded per-repo)")
 
 
 def _self_test():
@@ -379,7 +418,9 @@ def _self_test():
     items, skips = _pr_status_snapshot(fake_fetch, claim, repo, census)
     assert items == {} and skips == [{"pr_number": 0, "reason": "worker-pr-census-overflow"}]
 
-    # Repo-level listings stay sweep-fatal: a runaway issues walk still refuses the snapshot.
+    # Repo-level listings stay sweep-fatal AT THE _paginated LAYER: a runaway issues walk still
+    # refuses the snapshot (the ceiling itself is unchanged). The per-repo DEGRADATION below is a
+    # LAYER ABOVE it in snapshot_targets — the FetchError no longer kills the whole sweep.
     def endless(url):
         return [{"n": 1} for _ in range(100)]
     try:
@@ -388,6 +429,73 @@ def _self_test():
         pass
     else:
         raise AssertionError("runaway repo listing must stay fail-closed")
+
+    # PER-REPO DEGRADATION (audit modes #2/#3): one target whose listing fails must NOT kill the
+    # sweep — it degrades to complete:False + a recorded reason, and the OTHER target still snapshots
+    # fully. Mutation-checked: reverting snapshot_targets to re-raise turns this red.
+    good, bad = "example/good", "example/bad"
+
+    def two_repo_fetch(url):
+        base = url.split("?")[0]
+        if base.endswith(f"/repos/{bad}/issues") or base.endswith(f"/repos/{bad}/pulls"):
+            raise FetchError("simulated 503 after retries")
+        if base.endswith(f"/repos/{good}/issues"):
+            return []
+        if base.endswith(f"/repos/{good}/pulls"):
+            return []
+        raise AssertionError(f"unexpected fetch {url}")
+
+    with tempfile.TemporaryDirectory() as out_dir:
+        # good is index 0, bad is index 1
+        snapshot_targets(two_repo_fetch, claim, [good, bad], out_dir)
+        good_doc = json.loads(Path(out_dir, "raw-issues-0.json").read_text(encoding="utf-8"))
+        bad_doc = json.loads(Path(out_dir, "raw-issues-1.json").read_text(encoding="utf-8"))
+        bad_pulls = json.loads(Path(out_dir, "raw-pulls-1.json").read_text(encoding="utf-8"))
+        bad_prstatus = json.loads(Path(out_dir, "raw-prstatus-1.json").read_text(encoding="utf-8"))
+    assert good_doc["complete"] is True, "the healthy target must still snapshot fully"
+    assert bad_doc["complete"] is False, "the failing target must degrade, not kill the sweep"
+    assert "snapshot_error" in bad_doc and bad_doc["items"] == [], "degraded repo is fail-closed"
+    # every degraded file for that repo is marked (issues, pulls, prstatus) so the planner + the
+    # assemble step both see it and route it into snapshot_skips (the always() alarm).
+    assert bad_pulls["complete"] is False and bad_prstatus["complete"] is False
+    # END-TO-END allowlist link (review P1): the recorded reason must be the STABLE token whose
+    # `repo-degraded:`-prefixed form the CLAIM-side validator accepts — raw exception text here
+    # would make the degraded plan FAIL final validation and re-kill the sweep. The fold below is
+    # exactly what the dispatch.yml assemble step runs.
+    assert bad_doc["snapshot_error"] == "listing-failed", bad_doc["snapshot_error"]
+    folded = claim.fold_degraded_repos(
+        [{"target_repo": bad, "reason": bad_doc["snapshot_error"]}])
+    assert folded == [{"repo": bad, "pr_number": 0, "reason": "repo-degraded:listing-failed"}]
+    assert all(skip["reason"] in claim.SNAPSHOT_SKIP_REASONS for skip in folded)
+
+    # FIRST-target degradation (round-3 review: only the LAST-target case was exercised): the
+    # degraded repo at index 0 must degrade IN PLACE — the healthy second target still snapshots
+    # fully into ITS OWN index-1 artifacts (the index-shift regression made the second target
+    # read index 0). The full index-sensitive ASSEMBLY of both orderings runs in
+    # dispatch-claim.py's end-to-end self-test against the actual dispatch.yml heredocs.
+    with tempfile.TemporaryDirectory() as out_dir:
+        # bad is index 0 (FIRST), good is index 1
+        snapshot_targets(two_repo_fetch, claim, [bad, good], out_dir)
+        first_bad = json.loads(Path(out_dir, "raw-issues-0.json").read_text(encoding="utf-8"))
+        second_good = json.loads(Path(out_dir, "raw-issues-1.json").read_text(encoding="utf-8"))
+        second_good_pulls = json.loads(
+            Path(out_dir, "raw-pulls-1.json").read_text(encoding="utf-8"))
+    assert first_bad["complete"] is False and first_bad["snapshot_error"] == "listing-failed", \
+        "a FIRST-target failure must degrade in place at index 0"
+    assert second_good["complete"] is True and second_good_pulls["complete"] is True, \
+        "a FIRST-target degradation must leave the second target fully snapshotted at index 1"
+
+    # BUT a FLEET-WIDE listing failure (EVERY target fails) stays FATAL: an all-empty plan must not
+    # masquerade as a healthy empty backlog — the dispatch alarm job needs the PLAN failure to fire.
+    def all_fail_fetch(url):
+        raise FetchError("simulated global outage")
+    with tempfile.TemporaryDirectory() as out_dir:
+        try:
+            snapshot_targets(all_fail_fetch, claim, [good, bad], out_dir)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a fleet-wide listing failure must stay sweep-fatal")
 
     print("plan-snapshot self-test PASSED")
     return 0

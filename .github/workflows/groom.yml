@@ -119,7 +119,15 @@ jobs:
       # upserts ONE ops-alert issue per (condition, provider). An unreadable ledger exits NONZERO
       # (every reader fails loud, review r3); continue-on-error keeps the maintenance sweep alive
       # while this step goes visibly red. Account identifiers stay salted (decision 22a).
+      #
+      # [FABLE-5] `id` + the guard step below: continue-on-error keeps the sweep alive (grooming
+      # already ran) but a bare continue-on-error step failure does NOT set groom.result=failure, so
+      # the always()-final `alarm` job (keyed on needs.groom.result) would NOT fire and this
+      # load-bearing provider-cap alerting step could crash SILENTLY (visible only as a buried
+      # per-step annotation — exactly the posture this PR eliminates). The guard re-raises the
+      # decide outcome AFTER the sweep is safely complete, so groom reddens → the alarm fires.
       - name: Decide + raise/close model-access health alerts
+        id: model_health_decide
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -137,3 +145,70 @@ jobs:
           set -uo pipefail
           python3 scripts/model-health.py --self-test
           python3 scripts/model-health.py decide --policy-file policy/repos.toml
+
+      # [FABLE-5] Surface a swallowed decide failure into the JOB result so the always() alarm fires.
+      # The decide step is continue-on-error (the sweep must survive), but that ALSO hides its
+      # failure from the job-level alarm — a silent-failure gap for the load-bearing provider-cap
+      # alerting. This step runs last, after grooming is safely done, and reddens groom iff decide
+      # failed, so needs.groom.result becomes 'failure' and the alarm records it LOUDLY.
+      - name: Fail the job if the model-health decision step failed (so the alarm fires)
+        if: ${{ steps.model_health_decide.outcome == 'failure' }}
+        run: |
+          echo "::error::model-health decide step failed — reddening groom so the pipeline alarm fires (grooming itself completed)"
+          exit 1
+
+  # [FABLE-5] Loud-fail alarm — the STRUCTURAL GAP the audit flagged: groom.yml had NO
+  # always()/failure()-final alarm, so a failed scheduled groom surfaced ONLY as a red Actions run
+  # (the silent class the maintainer is fighting). groom is the ONLY crash-recovery path, so a
+  # silent groom failure freezes recovery fleet-wide. This job needs: groom and fires on its
+  # failure/cancel, upserting the single rolling pipeline-failure issue.
+  alarm:
+    needs: groom
+    if: ${{ always() && (needs.groom.result == 'failure' || needs.groom.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          job-name: groom
+          job-result: ${{ needs.groom.result }}
+          cancelled: ${{ needs.groom.result == 'cancelled' }}
+          detail: "groom sweep ${{ needs.groom.result }} — the crash-recovery path failed; recovery is frozen this tick"
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
+
+  # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): a healthy groom
+  # sweep prunes groom's rows from the rolling pipeline alert (--resolve), so a recovered groom
+  # never pins the alert open forever. Never reddens; a green tick with no open alert is one list.
+  recover:
+    needs: groom
+    if: ${{ always() && needs.groom.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      # actions:read — --resolve prunes only rows OLDER than this run's START
+      # (run_started_at via the runs API; round-5 P1 — the recover job's own execution
+      # time let an overlapping run's concurrent failure be pruned as recovered).
+      # Without it the script SKIPS recovery (fail closed).
+      actions: read
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          mode: resolve
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}

@@ -14,6 +14,10 @@
 # anthropic-ratelimit-unified-* response headers are read. Tokens come from SECRETS_JSON (toJSON(secrets))
 # by each account's secret_ref and are NEVER printed. FAIL-CLOSED: an account whose token is missing or
 # whose probe returns no rate-limit headers is OMITTED from the map, so choose_account() will skip it.
+# Because those omits still exit 0, the snapshot alone cannot prove probe health ([FABLE-5] round-9 P1:
+# `{}` is not health) — when USAGE_COVERAGE_OUTPUT is set, a SEMANTIC coverage verdict
+# (`coverage_ok=true` iff every pool-admitted catalog account carries an entry; boolean only, locked
+# decision 22b) is appended there so callers (dashboard.yml) gate degraded-alarm/recovery on coverage.
 #
 # [FABLE-5] FABLE SUB-QUOTA: an Anthropic account has a SEPARATE weekly premium sub-quota for
 # claude-fable-5, surfaced as the `anthropic-ratelimit-unified-7d_oi-*` headers. It is DISTINCT from the
@@ -354,22 +358,24 @@ def persist_limits(usage_path):
     return 0
 
 
-def main():
-    import time
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    registry_repo = os.environ["REGISTRY_REPO"]
-    secrets = _load_secrets()
-    pool = json.loads(os.environ.get("ACCOUNT_POOL", "[]"))  # optional handle allow-list
-    now = time.time()
-    salt = os.environ.get("PROVENANCE_SALT", "")
+def _sweep(accounts, secrets, pool, salt, script_dir, now, probe_account=None):
+    """The probe sweep: (usage_map, expected_count). `expected_count` is the number of
+    pool-admitted catalog accounts that SHOULD carry a usage entry — the denominator of the
+    SEMANTIC coverage gate (round-9 P1: every fail-closed omit deliberately drops its account
+    from the map and the process still exits 0, so `{}` from a wholesale token/probe failure was
+    indistinguishable from health; the caller compares len(usage) against expected). Exempt
+    accounts always contribute an entry, so any shortfall comes from fail-closed omits.
+    `probe_account` is injectable for the self-test ONLY."""
     backoffs = None    # lazily loaded on the first probe-exempt account
     mh = None          # the model-health module once loaded (None until then / on load failure)
     salt_warned = False
+    expected = 0
     usage = {}
-    for account in _load_accounts(script_dir, registry_repo):
+    for account in accounts:
         handle = account["handle"]
         if pool and handle not in pool:
             continue
+        expected += 1
         if _is_exempt_provider(account.get("provider")):
             # Probe-exempt provider (decision 2026-07-17, issue #29): eligible without usage data,
             # reactively backed off via the model-health rate-limit records. No salt -> no hash
@@ -401,11 +407,52 @@ def main():
                       "admitted WITHOUT rate-limit backoff (fail-open)", file=sys.stderr)
             usage[handle] = entry
             continue
-        probed = _probe_account(account, secrets)
+        probed = (probe_account or _probe_account)(account, secrets)
         if probed is None:
             continue  # fail-closed omit: unknown provider / bad secret_ref / no token / failed probe
         usage[handle] = probed
+    return usage, expected
+
+
+def _coverage_line(covered, expected):
+    """The single `coverage_ok=` output line for the caller's health gate. True ONLY when every
+    expected account carries an entry (a duplicate-handle catalog bug undercounts `covered` and
+    correctly reads degraded). A BOOLEAN, deliberately not the counts themselves: the line lands
+    in a workflow output and locked decision 22b keeps account counts out of every public
+    log/surface — the gate needs only complete-vs-not."""
+    return "coverage_ok=" + ("true" if covered == expected else "false")
+
+
+def _write_coverage(covered, expected):
+    """Append the semantic-coverage verdict to the file named by USAGE_COVERAGE_OUTPUT (the
+    dashboard probe step passes $GITHUB_OUTPUT), so the caller can gate health on WHAT WAS
+    OBSERVED rather than on exit status (round-9 P1: exit 0 with a snapshot that silently omits
+    failed accounts — even `{}` — is not evidence of health). No-op when unset (dispatch's probe
+    path keeps its own usage-alert loudness). Fail direction of a failed/missing write: the
+    caller reads an EMPTY output, which its exact-'true' comparison treats as degraded."""
+    path = os.environ.get("USAGE_COVERAGE_OUTPUT")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(_coverage_line(covered, expected) + "\n")
+    except OSError:
+        print("::warning::account-usage: coverage output unwritable — the caller's probe-health "
+              "gate reads an empty output and fails closed to degraded", file=sys.stderr)
+
+
+def main():
+    import time
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    registry_repo = os.environ["REGISTRY_REPO"]
+    secrets = _load_secrets()
+    pool = json.loads(os.environ.get("ACCOUNT_POOL", "[]"))  # optional handle allow-list
+    now = time.time()
+    salt = os.environ.get("PROVENANCE_SALT", "")
+    usage, expected = _sweep(_load_accounts(script_dir, registry_repo), secrets, pool, salt,
+                             script_dir, now)
     json.dump(usage, sys.stdout)
+    _write_coverage(len(usage), expected)
     return 0
 
 
@@ -655,6 +702,73 @@ def _self_test():
                          "secret_ref": "REGISTRY_ADMIN_APP_KEY"},
                         {"REGISTRY_ADMIN_APP_KEY": "priv"},
                         probe=_rec_probe, fable_probe=_rec_probe), probe_calls), (None, []))
+    # ---- SEMANTIC probe coverage (round-9 P1) ----
+    #   a fail-closed omit still exits 0, so the caller's health gate must compare what was
+    #   OBSERVED against what the catalog expected — `{}` (or any partial map) is not health.
+    chk("coverage line: complete", _coverage_line(2, 2), "coverage_ok=true")
+    chk("coverage line: shortfall", _coverage_line(1, 2), "coverage_ok=false")
+    chk("coverage line: empty catalog is legitimately complete", _coverage_line(0, 0),
+        "coverage_ok=true")
+    stub_accounts = [
+        {"handle": "a1", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+         "models": ["haiku"]},
+        {"handle": "a2", "provider": "anthropic", "secret_ref": "ACCT02_TOKEN",
+         "models": ["haiku"]},
+        {"handle": "e1", "provider": "openai", "secret_ref": "ACCT03_TOKEN",
+         "models": ["gpt"]},
+    ]
+
+    def _half_probe(account, secrets):
+        return {"status": "allowed"} if account["handle"] == "a1" else None
+
+    swept_err = io.StringIO()
+    with contextlib.redirect_stderr(swept_err):   # the salt-missing fail-open warning
+        swept, swept_expected = _sweep(stub_accounts, {"ACCT01_TOKEN": "t", "ACCT02_TOKEN": "t"},
+                                       [], "", script_dir, 0, probe_account=_half_probe)
+    chk("sweep: expected counts every pool-admitted account", swept_expected, 3)
+    chk("sweep: a failed probe is omitted (exempt + healthy covered)",
+        sorted(swept), ["a1", "e1"])
+    chk("sweep: partial coverage gates DEGRADED even though the process exits 0",
+        _coverage_line(len(swept), swept_expected), "coverage_ok=false")
+    with contextlib.redirect_stderr(io.StringIO()):
+        full, full_expected = _sweep(stub_accounts, {}, [], "", script_dir, 0,
+                                     probe_account=lambda a, s: {"status": "allowed"})
+    chk("sweep: full coverage gates healthy",
+        _coverage_line(len(full), full_expected), "coverage_ok=true")
+    with contextlib.redirect_stderr(io.StringIO()):
+        pooled, pooled_expected = _sweep(stub_accounts, {}, ["a1"], "", script_dir, 0,
+                                         probe_account=lambda a, s: {"status": "allowed"})
+    chk("sweep: the pool filter narrows the expectation too", (sorted(pooled), pooled_expected),
+        (["a1"], 1))
+    #   the reviewer's repro: a MISSING token omits the account BEFORE any probe (no network in
+    #   this test) and the sweep 'succeeds' with {} — semantic coverage must read degraded.
+    missing_tok, missing_expected = _sweep(
+        [{"handle": "a1", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+          "models": ["haiku"]}], {}, [], "", script_dir, 0)
+    chk("missing token: {} snapshot with a nonzero expectation", (missing_tok, missing_expected),
+        ({}, 1))
+    chk("missing token: coverage gates DEGRADED, never healthy",
+        _coverage_line(len(missing_tok), missing_expected), "coverage_ok=false")
+    #   the coverage verdict reaches the caller's gate file; boolean only (locked decision 22b:
+    #   no account counts on any public surface)
+    saved_cov = os.environ.get("USAGE_COVERAGE_OUTPUT")
+    with tempfile.NamedTemporaryFile("r", suffix=".out", delete=False) as fh:
+        cov_path = fh.name
+    try:
+        os.environ["USAGE_COVERAGE_OUTPUT"] = cov_path
+        _write_coverage(1, 2)
+        with open(cov_path, encoding="utf-8") as fh:
+            cov_written = fh.read()
+        chk("coverage verdict written to the gate file", cov_written, "coverage_ok=false\n")
+        chk("coverage output carries no counts (decision 22b)",
+            any(ch.isdigit() for ch in cov_written), False)
+    finally:
+        if saved_cov is None:
+            os.environ.pop("USAGE_COVERAGE_OUTPUT", None)
+        else:
+            os.environ["USAGE_COVERAGE_OUTPUT"] = saved_cov
+        os.unlink(cov_path)
+    _write_coverage(1, 2)   # unset env: must be a silent no-op, never a crash
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

@@ -76,6 +76,19 @@ SNAPSHOT_SKIP_FIELDS = {"repo", "pr_number", "reason"}
 # armed-SHA-mismatch disarm (whose ACT is itself the safety measure) still fires.
 # Fail-closed per ITEM, never per sweep; never fail-OPEN on the disarm net; MONOTONE
 # under a forged marker (the unmarked outcome or do-nothing, never a different act).
+# Repo-level degradation (pipeline-failure-visibility): a target whose issues/pulls LISTING
+# failed is kept PLANNED-BUT-EMPTY (zero items — fail-closed, and the planned set still equals
+# enabled policy so CLAIM's manifest equality holds) and carries a pr_number-0 skip row with a
+# `repo-degraded:` reason. The reason SUFFIX is a closed set — plan-snapshot.py records the
+# stable `listing-failed` token (never raw exception text), and fold_degraded_repos() below
+# normalizes anything else to `snapshot-incomplete` — so the full reason is allowlistable here
+# and a degraded PLAN artifact validates END-TO-END instead of dying at CLAIM.
+REPO_DEGRADED_PREFIX = "repo-degraded:"
+REPO_DEGRADED_REASONS = {
+    "listing-failed",            # plan-snapshot.py: the repo's issues/pulls listing failed
+    "snapshot-file-unreadable",  # planner step: the raw-issues file is missing/garbled
+    "snapshot-incomplete",       # planner step: complete != True with no usable reason string
+}
 SNAPSHOT_SKIP_REASONS = {
     "check-runs-overflow",
     "check-runs-malformed",
@@ -83,7 +96,7 @@ SNAPSHOT_SKIP_REASONS = {
     "pr-detail-read-failed",
     "pr-detail-malformed",
     "worker-pr-census-overflow",
-}
+} | {REPO_DEGRADED_PREFIX + reason for reason in REPO_DEGRADED_REASONS}
 # needs-ci-fix / needs-rebase are the zero-manual repair states: same-provider fix runs (reuse
 # mode=fix) that target red full-matrix CI legs / a conflicting base instead of review findings.
 # stranded is the loud terminal escalation for {drafted, unarmed, reviewed-sha == head, green
@@ -428,6 +441,29 @@ def snapshot_skip_reasons(snapshot_skips):
     for skip in snapshot_skips:
         reasons[f"snapshot-skip:{skip['reason']}"] += 1
     return reasons
+
+
+def fold_degraded_repos(degraded_repos):
+    """PURE: normalize PLAN's per-repo degradation records into ALLOWLISTED snapshot_skips rows
+    (pr_number 0 = repo-wide). This is the single mapping the dispatch.yml assemble step calls, so
+    a degraded repo VALIDATES end-to-end: every emitted reason is a member of
+    SNAPSHOT_SKIP_REASONS by construction — an unexpected/dynamic reason string (exception text, a
+    future plan-snapshot token this validator predates) is coerced to `snapshot-incomplete` rather
+    than minting a reason validate_plan would reject and thereby re-killing the sweep the
+    degradation exists to save. Malformed entries are dropped (the plan validator would reject
+    anything they could contribute; the ::warning:: surface in the workflow already printed them)."""
+    skips = []
+    for degraded in degraded_repos or []:
+        if not isinstance(degraded, dict):
+            continue
+        repo = degraded.get("target_repo")
+        if not isinstance(repo, str) or not SAFE_REPO.fullmatch(repo):
+            continue
+        reason = degraded.get("reason")
+        if reason not in REPO_DEGRADED_REASONS:
+            reason = "snapshot-incomplete"
+        skips.append({"repo": repo, "pr_number": 0, "reason": REPO_DEGRADED_PREFIX + reason})
+    return skips
 
 
 def decide_repair_admission(state, mergeable, gate, draft):
@@ -1500,6 +1536,18 @@ def _enabled_repositories(policy_doc, policy_module):
     return enabled
 
 
+def check_manifest_equality(plan, policy_doc, policy_module):
+    """CLAIM's policy-manifest gate, extracted from dispatch() so the degraded-PLAN end-to-end
+    self-test exercises the ACTUAL check (round-3 review): the planned repository set must
+    EXACTLY equal the enabled registry policy set. A degraded repo is PLANNED-BUT-EMPTY at its
+    original index precisely so this equality still holds — un-planning it must fail here."""
+    planned_repositories = {entry["target_repo"] for entry in plan["repositories"]}
+    enabled_repositories = _enabled_repositories(policy_doc, policy_module)
+    if planned_repositories != enabled_repositories:
+        raise DispatchError("PLAN target manifest does not exactly match enabled registry policy")
+    return planned_repositories
+
+
 def _release_failed_dispatch(allocator, registry_repo, claim_id):
     try:
         return allocator.release(registry_repo, claim_id, int(time.time()))
@@ -1548,10 +1596,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     except (OSError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
         raise DispatchError("cannot load dispatcher plan or policy") from exc
 
-    planned_repositories = {entry["target_repo"] for entry in plan["repositories"]}
-    enabled_repositories = _enabled_repositories(policy_doc, policy_module)
-    if planned_repositories != enabled_repositories:
-        raise DispatchError("PLAN target manifest does not exactly match enabled registry policy")
+    check_manifest_equality(plan, policy_doc, policy_module)
     if not workflow_ref or "\n" in workflow_ref or "\r" in workflow_ref:
         raise DispatchError("worker workflow ref is missing or unsafe")
 
@@ -1896,6 +1941,210 @@ def _self_test():
         with open(summary_file, encoding="utf-8") as handle:
             recorded = json.load(handle)
     assert recorded["defer_reasons"]["snapshot-skip:check-runs-overflow"] == 1
+
+    # ---- repo-level degradation validates END-TO-END (review P1: the degraded PLAN path) ----
+    # A target whose listing failed is kept PLANNED-BUT-EMPTY at its ORIGINAL index (so the
+    # assemble step's per-index artifact reads stay aligned and the planned set still equals
+    # enabled policy — CLAIM's manifest-equality gate), and its pr_number-0 `repo-degraded:*`
+    # skip row — built by the SAME fold_degraded_repos the assemble step calls — must pass the
+    # hostile-plan validator. Both the FIRST-target and the LAST-target degradation validate.
+    degraded_first = json.loads(json.dumps(fixture))
+    degraded_first["repositories"] = [
+        {"target_repo": "example/degraded", "target_sha": "0" * 40, "items": []},
+        degraded_first["repositories"][0],
+    ]
+    degraded_first["snapshot_skips"] = sorted(
+        degraded_first["snapshot_skips"]
+        + fold_degraded_repos([{"target_repo": "example/degraded", "reason": "listing-failed"}]),
+        key=lambda skip: (skip["repo"], skip["pr_number"]))
+    assert validate_plan(degraded_first) is degraded_first
+    # planned set retains the degraded repo: the CLAIM-side manifest equality
+    # (planned == enabled policy) holds — degradation no longer un-plans the repo.
+    assert {entry["target_repo"] for entry in degraded_first["repositories"]} == \
+        {"example/degraded", "example/repo"}
+    degraded_last = json.loads(json.dumps(fixture))
+    degraded_last["repositories"] = degraded_last["repositories"] + [
+        {"target_repo": "example/zdegraded", "target_sha": "0" * 40, "items": []}]
+    degraded_last["snapshot_skips"] = sorted(
+        degraded_last["snapshot_skips"]
+        + fold_degraded_repos([{"target_repo": "example/zdegraded",
+                                "reason": "snapshot-file-unreadable"}]),
+        key=lambda skip: (skip["repo"], skip["pr_number"]))
+    assert validate_plan(degraded_last) is degraded_last
+    # the degraded rows fold into the same defer-reason histogram (visible in the tick summary)
+    assert snapshot_skip_reasons(fold_degraded_repos(
+        [{"target_repo": "example/degraded", "reason": "listing-failed"}])) == \
+        {"snapshot-skip:repo-degraded:listing-failed": 1}
+    # fold_degraded_repos NEVER emits a reason the validator rejects: a dynamic/unknown reason
+    # (raw exception text, a future plan-snapshot token) coerces to `snapshot-incomplete`;
+    # malformed rows drop entirely (nothing they contribute could validate).
+    folded_degraded = fold_degraded_repos([
+        {"target_repo": "example/repo", "reason": "listing-failed"},
+        {"target_repo": "example/repo", "reason": "listing-failed:HTTP 503 for https://x"},
+        {"target_repo": "bad repo name", "reason": "listing-failed"},
+        "not-a-dict",
+    ])
+    assert [skip["reason"] for skip in folded_degraded] == [
+        "repo-degraded:listing-failed", "repo-degraded:snapshot-incomplete"]
+    assert all(skip["reason"] in SNAPSHOT_SKIP_REASONS for skip in folded_degraded)
+    assert fold_degraded_repos(None) == []
+
+    # ---- END-TO-END degraded PLAN (round-3 review): the ACTUAL dispatch.yml heredocs ----------
+    # The fabricated-plan assertions above lock the validator; the round-3 review asked for the
+    # degradation to run through the workflow's INDEX-SENSITIVE assembly itself plus CLAIM's
+    # policy-manifest check. The two PLAN heredocs are deliberately inline in dispatch.yml (they
+    # run AFTER target code executes in the same job, so only the workflow file itself is
+    # tamper-proof — they cannot be extracted into a registry script without weakening REG-4).
+    # So this test executes the REAL heredoc text: extract both blocks from dispatch.yml, run
+    # them against a fixture workspace with the FIRST and then the LAST target degraded, and pass
+    # the emitted plan through validate_plan + check_manifest_equality — the same final
+    # validations CLAIM applies. The 2026-07-16 regression (degrading the FIRST target shifted
+    # every later repo's compressed index off its per-index raw-*.json artifacts) goes red here.
+    import shutil
+    import textwrap
+
+    def _extract_heredoc(workflow_text, invocation_marker):
+        lines = workflow_text.splitlines()
+        for lineno, line in enumerate(lines):
+            if invocation_marker in line:
+                block = []
+                for candidate in lines[lineno + 1:]:
+                    if candidate.strip() == "PY":
+                        return textwrap.dedent("\n".join(block))
+                    block.append(candidate)
+        raise AssertionError(f"heredoc {invocation_marker!r} not found in dispatch.yml")
+
+    repo_root = Path(__file__).resolve().parent.parent
+    dispatch_wf = (repo_root / ".github" / "workflows" / "dispatch.yml").read_text(
+        encoding="utf-8")
+    plan_code = _extract_heredoc(
+        dispatch_wf, '- "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP" <<')
+    assemble_code = _extract_heredoc(dispatch_wf, '- "$RUNNER_TEMP" "$RUNNER_TEMP/plan.json" <<')
+
+    def _run_degraded_pipeline(degraded_index, fake_repos):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            out = tmp / "out"
+            out.mkdir()
+            target_root = tmp / "targets"
+            repos_txt = tmp / "repos.txt"
+            repos_txt.write_text("\n".join(fake_repos) + "\n", encoding="utf-8")
+            for index, _repo in enumerate(fake_repos):
+                target = target_root / str(index)
+                (target / "scripts").mkdir(parents=True)
+                # the registry is itself a real onboarded target: its own planner stack is the
+                # genuine article for the heredoc's load_dispatch()/compute_ready()/plan_dispatch()
+                for helper in ("dispatch-plan.py", "ready-issues.py", "route-resolve.py"):
+                    shutil.copy(repo_root / "scripts" / helper, target / "scripts" / helper)
+                (target / "orchestration").mkdir()
+                shutil.copy(repo_root / "orchestration" / "routing.toml",
+                            target / "orchestration" / "routing.toml")
+                subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+                subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit",
+                                "-q", "--allow-empty", "-m", "fixture"], cwd=target, check=True)
+                if index == degraded_index:
+                    (out / f"raw-issues-{index}.json").write_text(json.dumps(
+                        {"complete": False, "items": [],
+                         "snapshot_error": "listing-failed"}), encoding="utf-8")
+                    continue   # a degraded repo's pulls/prstatus snapshots are legitimately absent
+                issue = {"number": 100 + index, "state": "open",
+                         "body": f"ready fixture {index}",
+                         "labels": [{"name": "status:ready"}, {"name": "priority:P1"},
+                                    {"name": "role:impl"}, {"name": "area:usage"}],
+                         "user": {"login": "jeswr"}, "author_association": "OWNER"}
+                (out / f"raw-issues-{index}.json").write_text(json.dumps(
+                    {"complete": True, "items": [issue]}), encoding="utf-8")
+                (out / f"raw-pulls-{index}.json").write_text(json.dumps(
+                    {"complete": True, "items": []}), encoding="utf-8")
+            saved_argv = list(sys.argv)
+            saved_target_root = os.environ.get("TARGET_ROOT")
+            saved_github_output = os.environ.get("GITHUB_OUTPUT")
+            saved_cwd = os.getcwd()
+            try:
+                # phase 1: the ACTUAL index-sensitive PLAN heredoc (builds issue-plan.json +
+                # per-index pulls/issue-labels artifacts, degraded repo planned-but-empty)
+                sys.argv = ["-", str(repos_txt), str(out)]
+                os.environ["TARGET_ROOT"] = str(target_root)
+                exec(compile(plan_code, "dispatch.yml#plan-heredoc", "exec"), {})
+                # phase 2: the ACTUAL assemble heredoc (registry code only, local data), which
+                # ends by running claim_mod.validate_plan on the assembled document. GITHUB_OUTPUT
+                # captures the degraded job outputs the alarm/recover jobs consume (round-5 P1).
+                work = tmp / "work"
+                (work / "registry" / "scripts").mkdir(parents=True)
+                shutil.copy(repo_root / "scripts" / "dispatch-claim.py",
+                            work / "registry" / "scripts" / "dispatch-claim.py")
+                (work / "registry-ledger" / "data").mkdir(parents=True)
+                (work / "registry-ledger" / "data" / "leases.json").write_text(
+                    json.dumps({"leases": []}), encoding="utf-8")
+                plan_file = work / "plan.json"
+                gh_output_file = tmp / "github-output.txt"
+                os.environ["GITHUB_OUTPUT"] = str(gh_output_file)
+                sys.argv = ["-", str(out), str(plan_file)]
+                os.chdir(work)
+                exec(compile(assemble_code, "dispatch.yml#assemble-heredoc", "exec"), {})
+                gh_output = gh_output_file.read_text(encoding="utf-8") \
+                    if gh_output_file.is_file() else ""
+                return json.loads(plan_file.read_text(encoding="utf-8")), gh_output
+            finally:
+                os.chdir(saved_cwd)
+                sys.argv = saved_argv
+                if saved_target_root is None:
+                    os.environ.pop("TARGET_ROOT", None)
+                else:
+                    os.environ["TARGET_ROOT"] = saved_target_root
+                if saved_github_output is None:
+                    os.environ.pop("GITHUB_OUTPUT", None)
+                else:
+                    os.environ["GITHUB_OUTPUT"] = saved_github_output
+
+    e2e_policy_row = {"enabled": True, "routing": "orchestration/routing.toml",
+                      "account_pool": ["acct01"], "max_concurrent": 1,
+                      "worker_timeout_minutes": 30, "gate_profile": "none",
+                      "arm_auto_merge": False, "max_attempts": 1, "dispatch": "cron",
+                      "trust": "collaborators"}
+    e2e_policy_module = _load_module(
+        "registry_policy_resolve_e2e", Path(__file__).resolve().parent / "policy-resolve.py")
+    e2e_repos = ["example/alpha", "example/beta", "example/gamma"]
+    for degraded_index in (0, len(e2e_repos) - 1):     # FIRST and LAST target degraded
+        e2e_plan, e2e_gh_output = _run_degraded_pipeline(degraded_index, e2e_repos)
+        # The degraded surface is a JOB OUTPUT (round-5 P1): the always() alarm job raises the
+        # non-terminal `repo-degraded` row from it and recover gates on `degraded == '0'`, so
+        # the REAL heredoc must emit both lines — a silent partial PLAN goes red here.
+        assert "degraded=1\n" in e2e_gh_output, e2e_gh_output
+        assert f"degraded_repos={e2e_repos[degraded_index]}\n" in e2e_gh_output, e2e_gh_output
+        # original order + indices preserved: the degraded repo is PLANNED-BUT-EMPTY in place
+        assert [entry["target_repo"] for entry in e2e_plan["repositories"]] == e2e_repos, \
+            f"degraded index {degraded_index} must not reorder/unplan the manifest"
+        for index, entry in enumerate(e2e_plan["repositories"]):
+            assert re.fullmatch(r"[0-9a-f]{40}", entry["target_sha"])
+            if index == degraded_index:
+                assert entry["items"] == [], "a degraded repo must be planned EMPTY (fail-closed)"
+            else:
+                # THE index-alignment point: each healthy repo's item numbers were seeded
+                # per-index (100+i), so a shifted read of another repo's artifacts goes red here
+                assert [item["number"] for item in entry["items"]] == [100 + index], \
+                    (f"healthy repo at index {index} must plan from ITS OWN per-index "
+                     f"artifacts (degraded index {degraded_index})")
+        assert {"repo": e2e_repos[degraded_index], "pr_number": 0,
+                "reason": "repo-degraded:listing-failed"} in e2e_plan["snapshot_skips"], \
+            "the degradation must surface as a repo-degraded snapshot skip"
+        # final validation with the module under test (the assemble heredoc already ran its own
+        # loaded copy's validate_plan — this locks the running module too)
+        assert validate_plan(e2e_plan) is e2e_plan
+        # CLAIM's policy-manifest gate: planned-but-empty keeps the equality TRUE...
+        e2e_policy = {"repos": {repo: dict(e2e_policy_row) for repo in e2e_repos}}
+        check_manifest_equality(e2e_plan, e2e_policy, e2e_policy_module)
+        # ...and the old regression (un-planning the degraded repo) FAILS the gate loudly
+        unplanned = json.loads(json.dumps(e2e_plan))
+        unplanned["repositories"] = [entry for i, entry in enumerate(unplanned["repositories"])
+                                     if i != degraded_index]
+        try:
+            check_manifest_equality(unplanned, e2e_policy, e2e_policy_module)
+        except DispatchError:
+            pass
+        else:
+            raise AssertionError("an un-planned degraded repo must FAIL the manifest gate")
+
     assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"})
     assert _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"})
     assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"})
@@ -1937,6 +2186,10 @@ def _self_test():
             (lambda d: d.pop("snapshot_skips"), "missing snapshot_skips"),
             (lambda d: d["snapshot_skips"][0].update(unknown=True), "unknown snapshot skip field"),
             (lambda d: d["snapshot_skips"][0].update(reason="because"), "invalid snapshot skip reason"),
+            (lambda d: d["snapshot_skips"][0].update(reason="repo-degraded:listing-failed:HTTP 503"),
+             "dynamic (non-allowlisted) repo-degraded reason"),
+            (lambda d: d["snapshot_skips"][0].update(reason="repo-degraded:because"),
+             "unknown repo-degraded reason suffix"),
             (lambda d: d["snapshot_skips"][0].update(reason=[]), "unhashable snapshot skip reason"),
             (lambda d: d["snapshot_skips"][0].update(repo="not/planned"), "unplanned snapshot skip repo"),
             (lambda d: d["snapshot_skips"][0].update(pr_number=-1), "negative snapshot skip pr_number"),

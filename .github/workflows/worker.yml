@@ -1172,3 +1172,90 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run dispatch.yml -R "$GITHUB_REPOSITORY" || echo "::warning::doorbell ring failed (cron backstop covers this tick)"
+
+  # [FABLE-5] Loud-fail alarm — worker.yml had no always()-final alarm. It fires only on a genuine
+  # failure/cancel of any job (NOT skip: worker has extensive by-design dry_run/conditional skips
+  # that are not failures). The detail carries NO account handle or transcript — only the per-job
+  # result strings, mirroring the host-observable posture of worker-live.sh. This makes a failed
+  # worker (a lost implementation attempt) visible instead of a silent red run.
+  alarm:
+    needs: [resolve, claim, worker, provenance, model_health, release, doorbell]
+    if: >-
+      ${{ always() && (
+        contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+      ) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          # [FABLE-5] Name the job from WHICHEVER job actually failed/was cancelled, so distinct
+          # failure modes get distinct ledger rows instead of collapsing every post-run failure
+          # (provenance/model_health/release/doorbell) into one indistinguishable `worker-post`
+          # bucket where _merge_row would overwrite each other's diagnostic detail after the first.
+          job-name: >-
+            ${{ (needs.resolve.result == 'failure' || needs.resolve.result == 'cancelled') && 'resolve'
+             || (needs.claim.result == 'failure' || needs.claim.result == 'cancelled') && 'claim'
+             || (needs.worker.result == 'failure' || needs.worker.result == 'cancelled') && 'worker'
+             || (needs.provenance.result == 'failure' || needs.provenance.result == 'cancelled') && 'provenance'
+             || (needs.model_health.result == 'failure' || needs.model_health.result == 'cancelled') && 'model_health'
+             || (needs.release.result == 'failure' || needs.release.result == 'cancelled') && 'release'
+             || (needs.doorbell.result == 'failure' || needs.doorbell.result == 'cancelled') && 'doorbell'
+             || 'worker-post' }}
+          job-result: failure
+          cancelled: ${{ contains(needs.*.result, 'cancelled') }}
+          detail: >-
+            worker run: resolve=${{ needs.resolve.result }} claim=${{ needs.claim.result }}
+            worker=${{ needs.worker.result }} provenance=${{ needs.provenance.result }}
+            model_health=${{ needs.model_health.result }} release=${{ needs.release.result }}
+            doorbell=${{ needs.doorbell.result }} — an implementation attempt failed
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
+
+  # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): a healthy
+  # worker run prunes worker's rows from the rolling pipeline alert (--resolve), so a recovered
+  # worker never pins the alert open forever. Healthy = evidence of a SUCCESSFUL LIVE ATTEMPT
+  # (round-8 P1: `worker.result == success` alone also holds for a dry_run — the default input —
+  # and for a no-lease run where claim succeeds with acquired != true and the worker job runs
+  # mostly skipped; either would have pruned REAL prior failure rows on the strength of a run
+  # that attempted nothing). Required evidence: a live (non-dry-run) invocation, an actually
+  # acquired lease, the worker job green, AND its successful terminal output — the opened DRAFT
+  # PR (pr_number, set only when model → gate → publish all succeeded; the same discriminator
+  # the provenance job trusts) — with no job failed or cancelled. The exact-string comparisons
+  # are fail-closed: a missing/empty output skips recovery. Never reddens; cheap no-op with no
+  # open alert.
+  recover:
+    needs: [resolve, claim, worker, provenance, model_health, release, doorbell]
+    if: >-
+      ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' &&
+          needs.worker.result == 'success' && needs.worker.outputs.pr_number != '' &&
+          !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      # actions:read — --resolve prunes only rows OLDER than this run's START
+      # (run_started_at via the runs API; round-5 P1 — the recover job's own execution
+      # time let an overlapping run's concurrent failure be pruned as recovered).
+      # Without it the script SKIPS recovery (fail closed).
+      actions: read
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          mode: resolve
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}

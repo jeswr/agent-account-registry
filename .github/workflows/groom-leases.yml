@@ -23,3 +23,53 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Reclaim expired leases
         run: python3 scripts/select-and-claim.py --reclaim --repo "${{ github.repository }}"
+
+  # [FABLE-5] Loud-fail alarm: a silent groom-leases failure = leases linger = slots pinned =
+  # dispatch starves (the same stale-arm/busy-area freeze class). This job needs: reclaim and fires
+  # ONLY on its failure/cancel, upserting the single rolling pipeline-failure issue.
+  alarm:
+    needs: reclaim
+    if: ${{ always() && (needs.reclaim.result == 'failure' || needs.reclaim.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          job-name: reclaim
+          job-result: ${{ needs.reclaim.result }}
+          cancelled: ${{ needs.reclaim.result == 'cancelled' }}
+          detail: "groom-leases reclaim ${{ needs.reclaim.result }} — expired leases may still pin worker slots"
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
+
+  # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): a healthy
+  # reclaim prunes groom-leases' rows from the rolling pipeline alert (--resolve), so a recovered
+  # lease groomer never pins the alert open forever. Never reddens; cheap no-op with no open alert.
+  recover:
+    needs: reclaim
+    if: ${{ always() && needs.reclaim.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      # actions:read — --resolve prunes only rows OLDER than this run's START
+      # (run_started_at via the runs API; round-5 P1 — the recover job's own execution
+      # time let an overlapping run's concurrent failure be pruned as recovered).
+      # Without it the script SKIPS recovery (fail closed).
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pipeline-alarm
+        with:
+          mode: resolve
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
