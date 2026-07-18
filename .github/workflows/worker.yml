@@ -880,12 +880,54 @@ jobs:
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back
 
+      - name: Purge the account credential and scrub its env before the target-controlled gate
+        id: purge
+        # Credential-safety (registry #124): the write-back step above has already persisted any
+        # rotated credential to the registry secret, so from here on NOTHING legitimately needs the
+        # live account credential — yet the next steps run target-CONTROLLED cargo (build scripts /
+        # tests) host-side. Previously the prepare step's HOME, raw account handle, and credential
+        # paths persisted in $GITHUB_ENV through the gate, so a hostile build script could read or
+        # exfiltrate the full/rotated credential. Delete the whole credential tree (the isolated
+        # HOME, the rotation baseline, any source copy), hand the gate a FRESH credential-free HOME,
+        # and scrub the inherited account handle + credential-path vars from the job env BEFORE any
+        # target-controlled process runs. Fail closed: the Rust-toolchain and gate steps below run
+        # only when this step succeeded, so a failed purge blocks all target code.
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: |
+          set -euo pipefail
+          gate_home="$WORKER_ROOT/gate-home"
+          rm -rf -- "$gate_home"
+          mkdir -p -- "$gate_home"
+          chmod 700 "$gate_home"
+          # Remove every credential-bearing path materialized by worker-prep / the model run.
+          rm -rf -- "$WORKER_ROOT/home" "$WORKER_ROOT/.credential-baseline" "$WORKER_ROOT/.selected-credential"
+          for leftover in "$WORKER_ROOT/home" "$WORKER_ROOT/.credential-baseline" "$WORKER_ROOT/.selected-credential"; do
+            [[ ! -e "$leftover" ]] || { echo "::error::credential material $leftover survived the purge"; exit 1; }
+          done
+          # Repoint HOME/CODEX_HOME at the fresh credential-free directory the gate (and later host
+          # steps) will use, and blank the account handle + credential paths so no later step (the
+          # gate, publish) inherits a pointer to a credential. WORKER_PROVIDER/HARNESS/
+          # CREDENTIAL_FORMAT are intentionally kept — publish still needs the provider, and none of
+          # them name a secret or a credential path.
+          {
+            printf 'HOME=%s\n' "$gate_home"
+            printf 'CODEX_HOME=%s\n' "$gate_home/.codex"
+            printf 'WORKER_ACCOUNT=\n'
+            printf 'WORKER_CREDENTIAL_PATH=\n'
+            printf 'WORKER_CREDENTIAL_BASELINE=\n'
+          } >> "$GITHUB_ENV"
+          printf 'worker: account credential purged and its env scrubbed before the target-controlled gate\n'
+
       - name: Ensure a Rust toolchain for the crate-scoped gate
         # [OPUS-4.8] The gate runs `cargo clippy/test` directly on the runner; a stock ubuntu-latest may
         # have rustup with NO default toolchain set (and the target may pin one via rust-toolchain.toml),
         # which fails the gate with "rustup could not choose a version of cargo". Set one up in the target
         # dir so a rust-toolchain.toml pin is honoured; harmless for non-cargo gate profiles.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        # Gated on `purge` (registry #124): this reads the target's rust-toolchain.toml, so it runs
+        # only after the account credential has been deleted and its env scrubbed.
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' && steps.purge.outcome == 'success' }}
         working-directory: target
         run: |
           set -uo pipefail
@@ -897,7 +939,10 @@ jobs:
 
       - name: Run policy-selected local gate
         id: gate
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        # Gated on `purge` (registry #124): this runs target-CONTROLLED cargo host-side, so it must
+        # start only after the account credential is deleted and its env is scrubbed. A failed purge
+        # leaves the credential reachable, so it fail-closes the gate rather than exposing it.
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' && steps.purge.outcome == 'success' }}
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
@@ -987,8 +1032,9 @@ jobs:
 
       # [OPUS-4.8] The diagnostics ARTIFACT was DROPPED for credential-safety (security review,
       # finding #1). Rationale: the `gate` step above runs target-CONTROLLED cargo (build scripts /
-      # tests) while the job env exposes the account handle and credential file paths. Any file the
-      # artifact bundled lived at a path that hostile cargo could write to (it could plant credentials
+      # tests) host-side (the account credential is now deleted and its env scrubbed before that gate
+      # — registry #124 — but the cargo process is still hostile). Any file the artifact bundled
+      # lived at a path that hostile cargo could write to (it could plant credentials
       # or a raw model transcript into the predictable diagnostics dir), and the artifact uploaded the
       # directory WHOLESALE — an exfiltration channel. Even the "expected" files were unsafe: the gate
       # output is unredacted target output and error-signals.log is raw CLI stderr. The artifact was
