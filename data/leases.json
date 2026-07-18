@@ -159,6 +159,16 @@
    "model": "opus",
    "issued_at": 1784341943,
    "expires_at": 1784348243
+  },
+  {
+   "account": "acct04",
+   "claim_id": "505020545da34f39b2307d9384628f98",
+   "holder": "sparq-org/sparq#3188@dispatch-29627125828.1",
+   "package": "sparq-core-nt-dict",
+   "role": "impl",
+   "model": "fable",
+   "issued_at": 1784341948,
+   "expires_at": 1784348248
   }
  ]
 }
