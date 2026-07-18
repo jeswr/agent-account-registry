@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 1's documentation contradiction is resolved: the Features section now consistently identifies the local direct decoder as the default load/load_reader path, identifies the upstream hdt crate as the oracle/auxiliary path, and attributes unsupported-layout rejection to the direct decoder. The accompanying released-line notes and decode module commentary consistently distinguish the historical 0.4 data structures from the current 0.7.3 implementation. Checkout context confirms load_reader dispatches to decode::graph_from_reader and retains load_reader_via_upstream/graph_from_hdt as the upstream-backed alternative. No correctness, soundness, test-validity, security, or instruction-injection issue remains in this documentation-only diff.",
+ "verdict": "approve"
+}
