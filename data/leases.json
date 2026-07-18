@@ -11,16 +11,6 @@
    "expires_at": 1784384952
   },
   {
-   "account": "acct4css",
-   "claim_id": "3f05aa58d4ac4da0b3a332fbdf5bf588",
-   "holder": "fix:sparq-org/sparq#3472@dispatch-29646515969.1",
-   "package": "sparq-sim",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784382085,
-   "expires_at": 1784385685
-  },
-  {
    "account": "acct3css",
    "claim_id": "7a01159a58894494b2a9e0076ef327d5",
    "holder": "fix:sparq-org/sparq#3440@dispatch-29646588666.1",
