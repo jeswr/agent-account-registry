@@ -477,9 +477,9 @@ run_gate() {
 # onboarding push) — there is NO scripts/routing-validate.py; do not reference that name in suite
 # lists or briefs.
 FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
-plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
-groom.py account-usage.py usage-alert.py model-health.py broker-refresh.py \
-backfill-provenance.py dashboard-gen.py worker-live.sh"
+plan-snapshot.py triage.py retriage.py dispatch-claim.py worker-pr.py worker-issue.py \
+select-and-claim.py groom.py account-usage.py usage-alert.py model-health.py \
+broker-refresh.py backfill-provenance.py dashboard-gen.py worker-live.sh"
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
@@ -1377,6 +1377,7 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "data/leases.json" \
     "scripts/backfill-provenance.py" \
     "scripts/dashboard-gen.py" \
+    "scripts/retriage.py" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
     "$(grep -c 'self:worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
@@ -1392,6 +1393,8 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(grep -c 'self:backfill-provenance.py' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate runs the dashboard privacy self-test" \
     "$(grep -c 'self:dashboard-gen.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate runs the retriage self-test" \
+    "$(grep -c 'self:retriage.py' <<< "${sel//,/$'\n'}" || true)" "1"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'

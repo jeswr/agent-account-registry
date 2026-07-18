@@ -18,13 +18,18 @@ Scope — an OPEN issue is retriaged iff ALL hold:
   * NOT an account record (no `provider:*` label — those are data rows, not work items);
   * NOT gated `needs:user` / `needs:design` (human-owned holds; retriage never edits them);
   * NOT `trust:untrusted` (quarantine is owned by the maintainer-approval flow, #31/#63);
-  * NO `status:ready` (already visible to dispatch — nothing to do);
-  * NOT in a dispatch/groom-owned busy state (`status:in-progress`,
-    `status:in-progress-review`, `status:blocked`, `status:deferred`). In particular
-    `status:in-progress` recovery — orphaned or otherwise — belongs to groom's lease-driven
-    repair (attempt accounting, worker-run inspection); retriage racing the ledger from a
+  * its `status:*` label-set is EXACTLY empty (label-lost) or EXACTLY `status:untriaged` —
+    a POSITIVE whitelist, not a blacklist. Everything else is refused wholesale:
+    `status:ready` is already dispatch-visible; the dispatch/groom machine states
+    (`status:in-progress`, `status:in-progress-review`, `status:blocked`, `status:deferred`)
+    are never touched — in particular ALL `status:in-progress` recovery, orphaned or
+    otherwise, belongs to groom's lease-driven repair (retriage racing the ledger from a
     stale read at :13/:43 could strip a LIVE worker's status, so it never touches the state
-    and never reads the ledger at all;
+    and never reads the ledger at all); and any status this script does NOT know
+    (`status:available`, `status:unknown`, tomorrow's additions, or a mixed set) is refused
+    too, so a trusted issue that drifted into an account data-plane status can never have
+    `status:ready` promoted on top of it (a blacklist recreated exactly that label-lost
+    account-record hazard);
   * the AUTHOR re-passes the exact triage-issue.yml trust gate (maintainer / App bot slug /
     admin-maintain-write collaborator). Bot trust is TYPE-verified: only a GraphQL `Bot`
     actor may match the App slug, and a Bot actor can ONLY be trusted as that exact App —
@@ -50,11 +55,16 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import triage  # noqa: E402  (same-directory static-triage module — the single source of truth)
 
-# States owned by the dispatch/groom/review state machines — retriage never touches them.
-# status:in-progress is machine-owned too: ALL its recovery (orphan rows included) is groom's
-# lease-driven repair; a second reader racing live dispatch here could strip a live worker.
-MACHINE_OWNED_STATUS = {"status:in-progress", "status:in-progress-review",
-                        "status:blocked", "status:deferred"}
+# POSITIVE status whitelist: retriage acts ONLY when the issue's status:* label-set is
+# exactly empty (label-lost) or exactly {status:untriaged}. Every other set is refused
+# wholesale — status:ready (already dispatch-visible), the dispatch/groom machine states
+# (status:in-progress / -review / blocked / deferred; groom's lease-driven repair owns ALL
+# in-progress recovery, orphan rows included — a second reader racing live dispatch here
+# could strip a live worker), the account data-plane statuses (status:available,
+# status:unknown), and ANY status this script does not know, including mixed sets. A
+# blacklist here would let a trusted issue carrying an account-machine status gain
+# status:ready on top of it — recreating the label-lost account-record hazard.
+RETRIAGEABLE_STATUS_SETS = (set(), {"status:untriaged"})
 MAX_EDITS = 100  # hard per-run write cap; anything beyond is logged LOUDLY, never silent
 
 
@@ -76,10 +86,9 @@ def plan_retriage(issues, trusted):
             continue  # human-owned gates
         if "trust:untrusted" in labels:
             continue  # quarantine owned by the approval flow (#31/#63)
-        if "status:ready" in labels:
-            continue  # already dispatchable
-        if labels & MACHINE_OWNED_STATUS:
-            continue  # in-progress included: groom owns ALL lease/status repair
+        status = {lb for lb in labels if lb.startswith("status:")}
+        if status not in RETRIAGEABLE_STATUS_SETS:
+            continue  # whitelist: EXACTLY no status, or EXACTLY status:untriaged
         if not trusted(str(it.get("author", "")), bool(it.get("author_is_bot"))):
             continue
         result = triage.triage(labels, "task")
@@ -96,7 +105,15 @@ def _gh(args):
 
 
 def _norm_bot(login):
-    return login[: -len("[bot]")] if login.endswith("[bot]") else login
+    # The same App identity has three serialized spellings: `gh issue list --json author`
+    # rewrites Bot logins to `app/<slug>` (cli/cli queries_issue.go Author.MarshalJSON), REST
+    # events spell it `<slug>[bot]`, and raw GraphQL carries the bare `<slug>`. Fold all
+    # three to the bare slug; the actor-TYPE check in _exact_trust is what keeps this narrow.
+    if login.startswith("app/"):
+        login = login[len("app/"):]
+    if login.endswith("[bot]"):
+        login = login[: -len("[bot]")]
+    return login
 
 
 def _exact_trust(login, is_bot, maintainer, app_bot):
@@ -106,15 +123,15 @@ def _exact_trust(login, is_bot, maintainer, app_bot):
     A Bot actor (GraphQL `Bot` / REST `user.type == "Bot"`) can ONLY be trusted as the exact
     registry App identity — never via the maintainer match or the permission probe. A human
     actor can NEVER match the App slug, so an account merely NAMED like the App gains nothing.
-    The slug is compared [bot]-suffix-insensitively only because GraphQL (`gh issue list`)
-    reports bot logins without the suffix while REST events carry it — same identity, two
-    spellings; the actor-type requirement is what prevents this from widening trust."""
+    The slug comparison is spelling-insensitive (see _norm_bot: `app/<slug>`, `<slug>[bot]`,
+    bare `<slug>` are the same identity as serialized by gh/REST/GraphQL respectively); the
+    actor-type requirement is what prevents this from widening trust."""
     if not login:
         return False
     if is_bot:
         return bool(app_bot) and _norm_bot(login) == _norm_bot(app_bot)
-    if login.endswith("[bot]"):
-        return False  # brackets are impossible in real user logins — spoofed, never probed
+    if login.endswith("[bot]") or login.startswith("app/"):
+        return False  # brackets/slashes are impossible in real user logins — spoofed, never probed
     if login == maintainer:
         return True
     return None
@@ -141,7 +158,9 @@ def _trusted_factory(repo, maintainer, app_bot):
 
 def _fetch_open_issues(repo):
     # author.is_bot is GraphQL's actor-type discriminator (`__typename == "Bot"`) — the
-    # type half of the _exact_trust gate, not inferable from the login string.
+    # type half of the _exact_trust gate, not inferable from the login string. For Bot
+    # actors gh ALSO rewrites the serialized login to `app/<slug>` (cli/cli
+    # queries_issue.go Author.MarshalJSON); _norm_bot folds that back to the bare slug.
     r = _gh(["issue", "list", "-R", repo, "--state", "open", "--limit", "500",
              "--json", "number,labels,author"])
     if r.returncode != 0:
@@ -167,26 +186,41 @@ def _self_test():
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
 
     def iss(n, labels, author="jeswr", is_bot=False):
-        return {"number": n, "labels": labels, "author": author, "author_is_bot": is_bot}
+        # RAW `gh issue list --json` wire shape (labels as objects, author as an object) —
+        # the fixture enters through the REAL _fetch_open_issues path, so the test covers
+        # gh's actual serialization, not a hand-shaped post-fetch dict.
+        return {"number": n, "labels": [{"name": lb} for lb in labels],
+                "author": {"login": author, "is_bot": is_bot}}
 
-    # The REAL trust gate, with the network probe stubbed to "no permission" so every
+    # The REAL fetch + trust gate: `gh issue list` is stubbed to return the raw fixture
+    # JSON, and the network permission probe is stubbed to "no permission" so every
     # fall-through is fail-closed and observable (`probes` records who got probed). The
     # stub is not restored: --self-test returns straight to exit, nothing else runs.
     probes = []
+    fixture_raw = []
 
     class _Denied:
         returncode = 1
         stdout = ""
         stderr = "stubbed: no collaborator permission"
 
+    class _Listed:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self):
+            self.stdout = json.dumps(fixture_raw)
+
     def _stub_gh(args):
+        if args[:2] == ["issue", "list"]:
+            return _Listed()
         probes.append(args)
         return _Denied()
 
     _gh = _stub_gh
     trusted = _trusted_factory("jeswr/agent-account-registry", "jeswr",
                                "agent-account-registry[bot]")
-    fixture = [
+    fixture_raw += [
         # 1: human later added the priority by LABEL (the exact terminal case) -> promotes
         iss(1, ["status:untriaged", "priority:P2", "kind:docs", "area:docs"]),
         # 2: account record -> skipped (data row, not a work item)
@@ -221,16 +255,32 @@ def _self_test():
         # 17: untriaged, no area -> parks needs:area (same as triage-issue would)
         iss(17, ["status:untriaged", "priority:P2", "role:impl"]),
         # 18: label-lost, authored by the registry App — a TYPE-verified Bot actor is
-        # trusted under the exact slug (GraphQL spells it without the [bot] suffix)
+        # trusted under the exact slug. This is gh's REAL serialized spelling: `gh issue
+        # list --json author` rewrites Bot logins to `app/<slug>` (cli/cli
+        # Author.MarshalJSON), so the trust must survive the actual wire form.
         iss(18, ["priority:P1", "role:impl", "area:usage"],
-            author="agent-account-registry", is_bot=True),
+            author="app/agent-account-registry", is_bot=True),
         # 19: an actor NAMED like the App but NOT a Bot -> impersonator, never trusted
         # (falls through to the permission probe, which the stub denies)
         iss(19, ["priority:P1", "role:impl", "area:usage"],
             author="agent-account-registry", is_bot=False),
+        # 20/21: trusted + complete work labels but carrying an account data-plane status —
+        # the POSITIVE whitelist must REFUSE both (a blacklist would stack status:ready on
+        # top, recreating the label-lost account-record hazard)
+        iss(20, ["status:available", "priority:P1", "role:impl", "area:usage"]),
+        iss(21, ["status:unknown", "priority:P1", "role:impl", "area:docs"]),
+        # 22: MIXED status set (untriaged + available) -> refused; only EXACTLY
+        # {status:untriaged} or EXACTLY no status is retriageable
+        iss(22, ["status:untriaged", "status:available", "priority:P1", "role:impl",
+                 "area:usage"]),
+        # 23: a HUMAN account whose login is spelled like gh's app/ serialization ->
+        # spoofed, refused outright, never probed
+        iss(23, ["priority:P1", "role:impl", "area:usage"],
+            author="app/agent-account-registry", is_bot=False),
     ]
-    snapshot = copy.deepcopy(fixture)
-    actions = {n: (a, r) for n, a, r in plan_retriage(fixture, trusted)}
+    issues = _fetch_open_issues("jeswr/agent-account-registry")
+    snapshot = copy.deepcopy(issues)
+    actions = {n: (a, r) for n, a, r in plan_retriage(issues, trusted)}
 
     chk("acted-on set", sorted(actions), [1, 4, 5, 16, 17, 18])
     chk("untriaged->ready promotes", actions[1],
@@ -250,11 +300,18 @@ def _self_test():
     chk("incomplete untriaged untouched (no churn)", 15 in actions, False)
     chk("epic label-lost -> untriaged restored", actions[16], (["status:untriaged"], []))
     chk("no-area parks needs:area", actions[17], (["needs:area"], []))
-    chk("type-verified App bot trusted -> swept", actions[18], (["status:ready"], []))
+    chk("type-verified App bot trusted via REAL app/ wire form -> swept",
+        actions[18], (["status:ready"], []))
     chk("non-Bot actor with the App's name NOT trusted", 19 in actions, False)
+    chk("status:available NEVER promoted (whitelist)", 20 in actions, False)
+    chk("status:unknown NEVER promoted (whitelist)", 21 in actions, False)
+    chk("mixed untriaged+available REFUSED (whitelist)", 22 in actions, False)
+    chk("human spelled app/<slug> refused as spoofed", 23 in actions, False)
 
     # trust gate directly: actor TYPE + exact identity, both required
-    chk("bot + exact slug (GraphQL spelling) trusted",
+    chk("bot + exact slug (gh CLI app/ spelling) trusted",
+        trusted("app/agent-account-registry", True), True)
+    chk("bot + exact slug (bare GraphQL spelling) trusted",
         trusted("agent-account-registry", True), True)
     chk("bot + exact slug (REST spelling) trusted",
         trusted("agent-account-registry[bot]", True), True)
@@ -262,21 +319,25 @@ def _self_test():
         trusted("agent-account-registry", False), False)
     chk("non-bot with [bot]-suffixed name not trusted",
         trusted("agent-account-registry[bot]", False), False)
+    chk("non-bot with app/-prefixed name not trusted",
+        trusted("app/agent-account-registry", False), False)
     chk("foreign bot not trusted", trusted("some-other-app", True), False)
+    chk("foreign bot in app/ spelling not trusted", trusted("app/some-other-app", True), False)
     chk("maintainer (human) trusted", trusted("jeswr", False), True)
     chk("bot impersonating the maintainer slug not trusted", trusted("jeswr", True), False)
     chk("empty login not trusted", trusted("", False), False)
-    # Bot actors must NEVER reach the collaborator probe — no probe carries a bot login
-    chk("no permission probe ever ran for a bot actor",
-        any("some-other-app" in " ".join(p) or "[bot]" in " ".join(p) for p in probes),
+    # Bot-spelled actors must NEVER reach the collaborator probe — no probe carries one
+    chk("no permission probe ever ran for a bot-spelled actor",
+        any("some-other-app" in j or "[bot]" in j or "app/" in j
+            for j in (" ".join(p) for p in probes)),
         False)
 
     # MUTATION check 1: planning never mutates its input
-    chk("input not mutated", fixture == snapshot, True)
+    chk("input not mutated", issues == snapshot, True)
 
     # MUTATION check 2 (idempotence): applying the planned deltas and re-planning yields nothing
     applied = []
-    for it in fixture:
+    for it in issues:
         labels = _labels_of(it)
         if it["number"] in actions:
             add, remove = actions[it["number"]]
