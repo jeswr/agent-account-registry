@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct2css",
-   "claim_id": "1a92e69f8cba4ec0af0e0a2d83833eca",
-   "holder": "sparq-org/sparq#3256@dispatch-29629674327.1",
-   "package": "knowledge-graph",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784347145,
-   "expires_at": 1784353445
-  },
-  {
    "account": "acct4css",
    "claim_id": "6d5074a681d74353b47815be3e6b8da5",
    "holder": "sparq-org/sparq#2963@dispatch-29630108047.1",
