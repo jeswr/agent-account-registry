@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change fails closed for absent per-account measurements, excludes unknown accounts from eligible capacity, persists and surfaces an explicit probe outcome, and covers both the degraded-capacity behavior and malformed probe markers with non-vacuous self-test assertions. The workflow condition handles materialization, self-test, and probe failures without publishing a successful marker, while still allowing the dashboard to render visibly degraded. No trust check is weakened, no untrusted text is expanded into workflow execution, and no token-shaped data is exposed by the changed paths.",
+ "verdict": "approve"
+}
