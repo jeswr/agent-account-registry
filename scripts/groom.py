@@ -48,6 +48,10 @@ STALE_PARK_V2_RE = re.compile(
     r"parked_at:(?P<parked_at>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{8,15}(?:Z|[+-][0-9]{2}:[0-9]{2})) -->"
 )
 UNPARK_MARKER = "<!-- registry-groom-stale-pr-unpark:v1 -->"
+# The authoritative aggregator check-run on the target (sparq's `ci-summary / gate` job). Keep in
+# sync with dispatch-claim.py CI_GATE_CHECK. Fleet recovery means THIS check went green on the
+# parked head — an unrelated green matrix leg proves nothing while the required gate is still red.
+CI_GATE_CHECK = "gate"
 
 
 def park_marker(head_sha: str, now: int) -> str:
@@ -367,6 +371,38 @@ def repark_rate_limited(
     )
 
 
+def gate_check_runs_path(repo: str, sha: str) -> str:
+    """Check-runs listing for a head sha, server-side filtered to the authoritative gate check.
+    An UNFILTERED listing truncates at the first 100 of a big matrix and can push the gate run
+    off the page entirely — recovery must be judged on the gate, never on whichever runs happen
+    to fit in one page."""
+    return (
+        f"/repos/{repo}/commits/{sha}/check-runs"
+        f"?check_name={quote(CI_GATE_CHECK, safe='')}&per_page=100"
+    )
+
+
+def bot_owns_current_label(
+    timeline: list[dict[str, Any]], label: str, bot_login: str
+) -> bool:
+    """True only when the MOST RECENT `labeled` event for `label` was performed by the bot
+    itself. The park-comment record alone cannot prove this: a human may remove groom's label
+    and later re-apply it by hand, leaving groom's park comment as the latest marker while the
+    CURRENT label application is the human's own decision. Fail-closed: no labeled event for the
+    label, or a malformed actor, blocks unpark."""
+    owner: str | None = None
+    for event in timeline:
+        if not isinstance(event, dict) or event.get("event") != "labeled":
+            continue
+        entry = event.get("label")
+        if not isinstance(entry, dict) or entry.get("name") != label:
+            continue
+        actor = event.get("actor")
+        login = actor.get("login") if isinstance(actor, dict) else None
+        owner = login if isinstance(login, str) and login else None
+    return owner is not None and owner.casefold() == bot_login.casefold()
+
+
 def unpark_reason(
     pull: dict[str, Any],
     labels: set[str],
@@ -374,24 +410,33 @@ def unpark_reason(
     comments: list[dict[str, Any]],
     reviews: list[dict[str, Any]],
     check_runs: list[dict[str, Any]],
+    timeline: list[dict[str, Any]],
     bot_login: str,
 ) -> str | None:
     """Return why groom may reverse ITS OWN stale park, or None to leave the PR parked.
 
     Groom may remove needs:user from an open worker PR ONLY when ALL of these hold:
-      (a) the park is groom's own — the latest needs:user cause is the bot's marker comment;
+      (a) the park is groom's own — the latest needs:user cause is the bot's marker comment AND
+          the label-event timeline shows the CURRENT needs:user application was performed by the
+          bot itself (a human remove-then-reapply makes the label human-owned even while groom's
+          park comment remains the latest marker);
       (b) no non-bot comment or review landed after that park (a human who engaged owns the PR);
-      (c) the staleness cause has cleared — a new head sha, OR a check run that completed
-          successfully on this head after the park (fleet recovery), OR a now-clean merge state;
+      (c) the staleness cause has cleared — a new head sha, OR the authoritative gate check
+          (CI_GATE_CHECK) whose LATEST run completed successfully on this head after the park
+          (fleet recovery; an unrelated green matrix leg is never recovery), OR a now-clean
+          merge state;
       (d) review:needs-user (the review loop's terminal escalation) is absent — that label is
           strictly human-owned and groom never reverses it.
-    A human-applied needs:user has no bot marker, so (a) keeps it terminal forever.
+    A human-applied needs:user has no bot marker and no bot labeled-event, so (a) keeps it
+    terminal forever.
     """
     if "needs:user" not in labels:
         return None
     if "review:needs-user" in labels:
         return None
     if park is None:
+        return None
+    if not bot_owns_current_label(timeline, "needs:user", bot_login):
         return None
     head = pull.get("head", {}).get("ref", "")
     author = pull.get("user", {}).get("login", "")
@@ -422,12 +467,27 @@ def unpark_reason(
         return "the branch has a new head commit"
     if pull.get("draft") is not True and pull.get("mergeable_state") == "clean":
         return "the merge state is now clean"
+    # Only the authoritative gate check counts as recovery, and only its LATEST run: re-runs of
+    # the same check name are superseded by started_at (mirrors dispatch-claim.py
+    # interpret_check_runs), so an early post-park green that a later red re-run superseded
+    # never unparks.
+    latest_gate: tuple[str, dict[str, Any]] | None = None
     for run in check_runs:
-        if run.get("status") != "completed" or run.get("conclusion") != "success":
+        if run.get("name") != CI_GATE_CHECK:
             continue
-        completed = run.get("completed_at")
-        if isinstance(completed, str) and _epoch(completed, "check run") > park.at:
-            return "a check run completed successfully after the park"
+        started = str(run.get("started_at") or "")
+        if latest_gate is None or started >= latest_gate[0]:
+            latest_gate = (started, run)
+    if latest_gate is not None:
+        gate_run = latest_gate[1]
+        completed = gate_run.get("completed_at")
+        if (
+            gate_run.get("status") == "completed"
+            and gate_run.get("conclusion") == "success"
+            and isinstance(completed, str)
+            and _epoch(completed, "gate check run") > park.at
+        ):
+            return "the required gate check completed successfully after the park"
     return None
 
 
@@ -807,6 +867,21 @@ def _apply_labels(
     return bool(add or remove)
 
 
+def _unpark_writes(api: GitHubAPI, repo: str, number: int, body: str) -> None:
+    """Consumption-marker-then-delabel, in that order — the unpark must fail conservatively.
+    If the label DELETE fails after the marker posts, the park record is already consumed and
+    the PR simply stays parked until a human lifts it. The reverse order opens a window (label
+    gone, park record still live) in which a needs:user applied later by a human could be
+    attributed to groom by a subsequent sweep and stolen."""
+    api.request("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body})
+    print(f"WRITE unpark comment repo={repo} pr={number}")
+    api.request(
+        "DELETE",
+        f"/repos/{repo}/issues/{number}/labels/{quote('needs:user', safe='')}",
+    )
+    print(f"WRITE remove label repo={repo} issue={number} label=needs:user")
+
+
 def _fresh_issue(api: GitHubAPI, repo: str, number: int) -> dict[str, Any] | None:
     item = api.request("GET", f"/repos/{repo}/issues/{number}", allow_404=True)
     if item is None:
@@ -1156,11 +1231,18 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 for review in target_api.paginate(f"/repos/{repo}/pulls/{number}/reviews")
                 if isinstance(review, dict)
             ]
+            timeline = [
+                event
+                for event in target_api.paginate(
+                    f"/repos/{repo}/issues/{number}/timeline"
+                )
+                if isinstance(event, dict)
+            ]
             head_sha = detail.get("head", {}).get("sha")
             check_runs: list[dict[str, Any]] = []
             if isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha):
                 runs_doc = target_api.request(
-                    "GET", f"/repos/{repo}/commits/{head_sha}/check-runs?per_page=100"
+                    "GET", gate_check_runs_path(repo, head_sha)
                 )
                 if isinstance(runs_doc, dict) and isinstance(
                     runs_doc.get("check_runs"), list
@@ -1169,15 +1251,10 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                         run for run in runs_doc["check_runs"] if isinstance(run, dict)
                     ]
             reason = unpark_reason(
-                detail, labels, park, comments, reviews, check_runs, bot_login
+                detail, labels, park, comments, reviews, check_runs, timeline, bot_login
             )
             if reason is None:
                 continue
-            target_api.request(
-                "DELETE",
-                f"/repos/{repo}/issues/{number}/labels/{quote('needs:user', safe='')}",
-            )
-            print(f"WRITE remove label repo={repo} issue={number} label=needs:user")
             body = (
                 "> 🤖 SPARQ agent\n\n"
                 "Unparking: grooming applied this stale-PR park itself, no human has engaged "
@@ -1185,10 +1262,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 "`needs:user` or any `review:needs-user` is never touched by grooming.\n\n"
                 f"{UNPARK_MARKER}"
             )
-            target_api.request(
-                "POST", f"/repos/{repo}/issues/{number}/comments", {"body": body}
-            )
-            print(f"WRITE unpark comment repo={repo} pr={number}")
+            _unpark_writes(target_api, repo, number, body)
             unparked += 1
 
     reclaimed = _release_claims(registry_api, registry_repo, dead_claims)
@@ -1474,6 +1548,67 @@ def _self_test() -> int:
         "draft": False,
         "mergeable_state": "blocked",
     }
+    # Label-event ownership: the CURRENT needs:user application must be the bot's own labeled
+    # event — a park comment alone cannot prove it (human remove-then-reapply keeps the comment).
+    bot_labeled = [
+        {
+            "event": "labeled",
+            "label": {"name": "needs:user"},
+            "actor": {"login": "app[bot]"},
+        }
+    ]
+    human_relabel = bot_labeled + [
+        {
+            "event": "unlabeled",
+            "label": {"name": "needs:user"},
+            "actor": {"login": "human"},
+        },
+        {
+            "event": "labeled",
+            "label": {"name": "needs:user"},
+            "actor": {"login": "human"},
+        },
+    ]
+    check(
+        "bot owns its own label application",
+        bot_owns_current_label(bot_labeled, "needs:user", "app[bot]"),
+        True,
+    )
+    check(
+        "human remove-then-reapply transfers label ownership",
+        bot_owns_current_label(human_relabel, "needs:user", "app[bot]"),
+        False,
+    )
+    check(
+        "no labeled event fails closed",
+        bot_owns_current_label([], "needs:user", "app[bot]"),
+        False,
+    )
+    check(
+        "malformed labeled-event actor fails closed",
+        bot_owns_current_label(
+            [{"event": "labeled", "label": {"name": "needs:user"}, "actor": None}],
+            "needs:user",
+            "app[bot]",
+        ),
+        False,
+    )
+    check(
+        "other-label events do not disturb ownership",
+        bot_owns_current_label(
+            bot_labeled
+            + [
+                {
+                    "event": "labeled",
+                    "label": {"name": "status:ready"},
+                    "actor": {"login": "human"},
+                }
+            ],
+            "needs:user",
+            "app[bot]",
+        ),
+        True,
+    )
     check(
         "no unpark: a consumed park never steals a later-applied needs:user",
         unpark_reason(
@@ -1483,6 +1618,7 @@ def _self_test() -> int:
             [park_comment, unpark_comment],
             [],
             [],
+            bot_labeled,
             "app[bot]",
         ),
         None,
@@ -1490,45 +1626,90 @@ def _self_test() -> int:
     check(
         "unpark: groom park, no human activity, new head sha",
         unpark_reason(
-            parked_pull, parked_labels, park, [park_comment], [], [], "app[bot]"
+            parked_pull, parked_labels, park, [park_comment], [], [], bot_labeled,
+            "app[bot]",
         ),
         "the branch has a new head commit",
     )
+    check(
+        "no unpark: human re-applied needs:user after removing groom's park label",
+        unpark_reason(
+            parked_pull, parked_labels, park, [park_comment], [], [], human_relabel,
+            "app[bot]",
+        ),
+        None,
+    )
     same_head = {**parked_pull, "head": {"ref": "sparq-agent/issue-7-99-1", "sha": sha_a}}
-    green_run = {
+    gate_green = {
+        "name": CI_GATE_CHECK,
         "status": "completed",
         "conclusion": "success",
+        "started_at": datetime.fromtimestamp(park_at + 50, timezone.utc).isoformat(),
         "completed_at": datetime.fromtimestamp(park_at + 60, timezone.utc).isoformat(),
     }
     check(
-        "unpark: fleet recovery via a fresh green check run",
+        "unpark: fleet recovery via a fresh green GATE run",
         unpark_reason(
-            same_head, parked_labels, park, [park_comment], [], [green_run], "app[bot]"
+            same_head, parked_labels, park, [park_comment], [], [gate_green],
+            bot_labeled, "app[bot]",
         ),
-        "a check run completed successfully after the park",
+        "the required gate check completed successfully after the park",
+    )
+    check(
+        "no unpark: an unrelated green run is not gate recovery",
+        unpark_reason(
+            same_head, parked_labels, park, [park_comment], [],
+            [{**gate_green, "name": "test (ubuntu-latest, stable)"}],
+            bot_labeled, "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: a red gate re-run supersedes an earlier post-park green gate",
+        unpark_reason(
+            same_head, parked_labels, park, [park_comment], [],
+            [
+                gate_green,
+                {
+                    **gate_green,
+                    "conclusion": "failure",
+                    "started_at": datetime.fromtimestamp(
+                        park_at + 120, timezone.utc
+                    ).isoformat(),
+                    "completed_at": datetime.fromtimestamp(
+                        park_at + 130, timezone.utc
+                    ).isoformat(),
+                },
+            ],
+            bot_labeled, "app[bot]",
+        ),
+        None,
     )
     check(
         "unpark: merge state recovered to clean",
         unpark_reason(
             {**same_head, "mergeable_state": "clean"},
-            parked_labels, park, [park_comment], [], [], "app[bot]",
+            parked_labels, park, [park_comment], [], [], bot_labeled, "app[bot]",
         ),
         "the merge state is now clean",
     )
     check(
-        "no unpark: same head still blocked with no fresh green check",
+        "no unpark: same head still blocked with no fresh green gate",
         unpark_reason(
             same_head, parked_labels, park, [park_comment], [],
             [
-                {**green_run, "conclusion": "failure"},
+                {**gate_green, "conclusion": "failure"},
                 {
-                    **green_run,
+                    **gate_green,
+                    "started_at": datetime.fromtimestamp(
+                        park_at - 70, timezone.utc
+                    ).isoformat(),
                     "completed_at": datetime.fromtimestamp(
                         park_at - 60, timezone.utc
                     ).isoformat(),
                 },
             ],
-            "app[bot]",
+            bot_labeled, "app[bot]",
         ),
         None,
     )
@@ -1541,7 +1722,7 @@ def _self_test() -> int:
         "no unpark: a human commented after the park",
         unpark_reason(
             parked_pull, parked_labels, park, [park_comment, human_after], [], [],
-            "app[bot]",
+            bot_labeled, "app[bot]",
         ),
         None,
     )
@@ -1553,7 +1734,7 @@ def _self_test() -> int:
         "no unpark: a human reviewed after the park",
         unpark_reason(
             parked_pull, parked_labels, park, [park_comment], [human_review], [],
-            "app[bot]",
+            bot_labeled, "app[bot]",
         ),
         None,
     )
@@ -1561,22 +1742,47 @@ def _self_test() -> int:
         "no unpark: review:needs-user stays strictly human-owned",
         unpark_reason(
             parked_pull, parked_labels | {"review:needs-user"}, park, [park_comment],
-            [], [], "app[bot]",
+            [], [], bot_labeled, "app[bot]",
         ),
         None,
     )
     check(
         "no unpark: needs:user without groom's marker is human-applied",
-        unpark_reason(parked_pull, parked_labels, None, [], [], [], "app[bot]"),
+        unpark_reason(parked_pull, parked_labels, None, [], [], [], [], "app[bot]"),
         None,
     )
     check(
         "no unpark: a non-worker-authored PR is never unparked",
         unpark_reason(
             {**parked_pull, "user": {"login": "human"}}, parked_labels, park,
-            [park_comment], [], [], "app[bot]",
+            [park_comment], [], [], bot_labeled, "app[bot]",
         ),
         None,
+    )
+    check("gate check name matches dispatch-claim CI_GATE_CHECK", CI_GATE_CHECK, "gate")
+    check(
+        "gate check-runs read is server-side filtered to the gate",
+        gate_check_runs_path("o/r", sha_a),
+        f"/repos/o/r/commits/{sha_a}/check-runs?check_name=gate&per_page=100",
+    )
+
+    class _OrderStub:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def request(self, method, path, body=None, **_kwargs):
+            self.calls.append((method, path))
+            return {}
+
+    order_stub = _OrderStub()
+    _unpark_writes(order_stub, "o/r", 5, "unparking body")
+    check(
+        "unpark is marker-then-delabel (consumption marker posts before the DELETE)",
+        order_stub.calls,
+        [
+            ("POST", "/repos/o/r/issues/5/comments"),
+            ("DELETE", "/repos/o/r/issues/5/labels/needs%3Auser"),
+        ],
     )
     check(
         "repark of the same head inside one window is rate-limited",
