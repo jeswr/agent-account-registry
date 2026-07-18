@@ -342,6 +342,20 @@ def worker_pr_provenance_enumerable(
     exist ONLY there — and the legacy master registry checkout is the fallback so pre-outage
     records (<= sparq#2542) stay visible. A present-but-invalid ledger record is judged as-is
     (never falls back: the fallback is for the missing-file migration case only)."""
+    return (
+        _provenance_record(repo, number, registry_root, ledger_root=ledger_root)
+        is not None
+    )
+
+
+def _provenance_record(
+    repo: str, number: int, registry_root: Path = Path("."),
+    ledger_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """The PARSED registry provenance record for target PR ``repo#number`` IFF it is admissible
+    by the review loop's one shared schema, else None (missing, unreadable, or schema-invalid —
+    every case the review loop fails closed on). Resolution and validity semantics are documented
+    on worker_pr_provenance_enumerable, the boolean wrapper."""
     owner, _, name = repo.partition("/")
     if not owner or not name:
         raise GroomError("target repository name is malformed")
@@ -352,12 +366,71 @@ def worker_pr_provenance_enumerable(
         if ledger_path.is_file():
             record_path = ledger_path
     if not record_path.is_file():
-        return False
+        return None
     try:
         record = json.loads(record_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False  # unreadable/malformed JSON — the review loop fails closed on it too
-    return bool(_review_loop_module().is_enumerable_provenance(record, number))
+        return None  # unreadable/malformed JSON — the review loop fails closed on it too
+    if not _review_loop_module().is_enumerable_provenance(record, number):
+        return None
+    return record
+
+
+def _admitted_worker_prs(
+    repo: str,
+    pulls: dict[int, dict[str, Any]],
+    bot_login: str,
+    registry_root: Path = Path("."),
+    ledger_root: Path | None = None,
+) -> set[int]:
+    """Source-issue numbers among ``pulls`` (open PRs) with a PROVEN admitted worker attempt —
+    the ONLY linkage strong enough to suppress the exhausted-attempt defer (issue #170, review
+    round 1).
+
+    `_current_links` linkage (a worker-looking branch OR a `Fixes #N` body reference) is
+    deliberately NOT trusted for suppression: anyone can open a PR whose body says `Fixes #N`,
+    and a fork can spoof a worker-shaped head ref — under loose linkage either would hold an
+    exhausted issue out of `needs:user` indefinitely. Suppression instead requires the SAME
+    identity and provenance admissions the review loop applies before it will drive a PR
+    (dispatch-claim.enumerate_review_items):
+    - the head branch matches the worker pattern,
+    - the head repo IS the target repo (a fork head is attacker-controlled — never admitted),
+    - the author is the App bot,
+    - the body self-identifies with the worker PR marker,
+    - a VALID registry provenance record exists for the PR (the root of trust — the target
+      model cannot write the registry), and its ``issue`` field — the binding the review loop
+      itself dispatches on — agrees with the branch-encoded issue (exact repo/issue binding).
+    A PR failing ANY admission never suppresses: the review loop will never drive that PR, so
+    parking the exhausted issue is the correct fail-closed outcome."""
+    admitted: set[int] = set()
+    bot = bot_login.casefold()
+    if not bot:
+        return admitted  # no bot identity resolved — nothing can be proven, fail closed
+    for number, pull in pulls.items():
+        head = pull.get("head") or {}
+        ref = head.get("ref", "")
+        branch = WORKER_BRANCH.match(ref) if isinstance(ref, str) else None
+        if branch is None:
+            continue
+        head_repo = head.get("repo") or {}
+        author = (pull.get("user") or {}).get("login", "")
+        body = pull.get("body") or ""
+        if (
+            (head_repo.get("full_name") if isinstance(head_repo, dict) else None) != repo
+            or not isinstance(author, str)
+            or author.casefold() != bot
+            or not isinstance(body, str)
+            or not body.lstrip().startswith(WORKER_PR_MARKER)
+        ):
+            continue
+        record = _provenance_record(repo, number, registry_root, ledger_root=ledger_root)
+        if record is None:
+            continue
+        issue = record["issue"]  # a positive int — guaranteed by the admission schema
+        if issue != int(branch.group("issue")):
+            continue  # record and branch disagree on the source issue — admit neither
+        admitted.add(issue)
+    return admitted
 
 
 def stale_worker_pr_reason(
@@ -894,6 +967,7 @@ def _plan_actions(
     limits: dict[str, Limits],
     issues: dict[str, dict[int, dict[str, Any]]],
     pulls: dict[str, dict[int, dict[str, Any]]],
+    admitted: dict[str, set[int]],
     attempts: dict[tuple[str, int], int],
     lease_states: dict[str, LeaseDecision],
     leases: list[dict[str, Any]],
@@ -920,7 +994,19 @@ def _plan_actions(
             key = (repo, number)
             labels = _labels(issue, f"target issue {repo}#{number}")
             used = attempts[key]
-            if used >= limits[repo].max_attempts and key not in live_by_issue:
+            # An open PROVEN worker PR for this issue means the final allowed attempt SUCCEEDED —
+            # parking the source issue (`needs:user`) would strip that PR from dispatch's review
+            # loop (any source `needs:*` is terminal there), so exhaustion never defers while an
+            # ADMITTED attempt is open. Admission is `_admitted_worker_prs` — the review loop's
+            # own identity + registry-provenance checks — NEVER the loose `links` map below: an
+            # arbitrary PR whose body says `Fixes #N` (or a fork with a worker-shaped head) must
+            # not hold an exhausted issue out of `needs:user` (review round 1). This guard must
+            # run FIRST so a successful last attempt is not mis-parked.
+            if (
+                used >= limits[repo].max_attempts
+                and key not in live_by_issue
+                and number not in admitted[repo]
+            ):
                 actions.append(
                     IssueAction(repo, number, "defer", "attempt budget exhausted")
                 )
@@ -1109,8 +1195,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             if reason:
                 stale_prs[(repo, number)] = reason
 
+    admitted = {
+        repo: _admitted_worker_prs(repo, pulls[repo], bot_login, ledger_root=ledger_root)
+        for repo in groomable
+    }
     issue_actions, pull_actions, dead_claims = _plan_actions(
-        limits, issues, pulls, attempts, lease_states, leases, stale_prs, now
+        limits, issues, pulls, admitted, attempts, lease_states, leases, stale_prs, now
     )
 
     # Re-read the mutex before issue mutation. A newly claimed lease suppresses repair; claims
@@ -1200,6 +1290,23 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             ):
                 print(
                     f"SKIP issue {action.repo}#{action.number}: attempt budget is no longer exhausted"
+                )
+                continue
+        if mode == "defer":
+            # Mutation-boundary revalidation (issue #170, review round 1): re-read the target's
+            # open PRs NOW — not the pre-loop snapshot — so a final-attempt worker PR that opened
+            # after planning (or while earlier actions were processed) still suppresses the park.
+            # Covers BOTH defer paths (a planned exhaustion defer and the ready-path downgrade
+            # above). Suppression requires the ADMITTED proven-worker set, never loose linkage.
+            # This is as close to the label write as the API permits; the residual window is
+            # GitHub's own read-to-write gap, and since `needs:user` is terminal for the review
+            # loop (no automated repair), skipping — the fail-closed side, retried next sweep —
+            # wins any tie.
+            if action.number in _admitted_worker_prs(
+                action.repo, _pulls(api, action.repo), bot_login, ledger_root=ledger_root
+            ):
+                print(
+                    f"SKIP issue {action.repo}#{action.number}: an admitted worker PR is open"
                 )
                 continue
         changed = _apply_labels(api, action.repo, action.number, labels, mode)
@@ -1678,15 +1785,33 @@ def _self_test() -> int:
                     now - 700, timezone.utc
                 ).isoformat(),
             },
+            # Issue #9: the attempt budget is exhausted (issue #170), but its FINAL allowed attempt
+            # opened a still-open ADMITTED worker PR (#91). Exhaustion must NOT defer it — parking
+            # `needs:user` here would strip #91 from dispatch's review loop.
+            9: {
+                "labels": [{"name": "status:in-progress"}],
+                "updated_at": datetime.fromtimestamp(
+                    now - 700, timezone.utc
+                ).isoformat(),
+            },
         }
     }
-    fixture_pulls = {"owner/repo": {}}
-    fixture_attempts = {("owner/repo", 7): 0, ("owner/repo", 8): 2}
+    fixture_pulls = {
+        "owner/repo": {
+            91: {
+                "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat(),
+                "head": {"ref": "sparq-agent/issue-9-91-1"},
+                "body": "Fixes #9",
+            }
+        }
+    }
+    fixture_attempts = {("owner/repo", 7): 0, ("owner/repo", 8): 2, ("owner/repo", 9): 2}
     fixture_states = {"a" * 32: LeaseDecision("dead", "fixture complete")}
     actions, prs, dead = _plan_actions(
         {"owner/repo": limits},
         fixture_issues,
         fixture_pulls,
+        {"owner/repo": {9}},  # PR #91 is a PROVEN admitted worker attempt for issue #9
         fixture_attempts,
         fixture_states,
         [base],
@@ -1698,8 +1823,149 @@ def _self_test() -> int:
         [(action.number, action.mode) for action in actions],
         [(7, "ready"), (8, "defer")],
     )
+    check(
+        "MUTATION: exhaustion does NOT defer an issue whose ADMITTED final-attempt PR is open (#170)",
+        any(action.number == 9 for action in actions),
+        False,
+    )
     check("fixture reclaims dead claim", dead, {"a" * 32})
     check("fixture has no PR writes", prs, [])
+    # NEGATIVE (review round 1): the SAME open PR #91 — which still loose-links issue #9 via its
+    # branch and `Fixes #9` body — must NOT suppress the exhaustion defer when it is not in the
+    # ADMITTED set (no proven worker identity/provenance). Reverting the exhaustion guard back to
+    # the loose `links` map reds this check: an arbitrary or attacker-controlled PR would then
+    # hold an exhausted issue out of `needs:user` indefinitely.
+    unadmitted_actions, _prs_u, _dead_u = _plan_actions(
+        {"owner/repo": limits},
+        fixture_issues,
+        fixture_pulls,
+        {"owner/repo": set()},
+        fixture_attempts,
+        fixture_states,
+        [base],
+        {},
+        now,
+    )
+    check(
+        "MUTATION: an UNADMITTED linking PR does NOT suppress the exhaustion defer (round 1)",
+        [(a.number, a.mode) for a in unadmitted_actions if a.number == 9],
+        [(9, "defer")],
+    )
+
+    # ---- _admitted_worker_prs: the admission that gates exhaustion suppression (round 1) ----
+    # Only a PR carrying the review loop's OWN identity + provenance admissions may suppress the
+    # exhausted-attempt defer; every weaker linkage (a `Fixes #N` body reference, a fork's
+    # worker-shaped head, a bot PR with no registry provenance record) must be refused —
+    # otherwise an arbitrary open PR keeps an exhausted issue out of `needs:user` indefinitely.
+    with tempfile.TemporaryDirectory() as tmp:
+        admit_root = Path(tmp)
+        admit_dir = admit_root / PROVENANCE_DIR
+        admit_dir.mkdir(parents=True)
+        (admit_dir / "owner--repo--pr91.json").write_text(
+            json.dumps({
+                "pr_number": 91,
+                "head_sha_at_open": "1" * 40,
+                "impl_provider": "anthropic",
+                "impl_alias": "fable",
+                "impl_account_h": "ab" * 8,
+                "issue": 9,
+            }),
+            encoding="utf-8",
+        )
+        proven_pull = {
+            "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat(),
+            "head": {
+                "ref": "sparq-agent/issue-9-91-1",
+                "repo": {"full_name": "owner/repo"},
+            },
+            "user": {"login": "app[bot]"},
+            "body": WORKER_PR_MARKER + "\n\nFixes #9",
+        }
+        check(
+            "admission: a proven worker attempt (identity + provenance) suppresses",
+            _admitted_worker_prs("owner/repo", {91: proven_pull}, "app[bot]", admit_root),
+            {9},
+        )
+        arbitrary_pull = {
+            "updated_at": proven_pull["updated_at"],
+            "head": {"ref": "feature/anything", "repo": {"full_name": "owner/repo"}},
+            "user": {"login": "mallory"},
+            "body": "helpful contribution\n\nFixes #9",
+        }
+        check(
+            "NEGATIVE: an arbitrary PR with a `Fixes #9` body reference is NOT admitted",
+            _admitted_worker_prs("owner/repo", {92: arbitrary_pull}, "app[bot]", admit_root),
+            set(),
+        )
+        check(
+            "…although loose _current_links WOULD have linked it (the closed hole)",
+            9 in _current_links({92: arbitrary_pull}),
+            True,
+        )
+        fork_pull = {
+            **proven_pull,
+            "head": {
+                "ref": "sparq-agent/issue-9-91-1",
+                "repo": {"full_name": "mallory/repo"},
+            },
+        }
+        check(
+            "NEGATIVE: a fork PR with a spoofed worker-shaped head is NOT admitted",
+            _admitted_worker_prs("owner/repo", {91: fork_pull}, "app[bot]", admit_root),
+            set(),
+        )
+        check(
+            "NEGATIVE: a worker-shaped branch from a NON-BOT author is NOT admitted",
+            _admitted_worker_prs(
+                "owner/repo",
+                {91: {**proven_pull, "user": {"login": "mallory"}}},
+                "app[bot]",
+                admit_root,
+            ),
+            set(),
+        )
+        check(
+            "NEGATIVE: a bot worker branch WITHOUT the worker PR marker is NOT admitted",
+            _admitted_worker_prs(
+                "owner/repo",
+                {91: {**proven_pull, "body": "Fixes #9"}},
+                "app[bot]",
+                admit_root,
+            ),
+            set(),
+        )
+        # PR #93 is worker-shaped, bot-authored, and marked — but NO registry provenance record
+        # exists for it, so the review loop will never drive it: it must not suppress (an
+        # UNADMITTED worker-shaped branch is exactly the round-1 negative case).
+        unrecorded_pull = {
+            **proven_pull,
+            "head": {
+                "ref": "sparq-agent/issue-9-93-1",
+                "repo": {"full_name": "owner/repo"},
+            },
+        }
+        check(
+            "NEGATIVE: a worker-shaped bot PR with NO provenance record is NOT admitted",
+            _admitted_worker_prs("owner/repo", {93: unrecorded_pull}, "app[bot]", admit_root),
+            set(),
+        )
+        check(
+            "NEGATIVE: a record whose issue disagrees with the branch-encoded issue is refused",
+            _admitted_worker_prs(
+                "owner/repo",
+                {91: {**proven_pull,
+                      "head": {"ref": "sparq-agent/issue-8-91-1",
+                               "repo": {"full_name": "owner/repo"}}}},
+                "app[bot]",
+                admit_root,
+            ),
+            set(),
+        )
+        check(
+            "NEGATIVE: an unresolved (empty) bot login admits nothing (fail closed)",
+            _admitted_worker_prs("owner/repo", {91: proven_pull}, "", admit_root),
+            set(),
+        )
 
     # Orphan repair: closed-unmerged worker PRs strip every status label ('complete' adds nothing),
     # and a dead review loop leaves status:in-progress-review. Both are recoverable ONLY when the
@@ -1729,6 +1995,7 @@ def _self_test() -> int:
         {"owner/repo": limits},
         orphan_issues,
         {"owner/repo": {99: linked_pull}},
+        {"owner/repo": set()},
         orphan_attempts,
         {},
         [],
@@ -1982,6 +2249,130 @@ def _self_test() -> int:
         check("persistent CAS conflict fails loud after retries", settled_loud, True)
     finally:
         globals()["_sleep_backoff"] = real_backoff
+
+    # ---- run_sweep mutation-boundary guard (issue #170, review round 1, finding 3) ----
+    # Drive the REAL run_sweep with a stubbed API in which the open-PR listing is SCHEDULED per
+    # read: the plan read (#1) and pre-loop snapshot read (#2) see NO pulls, and only the defer
+    # branch's mutation-boundary re-read (#3) sees the freshly opened admitted worker PR. The
+    # discriminating pair: (A) the PR appears at the boundary → NO label mutation may occur
+    # (deleting or inverting the run_sweep defer-branch guard, or reverting it to the pre-loop
+    # snapshot, reds this — the snapshot never saw the PR); (B) no PR ever appears → the defer
+    # mutation MUST occur (an inverted guard, or one keyed on anything but the fresh read, reds
+    # this instead).
+    sweep_env: dict[str, Any] = {}
+
+    class _SweepAPI:
+        """Serve run_sweep's reads from fixtures; record every write. Listing reads of the
+        target's open PRs are counted so the qualifying PR can 'appear' mid-sweep."""
+
+        def __init__(self, token, purpose):
+            self.purpose = purpose
+
+        def request(self, method, path, body=None, allow_404=False, **_kwargs):
+            if method == "GET":
+                return sweep_env["gets"].get(path)
+            sweep_env["writes"].append((method, path))
+            return {}
+
+        def paginate(self, path):
+            if path == "/repos/owner/repo/pulls?state=open":
+                sweep_env["pull_reads"] += 1
+                if sweep_env["pull_reads"] >= sweep_env["pr_visible_from"]:
+                    return [sweep_env["worker_pull"]]
+                return []
+            return sweep_env["pages"].get(path, [])
+
+    sweep_now = int(time.time())
+    sweep_issue = {
+        "number": 8,
+        "state": "open",
+        "labels": [{"name": "status:in-progress"}],
+        "updated_at": datetime.fromtimestamp(sweep_now - 700, timezone.utc).isoformat(),
+        "comments": 1,
+    }
+    sweep_env["gets"] = {"/repos/owner/repo/issues/8": sweep_issue}
+    sweep_env["pages"] = {
+        "/repos/owner/repo/issues?state=open": [sweep_issue],
+        # Two durable bot attempt comments: the budget (max_attempts=2) is exhausted, so
+        # planning emits the defer and the write-loop recount confirms it.
+        "/repos/owner/repo/issues/8/comments": [
+            {"user": {"login": "app[bot]"}, "body": ATTEMPT_MARKER + " run=1 -->"},
+            {"user": {"login": "app[bot]"}, "body": ATTEMPT_MARKER + " run=2 -->"},
+        ],
+    }
+    sweep_env["worker_pull"] = {
+        "number": 91,
+        "updated_at": datetime.fromtimestamp(sweep_now - 30, timezone.utc).isoformat(),
+        "head": {"ref": "sparq-agent/issue-8-91-1", "repo": {"full_name": "owner/repo"}},
+        "user": {"login": "app[bot]"},
+        "body": WORKER_PR_MARKER + "\n\nFixes #8",
+    }
+
+    def _sweep_scenario(pr_visible_from: int) -> tuple[int, int, int, int]:
+        sweep_env.update(pull_reads=0, pr_visible_from=pr_visible_from, writes=[])
+        return run_sweep(argparse.Namespace(
+            registry_repo="owner/registry",
+            policy_file="unused-policy",
+            policy_resolver="unused-resolver",
+            bot_slug="app",
+            ledger_root="",
+        ))
+
+    sweep_patched = {
+        "GitHubAPI": _SweepAPI,
+        "load_limits": lambda *_a, **_k: {"owner/repo": limits},
+        "target_tokens_map": lambda: {"owner": "sweep-token"},
+        "_bot_login": lambda _api, _slug="": "app[bot]",
+        "_read_ledger": lambda _api, _repo: ([], "s1"),
+    }
+    sweep_saved = {name: globals()[name] for name in sweep_patched}
+    sweep_prior_cwd = os.getcwd()
+    try:
+        globals().update(sweep_patched)
+        with tempfile.TemporaryDirectory() as tmp:
+            # run_sweep resolves provenance from its working directory (the checkout root), so
+            # give the admitted worker PR a valid record there.
+            sweep_record_dir = Path(tmp) / PROVENANCE_DIR
+            sweep_record_dir.mkdir(parents=True)
+            (sweep_record_dir / "owner--repo--pr91.json").write_text(
+                json.dumps({
+                    "pr_number": 91,
+                    "head_sha_at_open": "2" * 40,
+                    "impl_provider": "anthropic",
+                    "impl_alias": "fable",
+                    "impl_account_h": "cd" * 8,
+                    "issue": 8,
+                }),
+                encoding="utf-8",
+            )
+            os.chdir(tmp)
+            # (A) The admitted worker PR opens AFTER the pre-loop snapshot (listing read #2) and
+            # is first visible to the mutation-boundary re-read (#3): NO label write may land.
+            summary_a = _sweep_scenario(pr_visible_from=3)
+            check(
+                "MUTATION boundary: a post-snapshot admitted worker PR suppresses the defer WRITE",
+                (summary_a, sweep_env["writes"]),
+                ((0, 0, 0, 0), []),
+            )
+            check(
+                "MUTATION boundary: the guard actually RE-READ open PRs at the boundary",
+                sweep_env["pull_reads"] >= 3,
+                True,
+            )
+            # (B) No PR ever appears: the exhausted defer mutation MUST land (discriminates an
+            # inverted or over-broad guard that would suppress every defer).
+            summary_b = _sweep_scenario(pr_visible_from=10**6)
+            check(
+                "MUTATION boundary: with no open worker PR the defer mutation still lands",
+                (summary_b[2],
+                 ("POST", "/repos/owner/repo/issues/8/labels") in sweep_env["writes"],
+                 ("DELETE", "/repos/owner/repo/issues/8/labels/status%3Ain-progress")
+                 in sweep_env["writes"]),
+                (1, True, True),
+            )
+    finally:
+        os.chdir(sweep_prior_cwd)
+        globals().update(sweep_saved)
 
     print("groom self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
