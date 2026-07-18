@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly re-derives the live source-issue route through the shared fail-closed resolver, computes the stricter of the route-implied same-provider tier and any durable escalation pin, uses that floor for allocator eligibility, and passes the same floor to the fix worker. Resolver and floor failures defer rather than falling back. The added tests are non-vacuous: they cover ordinary, trust-surface, CI, cross-provider, combined-pin, and no-same-provider cases, and the end-to-end claim assertions would fail under the former provider-wide FIX_CHAIN behavior. No trust check, audit binding, permission boundary, or token-handling path is weakened, and no reviewer-directed prompt injection appears in the diff.",
+ "verdict": "approve"
+}
