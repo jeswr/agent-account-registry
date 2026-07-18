@@ -125,11 +125,67 @@ tbody tr:last-child td { border-bottom: 0; }
 .empty { padding: 32px 20px; border: 1px dashed var(--line); border-radius: var(--radius); color: var(--muted); text-align: center; }
 .empty.subtle { margin: 0; padding: 10px 1px; border: 0; text-align: left; font-size: .82rem; }
 
+/* --- Agent-run observability (cache / run health / flow + auto-fixer trigger fires) --- */
+.obs-trigger-stack { display: grid; gap: 10px; margin-bottom: 18px; }
+.obs-trigger-stack:empty { display: none; }
+.obs-trigger-row {
+  display: grid;
+  gap: 5px;
+  padding: 13px 16px;
+  border: 1px solid rgba(255, 114, 125, .45);
+  border-radius: 12px;
+  background: rgba(255, 114, 125, .09);
+  color: #ffd9dd;
+  font-size: .86rem;
+}
+.obs-trigger-rule { font-weight: 750; letter-spacing: .04em; text-transform: uppercase; font-size: .68rem; color: var(--bad); }
+.obs-trigger-summary { line-height: 1.4; }
+.obs-trigger-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: .74rem; }
+.obs-evidence { color: var(--accent-2); text-decoration: none; border-bottom: 1px dotted var(--accent-2); }
+
+.obs-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.obs-card { padding: 20px; border-radius: var(--radius); border: 1px solid var(--line); background: linear-gradient(145deg, rgba(21, 30, 41, .96), rgba(15, 22, 30, .96)); box-shadow: 0 16px 45px rgba(0, 0, 0, .14); }
+.obs-card-title { margin: 0 0 14px; font-size: .95rem; letter-spacing: -.01em; }
+
+.obs-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; margin-bottom: 14px; }
+.obs-metric { display: flex; flex-direction: column; gap: 3px; }
+.obs-metric-label { color: var(--muted); font-size: .64rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.obs-metric-value { font-size: 1.15rem; font-weight: 750; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+.obs-metric-value .obs-metric-sub { display: block; margin-top: 1px; color: var(--muted); font-size: .68rem; font-weight: 600; letter-spacing: 0; }
+.obs-metric-value.good, td.good { color: var(--good); }
+.obs-metric-value.bad, td.bad { color: var(--bad); }
+.obs-metric-value.warn { color: var(--warn); }
+
+.obs-table { width: 100%; margin-bottom: 12px; border-collapse: collapse; font-size: .8rem; }
+.obs-lane { font-family: "SFMono-Regular", Consolas, monospace; font-size: .76rem; }
+.obs-reasons { margin-bottom: 12px; }
+.obs-reason-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+.obs-reason-row:last-child { border-bottom: 0; }
+.obs-reason-count { font-variant-numeric: tabular-nums; font-weight: 700; font-size: .8rem; }
+.obs-reason-count.bad { color: var(--bad); }
+.obs-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.obs-chip { padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .68rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.obs-bars { margin-bottom: 12px; }
+.obs-bar-row { display: grid; grid-template-columns: 34px 1fr 30px; align-items: center; gap: 8px; padding: 3px 0; }
+.obs-bar-label { color: var(--muted); font-size: .7rem; font-variant-numeric: tabular-nums; }
+.obs-bar-track { height: 7px; border-radius: 999px; background: rgba(11, 15, 20, .6); border: 1px solid var(--line); overflow: hidden; }
+.obs-bar-track.wide { flex: 1; }
+.obs-bar-fill { display: block; height: 100%; border-radius: 999px; background: var(--accent); }
+.obs-bar-fill.hot { background: var(--bad); }
+.obs-bar-count { text-align: right; color: var(--muted); font-size: .7rem; font-variant-numeric: tabular-nums; }
+
+.obs-spark-wrap { margin-top: 8px; }
+.obs-spark { display: block; width: 100%; height: 26px; overflow: visible; }
+.obs-spark-caption { margin: 0 0 3px; color: var(--muted); font-size: .62rem; letter-spacing: .04em; text-transform: uppercase; }
+.obs-spark-caption.muted { text-transform: none; letter-spacing: 0; }
+
 footer { margin-top: 50px; padding: 24px 0 40px; border-top: 1px solid var(--line); color: var(--muted); font-size: .75rem; }
 
 @media (max-width: 900px) {
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .account-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .obs-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 620px) {

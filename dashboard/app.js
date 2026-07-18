@@ -284,12 +284,328 @@ function updateFreshness(generatedAt) {
   }
 }
 
+// --- Agent-run observability (issue #246): cache effectiveness, per-lane run health + top defer
+// reasons, queue/lease/review flow, and auto-fixer trigger fires. Consumes the OPTIONAL
+// `observability` key of data.json — dashboard-gen validates + salts it server-side from the
+// collector's ledger snapshot (data/observability.json on the ledger branch; decision 22: no raw
+// account handles anywhere). Absent key => the whole section stays hidden; it never blocks the
+// rest of the dashboard. All identifiers here are obs-prefixed so this panel composes with other
+// independently-built panels in this file. -------------------------------------------------------
+const OBS_DEFAULT_THRESHOLDS = {
+  workflow_failure_rate: 0.5, defer_reason_hourly: 4,
+  queue_age_clamp_minutes: 10, merge_stall_minutes: 90,
+};
+const OBS_SALTED_RE = /^[0-9a-f]{8}$/;
+const OBS_SPARK_POINTS = 24;
+// data.json holds only the current snapshot; trends accumulate client-side across refreshes,
+// keyed by generated_at so re-polling an unchanged snapshot is not double-counted.
+const obsTrend = { stamp: null, points: [] };
+
+function obsNum(value, fallback = null) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function obsPct(value) {
+  const n = obsNum(value);
+  return n === null ? "—" : `${(n * 100).toFixed(n * 100 % 1 ? 1 : 0)}%`;
+}
+
+function obsThresholds(o) {
+  const supplied = o && typeof o.thresholds === "object" && o.thresholds ? o.thresholds : {};
+  const out = { ...OBS_DEFAULT_THRESHOLDS };
+  for (const key of Object.keys(out)) {
+    const value = obsNum(supplied[key]);
+    if (value !== null && value >= 0) out[key] = value;
+  }
+  return out;
+}
+
+function obsRecordTrend(o) {
+  if (obsTrend.stamp === o.generated_at) return;
+  obsTrend.stamp = o.generated_at;
+  const cache = o.cache || {};
+  const lanes = Array.isArray(o.lanes) ? o.lanes : [];
+  const queue = o.flow && Array.isArray(o.flow.queue) ? o.flow.queue : [];
+  obsTrend.points.push({
+    read: obsNum(cache.prompt_cache_read_fraction_1h),
+    warm: obsNum(cache.warm_drain_rate_1h),
+    defers: lanes.reduce((sum, lane) => sum + obsNum(lane["1h"] && lane["1h"].defer, 0), 0),
+    queue: queue.reduce((sum, row) => sum + obsNum(row.depth, 0), 0),
+  });
+  if (obsTrend.points.length > OBS_SPARK_POINTS) {
+    obsTrend.points.splice(0, obsTrend.points.length - OBS_SPARK_POINTS);
+  }
+}
+
+function obsSparkline(caption, series, stroke) {
+  const values = series.filter((v) => v !== null && Number.isFinite(v));
+  const wrap = node("div", "obs-spark-wrap");
+  wrap.append(node("p", "obs-spark-caption", caption));
+  if (values.length < 2) {
+    wrap.append(node("p", "obs-spark-caption muted", "collecting trend…"));
+    return wrap;
+  }
+  const W = 120;
+  const H = 26;
+  const min = Math.min(...values, 0);
+  const span = (Math.max(...values, 0) - min) || 1;
+  const step = W / (values.length - 1);
+  const y = (v) => H - ((v - min) / span) * (H - 2) - 1;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "obs-spark");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("aria-hidden", "true");
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  line.setAttribute("points", values.map((v, i) => `${(i * step).toFixed(1)},${y(v).toFixed(1)}`).join(" "));
+  line.setAttribute("fill", "none");
+  line.setAttribute("stroke", stroke);
+  line.setAttribute("stroke-width", "1.5");
+  line.setAttribute("stroke-linejoin", "round");
+  line.setAttribute("stroke-linecap", "round");
+  const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  dot.setAttribute("cx", ((values.length - 1) * step).toFixed(1));
+  dot.setAttribute("cy", y(values[values.length - 1]).toFixed(1));
+  dot.setAttribute("r", "2");
+  dot.setAttribute("fill", stroke);
+  svg.append(line, dot);
+  wrap.append(svg);
+  return wrap;
+}
+
+function obsMetric(label, value, opts = {}) {
+  const cell = node("div", "obs-metric");
+  cell.append(node("span", "obs-metric-label", label));
+  const holder = node("span", `obs-metric-value${opts.tone ? " " + opts.tone : ""}`, value);
+  if (opts.sub !== undefined) holder.append(node("span", "obs-metric-sub", opts.sub));
+  cell.append(holder);
+  return cell;
+}
+
+function obsCard(title) {
+  const card = node("article", "obs-card");
+  card.append(node("h3", "obs-card-title", title));
+  return card;
+}
+
+function obsRenderTriggers(fires) {
+  const host = byId("obs-triggers");
+  host.replaceChildren();
+  for (const fire of fires) {
+    if (!fire || typeof fire !== "object") continue;
+    const row = node("div", "obs-trigger-row");
+    row.setAttribute("role", "alert");
+    row.append(node("span", "obs-trigger-rule", String(fire.rule || "trigger")));
+    row.append(node("span", "obs-trigger-summary", String(fire.summary || "")));
+    const meta = node("span", "obs-trigger-meta");
+    meta.append(node("span", "", fire.fired_at ? `fired ${relative(fire.fired_at)}` : "fire time unknown"));
+    if (typeof fire.enqueued_task === "string" && fire.enqueued_task) {
+      meta.append(node("span", "obs-chip", `heal task ${fire.enqueued_task}`));
+    }
+    const links = Array.isArray(fire.evidence) ? fire.evidence : [];
+    links.forEach((href, index) => {
+      if (typeof href !== "string" || !href.startsWith("https://github.com/")) return;
+      const anchor = node("a", "obs-evidence", `evidence ${index + 1}`);
+      anchor.href = href;
+      anchor.rel = "noopener";
+      meta.append(anchor);
+    });
+    row.append(meta);
+    host.append(row);
+  }
+}
+
+function obsCacheCard(cache) {
+  const card = obsCard("Cache effectiveness");
+  const grid = node("div", "obs-metric-grid");
+  const samples = obsNum(cache.usage_samples_1h, 0);
+  grid.append(
+    obsMetric("Prompt-cache read", obsPct(cache.prompt_cache_read_fraction_1h),
+      { sub: samples ? `${samples} usage sample${samples === 1 ? "" : "s"} / 1h` : "no harness usage signal" }),
+    obsMetric("Warm drains", obsPct(cache.warm_drain_rate_1h),
+      { sub: `of ${obsNum(cache.drained_1h, 0)} drained / 1h` }),
+  );
+  card.append(grid);
+  const histogram = cache.chain_length_histogram || {};
+  const entries = Object.entries(histogram)
+    .filter(([, count]) => Number.isInteger(count) && count >= 0);
+  if (entries.length) {
+    const peak = Math.max(...entries.map(([, count]) => count), 1);
+    const bars = node("div", "obs-bars");
+    bars.append(node("p", "obs-spark-caption", "cache-chain lengths"));
+    for (const [length, count] of entries) {
+      const rowEl = node("div", "obs-bar-row");
+      rowEl.append(node("span", "obs-bar-label", `×${length}`));
+      const track = node("div", "obs-bar-track");
+      const fill = node("span", "obs-bar-fill");
+      fill.style.width = `${Math.max(4, (count / peak) * 100)}%`;
+      track.append(fill);
+      rowEl.append(track, node("span", "obs-bar-count", String(count)));
+      bars.append(rowEl);
+    }
+    card.append(bars);
+  }
+  card.append(
+    obsSparkline("read fraction trend", obsTrend.points.map((p) => p.read), "var(--accent)"),
+    obsSparkline("warm-drain trend", obsTrend.points.map((p) => p.warm), "var(--accent-2)"),
+  );
+  return card;
+}
+
+function obsHealthCard(lanes, deferReasons, exitClasses, thresholds) {
+  const card = obsCard("Agent-run health");
+  const table = node("table", "obs-table");
+  const head = node("tr");
+  for (const title of ["Lane", "1h ✓/✗/defer", "Fail rate 1h", "24h ✓/✗/defer"]) {
+    head.append(node("th", "", title));
+  }
+  table.append(head);
+  for (const lane of lanes) {
+    const hour = lane["1h"] || {};
+    const day = lane["24h"];
+    const success = obsNum(hour.success, 0);
+    const failure = obsNum(hour.failure, 0);
+    const attempts = success + failure;
+    const rate = attempts ? failure / attempts : null;
+    const row = node("tr");
+    row.append(node("td", "obs-lane", String(lane.lane)));
+    row.append(node("td", "", `${success} / ${failure} / ${obsNum(hour.defer, 0)}`));
+    const tone = rate === null ? "" : rate >= thresholds.workflow_failure_rate ? "bad" : "good";
+    row.append(node("td", tone, rate === null ? "—" : obsPct(rate)));
+    row.append(node("td", "", day
+      ? `${obsNum(day.success, 0)} / ${obsNum(day.failure, 0)} / ${obsNum(day.defer, 0)}` : "—"));
+    table.append(row);
+  }
+  card.append(table);
+  if (deferReasons.length) {
+    const list = node("div", "obs-reasons");
+    list.append(node("p", "obs-spark-caption", "top defer reasons / 1h"));
+    for (const item of deferReasons) {
+      const rowEl = node("div", "obs-reason-row");
+      rowEl.append(node("span", "obs-lane", String(item.reason)));
+      const hot = obsNum(item.count, 0) >= thresholds.defer_reason_hourly;
+      rowEl.append(node("span", `obs-reason-count${hot ? " bad" : ""}`, `×${obsNum(item.count, 0)}`));
+      list.append(rowEl);
+    }
+    card.append(list);
+  }
+  if (exitClasses.length) {
+    const chips = node("div", "obs-chips");
+    for (const row of exitClasses) {
+      chips.append(node("span", "obs-chip", `${row.model} · ${row.exit_class} ×${obsNum(row.count, 0)}`));
+    }
+    card.append(chips);
+  }
+  card.append(obsSparkline("defers / 1h trend", obsTrend.points.map((p) => p.defers), "var(--warn)"));
+  return card;
+}
+
+function obsFlowCard(flow, thresholds) {
+  const card = obsCard("Queue & flow");
+  const queue = Array.isArray(flow.queue) ? flow.queue : [];
+  if (queue.length) {
+    const list = node("div", "obs-reasons");
+    list.append(node("p", "obs-spark-caption", "task queue depth · oldest age"));
+    for (const row of queue) {
+      const rowEl = node("div", "obs-reason-row");
+      rowEl.append(node("span", "obs-lane", `class ${row.class}`));
+      const age = obsNum(row.oldest_age_minutes);
+      // The anti-starvation clamp guards CLASS-2 (self-healing) age: past it, red.
+      const late = age !== null && String(row.class).startsWith("2")
+        && age >= thresholds.queue_age_clamp_minutes;
+      rowEl.append(node("span", `obs-reason-count${late ? " bad" : ""}`,
+        `${obsNum(row.depth, 0)} deep${age === null ? "" : ` · ${age}m`}`));
+      list.append(rowEl);
+    }
+    card.append(list);
+  }
+  const grid = node("div", "obs-metric-grid");
+  const rounds = flow.review_rounds;
+  if (rounds) {
+    const exhausted = obsNum(rounds.budget_exhausted_1h, 0);
+    grid.append(obsMetric("Review rounds",
+      `${obsNum(rounds.mean) === null ? "—" : rounds.mean} avg`,
+      { sub: `max ${obsNum(rounds.max, 0)} · ${exhausted} budget-exhausted / 1h`,
+        tone: exhausted > 0 ? "bad" : "" }));
+  }
+  const parks = flow.parks_1h;
+  if (parks) {
+    grid.append(obsMetric("Parked / 1h",
+      `${obsNum(parks.needs_user, 0)} user · ${obsNum(parks.needs_orchestrator, 0)} orch`,
+      { tone: obsNum(parks.needs_orchestrator, 0) > 0 ? "warn" : "" }));
+  }
+  const latency = flow.arm_to_merge_minutes_24h;
+  if (latency) {
+    const p50 = obsNum(latency.p50);
+    grid.append(obsMetric("Arm → merge", p50 === null ? "—" : `${p50}m p50`,
+      { sub: `${obsNum(latency.p90) === null ? "—" : latency.p90 + "m"} p90 · ${obsNum(latency.samples, 0)} samples / 24h`,
+        tone: p50 !== null && p50 >= thresholds.merge_stall_minutes ? "bad" : "" }));
+  }
+  for (const target of Array.isArray(flow.target_ci_queue) ? flow.target_ci_queue : []) {
+    grid.append(obsMetric(`CI queue · ${target.repository}`, String(obsNum(target.depth, 0)),
+      { sub: "pending target CI runs" }));
+  }
+  if (grid.childElementCount) card.append(grid);
+  const leases = Array.isArray(flow.leases) ? flow.leases : [];
+  if (leases.length) {
+    const list = node("div", "obs-reasons");
+    list.append(node("p", "obs-spark-caption", "lease utilization / 1h (salted accounts)"));
+    for (const lease of leases) {
+      // Defense in depth for decision 22: only the salted 8-hex label shape is ever rendered.
+      if (typeof lease.label !== "string" || !OBS_SALTED_RE.test(lease.label)) continue;
+      const rowEl = node("div", "obs-reason-row");
+      rowEl.append(node("span", "obs-lane", `${lease.label}${lease.provider ? ` · ${lease.provider}` : ""}`));
+      const meter = node("div", "obs-bar-track wide");
+      const used = obsNum(lease.utilization_1h);
+      const fill = node("span", `obs-bar-fill${used !== null && used >= 0.85 ? " hot" : ""}`);
+      fill.style.width = `${used === null ? 0 : Math.min(100, used * 100)}%`;
+      meter.append(fill);
+      rowEl.append(meter, node("span", "obs-reason-count", obsPct(lease.utilization_1h)));
+      list.append(rowEl);
+    }
+    card.append(list);
+  }
+  card.append(obsSparkline("queue depth trend", obsTrend.points.map((p) => p.queue), "var(--accent-2)"));
+  return card;
+}
+
+function renderObservability(o) {
+  const section = byId("obs-section");
+  if (!o || typeof o !== "object") {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  obsRecordTrend(o);
+  byId("obs-time").textContent = o.generated_at
+    ? `Collected ${relative(o.generated_at)} · ${utc(o.generated_at)}` : "Collection time unknown";
+  const thresholds = obsThresholds(o);
+  obsRenderTriggers(Array.isArray(o.trigger_fires) ? o.trigger_fires : []);
+  const grid = byId("obs-grid");
+  grid.replaceChildren();
+  if (o.cache && typeof o.cache === "object") grid.append(obsCacheCard(o.cache));
+  const lanes = Array.isArray(o.lanes) ? o.lanes : [];
+  if (lanes.length) {
+    grid.append(obsHealthCard(
+      lanes,
+      Array.isArray(o.defer_reasons_1h) ? o.defer_reasons_1h : [],
+      Array.isArray(o.model_exit_classes_1h) ? o.model_exit_classes_1h : [],
+      thresholds,
+    ));
+  }
+  if (o.flow && typeof o.flow === "object") grid.append(obsFlowCard(o.flow, thresholds));
+  if (!grid.childElementCount) {
+    grid.append(node("p", "empty subtle", "Observability snapshot has no renderable groups yet."));
+  }
+}
+
 function render(data) {
   renderRepositoryAgents(data.active_by_repository, data.fleet.active_agents);
   renderSummary(data);
   renderAccounts(data.accounts || []);
   renderOutcomes(data.fleet.dispatch_outcomes || []);
   renderHealth(data.model_health);
+  renderObservability(data.observability);
   updateFreshness(data.generated_at);
 }
 

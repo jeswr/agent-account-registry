@@ -41,3 +41,23 @@ checkout (`dispatch.yml` PLAN + CLAIM, `review-fix.yml` resolve + run, `groom.ym
 `dashboard.yml`). Record readers consult the ledger checkout FIRST and fall back to the
 master-checkout copy so pre-outage records stay visible. Readers fail LOUD if the `ledger`
 branch is missing — never silently-empty.
+
+## `data/observability.json` — agent-run observability snapshot (issue #246)
+
+The dashboard's Observability panels (cache effectiveness / per-lane run health + top defer
+reasons / queue-lease-review flow / auto-fixer trigger fires) render the OPTIONAL
+`observability` key of the published `site/data.json`. That key is produced by
+`scripts/dashboard-gen.py --observability ledger/data/observability.json` from a snapshot the
+metrics collector persists on the `ledger` branch. Until the collector lands, the file is
+simply absent and the panels stay hidden — the rest of the dashboard is unaffected.
+
+The consumer-side contract IS `dashboard-gen._normalize_observability()` (self-tested with a
+golden fixture; collector authors: build against it, not this prose). Root shape:
+`{"schema": "registry-observability/v1", "generated_at", "cache", "lanes",
+"defer_reasons_1h", "model_exit_classes_1h", "flow", "trigger_fires", "thresholds"}` — every
+group optional. Validation is FAIL-CLOSED: an absent file hides the panel; a present document
+with the wrong `schema` fails the dashboard build LOUD; malformed rows inside a well-formed
+document are dropped (the model-health tolerance) — EXCEPT privacy violations, which are
+always fatal (decision 22): a `flow.leases[].label` that is not the 8-hex HMAC-salted account
+label raises, trigger `evidence` links are pinned to `https://github.com/`, and the existing
+`_assert_private` raw-handle sweep runs over the finished document.
