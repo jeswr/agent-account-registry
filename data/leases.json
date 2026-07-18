@@ -11,16 +11,6 @@
    "expires_at": 1784419754
   },
   {
-   "account": "acct01",
-   "claim_id": "843ecacbe81d4f8c935dbbf01aefa2e8",
-   "holder": "review:sparq-org/sparq#3523@dispatch-29664724659.1",
-   "package": "sparq-shacl",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784416367,
-   "expires_at": 1784417567
-  },
-  {
    "account": "acct03",
    "claim_id": "0fb4ceb2df804ddbb57e1acb14000a05",
    "holder": "fix:jeswr/agent-account-registry#235@dispatch-29664724659.1",
