@@ -182,16 +182,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "96a078fcf6bd4e4589e44994b5c9b142",
-   "holder": "sparq-org/sparq#3284@dispatch-29626600191.1",
-   "package": "sparq-canon",
-   "role": "impl",
-   "model": "terra",
-   "issued_at": 1784340893,
-   "expires_at": 1784347193
-  },
-  {
-   "account": "acct01",
    "claim_id": "9042e49b37324cc3a5c1901bcb3d294f",
    "holder": "sparq-org/sparq#3337@dispatch-29626600191.1",
    "package": "release",
