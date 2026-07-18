@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change aligns the demo seed with the ratified public-demo posture: root-level /playground/ grants authenticated Read/Write/Append plus public Read through both accessTo and default, grants no Control, and /README has a direct public-Read-only ACL. The unit test exercises the actual WAC authorizer for authenticated, anonymous, inherited-child, README, and Control cases, while the HTTP integration tests exercise real DPoP authentication and LDP enforcement for creation, anonymous denial, public reads, ACL rewrite denial, and an unseeded boot. The implementation remains opt-in and preserves the existing non-memory startup guard. No hostile reviewer-directed instruction appears in the diff.",
+ "verdict": "approve"
+}
