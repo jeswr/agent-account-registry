@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "This file is unrelated to the SHACL feature and records transient runner state, including a temporary agent-output filename and filesystem-capacity details. It is not a source, test, fixture, or durable project artifact and should not be shipped in the repository.",
+   "file": ".du.txt",
+   "fix_hint": "Delete `.du.txt` from the pull request; if this diagnostic filename is likely to recur, add an appropriate ignore rule in a separate scoped change only if repository policy calls for it.",
+   "severity": "minor",
+   "title": "Remove committed ephemeral diagnostic output"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The shapes-graph assembly remains correct and complete on the supplied evidence: transitive traversal is cycle-guarded, blank nodes are standardized apart across successful documents and from the intact seed (including RDF-star terms), and the regression test exercises the prior collision witness through the real validation path. The opt-in feature, CI leg, README, and skill documentation remain aligned. One non-blocking repository-hygiene issue remains: an ephemeral disk/transcript diagnostic file is committed at the repository root. No hostile reviewer-directed instruction appears in the diff. Because round 3 recorded no findings and this round identifies one new minor finding, progress is regressing under the mandated comparison scale.",
+ "verdict": "approve"
+}
