@@ -9,6 +9,7 @@ import hmac
 import importlib.util
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,23 @@ DISPATCH_COMPLETE_RE = re.compile(
     r"^\S+\s+dispatcher complete:\s+(\d+) worker/review/fix run\(s\) launched", re.MULTILINE)
 DISPATCHED_RE = re.compile(r"^\S+\s+dispatched\s", re.MULTILINE)
 DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
+
+# Agent-run observability (issue #246). The collector persists a snapshot of cache-effectiveness /
+# per-lane run-health / flow metrics + auto-fixer trigger fires on the ledger data-plane branch
+# (data/observability.json); dashboard.yml hands it in via --observability and
+# _normalize_observability() validates it FAIL-CLOSED here before it may reach the public
+# data.json (rendered by the dashboard's Observability panels; absent file => hidden panel).
+# Decision 22: no raw account handles anywhere on the public surface — lease rows must already
+# carry the 8-hex salted label (the _salted_labels shape); anything else dies loudly, and
+# _assert_private additionally backstops every known raw handle over the finished document.
+OBS_SCHEMA = "registry-observability/v1"
+OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{8}")
+OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
+OBS_QUEUE_CLASS_RE = re.compile(r"[1-4][a-z]?")   # the #243 queue classes (1, 2, 2a..2d, 3, 4)
+OBS_HISTOGRAM_KEY_RE = re.compile(r"\d{1,2}\+?")
+OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#%-]{1,220}")
+OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
+                      "queue_age_clamp_minutes", "merge_stall_minutes"}
 
 
 class DashboardError(RuntimeError):
@@ -458,7 +476,249 @@ def _assert_private(document, private_values):
         raise DashboardError("privacy assertion failed: raw account identity reached public JSON")
 
 
-def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt):
+def _obs_fraction(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 <= number <= 1.0:
+        return None
+    return round(number, 4)
+
+
+def _obs_count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _obs_minutes(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return round(float(value), 1) if 0 <= value < 10_000_000 else None
+
+
+def _obs_text(value, cap):
+    text = str(value or "").strip()
+    return text[:cap] if text and text.isprintable() else ""
+
+
+def _obs_lane_rows(lanes):
+    """Per-workflow (worker/review-fix/drain/groom/...) run outcomes over the 1h/24h windows.
+    Lane names are declared by the collector, validated as safe tokens here — a new lane appears
+    on the dashboard without a UI change. Malformed rows are dropped, not fatal."""
+    rows = []
+    if not isinstance(lanes, dict):
+        return rows
+    for name in sorted(str(key) for key in lanes):
+        row = lanes.get(name)
+        if (len(rows) == 12 or OBS_TOKEN_RE.fullmatch(name) is None
+                or not isinstance(row, dict)):
+            continue
+        out = {"lane": name}
+        for window in ("1h", "24h"):
+            source = row.get(window)
+            if not isinstance(source, dict):
+                out[window] = None
+                continue
+            out[window] = {key: _obs_count(source.get(key)) or 0
+                           for key in ("success", "failure", "defer")}
+        rows.append(out)
+    return rows
+
+
+def _obs_counted_rows(items, key_field, cap):
+    """[{<key_field>, count}] sorted by count descending (the TOP-N contract for defer reasons)."""
+    rows = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        key = item.get(key_field)
+        count = _obs_count(item.get("count"))
+        if not isinstance(key, str) or OBS_TOKEN_RE.fullmatch(key) is None or count is None:
+            continue
+        rows.append({key_field: key, "count": count})
+    rows.sort(key=lambda row: (-row["count"], row[key_field]))
+    return rows[:cap]
+
+
+def _obs_exit_rows(items):
+    rows = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        model, exit_class = item.get("model"), item.get("exit_class")
+        count = _obs_count(item.get("count"))
+        if (not isinstance(model, str) or SAFE_MODEL_RE.fullmatch(model) is None
+                or not isinstance(exit_class, str)
+                or OBS_TOKEN_RE.fullmatch(exit_class) is None or count is None):
+            continue
+        rows.append({"model": model, "exit_class": exit_class, "count": count})
+    rows.sort(key=lambda row: (-row["count"], row["model"], row["exit_class"]))
+    return rows[:16]
+
+
+def _obs_flow(flow):
+    """Queue depth/age per class, salted lease utilization, review rounds, park rates, arm→merge
+    latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape is a raw
+    account identity reaching the collector output — a decision-22 privacy incident, fatal."""
+    if not isinstance(flow, dict):
+        return None
+    queue = []
+    for item in flow.get("queue") if isinstance(flow.get("queue"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        queue_class = item.get("class")
+        depth = _obs_count(item.get("depth"))
+        if (not isinstance(queue_class, str)
+                or OBS_QUEUE_CLASS_RE.fullmatch(queue_class) is None or depth is None):
+            continue
+        queue.append({"class": queue_class, "depth": depth,
+                      "oldest_age_minutes": _obs_minutes(item.get("oldest_age_minutes"))})
+    queue.sort(key=lambda row: row["class"])
+
+    leases = []
+    for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label")
+        if not isinstance(label, str) or OBS_SALTED_LABEL_RE.fullmatch(label) is None:
+            raise DashboardError(
+                "observability lease row does not carry a salted account label (decision 22)")
+        provider = str(item.get("provider") or "").lower()
+        leases.append({"label": label,
+                       "provider": provider if SAFE_PROVIDER_RE.fullmatch(provider) else None,
+                       "utilization_1h": _obs_fraction(item.get("utilization_1h"))})
+
+    rounds = flow.get("review_rounds")
+    review_rounds = None
+    if isinstance(rounds, dict):
+        mean = rounds.get("mean")
+        review_rounds = {
+            "mean": round(float(mean), 2)
+            if isinstance(mean, (int, float)) and not isinstance(mean, bool)
+            and math.isfinite(mean) and mean >= 0
+            else None,
+            "max": _obs_count(rounds.get("max")),
+            "budget_exhausted_1h": _obs_count(rounds.get("budget_exhausted_1h")),
+        }
+
+    parks = flow.get("parks_1h")
+    parks_1h = None
+    if isinstance(parks, dict):
+        parks_1h = {key: _obs_count(parks.get(key)) or 0
+                    for key in ("needs_user", "needs_orchestrator")}
+
+    latency = flow.get("arm_to_merge_minutes_24h")
+    arm_to_merge = None
+    if isinstance(latency, dict):
+        arm_to_merge = {"p50": _obs_minutes(latency.get("p50")),
+                        "p90": _obs_minutes(latency.get("p90")),
+                        "samples": _obs_count(latency.get("samples")) or 0}
+
+    ci_queue = []
+    for item in (flow.get("target_ci_queue")
+                 if isinstance(flow.get("target_ci_queue"), list) else []):
+        if not isinstance(item, dict):
+            continue
+        repository = item.get("repository")
+        depth = _obs_count(item.get("depth"))
+        if (not isinstance(repository, str) or depth is None or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository)):
+            continue
+        ci_queue.append({"repository": repository, "depth": depth})
+
+    return {"queue": queue[:12], "leases": leases[:40], "review_rounds": review_rounds,
+            "parks_1h": parks_1h, "arm_to_merge_minutes_24h": arm_to_merge,
+            "target_ci_queue": ci_queue[:12]}
+
+
+def _obs_trigger_rows(items):
+    """Auto-fixer trigger fires (fire-only alarm semantics — the collector records each fire; the
+    dashboard only displays). Evidence links are pinned to github.com — anything else is dropped
+    loudly rather than published on the public page."""
+    rows = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        rule = item.get("rule")
+        if not isinstance(rule, str) or OBS_TOKEN_RE.fullmatch(rule) is None:
+            continue
+        evidence = []
+        for link in (item.get("evidence") if isinstance(item.get("evidence"), list) else [])[:8]:
+            if isinstance(link, str) and OBS_EVIDENCE_RE.fullmatch(link):
+                evidence.append(link)
+            else:
+                print("dashboard-gen: dropped a non-GitHub observability evidence link")
+        task = item.get("enqueued_task")
+        rows.append({
+            "rule": rule,
+            "fired_at": _utc_iso(item.get("fired_at")),
+            "summary": _obs_text(item.get("summary"), 240),
+            "evidence": evidence[:5],
+            "enqueued_task": task if isinstance(task, str)
+            and OBS_TOKEN_RE.fullmatch(task) else None,
+        })
+    rows.sort(key=lambda row: row["fired_at"] or "", reverse=True)
+    return rows[:20]
+
+
+def _normalize_observability(document):
+    """Validate + sanitize the collector's ledger observability snapshot before publication.
+
+    An ABSENT file is the not-yet-deployed collector => None (the panel hides; never blocks the
+    rest of the dashboard). A PRESENT document that is not the declared schema dies loudly — this
+    is collector-written data-plane input and must never be published on a guess. Inside a
+    well-formed document, malformed rows are dropped (the _normalize_model_health tolerance),
+    EXCEPT privacy-shaped violations (a non-salted lease label), which are always fatal."""
+    if document is None:
+        return None
+    if not isinstance(document, dict) or document.get("schema") != OBS_SCHEMA:
+        raise DashboardError(f"observability snapshot must declare schema {OBS_SCHEMA!r}")
+
+    cache_source = document.get("cache")
+    cache = None
+    if isinstance(cache_source, dict):
+        histogram = {}
+        raw_histogram = cache_source.get("chain_length_histogram")
+        if isinstance(raw_histogram, dict):
+            for key in sorted(str(k) for k in raw_histogram)[:12]:
+                count = _obs_count(raw_histogram.get(key))
+                if OBS_HISTOGRAM_KEY_RE.fullmatch(key) and count is not None:
+                    histogram[key] = count
+        cache = {
+            "prompt_cache_read_fraction_1h":
+                _obs_fraction(cache_source.get("prompt_cache_read_fraction_1h")),
+            "usage_samples_1h": _obs_count(cache_source.get("usage_samples_1h")) or 0,
+            "warm_drain_rate_1h": _obs_fraction(cache_source.get("warm_drain_rate_1h")),
+            "drained_1h": _obs_count(cache_source.get("drained_1h")) or 0,
+            "chain_length_histogram": histogram,
+        }
+
+    thresholds_source = document.get("thresholds")
+    thresholds = None
+    if isinstance(thresholds_source, dict):
+        thresholds = {}
+        for key in OBS_THRESHOLD_KEYS:
+            value = thresholds_source.get(key)
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) and value >= 0):
+                thresholds[key] = value
+
+    return {
+        "generated_at": _utc_iso(document.get("generated_at")),
+        "cache": cache,
+        "lanes": _obs_lane_rows(document.get("lanes")),
+        "defer_reasons_1h": _obs_counted_rows(document.get("defer_reasons_1h"), "reason", 16),
+        "model_exit_classes_1h": _obs_exit_rows(document.get("model_exit_classes_1h")),
+        "flow": _obs_flow(document.get("flow")),
+        "trigger_fires": _obs_trigger_rows(document.get("trigger_fires")),
+        "thresholds": thresholds,
+    }
+
+
+def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
+                    observability=None):
     accounts, private_values = _catalog(issues)
     handles = [account["handle"] for account in accounts]
     labels = _salted_labels(handles, salt)
@@ -506,6 +766,11 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         "active_by_repository": _repository_activity(live),
         "model_health": _normalize_model_health(model_health),
     }
+    observability = _normalize_observability(observability)
+    if observability is not None:
+        # Optional key (absent => the dashboard hides the Observability panels), placed INSIDE the
+        # document so the raw-identity assertion below covers every observability string too.
+        document["observability"] = observability
     _assert_private(document, private_values)
     return document
 
@@ -527,7 +792,9 @@ def _write_site(document, assets, site):
     if copied == 0:
         raise DashboardError("dashboard asset directory is empty")
     with open(site / "data.json", "w", encoding="utf-8") as handle:
-        json.dump(document, handle, indent=2, sort_keys=True)
+        # allow_nan=False: NaN/Infinity would serialize as non-standard JSON tokens that browser
+        # response.json() rejects, taking down the whole public page — die here instead.
+        json.dump(document, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
 
 
@@ -706,6 +973,123 @@ def _self_test():
           {"generated_at": "2025-06-15T15:06:40Z",
            "checks": [{"model": "fable", "provider": "anthropic",
                        "status": "healthy", "checked_at": None}]})
+
+    # --- observability normalization (issue #246): accept path is a GOLDEN fixture (every field
+    # class exercised, every malformed row visibly dropped), reject paths are explicit. ---------
+    obs_fixture = {
+        "schema": "registry-observability/v1",
+        "generated_at": now,
+        "cache": {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7,
+                  "warm_drain_rate_1h": "0.5", "drained_1h": 12,
+                  "chain_length_histogram": {"1": 4, "2": 3, "5+": 1, "bogus": 2, "3": -1}},
+        "lanes": {"worker": {"1h": {"success": 3, "failure": 1, "defer": 2},
+                             "24h": {"success": 30, "failure": 4, "defer": 9}},
+                  "review-fix": {"1h": {"success": 1, "failure": 0, "defer": 0}},
+                  "bad lane!": {"1h": {"success": 1}}},
+        "defer_reasons_1h": [{"reason": "partial-disarm", "count": 7},
+                             {"reason": "trust-gate-missing", "count": 9},
+                             {"reason": "bad reason!", "count": 3},
+                             {"reason": "plan-ordering", "count": "x"}],
+        "model_exit_classes_1h": [{"model": "fable", "exit_class": "success", "count": 3},
+                                  {"model": "terra", "exit_class": "no-changes", "count": 8},
+                                  {"model": "bad model!", "exit_class": "x", "count": 1}],
+        "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.34},
+                           {"class": "4", "depth": 9, "oldest_age_minutes": 3},
+                           {"class": "9z", "depth": 1}],
+                 "leases": [{"label": "ab12cd34", "provider": "anthropic",
+                             "utilization_1h": 0.8}],
+                 "review_rounds": {"mean": 1.44444, "max": 3, "budget_exhausted_1h": 0},
+                 "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
+                 "arm_to_merge_minutes_24h": {"p50": 18, "p90": 55.5, "samples": 9},
+                 "target_ci_queue": [{"repository": "sparq-org/sparq", "depth": 5},
+                                     {"repository": "not-a-repo", "depth": 2}]},
+        "trigger_fires": [
+            {"rule": "worker-failure-rate", "fired_at": now - 300,
+             "summary": "worker failure rate 67% over 3 consecutive runs",
+             "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/1",
+                          "https://evil.example/exfil"],
+             "enqueued_task": "heal-2a-0001"},
+            {"rule": "bad rule!", "fired_at": now, "summary": "must be skipped"}],
+        "thresholds": {"workflow_failure_rate": 0.5, "defer_reason_hourly": 4,
+                       "queue_age_clamp_minutes": 10, "merge_stall_minutes": 90, "bogus": 1},
+    }
+    obs_expected = {
+        "generated_at": "2025-06-15T15:06:40Z",
+        "cache": {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7,
+                  "warm_drain_rate_1h": 0.5, "drained_1h": 12,
+                  "chain_length_histogram": {"1": 4, "2": 3, "5+": 1}},
+        "lanes": [
+            {"lane": "review-fix", "1h": {"success": 1, "failure": 0, "defer": 0}, "24h": None},
+            {"lane": "worker", "1h": {"success": 3, "failure": 1, "defer": 2},
+             "24h": {"success": 30, "failure": 4, "defer": 9}}],
+        "defer_reasons_1h": [{"reason": "trust-gate-missing", "count": 9},
+                             {"reason": "partial-disarm", "count": 7}],
+        "model_exit_classes_1h": [{"model": "terra", "exit_class": "no-changes", "count": 8},
+                                  {"model": "fable", "exit_class": "success", "count": 3}],
+        "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.3},
+                           {"class": "4", "depth": 9, "oldest_age_minutes": 3.0}],
+                 "leases": [{"label": "ab12cd34", "provider": "anthropic",
+                             "utilization_1h": 0.8}],
+                 "review_rounds": {"mean": 1.44, "max": 3, "budget_exhausted_1h": 0},
+                 "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
+                 "arm_to_merge_minutes_24h": {"p50": 18.0, "p90": 55.5, "samples": 9},
+                 "target_ci_queue": [{"repository": "sparq-org/sparq", "depth": 5}]},
+        "trigger_fires": [
+            {"rule": "worker-failure-rate", "fired_at": "2025-06-15T15:01:40Z",
+             "summary": "worker failure rate 67% over 3 consecutive runs",
+             "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/1"],
+             "enqueued_task": "heal-2a-0001"}],
+        "thresholds": {"workflow_failure_rate": 0.5, "defer_reason_hourly": 4,
+                       "queue_age_clamp_minutes": 10, "merge_stall_minutes": 90},
+    }
+    check("observability golden normalization (bad rows dropped, top-N sorted, links pinned)",
+          _normalize_observability(obs_fixture), obs_expected)
+    check("absent observability snapshot stays hidden (None)",
+          _normalize_observability(None), None)
+    overflow = copy.deepcopy(obs_fixture)
+    overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
+    overflow["thresholds"]["workflow_failure_rate"] = 1e309
+    overflow_normalized = _normalize_observability(overflow)
+    check("non-finite review-round mean is rejected, never published",
+          overflow_normalized["flow"]["review_rounds"]["mean"], None)
+    check("non-finite threshold is dropped, never published",
+          "workflow_failure_rate" in overflow_normalized["thresholds"], False)
+    for bad_document in ({"schema": "wrong/v0"}, ["not", "a", "dict"], {}):
+        try:
+            _normalize_observability(bad_document)
+        except DashboardError:
+            schema_rejected = True
+        else:
+            schema_rejected = False
+        check(f"alien observability document rejected loudly ({type(bad_document).__name__})",
+              schema_rejected, True)
+    raw_label = copy.deepcopy(obs_fixture)
+    raw_label["flow"]["leases"][0]["label"] = handle   # a raw account handle, not the salted form
+    try:
+        _normalize_observability(raw_label)
+    except DashboardError:
+        label_rejected = True
+    else:
+        label_rejected = False
+    check("raw (non-salted) lease label is a fatal privacy violation (decision 22)",
+          label_rejected, True)
+    with_observability = build_dashboard(
+        issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
+    check("build_dashboard publishes the normalized observability key",
+          with_observability.get("observability"), obs_expected)
+    check("no observability input leaves data.json without the key (panel hidden)",
+          "observability" in got, False)
+    leak = copy.deepcopy(obs_fixture)
+    leak["trigger_fires"][0]["summary"] = f"lane stalled on {handle}"
+    try:
+        build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                        observability=leak)
+    except DashboardError:
+        leak_rejected = True
+    else:
+        leak_rejected = False
+    check("raw handle inside observability text is caught by the privacy assertion",
+          leak_rejected, True)
     empty = build_dashboard([], {"leases": []}, None, [], None, now, "fixture-salt")
     check("do-nothing case", (empty["accounts"], empty["fleet"],
                               empty["active_by_repository"]),
@@ -731,6 +1115,14 @@ def _self_test():
               ((site / "index.html").read_text(encoding="utf-8"),
                json.loads((site / "data.json").read_text(encoding="utf-8"))["schema"]),
               ("fixture", SCHEMA))
+        try:
+            _write_site({"schema": SCHEMA, "poison": float("inf")}, assets, site)
+        except ValueError:
+            nonfinite_blocked = True
+        else:
+            nonfinite_blocked = False
+        check("_write_site refuses non-finite numbers (allow_nan=False backstop)",
+              nonfinite_blocked, True)
     print("dashboard-gen self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -745,6 +1137,10 @@ def main(argv=None):
     parser.add_argument("--issues-file")
     parser.add_argument("--usage")
     parser.add_argument("--model-health")
+    # Optional: the collector's observability snapshot from a `ledger`-branch checkout (issue
+    # #246). Absent file => the Observability panels stay hidden; a present-but-invalid document
+    # fails LOUD in _normalize_observability (never published on a guess).
+    parser.add_argument("--observability")
     parser.add_argument("--assets", default="dashboard")
     parser.add_argument("--site", default="site")
     parser.add_argument("--history", type=int, default=8)
@@ -770,10 +1166,11 @@ def main(argv=None):
     leases = _read_json(args.leases, required=True)
     usage = _read_json(_optional_usage_path(args.usage), default={})
     model_health = _read_json(args.model_health, default=None)
+    observability = _read_json(args.observability, default=None)
     history = _fetch_dispatch_history(repo, args.history)
     document = build_dashboard(
         issues, leases, usage, history, model_health, int(time.time()),
-        os.environ.get("PROVENANCE_SALT", ""))
+        os.environ.get("PROVENANCE_SALT", ""), observability=observability)
     _write_site(document, args.assets, args.site)
     print(f"dashboard-gen: wrote {args.site}/data.json with {len(document['accounts'])} account(s)")
     return 0

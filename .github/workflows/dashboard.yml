@@ -94,8 +94,12 @@ jobs:
           test -f ledger/data/leases.json
           test -f ledger/data/model-health.json
           python3 scripts/dashboard-gen.py --self-test
+          # The observability snapshot (issue #246) is OPTIONAL on the ledger until its collector
+          # lands: an absent file keeps the panel hidden, while a present-but-invalid one fails
+          # this build loudly inside dashboard-gen (never published on a guess).
           python3 scripts/dashboard-gen.py --usage "$RUNNER_TEMP/usage.json" \
-            --leases ledger/data/leases.json --model-health ledger/data/model-health.json
+            --leases ledger/data/leases.json --model-health ledger/data/model-health.json \
+            --observability ledger/data/observability.json
 
       - name: Upload GitHub Pages artifact (pinned)
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
