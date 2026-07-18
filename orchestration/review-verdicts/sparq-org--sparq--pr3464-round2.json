@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "read_struct_map delegates every negative-key extension value to skip_value, but skip_value_depth handles nested maps by blindly skipping alternating keys and values. It neither requires integer keys nor enforces RFC 8949 length-first/bytewise key order or duplicate rejection inside those maps. Therefore a top-level wire object can contain an extension whose value is a non-canonical map (for example duplicate or reverse-ordered keys) and still pass a decoder documented to validate deterministic CBOR on the full input. The existing extension tests cover only a text value and do not exercise this real recursive path.",
+   "file": "crates/sparq-e2ee-ng/src/cbor.rs",
+   "fix_hint": "Make recursive skipping validate deterministic CBOR maps: capture each nested key's encoded span or canonical rank, require strictly increasing length-first/bytewise order, and reject duplicates (for every supported key type). Add a test embedding a reverse-ordered and a duplicate-key map as a negative extension value and require Error::NonCanonical.",
+   "severity": "major",
+   "title": "Skipped extension values bypass canonical map validation"
+  },
+  {
+   "body": "PublicGrant::decode_from enforces only publish => publisher_pub, not the documented publisher_pub iff publish invariant. Capability::validate has the same gap: with no Publish authority, publisher_sk absent, and publisher_pub present, both sides of its current boolean comparison are false, so validation succeeds. A read/admin grant can therefore carry and authenticate an unrelated publisher key while the API and separation documentation say that field is present iff publish is granted. No test covers this reverse mismatch.",
+   "file": "crates/sparq-e2ee-ng/src/capability.rs",
+   "fix_hint": "Require authority.contains(Publish) == publisher_pub.is_some() when decoding/validating a public grant, independently require publisher_sk presence to equal Publish for secret capabilities, then compare the derived key when present. Add public and secret decode tests that insert publisher_pub into a non-publish grant and require Error::Separation.",
+   "severity": "major",
+   "title": "Public grants accept publisher keys without publish authority"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "All four round-1 findings were materially fixed and covered by direct tests: map-key ordering now includes negative keys, authority arrays are rejected unless canonical, publisher secrets are matched to their public keys, and X25519 non-contributory exchanges fail closed. However, two new major acceptance gaps remain. Unknown extension values bypass recursive deterministic-CBOR map validation, and public grants accept a publisher key without publish authority despite the documented iff separation invariant. Because new major findings remain, this round is regressing under the required comparison scale.",
+ "verdict": "request_changes"
+}
