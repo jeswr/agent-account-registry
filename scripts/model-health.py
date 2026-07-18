@@ -136,7 +136,13 @@ PROVIDER_STATUS_URLS = {
     "anthropic": "https://status.claude.com/api/v2/status.json",
     "openai": "https://status.openai.com/api/v2/status.json",
 }
-STATUS_PROBE_TIMEOUT_SECONDS = 10
+# Two-layer probe bound (review #72 round 3): the socket timeout only caps INDIVIDUAL blocking
+# operations (DNS, connect, each recv) — a peer trickling one byte per few seconds never trips
+# it — so the whole request additionally runs under a hard WALL-CLOCK deadline, and the body
+# under a size cap (a real status.json is a few hundred bytes).
+STATUS_PROBE_TIMEOUT_SECONDS = 10   # per-socket-operation timeout
+STATUS_PROBE_DEADLINE_SECONDS = 20  # end-to-end wall-clock cap on one probe
+STATUS_PROBE_MAX_BYTES = 1 << 20    # response-size bound
 STATUS_OPERATIONAL = "operational"
 STATUS_DEGRADED = "degraded"    # indicator: minor
 STATUS_OUTAGE = "outage"        # indicator: major / critical
@@ -460,23 +466,57 @@ def classify_status_payload(payload):
     return _INDICATOR_MAP.get(indicator, STATUS_UNKNOWN), indicator
 
 
-def _fetch_status_json(url):
-    """GET one of the two fixed PROVIDER_STATUS_URLS (never a caller-built URL) with a hard
-    10s timeout; any transport or parse failure raises HealthError for the fail-open above."""
+def _fetch_status_json(url, deadline=STATUS_PROBE_DEADLINE_SECONDS):
+    """GET one of the two fixed PROVIDER_STATUS_URLS (never a caller-built URL). Review #72
+    round 3: the socket timeout bounds only individual blocking operations, so a peer that
+    trickles data can exceed it indefinitely — the whole request therefore runs in a DAEMON
+    thread that is ABANDONED after `deadline` wall-clock seconds (daemon: it cannot block
+    interpreter exit), and the body is read in bounded chunks with a hard size cap. Any
+    transport, parse, size, or deadline failure raises HealthError for the fail-open above."""
     import http.client
-    from urllib.request import Request, urlopen
-    request = Request(url, headers={"User-Agent": "registry-model-health"})
-    try:
+    import threading
+
+    def fetch_bounded():
+        from urllib.request import Request, urlopen
+        request = Request(url, headers={"User-Agent": "registry-model-health"})
         with urlopen(request, timeout=STATUS_PROBE_TIMEOUT_SECONDS) as response:
-            return json.loads(response.read().decode())
-    except (OSError, http.client.HTTPException, ValueError) as exc:
-        # OSError subsumes URLError/HTTPError/TimeoutError AND the raw socket errors
-        # (ConnectionResetError etc.) that response.read() can raise mid-body; HTTPException
-        # covers a truncated/half-closed response (http.client.IncompleteRead). Review #72
-        # finding 1: neither was normalized before, so a mid-read failure escaped HealthError
-        # and aborted _cmd_decide BEFORE the alert upsert — the one failure mode the fail-open
-        # design forbids. ValueError covers both JSONDecodeError and UnicodeDecodeError.
-        raise HealthError("provider status probe failed") from exc
+            chunks, size = [], 0
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > STATUS_PROBE_MAX_BYTES:
+                    raise HealthError("provider status response exceeds size bound")
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks).decode())
+
+    outcome = {}
+
+    def run():
+        try:
+            outcome["value"] = fetch_bounded()
+        except BaseException as exc:  # re-raised/normalized below on the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, name="status-probe", daemon=True)
+    worker.start()
+    worker.join(deadline)
+    if worker.is_alive():
+        raise HealthError("provider status probe exceeded wall-clock deadline")
+    if "error" in outcome:
+        exc = outcome["error"]
+        if isinstance(exc, HealthError):
+            raise exc
+        if isinstance(exc, (OSError, http.client.HTTPException, ValueError)):
+            # OSError subsumes URLError/HTTPError/TimeoutError AND the raw socket errors
+            # (ConnectionResetError etc.) that response.read() can raise mid-body; HTTPException
+            # covers a truncated/half-closed response (http.client.IncompleteRead). Review #72
+            # finding 1: neither was normalized before, so a mid-read failure escaped HealthError
+            # and aborted _cmd_decide BEFORE the alert upsert — the one failure mode the fail-open
+            # design forbids. ValueError covers both JSONDecodeError and UnicodeDecodeError.
+            raise HealthError("provider status probe failed") from exc
+        raise exc  # unnormalized surprise: probe_provider_status's broad backstop folds it
 
 
 def probe_provider_status(provider, fetch=None):
@@ -1532,12 +1572,15 @@ def _test_provider_status(chk):
 
 
 def _test_probe_fetch(chk):
-    """The PRODUCTION fetch path (review #72 finding 1): failures raised by response.read()
-    MID-BODY — a raw OSError (connection reset) or http.client.IncompleteRead (truncated
-    response) — must normalize to HealthError so the probe fails OPEN instead of aborting
-    `decide` before the alert upsert. urlopen is patched; no network is touched. Mutation
-    strength: dropping the OSError/HTTPException normalization crashes these checks red
-    (the raw exception escapes _raises)."""
+    """The PRODUCTION fetch path (review #72 findings, rounds 2+3): failures raised by
+    response.read() MID-BODY — a raw OSError (connection reset) or http.client.IncompleteRead
+    (truncated response) — must normalize to HealthError; a TRICKLING response must be
+    abandoned at the wall-clock deadline; an OVERSIZED body must trip the size bound. In every
+    case the probe fails OPEN instead of stalling or aborting `decide` before the alert
+    upsert. urlopen is patched; no network is touched. Mutation strength: dropping the
+    OSError/HTTPException normalization crashes the mid-read checks red (the raw exception
+    escapes _raises); dropping the deadline thread turns the elapsed-time check red; dropping
+    the size cap parses the oversized body successfully and turns its check red."""
     import http.client
     import urllib.request
 
@@ -1551,7 +1594,7 @@ def _test_probe_fetch(chk):
         def __exit__(self, *exc_info):
             return False
 
-        def read(self):
+        def read(self, amt=None):
             raise self._exc
 
     real_urlopen = urllib.request.urlopen
@@ -1575,6 +1618,76 @@ def _test_probe_fetch(chk):
 
     chk("annotation boundary fails OPEN on an unnormalized exception",
         probe_provider_status("anthropic", fetch=unnormalized), (STATUS_UNKNOWN, ""))
+
+    # Review #72 round 3: a peer that TRICKLES bytes — each individual read fast enough that
+    # the per-socket-op timeout never fires, but the total unbounded — must not hold the fetch
+    # past its wall-clock deadline. The stub yields one byte per 0.15s read forever; with a
+    # 0.4s deadline the fetch must abandon it and fail OPEN. Mutation strength: reverting to a
+    # direct (threadless) call makes the fetch ride the trickle to its end (~3s), turning the
+    # elapsed-time check red.
+    class _TrickleResponse:
+        def __init__(self):
+            self._reads = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self, amt=None):
+            self._reads += 1
+            if self._reads > 20:  # let the abandoned daemon thread terminate eventually
+                return b""
+            time.sleep(0.15)
+            return b"x"
+
+    real_urlopen = urllib.request.urlopen
+    try:
+        urllib.request.urlopen = lambda request, timeout=None: _TrickleResponse()
+        started = time.monotonic()
+        chk("trickling response is abandoned at the wall-clock deadline (HealthError)",
+            _raises(lambda: _fetch_status_json(
+                PROVIDER_STATUS_URLS["anthropic"], deadline=0.4)), True)
+        chk("...without riding the trickle to completion",
+            time.monotonic() - started < 1.5, True)
+        chk("probe production path fails OPEN on a trickling response",
+            probe_provider_status(
+                "anthropic",
+                fetch=lambda url: _fetch_status_json(url, deadline=0.4)),
+            (STATUS_UNKNOWN, ""))
+    finally:
+        urllib.request.urlopen = real_urlopen
+
+    # Size bound: an OVERSIZED but otherwise VALID JSON body must be rejected, not parsed.
+    # Mutation strength: dropping the size cap lets this parse successfully -> chk goes red
+    # (it cannot pass by accident via a parse error).
+    oversized = json.dumps({"status": {"indicator": "none"},
+                            "pad": "a" * (STATUS_PROBE_MAX_BYTES + 1)}).encode()
+
+    class _OversizedResponse:
+        def __init__(self):
+            self._pos = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self, amt=None):
+            chunk = oversized[self._pos:self._pos + (amt or len(oversized))]
+            self._pos += len(chunk)
+            return chunk
+
+    try:
+        urllib.request.urlopen = lambda request, timeout=None: _OversizedResponse()
+        chk("oversized valid-JSON body trips the size bound (HealthError)",
+            _raises(lambda: _fetch_status_json(PROVIDER_STATUS_URLS["anthropic"])), True)
+        chk("probe production path fails OPEN on an oversized body",
+            probe_provider_status("anthropic"), (STATUS_UNKNOWN, ""))
+    finally:
+        urllib.request.urlopen = real_urlopen
     return True
 
 
