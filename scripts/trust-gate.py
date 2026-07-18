@@ -55,6 +55,38 @@ def fetch_permission(repo, author):
         return "none"
 
 
+def _cli_exit_tests():
+    """CLI-contract checks (sol r1 on registry #227): the 0/3 exit codes and the fail-closed
+    fetch-failure path are what worker-issue.reverify consumes — cover them end-to-end."""
+    import os
+    me = os.path.abspath(__file__)
+    ok = True
+
+    def run_cli(*args):
+        return subprocess.run([sys.executable, me, *args],
+                              capture_output=True, text=True).returncode
+
+    checks = [
+        ("trusted author exits 0",
+         run_cli("--author", "a", "--permission", "admin"), 0),
+        ("bot author exits 0 regardless of permission",
+         run_cli("--author", "b[bot]", "--permission", "none", "--bot", "b[bot]"), 0),
+        ("third-party exits 3",
+         run_cli("--author", "x", "--permission", "read"), 3),
+        ("promoted third-party exits 0",
+         run_cli("--author", "x", "--permission", "read", "--maintainer-approved"), 0),
+        # --fetch against an unreachable repo: fetch_permission degrades to "none" ->
+        # untrusted -> exit 3 (fail closed, NEVER a crash exit).
+        ("fetch failure fails closed to 3",
+         run_cli("--author", "x", "--repo", "invalid/definitely-not-a-repo-000", "--fetch"), 3),
+    ]
+    for name, got, want in checks:
+        good = got == want
+        ok = ok and good
+        print(f"  {'ok  ' if good else 'FAIL'} {name}: exit {got} (want {want})")
+    return ok
+
+
 def _self_test():
     BOT = ["sparq-bot[bot]"]
     cases = [
@@ -76,6 +108,7 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} author={author!r:16} perm={perm:9} approved={approved!s:5} -> {got} (want {want})")
     assert actionable("trusted") and actionable("promoted") and not actionable("untrusted")
+    ok = _cli_exit_tests() and ok
     print("trust-gate self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

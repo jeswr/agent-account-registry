@@ -601,7 +601,7 @@ run_gate() {
 FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
 plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
 groom.py account-usage.py usage-alert.py plan-alert.py model-health.py pat-validity.py broker-refresh.py \
-backfill-provenance.py dashboard-gen.py worker-live.sh"
+backfill-provenance.py dashboard-gen.py trust-gate.py worker-live.sh"
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the

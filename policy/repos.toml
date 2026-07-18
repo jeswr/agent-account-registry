@@ -89,6 +89,7 @@ cross_provider_fallback = false
 # ready-and-arm re-derives the live PR diff (renamed paths included) before ever undrafting/arming.
 # The automated cross-provider review still runs — only the final arm click is a human's here.
 security_paths = [
+  "scripts/trust-gate.py",
   "scripts/dispatch-claim.py",
   "scripts/worker-live.sh",
   "scripts/worker-pr.py",
