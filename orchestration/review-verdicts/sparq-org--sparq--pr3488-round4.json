@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "gather-meta.json is written and re-parsed while GATHER_STATUS is complete, before GATHER_DONE is touched. If that touch fails, the script changes only GATHER_STATUS/FAILURES in memory and writes GATHER_FAILED; it never rewrites gather-meta.json. Thus the console/recovered artifacts contain canonical=true and status=complete for an invocation that exited nonzero and explicitly reported partial failure. This violates the script's stated protocol and can misclassify the recovered provenance outside the launcher's sentinel checks. The touch-failure test does not inspect metadata, so it misses the inconsistency.",
+   "file": "scripts/bench/canonical-beir-gather-instance.sh",
+   "fix_hint": "On GATHER_DONE touch failure, atomically rewrite gather-meta.json with canonical=false, status=partial, and the sentinel failure in missing, then re-parse it before dumping/recovering final artifacts; alternatively delay final metadata creation until the sentinel outcome is known. Extend case 6 to assert status=partial and canonical=false in gather-meta.json.",
+   "severity": "major",
+   "title": "Failed GATHER_DONE write leaves canonical-success metadata"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 3's stale/empty-envelope finding is materially fixed: validation now rejects pre-existing paths, checks exact top-level engine/suite identity, and requires finite Recall@100/nDCG@10 deficit fields, with non-vacuous fixtures. However, the failed-success-sentinel path mutates only shell variables after gather-meta.json has already been written and validated as canonical=true/status=complete. The resulting failed run therefore exports provenance that contradicts both GATHER_FAILED and the documented invariant that failed/partial outcomes carry canonical=false. This is a new major correctness issue, so progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
