@@ -446,28 +446,32 @@ run_model() {
 
 # [FABLE-5] Workspace-member discovery for the crate-scoped gate (defect #2, run 29634738177).
 # The area:<label> → cargo -p mapping used to be identity: WORKER_PACKAGES=gui ran `cargo -p gui`,
-# but the crate is `sparq-gui`, so `cargo -p gui` crashed with
+# which crashed with
 #   error: package ID specification `gui` did not match any packages
-# exit 101 — AFTER ~40 min of good model work, discarding it. `cargo metadata --no-deps` lists the
-# ACTUAL workspace member names and runs NO build scripts (safe on a hostile target checkout), so
-# we validate every requested package against that set before ever invoking `cargo -p`.
+# exit 101 — AFTER ~40 min of good model work, discarding it. (`gui` is not a root-workspace
+# member at ALL: sparq keeps gui/src-tauri as a standalone workspace excluded from the root, so
+# the correct outcome for area:gui is lint-only degrade, not a renamed build.) `cargo metadata
+# --no-deps` lists the ACTUAL workspace member names and runs NO build scripts (safe on a hostile
+# target checkout), so we validate every requested package against that set before ever invoking
+# `cargo -p`.
 #
 # PURE: print the workspace member package names, one per line, from `cargo metadata` JSON on stdin.
 # --no-deps keeps the `packages` array to workspace members only (no registry deps) and executes no
-# build scripts. Cached by the caller (one metadata call per gate). NOTE: the `python3 -` heredoc
-# would itself consume stdin (the script text), so the JSON is buffered into a var and handed to
-# python via an env var — leaving the interpreter's own stdin untouched.
+# build scripts. Cached by the caller (one metadata call per gate). The JSON MUST be STREAMED
+# through stdin: on the real sparq workspace the metadata is ~333KB, which exceeds Linux's
+# per-argument/per-env-string limit (MAX_ARG_STRLEN, 128KB) — handing it to python via an env var
+# or argv makes execve fail with "Argument list too long" (exit 126), the caller's `|| true`
+# swallows that, and the empty member set dies — recreating the exact post-model gate crash this
+# function exists to prevent. `python3 -c '<script>'` leaves stdin untouched for json.load.
 _workspace_member_names() {
-  local json
-  json="$(cat)"
-  WLIVE_META_JSON="$json" python3 - <<'PY'
+  python3 -c '
 import json
-import os
+import sys
 
 try:
-    meta = json.loads(os.environ.get("WLIVE_META_JSON", ""))
+    meta = json.load(sys.stdin)
 except (json.JSONDecodeError, ValueError):
-    raise SystemExit(0)  # unreadable metadata: emit nothing → caller degrades, never crashes
+    raise SystemExit(0)  # unreadable metadata: emit nothing -> caller degrades, never crashes
 members = set(meta.get("workspace_members") or [])
 for pkg in meta.get("packages") or []:
     pid = pkg.get("id")
@@ -478,27 +482,25 @@ for pkg in meta.get("packages") or []:
     # cargo that populates `packages` with deps despite --no-deps).
     if not members or pid in members:
         print(name)
-PY
+'
 }
 
 # PURE: resolve ONE requested area/package atom against the newline-delimited member-name set
 # (passed as the 2nd arg). Emits exactly one line:
-#   member:<name>   the atom is a real workspace member → build it as-is
-#   member:<name>   the atom mapped to sparq-<atom> which IS a member (gui → sparq-gui)
-#   degrade:<atom>  no member and no sparq-<atom> member → non-crate area, degrade to lint-only
-# Never fails; the caller decides build-vs-degrade from the prefix. This is the whole defect-#2
-# guard: an unmatched atom degrades to lint-only instead of crashing `cargo -p`.
+#   member:<atom>   the atom is EXACTLY a root-workspace member name → build it as-is
+#   degrade:<atom>  anything else → non-crate/non-member area, degrade to lint-only
+# There is deliberately NO name-guessing (a previous round tried sparq-<atom>, mapping gui →
+# sparq-gui — but sparq EXCLUDES gui/src-tauri from the root workspace as a standalone workspace,
+# so `sparq-gui` is never a root member and the guess was wrong by construction; any heuristic
+# that "finds" a member the label didn't name risks gating the WRONG crate). Never fails; the
+# caller decides build-vs-degrade from the prefix. This is the whole defect-#2 guard: an
+# unmatched atom degrades to lint-only instead of crashing `cargo -p`.
 _resolve_gate_package() {
   local atom=$1 members=$2 m
   while IFS= read -r m; do
     [[ "$m" == "$atom" ]] && { printf 'member:%s\n' "$atom"; return 0; }
   done <<< "$members"
-  # try the obvious sparq-<area> mapping (gui → sparq-gui, engine → sparq-engine, ...)
-  local mapped="sparq-$atom"
-  while IFS= read -r m; do
-    [[ "$m" == "$mapped" ]] && { printf 'member:%s\n' "$mapped"; return 0; }
-  done <<< "$members"
-  # genuinely non-crate area (deps, ci, docs, site, js, ...) OR a typo'd label: degrade, don't crash
+  # non-member area (gui, deps, ci, docs, site, js, ...) OR a typo'd label: degrade, don't crash
   printf 'degrade:%s\n' "$atom"
 }
 
@@ -534,8 +536,9 @@ run_gate() {
         cargo fmt --all -- --check || echo "worker-live: fmt drift (advisory; sparq CI treats fmt non-blocking)"
         # [FABLE-5] Validate every requested package against the ACTUAL workspace members BEFORE
         # `cargo -p` (defect #2). Compute the member set once (cargo metadata --no-deps runs no
-        # build scripts). An atom that is not a member and has no sparq-<atom> member DEGRADES to
-        # lint-only for that atom (never crashes) with a loud, no-silent-degrade log line.
+        # build scripts; its ~333KB JSON is streamed through stdin, never an env var/argv). An
+        # atom that is not an exact member DEGRADES to lint-only for that atom (never crashes)
+        # with a loud, no-silent-degrade log line.
         local members
         members="$(cargo metadata --no-deps --format-version 1 2>/dev/null | _workspace_member_names || true)"
         [[ -n "$members" ]] || die 'crate-scoped gate could not enumerate workspace members (cargo metadata failed)'
@@ -548,18 +551,14 @@ run_gate() {
           resolution="$(_resolve_gate_package "$package" "$members")"
           kind=${resolution%%:*}; name=${resolution#*:}
           if [[ "$kind" == member ]]; then
-            if [[ "$name" != "$package" ]]; then
-              printf 'worker-live: area label %s is not a workspace member — resolved to crate %s\n' \
-                "$package" "$name"
-            fi
             cargo clippy -p "$name" --all-targets -- -D warnings
             cargo test -p "$name"
             built+=("$name")
           else
-            # Non-crate / mismatched area (deps, ci, docs, site, js, …): fail SAFE to lint-only for
+            # Non-member area (gui, deps, ci, docs, site, js, …): fail SAFE to lint-only for
             # this atom instead of a hard `cargo -p` crash that would discard the model's work.
-            printf 'worker-live: area label %s does not resolve to a workspace member (tried %s and sparq-%s) — substituting lint-only gate profile for it\n' \
-              "$package" "$package" "$package"
+            printf 'worker-live: area label %s is not a root-workspace member — substituting lint-only gate profile for it (no name-guessing)\n' \
+              "$package"
             degraded+=("$package")
           fi
         done
@@ -1553,16 +1552,17 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(grep -c 'self:pat-validity.py' <<< "${sel//,/$'\n'}" || true)" "1"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
-  # `cargo -p` mapping crashed with exit 101 when the label was not a literal workspace-crate name
-  # (area:gui → `cargo -p gui`, but the crate is sparq-gui). Prove _workspace_member_names parses
-  # the metadata, and _resolve_gate_package: (a) passes a real member through, (b) maps gui→sparq-gui,
-  # (c) degrades a genuinely-non-crate area (deps) to lint-only WITHOUT crashing. ---
+  # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
+  # REAL membership semantics: sparq's root workspace excludes gui/src-tauri (a standalone
+  # workspace), so `gui` has NO member and must DEGRADE — no sparq-<area> guessing. Prove
+  # _workspace_member_names parses the metadata, and _resolve_gate_package: (a) passes an exact
+  # member through, (b) degrades gui, (c) degrades every other non-member area WITHOUT crashing. ---
   cat > "$tmp/meta.json" <<'JSON'
-{"workspace_members":["path+file:///w/crates/gui#sparq-gui@0.1.0",
+{"workspace_members":["path+file:///w/crates/core#sparq-core@0.1.0",
   "path+file:///w/crates/engine#sparq-engine@0.1.0",
   "path+file:///w/crates/site#sparq-site@0.1.0"],
  "packages":[
-   {"id":"path+file:///w/crates/gui#sparq-gui@0.1.0","name":"sparq-gui"},
+   {"id":"path+file:///w/crates/core#sparq-core@0.1.0","name":"sparq-core"},
    {"id":"path+file:///w/crates/engine#sparq-engine@0.1.0","name":"sparq-engine"},
    {"id":"path+file:///w/crates/site#sparq-site@0.1.0","name":"sparq-site"},
    {"id":"registry+https://example/serde#serde@1.0.0","name":"serde"}]}
@@ -1570,61 +1570,94 @@ JSON
   local members
   members="$(_workspace_member_names < "$tmp/meta.json")"
   chk "member enumeration lists workspace crates only (excludes registry dep serde)" \
-    "$(printf '%s\n' "$members" | sort | paste -sd',' -)" "sparq-engine,sparq-gui,sparq-site"
+    "$(printf '%s\n' "$members" | sort | paste -sd',' -)" "sparq-core,sparq-engine,sparq-site"
   chk "(a) a real workspace member gates as itself" \
     "$(_resolve_gate_package sparq-engine "$members")" "member:sparq-engine"
-  chk "(b) gui resolves to sparq-gui via the sparq-<area> mapping" \
-    "$(_resolve_gate_package gui "$members")" "member:sparq-gui"
-  chk "(b') a bare area matching a crate (site→sparq-site) maps too" \
-    "$(_resolve_gate_package site "$members")" "member:sparq-site"
-  chk "(c) a genuinely non-crate area (deps) degrades to lint-only, never crashes" \
-    "$(_resolve_gate_package deps "$members")" "degrade:deps"
-  for nc in ci docs js; do
-    chk "(c) non-crate area $nc degrades to lint-only" \
+  chk "(b) gui degrades to lint-only (gui/src-tauri is a standalone workspace, NOT a root member)" \
+    "$(_resolve_gate_package gui "$members")" "degrade:gui"
+  # (b-mutation) `site` is NOT a member even though `sparq-site` is — the retired sparq-<area>
+  # guess would resolve site → member:sparq-site and gate a crate the label never named.
+  # Re-adding any such heuristic turns this red.
+  chk "(b-mutation) site degrades even though sparq-site is a member (no sparq-<area> guessing)" \
+    "$(_resolve_gate_package site "$members")" "degrade:site"
+  for nc in deps ci docs js; do
+    chk "(c) non-member area $nc degrades to lint-only" \
       "$(_resolve_gate_package "$nc" "$members")" "degrade:$nc"
   done
 
-  # (d) MUTATION / crash-reproduction on a REAL cargo workspace: build a fixture whose only crate is
-  # `sparq-gui` (label would be area:gui). The OLD identity mapping ran `cargo -p gui` — reproduce
-  # that it FAILS (the exit-101 crash from run 29634738177), while the validated resolution maps
-  # gui→sparq-gui and `cargo -p sparq-gui` succeeds. Skipped (not failed) if cargo is unavailable.
+  # --- TARGET-SCALE regression (P1, PR #88 round 3): the real sparq workspace's cargo metadata is
+  # ~333KB. A previous revision of _workspace_member_names buffered that JSON into ONE env var
+  # before exec'ing python — over Linux's MAX_ARG_STRLEN (128KB per env/argv string) execve fails
+  # with "Argument list too long" (exit 126), the gate's `|| true` swallowed it, and the empty
+  # member set died — recreating the post-model crash for EVERY crate-scoped area. Feed a
+  # >256KB blob through the REAL stdin code path and require it to succeed; reverting to the
+  # env-var (or any argv) hand-off turns both checks red. ---
+  python3 - "$tmp/meta-large.json" <<'PY'
+import json, sys
+member_ids = ["path+file:///w/crates/core#sparq-core@0.1.0",
+              "path+file:///w/crates/engine#sparq-engine@0.1.0",
+              "path+file:///w/crates/site#sparq-site@0.1.0"]
+packages = [{"id": i, "name": i.rsplit("#", 1)[1].split("@")[0]} for i in member_ids]
+# pad with realistic non-member noise until the blob comfortably exceeds MAX_ARG_STRLEN
+packages += [{"id": "registry+https://example/p%d#pad-%d@1.0.0" % (n, n),
+              "name": "pad-%d" % n, "description": "x" * 200} for n in range(1400)]
+with open(sys.argv[1], "w") as f:
+    json.dump({"workspace_members": member_ids, "packages": packages}, f)
+PY
+  local large_bytes large_members large_rc
+  large_bytes=$(wc -c < "$tmp/meta-large.json")
+  chk "target-scale fixture exceeds 256KB (real workspace metadata is ~333KB)" \
+    "$(( large_bytes > 262144 ))" "1"
+  large_members="$(_workspace_member_names < "$tmp/meta-large.json")" && large_rc=0 || large_rc=$?
+  chk "target-scale metadata streams through stdin without failing (env-var path exits 126)" \
+    "$large_rc" "0"
+  chk "target-scale metadata yields the member set (empty set would die the gate)" \
+    "$(printf '%s\n' "$large_members" | sort | paste -sd',' -)" "sparq-core,sparq-engine,sparq-site"
+
+  # (d) crash-reproduction + degrade semantics on a REAL cargo workspace: one member crate
+  # `sparq-engine`; `gui` is (as on real sparq) not a member. The exact member gates as itself;
+  # gui degrades; and the ORIGINAL unvalidated behaviour (`cargo -p gui`) still reproduces the
+  # exit-101 crash from run 29634738177 — proving degrade, not guessing, is what prevents it.
+  # Skipped (not failed) if cargo is unavailable.
   if command -v cargo >/dev/null 2>&1; then
     local cw="$tmp/cargo-ws"
-    mkdir -p "$cw/crates/gui/src"
+    mkdir -p "$cw/crates/engine/src"
     cat > "$cw/Cargo.toml" <<'TOML'
 [workspace]
-members = ["crates/gui"]
+members = ["crates/engine"]
 resolver = "2"
 TOML
-    cat > "$cw/crates/gui/Cargo.toml" <<'TOML'
+    cat > "$cw/crates/engine/Cargo.toml" <<'TOML'
 [package]
-name = "sparq-gui"
+name = "sparq-engine"
 version = "0.1.0"
 edition = "2021"
 TOML
-    printf 'pub fn ok() -> bool { true }\n' > "$cw/crates/gui/src/lib.rs"
+    printf 'pub fn ok() -> bool { true }\n' > "$cw/crates/engine/src/lib.rs"
     # a lockfile is required for cargo's package-ID resolution (pkgid) — offline, no build.
     ( cd "$cw" && cargo generate-lockfile >/dev/null 2>&1 ) || true
     local live_members
     live_members="$(cd "$cw" && cargo metadata --no-deps --format-version 1 2>/dev/null | _workspace_member_names)"
-    chk "(d) live metadata sees only sparq-gui" \
-      "$(printf '%s\n' "$live_members")" "sparq-gui"
-    chk "(d) validated resolution maps gui → sparq-gui on the real workspace" \
-      "$(_resolve_gate_package gui "$live_members")" "member:sparq-gui"
-    # (d-mutation) the REVERTED-validation behaviour: `cargo -p gui` resolves the package spec `gui`
-    # against the workspace and, since the crate is sparq-gui, crashes with the EXACT error from run
-    # 29634738177 — "package ID specification `gui` did not match any packages", exit 101. `cargo
-    # pkgid` is the lightest command that does this spec resolution (no build/network). Reverting the
-    # fix (feeding the raw label to `cargo -p`) reproduces this red.
+    chk "(d) live metadata sees only sparq-engine" \
+      "$(printf '%s\n' "$live_members")" "sparq-engine"
+    chk "(d) an exact member gates as itself on the real workspace" \
+      "$(_resolve_gate_package sparq-engine "$live_members")" "member:sparq-engine"
+    chk "(d) gui degrades to lint-only on the real workspace (standalone workspace, not a member)" \
+      "$(_resolve_gate_package gui "$live_members")" "degrade:gui"
+    # (d-mutation) the REVERTED-validation behaviour: `cargo -p gui` resolves the package spec
+    # `gui` against the workspace and, since no member is named gui, crashes with the EXACT error
+    # from run 29634738177 — "package ID specification `gui` did not match any packages", exit
+    # 101. `cargo pkgid` is the lightest command that does this spec resolution (no build/
+    # network). Reverting the fix (feeding the raw label to `cargo -p`) reproduces this red.
     local mut_out mut_rc
     mut_out="$( cd "$cw" && cargo pkgid -p gui 2>&1 )" && mut_rc=0 || mut_rc=$?
     chk "(d-mutation) unvalidated cargo -p gui reproduces the exit-101 crash" "$mut_rc" "101"
     chk "(d-mutation) crash carries the run-29634738177 diagnostic text" \
       "$(grep -c 'package ID specification .gui. did not match' <<< "$mut_out" || true)" "1"
-    # (d-fixed) after validation the RESOLVED name `sparq-gui` resolves cleanly (green, exit 0).
+    # (d-fixed) the exact member name resolves cleanly (green, exit 0).
     local fix_rc
-    ( cd "$cw" && cargo pkgid -p sparq-gui >/dev/null 2>&1 ) && fix_rc=0 || fix_rc=$?
-    chk "(d-fixed) cargo -p sparq-gui resolves cleanly after validation" "$fix_rc" "0"
+    ( cd "$cw" && cargo pkgid -p sparq-engine >/dev/null 2>&1 ) && fix_rc=0 || fix_rc=$?
+    chk "(d-fixed) cargo -p sparq-engine resolves cleanly for the exact member" "$fix_rc" "0"
   else
     printf '  skip (d) live cargo crash-reproduction (cargo not on PATH)\n'
   fi
