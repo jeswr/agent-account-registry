@@ -21,8 +21,10 @@
 # creation is first-writer-wins on the server, and claims are never deleted (a failed run burns its
 # slot instead of releasing it, so a retry can never overwrite an in-flight credential). The slot is
 # derived from the COMPLETE union (fully paginated, never a capped page) of claim refs, acctNN issue
-# titles in ANY state, and ACCTNN_TOKEN secret names; if any listing fails, freeness cannot be
-# proven and the run fails closed. The claim-ref namespace is the canonical allocation record every
+# titles in ANY state, and ACCTNN_TOKEN secret names at BOTH scopes — repository AND the
+# dispatch-secrets environment, the post-#101 canonical home (an env-only token with no claim ref
+# or issue would otherwise be invisible and the broker would burn its claim ref on an occupied
+# slot); if any listing fails, freeness cannot be proven and the run fails closed. The claim-ref namespace is the canonical allocation record every
 # automated account writer must claim in BEFORE writing; downstream steps consume the claimed slot
 # via steps.store.outputs, not the stale snapshot.
 name: set-up-account
@@ -73,7 +75,8 @@ jobs:
       # #275): repository Secrets: READ (the store step only LISTS repo-scope secrets and GETs
       # the candidate name for the both-scopes absence probe — it never writes at repo scope)
       # + Environments: READ AND WRITE (the env public-key read `gh secret set --env` performs
-      # sits under Environments: read; the env-secret PUT under Environments: write).
+      # and the store step's env-secret union listing sit under Environments: read; the
+      # env-secret PUT under Environments: write).
       #
       # PRESENCE ALONE IS NOT ENOUGH (round-4 finding 1): a PAT that exists but was minted
       # under-scoped — or stored at repo scope by a well-meaning operator following a vague
@@ -189,8 +192,10 @@ jobs:
           # record; every automated account writer MUST create its claim ref before writing a secret
           # or an acctNN issue. Out-of-band manual writes cannot be forced through this protocol;
           # they are caught by deriving the slot from the COMPLETE union of claim refs, acctNN issue
-          # titles in ANY state, and ACCTNN_TOKEN secret names — each fully paginated, because any
-          # capped listing silently treats every unseen slot as free — plus a
+          # titles in ANY state, and ACCTNN_TOKEN secret names at BOTH scopes (repository AND the
+          # dispatch-secrets environment — the post-#101 canonical home; an env-only stray must be
+          # visible BEFORE the irreversible claim, not first at the absence probe) — each fully
+          # paginated, because any capped listing silently treats every unseen slot as free — plus a
           # secret-absence probe right before the upsert. If any listing fails, freeness cannot be
           # proven -> fail closed. The pre-login hint is reused when still free so a retry converges
           # on the same slot.
@@ -209,7 +214,18 @@ jobs:
                    --jq '.secrets[].name | select(test("^ACCT[0-9]+_TOKEN$")) | ltrimstr("ACCT") | rtrimstr("_TOKEN")'); then
               echo "::error::could not enumerate existing secrets — refusing to store (fail closed)"; exit 1
             fi
-            taken=$(printf '%s\n%s\n%s\n' "$claim_nums" "$issue_nums" "$secret_nums" \
+            # Post-cutover (#101) ACCTNN_TOKEN secrets live in the dispatch-secrets ENVIRONMENT,
+            # so the union MUST enumerate that scope too (sol round-6 finding 3): an env-only
+            # token with no claim ref or issue yet would otherwise be invisible here, the broker
+            # would create the claim ref IRREVERSIBLY (claims are never deleted) and only then
+            # fail at the env absence-probe below — permanently burning the slot. Fully
+            # paginated, same PAT (its Environments read+write grant is proven by the preflight
+            # canary write; env-secret listing sits under Environments: read).
+            if ! env_secret_nums=$(GH_TOKEN="$REGISTRY_PAT" gh api --paginate "repos/${{ github.repository }}/environments/dispatch-secrets/secrets?per_page=100" \
+                   --jq '.secrets[].name | select(test("^ACCT[0-9]+_TOKEN$")) | ltrimstr("ACCT") | rtrimstr("_TOKEN")'); then
+              echo "::error::could not enumerate dispatch-secrets environment secrets — refusing to store (fail closed)"; exit 1
+            fi
+            taken=$(printf '%s\n%s\n%s\n%s\n' "$claim_nums" "$issue_nums" "$secret_nums" "$env_secret_nums" \
                       | jq -Rn '[inputs | select(test("^[0-9]+$")) | tonumber]')
             n=$(jq -n --argjson t "$taken" --argjson r "$reserved" \
                   'if ($t | index($r)) then (([$t[], 0] | max) + 1) else $r end')

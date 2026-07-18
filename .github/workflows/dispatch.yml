@@ -583,11 +583,16 @@ jobs:
         with:
           path: registry
           persist-credentials: false
-          # The workflow file feeds the self-test's static assertion that the guard job keeps
-          # its load-bearing `actions: read` permission (see the permissions map above).
+          # The workflow files feed the self-test's static assertions: dispatch.yml for the
+          # guard job's load-bearing `actions: read` permission (see the permissions map
+          # above); set-up-account.yml for the broker's pre-claim slot-union contract (sol
+          # round 6 on the #275 PR: the union must enumerate ACCTNN_TOKEN names at BOTH the
+          # repo scope and the dispatch-secrets environment, fully paginated, BEFORE the
+          # irreversible acct-claims ref is created).
           sparse-checkout: |
             scripts/dispatch-secrets-guard.py
             .github/workflows/dispatch.yml
+            .github/workflows/set-up-account.yml
           sparse-checkout-cone-mode: false
 
       - name: Verify empty repo-scope secrets + default-branch-only environment policy

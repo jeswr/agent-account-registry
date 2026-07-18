@@ -21,10 +21,15 @@
 #          cleanup via `--phase resume-writers`. Workflow disable/enable sit under the
 #          fine-grained "Actions" WRITE permission — an under-granted token dies HERE, before any
 #          listing or mutation.
-#     M0b. pre-flight: refuse (fail closed) while any live secret-writer run is queued or
-#          in_progress. Quiesce stops NEW runs; this stops the migration while ALREADY-RUNNING
-#          runs (which a disable does not cancel) are still alive. `gh run list` sits under the
-#          fine-grained "Actions" permission (read).
+#     M0b. pre-flight: refuse (fail closed) while any secret-writer run sits in ANY nonterminal
+#          status — queued / in_progress / requested / waiting / pending (round-6 finding 2: a
+#          run already requested, or waiting on an environment, or pending a concurrency slot
+#          when the disable lands can still execute later). Quiesce stops NEW runs; this stops
+#          the migration while ALREADY-ADMITTED runs (which a disable does not cancel) are
+#          still alive. `gh run list` sits under the fine-grained "Actions" permission (read),
+#          and every invocation carries `--all` (round-6 finding 1): the quiesce just DISABLED
+#          these workflows, and gh's name-based `--workflow` lookup excludes disabled workflows
+#          without it.
 #     M1. list the environment's secret NAMES (a failed listing is a hard refusal, never "empty").
 #     M2. pre-mutation input check: every name the env does NOT yet hold must have a non-empty
 #         S_<name> value — asserted for ALL 14 BEFORE any mutation. An env-held name needs no
@@ -83,7 +88,11 @@
 # fresh-main, cleanup from 2/1/0-remaining, converged reruns of both phases,
 # interrupted-after-partial-copy, interrupted-mid-deletion, set-verify-mismatch, repo-stray (both
 # phases — cleanup now deletes NOTHING on a stray), late-writer leftover at cleanup time,
-# missing-input, in-flight-writer, listing-failure (both phases), env-missing-bootstrap,
+# missing-input, in-flight-writer (one scenario per NONTERMINAL run status — queued /
+# in_progress / requested / waiting / pending — each must abort), the fake-gh DISABLED-workflow
+# model (name-based run lookup without --all fails on a disabled workflow, with --all works —
+# so dropping --all from the preflight goes red), listing-failure (both phases),
+# env-missing-bootstrap,
 # resume-writers (happy / one-enable-fails / under-granted), and PER-ENDPOINT PERMISSION-model
 # failures (workflow disable without actions:write — incl. the old actions:read-only mint shape;
 # env-secret write without environments:write) so an under-granted mint is caught by the
@@ -158,13 +167,23 @@ quiesce_writers() {
   done
 }
 
+# The pre-flight runs AFTER quiesce_writers has DISABLED the writer workflows, and gh's
+# name-based workflow lookup (`--workflow <file>`) EXCLUDES disabled workflows unless `--all`
+# is supplied (round-6 finding 1) — without it the listing fails (or silently omits) for
+# exactly the runs it must inspect. `--all` is therefore LOAD-BEARING on every invocation.
+# And "live" means every NONTERMINAL run status GitHub models (round-6 finding 2): queued /
+# in_progress / requested / waiting / pending — a run already requested, or parked waiting on
+# an environment approval, or pending a concurrency slot when the disable lands can still
+# execute later (the writers use concurrency groups + the dispatch-secrets environment, so
+# waiting/pending are real states here). gh's `--status` flag takes ONE status per call, so
+# each is queried per-status.
 preflight_no_live_writers() {
   local wf status count
   for wf in "${WRITER_WORKFLOWS[@]}"; do
-    for status in queued in_progress; do
-      count=$(gh run list -R "$REPO" --workflow "$wf" --status "$status" \
+    for status in queued in_progress requested waiting pending; do
+      count=$(gh run list --all -R "$REPO" --workflow "$wf" --status "$status" \
                 --json databaseId --jq length) \
-        || die "could not list ${status} runs of ${wf} — cannot prove no live secret writer (fail closed; NOTE: this listing needs the App token's Actions: read grant)"
+        || die "could not list ${status} runs of ${wf} — cannot prove no live secret writer (fail closed; NOTE: this listing needs the App token's Actions: read grant, and --all is load-bearing: a name-based lookup without it excludes the workflows the quiesce just DISABLED)"
       [[ "$count" =~ ^[0-9]+$ ]] \
         || die "unparseable ${status} run count for ${wf} — cannot prove no live secret writer (fail closed)"
       if [[ "$count" -gt 0 ]]; then
@@ -172,7 +191,7 @@ preflight_no_live_writers() {
       fi
     done
   done
-  printf 'pre-flight: no queued/in_progress secret-writer runs\n'
+  printf 'pre-flight: no nonterminal (queued/in_progress/requested/waiting/pending) secret-writer runs\n'
 }
 
 phase_main() {
@@ -471,15 +490,33 @@ case "$*" in
   "workflow disable "*" -R o/r")
     _grant actions:write \
       || { echo "HTTP 403: Resource not accessible by integration (workflow disable needs Actions: write)" >&2; exit 1; }
+    touch "$state/disabled_$3"   # model gh state: the workflow is now DISABLED
     exit 0 ;;
   "workflow enable "*" -R o/r")
     _grant actions:write \
       || { echo "HTTP 403: Resource not accessible by integration (workflow enable needs Actions: write)" >&2; exit 1; }
     [[ -f "$state/fail_enable_$3" ]] && exit 1
+    rm -f "$state/disabled_$3"
     exit 0 ;;
-  "run list -R o/r --workflow "*" --status "*" --json databaseId --jq length")
+  "run list --all -R o/r --workflow "*" --status "*" --json databaseId --jq length")
+    # WITH --all, gh's name-based workflow lookup includes DISABLED workflows (round-6
+    # finding 1) — serve the live count regardless of disabled state.
     _grant actions:read \
       || { echo "HTTP 403: Resource not accessible by integration (workflow-run listing needs Actions: read)" >&2; exit 1; }
+    f="$state/inflight_${7}_${9}"
+    if [[ -f "$f" ]]; then cat "$f"; else echo 0; fi
+    exit 0 ;;
+  "run list -R o/r --workflow "*" --status "*" --json databaseId --jq length")
+    # WITHOUT --all, real gh EXCLUDES disabled workflows from the name-based lookup — the
+    # lookup fails for a workflow the quiesce disabled. Modeling this makes the preflight's
+    # --all argv contract NON-VACUOUS: strip --all from the script and scenario 1 (which
+    # disables the writers first) goes red here instead of silently listing nothing.
+    _grant actions:read \
+      || { echo "HTTP 403: Resource not accessible by integration (workflow-run listing needs Actions: read)" >&2; exit 1; }
+    if [[ -f "$state/disabled_${6}" ]]; then
+      echo "could not find any workflows named ${6} (it is disabled; use --all to include disabled workflows)" >&2
+      exit 1
+    fi
     f="$state/inflight_${6}_${8}"
     if [[ -f "$f" ]]; then cat "$f"; else echo 0; fi
     exit 0 ;;
@@ -552,8 +589,8 @@ FAKE
   local expected_preflight="$tmp/expected-preflight.log" wf st n
   : > "$expected_preflight"
   for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
-    for st in queued in_progress; do
-      printf 'run list -R o/r --workflow %s --status %s --json databaseId --jq length\n' "$wf" "$st" >> "$expected_preflight"
+    for st in queued in_progress requested waiting pending; do
+      printf 'run list --all -R o/r --workflow %s --status %s --json databaseId --jq length\n' "$wf" "$st" >> "$expected_preflight"
     done
   done
   # The round-5 quiesce prefix: the main phase disables all 4 writer workflows BEFORE the
@@ -798,6 +835,47 @@ FAKE
     "$(grep -c '1 in_progress run(s) of worker.yml' "$tmp/s12.out")" 1
   chk "in-flight writer: ONLY quiesce + run-list calls issued (no listing, no mutation)" \
     "$(grep -cvE '^(workflow disable |run list )' "$s12/calls.log" || true)" 0
+
+  # --- scenario 12b: EVERY NONTERMINAL RUN STATUS ABORTS (round-6 finding 2) — GitHub's active
+  # statuses are queued / in_progress / requested / waiting / pending, not just the first two:
+  # a run already requested, or parked waiting on an environment approval, or pending a
+  # concurrency slot when the disable lands can still execute later (the writers use
+  # concurrency + the dispatch-secrets environment, so waiting/pending are REAL states here).
+  # One scenario per status; each must fail the preflight closed with zero mutations.
+  local st sN
+  for st in queued in_progress requested waiting pending; do
+    sN="$tmp/s12b-$st"
+    mkdir -p "$sN"
+    printf '%s\n' "${names[@]}" > "$sN/repo_secrets"
+    : > "$sN/env_secrets"
+    echo 1 > "$sN/inflight_pat-validity.yml_${st}"
+    rc=$(run_case "$sN" "$tmp/s12b-$st.out" main all)
+    chk "nonterminal status ${st}: in-flight writer -> fail closed" "$rc" 1
+    chk "nonterminal status ${st}: distinct message names status + workflow" \
+      "$(grep -c "1 ${st} run(s) of pat-validity.yml" "$tmp/s12b-$st.out")" 1
+    chk "nonterminal status ${st}: zero mutations" \
+      "$(grep -cE '^secret (set|delete) ' "$sN/calls.log" || true)" 0
+  done
+
+  # --- scenario 12c: the fake-gh MODELS gh's disabled-workflow lookup semantics directly
+  # (round-6 finding 1 non-vacuity): after a `workflow disable`, a name-based run listing
+  # WITHOUT --all fails (real gh excludes disabled workflows from the name lookup), while the
+  # same listing WITH --all serves the count. This exercises the no---all fake branch IN-SUITE,
+  # so the branch the mutation check relies on (strip --all from the preflight -> scenario 1
+  # goes red) is itself proven live, not assumed.
+  local s12c="$tmp/s12c" noall_rc=0 withall_rc=0
+  mkdir -p "$s12c"
+  FAKE_GH_STATE="$s12c" "$tmp/bin/gh" workflow disable worker.yml -R o/r >/dev/null
+  FAKE_GH_STATE="$s12c" "$tmp/bin/gh" run list -R o/r --workflow worker.yml --status queued --json databaseId --jq length \
+    > "$tmp/s12c-noall.out" 2>&1 || noall_rc=$?
+  chk "fake-gh model: name-based run list WITHOUT --all on a DISABLED workflow errors out (real gh semantics)" \
+    "$noall_rc" 1
+  chk "fake-gh model: the no---all failure names the disabled-workflow cause" \
+    "$(grep -c 'use --all to include disabled workflows' "$tmp/s12c-noall.out")" 1
+  FAKE_GH_STATE="$s12c" "$tmp/bin/gh" run list --all -R o/r --workflow worker.yml --status queued --json databaseId --jq length \
+    > "$tmp/s12c-all.out" 2>&1 || withall_rc=$?
+  chk "fake-gh model: the same lookup WITH --all succeeds on the disabled workflow" "$withall_rc" 0
+  chk "fake-gh model: --all lookup serves the live count" "$(cat "$tmp/s12c-all.out")" 0
 
   # --- scenario 13: ENV LISTING FAILURE (main) — a dead listing is a refusal, never "empty env".
   local s13="$tmp/s13"
