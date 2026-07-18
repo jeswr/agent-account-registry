@@ -19,6 +19,16 @@
    "model": "terra",
    "issued_at": 1784419108,
    "expires_at": 1784420308
+  },
+  {
+   "account": "acct01",
+   "claim_id": "e5b6259a44a246789c66a8d7d2c0100d",
+   "holder": "review:jeswr/agent-account-registry#289@dispatch-29666028962.1",
+   "package": "groom",
+   "role": "review",
+   "model": "terra",
+   "issued_at": 1784419112,
+   "expires_at": 1784420312
   }
  ]
 }
