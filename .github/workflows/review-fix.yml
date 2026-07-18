@@ -257,27 +257,31 @@ jobs:
                              f"{owner}--{name}--pr{pull['number']}.json")
           if not record_path.is_file():
               raise SystemExit("no registry provenance record for this PR (fail closed)")
-          record = json.loads(record_path.read_text(encoding="utf-8"))
-          impl_provider = record.get("impl_provider")
-          impl_alias = str(record.get("impl_alias", ""))
+          try:
+              record = json.loads(record_path.read_text(encoding="utf-8"))
+          except ValueError:
+              raise SystemExit("provenance record is not readable JSON (fail closed)")
+          # ONE record-shape admission, imported from the registry checkout above: the SAME
+          # dispatch-claim.provenance_admission_error that gates the dispatcher's PLAN and
+          # CLAIM and groom's draft age-park carve-out. Replicating the field checks inline
+          # here is what let them drift (round-3 finding: groom preserved a draft whose
+          # missing alias / invalid issue this step rejects — a silent retry loop); a field
+          # constraint added to the shared function now binds every consumer in one commit.
+          import importlib.util
+          spec = importlib.util.spec_from_file_location(
+              "registry_dispatch_claim", Path("registry", "scripts", "dispatch-claim.py"))
+          dispatch_claim = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(dispatch_claim)
+          admission_error = dispatch_claim.provenance_admission_error(record, pull["number"])
+          if admission_error:
+              raise SystemExit(admission_error)
+          impl_provider = record["impl_provider"]
+          impl_alias = record["impl_alias"]
           # Privacy (locked decision 22a): the PUBLIC registry stores only the salted account
           # hash, never a raw acctNN handle; the reviewer-side hash comparison runs at claim time.
-          impl_account_h = str(record.get("impl_account_h", ""))
-          issue = record.get("issue")
-          opened_sha = str(record.get("head_sha_at_open", ""))
-          if record.get("pr_number") != pull["number"]:
-              raise SystemExit("provenance record does not match this PR")
-          if impl_provider not in {"anthropic", "openai"}:
-              raise SystemExit("provenance implementer provider is invalid")
-          if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
-              raise SystemExit("provenance implementer account hash is invalid "
-                               "(legacy raw-handle records must be re-recorded via backfill)")
-          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", impl_alias):
-              raise SystemExit("provenance implementer alias is invalid")
-          if not isinstance(issue, int) or issue <= 0:
-              raise SystemExit("provenance issue number is invalid")
-          if not re.fullmatch(r"[0-9a-f]{40}", opened_sha):
-              raise SystemExit("provenance head sha is malformed")
+          impl_account_h = record["impl_account_h"]
+          issue = record["issue"]
+          opened_sha = record["head_sha_at_open"]
           if opened_sha != head_sha:
               compare = json.loads(subprocess.run(
                   ["gh", "api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"],

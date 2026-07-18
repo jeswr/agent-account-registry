@@ -255,9 +255,13 @@ def validate_plan(document):
             raise DispatchError(f"{where} pr_number must be a positive integer")
         if not isinstance(item["head_sha"], str) or not SAFE_SHA.fullmatch(item["head_sha"]):
             raise DispatchError(f"{where} head_sha is malformed")
-        if item["state"] not in REVIEW_STATES:
+        # isinstance BEFORE each set membership: an unhashable JSON value ([] / {}) would
+        # TypeError the lookup — malformed plan input must fail as DispatchError, not crash.
+        state = item["state"]
+        if not isinstance(state, str) or state not in REVIEW_STATES:
             raise DispatchError(f"{where} state is invalid")
-        if item["impl_provider"] not in IMPL_PROVIDERS:
+        impl_provider = item["impl_provider"]
+        if not isinstance(impl_provider, str) or impl_provider not in IMPL_PROVIDERS:
             raise DispatchError(f"{where} impl_provider is invalid")
         repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
         if repo not in seen_repositories:
@@ -317,7 +321,8 @@ def validate_plan(document):
         # pr_number 0 is the repo-level worker-PR census-overflow skip (no single PR).
         if not isinstance(number, int) or isinstance(number, bool) or number < 0:
             raise DispatchError(f"{where} pr_number must be a non-negative integer")
-        if item["reason"] not in SNAPSHOT_SKIP_REASONS:
+        reason = item["reason"]
+        if not isinstance(reason, str) or reason not in SNAPSHOT_SKIP_REASONS:
             raise DispatchError(f"{where} reason is invalid")
         repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
         if repo not in seen_repositories:
@@ -497,7 +502,11 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
         if not login.endswith("[bot]") or (bot_login and login != bot_login):
             continue
         record = provenance.get(number)
-        if not isinstance(record, dict) or record.get("pr_number") != number:
+        record_number = record.get("pr_number") if isinstance(record, dict) else None
+        # Strict int identity, bool excluded — same float/bool-equality hazard as
+        # provenance_admission_error: 41.0 == 41 and True == 1 under a bare !=.
+        if (not isinstance(record_number, int) or isinstance(record_number, bool)
+                or record_number != number):
             continue                      # never loop-armed without provenance — leave to humans
         if not SAFE_SHA.fullmatch(sha):
             continue
@@ -569,6 +578,67 @@ def filter_busy_area_items(items, repo, pulls, issue_labels):
     return kept
 
 
+def provenance_admission_error(record, pr_number):
+    """Return why a PARSED provenance record for target PR ``pr_number`` is NOT admissible by
+    the review loop, or None when it passes EVERY record-shape requirement of EVERY consumer.
+
+    This is the ONE definition of "enumerable provenance" — the complete union of every field
+    constraint the review path enforces before driving a PR:
+    - dict shape + strict-int matching ``pr_number`` (float/bool excluded: 41.0 == 41 and
+      True == 1 under Python equality) + registered ``impl_provider`` (PLAN admission in
+      enumerate_review_items, review-fix.yml resolve),
+    - ``impl_alias`` a safe atom (review-fix.yml resolve: the alias flows into workflow
+      outputs and model prompts),
+    - ``issue`` a positive integer, bool excluded (review-fix.yml resolve + the source-issue
+      needs:* human-hold reads here and in review-fix.yml — a bool/zero/negative issue makes
+      the ``repos/<repo>/issues/<issue>`` read crash the run into the lease-expiry retry loop),
+    - well-formed 40-hex ``head_sha_at_open`` (CLAIM ancestry check, review-fix.yml resolve),
+    - salted 16-hex ``impl_account_h`` (locked decision 22a; CLAIM reviewer!=implementer
+      assertion, review-fix.yml resolve).
+
+    EVERY consumer calls this ONE function — enumerate_review_items (PLAN), the CLAIM record
+    re-read below, review-fix.yml's resolve step (imports this module from the registry
+    checkout), and groom.py's draft age-park carve-out (is_enumerable_provenance): a stale
+    draft worker PR is review-loop-owned (exempt from the terminal needs:user park) exactly
+    when this returns None. Adding a field constraint HERE updates every consumer in the same
+    commit — the partial-replica drift that groom-preserved a review-rejected draft (round-3
+    finding: alias/issue unchecked) is structurally impossible to reintroduce."""
+    if not isinstance(record, dict):
+        return "provenance record is not a JSON object"
+    number = record.get("pr_number")
+    # Strict int identity, bool excluded: Python's cross-type equality (41.0 == 41,
+    # True == 1) would otherwise ADMIT a JSON float or bool pr_number under a bare !=.
+    if not isinstance(number, int) or isinstance(number, bool) or number != pr_number:
+        return "provenance record does not match this PR"
+    impl_provider = record.get("impl_provider")
+    # isinstance BEFORE the set membership: an unhashable JSON value ([] / {}) would
+    # TypeError the lookup, and this predicate must REJECT a malformed record, never
+    # raise — a raise here aborts the whole PLAN/groom run instead of parking one orphan.
+    if not isinstance(impl_provider, str) or impl_provider not in IMPL_PROVIDERS:
+        return "provenance implementer provider is invalid"
+    impl_alias = record.get("impl_alias")
+    if not isinstance(impl_alias, str) or not SAFE_ATOM.fullmatch(impl_alias):
+        return "provenance implementer alias is invalid"
+    impl_account_h = record.get("impl_account_h")
+    if not isinstance(impl_account_h, str) or not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
+        return ("provenance implementer account hash is invalid "
+                "(legacy raw-handle records must be re-recorded via backfill-provenance.py)")
+    issue = record.get("issue")
+    if not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0:
+        return "provenance issue number is invalid"
+    opened_sha = record.get("head_sha_at_open")
+    if not isinstance(opened_sha, str) or not SAFE_SHA.fullmatch(opened_sha):
+        return "provenance head sha is malformed"
+    return None
+
+
+def is_enumerable_provenance(record, pr_number):
+    """True iff the review loop will admit target PR ``pr_number``'s provenance record —
+    a thin predicate over provenance_admission_error (the single source of truth; see its
+    docstring for the field set and the consumer list)."""
+    return provenance_admission_error(record, pr_number) is None
+
+
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
                            pr_status=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
@@ -626,11 +696,13 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         if not login.endswith("[bot]") or (bot_login and login != bot_login):
             continue
         record = provenance.get(number)
-        if not isinstance(record, dict) or record.get("pr_number") != number:
-            continue                      # no registry provenance record — fail closed
-        impl_provider = record.get("impl_provider")
-        if impl_provider not in IMPL_PROVIDERS:
-            continue
+        if not is_enumerable_provenance(record, number):
+            continue                      # missing/invalid registry provenance record — fail
+                                          # closed by the ONE shared predicate (CLAIM,
+                                          # review-fix.yml resolve, and groom's draft carve-out
+                                          # apply the same one, so "enumerated here" and
+                                          # "admitted there" cannot drift)
+        impl_provider = record["impl_provider"]
         labels = sorted({
             label.get("name") if isinstance(label, dict) else label
             for label in (pull.get("labels") or [])
@@ -640,8 +712,8 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             continue                      # terminal — human-owned, nothing autonomous re-enters
         if not SAFE_SHA.fullmatch(sha):
             continue
-        issue_number = record.get("issue")
-        source_labels = issue_labels.get(issue_number, []) if isinstance(issue_number, int) else []
+        issue_number = record["issue"]    # a positive int — guaranteed by the predicate above
+        source_labels = issue_labels.get(issue_number, [])
         if any(isinstance(label, str) and label.startswith("needs:") for label in source_labels):
             continue                      # the SOURCE issue is human-parked (groom/escalation) —
                                           # the whole PR surface is human-owned too
@@ -1015,26 +1087,32 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             if not record_path.is_file():
                 print(f"defer review {repo}#{number}: no registry provenance record (fail closed)")
                 continue
-            record = json.loads(record_path.read_text(encoding="utf-8"))
-            if (record.get("pr_number") != number
-                    or record.get("impl_provider") != item["impl_provider"]
-                    or record.get("impl_provider") not in IMPL_PROVIDERS):
+            try:
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+            except ValueError:
+                print(f"defer review {repo}#{number}: provenance record is not readable JSON "
+                      "(fail closed)")
+                continue
+            # ONE shared record-shape admission (provenance_admission_error — same function as
+            # PLAN, review-fix.yml resolve, and groom's draft carve-out), re-run on the LIVE
+            # re-read so a record edited between PLAN and CLAIM still fails closed.
+            record_error = provenance_admission_error(record, number)
+            if record_error:
+                print(f"defer review {repo}#{number}: {record_error}")
+                continue
+            if record["impl_provider"] != item["impl_provider"]:
                 print(f"defer review {repo}#{number}: provenance disagrees with the plan")
                 continue
-            opened_sha = str(record.get("head_sha_at_open", ""))
-            if not SAFE_SHA.fullmatch(opened_sha):
-                print(f"defer review {repo}#{number}: provenance head sha is malformed")
+            opened_sha = record["head_sha_at_open"]
+            issue_number = record["issue"]
+            # Human-owned SOURCE issue: groom's stale paths park work with needs:user (and a
+            # maintainer ping) — the repair loop must never disarm/redraft/push (nor review
+            # past) a PR whose work item a human explicitly owns. Live read, fail closed.
+            source_issue = _gh_json(["api", f"repos/{repo}/issues/{issue_number}"])
+            if any(label.startswith("needs:") for label in _labels(source_issue)):
+                print(f"defer review {repo}#{number}: source issue #{issue_number} is "
+                      "human-owned (needs:*)")
                 continue
-            issue_number = record.get("issue") if isinstance(record.get("issue"), int) else None
-            if issue_number is not None:
-                # Human-owned SOURCE issue: groom's stale paths park work with needs:user (and a
-                # maintainer ping) — the repair loop must never disarm/redraft/push (nor review
-                # past) a PR whose work item a human explicitly owns. Live read, fail closed.
-                source_issue = _gh_json(["api", f"repos/{repo}/issues/{issue_number}"])
-                if any(label.startswith("needs:") for label in _labels(source_issue)):
-                    print(f"defer review {repo}#{number}: source issue #{issue_number} is "
-                          "human-owned (needs:*)")
-                    continue
             if opened_sha != head_sha:
                 compare = _gh_json(["api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"])
                 if compare.get("status") not in {"identical", "ahead"}:
@@ -1179,12 +1257,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             fix_aliases = (worker_pr.pinned_fix_chain(impl_provider, pin_floor)
                            if pin_floor else FIX_CHAIN[impl_provider])
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
-            # record still carrying a raw handle (or nothing) fails closed — re-run the backfill.
-            impl_account_h = str(record.get("impl_account_h", ""))
-            if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
-                print(f"defer review {repo}#{number}: provenance lacks a salted account hash "
-                      "(re-record it via backfill-provenance.py)")
-                continue
+            # raw-handle/missing hash already deferred above (provenance_admission_error).
+            impl_account_h = record["impl_account_h"]
             if item["state"] == "needs-review":
                 reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
                 if reviewed and reviewed.group(1) == head_sha:
@@ -1819,7 +1893,9 @@ def _self_test():
             (lambda d: d["repositories"][0]["items"][0].update(unknown=True), "unknown item field"),
             (lambda d: d["repositories"][0]["items"][0].pop("deferred"), "missing deferred flag"),
             (lambda d: d["review_items"][0].update(state="armed"), "bad review state"),
+            (lambda d: d["review_items"][0].update(state=[]), "unhashable review state"),
             (lambda d: d["review_items"][0].update(impl_provider="other"), "bad impl provider"),
+            (lambda d: d["review_items"][0].update(impl_provider={}), "unhashable impl provider"),
             (lambda d: d["review_items"][0].update(repo="not/planned"), "unplanned review repo"),
             (lambda d: d["review_items"][0].update(head_sha="zz"), "bad review head sha"),
             (lambda d: d.pop("review_items"), "missing review_items"),
@@ -1842,6 +1918,7 @@ def _self_test():
             (lambda d: d.pop("snapshot_skips"), "missing snapshot_skips"),
             (lambda d: d["snapshot_skips"][0].update(unknown=True), "unknown snapshot skip field"),
             (lambda d: d["snapshot_skips"][0].update(reason="because"), "invalid snapshot skip reason"),
+            (lambda d: d["snapshot_skips"][0].update(reason=[]), "unhashable snapshot skip reason"),
             (lambda d: d["snapshot_skips"][0].update(repo="not/planned"), "unplanned snapshot skip repo"),
             (lambda d: d["snapshot_skips"][0].update(pr_number=-1), "negative snapshot skip pr_number"),
             (lambda d: d["snapshot_skips"].append(dict(d["snapshot_skips"][1])),
@@ -1930,6 +2007,72 @@ def _self_test():
     # known bot login pins authorship exactly
     assert enumerate_review_items(repo, pulls[:1], provenance, [], issue_labels, now,
                                   bot_login="another[bot]") == []
+
+    # ---- provenance_admission_error / is_enumerable_provenance (the ONE record-shape
+    # admission shared by PLAN, CLAIM, review-fix.yml resolve, and groom.py's draft age-park
+    # carve-out) ----
+    # Known-good: exactly the fixtures the enumerator admits above — complete records with a
+    # valid impl_alias and a positive-int issue.
+    assert provenance_admission_error(provenance[41], 41) is None
+    assert is_enumerable_provenance(provenance[41], 41)
+    assert is_enumerable_provenance(provenance[42], 42)
+    # PARITY battery: for EVERY malformed record, the predicate rejects AND the enumerator
+    # refuses to emit the PR — the two decisions are the same function call, and this battery
+    # is the regression tripwire should anyone ever split them again. Each case is keyed to
+    # exactly ONE field check in provenance_admission_error (dropping that check reds it).
+    def _rejected_everywhere(bad_record):
+        return (not is_enumerable_provenance(bad_record, 41)
+                and enumerate_review_items(repo, pulls[:1], {41: bad_record}, [],
+                                           issue_labels, now) == [])
+    assert _rejected_everywhere("not-a-dict")
+    assert _rejected_everywhere({})
+    assert _rejected_everywhere({**provenance[41], "pr_number": 40})       # mismatched PR
+    # Cross-type equality hazard: Python says 41.0 == 41 and True == 1, so a JSON float or
+    # bool pr_number slips through a bare != comparison. The strict int-not-bool guard
+    # rejects both; reverting it to bare != ADMITS 41.0 (this assertion reds).
+    assert _rejected_everywhere({**provenance[41], "pr_number": 41.0})     # float is not an int
+    assert _rejected_everywhere({**provenance[41], "pr_number": True})     # bool is not an int
+    assert _rejected_everywhere({**provenance[41], "pr_number": "41"})     # string is not an int
+    # ... and the True == 1 direction needs a target PR of 1 to be a live tripwire:
+    assert not is_enumerable_provenance({**provenance[41], "pr_number": True}, 1)
+    assert _rejected_everywhere({**provenance[41], "impl_provider": "mallory"})
+    # UNHASHABLE / wrong-type fields must be REJECTED, never raise: before the
+    # isinstance-before-membership guard, impl_provider=[] / {} raised TypeError out of the
+    # set lookup and aborted the entire PLAN/groom run instead of parking the one orphan.
+    # Reverting that guard makes these assertions RAISE (mutation tripwire), not just fail.
+    assert _rejected_everywhere({**provenance[41], "impl_provider": []})
+    assert _rejected_everywhere({**provenance[41], "impl_provider": {}})
+    assert _rejected_everywhere({**provenance[41], "impl_provider": 5})
+    assert _rejected_everywhere({**provenance[41], "issue": []})
+    assert _rejected_everywhere({**provenance[41], "head_sha_at_open": {}})
+    assert _rejected_everywhere({**provenance[41], "impl_account_h": []})
+    assert _rejected_everywhere({**provenance[41], "head_sha_at_open": "not-a-sha"})
+    assert _rejected_everywhere({**provenance[41], "impl_account_h": "raw-handle@example"})
+    assert _rejected_everywhere(
+        {key: value for key, value in provenance[41].items() if key != "impl_account_h"})
+    # Round-3 finding: alias and issue are review-fix.yml resolve requirements the old partial
+    # predicate omitted — a draft carrying these passed groom's carve-out but crashed every
+    # review claim into the lease-expiry retry loop. Now rejected by the same single function.
+    assert _rejected_everywhere(
+        {key: value for key, value in provenance[41].items() if key != "impl_alias"})
+    assert _rejected_everywhere({**provenance[41], "impl_alias": "no spaces allowed"})
+    assert _rejected_everywhere({**provenance[41], "impl_alias": 5})       # non-string
+    assert _rejected_everywhere(
+        {key: value for key, value in provenance[41].items() if key != "issue"})
+    assert _rejected_everywhere({**provenance[41], "issue": 0})
+    assert _rejected_everywhere({**provenance[41], "issue": -7})
+    assert _rejected_everywhere({**provenance[41], "issue": True})         # bool is not an issue
+    assert _rejected_everywhere({**provenance[41], "issue": "7"})          # string is not an int
+    # The error strings are consumer-facing (CLAIM defer lines, review-fix.yml SystemExit):
+    # assert the reason routing so a reordered/collapsed check cannot silently misreport.
+    assert provenance_admission_error({**provenance[41], "impl_alias": 5}, 41) \
+        == "provenance implementer alias is invalid"
+    assert provenance_admission_error({**provenance[41], "issue": True}, 41) \
+        == "provenance issue number is invalid"
+    assert provenance_admission_error({**provenance[41], "pr_number": 41.0}, 41) \
+        == "provenance record does not match this PR"
+    assert provenance_admission_error({**provenance[41], "impl_provider": []}, 41) \
+        == "provenance implementer provider is invalid"
 
     # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
     runs = [
@@ -2141,6 +2284,12 @@ def _self_test():
                                check_runs_degraded=True)}
     assert [item["pr_number"] for item in enumerate_disarm_items(
         repo, [moved], degraded_armed, provenance)] == [41]
+    # the disarm provenance re-read carries the same strict-int pr_number guard as
+    # provenance_admission_error: a float/bool record (41.0 == 41 under bare !=) never binds
+    assert enumerate_disarm_items(repo, [moved], armed_status,
+                                  {41: {**provenance[41], "pr_number": 41.0}}) == []
+    assert enumerate_disarm_items(repo, [moved], armed_status,
+                                  {41: {**provenance[41], "pr_number": True}}) == []
 
     # ---- decide_repair_admission: the LIVE trigger gates the defuse (defect-1 regression) ----
     # trigger holds: drafted proceeds, ready/armed defuses

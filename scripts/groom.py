@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import time
 import tomllib
 from typing import Any
@@ -39,6 +40,23 @@ LEDGER_PATH = "data/leases.json"
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
 STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
+# Registry provenance records — same location and <owner>--<name>--pr<N>.json naming as
+# worker-pr.provenance_path / dispatch-claim's fail-closed review lookup. Groom runs from the
+# registry checkout root (groom.yml), so the directory is reachable relatively.
+PROVENANCE_DIR = "orchestration/provenance"
+# Reason for age-parking a draft worker PR that has NO VALID registry provenance record —
+# missing, unreadable, or schema-invalid (bad pr_number/provider/alias/issue/head-sha/
+# account-hash). Such a draft is owned by NO automated loop: dispatch-claim's PLAN, its CLAIM
+# re-read, and review-fix.yml's resolve step all fail closed on every one of those cases via the
+# ONE shared admission function (dispatch-claim.provenance_admission_error, surfaced here as
+# is_enumerable_provenance), and groom's issue-side orphan repair skips it (an open draft links
+# its source issue). Age-parking to needs:user is the human hand-off — the closure guarantee that
+# no draft is ever silently stranded. Phrased to read after "…threshold, and {reason}." in the
+# park comment.
+ORPHAN_DRAFT_REASON = (
+    "the worker pull request is still a draft with no valid registry provenance record, so the "
+    "review loop (which fails closed on missing or invalid provenance) will never pick it up"
+)
 WORKER_PR_MARKER = "> 🤖 SPARQ agent"
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?")
@@ -274,10 +292,73 @@ def linked_issue_numbers(pull: dict[str, Any]) -> set[int]:
     return numbers
 
 
+_REVIEW_LOOP_MODULE: Any = None
+
+
+def _review_loop_module() -> Any:
+    """Cached dispatch-claim.py module — the review loop's own provenance-admission schema.
+
+    Loaded lazily from this script's directory so ``is_enumerable_provenance`` is IMPORTED,
+    never replicated: groom's "is this draft review-loop-owned?" decision and dispatch-claim's
+    "will the review loop actually drive this PR?" decision cannot drift. dispatch-claim.py is
+    import-side-effect-free (constants and defs only)."""
+    global _REVIEW_LOOP_MODULE
+    if _REVIEW_LOOP_MODULE is None:
+        _REVIEW_LOOP_MODULE = _load_module(
+            Path(__file__).resolve().parent / "dispatch-claim.py", "registry_dispatch_claim"
+        )
+    return _REVIEW_LOOP_MODULE
+
+
+def worker_pr_provenance_enumerable(
+    repo: str, number: int, registry_root: Path = Path(".")
+) -> bool:
+    """True when the registry provenance record for target PR ``repo#number`` exists on disk
+    AND is valid by the review loop's OWN admission schema (dispatch-claim.
+    is_enumerable_provenance: JSON object, strict-int matching pr_number (float/bool
+    excluded — 41.0 == 41 and True == 1 under lax equality), registered impl provider,
+    safe-atom impl alias, positive-int issue, well-formed 40-hex head sha, salted 16-hex
+    account hash — the COMPLETE field set; see provenance_admission_error, the one function
+    every consumer calls).
+
+    Mirrors worker-pr.provenance_path / dispatch-claim's review lookup: the record lives at
+    ``orchestration/provenance/<owner>--<name>--pr<N>.json`` in the registry checkout, which is
+    groom's working directory (groom.yml runs from the checkout root). VALIDITY — not mere file
+    existence — decides draft ownership: the review enumerator/claimer fail-close on an
+    unreadable or schema-invalid record exactly as on a missing one, so a draft carrying such a
+    record is owned by no automated loop and must keep the age-park hand-off. (A bare existence
+    check would groom-preserve that draft while the review loop never admits it — the same
+    silent-strand deadlock class, for the malformed case.)"""
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        raise GroomError("target repository name is malformed")
+    record_path = registry_root / PROVENANCE_DIR / f"{owner}--{name}--pr{number}.json"
+    if not record_path.is_file():
+        return False
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False  # unreadable/malformed JSON — the review loop fails closed on it too
+    return bool(_review_loop_module().is_enumerable_provenance(record, number))
+
+
 def stale_worker_pr_reason(
-    pull: dict[str, Any], bot_login: str, threshold_seconds: int, now: int
+    pull: dict[str, Any],
+    bot_login: str,
+    threshold_seconds: int,
+    now: int,
+    *,
+    has_valid_provenance: bool,
 ) -> str | None:
-    """Return why an old worker PR needs attention, or None when it should remain untouched."""
+    """Return why an old worker PR needs HUMAN attention, or None when it should remain untouched.
+
+    Scope: this age sweep escalates (1) a NON-DRAFT worker PR wedged in a BAD_MERGE_STATE
+    (conflicting/dirty/behind/blocked/unstable/unknown) — a state no automation recovers — and
+    (2) a DRAFT worker PR with NO VALID registry provenance record (missing, unreadable, or
+    schema-invalid — worker_pr_provenance_enumerable), which no automated loop will ever pick
+    up (genuine orphan). A DRAFT worker PR with a VALID provenance record is review-loop-owned
+    and is NEVER escalated here — see the draft branch below. Together: no draft is ever
+    silently stranded, and no pipeline-owned draft is ever terminally parked."""
     updated = _epoch(pull.get("updated_at"), "pull request")
     if now - updated < threshold_seconds:
         return None
@@ -294,7 +375,34 @@ def stale_worker_pr_reason(
     ):
         return None
     if pull.get("draft") is True:
-        return "the worker pull request is still a draft"
+        # [FABLE-5] A DRAFT worker PR with a VALID registry provenance record is
+        # REVIEW-LOOP-OWNED, never age-parked here (deadlock fix, live PRs
+        # jeswr/agent-account-registry#3472 / #3470). Draft is the NORMAL pre-review pipeline
+        # state: dispatch-claim.enumerate_review_items picks the draft up, the review-fix loop
+        # reviews it, then undrafts + arms it. A draft awaiting review gets NO `updated_at`
+        # bump, so it ages past worker_timeout_minutes purely by WAITING for a (backed-up)
+        # review lane — being old is NOT being stuck. Applying `needs:user` here is TERMINAL:
+        # it (and a `needs:` label on the source issue) is in
+        # dispatch-claim.HUMAN_HOLD_PR_LABELS, which EXCLUDES the PR from
+        # enumerate_review_items — so parking a pipeline-owned draft removes it from the exact
+        # loop that would otherwise drive it, a self-inflicted deadlock the maintainer reported
+        # as "can't be drained". (A starved-but-owned review lane's paging mechanism — a
+        # NON-terminal alert keyed on policy `review_queue_ttl_minutes` — is NOT YET WIRED to
+        # any consumer; that future mechanism is tracked separately in issue #90 and is NOT
+        # relied on here.)
+        if has_valid_provenance:
+            return None
+        # A DRAFT with NO VALID provenance record is a GENUINE ORPHAN owned by no automated
+        # loop: the review loop's PLAN, CLAIM, and review-fix.yml resolve all fail closed on a
+        # missing/mismatched/malformed record via the ONE shared admission function
+        # (dispatch-claim.provenance_admission_error, called here as is_enumerable_provenance —
+        # validity means EXACTLY what that loop will admit, alias and issue included), and groom's
+        # issue-side orphan repair skips it too (an open draft links its source issue, so
+        # `number in links`). Keeping the age-park for exactly this case preserves master's
+        # closure guarantee — a human hand-off instead of silence — without re-arming the
+        # deadlock for the valid-provenance majority above. (Gating on FILE EXISTENCE alone
+        # would strand the malformed-record case: groom-preserved, never enumerated.)
+        return ORPHAN_DRAFT_REASON
     merge_state = pull.get("mergeable_state")
     if merge_state is None:
         merge_state = "unknown"
@@ -371,10 +479,10 @@ class GitHubAPI:
         raise GroomError(f"{self._purpose} snapshot may be truncated at 5000 entries")
 
 
-def _load_module(path: Path):
-    spec = importlib.util.spec_from_file_location("registry_policy_resolve", path)
+def _load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise GroomError("cannot load policy-resolve.py")
+        raise GroomError(f"cannot load {path.name}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -389,7 +497,7 @@ def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
     repos = document.get("repos") if isinstance(document, dict) else None
     if not isinstance(repos, dict) or not repos:
         raise GroomError("repository policy has no target rows")
-    resolver = _load_module(resolver_file)
+    resolver = _load_module(resolver_file, "registry_policy_resolve")
     limits: dict[str, Limits] = {}
     for repo, raw in repos.items():
         if not isinstance(repo, str) or SAFE_REPO.fullmatch(repo) is None:
@@ -835,7 +943,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     f"target pull request detail is malformed for {repo}#{number}"
                 )
             reason = stale_worker_pr_reason(
-                detail, bot_login, repo_limits.threshold_seconds, now
+                detail,
+                bot_login,
+                repo_limits.threshold_seconds,
+                now,
+                has_valid_provenance=worker_pr_provenance_enumerable(repo, number),
             )
             if reason:
                 stale_prs[(repo, number)] = reason
@@ -947,7 +1059,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             print(f"SKIP PR {action.repo}#{action.number}: no longer open")
             continue
         reason = stale_worker_pr_reason(
-            pull, bot_login, limits[action.repo].threshold_seconds, now
+            pull,
+            bot_login,
+            limits[action.repo].threshold_seconds,
+            now,
+            has_valid_provenance=worker_pr_provenance_enumerable(action.repo, action.number),
         )
         if reason is None:
             print(f"SKIP PR {action.repo}#{action.number}: no longer stale/failing")
@@ -1120,17 +1236,236 @@ def _self_test() -> int:
     }
     check(
         "stale blocked worker PR",
-        stale_worker_pr_reason(old_pr, "app[bot]", limits.threshold_seconds, now),
+        stale_worker_pr_reason(
+            old_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+        ),
         BAD_MERGE_STATES["blocked"],
     )
     check(
         "clean worker PR is preserved",
         stale_worker_pr_reason(
-            {**old_pr, "mergeable_state": "clean"}, "app[bot]", 600, now
+            {**old_pr, "mergeable_state": "clean"},
+            "app[bot]",
+            600,
+            now,
+            has_valid_provenance=True,
         ),
         None,
     )
     check("worker branch links issue", linked_issue_numbers(old_pr), {7})
+
+    # [FABLE-5] Deadlock regression (live PRs #3472/#3470): a stale DRAFT worker PR with a VALID
+    # registry provenance record (aged past the maintenance threshold purely by WAITING for a
+    # backed-up review lane) is REVIEW-LOOP-OWNED and must NOT be age-parked into terminal
+    # needs:user by this sweep — that terminal label excludes the PR from
+    # dispatch-claim.enumerate_review_items, deadlocking the exact loop that drives it.
+    # (a) THE BUG: a stale valid-provenance draft returns None (no needs:user park). Even a draft
+    # in an otherwise-bad merge state stays untouched here — review-loop ownership dominates the
+    # merge-state escalation.
+    stale_draft_pr = {**old_pr, "draft": True}
+    check(
+        "stale DRAFT worker PR with VALID provenance is NOT age-parked (review-loop-owned)",
+        stale_worker_pr_reason(
+            stale_draft_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+        ),
+        None,
+    )
+    check(
+        "stale valid-provenance draft is untouched even in a bad merge state (ownership wins)",
+        stale_worker_pr_reason(
+            {**old_pr, "draft": True, "mergeable_state": "dirty"},
+            "app[bot]",
+            limits.threshold_seconds,
+            now,
+            has_valid_provenance=True,
+        ),
+        None,
+    )
+    # (a2) CLOSURE GUARANTEE: a stale DRAFT with NO VALID provenance record (missing, unreadable,
+    # or schema-invalid) is a genuine orphan — the review loop fails closed on every one of those
+    # cases and groom's issue-side orphan repair skips an open draft — so the age-park (human
+    # hand-off) is KEPT for exactly this case. Also dominates the merge state: the orphan reason,
+    # not the merge reason, is returned.
+    check(
+        "stale DRAFT worker PR WITHOUT valid provenance still parks (orphan hand-off)",
+        stale_worker_pr_reason(
+            stale_draft_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False
+        ),
+        ORPHAN_DRAFT_REASON,
+    )
+    check(
+        "no-provenance orphan draft park dominates the merge-state reason",
+        stale_worker_pr_reason(
+            {**old_pr, "draft": True, "mergeable_state": "dirty"},
+            "app[bot]",
+            limits.threshold_seconds,
+            now,
+            has_valid_provenance=False,
+        ),
+        ORPHAN_DRAFT_REASON,
+    )
+    # (b) A stale NON-DRAFT worker PR wedged in a bad merge state STILL parks (unchanged; a state no
+    # automation recovers — the defensible, in-scope escalation the fix must not remove).
+    check(
+        "stale NON-DRAFT bad-merge-state worker PR still parks (unchanged)",
+        stale_worker_pr_reason(
+            {**old_pr, "draft": False, "mergeable_state": "dirty"},
+            "app[bot]",
+            limits.threshold_seconds,
+            now,
+            has_valid_provenance=True,
+        ),
+        BAD_MERGE_STATES["dirty"],
+    )
+    # (a3) The provenance VALIDITY lookup: mirrors worker-pr.provenance_path — the record for
+    # <owner>/<name>#<N> lives at orchestration/provenance/<owner>--<name>--pr<N>.json under the
+    # registry root — and validates the record with the review loop's OWN shared predicate
+    # (dispatch-claim.is_enumerable_provenance, imported, so the schemas cannot drift). The
+    # result flips the draft branch between review-loop-owned (VALID) and orphan-park (missing
+    # OR invalid): the review loop fails closed on every invalid case below, so groom-preserving
+    # such a draft would silently strand it.
+    with tempfile.TemporaryDirectory() as tmp:
+        registry_root = Path(tmp)
+        check(
+            "provenance validity: missing record -> False (park)",
+            worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
+            False,
+        )
+        record_dir = registry_root / PROVENANCE_DIR
+        record_dir.mkdir(parents=True)
+        record_path = record_dir / "owner--repo--pr99.json"
+        # COMPLETE by the review path's full requirement set — including impl_alias (safe
+        # atom) and issue (positive int), the two fields the round-3 partial predicate missed.
+        valid_record = {
+            "pr_number": 99,
+            "head_sha_at_open": "1" * 40,
+            "impl_provider": "anthropic",
+            "impl_alias": "fable",
+            "impl_account_h": "ab" * 8,
+            "issue": 7,
+        }
+        record_path.write_text(json.dumps(valid_record), encoding="utf-8")
+        check(
+            "provenance validity: schema-valid record -> True (review-loop-owned)",
+            worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
+            True,
+        )
+        check(
+            "provenance validity: different PR number stays False",
+            worker_pr_provenance_enumerable("owner/repo", 100, registry_root),
+            False,
+        )
+        # MUTATION guard against the file-existence-only revert: every case below leaves the
+        # record FILE in place, so an existence-only lookup would report True (no park) while
+        # the review loop rejects the record — exactly the silent-strand this gate closes.
+        # Each must stay False (park).
+        record_path.write_text("{not json", encoding="utf-8")
+        check(
+            "provenance validity: MALFORMED-JSON record -> False (park; existence insufficient)",
+            worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
+            False,
+        )
+        record_path.write_text("{}", encoding="utf-8")
+        check(
+            "provenance validity: empty {} record -> False (park)",
+            worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
+            False,
+        )
+        for field, bad_value in (
+            ("pr_number", 98),  # points at a different target PR
+            # Cross-type equality hazard: Python says 99.0 == 99 and True == 1, so a bare
+            # != admits a JSON float/bool pr_number. The strict int-not-bool guard in
+            # provenance_admission_error rejects both; reverting it ADMITS 99.0 (reds here).
+            ("pr_number", 99.0),  # float is not an int (99.0 == 99 under lax equality)
+            ("pr_number", True),  # bool is not an int (True == 1 under lax equality)
+            ("impl_provider", "mallory"),  # unregistered provider
+            # UNHASHABLE / wrong-type fields must park, never raise: before the predicate's
+            # isinstance-before-membership guard, [] / {} here raised TypeError out of the
+            # provider set lookup and aborted the whole groom run instead of parking one
+            # orphan. Reverting that guard makes these cases RAISE (mutation tripwire).
+            ("impl_provider", []),  # unhashable list
+            ("impl_provider", {}),  # unhashable object
+            ("issue", []),  # wrong-type (list) issue number
+            ("head_sha_at_open", {}),  # wrong-type (object) opened-head sha
+            ("head_sha_at_open", "not-a-sha"),  # malformed opened-head sha
+            ("impl_account_h", "raw-handle@x"),  # not the salted 16-hex hash (decision 22a)
+            # Round-3 finding: review-fix.yml's resolve rejects these two, so a draft carrying
+            # them is review-REJECTED — groom must park, not preserve. Each keys the matching
+            # field check in dispatch-claim.provenance_admission_error (dropping it reds here).
+            ("impl_alias", "no spaces allowed"),  # not a safe atom (resolve-step requirement)
+            ("impl_alias", 5),  # non-string alias
+            ("issue", 0),  # not a positive issue number
+            ("issue", -7),  # negative issue number
+            ("issue", True),  # bool is not an issue number (str(True) breaks the issues/ read)
+            ("issue", "7"),  # string is not an int
+        ):
+            record_path.write_text(
+                json.dumps({**valid_record, field: bad_value}), encoding="utf-8"
+            )
+            check(
+                f"provenance validity: schema-invalid {field}={bad_value!r} -> False (park)",
+                worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
+                False,
+            )
+        for missing in ("impl_alias", "issue"):
+            record_path.write_text(
+                json.dumps({k: v for k, v in valid_record.items() if k != missing}),
+                encoding="utf-8",
+            )
+            check(
+                f"provenance validity: missing {missing} -> False (park)",
+                worker_pr_provenance_enumerable("owner/repo", 99, registry_root),
+                False,
+            )
+        malformed_repo_failed = False
+        try:
+            worker_pr_provenance_enumerable("no-slash", 99, registry_root)
+        except GroomError:
+            malformed_repo_failed = True
+        check("provenance validity: malformed repo fails closed", malformed_repo_failed, True)
+    # (c) Non-vacuity / mutation guards. The two draft tests above are mutually discriminating:
+    # reverting the draft branch to master's UNCONDITIONAL park reds test (a) (valid-provenance
+    # draft would park), and reverting it to an unconditional Return-None (the earlier revision of
+    # this fix) reds test (a2) (the orphan draft would get silence). The modelled revert below
+    # additionally proves test (a) discriminates against the exact master behaviour — if the draft
+    # branch ever again returns a reason for a valid-provenance draft, run_sweep's pull_actions
+    # loop applies needs:user, re-arming the deadlock.
+    def _reverted_stale_worker_pr_reason(pull, bot, threshold, at):
+        updated = _epoch(pull.get("updated_at"), "pull request")
+        if at - updated < threshold:
+            return None
+        head = pull.get("head", {}).get("ref", "")
+        author = pull.get("user", {}).get("login", "")
+        pbody = pull.get("body") or ""
+        if (
+            not isinstance(head, str)
+            or WORKER_BRANCH.match(head) is None
+            or not isinstance(author, str)
+            or author.casefold() != bot.casefold()
+            or not isinstance(pbody, str)
+            or not pbody.lstrip().startswith(WORKER_PR_MARKER)
+        ):
+            return None
+        if pull.get("draft") is True:
+            return "the worker pull request is still a draft"  # the removed terminal-park
+        merge_state = pull.get("mergeable_state") or "unknown"
+        return BAD_MERGE_STATES.get(merge_state)
+
+    check(
+        "MUTATION: reverting the draft-fix re-parks the draft (non-vacuous)",
+        _reverted_stale_worker_pr_reason(
+            stale_draft_pr, "app[bot]", limits.threshold_seconds, now
+        ),
+        "the worker pull request is still a draft",
+    )
+    check(
+        "MUTATION guard agrees with the live fix on the non-draft park (only draft changed)",
+        _reverted_stale_worker_pr_reason(old_pr, "app[bot]", limits.threshold_seconds, now)
+        == stale_worker_pr_reason(
+            old_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+        ),
+        True,
+    )
 
     fixture_issues = {
         "owner/repo": {
