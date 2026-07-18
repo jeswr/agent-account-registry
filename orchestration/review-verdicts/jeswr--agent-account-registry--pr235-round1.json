@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly centralizes review/fix lease caps and TTLs in LEASE_CONFIG, makes both dispatcher paths resolve through lease_limit(), and makes the workflow self-claim path obtain the same values through a narrowly scoped CLI mode. Unknown prefixes and malformed/non-positive workflow output fail closed. The regression checks are non-vacuous: they pin both canonical tuples and explicitly verify that an unknown prefix raises KeyError, while dispatch wiring delegates to the real resolver. No trust check, routing gate, permission, token handling, or arm-side behavior is weakened by this diff.",
+ "verdict": "approve"
+}
