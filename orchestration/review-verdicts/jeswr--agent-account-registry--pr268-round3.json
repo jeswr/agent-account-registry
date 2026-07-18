@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The per-owner credential change remains correct and complete. Enabled repositories are validated and grouped by owner, the workflow fails closed on owner-set drift, and each static mint receives the full repository scope for its owner. Mint failures defer only that owner's target-side grooming while registry-side dead-lease cleanup continues; successful-but-empty outputs fail loudly. Secret values are masked and the assembled token map stays within the sweep process rather than crossing GITHUB_OUTPUT. The sweep consistently routes reads and writes through the repository owner's client, and its reduced dictionaries remain internally aligned for planning and mutation. The added self-tests are non-vacuous and cover distinct-owner routing, missing-owner deferral, malformed maps, complete mint scope, unsafe names, and owner drift. I found no diff-supported correctness, soundness, test-validity, or security issue.",
+ "verdict": "approve"
+}
