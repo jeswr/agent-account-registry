@@ -39,8 +39,17 @@ LEDGER_PATH = "data/leases.json"
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
 STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
+# The stale-PR park label is GROOM-OWNED STATE: groom is the ONLY writer (apply and remove) of
+# this label, so the unpark DELETE can never race a human's application of it — the shared-label
+# TOCTOU of the earlier needs:user design (label DELETE-by-name is unconditional; a human
+# remove-then-reapply between groom's read and its DELETE would have been stolen) is eliminated
+# by ownership, not by timing. Humans hold a PR with needs:user / review:needs-user, which groom
+# NEVER writes or removes on a PR; every autonomous consumer (worker-pr.py HUMAN_OWNED_LABELS,
+# dispatch-claim.py HUMAN_HOLD_PR_LABELS, review-fix.yml) treats groom:parked as the same hard
+# hold. PRs parked with needs:user by pre-migration grooms stay human-held forever (fail closed).
+PARK_LABEL = "groom:parked"
 # v2 park marker: machine-readable head sha + park time so a later sweep can prove BOTH that the
-# needs:user label was applied by groom itself (never a human) AND whether the staleness cause has
+# park label was applied by groom itself (never a human) AND whether the staleness cause has
 # cleared since. v1 comments (no sha) remain recognised as groom parks; only the head-sha progress
 # branch is unavailable for them. Mirrors the worker-pr.py REVIEWED_SHA_RE bot-marker convention.
 STALE_PARK_V2_RE = re.compile(
@@ -95,6 +104,10 @@ LABELS = {
     "status:ready": ("0e8a16", "Ready for trusted automated dispatch"),
     "status:deferred": ("d4c5f9", "Private-registry worker orchestration state"),
     "needs:user": ("b60205", "Human attention required"),
+    "groom:parked": (
+        "5319e7",
+        "Stale-PR park owned by grooming; use needs:user for a human hold",
+    ),
 }
 
 
@@ -337,16 +350,17 @@ class ParkRecord:
 
 def latest_park(comments: list[dict[str, Any]], bot_login: str) -> ParkRecord | None:
     """The last stale-park comment authored by the BOT itself, or None. A park marker inside a
-    non-bot comment never counts: a human pasting the marker text must not make a human-applied
-    needs:user look reversible. A bot UNPARK comment CONSUMES any earlier park record: after an
-    unpark, the old park comment no longer explains a needs:user label, so a needs:user applied
-    later (e.g. silently, by a human) is never attributed to groom. A legitimate groom re-park
-    always posts a fresh park comment whenever it (re)applies the label, re-establishing the
-    record after any unpark."""
+    non-bot comment never counts: a human pasting the marker text must not make a hold look
+    groom-reversible. A bot UNPARK comment CONSUMES any earlier park record: after an unpark,
+    the old park comment no longer explains a park label, so a groom:parked applied later (in
+    violation of its contract) is never attributed to groom. A legitimate groom re-park always
+    posts a fresh park comment whenever it (re)applies the label, re-establishing the record
+    after any unpark."""
     bot = bot_login.casefold()
     record: ParkRecord | None = None
     for comment in comments:
-        if str(comment.get("user", {}).get("login", "")).casefold() != bot:
+        # `user` may be null for a deleted account: an unattributable comment is never the bot's.
+        if str((comment.get("user") or {}).get("login", "")).casefold() != bot:
             continue
         body = str(comment.get("body", ""))
         if UNPARK_MARKER in body:
@@ -419,29 +433,29 @@ def unpark_reason(
 ) -> str | None:
     """Return why groom may reverse ITS OWN stale park, or None to leave the PR parked.
 
-    Groom may remove needs:user from an open worker PR ONLY when ALL of these hold:
-      (a) the park is groom's own — the latest needs:user cause is the bot's marker comment AND
-          the label-event timeline shows the CURRENT needs:user application was performed by the
-          bot itself (a human remove-then-reapply makes the label human-owned even while groom's
-          park comment remains the latest marker);
+    Groom may remove groom:parked from an open worker PR ONLY when ALL of these hold:
+      (a) the park is groom's own — the latest groom:parked cause is the bot's marker comment AND
+          the label-event timeline shows the CURRENT groom:parked application was performed by
+          the bot itself (a hand-applied groom:parked violates the label's contract and is never
+          lifted autonomously);
       (b) no non-bot comment or review landed at or after that park's second (a human who
-          engaged owns the PR; sub-second order is unknowable, so same-second blocks);
+          engaged owns the PR; sub-second order is unknowable, so same-second blocks), and every
+          comment/review author is verifiable — a null/malformed actor blocks outright;
       (c) the staleness cause has cleared — a new well-formed head sha, OR the authoritative
           gate check (CI_GATE_CHECK) whose LATEST run completed successfully on this head after the park
           (fleet recovery; an unrelated green matrix leg is never recovery), OR a now-clean
           merge state;
-      (d) review:needs-user (the review loop's terminal escalation) is absent — that label is
-          strictly human-owned and groom never reverses it.
-    A human-applied needs:user has no bot marker and no bot labeled-event, so (a) keeps it
-    terminal forever.
+      (d) needs:user and review:needs-user are absent — both are strictly human-owned (groom
+          never writes either on a PR) and a human hold always trumps groom's own park.
+    A human hold uses needs:user, which groom never touches, so it stays terminal forever.
     """
-    if "needs:user" not in labels:
+    if PARK_LABEL not in labels:
         return None
-    if "review:needs-user" in labels:
+    if "review:needs-user" in labels or "needs:user" in labels:
         return None
     if park is None:
         return None
-    if not bot_owns_current_label(timeline, "needs:user", bot_login):
+    if not bot_owns_current_label(timeline, PARK_LABEL, bot_login):
         return None
     head = pull.get("head", {}).get("ref", "")
     author = pull.get("user", {}).get("login", "")
@@ -457,14 +471,24 @@ def unpark_reason(
     # second is unknowable — a human comment/review stamped in the SAME second as the park must
     # block (fail closed) rather than be assumed to precede it.
     for comment in comments:
+        login = (comment.get("user") or {}).get("login")
+        # An unverifiable author (user: null for a deleted account, or a malformed row) can
+        # never be proven to be the bot's own — it blocks unpark outright (fail closed).
+        if not isinstance(login, str) or not login:
+            return None
         if (
-            str(comment.get("user", {}).get("login", "")).casefold() != bot
+            login.casefold() != bot
             and _epoch(comment.get("created_at"), "pull request comment") >= park.at
         ):
             return None
     for review in reviews:
         login = (review.get("user") or {}).get("login")
-        if not isinstance(login, str) or login.casefold() == bot:
+        # An unverifiable review actor blocks unpark outright — it must NOT share the verified-
+        # bot skip path, or a post-park human review whose account was deleted would be ignored
+        # and a new head could unpark over live human engagement (fail open).
+        if not isinstance(login, str) or not login:
+            return None
+        if login.casefold() == bot:
             continue
         submitted = review.get("submitted_at")
         # A non-bot review without a parseable timestamp blocks unpark (fail conservative).
@@ -754,7 +778,8 @@ def _comments(api: GitHubAPI, repo: str, number: int) -> list[dict[str, Any]]:
     for comment in comments:
         if not isinstance(comment, dict):
             raise GroomError(f"target comments are malformed for {repo}#{number}")
-        login = comment.get("user", {}).get("login")
+        # `user` is null for a deleted account — raise (loud, fail closed), never AttributeError.
+        login = (comment.get("user") or {}).get("login")
         body = comment.get("body")
         if not isinstance(login, str) or not isinstance(body, str):
             raise GroomError(f"target comment fields are malformed for {repo}#{number}")
@@ -879,42 +904,72 @@ def _apply_labels(
     return bool(add or remove)
 
 
-def _unpark_writes(api: GitHubAPI, repo: str, number: int, bot_login: str, body: str) -> bool:
-    """Consumption-marker, fresh label-ownership re-proof, then delabel — in that order; True
-    only when the label was actually removed.
+def _attempt_unpark(api: GitHubAPI, repo: str, number: int, bot_login: str) -> bool:
+    """Re-derive EVERY unpark predicate from one fresh snapshot taken immediately before the
+    writes, then write; True only when the PR was actually unparked.
+
+    The candidate list came from the sweep's earlier pull snapshot, which is seconds stale by
+    write time — deciding from it would leave a window in which a human comment, review, or
+    label change lands unseen. So the decision inputs (PR detail, comments, reviews, label
+    timeline, gate check-runs) are ALL fetched here, and unpark_reason runs on that snapshot
+    with no writes before it. The residual instant between these reads and the DELETE cannot
+    lose a human hold: the only state deleted is groom:parked, which groom alone writes (see
+    PARK_LABEL) — a human hold arrives as needs:user or review:needs-user, which groom never
+    touches, and both continue to park the PR through every autonomous consumer regardless of
+    this DELETE.
 
     Marker before DELETE: if the DELETE fails after the marker posts, the park record is
-    already consumed and the PR simply stays parked until a human lifts it. The reverse order
-    opens a window (label gone, park record still live) in which a needs:user applied later by
-    a human could be attributed to groom by a subsequent sweep and stolen.
-
-    Re-proof before DELETE: the sweep's unpark decision was taken from a timeline read that is
-    seconds stale by write time — a human who removed and re-applied needs:user in between owns
-    the CURRENT application, and label DELETE-by-name is unconditional (no If-Match), so groom
-    must re-read the timeline immediately before deleting and fail closed if the latest
-    application is no longer its own. Failing here leaves the marker posted and the label
-    intact: the park record is consumed, the human's label stands, and no later sweep can
-    attribute it to groom. Only a groom-owned hold label distinct from needs:user could close
-    the residual re-read→DELETE instant entirely; until that migration, this re-proof is the
-    tightest ownership check the API offers."""
-    api.request("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body})
-    print(f"WRITE unpark comment repo={repo} pr={number}")
+    already consumed and the PR simply stays parked until groom re-parks it with a fresh
+    comment or a human lifts it. The reverse order opens a window (label gone, park record
+    still live) in which a groom:parked applied later could be attributed to this stale park
+    by a subsequent sweep."""
+    detail = api.request("GET", f"/repos/{repo}/pulls/{number}", allow_404=True)
+    if not isinstance(detail, dict) or detail.get("state") != "open":
+        return False
+    labels = _labels(detail, f"target pull request {repo}#{number}")
+    comments = _comments(api, repo, number)
+    park = latest_park(comments, bot_login)
+    if park is None:
+        print(f"SKIP unpark {repo}#{number}: no live groom park record for the label")
+        return False
+    reviews = [
+        review
+        for review in api.paginate(f"/repos/{repo}/pulls/{number}/reviews")
+        if isinstance(review, dict)
+    ]
     timeline = [
         event
         for event in api.paginate(f"/repos/{repo}/issues/{number}/timeline")
         if isinstance(event, dict)
     ]
-    if not bot_owns_current_label(timeline, "needs:user", bot_login):
-        print(
-            f"SKIP unpark {repo}#{number}: needs:user changed hands between the sweep's "
-            "decision and the write — the label now stands as human-owned"
-        )
+    head_sha = detail.get("head", {}).get("sha")
+    check_runs: list[dict[str, Any]] = []
+    if isinstance(head_sha, str) and HEAD_SHA_RE.fullmatch(head_sha):
+        runs_doc = api.request("GET", gate_check_runs_path(repo, head_sha))
+        if isinstance(runs_doc, dict) and isinstance(runs_doc.get("check_runs"), list):
+            check_runs = [run for run in runs_doc["check_runs"] if isinstance(run, dict)]
+    reason = unpark_reason(
+        detail, labels, park, comments, reviews, check_runs, timeline, bot_login
+    )
+    if reason is None:
         return False
+    body = (
+        "> 🤖 SPARQ agent\n\n"
+        "Unparking: grooming applied this stale-PR park itself, no human has engaged "
+        f"since, and {reason} — autonomous review may resume. A human-applied "
+        "`needs:user` or any `review:needs-user` is never touched by grooming.\n\n"
+        f"{UNPARK_MARKER}"
+    )
+    api.request("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body})
+    print(f"WRITE unpark comment repo={repo} pr={number}")
+    # allow_404: groom is the label's only legitimate writer, so an absent label here means it
+    # is already gone — there is nothing left to remove and no shared state to misattribute.
     api.request(
         "DELETE",
-        f"/repos/{repo}/issues/{number}/labels/{quote('needs:user', safe='')}",
+        f"/repos/{repo}/issues/{number}/labels/{quote(PARK_LABEL, safe='')}",
+        allow_404=True,
     )
-    print(f"WRITE remove label repo={repo} issue={number} label=needs:user")
+    print(f"WRITE remove label repo={repo} issue={number} label={PARK_LABEL}")
     return True
 
 
@@ -1192,26 +1247,35 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int, int]:
             print(f"SKIP PR {action.repo}#{action.number}: no longer stale/failing")
             continue
         labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
+        # A human hold already stands every autonomous flow down, and unpark_reason refuses to
+        # lift a park while one is present — parking on top would only create groom state that
+        # can never be lifted autonomously.
+        if {"needs:user", "review:needs-user"} & labels:
+            print(
+                f"SKIP PR {action.repo}#{action.number}: already human-held "
+                "(needs:user/review:needs-user)"
+            )
+            continue
         comments = _comments(target_api, action.repo, action.number)
         park = latest_park(comments, bot_login)
         head_sha = pull.get("head", {}).get("sha")
         if repark_rate_limited(
             park, head_sha, limits[action.repo].threshold_seconds, now
-        ) and "needs:user" not in labels:
+        ) and PARK_LABEL not in labels:
             print(
                 f"SKIP PR {action.repo}#{action.number}: this head was parked within the last timeout window"
             )
             continue
         label_changed = False
-        if "needs:user" not in labels:
-            _ensure_label(target_api, action.repo, "needs:user")
+        if PARK_LABEL not in labels:
+            _ensure_label(target_api, action.repo, PARK_LABEL)
             target_api.request(
                 "POST",
                 f"/repos/{action.repo}/issues/{action.number}/labels",
-                {"labels": ["needs:user"]},
+                {"labels": [PARK_LABEL]},
             )
             print(
-                f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
+                f"WRITE add labels repo={action.repo} issue={action.number} labels={PARK_LABEL}"
             )
             label_changed = True
         # A fresh park comment is written whenever the label is (re)applied or the recorded head
@@ -1242,63 +1306,17 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int, int]:
         if label_changed or comment_changed:
             stale_count += 1
 
-    # Unpark pass: groom may reverse ITS OWN stale park (never a human's) once the cause clears.
-    # The scan is restricted to open worker PRs currently labelled needs:user, so the extra
-    # comment/review/check-run reads stay proportional to the parked set, not O(open PRs).
+    # Unpark pass: groom may reverse ITS OWN stale park (never a human hold) once the cause
+    # clears. The snapshot only nominates candidates (open worker PRs carrying groom:parked, so
+    # the extra reads stay proportional to the parked set, not O(open PRs)); every predicate is
+    # then re-derived inside _attempt_unpark from a fresh read immediately before any write.
     unparked = 0
     for repo in limits:
         for number, snapshot in sorted(current_pulls[repo].items()):
             snapshot_labels = _labels(snapshot, f"target pull request {repo}#{number}")
-            if "needs:user" not in snapshot_labels:
+            if PARK_LABEL not in snapshot_labels:
                 continue
-            detail = target_api.request(
-                "GET", f"/repos/{repo}/pulls/{number}", allow_404=True
-            )
-            if not isinstance(detail, dict) or detail.get("state") != "open":
-                continue
-            labels = _labels(detail, f"target pull request {repo}#{number}")
-            comments = _comments(target_api, repo, number)
-            park = latest_park(comments, bot_login)
-            if park is None:
-                print(f"SKIP unpark {repo}#{number}: needs:user was not applied by groom")
-                continue
-            reviews = [
-                review
-                for review in target_api.paginate(f"/repos/{repo}/pulls/{number}/reviews")
-                if isinstance(review, dict)
-            ]
-            timeline = [
-                event
-                for event in target_api.paginate(
-                    f"/repos/{repo}/issues/{number}/timeline"
-                )
-                if isinstance(event, dict)
-            ]
-            head_sha = detail.get("head", {}).get("sha")
-            check_runs: list[dict[str, Any]] = []
-            if isinstance(head_sha, str) and HEAD_SHA_RE.fullmatch(head_sha):
-                runs_doc = target_api.request(
-                    "GET", gate_check_runs_path(repo, head_sha)
-                )
-                if isinstance(runs_doc, dict) and isinstance(
-                    runs_doc.get("check_runs"), list
-                ):
-                    check_runs = [
-                        run for run in runs_doc["check_runs"] if isinstance(run, dict)
-                    ]
-            reason = unpark_reason(
-                detail, labels, park, comments, reviews, check_runs, timeline, bot_login
-            )
-            if reason is None:
-                continue
-            body = (
-                "> 🤖 SPARQ agent\n\n"
-                "Unparking: grooming applied this stale-PR park itself, no human has engaged "
-                f"since, and {reason} — autonomous review may resume. A human-applied "
-                "`needs:user` or any `review:needs-user` is never touched by grooming.\n\n"
-                f"{UNPARK_MARKER}"
-            )
-            if _unpark_writes(target_api, repo, number, bot_login, body):
+            if _attempt_unpark(target_api, repo, number, bot_login):
                 unparked += 1
 
     reclaimed = _release_claims(registry_api, registry_repo, dead_claims)
@@ -1577,54 +1595,54 @@ def _self_test() -> int:
         ParkRecord(sha=sha_b, at=park_at + 240),
     )
     park = ParkRecord(sha=sha_a, at=park_at)
-    parked_labels = {"needs:user", "role:impl"}
+    parked_labels = {PARK_LABEL, "role:impl"}
     parked_pull = {
         "head": {"ref": "sparq-agent/issue-7-99-1", "sha": sha_b},
         "user": {"login": "app[bot]"},
         "draft": False,
         "mergeable_state": "blocked",
     }
-    # Label-event ownership: the CURRENT needs:user application must be the bot's own labeled
-    # event — a park comment alone cannot prove it (human remove-then-reapply keeps the comment).
+    # Label-event ownership: the CURRENT groom:parked application must be the bot's own labeled
+    # event — a park comment alone cannot prove it (remove-then-reapply keeps the comment).
     bot_labeled = [
         {
             "event": "labeled",
-            "label": {"name": "needs:user"},
+            "label": {"name": PARK_LABEL},
             "actor": {"login": "app[bot]"},
         }
     ]
     human_relabel = bot_labeled + [
         {
             "event": "unlabeled",
-            "label": {"name": "needs:user"},
+            "label": {"name": PARK_LABEL},
             "actor": {"login": "human"},
         },
         {
             "event": "labeled",
-            "label": {"name": "needs:user"},
+            "label": {"name": PARK_LABEL},
             "actor": {"login": "human"},
         },
     ]
     check(
         "bot owns its own label application",
-        bot_owns_current_label(bot_labeled, "needs:user", "app[bot]"),
+        bot_owns_current_label(bot_labeled, PARK_LABEL, "app[bot]"),
         True,
     )
     check(
         "human remove-then-reapply transfers label ownership",
-        bot_owns_current_label(human_relabel, "needs:user", "app[bot]"),
+        bot_owns_current_label(human_relabel, PARK_LABEL, "app[bot]"),
         False,
     )
     check(
         "no labeled event fails closed",
-        bot_owns_current_label([], "needs:user", "app[bot]"),
+        bot_owns_current_label([], PARK_LABEL, "app[bot]"),
         False,
     )
     check(
         "malformed labeled-event actor fails closed",
         bot_owns_current_label(
-            [{"event": "labeled", "label": {"name": "needs:user"}, "actor": None}],
-            "needs:user",
+            [{"event": "labeled", "label": {"name": PARK_LABEL}, "actor": None}],
+            PARK_LABEL,
             "app[bot]",
         ),
         False,
@@ -1640,13 +1658,13 @@ def _self_test() -> int:
                     "actor": {"login": "human"},
                 }
             ],
-            "needs:user",
+            PARK_LABEL,
             "app[bot]",
         ),
         True,
     )
     check(
-        "no unpark: a consumed park never steals a later-applied needs:user",
+        "no unpark: a consumed park never steals a later-applied park label",
         unpark_reason(
             parked_pull,
             parked_labels,
@@ -1668,10 +1686,18 @@ def _self_test() -> int:
         "the branch has a new head commit",
     )
     check(
-        "no unpark: human re-applied needs:user after removing groom's park label",
+        "no unpark: a human re-applied the park label after removing groom's own",
         unpark_reason(
             parked_pull, parked_labels, park, [park_comment], [], [], human_relabel,
             "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: a human-applied needs:user hold trumps the groom park",
+        unpark_reason(
+            parked_pull, parked_labels | {"needs:user"}, park, [park_comment], [], [],
+            bot_labeled, "app[bot]",
         ),
         None,
     )
@@ -1774,6 +1800,39 @@ def _self_test() -> int:
         ),
         None,
     )
+    # An unverifiable review actor must never take the verified-bot skip path: a post-park human
+    # review whose account was since deleted (user: null) would otherwise be ignored and a new
+    # head would unpark over live human engagement.
+    check(
+        "no unpark: a post-park review with a null actor blocks (fail closed)",
+        unpark_reason(
+            parked_pull, parked_labels, park, [park_comment],
+            [{"user": None, "submitted_at": datetime.fromtimestamp(
+                park_at + 30, timezone.utc).isoformat()}],
+            [], bot_labeled, "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: any review with an unverifiable actor blocks, even pre-park",
+        unpark_reason(
+            parked_pull, parked_labels, park, [park_comment],
+            [{"submitted_at": datetime.fromtimestamp(
+                park_at - 500, timezone.utc).isoformat()}],
+            [], bot_labeled, "app[bot]",
+        ),
+        None,
+    )
+    check(
+        "no unpark: a comment with an unverifiable author blocks (fail closed)",
+        unpark_reason(
+            parked_pull, parked_labels, park,
+            [park_comment, {"user": None, "created_at": datetime.fromtimestamp(
+                park_at - 500, timezone.utc).isoformat(), "body": "orphaned"}],
+            [], [], bot_labeled, "app[bot]",
+        ),
+        None,
+    )
     # Epoch truncation: sub-second order inside the park's second is unknowable, so same-second
     # human activity must block — with a strict > these two cases would unpark ("new head").
     same_second = datetime.fromtimestamp(park_at, timezone.utc).isoformat()
@@ -1824,7 +1883,7 @@ def _self_test() -> int:
         None,
     )
     check(
-        "no unpark: needs:user without groom's marker is human-applied",
+        "no unpark: a park label without groom's marker comment is never lifted",
         unpark_reason(parked_pull, parked_labels, None, [], [], [], [], "app[bot]"),
         None,
     )
@@ -1843,49 +1902,85 @@ def _self_test() -> int:
         f"/repos/o/r/commits/{sha_a}/check-runs?check_name=gate&per_page=100",
     )
 
-    class _OrderStub:
-        def __init__(self, timeline):
-            self.timeline = timeline
+    class _UnparkStub:
+        """Path-keyed GitHubAPI double for _attempt_unpark: every read is served from one
+        write-time snapshot and every call (reads AND writes) is recorded in order."""
+
+        def __init__(self, detail, comments, reviews, timeline, runs):
+            self.detail = detail
+            self.pages = {
+                "/repos/o/r/issues/5/comments": comments,
+                "/repos/o/r/pulls/5/reviews": reviews,
+                "/repos/o/r/issues/5/timeline": timeline,
+            }
+            self.runs = runs
             self.calls: list[tuple[str, str]] = []
 
         def request(self, method, path, body=None, **_kwargs):
             self.calls.append((method, path))
+            if method == "GET" and path == "/repos/o/r/pulls/5":
+                return self.detail
+            if method == "GET" and "/check-runs" in path:
+                return {"check_runs": self.runs}
             return {}
 
         def paginate(self, path):
             self.calls.append(("GET", path))
-            return self.timeline
+            return self.pages.get(path, [])
 
-    order_stub = _OrderStub(bot_labeled)
+    def _write_calls(stub):
+        return [call for call in stub.calls if call[0] != "GET"]
+
+    unpark_detail = {
+        "state": "open",
+        "labels": [{"name": PARK_LABEL}, {"name": "role:impl"}],
+        "head": {"ref": "sparq-agent/issue-7-99-1", "sha": sha_b},
+        "user": {"login": "app[bot]"},
+        "draft": False,
+        "mergeable_state": "blocked",
+    }
+    clean_stub = _UnparkStub(unpark_detail, [park_comment], [], bot_labeled, [])
     check(
-        "unpark removes the label once a fresh timeline re-proves bot ownership",
-        _unpark_writes(order_stub, "o/r", 5, "app[bot]", "unparking body"),
+        "unpark writes once every predicate re-proves on the write-time snapshot",
+        _attempt_unpark(clean_stub, "o/r", 5, "app[bot]"),
         True,
     )
     check(
-        "unpark is marker, fresh ownership re-read, then delabel — in that order",
-        order_stub.calls,
+        "unpark is ALL fresh reads, then marker, then delabel — in that order",
+        clean_stub.calls,
         [
-            ("POST", "/repos/o/r/issues/5/comments"),
+            ("GET", "/repos/o/r/pulls/5"),
+            ("GET", "/repos/o/r/issues/5/comments"),
+            ("GET", "/repos/o/r/pulls/5/reviews"),
             ("GET", "/repos/o/r/issues/5/timeline"),
-            ("DELETE", "/repos/o/r/issues/5/labels/needs%3Auser"),
+            ("GET", gate_check_runs_path("o/r", sha_b)),
+            ("POST", "/repos/o/r/issues/5/comments"),
+            ("DELETE", "/repos/o/r/issues/5/labels/groom%3Aparked"),
         ],
     )
-    # Decision→write race: a human removed and re-applied needs:user after the sweep decided to
-    # unpark but before the DELETE. The fresh re-read must catch it and never issue the DELETE.
-    stolen_stub = _OrderStub(human_relabel)
-    check(
-        "no delabel: needs:user changed hands between the unpark decision and the write",
-        _unpark_writes(stolen_stub, "o/r", 5, "app[bot]", "unparking body"),
-        False,
+    # Decision→write races: engagement or a label steal arriving AFTER the sweep nominated this
+    # PR (its stale snapshot) must be caught by the write-time snapshot — no marker, no DELETE.
+    raced_comment = _UnparkStub(
+        unpark_detail, [park_comment, human_after], [], bot_labeled, []
     )
     check(
-        "the raced unpark consumed the park record (marker posted) but issued no DELETE",
-        stolen_stub.calls,
-        [
-            ("POST", "/repos/o/r/issues/5/comments"),
-            ("GET", "/repos/o/r/issues/5/timeline"),
-        ],
+        "no writes: a human comment landed between the sweep snapshot and the write",
+        (_attempt_unpark(raced_comment, "o/r", 5, "app[bot]"), _write_calls(raced_comment)),
+        (False, []),
+    )
+    raced_review = _UnparkStub(
+        unpark_detail, [park_comment], [human_review], bot_labeled, []
+    )
+    check(
+        "no writes: a human review landed between the sweep snapshot and the write",
+        (_attempt_unpark(raced_review, "o/r", 5, "app[bot]"), _write_calls(raced_review)),
+        (False, []),
+    )
+    raced_label = _UnparkStub(unpark_detail, [park_comment], [], human_relabel, [])
+    check(
+        "no writes: the park label changed hands between the sweep snapshot and the write",
+        (_attempt_unpark(raced_label, "o/r", 5, "app[bot]"), _write_calls(raced_label)),
+        (False, []),
     )
     check(
         "repark of the same head inside one window is rate-limited",

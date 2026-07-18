@@ -231,10 +231,12 @@ jobs:
               label.get("name") for label in (pull.get("labels") or [])
               if isinstance(label, dict) and isinstance(label.get("name"), str)
           })
-          # review:needs-user (loop escalation) and needs:user (groom's parked-PR "Human
-          # attention required" marker) are BOTH human-owned terminal for every mode/flavour.
-          if {"review:needs-user", "needs:user"} & set(labels):
-              raise SystemExit("pull request is human-owned (review:needs-user / needs:user)")
+          # review:needs-user (loop escalation) and needs:user (a human hold) are human-owned
+          # terminal; groom:parked is groom's stale-PR park, lifted only by groom.py itself.
+          # ANY of them parks every mode/flavour of this workflow.
+          if {"review:needs-user", "needs:user", "groom:parked"} & set(labels):
+              raise SystemExit(
+                  "pull request is held (review:needs-user / needs:user / groom:parked)")
           # Only the verdict flavour is bound to review:changes; the ci/rebase repair flavours
           # (GAP-A/B) run over any non-terminal review state — the dispatcher re-derived their
           # triggers (concluded-red gate / conflicting base) from live data at admission.

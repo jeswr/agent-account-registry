@@ -62,9 +62,12 @@ PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
 WORKER_HEAD_RE = re.compile(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+")
-# Human-owned PR labels: review:needs-user is the loop's own terminal escalation, needs:user is
-# groom's parked-PR marker ("Human attention required"). Either stands the loop down.
-HUMAN_OWNED_LABELS = ("review:needs-user", "needs:user")
+# Hold labels that stand the loop down. review:needs-user (the loop's own terminal escalation)
+# and needs:user (a human hold) are HUMAN-owned: no autonomous flow ever removes them.
+# groom:parked is groom's stale-PR park — GROOM-owned state (groom.py alone applies and removes
+# it; that single-writer contract is what makes groom's unpark race-free) — but while present it
+# parks the autonomous surface exactly like the human-owned pair; this loop never removes it.
+HUMAN_OWNED_LABELS = ("review:needs-user", "needs:user", "groom:parked")
 SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # [OPUS-4.8] B3 / defect #2,#4: the trust-surface FILE paths. A worker PR whose diff touches ANY
 # of these gate-weakening / orchestration-control files must NOT auto-arm regardless of its issue
@@ -366,9 +369,10 @@ def trust_surface_paths_touched(diff_files, surface_paths=DEFAULT_TRUST_SURFACE_
 
 
 def human_owned(labels):
-    """A PR carrying review:needs-user (loop escalation) or needs:user (groom's parked-PR
-    "Human attention required" marker) is human-owned terminal: no autonomous disarm, redraft,
-    fix push, or review may touch it until a human clears the label."""
+    """A PR carrying review:needs-user (loop escalation), needs:user (a human hold), or
+    groom:parked (groom's stale-PR park) is held terminal for this loop: no autonomous disarm,
+    redraft, fix push, or review may touch it. Only a human clears the first two; only groom.py
+    clears groom:parked."""
     return any(label in HUMAN_OWNED_LABELS for label in labels)
 
 
@@ -1004,8 +1008,8 @@ def disarm(repo, pr_number, when):
     row that requested this is hostile — every precondition is re-derived from the API here).
 
     Trust surface mirrors the review enumerator: only an open, same-repo, bot-authored
-    `sparq-agent/*` PR is ever touched, and a PR labelled review:needs-user OR needs:user is
-    human-owned (a human arm/park decision stands). when=always additionally consults the
+    `sparq-agent/*` PR is ever touched, and a PR labelled review:needs-user, needs:user, or
+    groom:parked is held (an arm/park decision stands). when=always additionally consults the
     head-ref-linked SOURCE issue: a `needs:*`-parked issue is human-owned too, and the defuse
     precedes an autonomous push into that human's territory — mismatch mode deliberately does
     NOT consult the issue, because retracting a latch that would merge a never-reviewed tree is
@@ -1041,7 +1045,7 @@ def disarm(repo, pr_number, when):
         return
     if human_owned(labels):
         _write_outputs({"disarmed": False})
-        print("disarm skipped: the PR is human-owned (review:needs-user / needs:user)")
+        print("disarm skipped: the PR is held (review:needs-user / needs:user / groom:parked)")
         return
     if when == "always":
         # The defuse admits an autonomous fix push; a human-parked SOURCE issue parks that too.
@@ -1383,10 +1387,11 @@ def _self_test():
     check("trust-surface tolerates malformed entries",
           trust_surface_paths_touched(["", None, 123, "policy/x.toml"]), ["policy/x.toml"])
 
-    # human_owned: EITHER the loop's own escalation label or groom's parked-PR marker parks the
-    # autonomous surface; plain loop states do not.
+    # human_owned: the loop's own escalation label, a human needs:user hold, or groom's
+    # groom:parked stale-PR park all park the autonomous surface; plain loop states do not.
     check("human_owned loop escalation", human_owned({"review:needs-user"}), True)
-    check("human_owned groom park", human_owned({"needs:user", "review:pass"}), True)
+    check("human_owned human hold", human_owned({"needs:user", "review:pass"}), True)
+    check("human_owned groom park label", human_owned({"groom:parked", "review:needs"}), True)
     check("human_owned plain loop state", human_owned({"review:needs", "area:x"}), False)
 
     verdict = {"verdict": "request_changes", "injection_detected": False, "summary": "s",

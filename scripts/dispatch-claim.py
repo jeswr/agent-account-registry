@@ -91,10 +91,12 @@ SNAPSHOT_SKIP_REASONS = {
 # without a red gate), so CLAIM re-derives it live and applies the needs-user hand-off.
 REVIEW_STATES = {"needs-review", "needs-fix", "needs-ci-fix", "needs-rebase", "stranded"}
 FIX_KIND_OF_STATE = {"needs-fix": "verdict", "needs-ci-fix": "ci", "needs-rebase": "rebase"}
-# Human-owned PR labels: review:needs-user is the loop's own terminal escalation; needs:user is
-# groom's parked-PR marker ("Human attention required"). EITHER parks the whole autonomous
-# surface for the PR — enumeration, repair admission, and worker-pr.py disarm all stand down.
-HUMAN_HOLD_PR_LABELS = {"review:needs-user", "needs:user"}
+# PR hold labels: review:needs-user (the loop's own terminal escalation) and needs:user (a
+# human hold) are HUMAN-owned; groom:parked is groom's stale-PR park — GROOM-owned state that
+# only groom.py applies and removes (its single-writer contract is what makes groom's unpark
+# race-free). ANY of them parks the whole autonomous surface for the PR — enumeration, repair
+# admission, and worker-pr.py disarm all stand down; nothing here ever removes one.
+HUMAN_HOLD_PR_LABELS = {"review:needs-user", "needs:user", "groom:parked"}
 IMPL_PROVIDERS = {"anthropic", "openai"}
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_ATOM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -472,7 +474,7 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     interrupted — never emitted. CLAIM re-derives every precondition live (worker-pr.py disarm
     --when mismatch) before acting, and matching SHAs are NEVER emitted (an unarmed ready PR
     whose head equals its marker is the valid arm=false-policy terminal). Trust surface mirrors
-    enumerate_review_items; a review:needs-user or needs:user PR is human-owned (a human
+    enumerate_review_items; a review:needs-user, needs:user, or groom:parked PR is held (an
     arm/park decision stands). A check_runs_degraded snapshot record is CONSUMED here on
     purpose (PR #60 round-1): the disarm reads only head_sha + the armed bit — both detail
     fields — so check-run volume must never stand this net down (that would be fail-OPEN:
@@ -578,8 +580,8 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
     - the author must be a [bot] (and the App bot when `bot_login` is known),
     - a REGISTRY provenance record must exist for the PR (the root of trust — the target model
       cannot write the registry), carrying a valid impl provider,
-    - review:needs-user AND needs:user (groom's parked-PR marker) are TERMINAL (human-owned) for
-      every state including the repair states, and a `needs:*` label on the provenance-linked
+    - review:needs-user, needs:user (a human hold), and groom:parked (groom's stale-PR park,
+      lifted only by groom.py itself) are TERMINAL for every state including the repair states, and a `needs:*` label on the provenance-linked
       SOURCE issue parks the PR the same way (groom's stale paths ping a maintainer when they
       park — autonomy stands down until the human clears the label) — required so a
       budget-exhausted or groom escalation actually halts the loop. Round-budget exhaustion
@@ -1345,8 +1347,8 @@ def _apply_disarm_items(disarm_items, repo, script_dir, bot_login):
     """GAP-C (registry issue #42): retract stale GitHub auto-merge latches BEFORE any fix/review
     admission each sweep. The plan rows are HOSTILE — worker-pr.py `disarm --when mismatch`
     re-derives every precondition from the LIVE API (open same-repo bot worker PR, armed OR
-    ready with an interrupted disarm, head != reviewed-sha marker, not human-owned via
-    review:needs-user / needs:user) and is a no-op otherwise, so a spoofed row can never disarm
+    ready with an interrupted disarm, head != reviewed-sha marker, not held via
+    review:needs-user / needs:user / groom:parked) and is a no-op otherwise, so a spoofed row can never disarm
     a validly-armed or human-owned PR. Failures skip the item (per-item resilience); the
     enumeration re-emits next tick until the invariant holds — including across a crash between
     disable-auto and redraft, which mismatch mode re-enters via the ready-but-unarmed leg."""
@@ -2027,12 +2029,19 @@ def _self_test():
     stopped = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs-user"])
     assert enumerate_review_items(repo, [stopped], provenance, [], issue_labels, now,
                                   pr_status=red) == []
-    # groom's plain needs:user PR label ("Human attention required") is human-owned terminal
-    # exactly like review:needs-user — for the repair states AND the plain review flow
+    # a human needs:user hold is terminal exactly like review:needs-user — for the repair
+    # states AND the plain review flow
     parked_pr = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["needs:user", "review:needs"])
     assert enumerate_review_items(repo, [parked_pr], provenance, [], issue_labels, now,
                                   pr_status=red) == []
     assert enumerate_review_items(repo, [parked_pr], provenance, [], issue_labels, now) == []
+    # groom's stale-PR park label holds the review flow the same way (groom alone lifts it)
+    groom_parked_pr = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                           labels=["groom:parked", "review:needs"])
+    assert enumerate_review_items(repo, [groom_parked_pr], provenance, [], issue_labels, now,
+                                  pr_status=red) == []
+    assert enumerate_review_items(repo, [groom_parked_pr], provenance, [], issue_labels,
+                                  now) == []
     # ... and a needs:*-parked SOURCE issue parks its PR's whole autonomous surface the same way
     # (groom's stale-PR path parks exactly the merge states the repair states target)
     parked_issue = {7: ["area:crate-a", "needs:user", "role:impl", "status:deferred"],
@@ -2117,15 +2126,15 @@ def _self_test():
     assert enumerate_disarm_items(repo, [drafted_moved], {41: status_of(sha_b)},
                                   provenance) == []
     assert enumerate_disarm_items(repo, [bound], {41: status_of(sha_b)}, provenance) == []
-    # unknown snapshot / stale snapshot head / missing provenance / human-owned
-    # (review:needs-user OR groom's needs:user) are all DO-NOTHING
+    # unknown snapshot / stale snapshot head / missing provenance / held
+    # (review:needs-user, a human needs:user, or groom:parked) are all DO-NOTHING
     assert enumerate_disarm_items(repo, [moved], {}, provenance) == []
     assert enumerate_disarm_items(repo, [moved], {41: status_of(sha_a, armed=True)},
                                   provenance) == []
     assert enumerate_disarm_items(
         repo, [pull(90, "sparq-agent/issue-1-1-1", sha_b, draft=False)],
         {90: status_of(sha_b, armed=True)}, provenance) == []
-    for hold in ("review:needs-user", "needs:user"):
+    for hold in ("review:needs-user", "needs:user", "groom:parked"):
         parked = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=False,
                       labels=[hold], body="x")
         assert enumerate_disarm_items(repo, [parked], armed_status, provenance) == []

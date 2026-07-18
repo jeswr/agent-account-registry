@@ -454,8 +454,9 @@ jobs:
                               record_path.read_text(encoding="utf-8"))
                       except (OSError, json.JSONDecodeError):
                           continue
-              # Human-owned holds (review:needs-user / needs:user on the PR, needs:* on the
-              # source issue) are excluded inside the enumerator, as are label-terminal states.
+              # Holds (review:needs-user / needs:user / groom:parked on the PR, needs:* on
+              # the source issue) are excluded inside the enumerator, as are label-terminal
+              # states.
               # Round-budget exhaustion is NOT excluded here: CLAIM re-derives the live round
               # count and applies the terminal needs-user transition itself, so a PR whose
               # final outcome mutation crashed converges to a loud human hand-off.
