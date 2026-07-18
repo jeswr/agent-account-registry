@@ -110,8 +110,13 @@ def classify(pool, usage, margin, now=None):
         if u.get("exempt") is True:  # STRICT, mirroring usage_eligible (cross-provider review r1)
             until = _util(u.get("backoff_until"))
             if until is not None and now < until:
+                # A saturated chain may have been truncated in the health ledger (model-health
+                # BACKOFF_CHAIN_KEEP), so its re-derived count is a LOWER BOUND — render "x6+",
+                # never an exact "x6" (PR #85 finding 2). STRICT is-True, like `exempt`.
+                hits = (f"x{u.get('backoff_consecutive', 1)}"
+                        + ("+" if u.get("backoff_saturated") is True else ""))
                 rows.append((h, f"BACKED OFF — provider rate limit hit "
-                                f"(x{u.get('backoff_consecutive', 1)}); resumes at epoch "
+                                f"({hits}); resumes at epoch "
                                 f"{int(until)} (self-clearing)", False))
                 continue
             eligible += 1
@@ -394,6 +399,21 @@ def _self_test():
                                       "backoff_consecutive": 2}}, 0.10, now=tnow)
     chk("active backoff surfaced + not eligible",
         (e8, "BACKED OFF" in r8[0][1], "x2" in r8[0][1], r8[0][2]), (0, True, True, False))
+    chk("unsaturated backoff count stays EXACT (no lower-bound suffix)",
+        "x2+" in r8[0][1], False)
+    # A saturated (>6-hit, possibly ledger-truncated) chain displays the LOWER-BOUND form —
+    # "x6+", never an exact "x6" (PR #85 finding 2: prune truncation floors the re-derived
+    # count, so an exact display corrupts the diagnostic). Forged non-bool flags add nothing.
+    e8b, r8b = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow + 300,
+                                        "backoff_consecutive": 6,
+                                        "backoff_saturated": True}}, 0.10, now=tnow)
+    chk("saturated backoff displays the lower-bound form (x6+, never exact x6)",
+        ("(x6+)" in r8b[0][1], "(x6)" in r8b[0][1], r8b[0][2]), (True, False, False))
+    e8c, r8c = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow + 300,
+                                        "backoff_consecutive": 6,
+                                        "backoff_saturated": "yes"}}, 0.10, now=tnow)
+    chk("forged non-bool saturated flag never adds the suffix (strict is-True)",
+        ("(x6)" in r8c[0][1], "(x6+)" in r8c[0][1]), (True, False))
     e9, r9 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow - 1}}, 0.10, now=tnow)
     chk("expired backoff -> ok again", (e9, r9[0][2]), (1, True))
     e10, r10 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "garbage"}}, 0.10, now=tnow)
