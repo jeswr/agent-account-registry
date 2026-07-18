@@ -51,6 +51,33 @@ jobs:
           path: target-routing
           persist-credentials: false
 
+      - name: Enforce the policy row (enabled target + ITS validated routing pointer)
+        id: policy
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo '::error::unsafe target repo'; exit 1; }
+          python3 - <<'PY'
+          import os, sys, tomllib
+          from pathlib import Path, PurePosixPath
+          target = os.environ["TARGET_REPO"]
+          row = tomllib.load(open("policy/repos.toml", "rb")).get("repos", {}).get(target)
+          # Only an ENABLED policy target may be backfilled (sol r1: syntax-only checking
+          # permitted provenance pre-seeding for arbitrary public repositories), and the
+          # routing file comes from the row's validated pointer, never a hardcoded path.
+          if not isinstance(row, dict) or row.get("enabled") is not True:
+              raise SystemExit(f"::error::{target} is not an enabled policy target")
+          routing = row.get("routing")
+          if not isinstance(routing, str) or not routing:
+              raise SystemExit("::error::policy row carries no routing pointer")
+          root = Path("target-routing").resolve()
+          resolved = root.joinpath(*PurePosixPath(routing).parts).resolve()
+          resolved.relative_to(root)  # traversal guard — raises on escape
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"routing_file=target-routing/{routing}\n")
+          PY
+
       - name: Backfill (self-test first; dry run unless apply=true)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -60,11 +87,11 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
           TARGET_REPO: ${{ inputs.target_repo }}
           APPLY: ${{ inputs.apply }}
+          ROUTING_FILE: ${{ steps.policy.outputs.routing_file }}
         run: |
           set -euo pipefail
-          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo '::error::unsafe target repo'; exit 1; }
           python3 scripts/backfill-provenance.py --self-test
           args=(--target-repo "$TARGET_REPO" --registry-repo "$GITHUB_REPOSITORY" \
-                --routing-file target-routing/orchestration/routing.toml)
+                --routing-file "$ROUTING_FILE")
           if [[ "$APPLY" == "true" ]]; then args+=(--apply); fi
           python3 scripts/backfill-provenance.py "${args[@]}"

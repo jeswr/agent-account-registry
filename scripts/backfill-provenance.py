@@ -32,7 +32,13 @@ import subprocess
 import sys
 
 HEAD_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-([0-9]+)-([0-9]+)$")
+# ANCHORED to claim-job-prefixed lines (sol r1 on #147): `gh run view --log` prefixes every
+# line `<job>\t<step>\t<timestamp> <content>`, and the claim line is printed by the "Claim
+# live account lease" job, which runs no target/model code. An UNANCHORED search over the
+# whole log let hostile worker-job output forge `lease claimed: account=...` and override the
+# genuine identity — defeating the cross-provider inversion this record exists to protect.
 CLAIM_LINE_RE = re.compile(
+    r"(?mi)^[^\t]*claim[^\t]*\t[^\t]*\t\S+\s+"
     r"(?:lease claimed|dispatcher lease adopted): account=(acct[0-9a-z]{2,}), "
     r"model=([A-Za-z0-9][A-Za-z0-9_.-]*)")
 
@@ -50,11 +56,22 @@ def parse_head_ref(ref):
 
 
 def claim_from_log(log_text):
-    """(account, model_alias) from a worker run log, or None. Matches the claim line format the
-    PRE-migration worker.yml printed (historical logs; the current code no longer prints
-    handles, but new PRs get provenance at publish time and never reach this script)."""
-    match = CLAIM_LINE_RE.search(log_text or "")
-    return (match.group(1), match.group(2)) if match else None
+    """(account, model_alias) from CLAIM-job-prefixed lines of a worker run log, or None —
+    matches the claim line the PRE-migration worker.yml printed. Ambiguous (differing) repeats
+    fail closed."""
+    found = set(CLAIM_LINE_RE.findall(log_text or ""))
+    return found.pop() if len(found) == 1 else None
+
+
+def run_identity_from_log(log_text):
+    """The single agreed (account, model_alias) across BOTH trusted job-anchored sources, or
+    None. When both the historical claim line and the provenance-job env echo are present they
+    must AGREE — a disagreement means tampered/ambiguous evidence and fails closed (sol r1)."""
+    legacy = claim_from_log(log_text)
+    anchored = provenance_job_identity_from_log(log_text)
+    if legacy and anchored and legacy != anchored:
+        return None
+    return legacy or anchored
 
 
 # Post-migration identity source (the #96 outage population: worker succeeded, the provenance
@@ -159,7 +176,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         if not login.endswith("[bot]"):
             continue
         is_draft = pull.get("draft") is True
-        issue, run_id, _attempt = parsed
+        issue, run_id, attempt = parsed
         record_path = worker_pr.provenance_path(target_repo, number)
         # Post-outage records live on the `ledger` data-plane branch (issue #96); pre-outage
         # ones on master. Either counts as already-recorded.
@@ -178,18 +195,22 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
 
         # The worker RUN LOG is the only accepted identity source (no trailer fallback: trailers
         # on this pre-migration population are model-forgeable — see the module docstring).
+        # The ATTEMPT encoded in the head branch is passed explicitly (sol r1): without it a
+        # rerun's log could source identity from a different attempt than the one that pushed
+        # this head.
         account = alias = None
-        run_key = f"backfill:{run_id}"
-        log = _run_gh(["run", "view", run_id, "--repo", registry_repo, "--log"], check=False)
+        run_key = f"backfill:{run_id}.{attempt}"
+        log = _run_gh(["run", "view", run_id, "--attempt", attempt,
+                       "--repo", registry_repo, "--log"], check=False)
         if log.returncode == 0:
-            found = (claim_from_log(log.stdout)
-                     or provenance_job_identity_from_log(log.stdout))
+            found = run_identity_from_log(log.stdout)
             if found:
                 account, alias = found
         if alias is None or account is None:
             needs_human += 1
-            print(f"NEEDS-HUMAN #{number}: worker run {run_id} log is unavailable, or has "
-                  "neither a claim line nor a provenance-job env echo; leaving fail-closed "
+            print(f"NEEDS-HUMAN #{number}: worker run {run_id} attempt {attempt} log is "
+                  "unavailable, has neither trusted job-anchored identity source, or the "
+                  "sources DISAGREE (tampered/ambiguous evidence); leaving fail-closed "
                   "invisible (record provenance manually only after a human establishes the "
                   "implementer identity)")
             continue
@@ -238,12 +259,19 @@ def _self_test():
     check("non-worker ref rejected", parse_head_ref("feature/foo"), None)
     check("spoof-shaped ref without run id rejected", parse_head_ref("sparq-agent/issue-1-x"),
           None)
-    check("claim line parses",
-          claim_from_log("...\nlease claimed: account=acct02, model=fable, claim=deadbeef\n"),
+    claim_job = "Claim live account lease"
+    check("claim line parses (claim-job-anchored)",
+          claim_from_log(f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
+                         "lease claimed: account=acct02, model=fable, claim=deadbeef\n"),
           ("acct02", "fable"))
-    check("adopt line parses",
-          claim_from_log("dispatcher lease adopted: account=acct01, model=terra, claim=ab"),
+    check("adopt line parses (claim-job-anchored)",
+          claim_from_log(f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
+                         "dispatcher lease adopted: account=acct01, model=terra, claim=ab"),
           ("acct01", "terra"))
+    check("UNANCHORED claim line no longer matches (worker-job forgery class)",
+          claim_from_log("Run live target worker (DRAFT, review pending)\tmodel\t"
+                         "2026-07-18T09:03:04Z lease claimed: account=acct99zz, "
+                         "model=terra, claim=ff"), None)
     check("no claim line", claim_from_log("nothing here"), None)
     # Trailer-derived identity is REJECTED by construction: there is no code path from a commit
     # message to a provenance record (a forged GPT trailer cannot flip the reviewer provider).
@@ -268,9 +296,15 @@ def _self_test():
     check("forged lines mixed into a real log fail closed (ambiguity)",
           provenance_job_identity_from_log(
               prov_log + prov_log.replace("acct2css", "acct3xx")), None)
-    check("claim line takes precedence shape",
-          claim_from_log("lease claimed: account=acct02, model=fable, claim=x"),
-          ("acct02", "fable"))
+    claim_ok = (f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
+                "lease claimed: account=acct2css, model=fable, claim=x\n")
+    check("agreeing sources resolve", run_identity_from_log(claim_ok + prov_log),
+          ("acct2css", "fable"))
+    check("DISAGREEING trusted sources fail closed (tamper evidence)",
+          run_identity_from_log(claim_ok.replace("acct2css", "acct3css") + prov_log), None)
+    check("single source (anchored env echo) suffices", run_identity_from_log(prov_log),
+          ("acct2css", "fable"))
+    check("forged worker-job lines alone resolve nothing", run_identity_from_log(forged), None)
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
