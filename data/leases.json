@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "acct01",
-   "claim_id": "628aec589604434fa9c551c49127a6a7",
-   "holder": "review:jeswr/agent-account-registry#264@dispatch-29657838308.1",
-   "package": "dispatch",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784403102,
-   "expires_at": 1784404302
-  }
- ]
+ "leases": []
 }
