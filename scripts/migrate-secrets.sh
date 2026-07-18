@@ -52,6 +52,19 @@
 #          under the fine-grained "Actions" permission (read); every listing carries `--all`
 #          (round-6 finding 1): the writers ARE disabled here, and gh's name-based `--workflow`
 #          lookup excludes disabled workflows without it.
+#     M0c. ORDERING ATTESTATION (sol round-9 finding 1 — remedy b): a migrate run DISPATCHED
+#          while the quiesce run was still executing sits PENDING in the workflow's shared
+#          concurrency group with its `secrets.*` snapshot already fixed at QUEUE time — from
+#          BEFORE the drain finished — so M0a/M0b pass at start time while a writer admitted
+#          pre-drain may have rotated a secret V1 -> V2 after the snapshot: M3 would copy stale
+#          V1 and M5 would delete fresh V2. So: fetch THIS run's created_at
+#          (GET /repos/{repo}/actions/runs/$GITHUB_RUN_ID — the runner's default env var), list
+#          this workflow's runs, select the NEWEST run whose displayTitle is
+#          'migrate-secrets [quiesce]' (the workflow's `run-name` encodes the phase — the
+#          run-listing API does not expose workflow_dispatch inputs) with conclusion success,
+#          and require its updated_at (completion) STRICTLY BEFORE this run's created_at. Else
+#          fail closed with zero mutations: quiesce must COMPLETE before migrate is QUEUED
+#          (queue-time secrets snapshot) — re-dispatch migrate.
 #     M1. list the environment's secret NAMES and the REPO-scope secret NAMES (a failed listing
 #         is a hard refusal, never "empty"). The repo listing is taken BEFORE the copy loop
 #         (round-7 finding — late-writer freshness): repo-scope PRESENCE, not environment-name
@@ -86,9 +99,10 @@
 #
 #   --phase cleanup-bootstrap (`environment: dispatch-secrets`-BOUND job that minted FROM the
 #     environment copies; needs Secrets RW + Environments R + Actions R):
-#     C0. the same M0a quiesce gate + M0b coherent drain check (a cleanup-only rerun after an
-#         accidental resume must fail closed the same way — re-dispatch phase: quiesce, then
-#         phase: migrate, which converges through main as a no-op and re-runs this phase).
+#     C0. the same M0a quiesce gate + M0b coherent drain check + M0c ordering attestation (a
+#         cleanup-only rerun after an accidental resume must fail closed the same way —
+#         re-dispatch phase: quiesce, then phase: migrate, which converges through main as a
+#         no-op and re-runs this phase).
 #     C1. list the environment; assert it holds all 14 — with a DISTINCT refusal if a BOOTSTRAP
 #         name is missing: deleting its repo-scope original then would destroy the last mint
 #         credential (re-run the main phase first).
@@ -151,11 +165,21 @@
 # the caller's --jq expression with REAL jq, so the filter's content is exercised, not assumed.
 # Exact argv sequences (the M0a/M0b gate BEFORE any listing or set, env set via STDIN, no
 # --body, ZERO bootstrap deletes in the main phase, ZERO disables outside the quiesce phase, 4
-# enables in the resume path) are asserted. The suite also STATICALLY pins the WORKFLOW's
+# enables in the resume path) are asserted. Round 9: QUEUE-TIME ORDERING VIOLATION (migrate
+# queued while quiesce was still executing — the newest successful quiesce COMPLETED after this
+# run's created_at; must fail closed with zero mutations and the rotated V2 repo values
+# untouched; an OLDER successful quiesce decoy in the same listing proves the check selects the
+# NEWEST, and INVERTING the timestamp comparison turns the scenario red) plus
+# no-successful-quiesce-run (a failed quiesce + a successful MIGRATE decoy — the displayTitle
+# filter must not accept either). The suite also STATICALLY pins the WORKFLOW's
 # declared mint grants (round-4 finding 3: the fake-gh model alone never noticed a permission
 # line deleted from migrate-secrets-to-env.yml): check_workflow_mint_contract asserts all FOUR
 # mint steps' exact phase-specific `permission-*` sets and goes red on any
-# removal/weakening/widening.
+# removal/weakening/widening — and (round-9 finding 2) check_workflow_actor_contract pins BOTH
+# `github.actor == 'jeswr'` AND `github.triggering_actor == 'jeswr'` on every phase job's `if:`
+# (github.actor stays the ORIGINAL initiator on a re-run while triggering_actor is the
+# re-runner, so actor-only lets a write-access user re-run a jeswr run under the secret-admin
+# mint); dropping the triggering_actor clause goes red.
 # Wired into pr-gate.yml and worker-live's FULL_SELFTEST_SUITE so it gates. When the migration
 # workflow is deleted after its successful run, delete this script too and unenrol it from BOTH
 # suite lists.
@@ -277,6 +301,45 @@ drain_check_no_live_writers() {
   printf 'drain check: one coherent snapshot per writer workflow shows zero nonterminal (queued/in_progress/requested/waiting/pending) runs\n'
 }
 
+# QUEUE-TIME ORDERING ATTESTATION (sol round-9 finding 1 — remedy b): the M0a/M0b state checks
+# prove the writers are disabled + drained AT START TIME, but a migrate run DISPATCHED while
+# the quiesce run was still executing sat PENDING in the workflow's shared concurrency group
+# with its `secrets.*` snapshot already fixed at QUEUE time — i.e. from BEFORE the drain
+# finished. A writer admitted pre-drain can rotate V1 -> V2 after that snapshot; M0a/M0b then
+# pass and M3 copies stale V1 while M5 deletes fresh V2. This gate closes the window by
+# ORDERING the two runs: the NEWEST successful quiesce run must have COMPLETED (updated_at)
+# STRICTLY BEFORE this run was QUEUED (created_at). The quiesce run is discovered through the
+# workflow's `run-name: migrate-secrets [<phase>]` (the run-listing API does not expose
+# workflow_dispatch inputs, so the phase is machine-readable in displayTitle — the literal
+# below and the workflow's run-name change together). Both API calls sit under the App token's
+# Actions: read grant. ISO-8601 UTC timestamps of one fixed width compare correctly as strings.
+ISO_TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+QUIESCE_RUN_FILTER='[.[] | select(.displayTitle == "migrate-secrets [quiesce]" and .conclusion == "success")] | sort_by(.createdAt) | last | .updatedAt // ""'
+
+assert_quiesce_completed_before_queue() {
+  local run_id=${GITHUB_RUN_ID:-}
+  [[ "$run_id" =~ ^[0-9]+$ ]] \
+    || die "GITHUB_RUN_ID is unset or unsafe — cannot fetch this run's created_at for the queue-time ordering attestation (fail closed before any mutation)"
+  local my_created
+  my_created=$(gh api "repos/${REPO}/actions/runs/${run_id}" --jq .created_at) \
+    || die "could not fetch this run's created_at (run ${run_id}) — cannot prove the quiesce completed before this run was queued (fail closed; NOTE: the run read needs the App token's Actions: read grant)"
+  [[ "$my_created" =~ $ISO_TS_RE ]] \
+    || die "unparseable created_at '${my_created}' for this run — cannot order it against the quiesce completion (fail closed)"
+  local q_updated
+  q_updated=$(gh run list -R "$REPO" --workflow migrate-secrets-to-env.yml --limit 100 \
+                --json databaseId,displayTitle,conclusion,createdAt,updatedAt --jq "$QUIESCE_RUN_FILTER") \
+    || die "could not list this workflow's runs — cannot find the newest successful quiesce run for the ordering attestation (fail closed; NOTE: the listing needs the App token's Actions: read grant)"
+  [[ -n "$q_updated" ]] \
+    || die "no SUCCESSFUL 'phase: quiesce' run found in the run listing (displayTitle 'migrate-secrets [quiesce]') — the writers merely BEING disabled is not an attestation that a quiesce run drained them. Run 'phase: quiesce', wait for its success, THEN dispatch this phase (fail closed before any mutation)"
+  [[ "$q_updated" =~ $ISO_TS_RE ]] \
+    || die "unparseable quiesce completion timestamp '${q_updated}' — cannot order it against this run's queue instant (fail closed)"
+  if ! [[ "$q_updated" < "$my_created" ]]; then
+    die "the newest successful quiesce run completed at ${q_updated}, NOT strictly before this run was queued at ${my_created} — this run's QUEUE-time secrets snapshot was taken before the drain finished, so a writer admitted pre-drain could have rotated a secret this run's S_* inputs do not carry (stale-copy/fresh-delete loss): quiesce must COMPLETE before migrate is queued (queue-time secrets snapshot) — re-dispatch migrate (fail closed before any mutation)"
+  fi
+  printf 'ordering attestation: newest successful quiesce completed %s < this run queued %s\n' \
+    "$q_updated" "$my_created"
+}
+
 # The SECRET-FREE first run of the two-run protocol (round-8 finding 1): its workflow job maps
 # no S_* input and mints Actions:write ONLY — it cannot read or move a secret even if buggy.
 phase_quiesce() {
@@ -294,6 +357,8 @@ phase_main() {
   assert_writers_quiesced
   echo '== phase M0b: coherent drain check — no admitted writer run is still nonterminal =='
   drain_check_no_live_writers
+  echo '== phase M0c: ordering attestation — the newest successful quiesce run must have COMPLETED before this run was QUEUED (queue-time secrets snapshot) =='
+  assert_quiesce_completed_before_queue
 
   echo '== phase M1: list the environment + repo-scope secret names (resume/freshness state) =='
   local env_names repo_names
@@ -405,9 +470,10 @@ phase_main() {
 
 phase_cleanup() {
   setup
-  echo '== phase C0: quiesce gate + coherent drain check (same fail-closed gate as the main phase) =='
+  echo '== phase C0: quiesce gate + coherent drain check + ordering attestation (same fail-closed gate as the main phase) =='
   assert_writers_quiesced
   drain_check_no_live_writers
+  assert_quiesce_completed_before_queue
 
   echo '== phase C1: assert the environment holds all 14 (esp. both bootstrap mint credentials) =='
   local env_names
@@ -568,6 +634,37 @@ check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
   return "$rc"
 }
 
+# ACTOR CONTRACT (sol round-9 finding 2 — the RE-RUN bypass): every phase job gates on
+# `github.actor == 'jeswr'`, but github.actor stays the ORIGINAL initiator when a run is
+# RE-RUN — `github.triggering_actor` is the re-runner. Actor-only therefore lets ANY
+# write-access user re-run a jeswr-initiated run while it holds the secret-admin mint. The
+# workflow requires BOTH fields on all four phase jobs' `if:`; this pin (same anchored-awk
+# job-block extraction as the mint contract) goes red in --self-test if either clause is
+# dropped from any job.
+_job_block() {  # _job_block WORKFLOW_FILE JOB_KEY -> that job's lines (same anchor as _mint_grants)
+  awk -v job="$2" '
+    /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
+    injob { print }
+  ' "$1"
+}
+
+check_workflow_actor_contract() {  # check_workflow_actor_contract WORKFLOW_FILE
+  local wf=$1 job block rc=0
+  if [[ ! -f "$wf" ]]; then
+    printf '::error::migrate-secrets: workflow contract: %s not found (delete this script together with the workflow)\n' "$wf" >&2
+    return 1
+  fi
+  for job in quiesce migrate cleanup-bootstrap reenable-writers; do
+    block=$(_job_block "$wf" "$job")
+    if ! grep -qF "github.actor == 'jeswr'" <<<"$block" \
+       || ! grep -qF "github.triggering_actor == 'jeswr'" <<<"$block"; then
+      printf "::error::migrate-secrets: workflow contract violated — job %s must gate on BOTH github.actor == 'jeswr' AND github.triggering_actor == 'jeswr' (round-9 finding 2: github.actor stays the ORIGINAL initiator on a re-run while triggering_actor is the RE-RUNNER, so actor-only lets any write-access user re-run a jeswr run under the secret-admin mint)\n" "$job" >&2
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
 # ---------------------------------------------------------------------------------------------
 # Hermetic self-test: a fake `gh` on PATH (trust-gate.py precedent) records every argv line and
 # every STDIN payload, serves listings from a mutable state dir, and — new in review round 3 —
@@ -638,6 +735,24 @@ case "$*" in
       || { echo "HTTP 403: Resource not accessible by integration (workflow-state read needs Actions: read)" >&2; exit 1; }
     wfname=${2#repos/o/r/actions/workflows/}
     if [[ -f "$state/disabled_${wfname}" ]]; then echo disabled_manually; else echo active; fi
+    exit 0 ;;
+  "api repos/o/r/actions/runs/"*" --jq .created_at")
+    # Round-9 ordering attestation: the migrate/cleanup gate fetches ITS OWN run's created_at
+    # (the queue instant — the moment the secrets.* snapshot was fixed). Sits under Actions read.
+    _grant actions:read \
+      || { echo "HTTP 403: Resource not accessible by integration (run read needs Actions: read)" >&2; exit 1; }
+    [[ -f "$state/run_created" ]] || { echo "HTTP 404: Not Found (no such run modeled)" >&2; exit 1; }
+    cat "$state/run_created"
+    exit 0 ;;
+  "run list -R o/r --workflow migrate-secrets-to-env.yml --limit "*" --json databaseId,displayTitle,conclusion,createdAt,updatedAt --jq "*)
+    # Round-9 ordering attestation: serve the modeled run HISTORY of this migration workflow
+    # ($state/wf_runs, a JSON array with displayTitle/conclusion/createdAt/updatedAt) and apply
+    # the caller's --jq with REAL jq — the newest-successful-quiesce selection is exercised,
+    # not assumed (a decoy migrate-success or an older quiesce-success must not satisfy it).
+    _grant actions:read \
+      || { echo "HTTP 403: Resource not accessible by integration (workflow-run listing needs Actions: read)" >&2; exit 1; }
+    [[ -f "$state/wf_runs" ]] || { echo "HTTP 404: Not Found (no run history modeled)" >&2; exit 1; }
+    jq -r "${12}" "$state/wf_runs"
     exit 0 ;;
   "run list --all -R o/r --workflow "*" --limit "*" --json status,databaseId --jq "*)
     # ONE COHERENT SNAPSHOT (round-8 finding 2): serve EVERY run this state dir models — the
@@ -777,7 +892,9 @@ FAKE
   # run_case STATE_DIR OUT_FILE PHASE VALUE_MODE(all|none|repo-newest) [EMPTY_NAME]
   run_case() {
     local state=$1 out=$2 phase=$3 mode=$4 empty_name=${5:-}
-    local -a assigns=(PATH="$tmp/bin:$PATH" FAKE_GH_STATE="$state" REGISTRY_REPO=o/r)
+    # GITHUB_RUN_ID: the round-9 ordering attestation fetches this run's created_at from it
+    # (in production it is the runner's default env var; fixed here so the fake can model it).
+    local -a assigns=(PATH="$tmp/bin:$PATH" FAKE_GH_STATE="$state" REGISTRY_REPO=o/r GITHUB_RUN_ID=7777)
     local n
     for n in "${names[@]}"; do
       case "$mode" in
@@ -800,10 +917,12 @@ FAKE
     printf '%s' "$rc"
   }
 
-  # The migrate/cleanup phases' shared fail-closed prefix (round 8): 4 workflow-state reads
-  # (the quiesce gate) followed by 4 single-snapshot drain listings — ONE unfiltered call per
-  # workflow; the client-side NONTERMINAL_FILTER is part of the asserted argv, so a --status
-  # flag sneaking back in (or the filter disappearing) breaks the exact-sequence diffs.
+  # The migrate/cleanup phases' shared fail-closed prefix (rounds 8+9): 4 workflow-state reads
+  # (the quiesce gate), 4 single-snapshot drain listings — ONE unfiltered call per workflow;
+  # the client-side NONTERMINAL_FILTER is part of the asserted argv, so a --status flag
+  # sneaking back in (or the filter disappearing) breaks the exact-sequence diffs — then the
+  # round-9 ordering attestation: this run's created_at read + ONE run listing of the migration
+  # workflow itself with QUIESCE_RUN_FILTER pinned in the argv.
   local expected_gate="$tmp/expected-gate.log" wf st n
   : > "$expected_gate"
   for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
@@ -813,6 +932,9 @@ FAKE
     printf 'run list --all -R o/r --workflow %s --limit 1000 --json status,databaseId --jq %s\n' \
       "$wf" "$NONTERMINAL_FILTER" >> "$expected_gate"
   done
+  printf 'api repos/o/r/actions/runs/7777 --jq .created_at\n' >> "$expected_gate"
+  printf 'run list -R o/r --workflow migrate-secrets-to-env.yml --limit 100 --json databaseId,displayTitle,conclusion,createdAt,updatedAt --jq %s\n' \
+    "$QUIESCE_RUN_FILTER" >> "$expected_gate"
   # The quiesce PHASE (round-8 two-run protocol): 4 disables then the same 4 drain snapshots
   # (disable-then-check is the race-free order: no NEW run can start after the disable, and
   # the drain check then proves no already-admitted run remains).
@@ -827,14 +949,20 @@ FAKE
     printf 'run list --all -R o/r --workflow %s --limit 1000 --json status,databaseId --jq %s\n' \
       "$wf" "$NONTERMINAL_FILTER" >> "$expected_quiesce"
   done
-  # Seed the state a SUCCESSFUL quiesce run leaves behind (writers disabled): every scenario
-  # that exercises the migrate/cleanup phases starts from it, because those phases now fail
-  # closed without it (see the migrate-without-quiesce scenario).
+  # Seed the state a SUCCESSFUL quiesce run leaves behind (writers disabled), plus the round-9
+  # GOOD ORDERING: this run (id 7777) was queued at 12:00 and the newest successful quiesce
+  # run COMPLETED at 11:50 — strictly before the queue instant, so the ordering attestation
+  # passes. Every scenario that exercises the migrate/cleanup phases starts from it, because
+  # those phases now fail closed without it (see the migrate-without-quiesce and queue-time
+  # ordering scenarios); the ordering-violation scenarios overwrite run_created/wf_runs.
   seed_quiesced() {
     local d=$1 w
     for w in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
       touch "$d/disabled_$w"
     done
+    printf '2026-07-18T12:00:00Z\n' > "$d/run_created"
+    printf '[{"databaseId":7000,"displayTitle":"migrate-secrets [quiesce]","conclusion":"success","createdAt":"2026-07-18T11:40:00Z","updatedAt":"2026-07-18T11:50:00Z"}]\n' \
+      > "$d/wf_runs"
   }
 
   # --- scenario 0: QUIESCE PHASE (round-8 finding 1 — the secret-free first run of the
@@ -910,6 +1038,8 @@ FAKE
   : > "$s1/env_secrets"
   rc=$(run_case "$s1" "$tmp/s1.out" main all)
   chk "fresh main phase succeeds (terminal runs in the snapshot do not trip the drain check)" "$rc" 0
+  chk "fresh main: the GOOD-ORDERING attestation passes and is reported (quiesce completed 11:50 < queued 12:00)" \
+    "$(grep -c 'ordering attestation: newest successful quiesce completed 2026-07-18T11:50:00Z < this run queued 2026-07-18T12:00:00Z' "$tmp/s1.out")" 1
   chk "fresh main: env holds all 14 after" "$(sort "$s1/env_secrets" | paste -sd' ' -)" \
     "$(printf '%s\n' "${names[@]}" | sort | paste -sd' ' -)"
   chk "fresh main: repo scope holds EXACTLY the 2 bootstrap secrets after" \
@@ -1360,6 +1490,23 @@ FAKE
   rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18d.out" 2>&1 || rc=$?
   chk "contract goes RED when an extra grant is silently WIDENED in (exact-set pin)" "$rc" 1
 
+  # --- scenario 18h: ACTOR CONTRACT (round-9 finding 2 — the RE-RUN bypass): github.actor
+  # stays the ORIGINAL initiator when a run is re-run, while github.triggering_actor is the
+  # re-runner — so an actor-only `if:` lets any write-access user re-run a jeswr-initiated run
+  # while it holds the secret-admin mint. Every phase job must pin BOTH fields; dropping the
+  # triggering_actor clause from any job (the sed strips it from ALL FOUR) goes red, one
+  # violation per job.
+  rc=0; check_workflow_actor_contract "$wf_real" > "$tmp/s18h.out" 2>&1 || rc=$?
+  chk "actor contract holds on the real workflow (github.actor AND github.triggering_actor pinned on all 4 phase jobs)" "$rc" 0
+  sed "s/ && github.triggering_actor == 'jeswr'//" "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_actor_contract "$wf_mut" > "$tmp/s18i.out" 2>&1 || rc=$?
+  chk "actor contract goes RED when the triggering_actor clause is dropped (the re-run bypass reopens)" "$rc" 1
+  chk "actor contract names ALL FOUR under-gated jobs when the clause is dropped" \
+    "$(grep -c 'workflow contract violated' "$tmp/s18i.out")" 4
+  sed "s/github\.actor == 'jeswr' && //" "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_actor_contract "$wf_mut" > "$tmp/s18j.out" 2>&1 || rc=$?
+  chk "actor contract goes RED when the github.actor clause is dropped (both fields are load-bearing)" "$rc" 1
+
   # --- scenario 19: RESUME-WRITERS happy path (the self-resume after a COMPLETED migrate, or
   # the standalone phase: resume) — exactly the 4 enables, in the canonical writer order, and
   # nothing else.
@@ -1450,6 +1597,75 @@ FAKE
   chk "pure resume: NO delete argv" "$(grep -cE '^secret delete ' "$s23/calls.log" || true)" 0
   chk "pure resume: env values untouched (all 14 still V1)" \
     "$(grep -c '=v1-' "$s23/env_values")" 14
+
+  # --- scenario 24: QUEUE-TIME ORDERING VIOLATION (sol round-9 finding 1): a migrate run was
+  # DISPATCHED while the quiesce run was still executing — it sat PENDING in the shared
+  # concurrency group with its secrets snapshot fixed at QUEUE time (12:00), i.e. from BEFORE
+  # the drain finished. A writer admitted pre-drain rotated every repo value to V2 AFTER the
+  # snapshot; the quiesce then drained and COMPLETED at 12:05 (> 12:00). By start time the
+  # writers are disabled AND drained — M0a/M0b pass — so ONLY the ordering attestation can
+  # catch it: the newest successful quiesce completed AFTER this run was queued -> fail closed
+  # with ZERO mutations and the rotated V2 repo values untouched. (Without the gate: M3 copies
+  # the stale queue-time snapshot into the env and M5 deletes fresh V2 — the exact
+  # stale-copy/fresh-delete loss.) The listing also carries an OLDER successful quiesce
+  # (completed 11:00 < 12:00) as a DECOY: an any-success-before-queue check would pass on it —
+  # the attestation must select the NEWEST successful quiesce, so the run still fails.
+  # MUTATION CHECK: invert the timestamp comparison in assert_quiesce_completed_before_queue
+  # and this scenario goes red (rc 0, mutations performed) while the good-ordering scenarios
+  # (1, 2, ...) go red in the opposite direction.
+  local s24="$tmp/s24"
+  mkdir -p "$s24"
+  seed_quiesced "$s24"
+  printf '2026-07-18T12:00:00Z\n' > "$s24/run_created"
+  printf '%s\n' \
+    '[{"databaseId":6900,"displayTitle":"migrate-secrets [quiesce]","conclusion":"success","createdAt":"2026-07-18T10:50:00Z","updatedAt":"2026-07-18T11:00:00Z"},' \
+    ' {"databaseId":7000,"displayTitle":"migrate-secrets [quiesce]","conclusion":"success","createdAt":"2026-07-18T11:58:00Z","updatedAt":"2026-07-18T12:05:00Z"}]' \
+    > "$s24/wf_runs"
+  printf '%s\n' "${names[@]}" > "$s24/repo_secrets"
+  for n in "${names[@]}"; do printf '%s=v2-%s\n' "$n" "$n"; done > "$s24/repo_values"
+  : > "$s24/env_secrets"
+  rc=$(run_case "$s24" "$tmp/s24.out" main all)
+  chk "queue-time ordering violation: quiesce completed AFTER this run was queued -> fail closed" "$rc" 1
+  chk "queue-time ordering violation: distinct re-dispatch message" \
+    "$(grep -c 'quiesce must COMPLETE before migrate is queued' "$tmp/s24.out")" 1
+  chk "queue-time ordering violation: the older-success DECOY did not satisfy the check (newest selected)" \
+    "$(grep -c 'completed at 2026-07-18T12:05:00Z' "$tmp/s24.out")" 1
+  chk "queue-time ordering violation: ZERO mutations (the stale-copy/fresh-delete loss never opens)" \
+    "$(grep -cE '^secret (set|delete) ' "$s24/calls.log" || true)" 0
+  chk "queue-time ordering violation: the rotated V2 repo values survive untouched" \
+    "$(grep -c '=v2-' "$s24/repo_values")" 14
+  # ... and the cleanup phase's C0 gate applies the same attestation.
+  local s24c="$tmp/s24c"
+  mkdir -p "$s24c"
+  seed_quiesced "$s24c"
+  cp "$s24/run_created" "$s24c/run_created"
+  cp "$s24/wf_runs" "$s24c/wf_runs"
+  printf '%s\n' "${names[@]}" > "$s24c/env_secrets"
+  printf '%s\n' "${bootstrap[@]}" > "$s24c/repo_secrets"
+  rc=$(run_case "$s24c" "$tmp/s24c.out" cleanup-bootstrap none)
+  chk "queue-time ordering violation (cleanup): fail closed with zero deletions" \
+    "$rc-$(grep -cE '^secret delete ' "$s24c/calls.log" || true)" 1-0
+
+  # --- scenario 24b: NO SUCCESSFUL QUIESCE RUN in the listing — the writers being disabled
+  # (M0a green) is NOT an attestation that a quiesce RUN drained them (an admin may have
+  # disabled them by hand, or the only quiesce run FAILED). The listing carries a FAILED
+  # quiesce and a SUCCESSFUL *migrate* decoy — the displayTitle+conclusion filter must accept
+  # neither: fail closed with zero mutations.
+  local s24b="$tmp/s24b"
+  mkdir -p "$s24b"
+  seed_quiesced "$s24b"
+  printf '%s\n' \
+    '[{"databaseId":7000,"displayTitle":"migrate-secrets [quiesce]","conclusion":"failure","createdAt":"2026-07-18T11:40:00Z","updatedAt":"2026-07-18T11:50:00Z"},' \
+    ' {"databaseId":6800,"displayTitle":"migrate-secrets [migrate]","conclusion":"success","createdAt":"2026-07-18T10:00:00Z","updatedAt":"2026-07-18T10:10:00Z"}]' \
+    > "$s24b/wf_runs"
+  printf '%s\n' "${names[@]}" > "$s24b/repo_secrets"
+  : > "$s24b/env_secrets"
+  rc=$(run_case "$s24b" "$tmp/s24b.out" main all)
+  chk "no successful quiesce run (failed quiesce + successful-migrate decoy) -> fail closed" "$rc" 1
+  chk "no successful quiesce run: distinct message names the missing attestation" \
+    "$(grep -c "no SUCCESSFUL 'phase: quiesce' run found" "$tmp/s24b.out")" 1
+  chk "no successful quiesce run: zero mutations" \
+    "$(grep -cE '^secret (set|delete) ' "$s24b/calls.log" || true)" 0
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'migrate-secrets self-test PASSED\n'
