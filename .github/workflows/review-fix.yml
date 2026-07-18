@@ -1325,7 +1325,7 @@ jobs:
             --reviewer-provider "${{ needs.claim.outputs.provider }}"
             --arm "${{ needs.resolve.outputs.arm_auto_merge }}"
             --issue "${{ needs.resolve.outputs.issue }}"
-            --bot-login "${{ needs.resolve.outputs.bot_login }}"
+            --bot-login "${{ needs.resolve.outputs.pr_author }}"
           )
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")

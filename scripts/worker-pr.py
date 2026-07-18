@@ -1248,8 +1248,12 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # the hits while the CAS still accepts A). The compare at the immutable
         # reviewed_sha cannot change under us.
         base_ref = str((live.get("base") or {}).get("ref", "")) or "main"
-        trust_hits = trust_surface_paths_touched(
-            _files_at_sha(repo, base_ref, reviewed_sha), surfaces)
+        sha_files = _files_at_sha(repo, base_ref, reviewed_sha)
+        if FILES_TRUNCATED_SENTINEL in sha_files:
+            # Fail closed toward MORE audit: an unverifiable inventory is treated as a hit.
+            trust_hits = (FILES_TRUNCATED_SENTINEL,)
+        else:
+            trust_hits = trust_surface_paths_touched(sha_files, surfaces)
     if arm and trust_hits:
         # Durable audit BEFORE the merge latch can fire (sol r2 on #257): auto-merge can
         # complete immediately, and a post-merge crash would leave an armed trust diff with
@@ -1290,22 +1294,28 @@ TRUST_AUDIT_MARKER_PREFIX = "<!-- sparq-trust-audit:v1 sha="
 TRUST_AUDIT_MARKER = TRUST_AUDIT_MARKER_PREFIX  # back-compat alias for tests/greps
 
 
+COMPARE_FILES_CAP = 300  # GitHub returns changed files ONLY on compare page 1, capped at 300
+FILES_TRUNCATED_SENTINEL = "(compare file inventory truncated/unavailable - assumed trust-surface)"
+
+
 def _files_at_sha(repo, base_ref, sha):
-    """Changed-file names from the IMMUTABLE base...sha compare (paginated) — the SHA-bound
-    counterpart of the mutable PR files endpoint, for decisions that must bind to the
-    reviewed head (sol r3 on #257)."""
+    """Changed-file names (current AND previous names — rename-safe) from the IMMUTABLE
+    base...sha compare, the SHA-bound counterpart of the mutable PR files endpoint (sol
+    r3/r4 on #257). GitHub exposes files only on the FIRST compare page, capped at 300;
+    at/over the cap or on a malformed/missing files array this FAILS CLOSED by returning
+    the sentinel — the caller treats it as a trust hit and audits MORE, never less."""
+    doc = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{sha}?per_page={COMPARE_FILES_CAP}"])
+    rows = doc.get("files") if isinstance(doc, dict) else None
+    if not isinstance(rows, list) or len(rows) >= COMPARE_FILES_CAP:
+        return [FILES_TRUNCATED_SENTINEL]
     files = []
-    page = 1
-    while True:
-        doc = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{sha}"
-                              f"?per_page=100&page={page}"])
-        rows = doc.get("files") if isinstance(doc, dict) else None
-        if not rows:
-            break
-        files.extend(str(r.get("filename", "")) for r in rows if isinstance(r, dict))
-        if len(rows) < 100:
-            break
-        page += 1
+    for r in rows:
+        if not isinstance(r, dict):
+            return [FILES_TRUNCATED_SENTINEL]
+        files.append(str(r.get("filename", "")))
+        prev = r.get("previous_filename")
+        if isinstance(prev, str) and prev:
+            files.append(prev)
     return files
 
 
@@ -2330,6 +2340,25 @@ def _self_test():
               any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
         check("the audit snapshot is SHA-bound (compare at reviewed sha, not the PR endpoint)",
               raa_outputs.get("trust_surface"), True)
+        # _files_at_sha unit facets (sol r4): renames carry both names; the 300-cap and
+        # malformed rows fail closed to the assumed-trust sentinel.
+        real_files_gh = globals()["_gh_json"]
+        try:
+            globals()["_gh_json"] = lambda a, **k: {"files": [
+                {"filename": "scripts/renamed-away.py",
+                 "previous_filename": "scripts/worker-pr.py"}]}
+            check("renamed trust file still hits (previous_filename tracked)",
+                  bool(trust_surface_paths_touched(_files_at_sha("o/r", "main", "b" * 40))),
+                  True)
+            globals()["_gh_json"] = lambda a, **k: {"files": [
+                {"filename": f"f{i}.txt"} for i in range(COMPARE_FILES_CAP)]}
+            check("at the compare cap the inventory fails closed to the sentinel",
+                  _files_at_sha("o/r", "main", "b" * 40), [FILES_TRUNCATED_SENTINEL])
+            globals()["_gh_json"] = lambda a, **k: {"files": "garbage"}
+            check("malformed files array fails closed to the sentinel",
+                  _files_at_sha("o/r", "main", "b" * 40), [FILES_TRUNCATED_SENTINEL])
+        finally:
+            globals()["_gh_json"] = real_files_gh
         run_raa(head_ok=False)
         check("head race returns to review:needs with NO arm and NO audit",
               ("state:needs" in raa_calls,
