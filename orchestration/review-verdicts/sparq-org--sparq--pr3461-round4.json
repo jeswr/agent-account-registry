@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Envelope::to_delta reduces removes to an unlabelled causal-context dot set, while Replica::apply adds provenance only for delta.store() dots. Thus a receiver applying removal(q1,d) before add(q1,d) observes d but learns no q1 association. A forged add(q2,d) then passes validation; the join keeps q2 invisible because d is tombstoned, but apply nevertheless records d->q2 and returns Ok. The later legitimate add(q1,d) is rejected as conflicting historical provenance. This violates the documented CRDT-WIRE-4 full-lifetime guarantee and lets an invalid replay poison admission state even though visible State is unchanged.",
+   "file": "crates/sparq-crdt/src/origin.rs",
+   "fix_hint": "Carry authenticated dot-to-quad attribution for removed dots in the admitted wire unit (or otherwise make removal-first admission establish durable provenance), and validate it before mutation. Add a directed regression: deliver removal(q1,d) first, attempt forged add(q2,d), require Err with the entire Replica unchanged, then deliver legitimate add(q1,d) and require successful admission. Exercise the same ordering through run_schedule/generated schedules. If bare Delta intentionally cannot enforce this invariant, narrow the API and claims rather than returning successful admission and recording attacker-chosen provenance.",
+   "severity": "major",
+   "title": "Removal-first delivery leaves an observed dot open to provenance poisoning"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 4 fixes the round-3 SnapshotSync defect for a source that originally observed the add: snapshots now carry the durable dot-to-quad journal, apply it fail-closed, and the directed schedule test exercises that path. However, CRDT-WIRE-4 remains bypassable when a replica first observes a dot through a removal-only delta. Envelope::to_delta discards the quad association from removes, and Replica::apply records provenance only for live store entries. A later forged add can therefore assign that already-observed dot to another quad; although the causal context keeps the forged quad invisible, apply returns success and permanently records the forged association, causing the legitimate original add to be rejected later. This contradicts the full-lifetime validation claim and creates a poisoning/denial-of-service path. Progress is regressing under the required scale: the prior finding was fixed, but this round exposes a new major delivery-order defect in the same invariant.",
+ "verdict": "request_changes"
+}
