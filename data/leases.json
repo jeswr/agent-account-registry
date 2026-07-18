@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct03",
-   "claim_id": "e5ef90f038254c3997d99337ba5eb0be",
-   "holder": "jeswr/agent-account-registry#101@dispatch-29656633252.1",
-   "package": "dispatch",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784400777,
-   "expires_at": 1784403477
-  },
-  {
-   "account": "acct03",
    "claim_id": "350186a4dd464277b2d4da4ff26f0d0c",
    "holder": "jeswr/agent-account-registry#168@dispatch-29656633252.1",
    "package": "groom",
