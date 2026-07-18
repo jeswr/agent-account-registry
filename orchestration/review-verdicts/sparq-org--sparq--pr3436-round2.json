@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves the prior major anti-vacuity finding. The new domain harness no longer represents plain kani::cover! as merge-blocking: it explicitly labels the covers supplementary and adds a concrete maximal in-domain witness guarded by ordinary assertions. That witness exercises the real merge_join path, pins the four-row duplicate-key cross product and group advance behavior, and separately pins strict extra_shared rejection to one row. The symbolic covers remain useful reachability reports without being relied upon for proof success. The bounded equivalence harnesses still compare the production kernel against an independent nested-loop reference over the declared sorted two-column domain, and the workflow/formal-suite wiring includes all three harnesses. No correctness, soundness, security, or test-validity issue remains in the diff-scoped change.",
+ "verdict": "approve"
+}
