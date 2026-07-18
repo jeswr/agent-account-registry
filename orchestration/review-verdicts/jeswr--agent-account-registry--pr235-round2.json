@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The workflow claims to require exactly two positive integers, but `cap=\"${lease_cfg%% *}\"` and `ttl=\"${lease_cfg##* }\"` only validate the first and last space-delimited portions. For example, malformed output `10 999 1200` is accepted as cap 10 and TTL 1200 while silently ignoring `999`. That weakens the output contract at the trust boundary and can conceal resolver/output drift instead of stopping the claim path.",
+   "file": ".github/workflows/review-fix.yml",
+   "fix_hint": "Parse into an array (or use a strict whole-string regex), require exactly two fields, and then validate both as positive integers; add a regression assertion showing that an extra-field value such as `10 999 1200` is rejected.",
+   "severity": "major",
+   "title": "Lease-config parser accepts extra fields instead of failing closed"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The canonical Python resolver and dispatcher delegation are sound, but the workflow does not actually enforce its stated two-integer output contract. Its first/last-space parsing accepts malformed output containing additional fields, so the self-claim path can silently discard data rather than fail closed. This is a newly identified major finding relative to round 1, so progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
