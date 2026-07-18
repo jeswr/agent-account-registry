@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-2 parser finding is resolved. The workflow now validates the entire lease-config output with an anchored two-positive-integer pattern before using either value, so extra fields such as `10 999 1200` fail closed. The cap/TTL table is centralized in select-and-claim.py, unknown prefixes fail closed, and both dispatcher claim branches and the workflow self-claim path consume that source. The added self-tests are non-vacuous and specifically pin valid output, extra-field rejection, zero rejection, canonical values, and unknown-prefix behavior. No blocker, major, or other diff-supported issue remains.",
+ "verdict": "approve"
+}
