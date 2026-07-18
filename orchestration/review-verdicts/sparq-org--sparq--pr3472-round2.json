@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "tbox_expand_signature adds inferred (direction, superproperty, neighbor) elements, but similar_by_sig generates candidates by scanning actual triples with that superproperty. If :p1 and :p2 are both subproperties of :p, and :a :p1 :n while :b :p2 :n, the expanded signatures share (:p, :n) and similarity(a,b) is positive, yet scanning (?, :p, :n) finds neither entity, so most_similar(a, k) can omit :b. The current T-box tests exercise signature construction and direct similarity only, not the real retrieval path.",
+   "file": "crates/sparq-sim/src/lib.rs",
+   "fix_hint": "Make candidate generation for an inferred superproperty include owners of its relevant transitive subproperties (or build a reverse expansion/index that produces a sound candidate superset), then re-score exactly as today. Add a feature-gated most_similar test with two sibling subproperties sharing only a superclass and disable unrelated fallback tiers so the test cannot pass vacuously.",
+   "severity": "major",
+   "title": "T-box candidate generation misses sibling subproperties"
+  },
+  {
+   "body": "trigram_jaccard claims character-trigram Jaccard but constructs windows over UTF-8 bytes and chooses its short-string path using byte length. Multi-byte characters are therefore split into artificial trigrams, and strings with fewer than three characters can enter the trigram path merely because their UTF-8 encoding has at least three bytes. The added Unicode test proves only that the old slice panic is gone; it does not verify the documented metric.",
+   "file": "crates/sparq-sim/src/lib.rs",
+   "fix_hint": "Build trigrams from chars (for example collect chars and window over them), base the short-string decision and fallback denominator on character counts, and add assertions with non-ASCII strings whose byte-trigram and character-trigram scores differ. Alternatively, consistently document this as UTF-8 byte-trigram similarity if that narrower metric is intentional.",
+   "severity": "major",
+   "title": "Documented character trigrams are implemented as byte trigrams"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 1's two lexical defects are fixed: fallback now scans the full index and the new non-ASCII test exercises the former panic. However, review of the newly added T-box path found a retrieval-correctness gap: exact T-box similarity can be positive while most_similar cannot generate the candidate when two sibling subproperties meet only at an inferred superproperty. The lexical helper also implements byte trigrams while documenting character trigrams, producing incorrect Unicode scoring. Because these are new findings, progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
