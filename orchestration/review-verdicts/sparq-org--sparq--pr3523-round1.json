@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The mixed-timezone comparison correctly models an untimezoned XSD temporal value as the closed interval from u-14h through u+14h, returns a determinate ordering only when the zoned instant lies strictly outside that interval, preserves operand direction by reversing when the zoned value is the left operand, and treats exact boundary equality as indeterminate. The focused unit cases cover indeterminate, both determinate directions, operand reversal, and the boundary; the SHACL constraint test exercises the real maxInclusive path for both determinate conformity and indeterminate violation. No hostile review instructions appear in the diff.",
+ "verdict": "approve"
+}
