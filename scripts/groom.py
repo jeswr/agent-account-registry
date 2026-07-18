@@ -281,8 +281,9 @@ def stale_worker_pr_reason(
 
     Scope: this age sweep only escalates a NON-DRAFT worker PR wedged in a BAD_MERGE_STATE
     (conflicting/dirty/behind/blocked/unstable/unknown) — a state no automation recovers. A DRAFT
-    worker PR is review-loop-owned and is NEVER escalated here (see the draft branch below); its
-    starved-lane escalation belongs to the review-queue-TTL alert, not this sweep."""
+    worker PR is review-loop-owned and is NEVER escalated here (see the draft branch below). The
+    residual gap (a draft with NO provenance record, which the review loop also skips) is tracked
+    in issue #90, NOT covered by this sweep — see the draft branch for the honest boundary."""
     updated = _epoch(pull.get("updated_at"), "pull request")
     if now - updated < threshold_seconds:
         return None
@@ -308,10 +309,23 @@ def stale_worker_pr_reason(
         # `needs:` label on the source issue) is in dispatch-claim.HUMAN_HOLD_PR_LABELS, which
         # EXCLUDES the PR from enumerate_review_items — so parking a pipeline-owned draft removes
         # it from the exact loop that would otherwise drive it, a self-inflicted deadlock the
-        # maintainer reported as "can't be drained". The escalation owner for a starved/dead review
-        # lane is the review-queue-TTL alert (policy `review_queue_ttl_minutes`, surfaced by the
-        # dispatch/review pipeline as a NON-terminal ops alert that the review enumerator still sees
-        # through) — NOT this age sweep and NEVER the terminal label. Return None: leave untouched.
+        # maintainer reported as "can't be drained".
+        #
+        # ESCALATION OWNER (honest state, tracked in issue #90): the intended owner for a
+        # starved/dead review lane is a NON-terminal review-queue-TTL alert keyed on policy
+        # `review_queue_ttl_minutes` (a rolling `from:agent` alert issue, cf. pat-validity.py /
+        # usage-alert.py) — NOT this age sweep and NEVER the terminal label. That field is defined
+        # in policy/repos.toml and resolved+validated by policy-resolve.py, but it is NOT YET wired
+        # to any consumer that emits the alert, so today the starved-lane safety net is unbuilt.
+        #
+        # RESIDUAL GAP this Return-None widens (also issue #90): a genuinely-orphaned draft — one
+        # whose provenance write crashed before the record landed, or a pre-migration draft — is
+        # skipped by dispatch-claim.enumerate_review_items too (it fails closed on a missing
+        # provenance record), so it is owned by NO loop after this change. groom has no provenance
+        # access here, so it cannot cheaply tell that orphan apart from the review-loop-owned
+        # majority; parking the whole draft class (the master behaviour) re-arms the deadlock for
+        # the common case, so we leave drafts untouched and TRACK the orphan rather than silently
+        # trade one wrong park for another. Return None: leave untouched.
         return None
     merge_state = pull.get("mergeable_state")
     if merge_state is None:
