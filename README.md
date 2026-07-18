@@ -242,6 +242,7 @@ an additional eligibility gate for Fable routes, but does not replace the fleet-
 ## Security posture
 
 - Tokens: only in GitHub secrets (encrypted at rest, masked in logs).
+- `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the Actions secrets public-key read, then an authoritative `gh secret set` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only `Secrets: read`, so it would bless a read-only PAT that onboarding's write still breaks on) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and network blips never false-alarm.
 - Account metadata + selection logic: only in this private repo.
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
 
