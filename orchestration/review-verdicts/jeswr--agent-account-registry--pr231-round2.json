@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The purge enumerates canonical credentials and three known log files, while the containment scan checks only literal 24+ character substrings from the credential files in changed target files and followups.jsonl. A steered model can write the credential (or a reversible encoding of it) to another file under the predictable WORKER_ROOT, or encode it in a target change. Target-controlled cargo then runs as the same runner user and can read WORKER_ROOT directly or decode the target copy. Deleting known paths and scanning literal fragments therefore does not prevent the hostile gate from recovering credential material; the diff's own comment concedes the encoded-copy bypass and postpones the sandbox boundary.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Before any target-controlled toolchain or gate process runs, enforce an OS-level isolation boundary that cannot read runner temp, model artifacts, or any credential-bearing state and does not inherit credential-related environment. Treat the target checkout as potentially containing encoded credential material; do not rely on content scanning as the boundary. Alternatively, redesign execution so no process receives both the live credential and write access to data later visible to hostile gate code.",
+   "severity": "blocker",
+   "title": "Host-side gate still shares the model's writable trust domain"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "The revision removes the known credential files and model logs, scrubs inherited pointers, and gates cargo on purge success, but it still does not establish the enforceable isolation boundary required by round 1. The model still receives the live credential while it can write both the target checkout and other predictable runner-readable locations. Its output can preserve the secret under an unenumerated path or encode it in a changed target file; the same-user, host-side target-controlled gate can then read or decode that copy. The diff explicitly recognizes that encoded copies evade the scan and defers sandboxing to a follow-up, so the prior blocker remains materially unresolved.",
+ "verdict": "request_changes"
+}
