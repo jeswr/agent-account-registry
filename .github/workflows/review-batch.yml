@@ -18,6 +18,13 @@
 # and ready-and-arm re-checks human-hold + security labels once more before any undraft/latch;
 # the outcome/arm policy (max rounds, arm flag, security paths) is resolved from the TARGET
 # policy row (policy/repos.toml + protected routing), never global workflow vars.
+# [FABLE-5 r5] The dispatcher's claim is ADOPTED like the single path (worker.yml/review-fix.yml):
+# validated against the LIVE lease ledger + account catalog (holder prefix, pool, role/package
+# partition, model in the inverse review chain, provider, account, secret_ref == <ACCOUNT>_TOKEN)
+# BEFORE any App token is minted or any account secret is dereferenced, and a claim that failed
+# validation is NEVER released (the release job is gated on adoption). Each review leg resolves
+# the model + runs the policy-routed AGENT from the TARGET policy/routing resolution (never the
+# registry's routing mirror), exactly like the single path's resolve/selected steps.
 # A per-item failure NEVER sinks the batch (per-item try/except); the atomic commit records only the
 # healthy subset; failed items get no label/arm and re-plan next tick (their reviewed-sha marker is
 # never bound, so the sweep re-surfaces them). Verdict SCHEMA + label/arm/round-budget logic are the
@@ -106,12 +113,21 @@ jobs:
     timeout-minutes: 12
     permissions:
       contents: read
+      issues: read   # [FABLE-5 r5 #2] lease adoption reads the live account catalog (issues)
     outputs:
       matrix: ${{ steps.admit.outputs.matrix }}
       count: ${{ steps.admit.outputs.count }}
       target_owner: ${{ steps.admit.outputs.target_owner }}
       target_name: ${{ steps.admit.outputs.target_name }}
       batch_k: ${{ steps.admit.outputs.batch_k }}
+      # [FABLE-5 r5 #1] The policy-resolved TARGET routing pointer + routed agent ride to every
+      # review leg (review-fix.yml `needs.resolve.outputs.routing/agent` convention) — the legs
+      # resolve the model from the TARGET catalog and export WORKER_AGENT to worker-live.sh.
+      routing: ${{ steps.policy.outputs.routing }}
+      agent: ${{ steps.policy.outputs.agent }}
+      # [FABLE-5 r5 #2] True only after the dispatcher claim VALIDATED against the live ledger;
+      # the release job is gated on it (never release a claim that failed validation).
+      claim_adopted: ${{ steps.adopt.outputs.claim_adopted }}
     steps:
       - name: Checkout private registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -159,6 +175,160 @@ jobs:
           printf 'target_owner=%s\n' "${TARGET_REPO%%/*}" >> "$GITHUB_OUTPUT"
           printf 'target_name=%s\n' "${TARGET_REPO##*/}" >> "$GITHUB_OUTPUT"
 
+      # [FABLE-5 r5 #1] TARGET policy resolution for the whole batch, exactly like the single
+      # path's resolve step (review-fix.yml `policy`): the review legs must run the
+      # policy-routed AGENT (worker-live.sh fails closed on an empty/missing WORKER_AGENT before
+      # any model call) against the policy-resolved TARGET routing — never the registry's own
+      # routing mirror — and the lease-adoption step below validates the dispatcher claim
+      # against the SAME resolved account pool + inverse review chain. Fail closed: an unknown
+      # target repo or unresolvable chain fails the whole batch here, before any App token is
+      # minted or account secret dereferenced.
+      - name: Resolve target policy + inverse review chain (role=review)
+        id: policy
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          IMPL_PROVIDER: ${{ inputs.impl_provider }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/policy-resolve.py \
+            --target-repo "$TARGET_REPO" \
+            --policy-file registry/policy/repos.toml \
+            --target-root target-routing \
+            --role review > "$RUNNER_TEMP/policy.json"
+          python3 - "$RUNNER_TEMP/policy.json" <<'PY'
+          import json, os, re, sys, tomllib
+          from pathlib import Path, PurePosixPath
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              policy = json.load(handle)
+          impl_provider = os.environ["IMPL_PROVIDER"]
+          target_root = Path("target-routing").resolve()
+          routing_path = target_root.joinpath(*PurePosixPath(policy["routing"]).parts).resolve()
+          try:
+              routing_path.relative_to(target_root)
+          except ValueError as exc:
+              raise SystemExit("resolved routing path escaped target checkout") from exc
+          with open(routing_path, "rb") as handle:
+              routing = tomllib.load(handle)
+
+          # The review chain is the INVERSE of the implementer's provider and is computed HERE,
+          # never via resolve() (whose role=review row is always [opus]) — review-fix.yml
+          # convention; resolve() supplies account_pool / agent / caps only. A CODEX alias with
+          # a missing/TBD provider_model stays resolvable (locked decision 14: worker-live.sh
+          # omits --model and the CLI default applies); a claude alias needs a concrete id.
+          review_chain = {"anthropic": ["terra"], "openai": ["opus"]}
+          models = routing.get("models", {})
+          chain = []
+          for alias in review_chain[impl_provider]:
+              meta = models.get(alias)
+              if not isinstance(meta, dict):
+                  continue
+              provider_model = meta.get("provider_model")
+              concrete = (isinstance(provider_model, str) and provider_model != "TBD"
+                          and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", provider_model))
+              codex_default = (meta.get("harness") == "codex"
+                               and provider_model in (None, "", "TBD"))
+              if concrete or codex_default:
+                  chain.append(alias)
+          if not chain:
+              raise SystemExit(
+                  "review chain unresolvable for this direction; refusing the batch")
+          values = {
+              "routing": policy["routing"],
+              "model_chain": ",".join(chain),
+              "account_pool": ",".join(policy["account_pool"]),
+              "agent": policy["agent"],
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+                      raise SystemExit(f"unsafe resolved value: {key}")
+                  output.write(f"{key}={value}\n")
+          print(f"review chain for {impl_provider}-implemented batch: {','.join(chain)}")
+          PY
+
+      # [FABLE-5 r5 #2] Adopt the dispatcher-owned CAS claim by VALIDATING it against the LIVE
+      # lease ledger BEFORE any App token is minted or any account secret is dereferenced —
+      # mirrors the single path's worker.yml/review-fix.yml adopt step. Asserted against the
+      # live lease + its live account row: holder prefix (a batch review claim for THIS target
+      # repo), account == the supplied input AND in the resolved pool, work partition (role ==
+      # review, package == the batch package), model == the supplied input AND in the inverse
+      # review chain, provider (present, == the supplied input, != the implementer provider),
+      # and secret_ref == <ACCOUNT>_TOKEN == the supplied input — so a malformed/manual
+      # dispatch can never route another account's secret into the legs. A claim that FAILS
+      # validation is NEVER released (the supplied id could name an unrelated ACTIVE lease;
+      # releasing it would sever that job mid-run — it just expires via TTL/groom), and the
+      # release job below is gated on this step's claim_adopted output for the same reason.
+      # `--inspect` itself fails closed (exit 3) on an unknown/expired claim or holder mismatch.
+      - name: Adopt the dispatcher lease (validate against the live ledger; no secret deref yet)
+        id: adopt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          IMPL_PROVIDER: ${{ inputs.impl_provider }}
+          EXPECTED_ACCOUNT: ${{ inputs.account }}
+          CLAIM_ID: ${{ inputs.claim_id }}
+          EXPECTED_PACKAGE: ${{ inputs.package }}
+          EXPECTED_PROVIDER: ${{ inputs.reviewer_provider }}
+          EXPECTED_MODEL: ${{ inputs.reviewer_model }}
+          EXPECTED_SECRET_REF: ${{ inputs.secret_ref }}
+          EXPECTED_HARNESS: ${{ inputs.harness }}
+          EXPECTED_CREDENTIAL_FORMAT: ${{ inputs.credential_format }}
+          MODELS: ${{ steps.policy.outputs.model_chain }}
+          ACCOUNT_POOL: ${{ steps.policy.outputs.account_pool }}
+        run: |
+          set -euo pipefail
+          [[ "$CLAIM_ID" =~ ^[0-9a-f]{32}$ ]] || { echo '::error::unsafe or missing claim id'; exit 1; }
+          python3 registry/scripts/select-and-claim.py \
+            --inspect "$CLAIM_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --expected-holder-prefix "review:$TARGET_REPO#batch-" > "$RUNNER_TEMP/adopt.json"
+          python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
+          import json, os, re, sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              claim = json.load(handle)
+          if not isinstance(claim, dict):
+              raise SystemExit("dispatcher claim is not adoptable (fail closed)")
+          account = claim.get("account")
+          model = claim.get("model")
+          claim_id = claim.get("claim_id")
+          secret_ref = claim.get("secret_ref")
+          provider = claim.get("provider") or ""
+          pool = os.environ["ACCOUNT_POOL"].split(",")
+          models = os.environ["MODELS"].split(",")
+          if account != os.environ["EXPECTED_ACCOUNT"] or account not in pool:
+              raise SystemExit("dispatcher claim account is outside resolved policy")
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", str(account)):
+              raise SystemExit("dispatcher claim account is unsafe")
+          if model != os.environ["EXPECTED_MODEL"] or model not in models:
+              raise SystemExit("dispatcher claim model is outside the resolved review chain")
+          if claim_id != os.environ["CLAIM_ID"] or not re.fullmatch(r"[0-9a-f]{32}", str(claim_id)):
+              raise SystemExit("dispatcher claim id is invalid")
+          if claim.get("role") != "review" or claim.get("package") != os.environ["EXPECTED_PACKAGE"]:
+              raise SystemExit("dispatcher claim work partition disagrees with the batch")
+          if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(
+                  r"[A-Z][A-Z0-9_]*", str(secret_ref)):
+              raise SystemExit("dispatcher claim secret_ref is unsafe")
+          if secret_ref != os.environ["EXPECTED_SECRET_REF"]:
+              raise SystemExit("supplied secret_ref disagrees with the live account record")
+          if not provider:
+              raise SystemExit("claimed account has no provider metadata; failing closed")
+          if provider != os.environ["EXPECTED_PROVIDER"]:
+              raise SystemExit("supplied reviewer_provider disagrees with the live account record")
+          if provider == os.environ["IMPL_PROVIDER"]:
+              raise SystemExit("reviewer provider equals implementer provider; refusing")
+          for env_key, claim_key in (("EXPECTED_HARNESS", "harness"),
+                                     ("EXPECTED_CREDENTIAL_FORMAT", "credential_format")):
+              supplied = os.environ.get(env_key, "")
+              if supplied and supplied != (claim.get(claim_key) or ""):
+                  raise SystemExit(f"supplied {claim_key} disagrees with the live account record")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("claim_adopted=true\n")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"dispatcher batch lease adopted: model={model}, claim={claim_id[:8]}")
+          PY
+
       - name: Mint read-only App token for live re-admission (no target contents write)
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -184,6 +354,13 @@ jobs:
           # batching must re-assert the same per-PR trust gate. Empty (App slug unavailable) fails
           # every item closed.
           EXPECT_BOT_LOGIN: ${{ steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}
+          # [FABLE-5 r5 #2] The adopted reviewer account, for the per-item reviewer !=
+          # implementer ACCOUNT assertion on salted hashes (locked decision 22a — the single
+          # path's adopt step asserts this against its one PR; the batch asserts it per item
+          # against each provenance-bound impl_account_h). This job runs registry code only, so
+          # the salt never enters a job executing target code. A missing salt fails closed.
+          REVIEWER_ACCOUNT: ${{ inputs.account }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
           # The provenance record is read from the registry checkout (root of trust), same as
           # dispatch. head/label/author/state are read LIVE via the App token.
         run: |
@@ -207,6 +384,13 @@ jobs:
           repo = os.environ["TARGET_REPO"]
           impl_provider = os.environ["IMPL_PROVIDER"]
           expect_bot_login = os.environ.get("EXPECT_BOT_LOGIN", "")
+          # [FABLE-5 r5 #2] Salted reviewer hash for the per-item cross-ACCOUNT assertion
+          # (mirrors the single path's adopt step; a missing salt fails the whole batch closed).
+          salt = os.environ.get("PROVENANCE_SALT", "")
+          if not salt:
+              raise SystemExit(
+                  "PROVENANCE_SALT is unavailable; refusing to admit any batch item")
+          reviewer_h = worker_pr.account_hash(os.environ["REVIEWER_ACCOUNT"], salt)
 
           # [FABLE-5 round-2 #3c] Security keywords = builtin set + the TARGET routing's own
           # match_labels (same union review-fix's resolve computes). A missing/unreadable routing
@@ -308,6 +492,12 @@ jobs:
                   impl_account_h = str(prov.get("impl_account_h", ""))
                   if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h):
                       print(f"drop #{number}: provenance lacks a salted account hash")
+                      continue
+                  # [FABLE-5 r5 #2] reviewer account != implementer account, per item, on the
+                  # PROVENANCE-bound hash (never the hostile manifest's copy) — the same salted
+                  # assertion the single path's adopt step makes for its one PR.
+                  if impl_account_h == reviewer_h:
+                      print(f"drop #{number}: reviewer account equals the implementer account")
                       continue
                   # [FABLE-5 round-2 #3b] reviewed-sha binding: the head about to be reviewed
                   # must equal/descend from the provenance-bound worker-opened commit — the same
@@ -527,9 +717,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve the claimed model to a concrete provider model (protected routing catalog)
+      # [FABLE-5 r5 #1] The catalog of record is the policy-resolved TARGET routing (the `target`
+      # checkout at the policy row's routing pointer resolved by resolve-batch), NEVER the
+      # registry's own orchestration/routing.toml mirror — mirrors review-fix.yml's `selected`
+      # step verbatim, plus the batch's standing cross-provider assert (one claimed account
+      # serves every item; impl_provider is uniform across the batch by construction).
+      - name: Resolve the claimed model against the policy-resolved TARGET routing
         id: selected
         env:
+          ROUTING_PATH: ${{ needs.resolve-batch.outputs.routing }}
           LIVE_ACCOUNT: ${{ inputs.account }}
           LIVE_MODEL: ${{ inputs.reviewer_model }}
           LIVE_PROVIDER: ${{ inputs.reviewer_provider }}
@@ -539,46 +735,66 @@ jobs:
           IMPL_PROVIDER: ${{ inputs.impl_provider }}
         run: |
           set -euo pipefail
-          # routing.toml is keyed by MODEL alias (not account). The dispatcher already claimed the
-          # account and forwarded its resolved model + secret_ref; resolve the concrete provider
-          # model from the PROTECTED [models] catalog exactly like the single path's `selected` step,
-          # and fail closed if the reviewer provider would equal the implementer provider.
           python3 - <<'PY'
-          import json, os, re, tomllib
-          from pathlib import Path
+          import os, re, tomllib
+          from pathlib import Path, PurePosixPath
 
-          routing_path = Path(os.environ["GITHUB_WORKSPACE"], "registry", "orchestration", "routing.toml")
-          if not routing_path.is_file():
-              raise SystemExit("protected routing.toml is missing from the registry checkout")
-          with open(routing_path, "rb") as fh:
-              routing = tomllib.load(fh)
+          target_root = Path(os.environ["GITHUB_WORKSPACE"], "target").resolve()
+          routing_path = target_root.joinpath(*PurePosixPath(os.environ["ROUTING_PATH"]).parts).resolve()
+          try:
+              routing_path.relative_to(target_root)
+          except ValueError as exc:
+              raise SystemExit("resolved routing path escaped target checkout") from exc
+          with open(routing_path, "rb") as handle:
+              routing = tomllib.load(handle)
+
           account = os.environ["LIVE_ACCOUNT"]
           model = os.environ["LIVE_MODEL"]
-          provider = os.environ["LIVE_PROVIDER"]
           secret_ref = os.environ["LIVE_SECRET_REF"]
-          if not re.fullmatch(r"acct[0-9a-z]{2,}", account):
-              raise SystemExit("claimed account handle is unsafe")
-          if provider == os.environ["IMPL_PROVIDER"] or provider not in {"anthropic", "openai"}:
-              raise SystemExit("reviewer provider would equal implementer provider (fail closed)")
           meta = routing.get("models", {}).get(model)
           if not isinstance(meta, dict):
               raise SystemExit("claimed model is missing from protected target routing")
-          if meta.get("provider") != provider:
-              raise SystemExit("claimed model/provider disagree with the protected routing")
-          # A codex alias may leave provider_model unset/TBD: worker-live.sh then omits --model and
-          # the codex CLI default applies (the proven drain posture).
+          # A codex alias may leave provider_model unset/TBD (locked decision 14): worker-live.sh
+          # then omits --model and the codex CLI default applies (the proven drain posture).
           provider_model = meta.get("provider_model")
           if meta.get("harness") == "codex" and provider_model in (None, "", "TBD"):
               provider_model = "TBD"
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"account={account}\n")
-              out.write(f"provider={provider}\n")
-              out.write(f"model={model}\n")
-              out.write(f"provider_model={provider_model or ''}\n")
-              out.write(f"harness={meta.get('harness','')}\n")
-              out.write(f"secret_ref={secret_ref}\n")
-              out.write(f"credential_format={meta.get('credential_format','')}\n")
-          print(f"resolved review account -> provider={provider} model={model}")
+          values = {
+              "account": account,
+              "model": model,
+              "provider": meta.get("provider"),
+              "harness": meta.get("harness"),
+              "provider_model": provider_model,
+              "credential_format": meta.get("credential_format"),
+              "secret_ref": secret_ref,
+          }
+          if (values["provider"], values["harness"]) not in {
+              ("openai", "codex"), ("anthropic", "claude")
+          }:
+              raise SystemExit("claimed model has an unsupported provider/harness pair")
+          if values["credential_format"] not in {
+              "codex-auth-json", "claude-credentials-json", "claude-oauth-token", "anthropic-api-key"
+          }:
+              raise SystemExit("claimed model has an unsupported credential format")
+          for env_key, meta_key in (("LIVE_PROVIDER", "provider"), ("LIVE_HARNESS", "harness"),
+                                    ("LIVE_CREDENTIAL_FORMAT", "credential_format")):
+              claimed = os.environ[env_key]
+              if claimed and claimed != values[meta_key]:
+                  raise SystemExit(f"claimed account {meta_key} conflicts with protected routing")
+          if values["provider"] == os.environ["IMPL_PROVIDER"]:
+              raise SystemExit("reviewer provider would equal implementer provider (fail closed)")
+          if not re.fullmatch(r"acct[0-9a-z]{2,}", str(account)):
+              raise SystemExit("unsafe selected account")
+          if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(r"[A-Z][A-Z0-9_]*", str(secret_ref)):
+              raise SystemExit("unsafe selected secret_ref")
+          for key, value in values.items():
+              if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+                  raise SystemExit(f"unsafe or missing selected value: {key}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          # Privacy (locked decision 22b): public workflow logs never carry account handles.
+          print(f"selected account resolved: model={model}, harness={values['harness']}")
           PY
 
       - name: Prepare the read-only reviewer container (no GitHub token inside)
@@ -656,6 +872,10 @@ jobs:
           WORKER_IMPL_ALIAS: ${{ matrix.impl_alias }}
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
           WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
+          # [FABLE-5 r5 #1] The policy-routed agent, exactly like the single path's review step:
+          # worker-live.sh fails closed without it (empty agent / missing
+          # .claude/agents/<agent>.md in the target checkout reject the leg pre-model).
+          WORKER_AGENT: ${{ needs.resolve-batch.outputs.agent }}
         run: bash ../registry/scripts/worker-live.sh review
 
       # [GPT-5.6 r4 #5] The provider CLI may refresh the account credential during the run (codex
@@ -1281,11 +1501,15 @@ jobs:
               print(f"::warning::{failures} arm(s) failed; the sweep re-arms those PRs")
           PY
 
-  # ---- 4. Always release the ONE batch lease. ----
+  # ---- 4. Release the ONE batch lease — but ONLY a lease that PASSED adoption validation.
+  #         [FABLE-5 r5 #2] A supplied claim_id that failed (or never reached) the resolve-batch
+  #         adopt step is NEVER released: it could name an unrelated ACTIVE lease, and releasing
+  #         it would sever that job's account mid-run. An unadopted claim simply expires via its
+  #         TTL / groom-leases. ----
   release:
     name: Release the batch lease
     needs: [resolve-batch, review, commit-outcome]
-    if: ${{ always() }}
+    if: ${{ always() && needs.resolve-batch.outputs.claim_adopted == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
