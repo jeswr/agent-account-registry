@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The harness says that if a re-scope prunes the maximal duplicate-key witness or the rejecting extra_shared witness, the covers become unsatisfiable and the harness goes red. Plain kani::cover! properties are reachability reports, however; the normal cargo kani harness execution does not turn an uncovered cover into a failed safety proof. Thus both equivalence proofs can become vacuous over the load-bearing cases while this mandatory self-check still passes. The constant asserts only establish coarse numeric bounds and do not establish that either symbolic witness survives the assumptions and unwind bound.",
+   "file": "crates/sparq-substrate/src/join.rs",
+   "fix_hint": "Make witness survival a merge-blocking property rather than relying on plain cover reporting. For example, add concrete maximal witness inputs with ordinary assertions that exercise duplicate-key multi-match/group advance and strict extra_shared rejection, and retain cover! only as supplementary symbolic coverage; alternatively add and wire a CI checker that explicitly fails when these named cover goals are not SATISFIED. Update the comments to describe the mechanism accurately.",
+   "severity": "major",
+   "title": "Domain-coverage covers do not fail the proof when witnesses become unreachable"
+  }
+ ],
+ "progress": null,
+ "summary": "The bounded equivalence harnesses are well scoped and compare the real merge_join implementation against an independent nested-loop reference, but the mandatory anti-vacuity harness does not actually enforce its advertised witness-survival property. Kani cover properties report reachability; an uncovered/unsatisfiable cover is not an assertion failure under the ordinary cargo kani invocation wired here. Consequently the suite can remain green after a future change makes either interesting witness unreachable, contrary to the PR's central anti-vacuity claim.",
+ "verdict": "request_changes"
+}
