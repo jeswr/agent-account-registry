@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The model runs with the live credential and a writable bind mount of the target checkout, while its stdout/stderr are persisted under the predictable WORKER_ROOT. Target-supplied prompt content can cause the model process to copy or emit the credential into `target` or files such as `model-output.log`/`cli-stderr.log`. This step deletes only `home`, `.credential-baseline`, and `.selected-credential`; the subsequent cargo gate runs unsandboxed as the runner user and can read both the checkout and other runner-readable WORKER_ROOT files. Clearing environment pointers therefore does not make the gate credential-free, and the post-purge existence checks are vacuous with respect to these alternate copies.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Create an enforceable isolation boundary: do not expose credentials and the writable target to the same model process, and run target-controlled gates in a sandbox that cannot read runner temp or model artifacts. At minimum, remove all potentially credential-bearing model logs before the gate and add a validated invariant preventing credential material from entering the target, but content scanning alone should not be treated as a complete secret-containment guarantee.",
+   "severity": "blocker",
+   "title": "Purge does not remove credential copies reachable by hostile gate code"
+  }
+ ],
+ "progress": null,
+ "summary": "The new purge removes the canonical credential files and clears their path variables, but it does not establish the claimed credential-free boundary before hostile host-side cargo runs. The model previously receives the credential while writing to the target checkout and to persistent files under WORKER_ROOT; either location can contain a copied credential and remains readable by the same runner user during the gate. Because the gate is not sandboxed, deleting only three known paths is not a sound fail-closed containment measure.",
+ "verdict": "request_changes"
+}
