@@ -42,16 +42,6 @@
   },
   {
    "account": "acct2css",
-   "claim_id": "dca4a79560414a42906ce0bc14896818",
-   "holder": "jeswr/agent-account-registry#111@dispatch-29648262197.1",
-   "package": "dispatch",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784385400,
-   "expires_at": 1784388100
-  },
-  {
-   "account": "acct2css",
    "claim_id": "eb3b25e6da33417b89c8d2e8d1b83aff",
    "holder": "jeswr/agent-account-registry#133@dispatch-29648262197.1",
    "package": "worker",
