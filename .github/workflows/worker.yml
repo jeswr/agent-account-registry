@@ -888,10 +888,13 @@ jobs:
         # tests) host-side. Previously the prepare step's HOME, raw account handle, and credential
         # paths persisted in $GITHUB_ENV through the gate, so a hostile build script could read or
         # exfiltrate the full/rotated credential. Delete the whole credential tree (the isolated
-        # HOME, the rotation baseline, any source copy), hand the gate a FRESH credential-free HOME,
-        # and scrub the inherited account handle + credential-path vars from the job env BEFORE any
-        # target-controlled process runs. Fail closed: the Rust-toolchain and gate steps below run
-        # only when this step succeeded, so a failed purge blocks all target code.
+        # HOME, the rotation baseline, any source copy) AND the model process's persisted
+        # stdout/stderr logs (review r1: the model held the live credential, so its emitted streams
+        # are potential credential COPIES readable by the unsandboxed gate), hand the gate a FRESH
+        # credential-free HOME, and scrub the inherited account handle + credential-path vars from
+        # the job env BEFORE any target-controlled process runs. Fail closed: the Rust-toolchain and
+        # gate steps below run only when this step succeeded, so a failed purge blocks all target
+        # code.
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
@@ -901,11 +904,74 @@ jobs:
           rm -rf -- "$gate_home"
           mkdir -p -- "$gate_home"
           chmod 700 "$gate_home"
-          # Remove every credential-bearing path materialized by worker-prep / the model run.
-          rm -rf -- "$WORKER_ROOT/home" "$WORKER_ROOT/.credential-baseline" "$WORKER_ROOT/.selected-credential"
-          for leftover in "$WORKER_ROOT/home" "$WORKER_ROOT/.credential-baseline" "$WORKER_ROOT/.selected-credential"; do
+          # Credential-CONTAINMENT tripwire (review r1): the model ran with the live credential AND
+          # a writable target mount, so a steered model could also copy the credential INTO the
+          # target tree — which publish would push publicly and hostile gate code could read.
+          # BEFORE deleting the credential material, derive token patterns from every credential
+          # file worker-prep materialized (rotation baseline + possibly-rotated HOME copies) and
+          # fail closed if one appears in anything publish would stage or in the surviving
+          # follow-ups file. Patterns are token-shaped runs only ([A-Za-z0-9_-]{24,}): every
+          # materialized format (sk-ant-*, JWT segments, base64url refresh tokens, account UUIDs)
+          # yields such runs, while the credential files' JSON key names / URLs / timestamps never
+          # reach 24 unbroken chars, so legitimate model edits cannot collide. NOTE: this scan is a
+          # tripwire, not a containment proof — an ENCODED copy evades it; the enforceable boundary
+          # (running the gate in a sandbox that cannot read runner temp) is a filed follow-up.
+          patterns="$WORKER_ROOT/.credential-scan-patterns"
+          : > "$patterns"
+          chmod 600 "$patterns"
+          for cred in "$WORKER_ROOT/.credential-baseline" \
+                      "$WORKER_ROOT/home/.codex/auth.json" \
+                      "$WORKER_ROOT/home/.claude/.credentials.json" \
+                      "$WORKER_ROOT/home/.claude/worker-token"; do
+            if [[ -f "$cred" ]]; then
+              grep -haoE '[A-Za-z0-9_-]{24,}' -- "$cred" >> "$patterns" || true
+            fi
+          done
+          sort -u -o "$patterns" "$patterns"
+          scan_hit=0
+          scan_list="$WORKER_ROOT/.credential-scan-files"
+          # An ls-files failure dies under set -e: an UNSCANNED tree must block the gate, not pass.
+          git -C "$GITHUB_WORKSPACE/target" ls-files -z --modified --others --exclude-standard > "$scan_list"
+          if [[ -s "$patterns" ]]; then
+            while IFS= read -r -d '' changed; do
+              [[ -f "$GITHUB_WORKSPACE/target/$changed" ]] || continue
+              if grep -qaFf "$patterns" -- "$GITHUB_WORKSPACE/target/$changed"; then
+                printf '::error::credential material detected in target change %s\n' "$changed"
+                scan_hit=1
+              fi
+            done < "$scan_list"
+            if [[ -f "$WORKER_ROOT/followups.jsonl" ]] &&
+               grep -qaFf "$patterns" -- "$WORKER_ROOT/followups.jsonl"; then
+              printf '::error::credential material detected in the model follow-ups file\n'
+              scan_hit=1
+            fi
+          fi
+          # Remove every credential-bearing path materialized by worker-prep / the model run,
+          # INCLUDING the model's own stdout/stderr/error-signal logs (review r1: potential
+          # credential copies; nothing after write-back legitimately reads them) and this scan's
+          # own pattern file (it holds the extracted token material).
+          purge_paths=(
+            "$WORKER_ROOT/home"
+            "$WORKER_ROOT/.credential-baseline"
+            "$WORKER_ROOT/.selected-credential"
+            "$WORKER_ROOT/model-output.log"
+            "$WORKER_ROOT/cli-stderr.log"
+            "$WORKER_ROOT/error-signals.log"
+            "$patterns"
+            "$scan_list"
+          )
+          rm -rf -- "${purge_paths[@]}"
+          for leftover in "${purge_paths[@]}"; do
             [[ ! -e "$leftover" ]] || { echo "::error::credential material $leftover survived the purge"; exit 1; }
           done
+          if [[ "$scan_hit" -ne 0 ]]; then
+            # Fail CLOSED: block the gate and publish. Also discard the model-authored follow-ups —
+            # the follow-ups step still runs after a purge failure, and a run that tripped the
+            # credential scan forfeits every model-authored publication channel.
+            rm -f -- "$WORKER_ROOT/followups.jsonl"
+            echo "::error::credential-containment scan failed; blocking the gate and publish"
+            exit 1
+          fi
           # Repoint HOME/CODEX_HOME at the fresh credential-free directory the gate (and later host
           # steps) will use, and blank the account handle + credential paths so no later step (the
           # gate, publish) inherits a pointer to a credential. WORKER_PROVIDER/HARNESS/
@@ -918,7 +984,7 @@ jobs:
             printf 'WORKER_CREDENTIAL_PATH=\n'
             printf 'WORKER_CREDENTIAL_BASELINE=\n'
           } >> "$GITHUB_ENV"
-          printf 'worker: account credential purged and its env scrubbed before the target-controlled gate\n'
+          printf 'worker: account credential and model output logs purged, env scrubbed before the target-controlled gate\n'
 
       - name: Ensure a Rust toolchain for the crate-scoped gate
         # [OPUS-4.8] The gate runs `cargo clippy/test` directly on the runner; a stock ubuntu-latest may
