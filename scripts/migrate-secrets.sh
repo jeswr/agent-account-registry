@@ -30,19 +30,35 @@
 #          and every invocation carries `--all` (round-6 finding 1): the quiesce just DISABLED
 #          these workflows, and gh's name-based `--workflow` lookup excludes disabled workflows
 #          without it.
-#     M1. list the environment's secret NAMES (a failed listing is a hard refusal, never "empty").
-#     M2. pre-mutation input check: every name the env does NOT yet hold must have a non-empty
-#         S_<name> value — asserted for ALL 14 BEFORE any mutation. An env-held name needs no
-#         value: that IS the crash-resume path.
-#     M3. copy each missing name: value flows STDIN -> `gh secret set --env` (never argv), then
-#         re-list and verify it landed; a set-reported-success the listing does not show is a
-#         hard fail with the repo scope untouched.
+#     M1. list the environment's secret NAMES and the REPO-scope secret NAMES (a failed listing
+#         is a hard refusal, never "empty"). The repo listing is taken BEFORE the copy loop
+#         (round-7 finding — late-writer freshness): repo-scope PRESENCE, not environment-name
+#         presence, decides whether a value must be (re)copied.
+#     M2. pre-mutation input check, asserted for ALL 14 BEFORE any mutation: a name whose REPO
+#         copy is PRESENT requires a non-empty S_<name> (fail closed) — the env-unbound job
+#         resolves S_<name> from exactly that repo copy, the authoritative/NEWEST value. An
+#         environment NAME existing is NOT proof its VALUE is current (round-7 finding: env=V1,
+#         a late writer rotates repo to V2, cleanup aborts on the stray + instructs a main
+#         rerun; the old name-exists-skip then deleted repo V2 and left the pipeline on stale,
+#         possibly revoked, V1). An env-held name needs no value ONLY when the repo copy is
+#         ABSENT: that is the genuine resume-after-delete state. A name in neither scope with
+#         no value is a hard fail.
+#     M3. copy/refresh each name: a repo-present name is ALWAYS set (OVERWRITE) + verified from
+#         S_<name> — value flows STDIN -> `gh secret set --env` (never argv), then re-list and
+#         verify it landed; a set-reported-success the listing does not show is a hard fail
+#         with the repo scope untouched. An env-held name is skipped ONLY when its repo copy is
+#         absent — so every repo value reaches the environment BEFORE M5 deletes that name's
+#         repo copy. The overwrite rule applies to the 2 bootstrap names too (env refresh yes;
+#         their deletion stays cleanup-only).
 #     M4. assert a fresh env listing holds all 14 (extra env names — REGISTRY_SECRETS_PAT etc. —
 #         are expected and fine).
 #     M5. delete ONLY the 12 NON-bootstrap repo-scope copies still present (already-absent =
-#         resume path). The 2 bootstrap secrets are NEVER deleted in this phase — the argv-level
-#         invariant the self-test asserts — so ANY cancellation leaves a state from which this
-#         phase can re-mint and converge.
+#         resume path), each one guarded by the round-7 freshness rule: a name is deleted only
+#         if it was in the M1 repo listing (so M3 provably refreshed its value into the
+#         environment first); a name that appeared after M1 fails closed undeleted. The 2
+#         bootstrap secrets are NEVER deleted in this phase — the argv-level invariant the
+#         self-test asserts — so ANY cancellation leaves a state from which this phase can
+#         re-mint and converge.
 #     M6. assert repo scope holds none of the 12; the 2 bootstrap names remaining is EXPECTED
 #         (BY DESIGN — the cleanup phase drains them); any OTHER name is a distinct hard fail.
 #
@@ -84,10 +100,15 @@
 # migrate-secrets-to-env.yml for the per-phase grants), REGISTRY_REPO, one S_<name> env var per
 # secret (main phase only), optional SECRETS_ENV (default dispatch-secrets).
 #
-# `--self-test` / `self-test`: hermetic fake-`gh` PATH-shim suite (trust-gate.py precedent) —
+# `--self-test` / `self-test`: hermetic fake-`gh` PATH-shim suite (trust-gate.py precedent; the
+# fake models PER-SCOPE VALUES — env_values/repo_values state files, round-7 — so a freshness
+# regression shows up as actual VALUE loss, not just name churn) —
 # fresh-main, cleanup from 2/1/0-remaining, converged reruns of both phases,
 # interrupted-after-partial-copy, interrupted-mid-deletion, set-verify-mismatch, repo-stray (both
 # phases — cleanup now deletes NOTHING on a stray), late-writer leftover at cleanup time,
+# late-writer V1/V2 recovery (env=V1, repo=V2: a main rerun must refresh the env to V2 BEFORE
+# the repo delete), repo-present-without-value fail-closed, pure-resume (env-held + repo-absent
+# -> zero mutations),
 # missing-input, in-flight-writer (one scenario per NONTERMINAL run status — queued /
 # in_progress / requested / waiting / pending — each must abort), the fake-gh DISABLED-workflow
 # model (name-based run lookup without --all fails on a disabled workflow, with --all works —
@@ -201,30 +222,47 @@ phase_main() {
   echo '== phase M0b: pre-flight — no ALREADY-RUNNING secret-writer runs (quiesce does not cancel in-flight runs) =='
   preflight_no_live_writers
 
-  echo '== phase M1: list the environment secret names (resume state) =='
-  local env_names
+  echo '== phase M1: list the environment + repo-scope secret names (resume/freshness state) =='
+  local env_names repo_names
   env_names=$(_env_names) \
     || die "could not list secrets of environment '${ENV_NAME}' — refusing before any mutation (fail closed)"
+  # Round-7 freshness rule (sol): the REPO listing is taken BEFORE the copy loop because
+  # repo-scope PRESENCE — not environment-name presence — decides freshness. A repo copy that
+  # exists at migration time carries the authoritative/NEWEST value (e.g. a late writer's token
+  # rotation landed there after the env copy was made), and the env-unbound main job's S_<name>
+  # input resolves exactly that repo-scope value. An environment NAME alone proves nothing
+  # about its VALUE being current.
+  repo_names=$(_repo_names) \
+    || die 'could not list repo-scope secrets — refusing before any mutation (fail closed)'
 
   echo '== phase M2: pre-mutation input check (no mutation until every needed value is proven present) =='
   local name var
   for name in "${SECRET_NAMES[@]}"; do
-    if _has_name "$name" "$env_names"; then
-      printf 'already in %s (resume path — repo-scope value not required): %s\n' "$ENV_NAME" "$name"
-      continue
-    fi
     var="S_${name}"
-    if [[ -z "${!var:-}" ]]; then
-      die "value for ${name} is empty/missing AND the environment does not hold it — cannot converge; aborting BEFORE any mutation (were it a crash-rerun, the environment listing would already show the name)"
+    if _has_name "$name" "$repo_names"; then
+      # A repo copy EXISTS, so its value is the authoritative/newest one and the environment
+      # copy (whatever the name listing says) may be STALE: S_<name> is REQUIRED so M3 can
+      # refresh the environment BEFORE M5 deletes the repo copy.
+      [[ -n "${!var:-}" ]] \
+        || die "repo-scope copy of ${name} exists (its value is the authoritative/newest one) but S_${name} is empty/missing — cannot refresh the environment copy before the repo-scope deletion; aborting BEFORE any mutation (fail closed)"
+      printf 'repo copy present (authoritative value — will REFRESH the environment copy): %s\n' "$name"
+    elif _has_name "$name" "$env_names"; then
+      # Repo copy ABSENT + env name present: the genuine resume-after-delete state (a previous
+      # attempt already refreshed + deleted this name) — the only state where the env NAME is
+      # accepted as sufficient.
+      printf 'already in %s AND repo scope clear (resume path — no value required): %s\n' "$ENV_NAME" "$name"
+    else
+      [[ -n "${!var:-}" ]] \
+        || die "value for ${name} is empty/missing AND the environment does not hold it — cannot converge; aborting BEFORE any mutation (were it a crash-rerun, the environment listing would already show the name)"
+      printf 'present (will copy): %s\n' "$name"
     fi
-    printf 'present (will copy): %s\n' "$name"
   done
 
-  echo '== phase M3: copy each missing name into the environment (value via STDIN, never argv) =='
+  echo '== phase M3: copy/refresh into the environment (repo-present names ALWAYS overwritten; value via STDIN, never argv) =='
   local post
   for name in "${SECRET_NAMES[@]}"; do
-    if _has_name "$name" "$env_names"; then
-      printf 'skip copy (env already holds it): %s\n' "$name"
+    if ! _has_name "$name" "$repo_names" && _has_name "$name" "$env_names"; then
+      printf 'skip copy (repo scope clear + env already holds it — genuine resume): %s\n' "$name"
       continue
     fi
     var="S_${name}"
@@ -251,11 +289,17 @@ phase_main() {
   printf 'all 14 present in %s\n' "$ENV_NAME"
 
   echo '== phase M5: delete ONLY the 12 non-bootstrap repo-scope copies (bootstrap NEVER deleted here) =='
-  local repo_names
-  repo_names=$(_repo_names) \
+  local repo_now
+  repo_now=$(_repo_names) \
     || die 'could not list repo-scope secrets — refusing to delete blind (fail closed)'
   for name in "${NONBOOTSTRAP_NAMES[@]}"; do
-    if _has_name "$name" "$repo_names"; then
+    if _has_name "$name" "$repo_now"; then
+      # Round-7 freshness guard (defense-in-depth): every name deleted here MUST have been in
+      # the M1 repo listing, i.e. M3 provably refreshed its authoritative repo value into the
+      # environment. A copy that appeared only AFTER M1 was never refreshed (a writer slipped
+      # past the quiesce) — deleting it would destroy the newest value, so fail closed.
+      _has_name "$name" "$repo_names" \
+        || die "repo-scope ${name} appeared AFTER the M1 freshness listing — its value was never refreshed into the environment; refusing to delete it (fail closed; re-run the main phase so M3 refreshes it first)"
       gh secret delete "$name" --repo "$REPO" \
         || die "gh secret delete ${name} failed — re-run to converge (the environment copy is already verified)"
       printf 'deleted repo-scope: %s\n' "$name"
@@ -265,7 +309,7 @@ phase_main() {
   done
 
   echo '== phase M6: assert repo scope holds none of the 12 (bootstrap remaining is BY DESIGN) =='
-  repo_names=$(_repo_names) \
+  repo_now=$(_repo_names) \
     || die 'could not list repo-scope secrets for the final assertion (fail closed)'
   local stray=0 leftover=0
   while IFS= read -r name; do
@@ -279,7 +323,7 @@ phase_main() {
       printf '::error::migrate-secrets: unexpected non-migrated repo-scope secret: %s\n' "$name" >&2
       stray=1
     fi
-  done <<<"$repo_names"
+  done <<<"$repo_now"
   [[ "$leftover" -eq 0 ]] || die 'repo scope still holds non-bootstrap migrated names — re-run to converge'
   [[ "$stray" -eq 0 ]] \
     || die 'the 12 non-bootstrap secrets have converged into the environment, but the secrets-guard requires an EMPTY repo scope — move or remove the stray secret(s) named above (the cleanup-bootstrap phase still has to run too)'
@@ -538,6 +582,14 @@ case "$*" in
     printf '%s=%s\n' "$3" "$val" >> "$state/stdin.log"
     if [[ ! -f "$state/drop_set_$3" ]]; then
       grep -qxF -- "$3" "$state/env_secrets" 2>/dev/null || printf '%s\n' "$3" >> "$state/env_secrets"
+      # PER-SCOPE VALUE model (round-7): the env scope now holds THIS value for the name —
+      # an overwrite replaces any previous (possibly stale) value, so a freshness regression
+      # in the script is observable as the env ENDING on the wrong value, not just name churn.
+      if [[ -f "$state/env_values" ]]; then
+        grep -v "^$3=" "$state/env_values" > "$state/env_values.new" || true
+        mv "$state/env_values.new" "$state/env_values"
+      fi
+      printf '%s=%s\n' "$3" "$val" >> "$state/env_values"
     fi
     exit 0 ;;
   "secret delete "*" --repo o/r")
@@ -546,6 +598,13 @@ case "$*" in
     if [[ -f "$state/repo_secrets" ]]; then
       grep -vxF -- "$3" "$state/repo_secrets" > "$state/repo_secrets.new" || true
       mv "$state/repo_secrets.new" "$state/repo_secrets"
+    fi
+    # PER-SCOPE VALUE model (round-7): a repo delete destroys the repo-scope value for good —
+    # if the env was never refreshed from it, that value is GONE (exactly the loss the
+    # late-writer V1/V2 scenario asserts cannot happen).
+    if [[ -f "$state/repo_values" ]]; then
+      grep -v "^$3=" "$state/repo_values" > "$state/repo_values.new" || true
+      mv "$state/repo_values.new" "$state/repo_values"
     fi
     exit 0 ;;
   *)
@@ -563,7 +622,7 @@ FAKE
   local -a bootstrap=(REGISTRY_ADMIN_APP_ID REGISTRY_ADMIN_APP_KEY)
   local -a names=("${nonboot[@]}" "${bootstrap[@]}")
 
-  # run_case STATE_DIR OUT_FILE PHASE VALUE_MODE(all|none|missing-only) [EMPTY_NAME]
+  # run_case STATE_DIR OUT_FILE PHASE VALUE_MODE(all|none|repo-newest) [EMPTY_NAME]
   run_case() {
     local state=$1 out=$2 phase=$3 mode=$4 empty_name=${5:-}
     local -a assigns=(PATH="$tmp/bin:$PATH" FAKE_GH_STATE="$state" REGISTRY_REPO=o/r)
@@ -572,11 +631,14 @@ FAKE
       case "$mode" in
         all) assigns+=("S_${n}=v-${n}") ;;
         none) assigns+=("S_${n}=") ;;
-        missing-only)
-          if grep -qxF -- "$n" "$state/env_secrets" 2>/dev/null; then
-            assigns+=("S_${n}=")            # resume path: env-held names carry NO value
+        repo-newest)
+          # The production input shape: the env-UNBOUND main job resolves S_<name> from the
+          # REPO-scope secret, so a present repo copy supplies its (newest, v2-) value and a
+          # deleted one resolves EMPTY — exactly what a rerun after a late writer sees.
+          if grep -qxF -- "$n" "$state/repo_secrets" 2>/dev/null; then
+            assigns+=("S_${n}=v2-${n}")
           else
-            assigns+=("S_${n}=v-${n}")
+            assigns+=("S_${n}=")
           fi ;;
       esac
     done
@@ -636,20 +698,24 @@ FAKE
   chk "fresh main: EVERY workflow disable precedes the FIRST secret set (quiesce before mutation)" \
     "$(awk '/^workflow disable /{last=NR} /^secret set /{if(!first)first=NR} END{print (last && first && last<first) ? "yes" : "no"}' "$s1/calls.log")" yes
   local expected="$tmp/expected-main.log"
-  cat "$expected_quiesce" > "$expected"
-  cat "$expected_preflight" >> "$expected"
-  printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n' >> "$expected"
-  for n in "${names[@]}"; do
-    printf 'secret set %s --env dispatch-secrets --repo o/r\n' "$n" >> "$expected"
-    printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n' >> "$expected"
-  done
-  printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n' >> "$expected"
-  printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n' >> "$expected"
-  for n in "${nonboot[@]}"; do
-    printf 'secret delete %s --repo o/r\n' "$n" >> "$expected"
-  done
-  printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n' >> "$expected"
-  chk "fresh main: EXACT gh argv sequence (quiesce x4 -> preflight -> list -> set+verify x14 -> assert -> delete x12 NON-BOOTSTRAP ONLY -> assert)" \
+  {
+    cat "$expected_quiesce"
+    cat "$expected_preflight"
+    printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n'
+    # Round-7: M1 lists the REPO scope too, BEFORE the copy loop — repo presence decides freshness.
+    printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
+    for n in "${names[@]}"; do
+      printf 'secret set %s --env dispatch-secrets --repo o/r\n' "$n"
+      printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n'
+    done
+    printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n'
+    printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
+    for n in "${nonboot[@]}"; do
+      printf 'secret delete %s --repo o/r\n' "$n"
+    done
+    printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
+  } > "$expected"
+  chk "fresh main: EXACT gh argv sequence (quiesce x4 -> preflight -> env+repo list -> set+verify x14 -> assert -> delete x12 NON-BOOTSTRAP ONLY -> assert)" \
     "$(diff -q "$expected" "$s1/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
 
   # --- scenario 2: CLEANUP FROM 2-REMAINING — the state the main phase leaves. Exact argv
@@ -685,30 +751,36 @@ FAKE
   chk "converged reruns perform zero further mutations (only the initial 2 cleanup deletes in this state dir)" \
     "$(grep -cE '^secret (set|delete) ' "$s2/calls.log" || true)" 2
 
-  # --- scenario 4: MAIN INTERRUPTED AFTER PARTIAL COPY — env holds 5, repo still holds all 14,
-  # and the 5 env-held names have NO values (their repo copies could already be gone on a rerun).
+  # --- scenario 4: MAIN INTERRUPTED AFTER PARTIAL COPY — env holds 5, repo still holds all 14.
+  # Round-7: repo presence (not env-name presence) decides freshness — ALL 14 are refreshed on
+  # the rerun (the 5 env-held names may hold stale values; their repo copies are authoritative,
+  # and the rerun's S_ inputs resolve exactly those repo copies).
   local s4="$tmp/s4"
   mkdir -p "$s4"
   printf '%s\n' "${names[@]}" > "$s4/repo_secrets"
   printf '%s\n' "${names[@]:0:5}" > "$s4/env_secrets"
-  rc=$(run_case "$s4" "$tmp/s4.out" main missing-only)
+  rc=$(run_case "$s4" "$tmp/s4.out" main repo-newest)
   chk "partial-copy main rerun converges" "$rc" 0
-  chk "partial-copy main rerun copies ONLY the 9 missing names" \
-    "$(grep -cE '^secret set ' "$s4/calls.log")" 9
+  chk "partial-copy main rerun refreshes ALL 14 (repo-present -> overwrite, incl. the 5 env-held)" \
+    "$(grep -cE '^secret set ' "$s4/calls.log")" 14
   chk "partial-copy main rerun deletes the 12 non-bootstrap repo copies" \
     "$(grep -cE '^secret delete ' "$s4/calls.log")" 12
   chk "partial-copy main rerun leaves the 2 bootstrap at repo scope" \
     "$(sort "$s4/repo_secrets" | paste -sd' ' -)" "REGISTRY_ADMIN_APP_ID REGISTRY_ADMIN_APP_KEY"
 
   # --- scenario 5: MAIN INTERRUPTED MID-DELETION — env complete, 6 repo copies left (4
-  # non-bootstrap + the 2 bootstrap), no values.
+  # non-bootstrap + the 2 bootstrap). Round-7: the 6 repo-present names REQUIRE values (their
+  # repo copies are authoritative) and get refreshed — including BOTH bootstrap names (env
+  # refresh yes; bootstrap deletion still cleanup-only). The 8 repo-absent env-held names are
+  # the genuine resume path and need nothing.
   local s5="$tmp/s5"
   mkdir -p "$s5"
   printf '%s\n' "${names[@]}" > "$s5/env_secrets"
   printf '%s\n' "${names[@]:8}" > "$s5/repo_secrets"
-  rc=$(run_case "$s5" "$tmp/s5.out" main none)
-  chk "mid-deletion main rerun converges with zero values" "$rc" 0
-  chk "mid-deletion main rerun copies nothing" "$(grep -cE '^secret set ' "$s5/calls.log" || true)" 0
+  rc=$(run_case "$s5" "$tmp/s5.out" main repo-newest)
+  chk "mid-deletion main rerun converges (repo-present values supplied, none for the 8 resumed)" "$rc" 0
+  chk "mid-deletion main rerun refreshes exactly the 6 repo-present names (4 leftovers + 2 bootstrap)" \
+    "$(grep -cE '^secret set ' "$s5/calls.log")" 6
   chk "mid-deletion main rerun deletes exactly the 4 non-bootstrap leftovers" \
     "$(grep -cE '^secret delete ' "$s5/calls.log")" 4
   chk "mid-deletion main rerun still never touches bootstrap" \
@@ -765,14 +837,15 @@ FAKE
     "$(grep -cE '^secret delete ' "$s9/calls.log" || true)" 0
   chk "set-verify mismatch: repo scope untouched" "$(wc -l < "$s9/repo_secrets")" 14
 
-  # --- scenario 10: REPO-SCOPE STRAY (main) — a non-migrated repo secret; the 12 converge but
+  # --- scenario 10: REPO-SCOPE STRAY (main) — a non-migrated repo secret; the 12 converge
+  # (round-7: all 14 repo-present names are refreshed first, values from their repo copies) but
   # the run hard-fails with a distinct message. Extra ENV names (REGISTRY_SECRETS_PAT's
   # post-cutover home is this environment) must NOT trip anything, and bootstrap stays put.
   local s10="$tmp/s10"
   mkdir -p "$s10"
   { printf '%s\n' "${names[@]}"; echo SOME_LEGACY_SECRET; } > "$s10/repo_secrets"
   { printf '%s\n' "${names[@]}"; echo REGISTRY_SECRETS_PAT; } > "$s10/env_secrets"
-  rc=$(run_case "$s10" "$tmp/s10.out" main none)
+  rc=$(run_case "$s10" "$tmp/s10.out" main repo-newest)
   chk "main repo stray -> hard fail (guard requires empty repo scope)" "$rc" 1
   chk "main repo stray: surfaced by NAME with a distinct message" \
     "$(grep -c 'unexpected non-migrated repo-scope secret: SOME_LEGACY_SECRET' "$tmp/s10.out")" 1
@@ -1015,6 +1088,62 @@ FAKE
   chk "resume-writers without actions:write -> hard fail" "$rc" 1
   chk "resume-writers without actions:write: still attempts ALL 4 enables" \
     "$(grep -cE '^workflow enable ' "$s21/calls.log")" 4
+
+  # --- scenario 22: LATE-WRITER V1/V2 RECOVERY (round-7 finding — the newest-credential loss):
+  # env holds V1 for all 14; a late writer (token rotation) re-created ACCT02_TOKEN at repo
+  # scope with V2; cleanup aborted on the stray and instructed a main rerun. The rerun's S_
+  # inputs resolve the repo copies (V2 for ACCT02_TOKEN, empty for the 13 deleted ones). The
+  # OLD name-exists-skip saw the env NAME, skipped the copy, deleted repo V2 — leaving the
+  # pipeline on stale (possibly revoked) V1. The rule now: repo presence => REFRESH the env
+  # from S_ (overwrite) BEFORE that name's repo delete. The fake's per-scope value model makes
+  # the loss observable: the env must END at V2.
+  local s22="$tmp/s22"
+  mkdir -p "$s22"
+  printf '%s\n' "${names[@]}" > "$s22/env_secrets"
+  for n in "${names[@]}"; do printf '%s=v1-%s\n' "$n" "$n"; done > "$s22/env_values"
+  printf 'ACCT02_TOKEN\n' > "$s22/repo_secrets"
+  printf 'ACCT02_TOKEN=v2-ACCT02_TOKEN\n' > "$s22/repo_values"
+  rc=$(run_case "$s22" "$tmp/s22.out" main repo-newest)
+  chk "late-writer V1/V2 recovery: main rerun succeeds" "$rc" 0
+  chk "late-writer V1/V2 recovery: the env ENDS at V2 (newest credential preserved)" \
+    "$(grep -c '^ACCT02_TOKEN=v2-ACCT02_TOKEN$' "$s22/env_values")" 1
+  chk "late-writer V1/V2 recovery: the stale V1 env value is GONE" \
+    "$(grep -c '^ACCT02_TOKEN=v1-' "$s22/env_values" || true)" 0
+  chk "late-writer V1/V2 recovery: the refresh was a REAL set (stdin carried V2)" \
+    "$(grep -c '^ACCT02_TOKEN=v2-ACCT02_TOKEN$' "$s22/stdin.log")" 1
+  chk "late-writer V1/V2 recovery: the env SET argv precedes the repo DELETE argv (refresh-before-delete)" \
+    "$(awk '/^secret set ACCT02_TOKEN --env /{if(!s)s=NR} /^secret delete ACCT02_TOKEN --repo /{if(!d)d=NR} END{print (s && d && s<d) ? "yes" : "no"}' "$s22/calls.log")" yes
+  chk "late-writer V1/V2 recovery: exactly ONE set + ONE delete (the 13 repo-absent names are pure resume)" \
+    "$(grep -cE '^secret set ' "$s22/calls.log")-$(grep -cE '^secret delete ' "$s22/calls.log")" 1-1
+  chk "late-writer V1/V2 recovery: repo scope empty after (converged)" "$(cat "$s22/repo_secrets")" ""
+
+  # --- scenario 22b: repo-present name with NO S_ value -> FAIL CLOSED before any mutation
+  # (the env NAME existing is NOT accepted as freshness proof while a repo copy exists).
+  local s22b="$tmp/s22b"
+  mkdir -p "$s22b"
+  printf '%s\n' "${names[@]}" > "$s22b/env_secrets"
+  printf 'ACCT02_TOKEN\n' > "$s22b/repo_secrets"
+  rc=$(run_case "$s22b" "$tmp/s22b.out" main none)
+  chk "repo-present name with no S_ value -> fail closed" "$rc" 1
+  chk "repo-present-no-value: distinct cannot-refresh-before-deletion message" \
+    "$(grep -c 'cannot refresh the environment copy before the repo-scope deletion' "$tmp/s22b.out")" 1
+  chk "repo-present-no-value: ZERO mutations (the stale-V1 loss window never opens)" \
+    "$(grep -cE '^secret (set|delete) ' "$s22b/calls.log" || true)" 0
+
+  # --- scenario 23: PURE RESUME (round-7) — env holds all 14 (V1), repo scope ABSENT: the one
+  # state where an env NAME is sufficient (nothing newer can exist — the repo copies are gone).
+  # Converges with zero values, ZERO set argv, ZERO delete argv, env values untouched.
+  local s23="$tmp/s23"
+  mkdir -p "$s23"
+  printf '%s\n' "${names[@]}" > "$s23/env_secrets"
+  for n in "${names[@]}"; do printf '%s=v1-%s\n' "$n" "$n"; done > "$s23/env_values"
+  : > "$s23/repo_secrets"
+  rc=$(run_case "$s23" "$tmp/s23.out" main none)
+  chk "pure resume (env holds all 14, repo absent): converges with zero values" "$rc" 0
+  chk "pure resume: NO set argv" "$(grep -cE '^secret set ' "$s23/calls.log" || true)" 0
+  chk "pure resume: NO delete argv" "$(grep -cE '^secret delete ' "$s23/calls.log" || true)" 0
+  chk "pure resume: env values untouched (all 14 still V1)" \
+    "$(grep -c '=v1-' "$s23/env_values")" 14
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'migrate-secrets self-test PASSED\n'
