@@ -113,6 +113,14 @@ BUSY_OR_GATED = {
 # Busy/gated set for the deferred-RETRY path: status:deferred is the retry trigger, everything
 # else still gates (locked decision 20).
 DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
+# Readiness re-derivation (issue #102): PLAN computes blockers/non-dispatchability with HOSTILE
+# target code (dispatch-plan.py in the cloned target). CLAIM must independently re-prove the same
+# readiness predicate from LIVE registry-owned code before dispatch — an epic is a tracking
+# umbrella (never a work item), and `Blocked-by: #N` gates until every referenced issue is closed.
+# Kept byte-identical to scripts/ready-issues.py (NON_DISPATCHABLE + the blocker regex) so CLAIM
+# and the ready engine cannot silently diverge.
+NON_DISPATCHABLE = "kind:epic"
+BLOCKED_BY_RE = re.compile(r"[Bb]locked-by:\s*#([0-9]+)")
 # Cross-provider chains (locked decisions 14/17): the review chain is the INVERSE of the
 # implementer's provider and is computed HERE, never through policy-resolve.resolve() (whose
 # role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
@@ -883,6 +891,23 @@ def _routing_at_plan_sha(repo, path, sha):
         raise DispatchError(f"protected routing file is malformed for {repo}") from exc
 
 
+def _open_blockers(repo, body):
+    """Issue #102 readiness leg: re-derive `Blocked-by: #N` from the LIVE body and confirm every
+    referenced issue is closed, using registry-owned code — CLAIM never trusts the planner's
+    open-blocker count. Returns the sorted list of blocker numbers still OPEN. Fail-closed: a
+    blocker whose live state cannot be fetched raises DispatchError (the item then defers, per the
+    per-item resilience in dispatch()), so a row CLAIM cannot prove unblocked is never dispatched."""
+    numbers = sorted({int(match) for match in BLOCKED_BY_RE.findall(body)})
+    still_open = []
+    for number in numbers:
+        blocker = _gh_json(["api", f"repos/{repo}/issues/{number}"])
+        if not isinstance(blocker, dict) or "state" not in blocker:
+            raise DispatchError(f"blocker {repo}#{number} state is unreadable")
+        if str(blocker.get("state")).lower() == "open":
+            still_open.append(number)
+    return still_open
+
+
 def _current_issue_matches(repo, item):
     issue = _gh_json(["api", f"repos/{repo}/issues/{item['number']}"])
     if not isinstance(issue, dict) or "pull_request" in issue or issue.get("state") != "open":
@@ -898,6 +923,15 @@ def _current_issue_matches(repo, item):
         return False, "issue body changed after planning"
     if not _issue_is_trusted(issue):
         return False, "issue is not maintainer/collaborator/bot authored"
+    # Issue #102: re-prove the readiness predicate in registry-owned CLAIM code rather than trusting
+    # the hostile planner's frontier. `kind:epic` is a non-dispatchable tracking umbrella, and any
+    # still-open `Blocked-by: #N` gates the row. Both legs apply on the normal AND deferred paths —
+    # a deferred-retry of a re-blocked or epic issue must fail closed exactly like a fresh one.
+    if NON_DISPATCHABLE in labels:
+        return False, "issue is a non-dispatchable epic"
+    blocked = _open_blockers(repo, body)
+    if blocked:
+        return False, "issue has unresolved blockers: " + ", ".join(f"#{n}" for n in blocked)
     if item["deferred"]:
         # Deferred-retry (locked decision 20): status:deferred IS the trigger; every other
         # busy/gated label still fails closed. CLAIM flips deferred->ready on dispatch.
@@ -1993,6 +2027,70 @@ def _self_test():
     assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"})
     assert _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"})
     assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"})
+
+    # ---- issue #102: CLAIM independently RE-PROVES the readiness predicate (non-dispatchable
+    # epic + live blocker state) from registry-owned code, never trusting the hostile planner's
+    # frontier. Every assertion flips red if either leg is removed from _current_issue_matches. ----
+    prev_gh_json = _gh_json
+
+    def ready_issue(labels, body):
+        return {"state": "open", "user": {"login": "maintainer"},
+                "author_association": "MEMBER",
+                "labels": [{"name": name} for name in labels], "body": body}
+
+    def match_with(main_issue, blockers, item):
+        def fake(args):
+            found = re.search(r"/issues/(\d+)$", args[-1])
+            if not found:
+                raise AssertionError(f"unexpected read {args[-1]}")
+            number = int(found.group(1))
+            if number == item["number"]:
+                return main_issue
+            if number in blockers:
+                return blockers[number]
+            raise DispatchError(f"blocker #{number} unreadable")
+        globals()["_gh_json"] = fake
+        try:
+            return _current_issue_matches("example/repo", item)
+        finally:
+            globals()["_gh_json"] = prev_gh_json
+
+    ready_labels = sorted(["area:crate-a", "priority:P1", "role:impl", "status:ready"])
+    plain_body = "do the work"
+    item102 = {"number": 700, "labels": ready_labels, "author": "maintainer",
+               "body_sha": hashlib.sha256(plain_body.encode()).hexdigest(), "deferred": False}
+    # baseline: a ready, non-epic, unblocked issue passes every leg
+    passed, _ = match_with(ready_issue(ready_labels, plain_body), {}, item102)
+    assert passed, "ready unblocked non-epic issue must claim"
+    # kind:epic is independently rejected even though the plan emitted it (and its labels match)
+    epic_labels = sorted(ready_labels + [NON_DISPATCHABLE])
+    epic_item = dict(item102, labels=epic_labels)
+    epic_ok, epic_reason = match_with(ready_issue(epic_labels, plain_body), {}, epic_item)
+    assert not epic_ok and "epic" in epic_reason, epic_reason
+    # an OPEN `Blocked-by: #N` gates; the SAME body with a CLOSED blocker does not
+    blk_body = "prep first\nBlocked-by: #42"
+    blk_item = dict(item102, body_sha=hashlib.sha256(blk_body.encode()).hexdigest())
+    open_ok, open_reason = match_with(
+        ready_issue(ready_labels, blk_body), {42: {"state": "open"}}, blk_item)
+    assert not open_ok and "#42" in open_reason, open_reason
+    closed_ok, _ = match_with(
+        ready_issue(ready_labels, blk_body), {42: {"state": "closed"}}, blk_item)
+    assert closed_ok, "issue whose sole blocker is closed must claim"
+    # the readiness legs bind the DEFERRED-retry path too (a re-blocked deferred issue fails closed)
+    deferred_blk = dict(blk_item, deferred=True,
+                        labels=sorted(["area:crate-a", "priority:P1", "role:impl",
+                                       "status:deferred"]))
+    def_ok, _ = match_with(
+        ready_issue(deferred_blk["labels"], blk_body), {42: {"state": "open"}}, deferred_blk)
+    assert not def_ok, "deferred-retry of a re-blocked issue must fail closed"
+    # fail-closed: an UNREADABLE blocker state raises (the item then defers), never dispatches
+    try:
+        match_with(ready_issue(ready_labels, blk_body), {}, blk_item)
+        raise AssertionError("unreadable blocker must fail closed")
+    except DispatchError:
+        pass
+    # the parser is byte-identical to the ready engine's blocker regex (no silent divergence)
+    assert BLOCKED_BY_RE.findall("Blocked-by: #7 and blocked-by:#8") == ["7", "8"]
     # A DRAFT worker PR must land in linked_open_prs (dedupes issue re-dispatch) while the SAME PR
     # is separately enumerated as a review_item — the two enumerations must not fight (the issue
     # stays busy in status:in-progress-review while the PR cycles). Linking is head-ref/body based
