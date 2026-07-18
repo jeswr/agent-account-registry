@@ -16,10 +16,17 @@ and heartbeat are keyed by the unique claim_id.
 import argparse
 import base64
 import json
+import os
 import subprocess
 import sys
 
 LEDGER_PATH = "data/leases.json"
+# The mutable data plane lives on a dedicated NON-code branch: branch protection on the default
+# (code) branch rejects the bot's contents-API PUTs (issue #28 live incident 2026-07-17 — a
+# required `gate` status check on master blocked every lease write and starved all dispatch),
+# and a bot that can only write `ledger` can never push code to master. Env override is for
+# tests/migration only; every reader and writer threads this single constant.
+LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 
 
 class LeaseIOError(RuntimeError):
@@ -222,17 +229,53 @@ def partition_available(leases, holder_prefix, package):
 
 
 # ---- GitHub CAS I/O -----------------------------------------------------------------------------
+def ledger_read_path(repo):
+    """Contents-API GET path for the lease ledger, pinned to the data-plane branch (never the
+    protected default branch)."""
+    return f"repos/{repo}/contents/{LEDGER_PATH}?ref={LEDGER_REF}"
+
+
+def ledger_write_args(repo, message, content_b64, sha):
+    """gh argv for the ledger CAS PUT, pinned to the data-plane branch (never the protected
+    default branch — a PUT without `branch=` commits to the default branch and is rejected by
+    its required-status-check protection)."""
+    args = ["gh", "api", "-X", "PUT", f"repos/{repo}/contents/{LEDGER_PATH}",
+            "-f", f"message={message}", "-f", f"content={content_b64}",
+            "-f", f"branch={LEDGER_REF}"]
+    if sha:
+        args += ["-f", f"sha={sha}"]
+    return args
+
+
+def _ledger_branch_exists(repo):
+    return subprocess.run(
+        ["gh", "api", f"repos/{repo}/git/ref/heads/{LEDGER_REF}"],
+        capture_output=True, text=True, check=False,
+    ).returncode == 0
+
+
+def _read_404(branch_exists):
+    """Pure 404 policy: file-absent on a PRESENT ledger branch seeds an empty ledger (the first
+    CAS PUT creates the file); an ABSENT/unreadable ledger branch fails LOUD — silently-empty
+    would let every claim proceed against a ledger no other worker can see."""
+    if branch_exists:
+        return [], None
+    raise LeaseIOError(
+        f"ledger branch '{LEDGER_REF}' is missing or unreadable — create it from master "
+        "(see data/README.md) before claiming")
+
+
 def _read_ledger(repo):
     """Return (leases_list, blob_sha or None)."""
     result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/{LEDGER_PATH}"],
+        ["gh", "api", ledger_read_path(repo)],
         capture_output=True,
         text=True,
         check=False,
     )
     if result.returncode != 0:
         if "HTTP 404" in result.stderr:
-            return [], None  # file absent → first write creates it
+            return _read_404(_ledger_branch_exists(repo))
         raise LeaseIOError("lease ledger read failed")
     try:
         meta = json.loads(result.stdout)
@@ -250,11 +293,7 @@ def _read_ledger(repo):
 
 def _write_ledger(repo, leases, sha, message):
     body = base64.b64encode(json.dumps({"leases": leases}, indent=1).encode()).decode()
-    args = ["gh", "api", "-X", "PUT", f"repos/{repo}/contents/{LEDGER_PATH}",
-            "-f", f"message={message}", "-f", f"content={body}"]
-    if sha:
-        args += ["-f", f"sha={sha}"]
-    r = subprocess.run(args, capture_output=True, text=True)
+    r = subprocess.run(ledger_write_args(repo, message, body, sha), capture_output=True, text=True)
     return r.returncode == 0  # non-zero (e.g. 409 SHA conflict) → caller retries
 
 
@@ -689,6 +728,55 @@ def _self_test():
                         account_pool=["acctdual"], usage=dual_usage, margin=0.15)
     check("claim assigns model consistent with the admitting pass (haiku, not fable)",
           claimed and claimed["model"], "haiku")
+
+    # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
+    # Literal "ledger" on purpose: pointing either helper back at the default branch (or changing
+    # the shipped REGISTRY_LEDGER_REF default) must turn these red.
+    check("ledger read targets the ledger ref",
+          ledger_read_path("o/r"), f"repos/o/r/contents/{LEDGER_PATH}?ref=ledger")
+    wargs = ledger_write_args("o/r", "m", "Zm9v", "sha1")
+    check("ledger write pins branch=ledger", "branch=ledger" in wargs, True)
+    check("ledger write carries the CAS sha", "sha=sha1" in wargs, True)
+    check("ledger write without sha omits it (create-if-absent)",
+          any(a.startswith("sha=") for a in ledger_write_args("o/r", "m", "Zm9v", None)), False)
+    check("404 with ledger branch present seeds an empty ledger", _read_404(True), ([], None))
+    try:
+        _read_404(False)
+        check("404 with ledger branch MISSING fails loud", "no exception", "LeaseIOError")
+    except LeaseIOError:
+        check("404 with ledger branch MISSING fails loud", "LeaseIOError", "LeaseIOError")
+
+    # ---- CAS conflict-retry against the ledger ref (fixture-level, through the REAL I/O fns) ----
+    class _Res:
+        def __init__(self, returncode, stdout="", stderr=""):
+            self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+    fixture_calls = []
+
+    def _fake_gh(args, **_kwargs):
+        fixture_calls.append(list(args))
+        if "-X" not in args:  # contents GET: one expired lease, fresh sha per read
+            meta = {"content": base64.b64encode(json.dumps(
+                {"leases": [make_lease("a1", "o/r#1@run", "p", "impl", "m", now - 100, 1)]}
+            ).encode()).decode(), "sha": f"sha{len(fixture_calls)}"}
+            return _Res(0, stdout=json.dumps(meta))
+        puts = sum(1 for c in fixture_calls if "-X" in c)
+        return _Res(1 if puts == 1 else 0, stderr="HTTP 409")  # first PUT loses the CAS race
+
+    real_run = subprocess.run
+    subprocess.run = _fake_gh
+    try:
+        reclaimed = reclaim("o/r", now)
+    finally:
+        subprocess.run = real_run
+    fixture_gets = [c for c in fixture_calls if "-X" not in c]
+    fixture_puts = [c for c in fixture_calls if "-X" in c]
+    check("fixture reclaim rides out one CAS conflict", reclaimed, 1)
+    check("fixture reclaim re-read after the conflict (CAS retry)", len(fixture_gets), 2)
+    check("fixture reads all target the ledger ref",
+          all(c[2].endswith("?ref=ledger") for c in fixture_gets), True)
+    check("fixture writes all pin branch=ledger",
+          [sum(1 for a in c if a == "branch=ledger") for c in fixture_puts], [1, 1])
 
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

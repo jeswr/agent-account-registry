@@ -33,6 +33,10 @@ from urllib.request import Request, urlopen
 
 
 LEDGER_PATH = "data/leases.json"
+# Mutable data plane lives on a dedicated non-code branch (issue #28): required-status-check
+# protection on the default branch rejects the bot's contents-API PUTs, so every ledger read and
+# write pins this ref. Keep in sync with select-and-claim.py / model-health.py LEDGER_REF.
+LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
 STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
 WORKER_PR_MARKER = "> 🤖 SPARQ agent"
@@ -413,10 +417,39 @@ def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
     return limits
 
 
+def ledger_read_path(registry_repo: str) -> str:
+    """Contents-API GET path for the lease ledger, pinned to the data-plane branch."""
+    return f"/repos/{registry_repo}/contents/{LEDGER_PATH}?ref={LEDGER_REF}"
+
+
+def ledger_put_body(message: str, encoded: str, sha: str | None) -> dict[str, str]:
+    """Contents-API PUT body for the lease ledger, pinned to the data-plane branch (a PUT
+    without `branch` commits to the protected default branch and is rejected). A falsy sha is
+    OMITTED: that is the contents-API create-if-absent form for a file 404 on a PRESENT branch."""
+    body = {"message": message, "content": encoded, "branch": LEDGER_REF}
+    if sha:
+        body["sha"] = sha
+    return body
+
+
 def _read_ledger(
     api: GitHubAPI, registry_repo: str
-) -> tuple[list[dict[str, Any]], str]:
-    result = api.request("GET", f"/repos/{registry_repo}/contents/{LEDGER_PATH}")
+) -> tuple[list[dict[str, Any]], str | None]:
+    result = api.request("GET", ledger_read_path(registry_repo), allow_404=True)
+    if result is None:
+        # File-absent vs branch-absent (issue #28, review round 1): a missing FILE on a PRESENT
+        # ledger branch seeds an empty ledger (sha=None → the next CAS PUT creates it); a missing
+        # BRANCH fails LOUD, never silently-empty — grooming against a missing ledger branch
+        # would mask the exact outage class this ref exists to prevent.
+        branch = api.request(
+            "GET", f"/repos/{registry_repo}/git/ref/heads/{LEDGER_REF}", allow_404=True
+        )
+        if branch is None:
+            raise GroomError(
+                f"registry lease ledger read returned 404 and the '{LEDGER_REF}' ledger branch "
+                "is missing — create it (see data/README.md)"
+            )
+        return [], None
     if not isinstance(result, dict):
         raise GroomError("registry lease ledger response is malformed")
     content = result.get("content")
@@ -450,11 +483,7 @@ def _release_claims(
             result = api.request(
                 "PUT",
                 f"/repos/{registry_repo}/contents/{LEDGER_PATH}",
-                {
-                    "message": f"groom {len(present)} dead lease(s)",
-                    "content": encoded,
-                    "sha": sha,
-                },
+                ledger_put_body(f"groom {len(present)} dead lease(s)", encoded, sha),
                 retry_conflict=True,
             )
         except GroomConflict:
@@ -1208,6 +1237,40 @@ def _self_test() -> int:
     except GroomError:
         bad_holder_failed = True
     check("malformed non-repair holder still fails closed", bad_holder_failed, True)
+
+    # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
+    # Literal "ledger": pointing either helper back at the default branch (or changing the shipped
+    # REGISTRY_LEDGER_REF default) must turn these red.
+    check(
+        "ledger read targets the ledger ref",
+        ledger_read_path("o/r"),
+        f"/repos/o/r/contents/{LEDGER_PATH}?ref=ledger",
+    )
+    check("ledger write pins branch=ledger", ledger_put_body("m", "abc", "s")["branch"], "ledger")
+    check("ledger write carries the CAS sha", ledger_put_body("m", "abc", "s")["sha"], "s")
+    check("ledger write without sha omits it (create-if-absent)",
+          "sha" in ledger_put_body("m", "abc", None), False)
+    seeded = _StubAPI({
+        ledger_read_path("o/r"): {
+            "content": base64.b64encode(json.dumps({"leases": []}).encode()).decode(),
+            "sha": "s1",
+        }
+    })
+    check("ledger read parses at the ledger ref", _read_ledger(seeded, "o/r"), ([], "s1"))
+    missing_ledger_loud = False
+    try:
+        _read_ledger(_StubAPI({}), "o/r")  # stub 404s every path → branch AND file absent
+    except GroomError:
+        missing_ledger_loud = True
+    check("missing ledger BRANCH fails loud (never silently-empty)", missing_ledger_loud, True)
+    check(
+        "missing ledger FILE on a present branch seeds empty (first-write path)",
+        _read_ledger(
+            _StubAPI({f"/repos/o/r/git/ref/heads/{LEDGER_REF}": {"object": {"sha": "tip"}}}),
+            "o/r",
+        ),
+        ([], None),
+    )
 
     print("groom self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

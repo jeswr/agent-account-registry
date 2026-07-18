@@ -38,6 +38,10 @@ import sys
 import time
 
 LEDGER_PATH = "data/model-health.json"
+# Mutable data plane lives on a dedicated non-code branch (issue #28): required-status-check
+# protection on the default branch rejects the bot's contents-API PUTs, so every ledger read and
+# write pins this ref. Keep in sync with select-and-claim.py / groom.py LEDGER_REF.
+LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 
 # --- ledger bounds (WHY): a rolling window is enough to decide "is access failing NOW"; an
 # unbounded append would grow the committed file forever and slow every CAS write. 200 records / 48h
@@ -404,11 +408,23 @@ class HealthConflict(HealthError):
     """A retryable contents-API compare-and-swap conflict."""
 
 
+def ledger_read_path(registry_repo):
+    """Contents-API GET path for the model-health ledger, pinned to the data-plane branch."""
+    return f"/repos/{registry_repo}/contents/{LEDGER_PATH}?ref={LEDGER_REF}"
+
+
 def read_ledger(api, registry_repo):
-    """Return (records, sha). A MISSING ledger file (first ever record) is not an error — it seeds
-    an empty window with sha=None so the first PUT creates it."""
-    result = api.request("GET", f"/repos/{registry_repo}/contents/{LEDGER_PATH}", allow_404=True)
+    """Return (records, sha). A MISSING ledger FILE on a present ledger branch (first ever record)
+    is not an error — it seeds an empty window with sha=None so the first PUT creates it. A MISSING
+    ledger BRANCH fails LOUD (issue #28): silently-empty would hide the exact outage class this
+    ref exists to prevent."""
+    result = api.request("GET", ledger_read_path(registry_repo), allow_404=True)
     if result is None:
+        if api.request("GET", f"/repos/{registry_repo}/git/ref/heads/{LEDGER_REF}",
+                       allow_404=True) is None:
+            raise HealthError(
+                f"ledger branch '{LEDGER_REF}' is missing — create it from master "
+                "(see data/README.md) before recording model health")
         return [], None
     if not isinstance(result, dict):
         raise HealthError("model-health ledger response is malformed")
@@ -431,7 +447,8 @@ def append_record(api, registry_repo, record, now, retries=6):
         encoded = base64.b64encode(
             (json.dumps({"records": records}, indent=1) + "\n").encode()).decode()
         body = {"message": f"model-health record ({record['provider']}/{record['exit_class']})",
-                "content": encoded}
+                "content": encoded,
+                "branch": LEDGER_REF}  # pin the data-plane branch, never the protected default
         if sha:
             body["sha"] = sha
         try:
@@ -687,8 +704,12 @@ def _cmd_decide(args):
     try:
         records = prune(read_ledger(api, registry_repo)[0], now)
     except HealthError as exc:
-        print(f"::warning::model-health decide: cannot read ledger ({exc}); no action")
-        return 0
+        # Every ledger reader fails LOUD (review r3, issue #28): an unreadable/missing ledger is
+        # the exact outage class this branch exists to surface, so warn-and-exit-0 would hide it.
+        # groom.yml's decide step is continue-on-error, so the maintenance sweep still completes
+        # while this step goes visibly red.
+        print(f"::error::model-health decide: cannot read ledger ({exc})")
+        return 1
     provider_accounts = _enabled_provider_accounts(
         api, registry_repo, args.policy_file, salt)
     actions = classify_records(records, provider_accounts, now)
@@ -915,6 +936,9 @@ def _self_test():
     # ---- record exits NONZERO on CAS exhaustion (defect #8) ----------------------------------
     ok = _test_record_exit(chk) and ok
 
+    # ---- decide exits NONZERO on an unreadable ledger (review r3) ----------------------------
+    ok = _test_decide_exit(chk) and ok
+
     # ---- #39 routing fallback ---------------------------------------------------------------
     ok = _test_routing(chk) and ok
 
@@ -938,23 +962,38 @@ def _raises(fn):
 
 class _StubAPI:
     """In-memory contents API for the CAS writer test. `conflict_first` simulates a lost CAS race
-    on the first PUT (a 409) so the retry loop is exercised."""
+    on the first PUT (a 409) so the retry loop is exercised. Ledger-branch discipline (issue #28)
+    is enforced structurally: a GET that does not pin `?ref=ledger` misses, a PUT that does not
+    carry `branch=ledger` fails — so pointing the I/O back at the default branch turns the whole
+    CAS suite red. `branch_missing` simulates an absent ledger branch."""
 
-    def __init__(self, seed=None, conflict_first=False):
+    def __init__(self, seed=None, conflict_first=False, branch_missing=False):
         self._blob = None if seed is None else base64.b64encode(
             json.dumps({"records": seed}).encode()).decode()
         self._sha = None if seed is None else "sha0"
         self._n = 0
         self._conflict_first = conflict_first
+        self._branch_missing = branch_missing
+        self.last_put_branch = None
 
     def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+        if method == "GET" and "/git/ref/heads/" in path:
+            if self._branch_missing or not path.endswith("/git/ref/heads/ledger"):
+                if allow_404:
+                    return None
+                raise HealthError("missing branch")
+            return {"object": {"sha": "ledger-tip"}}
         if method == "GET":
-            if self._blob is None:
+            if self._blob is None or self._branch_missing or not path.endswith(
+                    f"/contents/{LEDGER_PATH}?ref=ledger"):
                 if allow_404:
                     return None
                 raise HealthError("missing")
             return {"content": self._blob, "sha": self._sha}
         # PUT
+        self.last_put_branch = body.get("branch")
+        if self.last_put_branch != "ledger":
+            raise HealthError("PUT did not pin the ledger branch")
         self._n += 1
         if self._conflict_first and self._n == 1:
             if retry_conflict:
@@ -983,6 +1022,18 @@ def _test_cas(chk):
     apic = _StubAPI(seed=[], conflict_first=True)
     kept = append_record(apic, "o/r", r, now)
     chk("CAS retries past a conflict", kept, 1)
+    # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
+    chk("ledger read targets the ledger ref",
+        ledger_read_path("o/r"), f"/repos/o/r/contents/{LEDGER_PATH}?ref=ledger")
+    chk("CAS writes pinned branch=ledger", api.last_put_branch, "ledger")
+    missing_branch_loud = False
+    try:
+        read_ledger(_StubAPI(seed=None, branch_missing=True), "o/r")
+    except HealthError:
+        missing_branch_loud = True
+    chk("missing ledger BRANCH fails loud (never silently-empty)", missing_branch_loud, True)
+    chk("missing ledger FILE on a present branch seeds empty (first-write path)",
+        read_ledger(_StubAPI(seed=None), "o/r"), ([], None))
     return True
 
 
@@ -1060,6 +1111,29 @@ def _test_record_exit(chk):
         args = _ap.Namespace(provider="anthropic", account="", model_alias="fable",
                              exit_class="auth", run_id="1", reset_hint=None)
         chk("record exits nonzero on CAS exhaustion", _cmd_record(args), 1)
+    finally:
+        GitHubAPI = real_api
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_decide_exit(chk):
+    """_cmd_decide exits NONZERO when the ledger cannot be read (review r3) — every ledger
+    reader fails LOUD; groom.yml's continue-on-error keeps the sweep alive while the step
+    goes red, so this must never be softened back to warn-and-exit-0."""
+    import argparse as _ap
+    global GitHubAPI
+    real_api = GitHubAPI
+    saved = {k: os.environ.get(k) for k in ("REGISTRY_REPO", "GH_TOKEN")}
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", GH_TOKEN="tok")
+        GitHubAPI = lambda token: _StubAPI(seed=None, branch_missing=True)
+        chk("decide exits nonzero on an unreadable ledger",
+            _cmd_decide(_ap.Namespace(policy_file="policy/repos.toml")), 1)
     finally:
         GitHubAPI = real_api
         for k, v in saved.items():

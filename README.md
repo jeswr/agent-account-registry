@@ -39,7 +39,10 @@ The **token value** for each account is stored ONLY as a repository/organization
 > reaction of a given type per identity, so many same-bot workers all see one 🚀 and all believe they
 > own a slot. Replaced with a **compare-and-swap lease ledger** (`scripts/select-and-claim.py`).
 
-A single JSON ledger `data/leases.json` records every active lease:
+A single JSON ledger `data/leases.json` records every active lease. It lives on the
+dedicated **`ledger` data-plane branch** — not on `master` — so branch protection on the
+code branch never rejects the bot's contents-API writes, and a token that can only write
+`ledger` can never push code (issue #28; `data/README.md` on master is the tombstone):
 
 ```json
 {"leases": [{"account": "acct01", "claim_id": "<uuid>", "holder": "<owner/repo@run>",
