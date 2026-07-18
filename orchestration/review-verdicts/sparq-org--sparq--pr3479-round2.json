@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The corpus walk permits files in multiple subdirectories, but ONT is only basename(OWL), and every temporary/output path is derived from ONT. For two files such as a/foo.owl and b/foo.owl, the second run reuses the first run's cached $GATHER/foo.owl.nt because conversion is guarded by `[ -f \"$NT\" ]`, while OWL_SHA is computed from the second file. The per-engine .out files also collide, and both envelopes use reason-dl-foo-<second-resolution timestamp>.json, so a later row can overwrite an earlier one. This can silently emit a hash, verdict, and timing that do not describe the same ontology, invalidating the comparison.",
+   "file": "scripts/bench/reason-dl-same-box.sh",
+   "fix_hint": "Derive a collision-resistant per-input key, for example from the path relative to ORE_CORPUS_DIR plus a short SHA-256, and use it for every converted file, raw output, and envelope filename. Do not reuse a converted file merely because a basename-derived path exists. Add a hermetic wrapper test with two same-basename ontologies in different subdirectories and assert that each is converted independently and produces a distinct envelope tied to its own SHA-256.",
+   "severity": "major",
+   "title": "Basename collisions can reuse inputs and overwrite benchmark results"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The prior timing-scope defect is fixed: sparq is now wrapper-clocked around the complete CLI process, and the internal phase timings are only a checked breakdown. However, full-corpus gathering keys all temporary and output files only by basename. Distinct ontology files in different corpus subdirectories can therefore reuse stale converted input, overwrite raw outputs, and overwrite an earlier JSON envelope. Because the script explicitly walks two directory levels, this collision is within its supported input shape and can silently associate results and hashes with the wrong ontology. Round 2 is regressing under the required scale because this is a new major finding, despite resolving round 1's issue.",
+ "verdict": "request_changes"
+}
