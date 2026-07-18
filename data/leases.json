@@ -19,6 +19,16 @@
    "model": "opus",
    "issued_at": 1784416779,
    "expires_at": 1784419479
+  },
+  {
+   "account": "acct01",
+   "claim_id": "07f3681b714c433a8b1e21446a35ef3c",
+   "holder": "review:jeswr/agent-account-registry#277@dispatch-29665007060.1",
+   "package": "groom",
+   "role": "review",
+   "model": "terra",
+   "issued_at": 1784416950,
+   "expires_at": 1784418150
   }
  ]
 }
