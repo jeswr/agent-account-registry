@@ -1,0 +1,29 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_current_links` treats both a worker-looking branch and every `Fixes/Closes/Resolves #N` body reference as linkage, with no author or provenance admission check. The new `number not in links` condition therefore lets an unrelated or attacker-controlled open PR keep an exhausted issue out of `needs:user` indefinitely. The comments and intended invariant specifically describe a successful worker PR, but neither the implementation nor the fixture establishes that identity. This turns missing worker provenance into a permissive path rather than failing closed.",
+   "file": "scripts/groom.py",
+   "fix_hint": "Suppress exhaustion only for an open PR proven to be the corresponding admitted worker attempt, using the same authoritative provenance/identity checks as the review loop (including exact repo/issue binding). Add negative tests showing that an arbitrary PR body reference and an unadmitted worker-shaped branch do not suppress deferral.",
+   "severity": "major",
+   "title": "Any open pull request can suppress exhausted-attempt deferral"
+  },
+  {
+   "body": "`current_pulls` and `current_links` are fetched once before iterating all issue actions. The new check in the `defer` branch does not re-read pull requests immediately before `_apply_labels`; a final-attempt PR can open after that snapshot (or while earlier actions are processed), and grooming will still park the source issue. Thus the exact race the change claims to prevent remains possible.",
+   "file": "scripts/groom.py",
+   "fix_hint": "Revalidate the target issue's qualifying open worker PR state at the mutation boundary, as close to the label write as the API permits, and define a fail-closed retry/skip strategy for changes during that boundary. Exercise the post-plan appearance case through `run_sweep`.",
+   "severity": "major",
+   "title": "The write-side check does not close the open-PR race"
+  },
+  {
+   "body": "The added assertion calls only `_plan_actions`. It proves the plan-time `number not in links` condition, but it would remain green if the new `run_sweep` defer-branch guard were deleted or inverted. Consequently the second half of the security-relevant fix has no non-vacuous regression coverage.",
+   "file": "scripts/groom.py",
+   "fix_hint": "Add a stubbed `run_sweep` test where planning produces an exhausted defer action, the revalidation read then reports a qualifying open worker PR, and assert that no label mutation occurs. Include a discriminating negative case where no PR appears and the defer mutation does occur.",
+   "severity": "major",
+   "title": "Self-test does not exercise the new mutation-time guard"
+  }
+ ],
+ "progress": null,
+ "summary": "The change addresses the plan-time ordering bug, but it is not complete or fail-closed. The new exemption accepts linkage from any open pull request rather than establishing that the pull request is the successful worker attempt, and the purported mutation-time recheck is based on a repository-wide snapshot taken before the mutation loop. The self-test exercises only the planning branch, so it cannot detect removal or breakage of the added write-side guard.",
+ "verdict": "request_changes"
+}
