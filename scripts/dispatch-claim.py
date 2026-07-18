@@ -1873,6 +1873,29 @@ def _self_test():
         }],
     }
     assert validate_plan(fixture) is fixture
+    # MIXED-REPO regression (2026-07-18 outage): the assembler must emit GLOBAL
+    # (repo, pr_number) order — per-repo policy order inverts it lexicographically the
+    # moment a second target has review items ("jeswr/..." < "sparq-org/..."), and the
+    # assembler's sort key must be pr_number (a wrong "number" key KeyErrors every
+    # non-empty plan — sol r1 on #233). Simulate the assembler on reverse-policy-order
+    # input and require the sorted document to validate.
+    mixed = json.loads(json.dumps(fixture))
+    second = json.loads(json.dumps(mixed["repositories"][0]))
+    second["target_repo"] = "aaa/first-lexically"
+    mixed["repositories"].append(second)
+    ri = json.loads(json.dumps(mixed["review_items"][0]))
+    ri["repo"] = "aaa/first-lexically"
+    # policy order appends the second repo's items AFTER example/repo's — unsorted this
+    # violates the global-order invariant
+    mixed["review_items"] = mixed["review_items"] + [ri]
+    try:
+        validate_plan(mixed)
+        raise AssertionError("unsorted mixed-repo plan must be rejected")
+    except DispatchError:
+        pass
+    mixed["review_items"].sort(key=lambda item: (item["repo"], item["pr_number"]))
+    mixed["disarm_items"].sort(key=lambda item: (item["repo"], item["pr_number"]))
+    validate_plan(mixed)
     # A skip-free plan is the common case and must validate too.
     empty_skips = json.loads(json.dumps(fixture))
     empty_skips["snapshot_skips"] = []

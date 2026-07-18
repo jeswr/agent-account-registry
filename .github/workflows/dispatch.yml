@@ -485,8 +485,8 @@ jobs:
           # target has review/disarm items (latent until the registry's own drain came online
           # 2026-07-18: "jeswr/..." < "sparq-org/..." lexicographically). Sort here — one
           # authority, the validator — instead of relying on policy iteration order.
-          review_items.sort(key=lambda item: (item["repo"], item["number"]))
-          disarm_items.sort(key=lambda item: (item["repo"], item["number"]))
+          review_items.sort(key=lambda item: (item["repo"], item["pr_number"]))
+          disarm_items.sort(key=lambda item: (item["repo"], item["pr_number"]))
           document = {
               "schema": "registry-dispatch-plan/v4",
               "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
