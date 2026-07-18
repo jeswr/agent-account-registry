@@ -1247,6 +1247,14 @@
    "model_alias": "opus",
    "exit_class": "success",
    "run_id": "29626690416.1"
+  },
+  {
+   "ts": 1784341741,
+   "provider": "anthropic",
+   "account": "efb4eb2781de6958",
+   "model_alias": "fable",
+   "exit_class": "success",
+   "run_id": "29626797066.1"
   }
  ]
 }
