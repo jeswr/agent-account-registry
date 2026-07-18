@@ -1,7 +1,7 @@
 # [FABLE-5] Batch-review worker — ONE job reviews a BATCH of worker draft PRs and writes ALL their
 # verdicts in ONE atomic Git-Data-API commit (worker-pr.py verdict-record-batch), instead of N
 # single-review jobs each doing a separate contended Contents-API commit. This is the throughput +
-# robustness rebuild described in research/batch-review-worker.md: it multiplies effective review
+# robustness rebuild described in orchestration/review-verdicts/README.md: it multiplies effective review
 # parallelism past the 40-slot account cap (1 batch job = up to BATCH_SIZE reviews, K in flight) AND
 # eliminates the inter-write contention that made concurrent single-review commits thrash the branch
 # head ("registry write for … kept conflicting", observed live on sparq-org--sparq--pr2521-round3).
@@ -138,6 +138,11 @@ jobs:
           IMPL_PROVIDER: ${{ inputs.impl_provider }}
           MANIFEST_B64: ${{ inputs.manifest_b64 }}
           BATCH_K: ${{ inputs.batch_k }}
+          # The registry App bot's PR-author login (<app-slug>[bot]). Each admitted PR's author MUST
+          # equal this — the single dispatch path enforces `login == bot_login` (dispatch-claim.py);
+          # batching must re-assert the same per-PR trust gate. Empty (App slug unavailable) fails
+          # every item closed.
+          EXPECT_BOT_LOGIN: ${{ steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}
           # The provenance record is read from the registry checkout (root of trust), same as
           # dispatch. head/label/author/state are read LIVE via the App token.
         run: |
@@ -154,6 +159,12 @@ jobs:
 
           repo = os.environ["TARGET_REPO"]
           impl_provider = os.environ["IMPL_PROVIDER"]
+          expect_bot_login = os.environ.get("EXPECT_BOT_LOGIN", "")
+          if not expect_bot_login.endswith("[bot]"):
+              # The App slug could not be resolved to a bot login: fail the WHOLE batch closed rather
+              # than admit PRs whose authorship can't be checked (the single path never runs without
+              # a bot_login to compare against).
+              raise SystemExit("registry App bot login unavailable; refusing to admit any batch item")
           with open(os.environ["RUNNER_TEMP"] + "/manifest.json", encoding="utf-8") as fh:
               manifest = json.load(fh)
           if not isinstance(manifest, list) or not manifest:
@@ -202,6 +213,12 @@ jobs:
                       print(f"drop #{number}: head advanced since planning; re-plan")
                       continue
                   login = str((pull.get("user") or {}).get("login", ""))
+                  # Per-PR authorship gate (parity with the single path's `login != bot_login` defer):
+                  # the PR MUST be authored by the registry App bot. A same-repo head branch matching
+                  # the worker pattern is not sufficient — assert the author too (fail closed).
+                  if login != expect_bot_login:
+                      print(f"drop #{number}: PR author '{login}' is not the App bot")
+                      continue
                   bot_login = bot_login or login
                   labels = {lb.get("name") for lb in (pull.get("labels") or []) if isinstance(lb, dict)}
                   if HUMAN_HOLD & labels:
@@ -294,10 +311,20 @@ jobs:
           repo_json="$(gh api "repos/$TARGET_REPO")"
           default_branch="$(printf '%s' "$repo_json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["default_branch"])')"
           [[ "$default_branch" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo '::error::unsafe default branch'; exit 1; }
-          # Re-assert the LIVE head has not drifted since admission (fail closed → this leg produces
-          # no verdict, the PR re-plans; never review a stale head).
-          live_head="$(gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" -q .head.sha)"
+          # The App bot's PR-author login. The single path defers any PR whose author != the App bot
+          # (dispatch-claim.py `login != bot_login`); re-assert it here on LIVE data before this leg
+          # spends a model call, and confirm the admitted author agrees (fail closed).
+          [[ "$APP_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || { echo '::error::App slug unavailable'; exit 1; }
+          expect_author="${APP_SLUG}[bot]"
+          # Re-assert the LIVE head has not drifted since admission AND the author is the App bot
+          # (fail closed → this leg produces no verdict, the PR re-plans; never review a stale head
+          # or a non-bot-authored PR).
+          pull_json="$(gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER")"
+          live_head="$(printf '%s' "$pull_json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["head"]["sha"])')"
+          live_author="$(printf '%s' "$pull_json" | python3 -c 'import json,sys;print((json.load(sys.stdin).get("user") or {}).get("login",""))')"
           [[ "$live_head" == "$EXPECT_HEAD" ]] || { echo "::error::head drifted for #$PR_NUMBER; refusing"; exit 1; }
+          [[ "$live_author" == "$expect_author" ]] || { echo "::error::PR #$PR_NUMBER author '$live_author' is not the App bot; refusing"; exit 1; }
+          [[ "$PR_AUTHOR" == "$expect_author" ]] || { echo "::error::admitted author '$PR_AUTHOR' disagrees with the App bot; refusing"; exit 1; }
           printf 'default_branch=%s\n' "$default_branch" >> "$GITHUB_OUTPUT"
 
       - name: Checkout target default branch (pinned, no persisted token)
@@ -547,8 +574,11 @@ jobs:
         if: ${{ steps.build.outputs.count != '0' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          # The verdict data-plane branch (off the protected default). Must be seeded from master once.
-          REGISTRY_VERDICT_REF: ${{ vars.REGISTRY_VERDICT_REF || 'ledger' }}
+          # The branch batch verdicts commit to. MUST match the branch every verdict reader consumes
+          # (dispatch-claim's registry-root checkout + review-fix's prior-verdict stage), or the
+          # review→fix loop silently breaks. Defaults to the registry default branch (where the
+          # single path writes and all readers read). Override only if the readers are migrated too.
+          REGISTRY_VERDICT_REF: ${{ vars.REGISTRY_VERDICT_REF || 'master' }}
         run: |
           set -euo pipefail
           python3 registry/scripts/worker-pr.py verdict-record-batch \
@@ -609,9 +639,27 @@ jobs:
           except Exception:
               surface = []
 
-          def run(args):
-              r = subprocess.run(["python3", "registry/scripts/worker-pr.py", *args])
-              return r.returncode
+          def run(args, capture_outputs=False):
+              """Run a worker-pr subcommand. When capture_outputs, hand it a PRIVATE GITHUB_OUTPUT
+              file and return (rc, parsed_outputs) so the caller can read the decision the single
+              path reads from steps.<id>.outputs — the batch has no per-item step, so it captures the
+              same key/value stream out-of-band."""
+              env = dict(os.environ)
+              out_file = None
+              if capture_outputs:
+                  out_file = os.path.join(rt, f"outputs-{os.getpid()}-{len(str(args))}.env")
+                  open(out_file, "w").close()
+                  env["GITHUB_OUTPUT"] = out_file
+              r = subprocess.run(["python3", "registry/scripts/worker-pr.py", *args], env=env)
+              parsed = {}
+              if out_file and os.path.isfile(out_file):
+                  with open(out_file, encoding="utf-8") as fh:
+                      for line in fh:
+                          if "=" in line:
+                              k, v = line.rstrip("\n").split("=", 1)
+                              parsed[k] = v
+                  os.remove(out_file)
+              return (r.returncode, parsed) if capture_outputs else r.returncode
 
           failures = 0
           for key, status in sorted(outcomes.items()):
@@ -632,6 +680,10 @@ jobs:
               vf, ff = os.path.join(d, "verdict.json"), os.path.join(d, "files.txt")
               rn = str(meta["review_round"])
               # 1) findings + label + escalation (review-outcome), reusing the single path verbatim.
+              #    Capture its `decision` output — the single path gates the arm step on it
+              #    (review-fix.yml: the ready-and-arm step runs only for decision == 'arm'), so the
+              #    batch must too; ready-and-arm has NO verdict guard of its own and would otherwise
+              #    un-draft + arm a request_changes PR.
               args = ["review-outcome", "--repo", repo, "--pr", pr_number,
                       "--verdict-file", vf, "--files-file", ff, "--round", rn,
                       "--max-rounds", os.environ.get("MAX_REVIEW_ROUNDS", "3"),
@@ -644,28 +696,42 @@ jobs:
                   args.append("--security")
               for p in surface:
                   args += ["--surface-path", p]
-              if run(args) != 0:
+              rc, outputs = run(args, capture_outputs=True)
+              if rc != 0:
                   print(f"::warning::review-outcome failed for #{pr_number}; it re-plans next tick")
                   failures += 1
                   continue
+              decision = outputs.get("decision", "")
               # 2) ready-and-arm — HOST-only, sha-bound, hash-asserted, trust-surface + security gated.
-              #    On approve only; the single path's exact gate. A withheld arm (security surface)
-              #    is a human's click, exactly as today.
-              arm_args = ["ready-and-arm", "--repo", repo, "--pr", pr_number,
-                          "--reviewed-sha", meta["reviewed_sha"],
-                          "--impl-provider", meta["impl_provider"],
-                          "--impl-account-h", meta["impl_account_h"],
-                          "--reviewer-provider", meta["reviewer_provider"],
-                          "--arm", os.environ.get("ARM_AUTO_MERGE", "true")]
-              if meta.get("issue") is not None:
-                  arm_args += ["--issue", str(meta["issue"])]
-              for p in surface:
-                  arm_args += ["--surface-path", p]
-              # ready-and-arm is idempotent + no-ops on a request_changes verdict, so it is safe to
-              # always call; it only arms on a schema-valid approve with all gates satisfied.
-              run(arm_args)
+              #    Run ONLY when the review decision is 'arm' (schema-valid approve, all gates), exactly
+              #    like the single path's `if: decision == 'arm'` arm step. For any other decision
+              #    (changes / needs-user) review-outcome already set the terminal state, so we bind
+              #    reviewed-sha and move on — never un-drafting a request_changes PR.
+              if decision == "arm":
+                  arm_args = ["ready-and-arm", "--repo", repo, "--pr", pr_number,
+                              "--reviewed-sha", meta["reviewed_sha"],
+                              "--impl-provider", meta["impl_provider"],
+                              "--impl-account-h", meta["impl_account_h"],
+                              "--reviewer-provider", meta["reviewer_provider"],
+                              "--arm", os.environ.get("ARM_AUTO_MERGE", "true")]
+                  if meta.get("issue") is not None:
+                      arm_args += ["--issue", str(meta["issue"])]
+                  for p in surface:
+                      arm_args += ["--surface-path", p]
+                  # ready-and-arm RAISES (rc != 0) on a recoverable arm failure where the draft was
+                  # restored for the sweep to retry. Matching the single path's bind gate
+                  # (review-fix.yml binds reviewed-sha only when `decision != arm || arm succeeded`),
+                  # SKIP the terminal reviewed-sha bind when the arm failed, so the sweep re-arms it
+                  # instead of the head being marked fully-reviewed while the PR is left
+                  # drafted+unarmed (the stranded absorbing state).
+                  if run(arm_args) != 0:
+                      print(f"::warning::ready-and-arm failed for #{pr_number}; "
+                            "NOT binding reviewed-sha so the sweep re-arms it")
+                      failures += 1
+                      continue
               # 3) reviewed-sha bind LAST (terminal marker for this head): a crash before it leaves
-              #    reviewed-sha != head so the sweep re-converges the PR.
+              #    reviewed-sha != head so the sweep re-converges the PR. Reached when the decision was
+              #    not 'arm' (terminal changes/needs-user) OR the arm succeeded.
               run(["reviewed-sha", "set", "--repo", repo, "--pr", pr_number,
                    "--sha", meta["reviewed_sha"]])
               print(f"outcome applied for #{pr_number} (round {rn})")

@@ -127,7 +127,7 @@ REVIEW_MAX_CONCURRENT = 10
 FIX_MAX_CONCURRENT = 8
 REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
 FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
-# [FABLE-5] Batch-review worker (design: research/batch-review-worker.md). ONE batch job claims ONE
+# [FABLE-5] Batch-review worker (design: orchestration/review-verdicts/README.md). ONE batch job claims ONE
 # account (ONE `review:` slot) and runs up to REVIEW_BATCH_K in-job parallel review calls over up to
 # REVIEW_BATCH_SIZE admitted review items, then writes ALL their verdicts in ONE atomic Git-Data-API
 # commit — so N reviews cost 1 slot + ~1 commit instead of N slots + N contended single-file commits
@@ -2811,6 +2811,101 @@ def _self_test():
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+
+            # ---- [FABLE-5] _dispatch_review_batches wiring: the batch path re-implements the two
+            # trust-critical review invariants (reviewer_provider != impl_provider AND
+            # reviewer_account != any impl_account in the batch) over a batch loop, so a bug there
+            # would not be caught by the single-path _dispatch_review_items wiring above. Stub the
+            # allocator + workflow launch and assert: (a) a same-provider claim DEFERS + releases +
+            # launches nothing; (b) a claim whose account hash collides with a batch member's
+            # impl_account_h DEFERS + releases + launches nothing; (c) a clean cross-provider,
+            # cross-account claim LAUNCHES the review-batch workflow exactly once. ----
+            os.environ["PROVENANCE_SALT"] = "batch-salt"
+            batch_launch_calls = []
+
+            class BatchAllocator:
+                """Returns a preset claim once, then None; records every release."""
+                def __init__(self, claim):
+                    self._claim = claim
+                    self.releases = []
+
+                def claim(self, *_a, **_k):
+                    c, self._claim = self._claim, None
+                    return c
+
+                def release(self, _repo, claim_id, _now):
+                    self.releases.append(claim_id)
+                    return True
+
+            def fake_run_gh_batch(args, **_kwargs):
+                # Only the workflow launch reaches _run_gh in this path.
+                if args[:2] == ["workflow", "run"]:
+                    batch_launch_calls.append(args)
+                    return argparse.Namespace(returncode=0, stdout="", stderr="")
+                raise AssertionError(f"unexpected _run_gh in batch dispatch: {args}")
+
+            # Two anthropic-implemented candidates in one package -> one cross-provider (openai)
+            # review batch. impl_account_h values are two DISTINCT salted hashes of VALID handles
+            # (so the account-format gate passes and the collision gate is the one under test).
+            impl_acct_h = wiring_worker_pr.account_hash("acct11", "batch-salt")
+            other_impl_h = wiring_worker_pr.account_hash("acct12", "batch-salt")
+            batch_cands = [
+                {"pr_number": 50, "impl_provider": "anthropic", "package": "crate-a",
+                 "impl_account_h": impl_acct_h, "head_sha": "a" * 40, "review_round": 1},
+                {"pr_number": 51, "impl_provider": "anthropic", "package": "crate-a",
+                 "impl_account_h": other_impl_h, "head_sha": "b" * 40, "review_round": 1},
+            ]
+            # anthropic-implemented PRs are reviewed by the inverse REVIEW_CHAIN["anthropic"] ==
+            # ["terra"] (openai/codex); terra is resolvable as a codex default even with no model.
+            routing_batch = {"models": {"terra": {"provider_model": "TBD", "harness": "codex"}}}
+            valid_claim_id = "d" * 32
+
+            def run_batches(claim):
+                batch_launch_calls.clear()
+                alloc = BatchAllocator(claim)
+                real_run_gh = globals()["_run_gh"]
+                globals()["_run_gh"] = fake_run_gh_batch
+                try:
+                    launched = _dispatch_review_batches(
+                        batch_cands, repo, routing_batch, alloc, wiring_worker_pr,
+                        "reg/repo", "main", {"account_pool": []})
+                finally:
+                    globals()["_run_gh"] = real_run_gh
+                return launched, alloc
+
+            # (a) SAME-PROVIDER claim (anthropic-implemented batch requires an OPENAI reviewer, but
+            # the allocator handed back an anthropic reviewer): fail closed — defer, release, no
+            # launch. This is the cross-provider review guarantee the whole lane turns on.
+            same_prov = {"account": "acct09", "claim_id": valid_claim_id,
+                         "provider": "anthropic", "model": "terra"}
+            launched, alloc = run_batches(same_prov)
+            assert launched == 0, launched
+            assert batch_launch_calls == [], batch_launch_calls
+            assert alloc.releases == [valid_claim_id], alloc.releases
+
+            # (b) CROSS-account COLLISION: the claimed reviewer account (acct11) hashes to batch
+            # member #50's impl_account_h (an implementer would review its own PR) — fail closed.
+            # acct11 is a valid handle so the account-format gate passes and the COLLISION gate is
+            # the one exercised.
+            collide_claim = {"account": "acct11", "claim_id": valid_claim_id,
+                             "provider": "openai", "model": "terra"}
+            launched, alloc = run_batches(collide_claim)
+            assert launched == 0, launched
+            assert batch_launch_calls == [], batch_launch_calls
+            assert alloc.releases == [valid_claim_id], alloc.releases
+
+            # (c) CLEAN cross-provider + cross-account claim -> launch the batch exactly once.
+            good_claim = {"account": "acct42", "claim_id": valid_claim_id,
+                          "provider": "openai", "model": "terra",
+                          "secret_ref": "sref", "harness": "codex", "credential_format": "cf"}
+            launched, alloc = run_batches(good_claim)
+            assert launched == 1, launched
+            assert len(batch_launch_calls) == 1, batch_launch_calls
+            assert alloc.releases == [], alloc.releases  # a launched batch keeps its lease
+            launch_args = batch_launch_calls[0]
+            assert "review-batch.yml" in launch_args
+            assert "impl_provider=anthropic" in launch_args
+            assert "reviewer_provider=openai" in launch_args
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io

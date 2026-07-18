@@ -104,13 +104,18 @@ VERDICT_DIR = "orchestration/review-verdicts"
 # the lease ledger (select-and-claim.py) and model-health CAS append. Keep in sync with
 # groom.py / select-and-claim.py / model-health.py LEDGER_REF.
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
-# [FABLE-5] Data-plane ref for BATCH verdict files. Batch verdict commits go to this dedicated
-# branch (default the shared `ledger` data-plane branch — same rationale as LEDGER_REF above and
-# the lease + model-health ledgers, issue #28) instead of the protected default branch. Pinned in
-# every read AND write so the atomic multi-blob commit path never races the default-branch head
-# (the "kept conflicting" thrash observed on sparq-org--sparq--pr2521-round3.json). The
-# single-file `_registry_put_file` path pins LEDGER_REF; the batch writer pins this ref.
-VERDICT_REF = os.environ.get("REGISTRY_VERDICT_REF", "ledger")
+# [FABLE-5] Branch the atomic multi-verdict commit targets. This MUST be the same branch every
+# verdict READER consumes, or batch verdicts become invisible and the review→fix loop silently
+# breaks: `dispatch-claim.latest_recorded_progress` + the fix-dispatch gate read the verdict from
+# the `--registry-root registry` (default-branch) checkout, and `review-fix.yml` stages the prior
+# verdict from `registry/orchestration/review-verdicts/...` (also the default branch). The single
+# path (`_registry_put_file`) writes verdicts to the default branch via the Contents API, so the
+# batch writer pins the default branch too — one branch for every read and every write. Overridable
+# via REGISTRY_VERDICT_REF only if the readers are migrated in lockstep (data/README.md). Writing
+# the verdict tree via the Git-Data-API to the default branch has the SAME contention profile as
+# the single path's Contents-API PUT it replaces; the CAS retry (re-read + re-filter per attempt)
+# handles a raced head — see `_registry_write_many`.
+VERDICT_REF = os.environ.get("REGISTRY_VERDICT_REF", "master")
 
 
 class WorkerPrError(RuntimeError):
@@ -887,15 +892,16 @@ def _canonical_verdict_bytes(document):
 
 
 def _git_data_read_ref(registry_repo, ref):
-    """Return (ref_sha, base_tree_sha) for `refs/heads/{ref}`. A MISSING data-plane BRANCH fails
-    LOUD (issue #28 — a silently-empty verdict branch would hide the exact contention class this
-    ref exists to prevent); the branch must be seeded from master once (see data/README.md)."""
+    """Return (ref_sha, base_tree_sha) for `refs/heads/{ref}`. A MISSING verdict branch fails LOUD:
+    the verdict branch MUST be the branch every reader consumes (the registry default branch by
+    default), so a 404 here means a misconfigured REGISTRY_VERDICT_REF, not a benign empty branch —
+    recording verdicts to a branch nothing reads would silently break the review→fix loop."""
     probe = _run_gh(["api", f"repos/{registry_repo}/git/ref/heads/{ref}"], check=False)
     if probe.returncode != 0:
         if "HTTP 404" in probe.stderr:
             raise WorkerPrError(
-                f"verdict data-plane branch '{ref}' is missing — seed it from master "
-                "(see data/README.md) before recording batch verdicts")
+                f"verdict branch '{ref}' does not exist — REGISTRY_VERDICT_REF must name the "
+                "branch the verdict readers consume (the registry default branch)")
         raise WorkerPrError(f"could not read verdict ref '{ref}'")
     try:
         ref_doc = json.loads(probe.stdout)
@@ -926,62 +932,76 @@ def _git_data_existing_bytes(registry_repo, ref, path):
         raise WorkerPrError(f"registry file {path} is unreadable") from exc
 
 
-def _registry_write_many(registry_repo, files, message, *, ref=None, retries=2):
+def _registry_write_many(registry_repo, files, message, *, ref=None, retries=6):
     """[FABLE-5] Atomically write N registry data files in ONE Git-Data-API commit, eliminating the
     per-file Contents-API write contention that made concurrent single-review commits thrash the
     branch head ("registry write for … kept conflicting", e.g. sparq-org--sparq--pr2521-round3.json).
 
     `files` is a list of (path, document) pairs. Returns a per-file result dict
     {path: "written" | "identical" | "conflict"} so the caller can label/arm only the successfully
-    recorded items. Per-file idempotency exactly matches `_registry_put_file`:
+    recorded items. Per-file idempotency exactly matches `_registry_put_file`, and — crucially — the
+    absent/identical/different decision is RE-DERIVED against the freshly-read ref on EVERY CAS
+    attempt (never hoisted out of the loop), so a concurrent writer that lands a DIFFERENT verdict at
+    one of our paths between attempts is detected and dropped, not clobbered:
       - absent on the ref            -> the blob is included in the tree ("written");
       - byte-identical already there -> the blob is OMITTED ("identical"; nothing to commit);
       - DIFFERENT content already    -> FAIL CLOSED for that file ("conflict"): it is dropped from
-                                        the tree, gets no label/arm, and is NEVER silently rewritten;
-                                        the commit still proceeds for the healthy items.
-    If, after that filter, no file needs writing, NO commit is made (empty-tree short-circuit).
-    A non-fast-forward ref update (another writer advanced the head) triggers ONE CAS retry:
-    re-read the ref, re-base the same content-addressed blobs on the new tree, re-commit, re-update.
-    One retry suffices because there is at most one batch writer per branch head per tick.
+                                        the tree, gets no label/arm, and is NEVER silently rewritten
+                                        (the invariant holds on the WINNING attempt, not just the
+                                        first); the commit still proceeds for the healthy items.
+    If, after that per-attempt filter, no file needs writing, NO commit is made (empty-tree
+    short-circuit) and the last-computed result map is returned.
 
-    The commit targets `ref` (default VERDICT_REF, a data-plane branch off the protected default),
-    pinned in every read and write, so the commit never races the code-review default branch head."""
+    A non-fast-forward ref update (another writer advanced the head between our read and our PATCH)
+    triggers a CAS retry: re-read the ref, RE-RUN the idempotency filter against the new tree, re-base
+    the content-addressed blobs for the paths that still need writing, re-commit, re-update. The
+    default target ref (VERDICT_REF) is the registry default branch — the hottest ref in the system
+    (lease claim/release, model-health, groom all advance it) — so the retry budget matches the lease
+    writer's (6), NOT a one-writer-per-tick assumption. The concurrency group
+    review-batch-<target>-<account> does NOT serialize batch jobs on different accounts writing the
+    same ref, so real same-ref contention is expected and the per-attempt re-filter makes it safe."""
     ref = ref or VERDICT_REF
-    # 1. Per-file idempotency filter against the CURRENT ref state (read once up front — the
-    #    absent/identical/different decision is content-addressed and survives a CAS rebase).
-    result = {}
-    to_write = []  # list of (path, canonical_bytes)
-    for path, document in files:
-        body = _canonical_verdict_bytes(document)
-        existing = _git_data_existing_bytes(registry_repo, ref, path)
-        if existing is None:
-            to_write.append((path, body))
-            result[path] = "written"
-        elif existing == body:
-            result[path] = "identical"  # idempotent success — nothing to commit
-        else:
-            result[path] = "conflict"   # fail closed: never rewrite a recorded verdict
-    if not to_write:
-        return result  # fully idempotent (or all-conflict) re-run makes ZERO commits
-    # 2. Create the N content-addressed blobs once (independent of the ref head, so a later CAS
-    #    rebase reuses them without re-POSTing).
+    # Canonicalize + content-address every candidate blob ONCE (the bytes are ref-independent, so a
+    # CAS rebase reuses the blob shas without re-POSTing). The absent/identical/different decision is
+    # NOT precomputed here — it is re-derived per attempt against the live ref inside the loop.
+    canonical = [(path, _canonical_verdict_bytes(document)) for path, document in files]
     blob_shas = {}
-    for path, body in to_write:
-        blob = _gh_json(
-            ["api", "-X", "POST", f"repos/{registry_repo}/git/blobs", "--input", "-"],
-            input_doc={"content": body, "encoding": "utf-8"})
-        sha = blob.get("sha") if isinstance(blob, dict) else None
-        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
-            raise WorkerPrError(f"git blob create for {path} returned no sha")
-        blob_shas[path] = sha
-    # 3-6. Build tree on the current base, commit with the ref head as parent, fast-forward the
-    #      ref. One CAS retry on a non-fast-forward.
+
+    def blob_sha_for(path, body):
+        if path not in blob_shas:
+            blob = _gh_json(
+                ["api", "-X", "POST", f"repos/{registry_repo}/git/blobs", "--input", "-"],
+                input_doc={"content": body, "encoding": "utf-8"})
+            sha = blob.get("sha") if isinstance(blob, dict) else None
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+                raise WorkerPrError(f"git blob create for {path} returned no sha")
+            blob_shas[path] = sha
+        return blob_shas[path]
+
     last_exc = None
+    result = {}
     for _ in range(max(1, retries)):
+        # Re-read the ref AND re-run the per-file idempotency filter against THIS attempt's ref state.
+        # Doing the filter inside the loop is load-bearing: a concurrent writer that recorded a
+        # DIFFERENT verdict at one of our paths since the previous read is now observed and dropped
+        # (conflict), so the fast-forward we are about to take can never overwrite it.
         ref_sha, base_tree_sha = _git_data_read_ref(registry_repo, ref)
+        result = {}
+        to_write = []  # (path, canonical_bytes) still needing a commit on the fresh ref
+        for path, body in canonical:
+            existing = _git_data_existing_bytes(registry_repo, ref, path)
+            if existing is None:
+                to_write.append((path, body))
+                result[path] = "written"
+            elif existing == body:
+                result[path] = "identical"  # idempotent success — nothing to commit
+            else:
+                result[path] = "conflict"   # fail closed: never rewrite a recorded verdict
+        if not to_write:
+            return result  # fully idempotent (or all-conflict) on the fresh ref: ZERO commits
         tree_entries = [
-            {"path": path, "mode": "100644", "type": "blob", "sha": blob_shas[path]}
-            for path, _ in to_write
+            {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha_for(path, body)}
+            for path, body in to_write
         ]
         tree = _gh_json(
             ["api", "-X", "POST", f"repos/{registry_repo}/git/trees", "--input", "-"],
@@ -1001,8 +1021,9 @@ def _registry_write_many(registry_repo, files, message, *, ref=None, retries=2):
             check=False)
         if patch.returncode == 0:
             return result
-        # A non-fast-forward (422) means another batch writer advanced the ref between our read and
-        # our PATCH. Re-read + re-base the (content-addressed, still-valid) blobs and retry once.
+        # A non-fast-forward (422) means another writer advanced the ref between our read and our
+        # PATCH. Loop: re-read, RE-FILTER (so a concurrent same-path verdict is now a conflict, not a
+        # clobber), re-base the still-needed blobs, re-commit, re-update.
         last_exc = patch.stderr
     raise WorkerPrError(
         f"batch verdict commit to '{ref}' kept conflicting (non-fast-forward): {last_exc or ''}"
@@ -2289,42 +2310,70 @@ def _self_test():
     real_batch_io = {name: wiring_globals[name] for name in ("_run_gh", "_gh_json")}
 
     class FakeRegistry:
-        """A minimal Git-Data-API + Contents-API model for one data-plane branch. `head_advances`
-        makes the FIRST ref PATCH return non-fast-forward (a concurrent writer beat us) so the CAS
-        retry path is exercised; `existing` seeds already-present files (canonical bytes)."""
-        def __init__(self, existing=None, head_advances=0):
-            self.files = dict(existing or {})   # path -> canonical bytes
-            self.blobs = {}                      # sha -> content
+        """A faithful-enough Git-Data-API + Contents-API model for ONE branch that enforces the
+        real non-fast-forward rule: `PATCH refs/heads/{ref}` with force=false REJECTS any commit
+        whose recorded PARENT != the current ref head. That is the only reason the CAS retry exists,
+        so the fake must model it via parent-vs-head validation (not a bare advance counter), or a
+        regression that drops the in-loop re-read/re-base would pass undetected.
+
+        `existing` seeds already-present files (canonical bytes). `on_before_patch` is a callable
+        invoked with `self` immediately BEFORE each PATCH is evaluated — a test uses it to simulate
+        a CONCURRENT writer landing a commit on the ref inside the CAS window (same-path different
+        verdict, or a disjoint file), which advances the head and makes THIS PATCH non-fast-forward.
+        It fires once per PATCH until it returns a falsey value (so the first attempt loses, the
+        retry — after re-read + re-filter — wins)."""
+        def __init__(self, existing=None, on_before_patch=None):
+            self.files = dict(existing or {})   # path -> canonical bytes (the current ref tree)
+            self.blobs = {}                      # blob sha -> content bytes
             self.ref_sha = "0" * 40
-            self.trees = {"0" * 40: dict(self.files)}  # commit/tree sha -> {path: bytes}
-            self.head_advances = head_advances
+            # commit/tree sha -> {path: bytes}; commit sha resolves to its own tree in this model.
+            self.trees = {"0" * 40: dict(self.files)}
+            self.parents = {"0" * 40: None}      # commit sha -> parent sha (for the ff check)
+            self.on_before_patch = on_before_patch
             self.commits = 0
             self.blob_posts = 0
+            self.patch_attempts = 0
+            self.commit_parents = []             # parent sha the client used on each commit POST
             self._n = 0
 
         def _sha(self, seed):
             self._n += 1
             return hashlib.sha1(f"{seed}:{self._n}".encode()).hexdigest()
 
+        def concurrent_commit(self, files):
+            """Model an external writer committing `files` (path -> canonical bytes) onto the ref,
+            advancing the head. Used by tests to seed a same-path or disjoint concurrent write in
+            the CAS window."""
+            tree = dict(self.files)
+            tree.update(files)
+            new_sha = self._sha("external")
+            self.trees[new_sha] = tree
+            self.parents[new_sha] = self.ref_sha
+            self.ref_sha = new_sha
+            self.files = tree
+
         def run_gh(self, args, **_kwargs):
             # gh arg layouts: ["api", "<path>", ...] or ["api", "-X", "<VERB>", "<path>", ...].
             verb = args[2] if args[:2] == ["api", "-X"] else "GET"
             path = args[3] if args[:2] == ["api", "-X"] else (args[1] if len(args) > 1 else "")
             if verb == "PATCH":
-                # refs/heads/<ref> PATCH: sha=<commit> force=false
+                # refs/heads/<ref> PATCH: sha=<commit> force=false.
+                self.patch_attempts += 1
                 new_sha = next(p.split("=", 1)[1] for p in args if p.startswith("sha="))
-                if self.head_advances > 0:
-                    self.head_advances -= 1
-                    # a concurrent writer advanced the head: our parent is now stale
-                    self.ref_sha = self._sha("concurrent")
-                    self.trees[self.ref_sha] = dict(self.files)
+                if self.on_before_patch is not None:
+                    # A concurrent writer may land here, advancing the head so our parent is stale.
+                    if not self.on_before_patch(self):
+                        self.on_before_patch = None
+                # REAL non-fast-forward semantics: reject unless the commit's PARENT is the current
+                # head. The fake NEVER accepts a commit built on a stale parent.
+                if self.parents.get(new_sha) != self.ref_sha:
                     return argparse.Namespace(returncode=1, stdout="",
                                               stderr="HTTP 422: Update is not a fast forward")
                 self.ref_sha = new_sha
                 self.files = dict(self.trees[new_sha])
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             if path.startswith("repos/") and "/contents/" in path:
-                # GET contents/<path>?ref=<ref> — idempotency probe
+                # GET contents/<path>?ref=<ref> — idempotency probe against the CURRENT ref tree.
                 rel = path.split("/contents/", 1)[1].split("?", 1)[0]
                 if rel in self.files:
                     content = base64.b64encode(self.files[rel].encode()).decode()
@@ -2359,18 +2408,33 @@ def _self_test():
             if path.endswith("/git/commits"):
                 self.commits += 1
                 tree_sha = input_doc["tree"]
+                parent = (input_doc.get("parents") or [None])[0]
+                self.commit_parents.append(parent)
                 commit_sha = self._sha("commit")
                 self.trees[commit_sha] = dict(self.trees[tree_sha])  # commit resolves to its tree
+                self.parents[commit_sha] = parent                    # record parent for the ff check
                 return {"sha": commit_sha}
             raise WorkerPrError(f"unexpected gh_json path {path}")
 
-    def run_batch(reg, files, message):
+    def run_batch(reg, files, message, retries=6):
         wiring_globals["_run_gh"] = reg.run_gh
         wiring_globals["_gh_json"] = reg.gh_json
         try:
-            return _registry_write_many("reg/registry", files, message)
+            return _registry_write_many("reg/registry", files, message, retries=retries)
         finally:
             wiring_globals.update(real_batch_io)
+
+    def advance_once(new_files):
+        """An on_before_patch that fires the concurrent commit exactly once (first PATCH loses)."""
+        state = {"fired": False}
+
+        def hook(reg):
+            if state["fired"]:
+                return False
+            state["fired"] = True
+            reg.concurrent_commit(new_files)
+            return False  # one-shot: the retry PATCH is unobstructed
+        return hook
 
     vpath = lambda pr, rn: verdict_path("o/r", pr, rn)  # noqa: E731
     vdoc = lambda vd: {"verdict": vd, "injection_detected": False, "summary": "s", "issues": []}
@@ -2410,8 +2474,12 @@ def _self_test():
           (res[vpath(2, 1)], vpath(2, 1) in reg.files), ("written", True))
     check("batch: a mixed batch still makes exactly one commit", reg.commits, 1)
 
-    # (4) CAS loser: first ref PATCH is non-fast-forward (a concurrent writer won); retry succeeds.
-    reg = FakeRegistry(head_advances=1)
+    # (4) CAS loser: a concurrent writer lands a DISJOINT file inside the CAS window, advancing the
+    # head so our first PATCH is non-fast-forward; the retry re-reads, re-bases on the NEW tree, and
+    # succeeds. This proves the retry re-reads the ref (finding #8): a stale-parent commit would be
+    # rejected by the ff check forever, so a success here requires the in-loop re-read + re-base.
+    disjoint = {vpath(100, 1): _canonical_verdict_bytes(approve)}  # some OTHER writer's verdict
+    reg = FakeRegistry(on_before_patch=advance_once(disjoint))
     res = run_batch(reg, [(vpath(9, 1), approve), (vpath(9, 2), reject)], "cas-loser retries")
     check("batch: CAS-loser still records both verdicts",
           [res[vpath(9, 1)], res[vpath(9, 2)]], ["written", "written"])
@@ -2419,9 +2487,46 @@ def _self_test():
           reg.blob_posts, 2)
     check("batch: both files present after the CAS retry",
           all(vpath(9, rn) in reg.files for rn in (1, 2)), True)
+    check("batch: the concurrent writer's disjoint file survives (not clobbered)",
+          reg.files[vpath(100, 1)], _canonical_verdict_bytes(approve))
+    check("batch: two PATCH attempts were made (first lost, retry won)", reg.patch_attempts, 2)
+    # The retry MUST have committed on the concurrent writer's advanced head, not the stale one:
+    # the two commit POSTs used DIFFERENT parents (finding #8 — no stale-parent re-commit).
+    check("batch: the retry re-based on the advanced head (distinct commit parents)",
+          len(set(reg.commit_parents)) == 2, True)
 
-    # (5) persistent non-fast-forward beyond the retry budget -> raise (no silent loss).
-    reg = FakeRegistry(head_advances=9)
+    # (4b) SAME-PATH concurrent DIFFERENT verdict inside the CAS window: a concurrent writer records
+    # a DIFFERENT verdict at one of OUR paths after our first read but before our PATCH. The retry
+    # MUST re-run the idempotency filter against the fresh ref, observe the different content, and
+    # FAIL CLOSED for that path (never overwrite the other writer's verdict) — findings #2/#5. Before
+    # the fix this path was silently clobbered because the filter was hoisted out of the CAS loop.
+    reg = FakeRegistry(on_before_patch=advance_once(
+        {vpath(9, 1): _canonical_verdict_bytes(reject)}))  # concurrent writer: DIFFERENT verdict
+    res = run_batch(reg, [(vpath(9, 1), approve), (vpath(9, 2), reject)], "same-path race")
+    check("batch: same-path concurrent DIFFERENT verdict fails closed on retry",
+          res[vpath(9, 1)], "conflict")
+    check("batch: the concurrent writer's same-path verdict is NOT overwritten",
+          reg.files[vpath(9, 1)], _canonical_verdict_bytes(reject))
+    check("batch: the OTHER batch path still commits after the same-path conflict",
+          (res[vpath(9, 2)], vpath(9, 2) in reg.files), ("written", True))
+
+    # (4c) SAME-PATH concurrent IDENTICAL verdict: the concurrent writer recorded the SAME bytes we
+    # were going to write — the retry's re-filter reports "identical" (idempotent), not a clobber.
+    reg = FakeRegistry(on_before_patch=advance_once(
+        {vpath(9, 1): _canonical_verdict_bytes(approve)}))  # concurrent writer: SAME verdict
+    res = run_batch(reg, [(vpath(9, 1), approve), (vpath(9, 2), reject)], "same-path identical race")
+    check("batch: same-path concurrent IDENTICAL verdict is idempotent on retry",
+          res[vpath(9, 1)], "identical")
+    check("batch: same-path identical race still records the other path",
+          res[vpath(9, 2)], "written")
+
+    # (5) persistent non-fast-forward beyond the retry budget -> raise (no silent loss). A writer
+    # that keeps advancing the head on EVERY PATCH (never returns falsey) starves the CAS budget.
+    def always_advance(reg):
+        reg.concurrent_commit({vpath(500, 1): _canonical_verdict_bytes(approve)})
+        return True  # keep obstructing every attempt
+
+    reg = FakeRegistry(on_before_patch=always_advance)
     try:
         run_batch(reg, [(vpath(5, 1), approve)], "always-loses")
     except WorkerPrError as exc:
