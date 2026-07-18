@@ -891,6 +891,13 @@ jobs:
   # JOB-level alarm needs BOTH jobs and fires on ANY failure/cancel/skip, so a PLAN crash (claim
   # skipped) AND a claim failure both upsert the single rolling pipeline-failure issue. It is the
   # last line of defense: no silent dispatch tick.
+  #
+  # SUPERSEDES PR #51's standalone `plan-alert` job (scripts/plan-alert.py, `ops-alert` label):
+  # #51 solved the SAME PLAN-crash-silences-CLAIM gap with a SECOND rolling issue under a SECOND
+  # label. Running both would spam TWO rolling issues for one PLAN crash — the exact "two competing
+  # spammers" the unified alarm exists to prevent. So this PR DELETES plan-alert.py and folds its
+  # (a) PLAN-crash channel into this alarm job and (b) auto-close-on-heal into the `recover` job
+  # below (pipeline-alarm.py --resolve), keeping ONE failure channel with recovery detection.
   alarm:
     needs: [plan, claim]
     if: >-
@@ -922,3 +929,34 @@ jobs:
           registry-token: ${{ github.token }}
           alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           alert-token: ${{ secrets.ALERT_TOKEN || '' }}
+
+  # [FABLE-5] Auto-close-on-heal (ported from PR #51's plan-alert recovery, generalized). On a
+  # HEALTHY dispatch tick (plan+claim both succeeded), prune dispatch's rows from the rolling alert
+  # and auto-close the issue once the ledger empties. This restores the recovery detection #51 had
+  # and this PR would otherwise have dropped. It NEVER reddens (success path, `--resolve` exits 0
+  # fail-soft) and, with no open alert, does only a bare `gh issue list` (cheap green tick).
+  recover:
+    needs: [plan, claim]
+    if: ${{ always() && needs.plan.result == 'success' && needs.claim.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Auto-close the rolling pipeline alert on a healthy dispatch tick
+        env:
+          ALARM_GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+        run: |
+          set -uo pipefail
+          if [ -n "${ALERT_TOKEN:-}" ]; then printf '::add-mask::%s\n' "$ALERT_TOKEN"; fi
+          python3 scripts/pipeline-alarm.py --self-test
+          python3 scripts/pipeline-alarm.py --resolve

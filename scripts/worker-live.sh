@@ -598,6 +598,9 @@ run_gate() {
 # NAMING NOTE (review round): the routing validator here is scripts/route-resolve.py (added by the
 # onboarding push) — there is NO scripts/routing-validate.py; do not reference that name in suite
 # lists or briefs.
+# [FABLE-5] pipeline-alarm.py SUPERSEDES plan-alert.py (#51): the unified loud-fail alarm now
+# carries the PLAN-crash failure channel AND a generalized auto-close-on-heal, so plan-alert.py is
+# deleted in this PR — it is intentionally absent from this suite.
 FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
 plan-snapshot.py triage.py pipeline-alarm.py dispatch-claim.py worker-pr.py worker-issue.py \
 select-and-claim.py groom.py account-usage.py usage-alert.py model-health.py pat-validity.py \
