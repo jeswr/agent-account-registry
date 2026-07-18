@@ -480,13 +480,6 @@ jobs:
                   repo, pulls, issue_labels)
 
           snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
-          # The validator (dispatch-claim validate_plan) requires GLOBAL (repo, number) order;
-          # per-repo enumeration appends in POLICY order, which inverts it the moment a second
-          # target has review/disarm items (latent until the registry's own drain came online
-          # 2026-07-18: "jeswr/..." < "sparq-org/..." lexicographically). Sort here — one
-          # authority, the validator — instead of relying on policy iteration order.
-          review_items.sort(key=lambda item: (item["repo"], item["pr_number"]))
-          disarm_items.sort(key=lambda item: (item["repo"], item["pr_number"]))
           document = {
               "schema": "registry-dispatch-plan/v4",
               "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -495,6 +488,10 @@ jobs:
               "disarm_items": disarm_items,
               "snapshot_skips": snapshot_skips,
           }
+          # GLOBAL (repo, pr_number) order via the SHARED, self-tested helper (sol r2 on
+          # #233): per-repo policy-order assembly inverts lexicographically with a second
+          # active target; the sort must be the exact code the self-test exercises.
+          claim_mod.normalize_plan_order(document)
           # PLAN-side inline set-equality checks (CLAIM repeats a stricter independent
           # re-validation of the artifact as hostile data before any mutation).
           if set(document) != {"schema", "generated_at", "repositories", "review_items",
