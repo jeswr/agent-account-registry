@@ -75,6 +75,7 @@ SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # from the target policy row; this constant is the built-in fail-closed default when no list is
 # supplied (so the guard is never silently absent).
 DEFAULT_TRUST_SURFACE_PATHS = (
+    "scripts/trust-gate.py",
     "scripts/dispatch-claim.py",
     "scripts/worker-live.sh",
     "scripts/worker-pr.py",
