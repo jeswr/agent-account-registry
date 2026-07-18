@@ -1,0 +1,9 @@
+{
+ "head_sha_at_open": "cff06503aa7eb118edcc66f428c6a669fbddafed",
+ "impl_account_h": "dc2d751954080e13",
+ "impl_alias": "terra",
+ "impl_provider": "openai",
+ "issue": 3349,
+ "pr_number": 3437,
+ "recorded_at_run": "backfill:29626187834.1"
+}
