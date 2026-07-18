@@ -161,16 +161,6 @@
    "expires_at": 1784345882
   },
   {
-   "account": "acct01",
-   "claim_id": "c7bb9ee014a54e4498dd9b8a69d30d8e",
-   "holder": "sparq-org/sparq#2871@dispatch-29625933900.1",
-   "package": "ci-fragments",
-   "role": "impl",
-   "model": "terra",
-   "issued_at": 1784339585,
-   "expires_at": 1784345885
-  },
-  {
    "account": "acct2css",
    "claim_id": "650f991954514dfbaffa2ae9c67c242a",
    "holder": "sparq-org/sparq#2585@dispatch-29626100026.1",
