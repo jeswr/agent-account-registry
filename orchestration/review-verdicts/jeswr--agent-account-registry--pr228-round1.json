@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly replaces the former HTTP-success shortcut with ledger-first decoding and the review loop's authoritative provenance admission predicate. A clean ledger 404 alone falls back to master, non-404 probe failures remain fail-closed, malformed or PR-mismatched records are escalated for human repair, and only an admissible record can take the already-recorded skip path. The added self-tests are substantive and cover matching, malformed, mismatched, legacy-handle, lookup precedence, absence, and error propagation cases. No trust check is weakened and no injection-directed text appears in the diff.",
+ "verdict": "approve"
+}
