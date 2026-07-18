@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`KEY` combines a lossy sanitized relative stem with a hash of file contents only. Distinct paths such as `a/foo.owl` and `a_foo.owl` both sanitize to `a_foo`; if their bytes are identical, their SHA suffix is also identical. They then share the NT cache and raw output paths, and both envelopes use the same key plus a second-resolution timestamp, allowing the later row to overwrite the earlier row. Thus the claimed one-envelope-per-ontology corpus walk remains incomplete for a supported input shape. The new test does not expose this because its two fixtures deliberately have different content hashes.",
+   "file": "scripts/bench/reason-dl-same-box.sh",
+   "fix_hint": "Include a hash of the exact corpus-relative path in `KEY` (or use a reversible/path-preserving encoding), in addition to the content hash. Extend `scripts/tests/test_reason_dl_same_box_keys.sh` with two distinct paths whose sanitized stems collide and whose contents are identical; assert distinct artifact paths and two envelopes identifying both relative paths.",
+   "severity": "major",
+   "title": "Lossy path sanitization still permits per-input key collisions"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 2's basename collision is improved and the new hermetic test passes for same-basename files with different content. However, the replacement key is still not collision-resistant: sanitizing the relative stem with `tr -c` is lossy, while the hash suffix covers only file content. Two distinct relative paths that sanitize identically and contain identical bytes receive the same key, so converted/raw artifacts are shared and their same-second envelope names collide. This is a new major finding, so progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
