@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "After both listings and the local jq guard, another manual or workflow writer can create the same issue or set the same secret before this run executes `gh secret set`. The workflow concurrency group only serializes this workflow, while the comments explicitly identify other writers as part of the threat model. Because `gh secret set` is an upsert and issue titles are not unique, this sequence can still overwrite a credential and create duplicate registrations. Calling the chosen value a reserved slot and asserting it is always free is therefore unsound.",
+   "file": ".github/workflows/set-up-account.yml",
+   "fix_hint": "Use a single shared atomic claim mechanism observed by every account writer (for example a compare-and-swap update to a canonical allocation record), and only write the credential after this run owns that exact claim. Re-reading immediately before the upsert cannot substitute for atomic ownership. Ensure failures release or safely preserve the claim without allowing a different credential to overwrite it.",
+   "severity": "major",
+   "title": "The live re-read remains a TOCTOU check, not a reservation"
+  },
+  {
+   "body": "The new check says it derives from every acctNN issue in any state, but `gh issue list --state all --limit 500` examines at most 500 issues. A matching account issue outside that page is invisible. If its corresponding secret is absent (for example after rotation/removal or a partial registration), the code can reuse that issue number and create a duplicate title, contradicting the fail-closed invariant.",
+   "file": ".github/workflows/set-up-account.yml",
+   "fix_hint": "Enumerate all issue pages, or query a canonical allocation record that is complete and atomically maintained. If completeness cannot be established, abort rather than treating the omitted portion as free.",
+   "severity": "major",
+   "title": "The issue listing does not cover every account title"
+  }
+ ],
+ "progress": null,
+ "summary": "The change improves the freshness of the allocation snapshot, but it does not actually close the stale-slot race it claims to fix. The selected number is neither claimed atomically nor protected from the explicitly in-scope manual/other writers, and the issue scan is truncated. Therefore the workflow still cannot prove that the slot is free before its upsert and issue creation.",
+ "verdict": "request_changes"
+}
