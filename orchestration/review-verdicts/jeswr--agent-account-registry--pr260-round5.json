@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "When `pending_targets(...)` is empty, the workflow prints success and breaks without calling `verify_grant`. `pending_targets` checks only `handle not in pool`, so a target pool containing the handle twice is treated as successfully granted, despite `verify_grant` requiring `new_pool.count(handle) == 1` and the workflow comments promising that every success path verifies the parsed postcondition. The write path catches this condition, but the all-present no-op path does not. The current self-test checks a normal parsed-membership no-op only and therefore does not turn red for this defect.",
+   "file": ".github/workflows/set-up-account.yml",
+   "fix_hint": "Before accepting the no-op, validate the same exact postcondition used after an edit (including exactly one handle occurrence in every target). Add a regression assertion where every requested target already contains the handle more than once and require the no-op verification to refuse; also retain a positive assertion for a valid single-occurrence no-op.",
+   "severity": "major",
+   "title": "All-present no-op bypasses the exact parsed grant postcondition"
+  }
+ ],
+ "progress": "improving",
+ "summary": "The round-4 shell-injection blocker is fixed: label names now cross the expression/shell boundary as JSON and are parsed as data. However, the parsed-TOML postcondition is still not enforced on the all-already-present path. That path accepts duplicate handle entries even though the stated invariant requires exactly one occurrence, and the self-test omits this no-op case. Because a malformed pre-existing pool can therefore be reported as a successful grant without full verification, changes are still required. This is improving relative to round 4 because the blocker is resolved and only a lower-severity finding remains.",
+ "verdict": "request_changes"
+}
