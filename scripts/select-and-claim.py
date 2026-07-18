@@ -595,6 +595,29 @@ def _self_test():
     except KeyError:
         check("unknown lease prefix fails closed", "KeyError", "KeyError")
 
+    # ---- workflow-side parse of `--lease-config` output (PR #235 round-2 finding): the
+    # review-fix.yml claim step must match the WHOLE emitted string against an anchored
+    # two-field pattern. Its previous prefix/suffix parse (`%% *`/`##* `) silently dropped
+    # middle fields (`10 999 1200` → cap 10, ttl 1200), concealing resolver drift instead of
+    # stopping the claim. Extract the LIVE `lease_re` from the workflow (bash ERE here is
+    # plain-Python-re compatible: anchors, groups, classes only) and pin both directions.
+    import re
+    wf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", ".github", "workflows", "review-fix.yml")
+    try:
+        wf_text = open(wf_path, encoding="utf-8").read()
+    except OSError:
+        wf_text = ""
+    wf_match = re.search(r"lease_re='([^']+)'", wf_text)
+    check("review-fix.yml pins the lease-config parse in lease_re", wf_match is not None, True)
+    lease_re = wf_match.group(1) if wf_match else "$^"  # unextractable → match nothing → red
+    check("workflow lease-config parse accepts exactly two positive integers",
+          bool(re.search(lease_re, "10 1200")), True)
+    check("workflow lease-config parse rejects an extra field (10 999 1200)",
+          bool(re.search(lease_re, "10 999 1200")), False)
+    check("workflow lease-config parse rejects a zero cap",
+          bool(re.search(lease_re, "0 1200")), False)
+
     # Two live review leases for DISTINCT PRs are bounded by the SHARED `review:` prefix cap
     # (max_holder_concurrent=2 = the static codex slot bound; codex is usage-exempt so the CLI
     # usage=None path is acceptable). A third claim must come back None, an impl claim must not.

@@ -547,11 +547,16 @@ jobs:
           # Single source of truth for the per-prefix cap + TTL (issue #167): the dispatcher reads
           # select-and-claim.LEASE_CONFIG via lease_limit(); this self-claim path reads the SAME
           # table through `--lease-config`, so the two launch paths for one PR can never drift to
-          # conflicting capacity. Fail closed unless the emitted config is two positive integers.
+          # conflicting capacity. Fail closed unless the emitted config is EXACTLY two positive
+          # integers: a prefix/suffix parse (`%% *`/`##* `) would silently drop middle fields
+          # (`10 999 1200` → cap 10, ttl 1200) and conceal resolver drift at this trust boundary,
+          # so the whole string must match the anchored two-field pattern (round-2 review finding;
+          # `lease_re` is asserted against by the select-and-claim.py self-test — keep in sync).
           lease_cfg="$(python3 registry/scripts/select-and-claim.py --lease-config "$prefix")"
-          cap="${lease_cfg%% *}"; ttl="${lease_cfg##* }"
-          [[ "$cap" =~ ^[1-9][0-9]*$ && "$ttl" =~ ^[1-9][0-9]*$ ]] \
+          lease_re='^([1-9][0-9]*) ([1-9][0-9]*)$'
+          [[ "$lease_cfg" =~ $lease_re ]] \
             || { echo "::error::invalid lease config '$lease_cfg' for prefix $prefix"; exit 1; }
+          cap="${BASH_REMATCH[1]}"; ttl="${BASH_REMATCH[2]}"
           holder="$prefix$TARGET_REPO#$PR_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           set +e
           python3 registry/scripts/select-and-claim.py \
