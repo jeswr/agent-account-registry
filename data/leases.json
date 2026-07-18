@@ -9,16 +9,6 @@
    "model": "sonnet",
    "issued_at": 1784393855,
    "expires_at": 1784397455
-  },
-  {
-   "account": "acct01",
-   "claim_id": "3968fd90d57f48e89cb2cd75daebe3ff",
-   "holder": "review:jeswr/agent-account-registry#260@dispatch-29653838643.1",
-   "package": "set-up-account",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784395657,
-   "expires_at": 1784396857
   }
  ]
 }
