@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "In the `error` case, an event with `error.id` that is neither in `closing` nor `active` falls through to `pending.shift()` and is treated as an id-less subscribe refusal. This can close an unrelated in-flight subscription and then cause its later `subscribed` ack to be assigned to the next pending entry. The real server can generate this race: an unsubscribe frame may be sent, a re-evaluation may first terminate and remove that subscription, and then processing the queued unsubscribe returns `error` with that id. If another subscribe is pending at that point, its state is corrupted.",
+   "file": "packages/sparq-client/src/ws-subscriptions.ts",
+   "fix_hint": "When `event.error.id !== undefined`, handle it exclusively by id: consume it for `closing`, terminate a matching `active` entry, and otherwise report it via `onUnrouted`; do not enter the FIFO refusal path. Reserve `pending.shift()` strictly for errors whose id is undefined. Add a test with one pending subscribe followed by an error carrying an unknown/stale id, asserting the error is unrouted and the subsequent ack still belongs to the pending subscription.",
+   "severity": "major",
+   "title": "Unknown id-bearing errors are misattributed to pending subscriptions"
+  }
+ ],
+ "progress": null,
+ "summary": "The multiplexing design and main lifecycle tests are coherent, but error routing has a protocol race that can reject the wrong subscription. An id-bearing error for a stale/unknown subscription falls through to the FIFO refusal path and consumes the oldest pending subscribe. The server can produce exactly this sequence when an unsubscribe races a server-side termination, so this is not merely hostile-server behavior. Add an explicit unknown-id branch and a regression test before approval.",
+ "verdict": "request_changes"
+}
