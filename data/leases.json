@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct05",
-   "claim_id": "62522e5653fc4bfdb39c7bca797724c6",
-   "holder": "sparq-org/sparq#3413@dispatch-29627299646.1",
-   "package": "sparq-geo",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784342336,
-   "expires_at": 1784348636
-  },
-  {
-   "account": "acct05",
    "claim_id": "ed82443aa9f34c7a8376ad9c09b69435",
    "holder": "sparq-org/sparq#3190@dispatch-29627437488.1",
    "package": "sparq-engine-exec",
