@@ -55,23 +55,45 @@ def parse_head_ref(ref):
     return int(match.group(1)), match.group(2), match.group(3)
 
 
+# Tri-state sentinel (sol r2): "a source produced CONFLICTING matches" must never collapse
+# into "a source is absent" — absent lets the other source stand alone, ambiguous is tamper
+# evidence that fails the whole run.
+AMBIGUOUS = object()
+
+
 def claim_from_log(log_text):
-    """(account, model_alias) from CLAIM-job-prefixed lines of a worker run log, or None —
-    matches the claim line the PRE-migration worker.yml printed. Ambiguous (differing) repeats
-    fail closed."""
+    """Tri-state: (account, model_alias) from CLAIM-job-prefixed lines, None when absent, or
+    AMBIGUOUS when differing repeats conflict (tamper evidence — sol r2)."""
     found = set(CLAIM_LINE_RE.findall(log_text or ""))
-    return found.pop() if len(found) == 1 else None
-
-
-def run_identity_from_log(log_text):
-    """The single agreed (account, model_alias) across BOTH trusted job-anchored sources, or
-    None. When both the historical claim line and the provenance-job env echo are present they
-    must AGREE — a disagreement means tampered/ambiguous evidence and fails closed (sol r1)."""
-    legacy = claim_from_log(log_text)
-    anchored = provenance_job_identity_from_log(log_text)
-    if legacy and anchored and legacy != anchored:
+    if not found:
         return None
-    return legacy or anchored
+    return found.pop() if len(found) == 1 else AMBIGUOUS
+
+
+def run_identity_from_log(log_text, target_repo, pr_number, issue):
+    """The PR-BOUND (account, model_alias) for the run, or None (needs-human).
+
+    Fail-closed rules (sol r1+r2):
+    - The provenance-job source is REQUIRED — its command echo binds the identity to the exact
+      PR being recorded (--target-repo/--pr/--issue must match the live PR); the run id in a
+      head branch is model-forgeable, so an unbound identity (legacy claim line only) is never
+      sufficient — that population (<= sparq#2542) already has master records anyway.
+    - AMBIGUITY in EITHER source (conflicting repeats) fails the run — never fall back past a
+      conflicted source.
+    - When the legacy claim line is also present it must AGREE on (account, alias)."""
+    anchored = provenance_job_identity_from_log(log_text)
+    if anchored is None or anchored is AMBIGUOUS:
+        return None
+    if (anchored["target_repo"] != target_repo or anchored["pr"] != int(pr_number)
+            or anchored["issue"] != int(issue)):
+        return None
+    legacy = claim_from_log(log_text)
+    if legacy is AMBIGUOUS:
+        return None
+    identity = (anchored["account"], anchored["alias"])
+    if legacy is not None and legacy != identity:
+        return None
+    return identity
 
 
 # Post-migration identity source (the #96 outage population: worker succeeded, the provenance
@@ -82,21 +104,43 @@ def run_identity_from_log(log_text):
 # these patterns ANCHOR on a job name containing "provenance" — that job runs NO target/model
 # code, so a hostile model printing a lookalike line lands under the WORKER job's prefix and
 # can never match (same fail-closed posture as the no-trailer rule below).
-PROV_JOB_ACCOUNT_RE = re.compile(
-    r"(?mi)^[^\t]*provenance[^\t]*\t[^\t]*\t\S+\s+WORKER_IMPL_ACCOUNT:\s*(acct[0-9a-z]{2,})\s*$")
-PROV_JOB_ALIAS_RE = re.compile(
-    r'(?mi)^[^\t]*provenance[^\t]*\t[^\t]*\t\S+\s+--impl-alias\s+"?([A-Za-z0-9][A-Za-z0-9_.-]*)"?')
+def _prov_job_field(name, value_pattern):
+    return re.compile(
+        r"(?mi)^[^\t]*provenance[^\t]*\t[^\t]*\t\S+\s+" + name + r"\s*" + value_pattern)
+
+
+PROV_JOB_ACCOUNT_RE = _prov_job_field("WORKER_IMPL_ACCOUNT:", r"(acct[0-9a-z]{2,})\s*$")
+PROV_JOB_ALIAS_RE = _prov_job_field("--impl-alias", r'"?([A-Za-z0-9][A-Za-z0-9_.-]*)"?')
+# PR-binding fields (sol r2): the provenance job's command echo names the exact PR it was
+# recording — required to match the live PR, so a forged/reused run id in a head branch can
+# never transplant another PR's identity.
+PROV_JOB_TARGET_RE = _prov_job_field("--target-repo", r'"?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"?')
+PROV_JOB_PR_RE = _prov_job_field("--pr", r'"?([1-9][0-9]*)"?')
+PROV_JOB_ISSUE_RE = _prov_job_field("--issue", r'"?([1-9][0-9]*)"?')
 
 
 def provenance_job_identity_from_log(log_text):
-    """(account, model_alias) from the FAILED provenance job's log section, or None. Requires
-    BOTH the env echo and the command echo inside provenance-job-prefixed lines; ambiguity
-    (differing repeated matches) fails closed to None."""
-    accounts = set(PROV_JOB_ACCOUNT_RE.findall(log_text or ""))
-    aliases = set(PROV_JOB_ALIAS_RE.findall(log_text or ""))
-    if len(accounts) == 1 and len(aliases) == 1:
-        return accounts.pop(), aliases.pop()
-    return None
+    """Tri-state: a dict {account, alias, target_repo, pr, issue} from the FAILED provenance
+    job's log section, None when the section/fields are absent, or AMBIGUOUS when any field
+    has differing repeated matches (tamper evidence). Every field is required."""
+    fields = {"account": PROV_JOB_ACCOUNT_RE, "alias": PROV_JOB_ALIAS_RE,
+              "target_repo": PROV_JOB_TARGET_RE, "pr": PROV_JOB_PR_RE,
+              "issue": PROV_JOB_ISSUE_RE}
+    out = {}
+    saw_any = False
+    for key, pattern in fields.items():
+        found = set(pattern.findall(log_text or ""))
+        if len(found) > 1:
+            return AMBIGUOUS
+        if not found:
+            continue
+        saw_any = True
+        out[key] = found.pop()
+    if len(out) != len(fields):
+        return AMBIGUOUS if saw_any else None
+    out["pr"] = int(out["pr"])
+    out["issue"] = int(out["issue"])
+    return out
 
 
 def provider_of(alias, routing):
@@ -203,7 +247,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         log = _run_gh(["run", "view", run_id, "--attempt", attempt,
                        "--repo", registry_repo, "--log"], check=False)
         if log.returncode == 0:
-            found = run_identity_from_log(log.stdout)
+            found = run_identity_from_log(log.stdout, target_repo, number, issue)
             if found:
                 account, alias = found
         if alias is None or account is None:
@@ -281,30 +325,50 @@ def _self_test():
     check("provider lookup", provider_of("terra", routing), "openai")
     check("unknown alias provider", provider_of("ghost", routing), None)
     prov_job = "Record implementer provenance (no target code runs here)"
-    prov_log = (f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44.23Z   "
-                "WORKER_IMPL_ACCOUNT: acct2css\n"
-                f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44.04Z   "
-                '--impl-alias "fable" \\\n')
-    check("provenance-job env echo parses", provenance_job_identity_from_log(prov_log),
-          ("acct2css", "fable"))
+
+    def prov_lines(account="acct2css", alias="fable", target="sparq-org/sparq",
+                   pr=3459, issue=3404):
+        step = f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44Z   "
+        return (f"{step}WORKER_IMPL_ACCOUNT: {account}\n"
+                f'{step}--target-repo "{target}" \\\n'
+                f'{step}--pr "{pr}" \\\n'
+                f'{step}--impl-alias "{alias}" \\\n'
+                f'{step}--issue "{issue}" \\\n')
+
+    prov_log = prov_lines()
+    bound = {"account": "acct2css", "alias": "fable", "target_repo": "sparq-org/sparq",
+             "pr": 3459, "issue": 3404}
+    check("provenance-job echo parses ALL binding fields",
+          provenance_job_identity_from_log(prov_log), bound)
     forged = ("Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
               "WORKER_IMPL_ACCOUNT: acct99zz\n"
               "Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
               '--impl-alias "opus"\n')
     check("worker-job forgery cannot match (job-prefix anchor)",
           provenance_job_identity_from_log(forged), None)
-    check("forged lines mixed into a real log fail closed (ambiguity)",
+    check("conflicting repeats are AMBIGUOUS, not absent",
           provenance_job_identity_from_log(
-              prov_log + prov_log.replace("acct2css", "acct3xx")), None)
+              prov_log + prov_lines(account="acct3css")) is AMBIGUOUS, True)
+    check("partial fields are AMBIGUOUS (never a half-bound identity)",
+          provenance_job_identity_from_log(
+              f"{prov_job}\ts\t2026-07-18T09:10:44Z   WORKER_IMPL_ACCOUNT: acct2css\n")
+          is AMBIGUOUS, True)
     claim_ok = (f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
                 "lease claimed: account=acct2css, model=fable, claim=x\n")
-    check("agreeing sources resolve", run_identity_from_log(claim_ok + prov_log),
+    ident = lambda log, pr=3459, issue=3404: run_identity_from_log(
+        log, "sparq-org/sparq", pr, issue)
+    check("bound identity resolves", ident(prov_log), ("acct2css", "fable"))
+    check("agreeing legacy corroboration keeps it", ident(claim_ok + prov_log),
           ("acct2css", "fable"))
-    check("DISAGREEING trusted sources fail closed (tamper evidence)",
-          run_identity_from_log(claim_ok.replace("acct2css", "acct3css") + prov_log), None)
-    check("single source (anchored env echo) suffices", run_identity_from_log(prov_log),
-          ("acct2css", "fable"))
-    check("forged worker-job lines alone resolve nothing", run_identity_from_log(forged), None)
+    check("DISAGREEING trusted sources fail closed",
+          ident(claim_ok.replace("acct2css", "acct3css") + prov_log), None)
+    check("AMBIGUOUS legacy claims fail closed even with a clean anchored source (sol r2)",
+          ident(claim_ok + claim_ok.replace("acct2css", "acct3css") + prov_log), None)
+    check("claim-only identity is NEVER sufficient (unbound to the PR)",
+          ident(claim_ok), None)
+    check("PR-binding mismatch fails closed (reused run id)", ident(prov_log, pr=9999), None)
+    check("issue-binding mismatch fails closed", ident(prov_log, issue=1), None)
+    check("forged worker-job lines alone resolve nothing", ident(forged), None)
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
