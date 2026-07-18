@@ -254,7 +254,9 @@ from the `data/model-health.json` records the worker/review outcome jobs already
 - **Duration:** the provider's machine-parseable reset hint (`try again in 20s`, `retry-after: 120`)
   when present, else **15 min doubling per consecutive hit, capped at 5 h**; a successful run
   resets the multiplier.
-- **Enforcement:** `account-usage.py` stamps `backoff_until` onto the exempt entry;
+- **Enforcement:** `account-usage.py` reads the ledger from the `ledger` **branch** via the
+  pinned contents API (the job's checkout is the default ref, whose seed file is empty) and
+  stamps `backoff_until` onto the exempt entry;
   `usage_eligible` excludes the account until it expires; `usage-alert.py` surfaces active
   backoffs (`BACKED OFF`) instead of flagging exempt accounts probe-missing.
 - **Fail-open by design:** an unreadable ledger or missing salt disables only the backoff (loud

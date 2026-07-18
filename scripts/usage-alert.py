@@ -148,8 +148,13 @@ def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redac
         # carries counts only — never an account handle (decision 22a).
         capped = sum(1 for _h, s, _ok in rows if s.startswith("CAPPED"))
         unavailable = sum(1 for _h, s, _ok in rows if s.startswith("UNAVAILABLE"))
-        ok_count = len(rows) - capped - unavailable
-        lines.append(f"- ⛔ capped: {capped} · unavailable: {unavailable} · ✅ ok: {ok_count}")
+        backed_off = sum(1 for _h, s, _ok in rows if s.startswith("BACKED OFF"))
+        # healthy comes from ok_bool, never len-minus-categories (cross-provider review r3
+        # finding 4): a BACKED OFF row is neither capped nor unavailable, so the remainder
+        # arithmetic counted it healthy — "Usable workers: 0/1" alongside "✅ ok: 1".
+        ok_count = sum(1 for _h, _s, ok_bool in rows if ok_bool)
+        lines.append(f"- ⛔ capped: {capped} · unavailable: {unavailable} · backed off: "
+                     f"{backed_off} · ✅ ok: {ok_count}")
         lines.append("\n⚠️ Per-account detail suppressed: the private alert route is HALF-configured "
                      "(`ALERT_REPO` is set but the `ALERT_TOKEN` secret is missing), so this alert "
                      "fell back to the public registry repo. Set `ALERT_TOKEN` to receive per-account "
@@ -306,8 +311,16 @@ def _self_test():
     chk("redacted body carries no handle",
         ("acct-priv-h1" in red, "acct-priv-h2" in red, "acct-priv-h3" in red), (False, False, False))
     chk("redacted body keeps counts + hint",
-        ("capped: 1" in red, "unavailable: 1" in red, "ok: 1" in red, "ALERT_TOKEN" in red),
+        ("capped: 1" in red, "unavailable: 1" in red, "✅ ok: 1" in red, "ALERT_TOKEN" in red),
         (True, True, True, True))
+    # a BACKED OFF row is NOT healthy in the redacted render (cross-provider review r3 finding 4):
+    # ok comes from ok_bool, and the backed-off state gets its own visible category — one active
+    # backoff must not read as "Usable workers: 0/1" next to "✅ ok: 1"
+    rback = render(0, [("acct-priv-h4", "BACKED OFF — provider rate limit hit (x2); resumes at "
+                        "epoch 99 (self-clearing)", False)], ["p"], 1, "m", redact_handles=True)
+    chk("redacted backed-off row counted backed-off, not ok",
+        ("backed off: 1" in rback, "✅ ok: 0" in rback, "acct-priv-h4" in rback),
+        (True, True, False))
     # _gh(check=True) fail-loud + sanitization (review r1): a non-zero gh returncode must emit a
     # ::warning:: naming the op + rc, and must NOT republish gh stderr (GH_DEBUG=api can echo the
     # request body) nor any argument content.

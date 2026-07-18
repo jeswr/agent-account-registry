@@ -294,8 +294,10 @@ def account_backoffs(records, now):
     FUTURE_SKEW_SECONDS ahead of `now` (cross-provider review r2 finding 2: the per-record clamp
     would otherwise let a forged far-future stamp yield a backoff far past the 5 h ceiling —
     future-forged records are skipped fail-open here, not just in prune, because this walk must
-    not RELY on callers pre-pruning). So every returned backoff ends within
-    now + FUTURE_SKEW_SECONDS + BACKOFF_CAP_SECONDS. Returns only ACTIVE backoffs:
+    not RELY on callers pre-pruning). The final clamp is against NOW (cross-provider review r3
+    finding 1: a within-skew record at now+300 with a capped hint would otherwise end 5 minutes
+    past the ceiling), so every returned backoff ends within now + BACKOFF_CAP_SECONDS — the cap
+    is a hard bound on how long an account can be sidelined. Returns only ACTIVE backoffs:
     {account_hash: {"backoff_until", "consecutive", "last_signal", "last_ts"}}."""
     state = {}
     valid = []
@@ -322,6 +324,9 @@ def account_backoffs(records, now):
             hinted = parse_reset_hint(record.get("reset_hint"), ts)
             until = exponential if hinted is None else min(max(hinted, ts),
                                                            ts + BACKOFF_CAP_SECONDS)
+            until = min(until, now + BACKOFF_CAP_SECONDS)   # the 5 h cap binds relative to NOW:
+            # a within-skew future ts (clock drift, <= now + FUTURE_SKEW_SECONDS) must not let a
+            # capped hint/exponential end past the ceiling (cross-provider review r3 finding 1)
             state[acct] = {"backoff_until": int(until), "consecutive": consecutive,
                            "last_signal": cls, "last_ts": int(ts)}
         # other classes (auth/setup/unknown) neither extend nor clear a backoff
@@ -1101,8 +1106,20 @@ def _self_test():
         account_backoffs([{"account": ah, "exit_class": CLASS_TRANSIENT, "ts": now + 180000}],
                          now), {})
     bskew = account_backoffs([{"account": ah, "exit_class": CLASS_TRANSIENT, "ts": now + 60}], now)
-    chk("within-skew stamp still backs off (bounded by skew + cap)",
+    chk("within-skew stamp still backs off (bounded by now + cap)",
         bskew.get(ah, {}).get("backoff_until"), now + 60 + BACKOFF_BASE_SECONDS)
+    # the cap binds relative to NOW, not the record ts (cross-provider review r3 finding 1): a
+    # record at exactly now + FUTURE_SKEW with a capped hint would otherwise return
+    # now + 300 + 18000 — five minutes past the 5 h ceiling
+    bcaph = account_backoffs([rec("openai", "codex01", "rate-limit", dt=FUTURE_SKEW_SECONDS,
+                                  reset="in 999999 hours")], now)
+    chk("within-skew stamp + capped hint ends at now + cap exactly",
+        bcaph.get(ah, {}).get("backoff_until"), now + BACKOFF_CAP_SECONDS)
+    # same bound on the exponential arm: last hit at now+110, derived at now+50 -> now+50+cap
+    bcape = account_backoffs([rec("openai", "codex01", "rate-limit", dt=i * 10)
+                              for i in range(12)], now + 50)
+    chk("within-skew stamp + capped exponential ends at now + cap exactly",
+        bcape.get(ah, {}).get("backoff_until"), now + 50 + BACKOFF_CAP_SECONDS)
     chk("hint: bare epoch", parse_reset_hint("1770000000", 1000), 1770000000.0)
     chk("hint: past epoch rejected", parse_reset_hint("1770000000", 1780000000), None)
     chk("hint: garbage -> None", parse_reset_hint("resets at 2pm", 1000), None)

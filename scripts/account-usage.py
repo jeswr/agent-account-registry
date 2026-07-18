@@ -168,21 +168,33 @@ def _load_model_health(script_dir):
     return module
 
 
-def _load_backoffs(mh, script_dir, now):
-    """{salted_account_hash: backoff} derived from the checked-out model-health ledger via the
-    already-loaded model-health module `mh` (MODEL_HEALTH_FILE overrides the default
-    registry-checkout path). FAIL-OPEN by design: any read/validate error returns {} after a LOUD
-    log line — a lost backoff ledger merely admits a possibly rate-limited openai account (one
-    wasted run), while failing closed here would starve the whole exempt provider, the exact
-    regression the exemption removes."""
-    path = os.environ.get("MODEL_HEALTH_FILE") or os.path.join(
-        script_dir, os.pardir, "data", "model-health.json")
+def _load_backoffs(mh, now, api=None):
+    """{salted_account_hash: backoff} via the already-loaded model-health module `mh`. The ledger
+    lives on the LEDGER branch (the mutable data plane), NOT in this job's checkout: the CLAIM job
+    checks out the DEFAULT ref, whose data/model-health.json is the empty master seed, so a
+    checkout-relative read validated cleanly, warned about nothing, and made the reactive backoff
+    silently inert (cross-provider review r3 finding 2). The read therefore goes through
+    model-health's contents API pinned to ?ref=ledger (mh.read_ledger) under the ambient
+    GH_TOKEN; MODEL_HEALTH_FILE remains as an explicit file override (self-test / a caller that
+    already holds a ledger-branch checkout), and `api` is injectable for the self-test. FAIL-OPEN
+    by design, for ANY failure class (unreadable file, API/transport error, missing ledger
+    branch, missing token/env): return {} after a LOUD log line — a lost backoff ledger merely
+    admits a possibly rate-limited openai account (one wasted run), while failing closed here
+    would starve the whole exempt provider, the exact regression the exemption removes."""
     try:
-        with open(path, encoding="utf-8") as handle:
-            document = json.load(handle)
-        records = mh.prune(mh.validate_ledger(document), now)
-        return mh.account_backoffs(records, now)
-    except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+        path = os.environ.get("MODEL_HEALTH_FILE")
+        if path:
+            with open(path, encoding="utf-8") as handle:
+                records = mh.validate_ledger(json.load(handle))
+        else:
+            if api is None:
+                api = mh.GitHubAPI(os.environ.get("GH_TOKEN")
+                                   or os.environ.get("GITHUB_TOKEN", ""))
+            records, _sha = mh.read_ledger(api, os.environ["REGISTRY_REPO"])
+        return mh.account_backoffs(mh.prune(records, now), now)
+    except Exception:
+        # Broad by design: the fail-open contract above must hold no matter what the ledger
+        # read raises (mh.HealthError, OSError, ValueError, KeyError, ...).
         print("::warning::account-usage: model-health ledger unreadable — exempt accounts admitted "
               "WITHOUT rate-limit backoff this tick (fail-open; fix the ledger to restore backoff)",
               file=sys.stderr)
@@ -199,6 +211,35 @@ EXEMPT_PROVIDERS = frozenset({"openai"})
 def _is_exempt_provider(provider):
     """True only for the explicitly probe-exempt providers (pure; whitespace/case tolerant)."""
     return str(provider or "").strip().lower() in EXEMPT_PROVIDERS
+
+
+def _probe_account(account, secrets, probe=None, fable_probe=None):
+    """Probed usage entry for ONE non-exempt account, or None (fail-closed omit). The provider
+    MUST normalize to `anthropic` BEFORE the secret is even dereferenced (cross-provider review
+    r3 finding 3): the probe below is addressed to the Anthropic API, so a missing, misspelled,
+    or unknown provider (e.g. `openia`) previously TRANSMITTED that account's token to a provider
+    the catalog never named — and admitted the account on the response. Unknown providers now
+    never reach a probe; the omitted entry surfaces as UNAVAILABLE in usage-alert (loud), like
+    every other fail-closed omit. `probe`/`fable_probe` are injectable for the self-test ONLY."""
+    if str(account.get("provider") or "").strip().lower() != "anthropic":
+        return None
+    ref = account.get("secret_ref")
+    if not isinstance(ref, str) or SECRET_REF_RE.fullmatch(ref) is None:
+        return None  # fail-closed omit: never dereference a non-worker-token secret name
+    token = secrets.get(ref)
+    if not token:
+        return None  # fail-closed omit
+    probed = (probe or _probe_anthropic)(token)
+    if probed is None:
+        return None
+    # [FABLE-5] Only fable-capable accounts need the extra Claude-Code-shaped fable probe. A missing
+    # or failed fable probe leaves the fable sub-quota fields absent -> usage_eligible fail-closes FABLE
+    # routing for this account, while its base 5h/7d signal still admits it for non-fable models.
+    if "fable" in account.get("models", []):
+        fable = (fable_probe or _probe_fable)(token)
+        if fable is not None:
+            probed.update(fable)
+    return probed
 
 
 def _apply_backoff(entry, backoff):
@@ -328,8 +369,8 @@ def main():
             # Probe-exempt provider (decision 2026-07-17, issue #29): eligible without usage data,
             # reactively backed off via the model-health rate-limit records. No salt -> no hash
             # mapping -> loud fail-open (backoff disabled, exemption intact). Any provider NOT on
-            # the explicit allowlist (incl. missing/misspelled) falls through to the fail-closed
-            # probe path below and surfaces as UNAVAILABLE in usage-alert.
+            # the explicit allowlist (incl. missing/misspelled) is fail-closed OMITTED by
+            # _probe_account below — never probed — and surfaces as UNAVAILABLE in usage-alert.
             entry = {"exempt": True}
             if salt:
                 if backoffs is None:
@@ -339,7 +380,7 @@ def main():
                     # would fail closed: the exact starvation the exemption exists to prevent.
                     try:
                         mh = _load_model_health(script_dir)
-                        backoffs = _load_backoffs(mh, script_dir, now)
+                        backoffs = _load_backoffs(mh, now)
                     except Exception:
                         print("::warning::account-usage: model-health module unavailable — exempt "
                               "accounts admitted WITHOUT rate-limit backoff this tick (fail-open)",
@@ -355,22 +396,9 @@ def main():
                       "admitted WITHOUT rate-limit backoff (fail-open)", file=sys.stderr)
             usage[handle] = entry
             continue
-        ref = account.get("secret_ref")
-        if not isinstance(ref, str) or SECRET_REF_RE.fullmatch(ref) is None:
-            continue  # fail-closed omit: never dereference a non-worker-token secret name
-        token = secrets.get(ref)
-        if not token:
-            continue  # fail-closed omit
-        probed = _probe_anthropic(token)
+        probed = _probe_account(account, secrets)
         if probed is None:
-            continue
-        # [FABLE-5] Only fable-capable accounts need the extra Claude-Code-shaped fable probe. A missing
-        # or failed fable probe leaves the fable sub-quota fields absent -> usage_eligible fail-closes FABLE
-        # routing for this account, while its base 5h/7d signal still admits it for non-fable models.
-        if "fable" in account.get("models", []):
-            fable = _probe_fable(token)
-            if fable is not None:
-                probed.update(fable)
+            continue  # fail-closed omit: unknown provider / bad secret_ref / no token / failed probe
         usage[handle] = probed
     json.dump(usage, sys.stdout)
     return 0
@@ -483,13 +511,14 @@ def _self_test():
     mh = _load_model_health(script_dir)
     test_now = 1_000_000
     hashed = mh.account_hash("codex01", "s3cret")
-    good_ledger = {"records": [{"ts": test_now, "provider": "openai", "account": hashed,
-                                "model_alias": "gpt", "exit_class": "transient", "run_id": "1"}]}
+    ledger_record = {"ts": test_now, "provider": "openai", "account": hashed,
+                     "model_alias": "gpt", "exit_class": "transient", "run_id": "1"}
+    good_ledger = {"records": [ledger_record]}
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump(good_ledger, fh)
         good_path = fh.name
     os.environ["MODEL_HEALTH_FILE"] = good_path
-    backoffs = _load_backoffs(mh, script_dir, test_now + 60)
+    backoffs = _load_backoffs(mh, test_now + 60)
     chk("ledger round-trip: active backoff derived for the salted handle",
         backoffs.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_BASE_SECONDS)
     #   (v) malformed ledger -> loud fail-open {} (never crashes the sweep). CAPTURED stderr
@@ -499,10 +528,10 @@ def _self_test():
     import contextlib
     import io
 
-    def _load_backoffs_captured(now_arg):
+    def _load_backoffs_captured(now_arg, api=None):
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
-            result = _load_backoffs(mh, script_dir, now_arg)
+            result = _load_backoffs(mh, now_arg, api=api)
         return result, buf.getvalue()
 
     with open(good_path, "w", encoding="utf-8") as fh:
@@ -524,6 +553,62 @@ def _self_test():
         (False, False))
     del os.environ["MODEL_HEALTH_FILE"]
     os.unlink(good_path)
+    #   (vi) ledger-BRANCH API read (cross-provider review r3 finding 2): without MODEL_HEALTH_FILE
+    #   the read must go through model-health's contents API pinned to ?ref=ledger — the job's
+    #   checkout is the DEFAULT ref whose data/model-health.json is the empty master seed, so a
+    #   checkout-relative read made the reactive backoff silently inert. mh._StubAPI enforces the
+    #   ledger pin structurally (an unpinned GET misses).
+    saved_repo = os.environ.get("REGISTRY_REPO")
+    os.environ["REGISTRY_REPO"] = "o/r"
+    got, err = _load_backoffs_captured(test_now + 60, api=mh._StubAPI(seed=[ledger_record]))
+    chk("no MODEL_HEALTH_FILE -> ledger-pinned API read derives the backoff",
+        got.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_BASE_SECONDS)
+    chk("API-read success path emits no warning", err, "")
+    #   a MISSING ledger branch fails open (never crashes the probe) but stays LOUD
+    got, err = _load_backoffs_captured(test_now, api=mh._StubAPI(branch_missing=True))
+    chk("missing ledger branch fails open to no-backoff", got, {})
+    chk("missing ledger branch fail-open is LOUD", "::warning::" in err, True)
+    #   a missing ledger FILE on a present branch is the legitimate first-write state: genuinely
+    #   no backoffs, and NOT a warning (an always-on warning would destroy the signal)
+    got, err = _load_backoffs_captured(test_now, api=mh._StubAPI(seed=None))
+    chk("first-write empty ledger -> no backoffs, no warning", (got, err), ({}, ""))
+    if saved_repo is None:
+        os.environ.pop("REGISTRY_REPO", None)
+    else:
+        os.environ["REGISTRY_REPO"] = saved_repo
+    # ---- provider-addressed probing (cross-provider review r3 finding 3) ----
+    #   an unknown/missing/misspelled provider must NEVER reach a probe: the probe is addressed
+    #   to the Anthropic API, so transmitting the token there both leaks the credential to an
+    #   endpoint the catalog never named AND admits the account on the response. Fail-closed
+    #   omit (None), with ZERO probe invocations.
+    probe_calls = []
+
+    def _rec_probe(token):
+        probe_calls.append(token)
+        return {"status": "allowed", "5h_util": "0.1"}
+
+    stub_secrets = {"ACCT01_TOKEN": "tok"}
+    for prov in ("openia", "codex", "gemini", "", None):
+        got = _probe_account({"handle": "x", "provider": prov, "secret_ref": "ACCT01_TOKEN",
+                              "models": ["haiku"]}, stub_secrets,
+                             probe=_rec_probe, fable_probe=_rec_probe)
+        chk(f"unknown provider {prov!r} fail-closed omitted", got, None)
+    chk("unknown providers never invoked a probe", probe_calls, [])
+    got = _probe_account({"handle": "x", "provider": " Anthropic ", "secret_ref": "ACCT01_TOKEN",
+                          "models": ["haiku"]}, stub_secrets,
+                         probe=_rec_probe, fable_probe=_rec_probe)
+    chk("anthropic account still probes (normalized match)", (got or {}).get("status"), "allowed")
+    chk("non-fable account probes exactly once", probe_calls, ["tok"])
+    probe_calls.clear()
+    _probe_account({"handle": "x", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+                    "models": ["fable"]}, stub_secrets, probe=_rec_probe, fable_probe=_rec_probe)
+    chk("fable account gets the second (fable) probe", probe_calls, ["tok", "tok"])
+    probe_calls.clear()
+    chk("non-worker secret_ref still never dereferenced/probed",
+        (_probe_account({"handle": "x", "provider": "anthropic",
+                         "secret_ref": "REGISTRY_ADMIN_APP_KEY"},
+                        {"REGISTRY_ADMIN_APP_KEY": "priv"},
+                        probe=_rec_probe, fable_probe=_rec_probe), probe_calls), (None, []))
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
