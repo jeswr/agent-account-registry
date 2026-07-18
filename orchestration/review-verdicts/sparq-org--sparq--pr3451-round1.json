@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "evaluate_contract only tests whether requirements.method_policy is Some, then evaluates caller-supplied MethodPrecheck fields. MethodPrecheck carries no policy IRI, and the named IRI is never compared with or used to resolve policy_n3/constraint_iris. Thus TR can require policy A while the holder supplies an admissible weaker policy B; the code accepts it despite claiming that the named trustx:methodPolicy is enforced. The existing tests use urn:policy1 but do not demonstrate any binding between that IRI and the supplied policy data, so they are vacuous with respect to this invariant.",
+   "file": "crates/sparq-trust/src/expression.rs",
+   "fix_hint": "Make the pre-check input cryptographically or otherwise authoritatively resolved from requirements.method_policy, or at minimum carry the resolved policy IRI and reject a mismatch. Add a negative test where TR names policy A but the supplied precheck is for policy B and assert fail-closed rejection. Document the trust boundary if resolution/authentication remains caller-owned.",
+   "severity": "major",
+   "title": "Method pre-check is not authenticated or bound to the policy named by the envelope"
+  },
+  {
+   "body": "This diff exports a new feature, module, functions, and public data types, but contains no matching skills/<surface>/SKILL.md update. AGENTS.md requires public API documentation to be updated in the same change, so the change is incomplete even if the implementation is corrected.",
+   "file": "crates/sparq-trust/src/lib.rs",
+   "fix_hint": "Update the appropriate trust/capability skill (and router/README if this is a brand-new public surface) with the expression feature opt-in, envelope construction, evaluation, verification, limitations, and fail-closed trust boundaries.",
+   "severity": "major",
+   "title": "New public expression API lacks the required usage-skill update"
+  }
+ ],
+ "progress": null,
+ "summary": "The new trust-expression path is not sound as scoped because a trust-requirements document's methodPolicy IRI is never bound to the MethodPrecheck content that is evaluated. A caller can name one policy in TR while supplying constraints and N3 for a different, weaker policy, and evaluation will proceed. The change also adds a substantial public API without the repository-mandated matching skill documentation update.",
+ "verdict": "request_changes"
+}
