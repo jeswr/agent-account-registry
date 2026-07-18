@@ -4,17 +4,18 @@
 # labels vanished entirely) sat invisible to dispatch forever (observed: 7 untriaged +
 # 9 label-lost of 39 open). This sweep re-runs the SAME static triage (scripts/triage.py,
 # imported by scripts/retriage.py — no duplicated logic) over parked/label-lost issues by
-# trusted authors. Fail-closed: no default priority (this repo IS the trust plane), gated
-# (needs:*) and machine-owned states are never touched, and an unreadable lease ledger
-# skips every status:in-progress issue. Mirrors the sparq target's retriage.yml.
+# trusted authors. Fail-closed: no default priority (this repo IS the trust plane), and
+# gated (needs:*) and machine-owned states — status:in-progress INCLUDED — are never
+# touched: ALL in-progress recovery is groom's lease-driven repair, so retriage never
+# reads the lease ledger at all. Mirrors the sparq target's retriage.yml.
 name: retriage
 
 on:
   workflow_dispatch:
   schedule:
     # Every 30 min, offset from groom-leases (*/15 -> :00/:15/:30/:45) and groom
-    # (7-59/15 -> :07/:22/:37/:52). Retriage only READS the ledger, so this is scheduler
-    # spread, not CAS-contention avoidance.
+    # (7-59/15 -> :07/:22/:37/:52). Retriage never touches the ledger or in-progress
+    # state, so this is pure scheduler spread, not CAS-contention avoidance.
     - cron: '13,43 * * * *'
 
 permissions:
@@ -28,7 +29,8 @@ concurrency:
 env:
   # Exact-match trusted logins, same gate as triage-issue.yml: the maintainer plus the
   # registry orchestrator App bot slug (repo variable overrides the documented default).
-  # NO blanket [bot] trust.
+  # NO blanket [bot] trust — and the App match additionally requires the GraphQL Bot
+  # actor type, so a user account named like the App is never trusted.
   MAINTAINER_LOGIN: jeswr
   APP_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'agent-account-registry[bot]' }}
 

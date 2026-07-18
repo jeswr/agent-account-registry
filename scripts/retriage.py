@@ -19,28 +19,29 @@ Scope — an OPEN issue is retriaged iff ALL hold:
   * NOT gated `needs:user` / `needs:design` (human-owned holds; retriage never edits them);
   * NOT `trust:untrusted` (quarantine is owned by the maintainer-approval flow, #31/#63);
   * NO `status:ready` (already visible to dispatch — nothing to do);
-  * NOT in a dispatch/groom-owned busy state (`status:in-progress-review`, `status:blocked`,
-    `status:deferred` — flipping those would break the deferral/review state machines);
-  * `status:in-progress` only when the lease LEDGER IS READABLE and NO lease row (live or
-    expired) references the issue: groom's lease-driven repair owns every row-backed case
-    (it runs 2x as often and does attempt accounting); a row that VANISHED entirely is the
-    LOST state only this sweep can see. An unreadable ledger fail-closed skips all
-    in-progress issues;
+  * NOT in a dispatch/groom-owned busy state (`status:in-progress`,
+    `status:in-progress-review`, `status:blocked`, `status:deferred`). In particular
+    `status:in-progress` recovery — orphaned or otherwise — belongs to groom's lease-driven
+    repair (attempt accounting, worker-run inspection); retriage racing the ledger from a
+    stale read at :13/:43 could strip a LIVE worker's status, so it never touches the state
+    and never reads the ledger at all;
   * the AUTHOR re-passes the exact triage-issue.yml trust gate (maintainer / App bot slug /
-    admin-maintain-write collaborator). An untrusted author is never triaged here — and never
+    admin-maintain-write collaborator). Bot trust is TYPE-verified: only a GraphQL `Bot`
+    actor may match the App slug, and a Bot actor can ONLY be trusted as that exact App —
+    a human account merely named like the App falls through to the permission probe, and a
+    foreign bot matches nothing. An untrusted author is never triaged here — and never
     re-quarantined either (that could undo a maintainer approval).
 
 Unlike the sparq retriage, NO default priority is applied: auto-P3 would auto-dispatch
 trust-plane work no human ever prioritised. Missing priority stays parked, fail-closed.
 
 Idempotent (an empty label delta is not an action; re-planning the post-state yields nothing).
-Bounded API usage: one issue list, one ledger read, <=1 cached permission probe per unique
+Bounded API usage: one issue list, <=1 cached permission probe per unique
 author, exactly one `gh issue edit` per acted-on issue, hard-capped at MAX_EDITS per run.
 Pure `plan_retriage()` is unit-tested (--self-test); the CLI wraps it over `gh`. Default is a
 dry-run print; the cron passes --apply.
 """
 import argparse
-import base64
 import json
 import os
 import subprocess
@@ -49,12 +50,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import triage  # noqa: E402  (same-directory static-triage module — the single source of truth)
 
-LEDGER_PATH = "data/leases.json"
-LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
-# review:/fix: repair leases are PR-scoped (dispatch-claim prefixes) — never issue-mapped here.
-REPAIR_HOLDER_PREFIXES = ("review:", "fix:")
 # States owned by the dispatch/groom/review state machines — retriage never touches them.
-MACHINE_OWNED_STATUS = {"status:in-progress-review", "status:blocked", "status:deferred"}
+# status:in-progress is machine-owned too: ALL its recovery (orphan rows included) is groom's
+# lease-driven repair; a second reader racing live dispatch here could strip a live worker.
+MACHINE_OWNED_STATUS = {"status:in-progress", "status:in-progress-review",
+                        "status:blocked", "status:deferred"}
 MAX_EDITS = 100  # hard per-run write cap; anything beyond is logged LOUDLY, never silent
 
 
@@ -62,13 +62,11 @@ def _labels_of(issue):
     return {lb["name"] if isinstance(lb, dict) else lb for lb in issue.get("labels", [])}
 
 
-def plan_retriage(issues, trusted, leased_numbers=frozenset(), ledger_ok=True):
+def plan_retriage(issues, trusted):
     """[(number, add:sortedlist, remove:sortedlist)] — the exact label mutations to apply.
 
-    `leased_numbers` is the set of issue numbers referenced by ANY lease-ledger row (live or
-    expired); `ledger_ok=False` means the ledger could not be read, which fail-closed skips
-    every `status:in-progress` issue. Empty deltas are dropped, so re-running over the
-    post-apply state plans nothing (idempotence)."""
+    Empty deltas are dropped, so re-running over the post-apply state plans nothing
+    (idempotence). `trusted(login, is_bot)` is the author trust gate."""
     actions = []
     for it in issues:
         labels = _labels_of(it)
@@ -81,17 +79,12 @@ def plan_retriage(issues, trusted, leased_numbers=frozenset(), ledger_ok=True):
         if "status:ready" in labels:
             continue  # already dispatchable
         if labels & MACHINE_OWNED_STATUS:
-            continue
-        extra_remove = set()
-        if "status:in-progress" in labels:
-            if not ledger_ok or it.get("number") in leased_numbers:
-                continue  # a lease row exists (or is unknowable) — groom owns the repair
-            extra_remove = {"status:in-progress"}  # lease row VANISHED — the LOST state
-        if not trusted(str(it.get("author", ""))):
+            continue  # in-progress included: groom owns ALL lease/status repair
+        if not trusted(str(it.get("author", "")), bool(it.get("author_is_bot"))):
             continue
         result = triage.triage(labels, "task")
         add = set(result["add"])
-        remove = set(result["remove"]) | extra_remove
+        remove = set(result["remove"])
         if not add and not remove:
             continue  # already converged — no churn
         actions.append((it.get("number"), sorted(add), sorted(remove)))
@@ -106,20 +99,37 @@ def _norm_bot(login):
     return login[: -len("[bot]")] if login.endswith("[bot]") else login
 
 
+def _exact_trust(login, is_bot, maintainer, app_bot):
+    """Type-verified exact-match trust: True/False is a decision, None means the caller must
+    fall through to the collaborator-permission probe (human actors only).
+
+    A Bot actor (GraphQL `Bot` / REST `user.type == "Bot"`) can ONLY be trusted as the exact
+    registry App identity — never via the maintainer match or the permission probe. A human
+    actor can NEVER match the App slug, so an account merely NAMED like the App gains nothing.
+    The slug is compared [bot]-suffix-insensitively only because GraphQL (`gh issue list`)
+    reports bot logins without the suffix while REST events carry it — same identity, two
+    spellings; the actor-type requirement is what prevents this from widening trust."""
+    if not login:
+        return False
+    if is_bot:
+        return bool(app_bot) and _norm_bot(login) == _norm_bot(app_bot)
+    if login.endswith("[bot]"):
+        return False  # brackets are impossible in real user logins — spoofed, never probed
+    if login == maintainer:
+        return True
+    return None
+
+
 def _trusted_factory(repo, maintainer, app_bot):
-    """Exact-match maintainer/App-bot trust, else a CACHED collaborator-permission probe —
-    the same gate triage-issue.yml applies, never a blanket [bot] trust. The App slug is
-    compared [bot]-suffix-insensitively because GraphQL (`gh issue list`) reports bot authors
-    without the suffix while the REST issue event carries it."""
+    """Exact-match maintainer/App-bot trust (type-verified, see _exact_trust), else a CACHED
+    collaborator-permission probe — the same gate triage-issue.yml applies, never a blanket
+    [bot] trust."""
     cache = {}
 
-    def trusted(login):
-        if not login:
-            return False
-        if login == maintainer:
-            return True
-        if app_bot and _norm_bot(login) == _norm_bot(app_bot):
-            return True
+    def trusted(login, is_bot=False):
+        exact = _exact_trust(login, is_bot, maintainer, app_bot)
+        if exact is not None:
+            return exact
         if login not in cache:
             r = _gh(["api", f"repos/{repo}/collaborators/{login}/permission",
                      "--jq", ".permission"])
@@ -130,44 +140,24 @@ def _trusted_factory(repo, maintainer, app_bot):
 
 
 def _fetch_open_issues(repo):
+    # author.is_bot is GraphQL's actor-type discriminator (`__typename == "Bot"`) — the
+    # type half of the _exact_trust gate, not inferable from the login string.
     r = _gh(["issue", "list", "-R", repo, "--state", "open", "--limit", "500",
              "--json", "number,labels,author"])
     if r.returncode != 0:
         raise SystemExit(f"retriage: could not list open issues for {repo}: {r.stderr.strip()}")
     issues = []
     for it in json.loads(r.stdout or "[]"):
+        author = it.get("author") or {}
         issues.append({"number": it.get("number"), "labels": it.get("labels") or [],
-                       "author": ((it.get("author") or {}).get("login") or "")})
+                       "author": (author.get("login") or ""),
+                       "author_is_bot": bool(author.get("is_bot"))})
     return issues
-
-
-def _fetch_leased_numbers(repo, ref=LEDGER_REF):
-    """Issue numbers referenced by ANY ledger lease row for `repo`, or None if the ledger is
-    unreadable (fail-closed: the caller then skips every status:in-progress issue)."""
-    r = _gh(["api", f"repos/{repo}/contents/{LEDGER_PATH}?ref={ref}", "--jq", ".content"])
-    if r.returncode != 0:
-        return None
-    try:
-        rows = json.loads(base64.b64decode(r.stdout)).get("leases", [])
-    except (ValueError, TypeError, AttributeError):
-        return None
-    numbers = set()
-    prefix = f"{repo}#"
-    for lease in rows:
-        holder = lease.get("holder", "") if isinstance(lease, dict) else ""
-        if not isinstance(holder, str) or holder.startswith(REPAIR_HOLDER_PREFIXES):
-            continue
-        key = holder.split("@", 1)[0]  # holder shape: repo#issue@run (groom.py HOLDER)
-        if key.startswith(prefix):
-            try:
-                numbers.add(int(key[len(prefix):]))
-            except ValueError:
-                continue
-    return numbers
 
 
 def _self_test():
     import copy
+    global _gh
     ok = True
 
     def chk(n, got, want):
@@ -176,10 +166,26 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
 
-    def iss(n, labels, author="jeswr"):
-        return {"number": n, "labels": labels, "author": author}
+    def iss(n, labels, author="jeswr", is_bot=False):
+        return {"number": n, "labels": labels, "author": author, "author_is_bot": is_bot}
 
-    trusted = lambda login: login in {"jeswr", "agent-account-registry[bot]"}  # noqa: E731
+    # The REAL trust gate, with the network probe stubbed to "no permission" so every
+    # fall-through is fail-closed and observable (`probes` records who got probed). The
+    # stub is not restored: --self-test returns straight to exit, nothing else runs.
+    probes = []
+
+    class _Denied:
+        returncode = 1
+        stdout = ""
+        stderr = "stubbed: no collaborator permission"
+
+    def _stub_gh(args):
+        probes.append(args)
+        return _Denied()
+
+    _gh = _stub_gh
+    trusted = _trusted_factory("jeswr/agent-account-registry", "jeswr",
+                               "agent-account-registry[bot]")
     fixture = [
         # 1: human later added the priority by LABEL (the exact terminal case) -> promotes
         iss(1, ["status:untriaged", "priority:P2", "kind:docs", "area:docs"]),
@@ -200,9 +206,9 @@ def _self_test():
         iss(8, ["status:untriaged", "trust:untrusted", "priority:P1"]),
         # 9: untrusted author -> never triaged here (and never re-quarantined)
         iss(9, ["priority:P1", "role:impl", "area:usage"], author="rando"),
-        # 10: in-progress with a lease row -> groom owns it, skipped
+        # 10/11: status:in-progress is machine-owned — groom owns ALL its repair (orphan
+        # rows included); retriage must NEVER touch it, ledger or no ledger
         iss(10, ["status:in-progress", "priority:P1", "role:impl", "area:docs"]),
-        # 11: in-progress ORPHAN (lease row vanished) -> re-derived, in-progress stripped
         iss(11, ["status:in-progress", "priority:P2", "role:impl", "area:usage"]),
         # 12: review/deferred/blocked machine states -> skipped
         iss(12, ["status:in-progress-review", "priority:P1", "role:impl", "area:docs"]),
@@ -214,11 +220,19 @@ def _self_test():
         iss(16, ["kind:epic", "priority:P1", "role:impl", "area:usage"]),
         # 17: untriaged, no area -> parks needs:area (same as triage-issue would)
         iss(17, ["status:untriaged", "priority:P2", "role:impl"]),
+        # 18: label-lost, authored by the registry App — a TYPE-verified Bot actor is
+        # trusted under the exact slug (GraphQL spells it without the [bot] suffix)
+        iss(18, ["priority:P1", "role:impl", "area:usage"],
+            author="agent-account-registry", is_bot=True),
+        # 19: an actor NAMED like the App but NOT a Bot -> impersonator, never trusted
+        # (falls through to the permission probe, which the stub denies)
+        iss(19, ["priority:P1", "role:impl", "area:usage"],
+            author="agent-account-registry", is_bot=False),
     ]
     snapshot = copy.deepcopy(fixture)
-    actions = {n: (a, r) for n, a, r in plan_retriage(fixture, trusted, leased_numbers={10})}
+    actions = {n: (a, r) for n, a, r in plan_retriage(fixture, trusted)}
 
-    chk("acted-on set", sorted(actions), [1, 4, 5, 11, 16, 17])
+    chk("acted-on set", sorted(actions), [1, 4, 5, 16, 17, 18])
     chk("untriaged->ready promotes", actions[1],
         (["role:docs", "status:ready"], ["status:untriaged"]))
     chk("account record skipped", 2 in actions, False)
@@ -230,18 +244,32 @@ def _self_test():
     chk("status:ready out of scope", 7 in actions, False)
     chk("quarantine skipped", 8 in actions, False)
     chk("untrusted author skipped", 9 in actions, False)
-    chk("leased in-progress skipped", 10 in actions, False)
-    chk("orphaned in-progress re-derived", actions[11],
-        (["status:ready"], ["status:in-progress"]))
+    chk("status:in-progress NEVER touched (groom owns all repair)",
+        any(n in actions for n in (10, 11)), False)
     chk("machine-owned states skipped", any(n in actions for n in (12, 13, 14)), False)
     chk("incomplete untriaged untouched (no churn)", 15 in actions, False)
     chk("epic label-lost -> untriaged restored", actions[16], (["status:untriaged"], []))
     chk("no-area parks needs:area", actions[17], (["needs:area"], []))
+    chk("type-verified App bot trusted -> swept", actions[18], (["status:ready"], []))
+    chk("non-Bot actor with the App's name NOT trusted", 19 in actions, False)
 
-    # unreadable ledger fail-closed skips EVERY in-progress issue, orphan included
-    closed = {n for n, _, _ in plan_retriage(fixture, trusted, set(), ledger_ok=False)}
-    chk("ledger unreadable -> in-progress skipped", 11 in closed, False)
-    chk("ledger unreadable -> others still swept", 1 in closed, True)
+    # trust gate directly: actor TYPE + exact identity, both required
+    chk("bot + exact slug (GraphQL spelling) trusted",
+        trusted("agent-account-registry", True), True)
+    chk("bot + exact slug (REST spelling) trusted",
+        trusted("agent-account-registry[bot]", True), True)
+    chk("non-bot with App name not exact-trusted",
+        trusted("agent-account-registry", False), False)
+    chk("non-bot with [bot]-suffixed name not trusted",
+        trusted("agent-account-registry[bot]", False), False)
+    chk("foreign bot not trusted", trusted("some-other-app", True), False)
+    chk("maintainer (human) trusted", trusted("jeswr", False), True)
+    chk("bot impersonating the maintainer slug not trusted", trusted("jeswr", True), False)
+    chk("empty login not trusted", trusted("", False), False)
+    # Bot actors must NEVER reach the collaborator probe — no probe carries a bot login
+    chk("no permission probe ever ran for a bot actor",
+        any("some-other-app" in " ".join(p) or "[bot]" in " ".join(p) for p in probes),
+        False)
 
     # MUTATION check 1: planning never mutates its input
     chk("input not mutated", fixture == snapshot, True)
@@ -254,9 +282,9 @@ def _self_test():
             add, remove = actions[it["number"]]
             labels = (labels | set(add)) - set(remove)
         applied.append({"number": it["number"], "labels": sorted(labels),
-                        "author": it["author"]})
+                        "author": it["author"], "author_is_bot": it["author_is_bot"]})
     chk("idempotent (re-plan of post-state is empty)",
-        plan_retriage(applied, trusted, leased_numbers={10}), [])
+        plan_retriage(applied, trusted), [])
 
     # the promoted post-state is genuinely dispatch-visible per the readiness invariants
     ready_labels = set(applied[0]["labels"])
@@ -278,14 +306,8 @@ def main():
 
     maintainer = os.environ.get("MAINTAINER_LOGIN", "jeswr")
     app_bot = os.environ.get("APP_BOT_LOGIN", "agent-account-registry[bot]")
-    leased = _fetch_leased_numbers(args.repo)
-    ledger_ok = leased is not None
-    if not ledger_ok:
-        print("::warning::retriage: lease ledger unreadable — "
-              "all status:in-progress issues skipped (fail-closed)")
     actions = plan_retriage(_fetch_open_issues(args.repo),
-                            _trusted_factory(args.repo, maintainer, app_bot),
-                            leased or set(), ledger_ok)
+                            _trusted_factory(args.repo, maintainer, app_bot))
     if len(actions) > MAX_EDITS:
         print(f"::warning::retriage: {len(actions)} deltas exceed the per-run cap of "
               f"{MAX_EDITS}; the remainder is deferred to the next tick (NOT silent)")
