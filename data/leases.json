@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct03",
-   "claim_id": "8bc546f2cf264d68961e562627e693bb",
-   "holder": "sparq-org/sparq#3227@dispatch-29637717097.1",
-   "package": "gui",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784363883,
-   "expires_at": 1784370183
-  },
-  {
    "account": "acct2css",
    "claim_id": "37911113bf7c47d0897701f587bf574a",
    "holder": "sparq-org/sparq#2766@dispatch-29637862980.1",
