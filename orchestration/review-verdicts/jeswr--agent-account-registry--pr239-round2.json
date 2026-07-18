@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-2 diff remains correct and complete. It dispatches the canonical records shape to the shared model-health ledger validator and exit-class constants, fails loudly on validator rejection, selects the newest record per sanitized provider/model pair, bounds the output, and excludes account hashes. The added self-test is non-vacuous: it exercises same-pair newest-record precedence, status folding, omission of model-less fleet signals, generated_at semantics, and malformed-account rejection. Legacy model-health normalization remains covered, and the diff neither weakens a trust check nor introduces a supported security issue.",
+ "verdict": "approve"
+}
