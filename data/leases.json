@@ -19,6 +19,16 @@
    "model": "fable",
    "issued_at": 1784348577,
    "expires_at": 1784354877
+  },
+  {
+   "account": "acct05",
+   "claim_id": "56e4bcaea185432490bf7995a52e29f9",
+   "holder": "sparq-org/sparq#3257@dispatch-29630965439.1",
+   "package": "knowledge-graph",
+   "role": "impl",
+   "model": "fable",
+   "issued_at": 1784349855,
+   "expires_at": 1784356155
   }
  ]
 }
