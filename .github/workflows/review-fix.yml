@@ -379,11 +379,16 @@ jobs:
           # against the LIVE head here — the dispatcher's content_provider input is an
           # UNAUTHENTICATED hint that is only cross-checked, never trusted. The successful-push
           # author markers (bot-authored, bound to their pushed sha) are the durable source;
-          # no marker => the provenance implementer authored the content, and a head bound to
-          # NO marker is accepted ONLY via the merge-only carry-forward probe against the PR's
-          # ACTUAL base ref (sol review r3 finding 1: the head advanced from the last recorded
-          # push purely by base-branch merges with a byte-identical diff — never a latest-
-          # marker guess for an ordinary unmarked commit). The fix ladder is the unified
+          # ZERO markers name the provenance implementer ONLY when the head is proven to still
+          # be the implementer's published tree (sol review r5 finding 1): head ==
+          # head_sha_at_open or a merge-only content-identical advance of it — the ancestry
+          # check above passes ANY descendant, so an unmarked advanced head (a pushed fix
+          # whose marker recording crashed) must fail closed, never read as implementer-
+          # authored. A head bound to NO marker among several is accepted ONLY via the same
+          # merge-only carry-forward probe against the PR's ACTUAL base ref (sol review r3
+          # finding 1: the head advanced from the last recorded push purely by base-branch
+          # merges with a byte-identical diff — never a latest-marker guess for an ordinary
+          # unmarked commit). The fix ladder is the unified
           # escalation ladder intersected with the provenance record's ORIGINAL route
           # constraint (persisted at publication — immutable) AND the live re-derivation from
           # the source issue's current labels, so live labels only ever NARROW the recorded
@@ -412,7 +417,7 @@ jobs:
           base_ref = str((pull.get("base") or {}).get("ref") or "")
           try:
               author_alias = worker_pr.content_author_alias(
-                  worker_pr.fix_push_authors(pr_comments, author), head_sha,
+                  worker_pr.fix_push_authors(pr_comments, author), head_sha, opened_sha,
                   carry_forward=lambda marked_sha: bool(base_ref)
                   and worker_pr._merge_only_carry_forward(repo, head_sha, marked_sha,
                                                           base_ref))

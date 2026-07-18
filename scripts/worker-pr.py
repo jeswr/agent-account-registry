@@ -207,23 +207,41 @@ def fix_push_authors(comments, bot_login):
     return authors
 
 
-def content_author_alias(authors, head_sha, carry_forward=None):
+def content_author_alias(authors, head_sha, opened_sha, carry_forward=None):
     """The model alias that authored the CONTENT at `head_sha`, from the ordered successful-push
-    author markers (fix_push_authors). None => no fix ever pushed, the provenance implementer
-    authored the content. The ONLY accepted bindings (sol review r3 finding 1):
+    author markers (fix_push_authors). None => the provenance implementer authored the content —
+    returned ONLY when that is PROVEN (sol review r5 finding 1): with zero markers the head must
+    be EXACTLY `opened_sha` (the provenance record's head_sha_at_open) or a proven merge-only,
+    content-identical advance of it. A bare zero-marker fallback is not enough: the callers'
+    ancestry checks pass any ordinary descendant commit, so an unmarked advanced head (e.g. a
+    fix/rebase push that landed while outcome-marker recording crashed) would be misattributed
+    to the implementer and could flip the review direction to the content author's own provider.
+    The ONLY accepted bindings:
     - a marker bound to EXACTLY this head sha, or
-    - `carry_forward(last_marked_sha)` returning True — the caller-supplied probe over the
-      existing merge-only carry-forward machinery (_merge_only_carry_forward), proving the head
-      advanced from the LAST recorded push solely by base-branch merge commits with a
-      byte-identical diff vs the merge base, so the last push author still owns the content.
-    There is deliberately NO latest-marker or implementer fallback for an unmarked head: an
-    ordinary (non-merge) descendant commit passes the ancestry checks, so guessing its author
-    from an unrelated marker could flip the review direction to the content author's own
-    provider. Any unmarked, unproven head raises — the caller escalates to a human, never
-    guesses a review direction. Two markers binding the SAME sha to different models is
-    corrupt/forged marker data and raises for the same reason."""
+    - zero markers AND head == opened_sha (the head still is the implementer's published
+      commit), or
+    - `carry_forward(sha)` returning True for the last PROVEN-authored sha — the LAST marked
+      push, or `opened_sha` when no push was ever marked. The probe is the caller-supplied
+      wrapper over the existing merge-only carry-forward machinery
+      (_merge_only_carry_forward): the head advanced from that sha solely by base-branch merge
+      commits with a byte-identical diff vs the merge base, so that sha's author still owns
+      the content.
+    There is deliberately NO latest-marker or implementer fallback for an unmarked, unproven
+    head — it raises and the caller escalates to a human, never guesses a review direction.
+    Two markers binding the SAME sha to different models is corrupt/forged marker data and
+    raises for the same reason."""
+    if not re.fullmatch(r"[0-9a-f]{40}", opened_sha or ""):
+        raise WorkerPrError(
+            "content-author derivation requires the provenance head_sha_at_open")
     if not authors:
-        return None
+        if head_sha == opened_sha:
+            return None
+        if carry_forward is not None and carry_forward(opened_sha):
+            return None
+        raise WorkerPrError(
+            "no successful-push author markers exist and the live head is neither the "
+            "provenance-opened commit nor a proven merge-only, content-identical advance "
+            "of it")
     by_sha = {}
     for _, model, sha in authors:
         by_sha.setdefault(sha, set()).add(model)
@@ -1890,6 +1908,7 @@ def _self_test():
     # ---- successful-push author markers (sol audit 2026-07-18): the CONTENT author is bound
     # to the pushed head sha; per-attempt fix-model markers never derive the review direction ----
     sha_p, sha_q = "1" * 40, "2" * 40
+    sha_open = "0" * 40   # the provenance record's head_sha_at_open
     author_comments = [
         {"user": {"login": bot},
          "body": f"a {FIX_AUTHOR_MARKER} round=1 model=opus sha={sha_p} run=1.1 -->"},
@@ -1902,36 +1921,63 @@ def _self_test():
     check("push authors are bot-only and ordered", authors,
           [(1, "opus", sha_p), (2, "luna", sha_q)])
     check("content author binds to the exact head sha",
-          content_author_alias(authors, sha_q), "luna")
+          content_author_alias(authors, sha_q, sha_open), "luna")
     check("an earlier pushed head resolves its own author",
-          content_author_alias(authors, sha_p), "opus")
+          content_author_alias(authors, sha_p, sha_open), "opus")
     # Sol review r3 finding 1: an UNMARKED head gets NO latest-marker guess — without a proven
     # merge-only content-identical advance the derivation raises and the caller escalates.
     try:
-        content_author_alias(authors, "3" * 40)
+        content_author_alias(authors, "3" * 40, sha_open)
     except WorkerPrError:
         check("unmarked head without carry-forward proof fails closed", "rejected", "rejected")
     else:
         check("unmarked head without carry-forward proof fails closed", "accepted", "rejected")
     probed = []
     check("proven merge-only advance keeps the LAST push author",
-          content_author_alias(authors, "3" * 40,
+          content_author_alias(authors, "3" * 40, sha_open,
                                carry_forward=lambda sha: probed.append(sha) or True), "luna")
     check("the carry-forward probe runs against the LAST marked sha", probed, [sha_q])
     try:
-        content_author_alias(authors, "3" * 40, carry_forward=lambda sha: False)
+        content_author_alias(authors, "3" * 40, sha_open, carry_forward=lambda sha: False)
     except WorkerPrError:
         check("a refuted carry-forward probe fails closed", "rejected", "rejected")
     else:
         check("a refuted carry-forward probe fails closed", "accepted", "rejected")
     check("an exact-sha marker never consults the carry-forward probe",
-          content_author_alias(authors, sha_q,
+          content_author_alias(authors, sha_q, sha_open,
                                carry_forward=lambda sha: (_ for _ in ()).throw(
                                    AssertionError("probe must not run"))), "luna")
-    check("no push authors means implementer-authored content",
-          content_author_alias([], "3" * 40), None)
+    # Sol review r5 finding 1: the ZERO-marker implementer fallback is PROOF-GATED on the
+    # provenance-opened sha — a bare "no markers => implementer" answer misattributes an
+    # unmarked ADVANCED head (a pushed fix whose marker recording crashed still descends from
+    # the opened commit, so the callers' ancestry checks alone cannot catch it).
+    check("no push authors + the UNMOVED opened head is implementer-authored",
+          content_author_alias([], sha_open, sha_open), None)
     try:
-        content_author_alias([(1, "opus", sha_p), (2, "luna", sha_p)], sha_p)
+        content_author_alias([], "3" * 40, sha_open)
+    except WorkerPrError:
+        check("no markers + an ADVANCED head fails closed", "rejected", "rejected")
+    else:
+        check("no markers + an ADVANCED head fails closed", "accepted", "rejected")
+    probed = []
+    check("no markers + a proven merge-only advance of the OPENED sha keeps the implementer",
+          content_author_alias([], "3" * 40, sha_open,
+                               carry_forward=lambda sha: probed.append(sha) or True), None)
+    check("the zero-marker probe runs against the OPENED sha", probed, [sha_open])
+    try:
+        content_author_alias([], "3" * 40, sha_open, carry_forward=lambda sha: False)
+    except WorkerPrError:
+        check("no markers + a refuted opened-sha probe fails closed", "rejected", "rejected")
+    else:
+        check("no markers + a refuted opened-sha probe fails closed", "accepted", "rejected")
+    try:
+        content_author_alias([], sha_open, "not-a-sha")
+    except WorkerPrError:
+        check("a malformed opened sha fails closed", "rejected", "rejected")
+    else:
+        check("a malformed opened sha fails closed", "accepted", "rejected")
+    try:
+        content_author_alias([(1, "opus", sha_p), (2, "luna", sha_p)], sha_p, sha_open)
     except WorkerPrError:
         check("conflicting same-sha authors fail closed", "rejected", "rejected")
     else:
@@ -1945,7 +1991,7 @@ def _self_test():
          "body": f"a {FIX_AUTHOR_MARKER} round=2 model=luna sha={sha_q} run=2.2 -->"},
     ]
     check("attempt-polluted round still yields ONE push author",
-          content_author_alias(fix_push_authors(mixed_round, bot), sha_q), "luna")
+          content_author_alias(fix_push_authors(mixed_round, bot), sha_q, sha_open), "luna")
 
     # ---- route-constrained fix ladder (sol audit 2026-07-18) ----
     constraint_routing = {

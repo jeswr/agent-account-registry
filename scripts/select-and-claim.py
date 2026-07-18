@@ -18,6 +18,7 @@ import base64
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 
@@ -371,6 +372,106 @@ def read_accounts(repo):
         if a["handle"] and a["models"]:
             accounts.append(a)
     return accounts
+
+
+# ---- catalog-derived enrollment + account-record migration --------------------------------------
+# choose_account matches an account's `models:` aliases LITERALLY against the offered chain, so an
+# enrollment shape narrower than the routing catalog silently starves every chain tier it omits
+# (sol review r5 finding 2: openai accounts enrolled as models: [terra] could serve NEITHER the
+# sol/luna review chain NOR the openai tiers of the unified fix ladder — merging the chains would
+# starve the lane on every freshly enrolled account). The broker (set-up-account.yml) and the
+# migration sweep below therefore both derive the models line from the catalog, never a literal.
+ACCOUNT_HANDLE_RE = re.compile(r"acct[0-9a-z]{2,}")
+MODELS_LINE_RE = re.compile(r"(?m)^models\s*:.*$")
+# Pre-unification broker enrollment shapes. ONLY a record whose models set still EQUALS its
+# provider's legacy shape is migrated: any other list is an operator edit (e.g. an alias
+# deliberately withheld from one account) that a convergence sweep must never fight.
+LEGACY_ENROLLMENT_MODELS = {
+    "openai": frozenset({"terra"}),
+    "anthropic": frozenset({"fable", "opus", "sonnet", "haiku"}),
+}
+
+
+def enrollment_models(provider, routing):
+    """The CATALOG-DERIVED model-alias list an enrolling `provider` account must register:
+    every `[models.<alias>]` whose provider matches, in catalog order. Raises when the catalog
+    names none (fail closed — an empty models line makes the account invisible to
+    read_accounts, so the broker must refuse the enrollment rather than register a dud)."""
+    models = routing.get("models") if isinstance(routing, dict) else None
+    if not isinstance(models, dict):
+        models = {}
+    aliases = [alias for alias, spec in models.items()
+               if isinstance(spec, dict) and spec.get("provider") == provider]
+    if not aliases:
+        raise LeaseIOError(f"the routing catalog names no models for provider '{provider}'")
+    return aliases
+
+
+def migrate_models_line(body, legacy, required):
+    """Pure rewrite of ONE account-record body for the models migration. Returns
+    (new_body, reason); new_body is None when the record must not change:
+    - the models set already covers the required catalog set (idempotent no-op),
+    - the models set differs from the provider's LEGACY enrollment shape (operator-edited —
+      never fought), or
+    - the body is unmigratable (zero or multiple models lines) — surfaced in `reason` so the
+      caller logs it loudly instead of guessing which line to edit."""
+    lines = MODELS_LINE_RE.findall(body or "")
+    if len(lines) != 1:
+        return None, f"unmigratable body ({len(lines)} models lines)"
+    current = set(_parse_account(body)["models"])
+    if current >= set(required):
+        return None, "already covers the catalog set"
+    if legacy is None or current != set(legacy):
+        return None, f"custom models line {sorted(current)} (operator-edited); left alone"
+    replacement = "models: [" + ", ".join(required) + "]"
+    return MODELS_LINE_RE.sub(replacement, body, count=1), "migrated"
+
+
+def migrate_account_models(repo, routing):
+    """Converge OPEN account records still carrying a LEGACY enrollment shape to the
+    catalog-derived alias set, so accounts enrolled before the chain unification can serve the
+    sol/luna review chain and the unified fix ladder. Idempotent (a migrated record no longer
+    matches its legacy shape); operator-edited and unparseable records are logged and left
+    alone. Every rewritten body is re-validated through the REAL _parse_account parser before
+    the PATCH; a write or validation failure raises (loud, fail closed)."""
+    out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
+                "--json", "number,title,body,labels"]).stdout
+    migrated = 0
+    for it in json.loads(out or "[]"):
+        handle = str(it.get("title", "")).strip()
+        if not ACCOUNT_HANDLE_RE.fullmatch(handle):
+            continue
+        labels = {str(lb.get("name", "")) for lb in it.get("labels", [])
+                  if isinstance(lb, dict)}
+        label_providers = {name[len("provider:"):] for name in labels
+                           if name.startswith("provider:")}
+        body = it.get("body") or ""
+        body_provider = _parse_account(body).get("provider", "")
+        providers = {p for p in label_providers | {body_provider} if p}
+        if len(providers) != 1 or not providers <= set(LEGACY_ENROLLMENT_MODELS):
+            # Ambiguous/unknown provider identity: never guess which alias set applies.
+            print(f"skip {handle}: ambiguous or unknown provider {sorted(providers)}")
+            continue
+        provider = next(iter(providers))
+        required = enrollment_models(provider, routing)
+        new_body, reason = migrate_models_line(
+            body, LEGACY_ENROLLMENT_MODELS[provider], required)
+        if new_body is None:
+            print(f"skip {handle}: {reason}")
+            continue
+        if set(_parse_account(new_body)["models"]) != set(required):
+            raise LeaseIOError(f"migrated body for {handle} does not re-parse to the "
+                               "catalog alias set; refusing to write")
+        result = subprocess.run(
+            ["gh", "api", "-X", "PATCH", f"repos/{repo}/issues/{it['number']}",
+             "--input", "-"],
+            input=json.dumps({"body": new_body}), capture_output=True, text=True,
+            check=False)
+        if result.returncode != 0:
+            raise LeaseIOError(f"account-record body PATCH failed for {handle}")
+        print(f"migrated {handle}: models -> [{', '.join(required)}]")
+        migrated += 1
+    return migrated
 
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
@@ -848,6 +949,99 @@ def _self_test():
     check("fixture writes all pin branch=ledger",
           [sum(1 for a in c if a == "branch=ledger") for c in fixture_puts], [1, 1])
 
+    # ---- catalog-derived enrollment + legacy-record migration (sol review r5 finding 2) ----
+    catalog = {"models": {
+        "haiku": {"provider": "anthropic"}, "sonnet": {"provider": "anthropic"},
+        "opus": {"provider": "anthropic"}, "fable": {"provider": "anthropic"},
+        "terra": {"provider": "openai"}, "sol": {"provider": "openai"},
+        "luna": {"provider": "openai"},
+    }}
+    check("openai enrollment registers EVERY catalog alias (catalog order)",
+          enrollment_models("openai", catalog), ["terra", "sol", "luna"])
+    check("anthropic enrollment registers every catalog alias",
+          enrollment_models("anthropic", catalog), ["haiku", "sonnet", "opus", "fable"])
+    try:
+        enrollment_models("mystery", catalog)
+    except LeaseIOError:
+        check("a provider the catalog omits fails closed", "rejected", "rejected")
+    else:
+        check("a provider the catalog omits fails closed", "accepted", "rejected")
+    try:
+        enrollment_models("openai", {"models": "nope"})
+    except LeaseIOError:
+        check("a malformed catalog fails closed", "rejected", "rejected")
+    else:
+        check("a malformed catalog fails closed", "accepted", "rejected")
+    legacy_body = ("provider: openai\nharness: codex\nmodels: [terra]\n"
+                   "credential_format: codex-auth-json\nmax_concurrent_workers: 1\n"
+                   "secret_ref: ACCT01_TOKEN\nnotes: registered via set-up-account broker\n")
+    required = enrollment_models("openai", catalog)
+    migrated_body, reason = migrate_models_line(
+        legacy_body, LEGACY_ENROLLMENT_MODELS["openai"], required)
+    check("legacy openai record migrates to the catalog set", reason, "migrated")
+    check("the migrated body re-parses to the catalog set",
+          _parse_account(migrated_body)["models"], ["terra", "sol", "luna"])
+    check("migration touches ONLY the models line",
+          migrated_body.replace("models: [terra, sol, luna]",
+                                "models: [terra]") == legacy_body, True)
+    legacy_shape = LEGACY_ENROLLMENT_MODELS["openai"]
+    check("migration is idempotent (a migrated body no longer changes)",
+          migrate_models_line(migrated_body, legacy_shape, required)[0], None)
+    check("an operator-edited models line is NEVER fought",
+          migrate_models_line(legacy_body.replace("[terra]", "[terra, sol]"),
+                              legacy_shape, required)[0], None)
+    check("a body with no models line is unmigratable (logged, not guessed)",
+          migrate_models_line("provider: openai\n", legacy_shape, required),
+          (None, "unmigratable body (0 models lines)"))
+    check("a body with duplicate models lines is unmigratable",
+          migrate_models_line("models: [terra]\nmodels: [terra]\n",
+                              legacy_shape, required)[0], None)
+    # Live-driver wiring over stubbed I/O: exactly the legacy openai record is PATCHed; the
+    # anthropic full-set record, an operator-edited record, a provider-conflicted record, and
+    # a non-account issue are all left untouched.
+    issues = [
+        {"number": 1, "title": "acct01", "body": legacy_body,
+         "labels": [{"name": "provider:openai"}, {"name": "status:available"}]},
+        {"number": 2, "title": "acct02",
+         "body": "provider: anthropic\nmodels: [fable, opus, sonnet, haiku]\n",
+         "labels": [{"name": "provider:anthropic"}]},
+        {"number": 3, "title": "acct03", "body": "provider: openai\nmodels: [terra, sol]\n",
+         "labels": [{"name": "provider:openai"}]},
+        {"number": 4, "title": "acct04", "body": "provider: openai\nmodels: [terra]\n",
+         "labels": [{"name": "provider:anthropic"}]},   # label/body conflict: never guessed
+        {"number": 5, "title": "set up new account", "body": "models: [terra]\n",
+         "labels": [{"name": "provider:openai"}]},
+    ]
+    patches = []
+    real_run, real_sub_run = _run, subprocess.run
+
+    def fake_run(args):
+        class _R:
+            stdout = json.dumps(issues)
+        return _R()
+
+    def fake_sub_run(args, **kwargs):
+        patches.append((args, kwargs.get("input")))
+
+        class _R:
+            returncode = 0
+            stdout = stderr = ""
+        return _R()
+
+    try:
+        globals()["_run"] = fake_run
+        subprocess.run = fake_sub_run
+        migrated_count = migrate_account_models("reg/repo", catalog)
+    finally:
+        globals()["_run"] = real_run
+        subprocess.run = real_sub_run
+    check("exactly the legacy-shape openai record migrates", migrated_count, 1)
+    check("the PATCH targets that record",
+          [args[4] for args, _ in patches], ["repos/reg/repo/issues/1"])
+    check("the PATCHed body carries the catalog set",
+          _parse_account(json.loads(patches[0][1])["body"])["models"],
+          ["terra", "sol", "luna"])
+
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -873,9 +1067,27 @@ def main():
                     help="required holder prefix when inspecting a dispatcher claim")
     ap.add_argument("--ttl", type=int, default=3600, help="lease lifetime in seconds")
     ap.add_argument("--repo", default="jeswr/agent-account-registry")
+    ap.add_argument("--enrollment-models", metavar="PROVIDER",
+                    help="print the catalog-derived models line for an enrolling account "
+                         "(set-up-account broker)")
+    ap.add_argument("--migrate-account-models", action="store_true",
+                    help="converge legacy-shape open account records to the catalog-derived "
+                         "models line (idempotent groom sweep)")
+    ap.add_argument("--routing", default="orchestration/routing.toml",
+                    help="routing catalog for --enrollment-models / --migrate-account-models")
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
+    if args.enrollment_models or args.migrate_account_models:
+        import tomllib
+        with open(args.routing, "rb") as handle:
+            routing = tomllib.load(handle)
+        if args.enrollment_models:
+            print("[" + ", ".join(enrollment_models(args.enrollment_models, routing)) + "]")
+            return 0
+        migrated = migrate_account_models(args.repo, routing)
+        print(f"migrated {migrated} account record(s)")
+        return 0
     import time
     if args.reclaim:
         n = reclaim(args.repo, int(time.time()))

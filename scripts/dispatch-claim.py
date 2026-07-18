@@ -1333,11 +1333,16 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # each BOUND to its pushed head sha — never from the per-attempt fix-model
                 # markers, which also record no-change/gate-failed attempts and so can span
                 # providers within one round (an opus attempt + a luna success previously
-                # read as "conflicting providers" and parked). No author marker => the
-                # provenance implementer authored the head. A head that carries markers but
-                # is bound to NONE of them (sol review r3 finding 1) is accepted ONLY via the
-                # merge-only carry-forward probe against the PR's ACTUAL base ref (the head
-                # advanced from the last recorded push purely by base-branch merges with a
+                # read as "conflicting providers" and parked). ZERO author markers name the
+                # provenance implementer ONLY when the head is proven to still be the
+                # implementer's published tree (sol review r5 finding 1): head ==
+                # head_sha_at_open, or a merge-only content-identical advance of it — the
+                # ancestry check above passes ANY descendant, so a pushed fix whose marker
+                # recording crashed would otherwise read as implementer-authored and flip
+                # the review direction. A head that carries markers but is bound to NONE of
+                # them (sol review r3 finding 1) is accepted ONLY via the same merge-only
+                # carry-forward probe against the PR's ACTUAL base ref (the head advanced
+                # from the last recorded push purely by base-branch merges with a
                 # byte-identical diff vs the merge base — issue #69/#81 machinery); anything
                 # else — conflicting markers, an unmarked/unproven head, or an alias the
                 # target routing does not name — is a loud human hand-off, never a guessed
@@ -1346,6 +1351,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 try:
                     author_alias = worker_pr.content_author_alias(
                         worker_pr.fix_push_authors(comments, bot_login), head_sha,
+                        opened_sha,
                         carry_forward=lambda marked_sha: bool(base_ref)
                         and worker_pr._merge_only_carry_forward(
                             repo, head_sha, marked_sha, base_ref))
@@ -2877,6 +2883,35 @@ def _self_test():
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
 
+            # ---- ZERO markers + an ADVANCED head (sol review r5 finding 1): the head
+            # descends from the opened commit (the fake compare answers "ahead", so the
+            # ancestry admission passes) but carries NO author marker and is NOT the opened
+            # sha — the crash window where a fix pushed and marker recording died. The
+            # implementer fallback must NOT fire: loud park, with the carry-forward probe
+            # run against the OPENED sha + the ACTUAL base ref ----
+            ledger_record.write_text(json.dumps(
+                {**provenance[41], "head_sha_at_open": sha_b}), encoding="utf-8")
+            fake["comments"] = round_markers(2)
+            real_carry = wiring_worker_pr._merge_only_carry_forward
+            probe_calls = []
+            wiring_worker_pr._merge_only_carry_forward = (
+                lambda *args: probe_calls.append(args) or False)
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+            assert probe_calls == [(repo, sha_a, sha_b, "main")], probe_calls
+            # ... while a PROVEN merge-only, content-identical advance of the OPENED sha
+            # keeps the implementer owning the content (review direction: openai chain)
+            wiring_worker_pr._merge_only_carry_forward = lambda *args: True
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
+            wiring_worker_pr._merge_only_carry_forward = real_carry
+            ledger_record.write_text(json.dumps(provenance[41]), encoding="utf-8")
+
             # ---- claim-layer guard is CONTENT-keyed (sol audit; previously unreachable —
             # the deferring allocator never returned a claim) ----
             class GrantingAllocator:
@@ -3052,6 +3087,28 @@ def _self_test():
     assert escalate_starved(True, {"acct01": {}}, 1) is False
     assert escalate_starved(False, {"acct01": {}}, 0) is False
     assert escalate_starved(None, {"acct01": {}}, 0) is False
+
+    # ---- catalog-coverage regression (sol review r5 finding 2): every alias the review
+    # chain or the unified fix ladder can EVER offer must be enrollable — named by the LIVE
+    # orchestration/routing.toml catalog under a provider whose broker enrollment shape
+    # (select-and-claim.enrollment_models, consumed by set-up-account.yml and the groom
+    # migration sweep) registers it on accounts. An alias missing here means a chain tier NO
+    # enrollable account shape can serve: the allocator matches aliases literally, so that
+    # tier starves on every freshly enrolled account (the openai [terra] defect). ----
+    catalog_path = Path(__file__).resolve().parent.parent / "orchestration" / "routing.toml"
+    catalog = tomllib.loads(catalog_path.read_text(encoding="utf-8"))
+    allocator_mod = _load_module("registry_select_and_claim_coverage",
+                                 Path(__file__).resolve().parent / "select-and-claim.py")
+    enrollable = set()
+    for provider in ("anthropic", "openai"):
+        aliases = allocator_mod.enrollment_models(provider, catalog)
+        assert aliases, f"no enrollable {provider} aliases in the catalog"
+        enrollable.update(aliases)
+    chain_aliases = ({alias for chain in REVIEW_CHAIN.values() for alias in chain}
+                     | set(wiring_worker_pr.UNIFIED_FIX_LADDER))
+    unservable = sorted(chain_aliases - enrollable)
+    assert not unservable, \
+        f"chain aliases NO enrollable account shape can serve: {unservable}"
 
     print("dispatch-claim self-test PASSED")
 

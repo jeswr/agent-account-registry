@@ -63,6 +63,9 @@ jobs:
             exit 1
           fi
 
+      - name: Checkout (pinned)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - name: Determine provider (structured — no silent default)
         id: meta
         run: |
@@ -76,8 +79,15 @@ jobs:
             exit 1
           fi
           # The models line the allocator requires (read_accounts drops model-less accounts),
-          # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
-          if [ "$prov" = openai ]; then models='[terra]'; else models='[fable, opus, sonnet, haiku]'; fi
+          # DERIVED FROM the orchestration/routing.toml [models] catalog — never a literal
+          # (sol review r5 finding 2: the allocator matches these aliases LITERALLY against
+          # the review/fix chains, so a hardcoded openai [terra] enrolled accounts that could
+          # serve neither the sol/luna review chain nor the unified fix ladder). The
+          # catalog-derived set is self-tested + coverage-tested against both chains
+          # (select-and-claim.py enrollment_models, dispatch-claim.py --self-test), and an
+          # empty catalog set fails this step (fail closed — no dud registration).
+          models=$(python3 scripts/select-and-claim.py --enrollment-models "$prov" \
+            --routing orchestration/routing.toml)
           n=$(gh issue list -R "${{ github.repository }}" --state all --json title \
                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]|max // 0' 2>/dev/null || echo 0)
           {
@@ -86,9 +96,6 @@ jobs:
             printf 'handle=acct%02d\n' "$((n+1))"
             printf 'secret=ACCT%02d_TOKEN\n' "$((n+1))"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Checkout (pinned)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install provider CLI (version-pinned, fail on error)
         run: |
@@ -144,6 +151,7 @@ jobs:
           python3 - <<'PY'
           import importlib.util
           import os
+          import tomllib
 
           spec = importlib.util.spec_from_file_location(
               "registry_select_and_claim", "scripts/select-and-claim.py")
@@ -156,6 +164,17 @@ jobs:
               raise SystemExit(
                   f"registration validation FAILED: {handle} is invisible to read_accounts "
                   "(missing or empty models line) — the allocator could never select it")
+          # Catalog coverage (sol review r5 finding 2): the registered aliases must cover the
+          # provider's FULL catalog set, or the account silently starves every chain tier it
+          # omits (the allocator matches aliases literally).
+          with open("orchestration/routing.toml", "rb") as fh:
+              routing = tomllib.load(fh)
+          required = set(module.enrollment_models(account.get("provider", ""), routing))
+          if not required <= set(account["models"]):
+              raise SystemExit(
+                  f"registration validation FAILED: {handle} models={account['models']} does "
+                  f"not cover the catalog set {sorted(required)} — the review/fix chains "
+                  "could starve on this account")
           print(f"registration validated: {handle} models={account['models']}")
           PY
 

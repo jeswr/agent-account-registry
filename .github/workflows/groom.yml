@@ -113,6 +113,26 @@ jobs:
             --bot-slug "$APP_SLUG" \
             --ledger-root ledger
 
+      # Account-record models MIGRATION (sol review r5 finding 2): accounts enrolled by the
+      # pre-unification broker carry models: [terra], which the allocator matches literally —
+      # those records can serve NEITHER the sol/luna review chain NOR the openai tiers of the
+      # unified fix ladder, so merging the chains without this sweep would starve the lane.
+      # Idempotent convergence: only an open acctNN record whose models line still EQUALS its
+      # provider's LEGACY enrollment shape is rewritten to the catalog-derived set (an
+      # operator-edited list is never fought; a migrated record no longer matches). Runs every
+      # groom tick from master, so existing accounts gain the aliases on the first tick after
+      # merge with no manual pass. continue-on-error mirrors the model-health step: a
+      # write/validation failure goes visibly red while the maintenance sweep stays alive.
+      - name: Converge legacy account-record model aliases to the catalog
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/select-and-claim.py --self-test
+          python3 scripts/select-and-claim.py --migrate-account-models \
+            --repo "$GITHUB_REPOSITORY" --routing orchestration/routing.toml
+
       # Model-access health decision (registry #32): the groom sweep already runs on schedule, so it
       # is the natural place to evaluate the health record window and raise/close alerts (keeps
       # dispatch.yml lean). Reads data/model-health.json + the enabled provider->account fleet, then
