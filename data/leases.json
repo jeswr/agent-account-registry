@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct07",
-   "claim_id": "5dc327a72f694058aba3731bc562f5d2",
-   "holder": "fix:jeswr/agent-account-registry#235@dispatch-29657525675.1",
-   "package": "review-loop",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784402501,
-   "expires_at": 1784406101
-  },
-  {
    "account": "acct01",
    "claim_id": "1ec1afe46f8240c683d7649a3a0c1ce2",
    "holder": "review:jeswr/agent-account-registry#264@dispatch-29657525675.1",
