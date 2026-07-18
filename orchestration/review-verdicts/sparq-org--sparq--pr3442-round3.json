@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "collect_bgps handles GraphPattern::Join identically to Union and pushes each child BGP separately. witness_abox then assigns each child a distinct di namespace, so a variable shared across the join is frozen to different IRIs and no generated data necessarily satisfies the complete joined CQ. For a query written with nested groups that parse as Join, both the raw query and a wrongly minimized query can consequently be empty over the synthesized witness. The claimed per-disjunct canonical-instance guarantee does not hold on this admitted path. The current shared-variable test places both triples in a single BGP, so it does not cover Join.",
+   "file": "crates/sparq-reason-ql/examples/ql_npd_requiem_bench.rs",
+   "fix_hint": "Preserve conjunction when traversing Join: construct one canonical instance for the combined joined branch with a shared variable-freezing map (while Union creates alternatives), or fail closed on Join shapes that are not proven to be emitter structure. Add a regression whose original/raw query contains Join(Bgp, Bgp) sharing a variable and whose deliberately wrong minimized query drops a non-subsumed branch; assert the revised witness is non-empty and detects the mismatch (or refuses witness mode with no timing row).",
+   "severity": "major",
+   "title": "Join nodes are frozen as separate disjuncts, making the witness gate vacuous"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "Round 3 fixes the prior FILTER/VALUES witness-mode defect by refusing those modifiers and adds a direct refusal regression. However, the witness traversal still treats GraphPattern::Join like Union: each joined BGP is frozen as an independent disjunct with a different per-disjunct namespace. A syntactically joined CQ can therefore have no complete canonical instance, making raw and wrongly minimized queries agree vacuously. The existing multi-atom regression uses one BGP and does not exercise this path. This is a new major finding, so progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
