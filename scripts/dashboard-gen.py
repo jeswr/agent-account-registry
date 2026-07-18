@@ -6,6 +6,7 @@ import copy
 import datetime as dt
 import hashlib
 import hmac
+import importlib.util
 import io
 import json
 import os
@@ -297,9 +298,69 @@ def _health_status(value):
     return "unknown"
 
 
+_MODEL_HEALTH_MODULE = None
+
+
+def _model_health_module():
+    """Load scripts/model-health.py (hyphenated name — importlib, same pattern as
+    account-usage._load_model_health) so the ledger validator + exit-class taxonomy are SHARED,
+    not re-implemented here where they would drift."""
+    global _MODEL_HEALTH_MODULE
+    if _MODEL_HEALTH_MODULE is None:
+        path = Path(__file__).resolve().with_name("model-health.py")
+        spec = importlib.util.spec_from_file_location("registry_model_health", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _MODEL_HEALTH_MODULE = module
+    return _MODEL_HEALTH_MODULE
+
+
+def _normalize_ledger_health(document):
+    """Canonical model-health ledger, {"records": [...]} (issue #218): validate with the shared
+    model-health validator — a malformed ledger fails LOUD, never renders a fabricated check —
+    then derive one status per (provider, model): the NEWEST record's exit-class, folded to
+    healthy/degraded/unhealthy/unknown. Records without a model alias (zero-dispatch fleet
+    signals) carry no per-model information and are skipped; account hashes never reach the
+    output. Output is bounded: one check per distinct (provider, model), newest 20 pairs."""
+    health = _model_health_module()
+    try:
+        records = health.validate_ledger(document)
+    except ValueError as exc:
+        raise DashboardError(f"model-health ledger is malformed: {exc}") from exc
+    class_status = {
+        health.SUCCESS: "healthy",
+        health.CLASS_LIMIT: "degraded",
+        health.CLASS_TRANSIENT: "degraded",
+        health.CLASS_AUTH: "unhealthy",
+        health.CLASS_BILLING: "unhealthy",
+    }
+    latest = {}
+    for record in records:
+        provider = str(record["provider"]).lower()
+        model = str(record.get("model_alias") or "")
+        if (SAFE_PROVIDER_RE.fullmatch(provider) is None
+                or SAFE_MODEL_RE.fullmatch(model) is None):
+            continue
+        key = (provider, model)
+        if key not in latest or record["ts"] >= latest[key]["ts"]:
+            latest[key] = record
+    newest_pairs = sorted(latest.items(), key=lambda item: item[1]["ts"], reverse=True)[:20]
+    checks = sorted(({
+        "model": model,
+        "provider": provider,
+        "status": class_status.get(record["exit_class"], "unknown"),
+        "checked_at": _utc_iso(record["ts"]),
+    } for (provider, model), record in newest_pairs),
+        key=lambda check: (check["provider"], check["model"]))
+    generated_at = _utc_iso(max((record["ts"] for record in records), default=None))
+    return {"generated_at": generated_at, "checks": checks}
+
+
 def _normalize_model_health(document):
     if document is None:
         return None
+    if isinstance(document, dict) and "records" in document:
+        return _normalize_ledger_health(document)
     generated_at = None
     candidates = document
     if isinstance(document, dict):
@@ -581,8 +642,40 @@ def _self_test():
         {"account": "expired-private", "holder": "org/expired#4@old", "model": "terra",
          "expires_at": now - 1},
     ]}
+    # Live ledger fixture — the exact {"records": [...]} shape model-health.py writes (#218).
+    health_ledger = {"records": [
+        {"ts": now - 900, "provider": "anthropic", "account": "a" * 16,
+         "model_alias": "fable", "exit_class": "transient", "run_id": "r1"},
+        {"ts": now - 600, "provider": "anthropic", "account": "b" * 16,
+         "model_alias": "fable", "exit_class": "success", "run_id": "r2"},
+        {"ts": now - 300, "provider": "openai", "account": "c" * 16,
+         "model_alias": "codex", "exit_class": "limit", "run_id": "r3",
+         "reset_hint": "2025-06-15T18:00:00Z"},
+        {"ts": now - 120, "provider": "anthropic", "account": "d" * 16,
+         "model_alias": "", "exit_class": "zero-dispatch", "run_id": "r4"},
+    ]}
     ordered = build_dashboard(
-        ordered_issues, activity_leases, ordered_usage, [], None, now, "fixture-salt")
+        ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt")
+    check("canonical records ledger -> per-provider/model checks", ordered["model_health"], {
+        "generated_at": _utc_iso(now - 120),
+        "checks": [
+            {"model": "fable", "provider": "anthropic", "status": "healthy",
+             "checked_at": _utc_iso(now - 600)},
+            {"model": "codex", "provider": "openai", "status": "degraded",
+             "checked_at": _utc_iso(now - 300)},
+        ],
+    })
+    try:
+        _normalize_model_health({"records": [
+            {"ts": now, "provider": "anthropic", "account": "acct01",
+             "model_alias": "fable", "exit_class": "success", "run_id": "r5"},
+        ]})
+    except DashboardError:
+        ledger_rejected = True
+    else:
+        ledger_rejected = False
+    check("malformed records ledger fails loudly, never a fabricated check",
+          ledger_rejected, True)
     salted = _salted_labels(ordered_handles, "fixture-salt")
     check("providers grouped + weekly resets soonest first + unknown last", [
         (row["provider"], row["label"], row["weekly_reset_at"])
