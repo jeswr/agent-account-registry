@@ -134,6 +134,6 @@ jobs:
           # provider-capped ("every enabled account") decision can be computed.
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           python3 scripts/model-health.py --self-test
           python3 scripts/model-health.py decide --policy-file policy/repos.toml
