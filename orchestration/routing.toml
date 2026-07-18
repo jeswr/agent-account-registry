@@ -53,15 +53,21 @@ credential_format = "codex-auth-json"
 [models.sol]
 provider = "openai"
 harness = "codex"
-provider_model = "gpt-5.6-sol"         # THE cross-provider REVIEW model (maintainer 2026-07-18): the
-                                       # REVIEW_CHAIN routes reviews of anthropic-authored PRs to `sol`.
-                                       # Distinct alias from `terra` (a different GPT model, which stays
-                                       # the openai IMPL/fix alias); id probed working on the worker
-                                       # account type 2026-07-18.
+provider_model = "gpt-5.6-sol"         # Cross-provider REVIEW model (maintainer 2026-07-18): REVIEW_CHAIN
+                                       # routes reviews of anthropic-authored CONTENT to `sol`. Distinct
+                                       # alias from `terra` (a different GPT model); id probed working on
+                                       # the worker account type 2026-07-18.
+credential_format = "codex-auth-json"
+[models.luna]
+provider = "openai"
+harness = "codex"
+provider_model = "gpt-5.6-luna"        # Second tier of the unified fix ladder opus<luna<fable<sol
+                                       # (maintainer 2026-07-18) + sol's review fallback; id probed
+                                       # working on the worker account type 2026-07-18.
 credential_format = "codex-auth-json"
 
 [defaults]
-model_chain = ["fable", "sonnet", "terra"]
+model_chain = ["fable", "sol", "opus"]
 agent = "registry-impl"
 
 # ---------------------------------------------------------------------------------------------------
@@ -85,7 +91,7 @@ escalate = true
 # fallback so an Anthropic outage does not stall implementation. docs -> haiku-led (cheap).
 [[route]]
 role = "impl"
-model_chain = ["fable", "sonnet", "terra"]
+model_chain = ["fable", "sol", "opus"]
 agent = "registry-impl"
 
 # [FABLE-5] STANDING RULE — UI/front-end ownership (maintainer decision 2026-07-17): UI/front-end
@@ -96,7 +102,7 @@ agent = "registry-impl"
 # unions ALL match_labels keywords, so UI keywords there would human-arm every UI PR.
 [[route]]
 role = "site"
-model_chain = ["terra", "fable", "sonnet"]
+model_chain = ["sol", "fable", "opus"]
 agent = "registry-impl"
 
 # [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
@@ -116,7 +122,7 @@ agent = "registry-impl"
 # into each target's routing.toml (sparq-org/sparq carries it, PR #3422).
 [[route]]
 role = "ci"
-model_chain = ["fable", "terra"]
+model_chain = ["fable", "sol"]
 agent = "registry-ci"
 
 [[route]]
@@ -124,9 +130,12 @@ role = "research"
 model_chain = ["fable", "opus"]
 agent = "registry-researcher"
 
+# docs-only cheap tiers (maintainer 2026-07-18): sonnet AND terra appear in THIS chain and
+# nowhere else — scripts/route-resolve.py validate_routing() REJECTS any table naming either
+# outside role=docs.
 [[route]]
 role = "docs"
-model_chain = ["haiku", "fable"]
+model_chain = ["haiku", "sonnet", "terra", "fable"]
 agent = "registry-docs"
 
 # Review / soundness: Opus only; escalate to a human on unavailability (never fall to a weaker

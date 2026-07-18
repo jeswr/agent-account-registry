@@ -113,11 +113,17 @@ BUSY_OR_GATED = {
 # Busy/gated set for the deferred-RETRY path: status:deferred is the retry trigger, everything
 # else still gates (locked decision 20).
 DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
-# Cross-provider chains (locked decisions 14/17): the review chain is the INVERSE of the
-# implementer's provider and is computed HERE, never through policy-resolve.resolve() (whose
-# role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
-REVIEW_CHAIN = {"anthropic": ["sol"], "openai": ["opus"]}
-FIX_CHAIN = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
+# Cross-provider chains (locked decisions 14/17, revised by maintainer 2026-07-18): the REVIEW
+# chain is keyed by the CONTENT author's provider (the latest fix round's model, else the
+# provenance implementer) and lists strictly OPPOSITE-provider reviewers, strongest first —
+# an anthropic model only reviews codex-authored content and vice versa. The FIX chain is the
+# UNIFIED cross-provider escalation ladder in ascending capability order opus < luna < fable
+# < sol, shared by both implementer providers, so a hard fix escalates across providers.
+# Computed HERE, never through policy-resolve.resolve() (whose role=review row is always
+# [opus]); resolve() supplies account_pool/caps/gate/arm only.
+REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["fable", "opus"]}
+FIX_CHAIN = {"anthropic": ["opus", "luna", "fable", "sol"],
+             "openai": ["opus", "luna", "fable", "sol"]}
 # Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
 # 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
 # earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
@@ -1276,6 +1282,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # raw-handle/missing hash already deferred above (provenance_admission_error).
             impl_account_h = record["impl_account_h"]
+            content_provider = impl_provider
             if item["state"] == "needs-review":
                 reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
                 if reviewed and reviewed.group(1) == head_sha:
@@ -1288,7 +1295,25 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     print(f"defer review {repo}#{number}: empty diff vs merge base (no-op rebase)")
                     continue
                 mode, role = "review", "review"
-                chain = _resolvable_chain(REVIEW_CHAIN[impl_provider], routing)
+                # Reviews are strictly CROSS-PROVIDER against the CONTENT author (maintainer
+                # 2026-07-18): on the unified fix ladder a fix round may cross providers, so
+                # the head under review can be authored by the LATEST fix round's model, not
+                # the provenance implementer. An alias the target routing does not name (or a
+                # round whose markers disagree on provider) is hostile/corrupt marker data —
+                # loud human hand-off, never a guessed review direction.
+                if round_models:
+                    latest_aliases = round_models[max(round_models)]
+                    providers = {
+                        str((routing.get("models", {}).get(alias) or {}).get("provider", ""))
+                        for alias in latest_aliases}
+                    if len(providers) != 1 or not providers <= {"anthropic", "openai"}:
+                        _pr_needs_user(script_dir, repo, number, issue_number,
+                                       "cannot derive the content provider for the review "
+                                       "direction (unknown or conflicting fix-model markers); "
+                                       "a human must inspect this PR's fix-model markers")
+                        continue
+                    content_provider = providers.pop()
+                chain = _resolvable_chain(REVIEW_CHAIN[content_provider], routing)
                 holder_prefix, cap, ttl = "review:", REVIEW_MAX_CONCURRENT, REVIEW_TTL
                 round_number = rounds + 1
             elif repair_state:
@@ -1397,8 +1422,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             violation = "PROVENANCE_SALT unavailable; cannot assert reviewer != implementer"
         elif mode == "review" and worker_pr.account_hash(account, salt) == impl_account_h:
             violation = "reviewer account would equal implementer account"
-        elif mode == "fix" and claim_provider and claim_provider != impl_provider:
-            violation = "fixer provider would differ from implementer provider"
+        # NOTE: no fixer-provider assertion — the unified fix ladder (fable->opus->sol->luna)
+        # deliberately crosses providers (maintainer 2026-07-18); the review direction above
+        # follows the content author, so cross-provider review integrity is preserved.
         if violation:
             _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
             print(f"defer review {repo}#{number}: {violation}; released + skipped")
@@ -1415,6 +1441,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # The pinned fix-model floor rides along so the workflow's own chain resolution
             # honours it (review mode never carries a pin; the input is ladder-validated there).
             "-f", f"model_pin={(pin_floor or '') if mode == 'fix' else ''}",
+            # Review mode carries the derived CONTENT provider so the workflow's own chain
+            # resolution reviews strictly cross-provider against the head's actual author.
+            "-f", f"content_provider={content_provider if mode == 'review' else ''}",
             "-f", f"review_round={round_number}",
             "-f", f"account={account}",
             "-f", f"claim_id={claim_id}",
@@ -2464,19 +2493,25 @@ def _self_test():
                         "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
                         "security": False, "context": ""}
             routing_ok = {"models": {
-                "sonnet": {"provider_model": "claude-sonnet-4-6", "harness": "claude"},
-                "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
-                "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
-                "terra": {"provider_model": "TBD", "harness": "codex"},
-                "sol": {"provider_model": "gpt-5.6-sol", "harness": "codex"},
+                "sonnet": {"provider": "anthropic", "provider_model": "claude-sonnet-4-6",
+                           "harness": "claude"},
+                "fable": {"provider": "anthropic", "provider_model": "claude-fable-5",
+                          "harness": "claude"},
+                "opus": {"provider": "anthropic", "provider_model": "claude-opus-4-8",
+                         "harness": "claude"},
+                "terra": {"provider": "openai", "provider_model": "TBD", "harness": "codex"},
+                "sol": {"provider": "openai", "provider_model": "gpt-5.6-sol",
+                        "harness": "codex"},
+                "luna": {"provider": "openai", "provider_model": "gpt-5.6-luna",
+                         "harness": "codex"},
             }}
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
                         check_runs=gate_green, issue_labels=["area:crate-a"])
             fix_model = wiring_worker_pr.FIX_MODEL_MARKER
             pin_marker = wiring_worker_pr.MODEL_PIN_MARKER
 
-            # ACT: base budget spent on sonnet -> extension, fable pin converged, and a chain
-            # WITHOUT sonnet; the None claim then defers with a missed marker, NOT needs-user
+            # ACT: base budget spent on sonnet (legacy->opus) -> extension pins luna, and a
+            # chain WITHOUT the bottom tier; the None claim then defers with a missed marker
             fake["comments"] = round_markers(3) + [
                 bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
                 bot_comment(f"x {fix_model} round=2 model=sonnet run=2.9 -->")]
@@ -2487,8 +2522,8 @@ def _self_test():
                 ("worker-pr.py", "record-model-pin"),
                 ("worker-pr.py", "record-marker")], helper_calls
             pin_args = helper_calls[0][1]
-            assert pin_args[pin_args.index("--tier") + 1] == "fable", pin_args
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert pin_args[pin_args.index("--tier") + 1] == "luna", pin_args
+            assert alloc.chains == [["luna", "fable", "sol"]], alloc.chains
 
             # DO-NOTHING flip: under budget -> no pin call, the DEFAULT fix chain is offered
             fake["comments"] = round_markers(2)
@@ -2497,38 +2532,38 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+            assert alloc.chains == [["opus", "luna", "fable", "sol"]], alloc.chains
 
             # a recorded bot pin governs the chain even under budget (the floor never lowers) ...
             fake["comments"] = round_markers(2) + [
-                bot_comment(f"z {pin_marker} round=1 tier=opus run=1.5 -->")]
+                bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->")]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["opus"]], alloc.chains
+            assert alloc.chains == [["fable", "sol"]], alloc.chains
             # ... while a NON-bot forged pin marker is inert (bot-login trust filter)
             fake["comments"] = round_markers(2) + [
                 {"user": {"login": "mallory"},
                  "body": f"z {pin_marker} round=1 tier=opus run=6.6 -->"}]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+            assert alloc.chains == [["opus", "luna", "fable", "sol"]], alloc.chains
 
             # top tier ran + latest verdict improving -> progress extension (pin floor kept)
             fake["comments"] = round_markers(4) + [
                 bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->"),
-                bot_comment(f"z {pin_marker} round=3 tier=opus run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=3 model=sol run=3.9 -->"),
+                bot_comment(f"z {pin_marker} round=3 tier=sol run=3.9 -->")]
             write_verdict(4, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["opus"]], alloc.chains
+            assert alloc.chains == [["sol"]], alloc.chains
 
             # flip-goes-red: top tier + stagnant -> the loud terminal needs-user, no claim
             fake["comments"] = round_markers(4) + [
                 bot_comment(f"x {fix_model} round=1 model=sonnet run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=3 model=sol run=3.9 -->")]
             write_verdict(4, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -2575,15 +2610,17 @@ def _self_test():
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert helper_calls == [], helper_calls
-            assert alloc.chains == [["sol"]], alloc.chains
+            # content-keyed review direction: the round-3 fix is anthropic (opus), so the
+            # offered reviewers are the OPENAI chain, strongest first
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
 
             # flip-goes-red: the same posture whose latest fix ran BELOW the recorded opus
             # floor (a pin violation / forged marker) mints NO re-review — with the top tier
             # already graded stagnant it is the loud terminal instead
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"z {pin_marker} round=1 tier=opus run=1.5 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=sol run=1.9 -->"),
+                bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->"),
+                bot_comment(f"x {fix_model} round=3 model=luna run=3.9 -->")]
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [

@@ -62,6 +62,11 @@ on:
         required: false
         default: ''
         type: string
+      content_provider:
+        description: Provider of the model that authored the current head (dispatcher-derived from the latest fix-model marker; empty = the provenance implementer; review mode only)
+        required: false
+        default: ''
+        type: string
       review_round:
         description: Review round this run belongs to (review = rounds+1, fix = current round)
         required: true
@@ -123,6 +128,7 @@ jobs:
           FIX_KIND: ${{ inputs.fix_kind }}
           FIX_CONTEXT: ${{ inputs.fix_context }}
           MODEL_PIN: ${{ inputs.model_pin }}
+          CONTENT_PROVIDER: ${{ inputs.content_provider }}
           REVIEW_ROUND: ${{ inputs.review_round }}
           ACCOUNT: ${{ inputs.account }}
           CLAIM_ID: ${{ inputs.claim_id }}
@@ -137,6 +143,7 @@ jobs:
           fix_kind = os.environ["FIX_KIND"] or "verdict"
           fix_context = os.environ["FIX_CONTEXT"]
           model_pin = os.environ["MODEL_PIN"]
+          content_provider = os.environ.get("CONTENT_PROVIDER", "")
           review_round = os.environ["REVIEW_ROUND"]
           account = os.environ["ACCOUNT"]
           claim_id = os.environ["CLAIM_ID"]
@@ -155,10 +162,14 @@ jobs:
           # arbitrary provider_model (the concrete id is still resolved from the protected
           # target routing BY ALIAS, and the provider-ladder membership is re-checked against
           # the provenance-bound implementer provider in the resolve step below).
-          if model_pin and model_pin not in {"sonnet", "fable", "opus", "terra", "sol"}:
+          if model_pin and model_pin not in {"sonnet", "fable", "opus", "terra", "sol", "luna"}:
               raise SystemExit("model_pin must be empty or an escalation-ladder tier")
           if mode == "review" and model_pin:
               raise SystemExit("review mode takes no model pin")
+          if content_provider not in {"", "anthropic", "openai"}:
+              raise SystemExit("content_provider must be anthropic, openai, or empty")
+          if mode == "fix" and content_provider:
+              raise SystemExit("fix mode takes no content provider (it uses the unified ladder)")
           # Printable-ASCII, single-line, capped: the context is advisory model input (failing
           # check-run names) that must never smuggle control characters into prompts or logs.
           if not re.fullmatch(r"[ -~]{0,1000}", fix_context):
@@ -379,6 +390,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           MODEL_PIN: ${{ inputs.model_pin }}
           IMPL_PROVIDER: ${{ steps.pr.outputs.impl_provider }}
+          CONTENT_PROVIDER: ${{ inputs.content_provider }}
         run: |
           set -euo pipefail
           role=review
@@ -406,31 +418,42 @@ jobs:
           with open(routing_path, "rb") as handle:
               routing = tomllib.load(handle)
 
-          # The review chain is the INVERSE of the implementer's provider and is computed HERE,
-          # never via resolve() (whose role=review row is always [opus]); resolve() supplies
-          # account_pool / gate / arm / caps only. Fix uses the implementer's own chain.
+          # The review chain is keyed by the CONTENT author's provider (the dispatcher derives
+          # it from the latest fix-model marker and passes it as content_provider; empty =
+          # the provenance implementer) and lists strictly OPPOSITE-provider reviewers,
+          # strongest first — an anthropic model only reviews codex-authored content and vice
+          # versa (maintainer 2026-07-18). Computed HERE, never via resolve() (whose
+          # role=review row is always [opus]); resolve() supplies account_pool / gate / arm /
+          # caps only. Fix uses the UNIFIED cross-provider escalation ladder.
           # A CODEX alias with a missing/TBD provider_model is RESOLVABLE (locked decision 14):
           # the proven codex drain passes no --model flag (CLI default), and worker-live.sh omits
-          # --model in that case — so an unpinned terra never stalls the common
-          # anthropic-implemented direction. A claude alias still needs a concrete id.
-          review_chain = {"anthropic": ["sol"], "openai": ["opus"]}
-          fix_chain = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
-          # Escalation ladders in ascending order — mirrors worker-pr.py ESCALATION_LADDERS
-          # (maintainer directive 2026-07-17). A pinned fix-model FLOOR replaces the default
-          # fix chain with the ladder tiers at/above the pin, cheapest first: tiers below the
-          # floor are DELIBERATELY absent (defer-not-fallback — with no at/above-floor account
-          # free, the claim defers to a later tick instead of burning the extended round budget
-          # on the model that already failed; see dispatch-claim.py). A pin outside the
-          # implementer provider's ladder fails closed.
-          ladders = {"anthropic": ["sonnet", "fable", "opus"], "openai": ["terra"]}
+          # --model in that case. A claude alias still needs a concrete id.
+          content_provider = os.environ.get("CONTENT_PROVIDER", "") or impl_provider
+          if content_provider not in {"anthropic", "openai"}:
+              raise SystemExit("content_provider must be anthropic, openai, or empty")
+          review_chain = {"anthropic": ["sol", "luna"], "openai": ["fable", "opus"]}
+          # UNIFIED fix ladder in ascending capability order opus < luna < fable < sol —
+          # mirrors worker-pr.py ESCALATION_LADDERS (maintainer 2026-07-18): both implementer
+          # providers share it, so a hard fix escalates ACROSS providers. A pinned fix-model
+          # FLOOR replaces the default fix chain with the ladder tiers at/above the pin,
+          # cheapest first: tiers below the floor are DELIBERATELY absent (defer-not-fallback —
+          # with no at/above-floor account free, the claim defers to a later tick instead of
+          # burning the extended round budget on the model that already failed; see
+          # dispatch-claim.py). A pin outside the ladder fails closed after legacy translation
+          # (pre-unification sonnet/terra pins map to the ladder bottom tiers).
+          unified_ladder = ["opus", "luna", "fable", "sol"]
+          fix_chain = {"anthropic": unified_ladder, "openai": unified_ladder}
+          ladders = {"anthropic": unified_ladder, "openai": unified_ladder}
           model_pin = os.environ.get("MODEL_PIN", "")
+          model_pin = {"sonnet": "opus", "terra": "opus"}.get(model_pin, model_pin)
           if mode == "fix" and model_pin:
               ladder = ladders[impl_provider]
               if model_pin not in ladder:
                   raise SystemExit("model_pin is not a ladder tier for the implementer provider")
               wanted = ladder[ladder.index(model_pin):]
           else:
-              wanted = (review_chain if mode == "review" else fix_chain)[impl_provider]
+              wanted = (review_chain[content_provider] if mode == "review"
+                        else fix_chain[impl_provider])
           models = routing.get("models", {})
           chain = []
           for alias in wanted:

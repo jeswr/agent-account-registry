@@ -52,12 +52,19 @@ FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
 MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
 PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-# Provider escalation ladders in ASCENDING capability order. anthropic: sonnet < fable < opus
-# (opus is the terminal fix tier for hard cases); openai is single-tier (terra) — no ladder, so
-# only the progress extension applies there. A pin or recorded model outside its provider ladder
-# is REJECTED (hostile-input surface: a forged marker must never select an arbitrary
-# provider_model — concrete ids are still resolved from protected target routing by alias).
-ESCALATION_LADDERS = {"anthropic": ["sonnet", "fable", "opus"], "openai": ["terra"]}
+# UNIFIED cross-provider fix escalation ladder in ASCENDING capability order (maintainer
+# 2026-07-18): opus < luna < fable < sol — anthropic (opus, fable) and openai (luna, sol)
+# tiers interleaved in ONE ladder shared by both implementer providers, so a hard fix
+# escalates across providers. A pin or recorded model outside the ladder is REJECTED after
+# LEGACY_TIER translation (hostile-input surface: a forged marker must never select an
+# arbitrary provider_model — concrete ids are still resolved from protected target routing
+# by alias).
+UNIFIED_FIX_LADDER = ["opus", "luna", "fable", "sol"]
+ESCALATION_LADDERS = {"anthropic": UNIFIED_FIX_LADDER, "openai": UNIFIED_FIX_LADDER}
+# Pre-unification pin markers on live PRs name retired tiers; translate to the nearest
+# current ladder member instead of failing closed. Both legacy cheap tiers map to the ladder
+# BOTTOM (opus): terra is sonnet-class (maintainer 2026-07-18), not luna-class.
+LEGACY_TIERS = {"sonnet": "opus", "terra": "opus"}
 PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -205,7 +212,7 @@ def pinned_fix_floor(comments, bot_login, provider):
     floor = None
     for comment in _bot_comments(comments, bot_login):
         for match in pattern.finditer(str(comment.get("body", ""))):
-            tier = match.group(2)
+            tier = LEGACY_TIERS.get(match.group(2), match.group(2))
             if tier not in ladder:
                 raise WorkerPrError("recorded model pin is not a ladder member for this provider")
             if floor is None or ladder.index(tier) > ladder.index(floor):
@@ -218,6 +225,7 @@ def pinned_fix_chain(provider, floor):
     first. Tiers below the floor are never offered to the allocator — see the defer-not-fallback
     rationale on decide_budget."""
     ladder = ESCALATION_LADDERS.get(provider)
+    floor = LEGACY_TIERS.get(floor, floor)
     if not ladder or floor not in ladder:
         raise WorkerPrError("model pin must be a ladder member for its provider")
     return ladder[ladder.index(floor):]
@@ -279,14 +287,19 @@ def decide_budget(rounds_used, per_round_models, latest_progress, provider,
         raise WorkerPrError("rounds_used must be a non-negative integer")
     if not isinstance(base_rounds, int) or isinstance(base_rounds, bool) or base_rounds < 1:
         raise WorkerPrError("base_rounds must be a positive integer")
-    models = sorted(set(per_round_models))
+    # Live PRs carry fix-model markers from before the ladder unification (sonnet/terra
+    # rounds); translate those recorded tiers like pinned_fix_floor does — a historical round
+    # must never hard-fail today's budget decision into a needs-user park.
+    models = sorted({LEGACY_TIERS.get(model, model) for model in per_round_models})
     for model in models:
         if model not in ladder:
             raise WorkerPrError("a recorded fix-round model is not a ladder member")
-    pending = sorted(set(pending_fix_models))
+    pending = sorted({LEGACY_TIERS.get(model, model) for model in pending_fix_models})
     for model in pending:
         if model not in ladder:
             raise WorkerPrError("a pending fix-round model is not a ladder member")
+    if pin_floor is not None:
+        pin_floor = LEGACY_TIERS.get(pin_floor, pin_floor)
     if pin_floor is not None and pin_floor not in ladder:
         raise WorkerPrError("pin_floor must be a ladder member for its provider")
     if latest_progress is not None and latest_progress not in PROGRESS_VALUES:
@@ -1514,55 +1527,58 @@ def _self_test():
           {"action": "continue", "pin": None})
     check("budget zero rounds continues", budget(0, [], None),
           {"action": "continue", "pin": None})
-    # Mechanism 1 — model escalation, precedence over progress (it resets the quality question)
-    check("exhaustion on sonnet pins fable", budget(3, ["sonnet"], "stagnant"),
-          {"action": "extend-model-pin", "pin": "fable"})
+    # Mechanism 1 — model escalation on the UNIFIED ladder opus < luna < fable < sol
+    # (maintainer 2026-07-18; legacy sonnet/terra rounds translate to the ladder bottom tiers)
+    check("exhaustion on sonnet (legacy->opus) pins luna", budget(3, ["sonnet"], "stagnant"),
+          {"action": "extend-model-pin", "pin": "luna"})
     check("model pin outranks improving progress", budget(3, ["sonnet"], "improving"),
+          {"action": "extend-model-pin", "pin": "luna"})
+    check("exhaustion on fable pins sol", budget(3, ["fable"], None),
+          {"action": "extend-model-pin", "pin": "sol"})
+    check("mixed opus+fable pins sol", budget(4, ["opus", "fable"], "regressing"),
+          {"action": "extend-model-pin", "pin": "sol"})
+    check("cross-provider history opus+luna pins fable", budget(3, ["opus", "luna"], None),
           {"action": "extend-model-pin", "pin": "fable"})
-    check("exhaustion on fable pins opus", budget(3, ["fable"], None),
-          {"action": "extend-model-pin", "pin": "opus"})
-    check("mixed sonnet+fable pins opus", budget(4, ["sonnet", "fable"], "regressing"),
-          {"action": "extend-model-pin", "pin": "opus"})
-    # Mechanism 2 — progress extension once the top tier has run (or nothing is recorded)
-    check("opus + improving extends on progress", budget(3, ["opus"], "improving"),
+    # Mechanism 2 — progress extension once the top tier (sol) has run (or nothing is recorded)
+    check("sol + improving extends on progress", budget(3, ["sol"], "improving"),
           {"action": "extend-progress", "pin": None})
-    check("sonnet+opus + improving is progress-only", budget(4, ["sonnet", "opus"], "improving"),
+    check("luna+sol + improving is progress-only", budget(4, ["luna", "sol"], "improving"),
           {"action": "extend-progress", "pin": None})
     check("no fix record + improving extends", budget(3, [], "improving"),
           {"action": "extend-progress", "pin": None})
     # Re-review authorization: a PUSHED-but-unreviewed fix at/above the pinned floor gets its
-    # re-review even at exhaustion (the terminal-grant orphan defect: the executed opus fix
+    # re-review even at exhaustion (the terminal-grant orphan defect: the executed top-tier fix
     # falsifies the top-tier predicate while the stagnant grade predates that fix)
     check("pending pinned-floor fix authorizes its re-review",
-          budget(3, ["fable", "opus"], "stagnant", pending=["opus"], pin="opus"),
+          budget(3, ["fable", "sol"], "stagnant", pending=["sol"], pin="sol"),
           {"action": "extend-pending-review", "pin": None})
     check("no pending fix in the same posture stops (flip side)",
-          budget(3, ["fable", "opus"], "stagnant"),
+          budget(3, ["fable", "sol"], "stagnant"),
           {"action": "needs-user", "pin": None})
     check("pending fix BELOW the pinned floor never extends",
-          budget(3, ["fable", "opus"], "stagnant", pending=["fable"], pin="opus"),
+          budget(3, ["fable", "sol"], "stagnant", pending=["fable"], pin="sol"),
           {"action": "needs-user", "pin": None})
     check("unpinned pending fix authorizes (floor is the ladder bottom)",
           budget(3, ["sonnet"], None, pending=["sonnet"]),
           {"action": "extend-pending-review", "pin": None})
     check("pending re-review precedes the progress extension",
-          budget(3, ["opus"], "improving", pending=["opus"], pin="opus"),
+          budget(3, ["sol"], "improving", pending=["sol"], pin="sol"),
           {"action": "extend-pending-review", "pin": None})
     check("openai pending fix authorizes its re-review",
           budget(3, ["terra"], None, provider="openai", pending=["terra"]),
           {"action": "extend-pending-review", "pin": None})
     check("hard cap still dominates a pending fix",
-          budget(6, ["fable", "opus"], "stagnant", pending=["opus"], pin="opus"),
+          budget(6, ["fable", "sol"], "stagnant", pending=["sol"], pin="sol"),
           {"action": "needs-user", "pin": None})
     check("pending fix below base just continues",
           budget(2, ["sonnet"], None, pending=["sonnet"]),
           {"action": "continue", "pin": None})
-    # needs-user sides (flip-goes-red on every ACT above)
-    check("opus + stagnant stops", budget(3, ["opus"], "stagnant"),
+    # needs-user sides (flip-goes-red on every ACT above; sol is the terminal tier)
+    check("sol + stagnant stops", budget(3, ["sol"], "stagnant"),
           {"action": "needs-user", "pin": None})
-    check("opus + regressing stops", budget(4, ["opus"], "regressing"),
+    check("sol + regressing stops", budget(4, ["sol"], "regressing"),
           {"action": "needs-user", "pin": None})
-    check("opus + ungraded stops", budget(3, ["opus"], None),
+    check("sol + ungraded stops", budget(3, ["sol"], None),
           {"action": "needs-user", "pin": None})
     check("no fix record + stagnant stops", budget(3, [], "stagnant"),
           {"action": "needs-user", "pin": None})
@@ -1572,28 +1588,30 @@ def _self_test():
           {"action": "needs-user", "pin": None})
     check("round 5 still extends under the cap", budget(5, ["sonnet"], None)["action"],
           "extend-model-pin")
-    # openai: single tier — no ladder, mechanism 2 only
-    check("openai never model-pins", budget(3, ["terra"], "stagnant", provider="openai"),
-          {"action": "needs-user", "pin": None})
-    check("openai improving extends", budget(3, ["terra"], "improving", provider="openai"),
+    # openai shares the unified ladder — it model-pins exactly like anthropic
+    check("openai escalates the ladder (terra legacy->opus pins luna)",
+          budget(3, ["terra"], "stagnant", provider="openai"),
+          {"action": "extend-model-pin", "pin": "luna"})
+    check("openai top tier + improving extends", budget(3, ["sol"], "improving",
+                                                        provider="openai"),
           {"action": "extend-progress", "pin": None})
     # an explicit policy base above the hard cap is respected up to the base, never extended
     check("base above cap continues below base", budget(6, ["sonnet"], "improving", base=8),
           {"action": "continue", "pin": None})
     check("base above cap stops at base", budget(8, ["sonnet"], "improving", base=8),
           {"action": "needs-user", "pin": None})
+    # Cross-provider fix models/pins are now VALID (unified ladder) — assert acceptance.
+    check("cross-provider fix model accepted", budget(3, ["luna"], None)["action"],
+          "extend-model-pin")
+    check("cross-provider pending model accepted",
+          budget(3, ["opus"], None, pending=["terra"])["action"], "extend-pending-review")
     for bad, name in (
             (lambda: budget(3, ["gpt-omega"], None), "unknown fix model"),
-            (lambda: budget(3, ["terra"], None), "cross-provider fix model"),
             (lambda: decide_budget(3, [], None, "mystery"), "unknown provider"),
             (lambda: budget(3, [], "better"), "unknown progress value"),
             (lambda: budget(True, [], None), "boolean rounds"),
             (lambda: decide_budget(3, [], None, "anthropic", base_rounds=0), "zero base"),
             (lambda: budget(3, ["opus"], None, pending=["gpt-omega"]), "unknown pending model"),
-            (lambda: budget(3, ["opus"], None, pending=["terra"]),
-             "cross-provider pending model"),
-            (lambda: budget(3, ["opus"], None, pending=["opus"], pin="terra"),
-             "cross-provider pin floor"),
             (lambda: budget(3, ["opus"], None, pin="gpt-omega"), "unknown pin floor"),
     ):
         try:
@@ -1628,11 +1646,11 @@ def _self_test():
     ]
     check("pinned floor reads the bot marker (forged higher pin ignored)",
           pinned_fix_floor(pin_comments, bot, "anthropic"), "fable")
-    check("highest recorded floor wins",
+    check("highest recorded floor wins (fable > opus on the unified ladder)",
           pinned_fix_floor(pin_comments + [
               {"user": {"login": bot},
                "body": f"z {MODEL_PIN_MARKER} round=4 tier=opus run=4.1 -->"}], bot,
-              "anthropic"), "opus")
+              "anthropic"), "fable")
     try:
         pinned_fix_floor([{"user": {"login": bot},
                            "body": f"z {MODEL_PIN_MARKER} round=1 tier=gpt-omega run=1.1 -->"}],
@@ -1642,18 +1660,18 @@ def _self_test():
     else:
         check("corrupt pin tier fails closed", "accepted", "rejected")
     check("pinned chain keeps floor-and-above ascending",
-          pinned_fix_chain("anthropic", "fable"), ["fable", "opus"])
-    check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "opus"), ["opus"])
-    check("pinned chain at the bottom is the whole ladder",
-          pinned_fix_chain("anthropic", "sonnet"), ["sonnet", "fable", "opus"])
-    check("openai pinned chain is its single tier", pinned_fix_chain("openai", "terra"),
-          ["terra"])
+          pinned_fix_chain("anthropic", "fable"), ["fable", "sol"])
+    check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "sol"), ["sol"])
+    check("pinned chain at a legacy bottom pin is the whole ladder",
+          pinned_fix_chain("anthropic", "sonnet"), ["opus", "luna", "fable", "sol"])
+    check("openai pinned chain shares the unified ladder (terra legacy->opus)",
+          pinned_fix_chain("openai", "terra"), ["opus", "luna", "fable", "sol"])
     try:
-        pinned_fix_chain("anthropic", "terra")
+        pinned_fix_chain("anthropic", "gpt-omega")
     except WorkerPrError:
-        check("cross-provider pin fails closed", "rejected", "rejected")
+        check("unknown pin fails closed", "rejected", "rejected")
     else:
-        check("cross-provider pin fails closed", "accepted", "rejected")
+        check("unknown pin fails closed", "accepted", "rejected")
 
     # decide_disarm (issue #42): the sweep invariant acts on mismatch when the PR is armed OR
     # ready-but-unarmed (interrupted-disarm crash-window re-entry); matching SHAs are NEVER
@@ -1770,14 +1788,14 @@ def _self_test():
 
             sonnet_fix = [{"user": {"login": bot},
                            "body": f"x {FIX_MODEL_MARKER} round=1 model=sonnet run=1.1 -->"}]
-            opus_fix = [{"user": {"login": bot},
-                         "body": f"x {FIX_MODEL_MARKER} round=1 model=opus run=1.1 -->"}]
+            sol_fix = [{"user": {"login": bot},
+                        "body": f"x {FIX_MODEL_MARKER} round=1 model=sol run=1.1 -->"}]
             check("outcome model extension pins + stays changes",
                   outcome("stagnant", sonnet_fix),
-                  [("findings", 3), ("pin", "fable"), ("state", "changes")])
+                  [("findings", 3), ("pin", "luna"), ("state", "changes")])
             check("outcome progress extension stays changes without a pin",
-                  outcome("improving", opus_fix), [("findings", 3), ("state", "changes")])
-            terminal = outcome("stagnant", opus_fix)
+                  outcome("improving", sol_fix), [("findings", 3), ("state", "changes")])
+            terminal = outcome("stagnant", sol_fix)
             check("outcome terminal escalates once",
                   [entry[0] for entry in terminal], ["findings", "needs-user"])
             check("terminal reason names the exhausted budget",
