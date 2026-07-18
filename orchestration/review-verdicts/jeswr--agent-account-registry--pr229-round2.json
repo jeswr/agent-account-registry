@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The prior major finding is resolved: HTTP 422 is now treated as retryable only for a sha-less create carrying the narrow GitHub missing-sha race signature, while ordinary 422 validation failures and other non-conflict PUT errors raise immediately. The self-tests cover both sides of that classification, including the same signature on a SHA-carrying update. The prior jitter-test weakness is also resolved by stubbing random.uniform and asserting its exact bounds and returned sentinel. Retry sleeps occur only between attempts, and the added groom retry behavior remains fail-loud for non-conflict errors. No blocker, major, or remaining substantive issue is supported by the diff.",
+ "verdict": "approve"
+}
