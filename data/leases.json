@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct2css",
-   "claim_id": "880543cd1a1649fcb4d43b6c9c013939",
-   "holder": "fix:sparq-org/sparq#3476@dispatch-29651708285.1",
-   "package": "sparq-lws-core",
-   "role": "fix",
-   "model": "sonnet",
-   "issued_at": 1784391710,
-   "expires_at": 1784395310
-  },
-  {
    "account": "acct06",
    "claim_id": "4e4ea2752ae64bd890930ae7a4a91016",
    "holder": "fix:sparq-org/sparq#3468@dispatch-29652181510.1",
