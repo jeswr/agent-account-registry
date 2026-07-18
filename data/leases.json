@@ -219,6 +219,16 @@
    "model": "fable",
    "issued_at": 1784340463,
    "expires_at": 1784346763
+  },
+  {
+   "account": "acct06",
+   "claim_id": "6649f38642824cb8ac499b7380f76819",
+   "holder": "sparq-org/sparq#3413@dispatch-29626390979.1",
+   "package": "sparq-geo",
+   "role": "impl",
+   "model": "sonnet",
+   "issued_at": 1784340467,
+   "expires_at": 1784346767
   }
  ]
 }
