@@ -98,7 +98,10 @@ GH_TIMEOUT_S = 45            # per gh call
 # row itself is already durable in the comment log by then.
 MAX_WRITE_ATTEMPTS = 4
 RETRY_SLEEP_S = 0.5          # small linear backoff between view-convergence retries
-MAX_FOLD_COMMENTS = 50       # oldest-first pending-comment fold bound per write (rest fold next tick)
+MAX_FOLD_COMMENTS = 50       # per-write bound on NEWLY-FOLDED (above-watermark) comments, applied
+                             # in _fold_pending AFTER the watermark filter (round-8 P1: bounding
+                             # the raw listing let 50 already-folded comments hide a newer failure
+                             # from the fold AND the post-close race check); rest fold next tick
 GC_MIN_AGE_S = 3600          # never GC a folded row comment younger than this (job timeouts are
                              # minutes, so no in-flight stale writer's watermark regression can
                              # reach a comment this old)
@@ -550,12 +553,14 @@ def _append_row_comment(num, repo, token, row):
 
 
 def _list_row_comments(num, repo, token):
-    """[(comment_id, coerced_row, created_at)] of every TRUSTED pending row comment on the rolling
-    issue, oldest-first, bounded to MAX_FOLD_COMMENTS (the rest fold next tick — delayed, never
-    lost). Untrusted authors are ignored (comment-injection gate: comments are world-writable on a
-    public repo; only the workflow bot / collaborators may feed the ledger). Returns None when the
-    listing itself failed (callers degrade to a body-only write — fail-soft), [] when readable but
-    empty/garbled."""
+    """[(comment_id, coerced_row, created_at)] of every TRUSTED row comment on the rolling issue,
+    oldest-first, UNBOUNDED (round-8 P1: truncating here — before the watermark filter — let 50
+    already-folded comments hide a NEWER unfolded failure from both the fold and resolve's
+    post-close race check, so recovery could close over a live failure). The per-write fold bound
+    now lives in _fold_pending, after the `cid > folded_through` filter. Untrusted authors are
+    ignored (comment-injection gate: comments are world-writable on a public repo; only the
+    workflow bot / collaborators may feed the ledger). Returns None when the listing itself failed
+    (callers degrade to a body-only write — fail-soft), [] when readable but empty/garbled."""
     proc = _gh(["api", "--paginate", "--slurp",
                 f"repos/{repo}/issues/{int(num)}/comments?per_page=100"], token, capture=True)
     if proc.returncode != 0:
@@ -606,19 +611,29 @@ def _list_row_comments(num, repo, token):
             row["last_seen"] = created_at
         out.append((cid, row, created_at))
     out.sort(key=lambda entry: entry[0])
-    return out[:MAX_FOLD_COMMENTS]
+    return out
 
 
-def _fold_pending(rows, pending, own_comment_id, folded_through):
-    """Merge every pending row comment newer than the watermark into `rows`; returns
-    (rows, new_watermark). The caller merges its OWN row in-memory (fresher detail), so its own
+def _fold_pending(rows, pending, own_comment_id, folded_through, bound=MAX_FOLD_COMMENTS):
+    """Merge pending row comments newer than the watermark into `rows`, oldest-first, folding at
+    most `bound` of them per call (round-8 P1: the bound applies AFTER the `cid > folded_through`
+    filter — already-folded comments must never consume it and hide a newer failure); returns
+    (rows, new_watermark). `bound=None` folds everything (the resolver uses this: recovery must
+    weigh EVERY durable row before pruning/closing). Comments beyond the bound stay above the
+    watermark and fold next tick — delayed, never lost; if the caller's OWN comment falls beyond
+    it, a later fold merges it as a row (a duplicate count bump, the documented fail direction —
+    never a lost row). The caller merges its OWN row in-memory (fresher detail), so its own
     comment id only advances the watermark. Because the watermark is written atomically WITH the
     folded rows in one body edit, a clobbered write regresses both together and the next fold
     repeats exactly the lost work — idempotent, so a row can neither be lost nor double-counted."""
     watermark = folded_through
-    for cid, row, _created in pending or []:
+    folded = 0
+    for cid, row, _created in pending or []:      # oldest-first (listing is sorted)
         if cid <= folded_through:
             continue
+        if bound is not None and folded >= bound:
+            break
+        folded += 1
         if own_comment_id and cid == own_comment_id:
             watermark = max(watermark, cid)
             continue
@@ -755,7 +770,10 @@ def upsert_alarm(new_row, repo, token, maintainer):
         # PLUS its durable row comments above its own watermark — into the canonical ledger. A
         # duplicate whose comment log is unreadable is folded body-only and left OPEN (fail
         # closed: never close an issue whose durable rows we could not read); it reconciles on a
-        # later write. Closing happens only after the folded body write is VERIFIED below.
+        # later write. Closing happens only after the folded body write is VERIFIED below. The
+        # fold is UNBOUNDED (the listing returns every trusted comment — round-8 P1): the
+        # duplicate gets CLOSED after this fold, so a bounded fold would lose any row beyond
+        # the bound forever, not merely delay it.
         folded_dups = []
         own_row_folded = False
         for dup_num, dup_body in dups:
@@ -918,7 +936,11 @@ def resolve_alarm(workflow, repo, token, maintainer, run_started=None):
             print("::error::pipeline-alarm: cannot read the alert's durable comment log; "
                   "recovery ABORTED (fail closed — retries next healthy tick)")
             return False
-        ledger, watermark = _fold_pending(ledger, pending, None, folded_before)
+        # UNBOUNDED fold (round-8 P1): recovery must weigh EVERY durable pending row before
+        # pruning/closing — a bounded fold would leave unweighed comments above the watermark
+        # that the close below would close over (the truncation repro: 50 already-folded
+        # comments hid the one live failure that existed only as comment 51+).
+        ledger, watermark = _fold_pending(ledger, pending, None, folded_before, bound=None)
         kept, dropped = _resolve_ledger(ledger, workflow, before)
         if dropped == 0:
             # This workflow had no open failure rows; leave the alert untouched (another workflow
@@ -2446,6 +2468,77 @@ def _self_test():
            and all(r.get("workflow") != "dispatch" for r in _parse_ledger(rf["body"])))
         ok("resolver advances the watermark over the folded comment",
            _parse_ledger_doc(rf["body"])[1] >= 401)
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- round-8 P1 regression: the fold bound applies AFTER the watermark filter --------------
+    # >MAX_FOLD_COMMENTS already-folded (<= watermark) comments must never consume the bound and
+    # hide a newer unfolded failure from the fold or from resolve's post-close race check.
+    b8_row = {"workflow": "w", "job": "j", "failure_class": "job-failure", "count": 1,
+              "last_seen": "2026-07-18T09:00:00Z", "run_url": "https://x/1", "detail": "d",
+              "failed_step": ""}
+    sixty = [(i, dict(b8_row), "2026-07-18T09:00:00Z") for i in range(1, 61)]
+    _r8, wm8 = _fold_pending([], sixty, None, 55)
+    chk("comments already under the watermark never consume the fold bound", wm8, 60)
+    _r8b, wm8b = _fold_pending([], sixty, None, 0)
+    chk("the per-write bound still limits NEWLY-folded comments (rest fold next tick)", wm8b,
+        MAX_FOLD_COMMENTS)
+
+    def bd_comment(cid, wf):
+        return {"id": cid, "body": f"{ROW_COMMENT_MARKER}\n```json\n" + json.dumps(
+            {"workflow": wf, "job": "j", "failure_class": "job-failure", "count": 1,
+             "last_seen": "2026-07-18T11:00:00Z", "run_url": "https://x/7", "detail": "d",
+             "failed_step": ""}) + "\n```",
+            "user": {"login": "github-actions[bot]"}, "author_association": "NONE",
+            "created_at": "2026-07-18T11:00:00Z"}
+
+    # 55 folded comments (<= watermark 400, awaiting GC) + ONE newer failure that exists ONLY as
+    # comment 456. The old oldest-50 listing truncation dropped #456 everywhere, so resolve
+    # pruned the body row, closed the issue, and the post-close check saw nothing — a live
+    # failure hidden behind a closed alert (the reviewer's repro).
+    bd_comments = [[bd_comment(100 + i, "old") for i in range(55)] + [bd_comment(456, "worker")]]
+    bd_body = render_body([{"workflow": "dispatch", "job": "plan",
+                            "failure_class": "job-failure", "count": 1,
+                            "last_seen": "2026-07-18T10:00:00Z", "run_url": "https://x/1",
+                            "detail": "d", "failed_step": ""}], "jeswr", folded_through=400)
+    bd = {"body": bd_body, "closes": 0}
+
+    def beyond_bound_gh(args, token, capture=False):
+        if args and args[0] == "api":
+            if "--slurp" in args:
+                return subprocess.CompletedProcess(args, 0, json.dumps(bd_comments), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 61, "body": bd["body"]}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            bd["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "close":
+            bd["closes"] += 1
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": bd["body"], "state": "OPEN"}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = beyond_bound_gh
+    try:
+        listed_all = _list_row_comments(61, "jeswr/x", "tok")
+        chk("the trusted-comment listing is unbounded (56th comment visible)",
+            len(listed_all), 56)
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr", run_started="2026-07-18T12:00:00Z")
+        chk("resolve NEVER closes over a failure hidden beyond 50 folded comments",
+            bd["closes"], 0)
+        ok("the beyond-bound failure row is folded into the refreshed body and survives",
+           any(r.get("workflow") == "worker" for r in _parse_ledger(bd["body"]))
+           and all(r.get("workflow") != "dispatch" for r in _parse_ledger(bd["body"])))
+        ok("resolve's unbounded fold advances the watermark over the newest comment",
+           _parse_ledger_doc(bd["body"])[1] >= 456)
     finally:
         globals()["_gh"] = real_gh
 

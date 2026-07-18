@@ -20,6 +20,14 @@ jobs:
       actions: read
       contents: read
       issues: read
+    # [FABLE-5] Round-8 P1: honest usage-probe health. The probe steps stay non-terminal
+    # (continue-on-error — the dashboard still deploys, rendering usage as `unknown`), but
+    # their REAL outcomes feed this output so a failed probe raises a non-terminal
+    # `usage-probe-degraded` alarm and BLOCKS the recover job — a silent probe failure can no
+    # longer publish false availability or clear prior dashboard alerts. 'true' ONLY when both
+    # steps genuinely succeeded; anything else (including a crash before them) is degraded.
+    outputs:
+      usage_probe_ok: ${{ (steps.acct-secrets.outcome == 'success' && steps.probe.outcome == 'success') && 'true' || 'false' }}
     steps:
       - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -47,7 +55,9 @@ jobs:
           test ! -e ledger/scripts
 
       # Only this filter sees the complete secret map; the probe receives an ACCT_* file.
+      # Non-terminal (continue-on-error) but its real outcome feeds `usage_probe_ok` above.
       - name: Materialize the ACCT_* worker-token subset for the probe
+        id: acct-secrets
         continue-on-error: true
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}
@@ -69,16 +79,23 @@ jobs:
           os.chmod(path, 0o600)
           PY
 
+      # [FABLE-5] Round-8 P1: the probe no longer swallows its own failure into an empty-but-
+      # "successful" `{}` snapshot (which the generator then published as every account
+      # AVAILABLE). A failed self-test or probe now fails THIS step — non-terminal via
+      # continue-on-error (the dashboard still deploys, rendering usage as `unknown`), but the
+      # real outcome feeds `usage_probe_ok`, which alarms and blocks recovery. stderr is still
+      # discarded on the probe call (credential-safety posture: never stream probe stderr).
       - name: Probe live account usage (tokens never printed)
+        id: probe
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
         run: |
-          set -uo pipefail
+          set -euo pipefail
           python3 scripts/account-usage.py --self-test
-          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null || printf '{}' > "$RUNNER_TEMP/usage.json"
+          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null
           echo 'usage-probe: snapshot written'
 
       - name: Generate privacy-safe dashboard
@@ -93,6 +110,14 @@ jobs:
           # every live lease.
           test -f ledger/data/leases.json
           test -f ledger/data/model-health.json
+          # A FAILED probe may leave usage.json absent or truncated mid-write; discard it so the
+          # generator renders usage as `unknown` (probe health is alarmed separately via
+          # usage_probe_ok) instead of crashing the build on a partial file. Only on probe
+          # failure: a SUCCESSFUL probe that wrote garbage must crash the build loudly below
+          # (_read_json raises), never be silently discarded as "unknown".
+          if [ "${{ steps.probe.outcome }}" != "success" ]; then
+            rm -f "$RUNNER_TEMP/usage.json"
+          fi
           python3 scripts/dashboard-gen.py --self-test
           python3 scripts/dashboard-gen.py --usage "$RUNNER_TEMP/usage.json" \
             --leases ledger/data/leases.json --model-health ledger/data/model-health.json
@@ -124,11 +149,16 @@ jobs:
   # alarm records a build OR deploy failure/cancel to the same rolling pipeline-failure issue.
   alarm:
     needs: [build, deploy]
+    # Fires on any hard build/deploy failure — AND (round-8 P1) on a GREEN tick whose usage
+    # probe silently failed: the dashboard then deploys with usage rendered `unknown`, which is
+    # honest on the page but must ALSO reach the rolling alert (mirrors dispatch's non-terminal
+    # `repo-degraded` pattern). `!= 'true'` is fail-closed against a missing output.
     if: >-
       ${{ always() && (
         needs.build.result == 'failure' || needs.build.result == 'cancelled' ||
         needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled' ||
-        needs.deploy.result == 'skipped'
+        needs.deploy.result == 'skipped' ||
+        (needs.build.result == 'success' && needs.build.outputs.usage_probe_ok != 'true')
       ) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -140,7 +170,12 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: ./.github/actions/pipeline-alarm
+      - name: Alarm on a build/deploy failure (terminal)
+        if: >-
+          ${{ needs.build.result == 'failure' || needs.build.result == 'cancelled' ||
+              needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled' ||
+              needs.deploy.result == 'skipped' }}
+        uses: ./.github/actions/pipeline-alarm
         with:
           # Deploy is `needs: build`, so a build crash SKIPS deploy — surface whichever failed.
           job-name: ${{ (needs.build.result == 'failure' || needs.build.result == 'cancelled') && 'build' || 'deploy' }}
@@ -152,6 +187,28 @@ jobs:
           registry-token: ${{ github.token }}
           alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           alert-token: ${{ secrets.ALERT_TOKEN || '' }}
+      # [FABLE-5] Round-8 P1: the degraded-usage-probe out-of-band alarm. NON-TERMINAL — the
+      # tick stays green and the dashboard still deploys — but LOUD: the rolling alert carries a
+      # `usage-probe-degraded` row, and `recover` (gated on usage_probe_ok == 'true') will not
+      # clear dashboard rows until a tick probes cleanly. Both steps can fire in one run
+      # (probe degraded + deploy failed): two distinct rows, both accurate.
+      - name: Alarm on a degraded usage probe (dashboard deployed with unknown usage, non-terminal)
+        if: >-
+          ${{ needs.build.result == 'success' &&
+              needs.build.outputs.usage_probe_ok != 'true' }}
+        uses: ./.github/actions/pipeline-alarm
+        with:
+          job-name: build
+          job-result: failure
+          failure-class: usage-probe-degraded
+          detail: >-
+            dashboard usage probe DEGRADED — the secret materialization or live usage probe
+            failed, so the dashboard deployed rendering every account's usage/availability as
+            unknown (no false availability is published); heals automatically once a dashboard
+            tick probes cleanly
+          registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
 
   # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): on a healthy
   # dashboard tick, prune dashboard's rows from the rolling pipeline alert (--resolve) so a
@@ -159,7 +216,14 @@ jobs:
   # with no open alert it is a single cheap `gh issue list`.
   recover:
     needs: [build, deploy]
-    if: ${{ always() && needs.build.result == 'success' && needs.deploy.result == 'success' }}
+    # `usage_probe_ok == 'true'` (round-8 P1): a green tick whose usage probe failed proved
+    # NOTHING about probe health — running --resolve on it would clear prior dashboard alerts
+    # (including the freshly-raised `usage-probe-degraded` row's predecessors) on the strength
+    # of a run that observed no usage data at all. The exact-'true' comparison is itself
+    # fail-closed: a missing/empty output skips recovery too.
+    if: >-
+      ${{ always() && needs.build.result == 'success' && needs.deploy.result == 'success' &&
+          needs.build.outputs.usage_probe_ok == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

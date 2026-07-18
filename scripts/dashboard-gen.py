@@ -202,7 +202,11 @@ def _availability(account, usage_entry):
     if not account["catalog_available"]:
         return "unavailable"
     if not isinstance(usage_entry, dict):
-        return "available"
+        # No probe data for this account (probe failed/degraded, or it was never probed) —
+        # HONEST rendering only (round-8 P1: this used to publish "available", so a silently
+        # failed probe published false fleet health). `unknown` also never counts toward the
+        # provider's eligible capacity.
+        return "unknown"
     status = str(usage_entry.get("status") or "").strip().lower()
     if status not in {"", "allowed"}:
         return "unavailable"
@@ -547,6 +551,12 @@ def _self_test():
     check("privacy assertion rejects injected raw handle", rejected, True)
     no_salt = build_dashboard(issues, {"leases": []}, {}, [], None, now, "")
     check("missing salt fails closed", no_salt["accounts"][0]["label"], "salt-missing")
+    # Round-8 P1 regression: an account with NO usage-probe entry (failed/degraded probe) must
+    # render `unknown` — never `available` — and never count toward eligible capacity.
+    check("missing probe data renders unknown and is never eligible",
+          (no_salt["accounts"][0]["availability"],
+           no_salt["fleet"]["capacity"]["anthropic"]),
+          ("unknown", {"eligible": 0, "total": 1}))
 
     def issue(account_handle, provider, secret):
         return {
