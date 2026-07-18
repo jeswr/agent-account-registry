@@ -2,7 +2,7 @@
 # be discovered only when set-up-account or the rotation write-back actually ran `gh secret set` —
 # i.e. while a human was waiting on onboarding. This probes ahead of time (GET /user + the Actions
 # secrets public-key read, the exact read `gh secret set` performs) and upserts ONE rolling
-# `from:agent` alert issue on invalid/insufficient-scope; network-unknown never alerts and never
+# `from:agent` alert issue on invalid/insufficient-scope/near-expiry; network-unknown never alerts and never
 # closes an existing alert (no false alarms, no false recoveries). The token is never printed.
 name: pat-validity
 on:
@@ -14,6 +14,9 @@ on:
   workflow_dispatch: {}
 
 permissions:
+  # An explicit permissions block zeroes every grant not listed — checkout of the probe script
+  # on this private repo needs contents:read or the job dies before the probe runs.
+  contents: read
   issues: write   # rolling alert upsert only
 
 concurrency:
