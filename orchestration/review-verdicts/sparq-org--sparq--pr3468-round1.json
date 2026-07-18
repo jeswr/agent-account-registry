@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The new RIF conformance runner is internally consistent with the existing authoritative rif_wg_core_suite oracle: it preserves the import/validation/closure path, negative-entailment vacuity guard, genuine-rejection classification, ground/encodable conclusion guard, and value-aware exact-rational matching. The smoke lane pins every discovered fixture and detects missing, renamed, unpinned, or verdict-drifting cases; the supplied cases exercise positive and negative entailment, valid and invalid syntax, and two skip/vacuity paths. Full mode reports per-archive dialect tallies, itemized genuine failures, named skips, no timing, and fails on wrong answers while gracefully handling an absent unvendored suite. Feature gating remains opt-in. No prompt-injection-like instruction was present in the diff. I could not execute the smoke command because cargo is unavailable in this review environment, but found no diff-level correctness, soundness, security, or test-validity defect.",
+ "verdict": "approve"
+}
