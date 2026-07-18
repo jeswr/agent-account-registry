@@ -911,6 +911,14 @@
    "model_alias": "sonnet",
    "exit_class": "success",
    "run_id": "29626182154.1"
+  },
+  {
+   "ts": 1784340657,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "terra",
+   "exit_class": "unknown",
+   "run_id": "29626488700.1"
   }
  ]
 }
