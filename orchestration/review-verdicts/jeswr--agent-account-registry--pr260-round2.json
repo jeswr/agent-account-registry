@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Determine provider captures TARGET_REPOS from the labeled-event payload before a roughly 13-minute login. The write-time check only revalidates those captured names against live policy/repos.toml; it never fetches the issue's current labels. If an authorized maintainer removes or replaces a target label while login is in progress, the workflow still grants the account to the originally captured pool and closes the issue claiming that grant. A missing target label therefore does not fail closed at the authorization boundary, and the committed pools need not exactly match the request's live authorized targets.",
+   "file": ".github/workflows/set-up-account.yml",
+   "fix_hint": "Immediately before editing policy/repos.toml, fetch the issue's current labels through the API, derive the target set again without inline shell interpolation, require at least one target, and require it to exactly match the captured/approved target set (or use the freshly derived set after revalidating every member). Add a self-test or workflow-level regression proving that target removal/replacement during login causes refusal rather than a grant.",
+   "severity": "major",
+   "title": "Grant uses a stale snapshot of target authorization labels"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The round-1 parsed-membership defect is fixed and covered by a meaningful regression test. However, the new repository authorization is snapshotted from issue labels before the long interactive login and is never revalidated from the live issue before the grant. Removing or changing a target label during that window does not revoke the pending grant, so the workflow can write account_pool membership that no longer matches the request's current authorization. Because target labels are the newly introduced authorization boundary, the write must fail closed against stale label state.",
+ "verdict": "request_changes"
+}
