@@ -67,6 +67,12 @@ jobs:
           account-usage.py usage-alert.py model-health.py plan-alert.py pat-validity.py broker-refresh.py \
           backfill-provenance.py dashboard-gen.py trust-gate.py"
           for s in $suite; do
+            # An enrolled script that is MISSING is a hard failure (sol r3 on #227): the
+            # silent [[ -f ]] skip would keep this gate green after deleting a security
+            # script — the exact class the trust-gate outage exposed.
+            if [[ ! -f "scripts/$s" ]]; then
+              echo "::error::enrolled self-test script scripts/$s is missing"; exit 1
+            fi
             if [[ -f "scripts/$s" ]]; then
               echo "== self-test $s =="
               python3 "scripts/$s" --self-test

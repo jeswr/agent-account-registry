@@ -88,6 +88,10 @@ def _cli_exit_tests():
          run_cli("--author", "x", "--fetch"), 2),
         ("--fetch with --permission is a hard error",
          run_cli("--author", "x", "--repo", "o/r", "--fetch", "--permission", "write"), 2),
+        ("no permission source is a hard error (even approved)",
+         run_cli("--author", "x", "--maintainer-approved"), 2),
+        ("no permission source is a hard error (even exact bot)",
+         run_cli("--author", "b[bot]", "--bot", "b[bot]"), 2),
     ]
     for name, got, want in checks:
         good = got == want
@@ -100,7 +104,13 @@ def _cli_exit_tests():
     with tempfile.TemporaryDirectory() as fake_bin:
         fake_gh = os.path.join(fake_bin, "gh")
         with open(fake_gh, "w", encoding="utf-8") as fh:
-            fh.write("#!/bin/sh\necho admin\n")
+            # Asserts the EXACT api invocation (sol r3): an endpoint typo/regression must fail
+            # this test, not silently defer every live worker.
+            fh.write('#!/bin/sh\n'
+                     'if [ "$*" = '
+                     '"api repos/o/r/collaborators/x/permission --jq .permission" ]; '
+                     'then echo admin; exit 0; fi\n'
+                     'echo "unexpected gh invocation: $*" >&2; exit 9\n')
         os.chmod(fake_gh, 0o755)
         env = dict(os.environ, PATH=fake_bin + os.pathsep + os.environ.get("PATH", ""))
         r = subprocess.run([sys.executable, os.path.abspath(__file__),
@@ -168,6 +178,10 @@ def main():
             return 2
         perm = fetch_permission(args.repo, args.author)
     else:
+        if not args.permission:
+            print("error: exactly one permission source is required "
+                  "(--permission or --fetch)", file=sys.stderr)
+            return 2
         perm = args.permission
     bots = [b for b in args.bot.split(",") if b.strip()]
     v = verdict(args.author, perm, args.maintainer_approved, bots)
