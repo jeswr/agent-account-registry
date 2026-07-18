@@ -20,6 +20,13 @@
 # via `target:<owner>/<name>` label(s) — at least one, validated known + enabled — and the handle is
 # added ONLY to those rows' account_pool, never blanket-appended to every (incl. disabled) pool.
 #
+# GRANT-POSTCONDITION fix (review round 1 of #260): pool membership is decided from PARSED TOML,
+# never from quoted-handle text in the raw array body (a multiline account_pool comment such as
+# `# retired "acct08"` faked membership and let the textual no-op path close the request as granted
+# while tomllib never saw the handle). The pure edit/membership/verify logic now lives in
+# scripts/grant-account.py (regression-tested by the registry-selftest gate), and both the write
+# and the no-op path verify the parsed postcondition before reporting success.
+#
 # STALE-SNAPSHOT fix (#186, hardened after review round 1 of #236): the handle/secret in `meta`
 # are only a pre-login HINT. A re-read before the write is still a TOCTOU check, so the store step
 # instead takes ATOMIC ownership of the slot by creating `refs/acct-claims/<handle>` — git ref
@@ -298,6 +305,12 @@ jobs:
       # #190: the grant is SCOPED — the handle is added ONLY to the account_pool of the request's
       # explicitly-authorized, enabled target repositories, never to every pool. Every other row's
       # account_pool is asserted byte-identical before the write (fail closed on any drift).
+      # Review round 1 of #260: membership is decided from PARSED TOML only (never by substring-
+      # searching the raw array body, where a comment like `# retired "acct08"` faked membership
+      # and let the textual no-op path close the request unverified). The pure edit/verify logic
+      # lives in scripts/grant-account.py — imported here like the read_accounts validation step —
+      # so the registry-selftest gate regression-tests it; every success path below re-checks the
+      # parsed postcondition (handle present in every target pool).
       - name: Grant the handle to the authorized target account_pools (contents-API CAS, rebase-retry)
         if: steps.login.outputs.status == 'ok'
         env:
@@ -307,12 +320,18 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import base64
+          import importlib.util
           import json
           import os
           import re
           import subprocess
           import time
           import tomllib
+
+          spec = importlib.util.spec_from_file_location(
+              "registry_grant_account", "scripts/grant-account.py")
+          ga = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(ga)
 
           repo = os.environ["GITHUB_REPOSITORY"]
           handle = os.environ["NEW_HANDLE"]
@@ -329,35 +348,6 @@ jobs:
                   input=json.dumps(input_doc) if input_doc is not None else None)
               return result
 
-          # Format-preserving: edit the account_pool line ONLY inside a target's own
-          # [repos."owner/name"] section span. A whole-file subn (the #190 bug) would have appended
-          # the handle to every pool, including disabled and future rows.
-          section_re = re.compile(r'(?m)^\[repos\."([^"]+)"\]')
-          pool_re = re.compile(r"(?m)^(account_pool\s*=\s*\[)([^\]]*)(\])")
-
-          def append(match):
-              entries = match.group(2)
-              if f'"{handle}"' in entries:
-                  return match.group(0)
-              separator = ", " if entries.strip() else ""
-              return f"{match.group(1)}{entries}{separator}\"{handle}\"{match.group(3)}"
-
-          def grant_targets(text):
-              headers = list(section_re.finditer(text))
-              if not headers:
-                  raise SystemExit("no [repos.\"...\"] sections in policy/repos.toml")
-              pieces = [text[:headers[0].start()]]
-              for i, h in enumerate(headers):
-                  name = h.group(1)
-                  end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
-                  section = text[h.start():end]
-                  if name in targets:
-                      section, count = pool_re.subn(append, section, count=1)
-                      if count == 0:
-                          raise SystemExit(f"target {name} has no account_pool line — refusing")
-                  pieces.append(section)
-              return "".join(pieces)
-
           for attempt in range(6):
               meta = gh_api([f"repos/{repo}/contents/{path}"])
               if meta.returncode != 0:
@@ -373,24 +363,18 @@ jobs:
                       raise SystemExit(f"target {t} is not a repository in policy/repos.toml — refusing")
                   if not row.get("enabled", False):
                       raise SystemExit(f"target {t} is disabled — refusing to grant a disabled pool")
-              new_text = grant_targets(text)
-              if new_text == text:
-                  print(f"{handle} already present in every target pool")
+              # Membership from PARSED TOML (#260 r1): only targets whose parsed pool lacks the
+              # handle are edited; "already granted" is therefore a VERIFIED parsed postcondition,
+              # never an inference from an unchanged byte string.
+              pending = ga.pending_targets(before, targets, handle)
+              if not pending:
+                  print(f"{handle} already present in every target pool (verified via parsed TOML)")
                   break
+              new_text = ga.grant_targets(text, handle, pending)
               after = tomllib.loads(new_text).get("repos", {})  # refuse a policy the resolver can't parse
-              # The scoping invariant that closes #190: EXACTLY the target rows gain the handle and
-              # every non-target row's account_pool is unchanged.
-              for name, row in before.items():
-                  old_pool = list(row.get("account_pool") or [])
-                  new_pool = list(after.get(name, {}).get("account_pool") or [])
-                  if name in targets:
-                      if handle not in new_pool:
-                          raise SystemExit(f"target {name} did not gain {handle}; refusing")
-                      if set(new_pool) - set(old_pool) - {handle}:
-                          raise SystemExit(f"target {name} gained unexpected members; refusing")
-                  elif new_pool != old_pool:
-                      raise SystemExit(
-                          f"non-target {name} account_pool changed — refusing to over-grant (fail closed)")
+              # The scoping invariant that closes #190, on parsed documents: EXACTLY the target rows
+              # hold the handle (once) and every non-target row's account_pool is unchanged.
+              ga.verify_grant(before, after, targets, handle)
               put = gh_api(
                   [f"repos/{repo}/contents/{path}", "-X", "PUT", "--input", "-"],
                   input_doc={

@@ -87,6 +87,7 @@ cross_provider_fallback = false
 # The automated cross-provider review still runs — only the final arm click is a human's here.
 security_paths = [
   "scripts/trust-gate.py",
+  "scripts/grant-account.py",
   "scripts/dispatch-claim.py",
   "scripts/worker-live.sh",
   "scripts/worker-pr.py",
