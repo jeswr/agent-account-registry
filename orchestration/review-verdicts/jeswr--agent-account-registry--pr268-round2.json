@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-1 credential-path findings are resolved. The workflow no longer republishes masked secrets through GITHUB_OUTPUT: it passes each mint output directly into the sweep step, masks the values there, and constructs TARGET_GH_TOKENS only inside that process environment. Token mint scope now includes every enabled repository for each expected owner, with validated repository names and an exact enabled-owner-set check that fails closed on policy drift. The sweep routes every target access through the repository owner's client, defers only the owners whose token is unavailable, and retains registry-side dead-lease cleanup. The added self-tests are non-vacuous: they distinguish owner clients, exercise missing-owner deferral and malformed token maps, prove multi-repository mint scope, and verify owner-set drift is rejected. I found no blocker, major, or other diff-supported issue.",
+ "verdict": "approve"
+}
