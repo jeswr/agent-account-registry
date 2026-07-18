@@ -50,9 +50,20 @@ provider_model = ""                    # EMPTY = omit --model: the codex CLI def
                                        # changes", 8/8 uniform 2026-07-18). Set a concrete id only once
                                        # verified against the worker account type.
 credential_format = "codex-auth-json"
+[models.sol]
+provider = "openai"
+harness = "codex"
+provider_model = "gpt-5.6-sol"         # Frontier codex model (maintainer 2026-07-18): leads impl/ci/site
+                                       # chains (credit abundance) + reviews anthropic-authored content.
+credential_format = "codex-auth-json"
+[models.luna]
+provider = "openai"
+harness = "codex"
+provider_model = "gpt-5.6-luna"        # Second codex tier (opus<luna<fable<sol); sol's fallback.
+credential_format = "codex-auth-json"
 
 [defaults]
-model_chain = ["fable", "sonnet", "terra"]
+model_chain = ["sol", "fable", "opus"]
 agent = "registry-impl"
 
 # ---------------------------------------------------------------------------------------------------
@@ -76,7 +87,7 @@ escalate = true
 # fallback so an Anthropic outage does not stall implementation. docs -> haiku-led (cheap).
 [[route]]
 role = "impl"
-model_chain = ["fable", "sonnet", "terra"]
+model_chain = ["sol", "fable", "opus"]
 agent = "registry-impl"
 
 # [FABLE-5] STANDING RULE — UI/front-end ownership (maintainer decision 2026-07-17): UI/front-end
@@ -87,7 +98,7 @@ agent = "registry-impl"
 # unions ALL match_labels keywords, so UI keywords there would human-arm every UI PR.
 [[route]]
 role = "site"
-model_chain = ["terra", "fable", "sonnet"]
+model_chain = ["sol", "fable", "opus"]
 agent = "registry-impl"
 
 # [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
@@ -107,7 +118,7 @@ agent = "registry-impl"
 # into each target's routing.toml (sparq-org/sparq carries it, PR #3422).
 [[route]]
 role = "ci"
-model_chain = ["fable", "terra"]
+model_chain = ["sol", "fable"]
 agent = "registry-ci"
 
 [[route]]
