@@ -32,7 +32,13 @@ import subprocess
 import sys
 
 HEAD_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-([0-9]+)-([0-9]+)$")
+# ANCHORED to claim-job-prefixed lines (sol r1 on #147): `gh run view --log` prefixes every
+# line `<job>\t<step>\t<timestamp> <content>`, and the claim line is printed by the "Claim
+# live account lease" job, which runs no target/model code. An UNANCHORED search over the
+# whole log let hostile worker-job output forge `lease claimed: account=...` and override the
+# genuine identity — defeating the cross-provider inversion this record exists to protect.
 CLAIM_LINE_RE = re.compile(
+    r"(?mi)^[^\t]*claim[^\t]*\t[^\t]*\t\S+\s+"
     r"(?:lease claimed|dispatcher lease adopted): account=(acct[0-9a-z]{2,}), "
     r"model=([A-Za-z0-9][A-Za-z0-9_.-]*)")
 
@@ -49,12 +55,131 @@ def parse_head_ref(ref):
     return int(match.group(1)), match.group(2), match.group(3)
 
 
+# Tri-state sentinel (sol r2): "a source produced CONFLICTING matches" must never collapse
+# into "a source is absent" — absent lets the other source stand alone, ambiguous is tamper
+# evidence that fails the whole run.
+AMBIGUOUS = object()
+
+
 def claim_from_log(log_text):
-    """(account, model_alias) from a worker run log, or None. Matches the claim line format the
-    PRE-migration worker.yml printed (historical logs; the current code no longer prints
-    handles, but new PRs get provenance at publish time and never reach this script)."""
-    match = CLAIM_LINE_RE.search(log_text or "")
-    return (match.group(1), match.group(2)) if match else None
+    """Tri-state: (account, model_alias) from CLAIM-job-prefixed lines, None when absent, or
+    AMBIGUOUS when differing repeats conflict (tamper evidence — sol r2)."""
+    found = set(CLAIM_LINE_RE.findall(log_text or ""))
+    if not found:
+        return None
+    return found.pop() if len(found) == 1 else AMBIGUOUS
+
+
+def run_identity_from_log(log_text, target_repo, pr_number, issue, live_author):
+    """The PR-BOUND (account, model_alias) for the run, or None (needs-human).
+
+    Fail-closed rules (sol r1+r2):
+    - The provenance-job source is REQUIRED — its command echo binds the identity to the exact
+      PR being recorded (--target-repo/--pr/--issue must match the live PR); the run id in a
+      head branch is model-forgeable, so an unbound identity (legacy claim line only) is never
+      sufficient — that population (<= sparq#2542) already has master records anyway.
+    - AMBIGUITY in EITHER source (conflicting repeats) fails the run — never fall back past a
+      conflicted source.
+    - When the legacy claim line is also present it must AGREE on (account, alias)."""
+    anchored = provenance_job_identity_from_log(log_text)
+    if anchored is None or anchored is AMBIGUOUS:
+        return None
+    if (anchored["target_repo"] != target_repo or anchored["pr"] != int(pr_number)
+            or anchored["issue"] != int(issue)):
+        return None
+    # The historical job hard-required this exact App author (provenance_record
+    # --verify-bot-login); the live PR author must still match it EXACTLY — any *[bot] is not
+    # enough (sol r4: a job that failed VALIDATION, not the write, must never be recorded).
+    if anchored["bot_login"] != live_author:
+        return None
+    legacy = claim_from_log(log_text)
+    if legacy is AMBIGUOUS:
+        return None
+    identity = (anchored["account"], anchored["alias"])
+    if legacy is not None and legacy != identity:
+        return None
+    return anchored["account"], anchored["alias"], anchored["provider"]
+
+
+# Post-migration identity source (the #96 outage population: worker succeeded, the provenance
+# JOB failed on the protected-master write, so no record exists and the worker log carries no
+# handle). The failed provenance job's OWN log section still shows its env echo
+# (`WORKER_IMPL_ACCOUNT: acctNN`) and command echo (`--impl-alias "<alias>"`). TRUST SCOPE: in
+# `gh run view --log` output every line is prefixed `<job>\t<step>\t<timestamp> <content>`, and
+# these patterns ANCHOR on a job name containing "provenance" — that job runs NO target/model
+# code, so a hostile model printing a lookalike line lands under the WORKER job's prefix and
+# can never match (same fail-closed posture as the no-trailer rule below).
+# The Actions runner wraps every `run:` SCRIPT line in cyan SGR controls, and `gh run view
+# --log` caret-sanitizes them (`^[[36;1m ... ^[[0m`) instead of stripping (sol r6 — with a
+# synthetic-fixture false green, the six command fields matched NOTHING in a real log and
+# every outage PR went AMBIGUOUS/needs-human). Accept an optional raw-ESC or caret-sanitized
+# SGR wrapper before the field; env echoes (WORKER_IMPL_ACCOUNT) are runner-emitted, unwrapped.
+_SGR_PREFIX = r"(?:(?:\^\[|\x1b)\[[0-9;]*m)?\s*"
+
+
+def _prov_job_field(name, value_pattern):
+    return re.compile(
+        r"(?mi)^[^\t]*provenance[^\t]*\t[^\t]*\t\S+\s+" + _SGR_PREFIX + name
+        + r"\s*" + value_pattern)
+
+
+PROV_JOB_ACCOUNT_RE = _prov_job_field("WORKER_IMPL_ACCOUNT:", r"(acct[0-9a-z]{2,})\s*$")
+PROV_JOB_ALIAS_RE = _prov_job_field("--impl-alias", r'"?([A-Za-z0-9][A-Za-z0-9_.-]*)"?')
+# The PROVIDER is also run-bound (sol r3): deriving it from TODAY's mutable routing lets a
+# routing remap flip a historical anthropic run to openai and defeat the cross-provider gate.
+PROV_JOB_PROVIDER_RE = _prov_job_field("--impl-provider", r'"?(anthropic|openai)"?')
+# The exact App-bot author the historical job REQUIRED (sol r4): accepting any *[bot] would
+# record a provenance job that failed VALIDATION (hostile worker pointed it at another bot's
+# PR) as if it were the #96 write outage.
+PROV_JOB_BOTLOGIN_RE = _prov_job_field("--verify-bot-login",
+                                       r'"?([A-Za-z0-9._-]+\[bot\])"?')
+# PR-binding fields (sol r2): the provenance job's command echo names the exact PR it was
+# recording — required to match the live PR, so a forged/reused run id in a head branch can
+# never transplant another PR's identity.
+PROV_JOB_TARGET_RE = _prov_job_field("--target-repo", r'"?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"?')
+PROV_JOB_PR_RE = _prov_job_field("--pr", r'"?([1-9][0-9]*)"?')
+PROV_JOB_ISSUE_RE = _prov_job_field("--issue", r'"?([1-9][0-9]*)"?')
+
+
+def provenance_job_identity_from_log(log_text):
+    """Tri-state: a dict {account, alias, target_repo, pr, issue} from the FAILED provenance
+    job's log section, None when the section/fields are absent, or AMBIGUOUS when any field
+    has differing repeated matches (tamper evidence). Every field is required."""
+    fields = {"account": PROV_JOB_ACCOUNT_RE, "alias": PROV_JOB_ALIAS_RE,
+              "provider": PROV_JOB_PROVIDER_RE, "bot_login": PROV_JOB_BOTLOGIN_RE,
+              "target_repo": PROV_JOB_TARGET_RE, "pr": PROV_JOB_PR_RE,
+              "issue": PROV_JOB_ISSUE_RE}
+    out = {}
+    saw_any = False
+    for key, pattern in fields.items():
+        found = set(pattern.findall(log_text or ""))
+        if len(found) > 1:
+            return AMBIGUOUS
+        if not found:
+            continue
+        saw_any = True
+        out[key] = found.pop()
+    if len(out) != len(fields):
+        return AMBIGUOUS if saw_any else None
+    out["pr"] = int(out["pr"])
+    out["issue"] = int(out["issue"])
+    return out
+
+
+def flatten_pull_pages(pages):
+    """Flatten `gh api --paginate --slurp` output (a list of per-page LISTS) into one pull
+    list, or None when the shape is malformed. Every page must be a list of dicts."""
+    if not isinstance(pages, list):
+        return None
+    pulls = []
+    for page in pages:
+        if not isinstance(page, list):
+            return None
+        for pull in page:
+            if not isinstance(pull, dict):
+                return None
+            pulls.append(pull)
+    return pulls
 
 
 def provider_of(alias, routing):
@@ -114,9 +239,12 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
     if not salt:
         raise BackfillError("PROVENANCE_SALT is required (records store only the salted hash)")
 
-    pulls = _gh_json(["api", "--paginate",
+    # --slurp: without it `gh api --paginate` emits each page as a SEPARATE json array and a
+    # >100-open-PR target aborts on "malformed JSON" before recovery begins (sol r5).
+    pages = _gh_json(["api", "--paginate", "--slurp",
                       f"repos/{target_repo}/pulls?state=open&per_page=100"])
-    if not isinstance(pulls, list):
+    pulls = flatten_pull_pages(pages)
+    if pulls is None:
         raise BackfillError("pull listing is malformed")
     written = skipped = needs_human = 0
     for pull in pulls:
@@ -134,7 +262,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         if not login.endswith("[bot]"):
             continue
         is_draft = pull.get("draft") is True
-        issue, run_id, _attempt = parsed
+        issue, run_id, attempt = parsed
         record_path = worker_pr.provenance_path(target_repo, number)
         # Post-outage records live on the `ledger` data-plane branch (issue #96); pre-outage
         # ones on master. Either counts as already-recorded.
@@ -153,23 +281,39 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
 
         # The worker RUN LOG is the only accepted identity source (no trailer fallback: trailers
         # on this pre-migration population are model-forgeable — see the module docstring).
+        # The ATTEMPT encoded in the head branch is passed explicitly (sol r1): without it a
+        # rerun's log could source identity from a different attempt than the one that pushed
+        # this head.
         account = alias = None
-        run_key = f"backfill:{run_id}"
-        log = _run_gh(["run", "view", run_id, "--repo", registry_repo, "--log"], check=False)
+        run_key = f"backfill:{run_id}.{attempt}"
+        log = _run_gh(["run", "view", run_id, "--attempt", attempt,
+                       "--repo", registry_repo, "--log"], check=False)
+        echo_provider = None
         if log.returncode == 0:
-            found = claim_from_log(log.stdout)
+            found = run_identity_from_log(log.stdout, target_repo, number, issue, login)
             if found:
-                account, alias = found
+                account, alias, echo_provider = found
         if alias is None or account is None:
             needs_human += 1
-            print(f"NEEDS-HUMAN #{number}: worker run {run_id} log is unavailable or has no "
-                  "claim line; leaving fail-closed invisible (record provenance manually only "
-                  "after a human establishes the implementer identity)")
+            print(f"NEEDS-HUMAN #{number}: worker run {run_id} attempt {attempt} log is "
+                  "unavailable, has neither trusted job-anchored identity source, or the "
+                  "sources DISAGREE (tampered/ambiguous evidence); leaving fail-closed "
+                  "invisible (record provenance manually only after a human establishes the "
+                  "implementer identity)")
             continue
         provider = provider_of(alias, routing)
         if provider is None:
             needs_human += 1
             print(f"NEEDS-HUMAN #{number}: alias {alias!r} has no provider in routing")
+            continue
+        if provider != echo_provider:
+            # sol r3: the run's own --impl-provider echo is authoritative for HISTORY; a
+            # disagreement means today's routing was remapped since the run — recording
+            # today's provider could flip the cross-provider reviewer gate.
+            needs_human += 1
+            print(f"NEEDS-HUMAN #{number}: the run recorded provider {echo_provider!r} but "
+                  f"today's routing maps {alias!r} to {provider!r}; a human must resolve the "
+                  "remap before this identity is recorded")
             continue
         commits = _gh_json(["api", f"repos/{target_repo}/pulls/{number}/commits?per_page=100"])
         if not isinstance(commits, list) or not commits:
@@ -211,12 +355,19 @@ def _self_test():
     check("non-worker ref rejected", parse_head_ref("feature/foo"), None)
     check("spoof-shaped ref without run id rejected", parse_head_ref("sparq-agent/issue-1-x"),
           None)
-    check("claim line parses",
-          claim_from_log("...\nlease claimed: account=acct02, model=fable, claim=deadbeef\n"),
-          ("acct02", "fable"))
-    check("adopt line parses",
-          claim_from_log("dispatcher lease adopted: account=acct01, model=terra, claim=ab"),
-          ("acct01", "terra"))
+    claim_job = "Claim live account lease"
+    check("claim line parses (claim-job-anchored)",
+          claim_from_log(f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
+                         "lease claimed: account=acct0fx3, model=fable, claim=deadbeef\n"),
+          ("acct0fx3", "fable"))
+    check("adopt line parses (claim-job-anchored)",
+          claim_from_log(f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
+                         "dispatcher lease adopted: account=acct0fx4, model=terra, claim=ab"),
+          ("acct0fx4", "terra"))
+    check("UNANCHORED claim line no longer matches (worker-job forgery class)",
+          claim_from_log("Run live target worker (DRAFT, review pending)\tmodel\t"
+                         "2026-07-18T09:03:04Z lease claimed: account=acct0fx9, "
+                         "model=terra, claim=ff"), None)
     check("no claim line", claim_from_log("nothing here"), None)
     # Trailer-derived identity is REJECTED by construction: there is no code path from a commit
     # message to a provenance record (a forged GPT trailer cannot flip the reviewer provider).
@@ -225,6 +376,72 @@ def _self_test():
     routing = {"models": {"terra": {"provider": "openai"}, "fable": {"provider": "anthropic"}}}
     check("provider lookup", provider_of("terra", routing), "openai")
     check("unknown alias provider", provider_of("ghost", routing), None)
+    prov_job = "Record implementer provenance (no target code runs here)"
+
+    def prov_lines(account="acct0fx1", alias="fable", provider="anthropic",
+                   target="sparq-org/sparq", pr=3459, issue=3404, wrap=True):
+        # wrap=True reproduces the LITERAL `gh run view --log` shape: command echoes carry
+        # caret-sanitized SGR wrappers + a trailing continuation backslash (sol r6); the env
+        # echo line is runner-emitted and unwrapped.
+        step = f"{prov_job}\tRecord provenance\t2026-07-18T09:10:44Z "
+        o, c, bs = ("^[[36;1m  ", " \\^[[0m", "") if wrap else ("", " \\", "")
+        return (f"{step}  WORKER_IMPL_ACCOUNT: {account}\n"
+                f'{step}{o}--target-repo "{target}"{c}\n'
+                f'{step}{o}--pr "{pr}"{c}\n'
+                f'{step}{o}--impl-provider "{provider}"{c}\n'
+                f'{step}{o}--impl-alias "{alias}"{c}\n'
+                f'{step}{o}--issue "{issue}"{c}\n'
+                f'{step}{o}--verify-bot-login "sparq-orchestrator[bot]"{c}\n')
+
+    prov_log = prov_lines()
+    bound = {"account": "acct0fx1", "alias": "fable", "provider": "anthropic",
+             "bot_login": "sparq-orchestrator[bot]",
+             "target_repo": "sparq-org/sparq", "pr": 3459, "issue": 3404}
+    check("provenance-job echo parses ALL binding fields (REAL caret-SGR log shape)",
+          provenance_job_identity_from_log(prov_log), bound)
+    check("unwrapped (raw-print) shape still parses",
+          provenance_job_identity_from_log(prov_lines(wrap=False)), bound)
+    forged = ("Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
+              "WORKER_IMPL_ACCOUNT: acct0fx9\n"
+              "Run live target worker (DRAFT, review pending)\tmodel\t2026-07-18T09:10:44Z "
+              '--impl-alias "opus"\n')
+    check("worker-job forgery cannot match (job-prefix anchor)",
+          provenance_job_identity_from_log(forged), None)
+    check("conflicting repeats are AMBIGUOUS, not absent",
+          provenance_job_identity_from_log(
+              prov_log + prov_lines(account="acct0fx2")) is AMBIGUOUS, True)
+    check("partial fields are AMBIGUOUS (never a half-bound identity)",
+          provenance_job_identity_from_log(
+              f"{prov_job}\ts\t2026-07-18T09:10:44Z   WORKER_IMPL_ACCOUNT: acct0fx1\n")
+          is AMBIGUOUS, True)
+    claim_ok = (f"{claim_job}\tAdopt\t2026-07-18T09:03:04Z "
+                "lease claimed: account=acct0fx1, model=fable, claim=x\n")
+    ident = lambda log, pr=3459, issue=3404, author="sparq-orchestrator[bot]": (
+        run_identity_from_log(log, "sparq-org/sparq", pr, issue, author))
+    check("bound identity resolves with the RUN's provider", ident(prov_log),
+          ("acct0fx1", "fable", "anthropic"))
+    check("agreeing legacy corroboration keeps it", ident(claim_ok + prov_log),
+          ("acct0fx1", "fable", "anthropic"))
+    check("provider conflicts are AMBIGUOUS",
+          provenance_job_identity_from_log(
+              prov_log + prov_lines(provider="openai")) is AMBIGUOUS, True)
+    check("DISAGREEING trusted sources fail closed",
+          ident(claim_ok.replace("acct0fx1", "acct0fx2") + prov_log), None)
+    check("AMBIGUOUS legacy claims fail closed even with a clean anchored source (sol r2)",
+          ident(claim_ok + claim_ok.replace("acct0fx1", "acct0fx2") + prov_log), None)
+    check("claim-only identity is NEVER sufficient (unbound to the PR)",
+          ident(claim_ok), None)
+    check("PR-binding mismatch fails closed (reused run id)", ident(prov_log, pr=9999), None)
+    check("issue-binding mismatch fails closed", ident(prov_log, issue=1), None)
+    check("live author must EXACTLY match the echoed --verify-bot-login (sol r4)",
+          ident(prov_log, author="different-bot[bot]"), None)
+    check("two-page slurped listing flattens (sol r5)",
+          flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
+          [{"number": 1}, {"number": 2}, {"number": 3}])
+    check("non-list page fails closed", flatten_pull_pages([[{"number": 1}], "x"]), None)
+    check("non-dict pull fails closed", flatten_pull_pages([[1]]), None)
+    check("empty slurp is an empty list", flatten_pull_pages([]), [])
+    check("forged worker-job lines alone resolve nothing", ident(forged), None)
     print("backfill-provenance self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

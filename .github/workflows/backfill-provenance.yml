@@ -1,0 +1,97 @@
+# Manual recovery for worker PRs missing their registry provenance record — the #96 outage
+# population (worker succeeded, the provenance job's protected-master write failed) and any
+# pre-migration stragglers. Runs scripts/backfill-provenance.py, which reconstructs the
+# implementer identity ONLY from trusted run-log lines (the historical claim line, or the
+# failed provenance job's own env echo — job-prefix-anchored so model output can never forge
+# it) and writes records to the `ledger` data-plane branch. DRY RUN unless apply=true.
+name: backfill-provenance
+run-name: backfill-provenance ${{ inputs.target_repo }} apply=${{ inputs.apply }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Target owner/repository (must be enabled in policy/repos.toml)
+        required: true
+        default: sparq-org/sparq
+        type: string
+      apply:
+        description: Write records + convert to draft (false = dry run)
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: backfill-provenance
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: Backfill missing provenance records (ledger branch)
+    # The salt is a secret: refuse to run from any non-default ref (a modified branch copy of
+    # this workflow must never see it — the sol-audit arbitrary-ref class).
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # ledger-branch record PUTs via github.token
+      actions: read     # worker run-log reads (the identity source)
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout public target for protected routing data (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target-routing
+          persist-credentials: false
+
+      - name: Enforce the policy row (enabled target + ITS validated routing pointer)
+        id: policy
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo '::error::unsafe target repo'; exit 1; }
+          python3 - <<'PY'
+          import os, sys, tomllib
+          from pathlib import Path, PurePosixPath
+          target = os.environ["TARGET_REPO"]
+          row = tomllib.load(open("policy/repos.toml", "rb")).get("repos", {}).get(target)
+          # Only an ENABLED policy target may be backfilled (sol r1: syntax-only checking
+          # permitted provenance pre-seeding for arbitrary public repositories), and the
+          # routing file comes from the row's validated pointer, never a hardcoded path.
+          if not isinstance(row, dict) or row.get("enabled") is not True:
+              raise SystemExit(f"::error::{target} is not an enabled policy target")
+          routing = row.get("routing")
+          if not isinstance(routing, str) or not routing:
+              raise SystemExit("::error::policy row carries no routing pointer")
+          root = Path("target-routing").resolve()
+          resolved = root.joinpath(*PurePosixPath(routing).parts).resolve()
+          resolved.relative_to(root)  # traversal guard — raises on escape
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"routing_file=target-routing/{routing}\n")
+          PY
+
+      - name: Backfill (self-test first; dry run unless apply=true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Raw handles never appear in output — the script prints only the salted hash. A
+          # non-draft PR needing conversion is WARNed with the manual command (github.token
+          # has no target write; the outage population is already draft).
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          APPLY: ${{ inputs.apply }}
+          ROUTING_FILE: ${{ steps.policy.outputs.routing_file }}
+        run: |
+          set -euo pipefail
+          python3 scripts/backfill-provenance.py --self-test
+          args=(--target-repo "$TARGET_REPO" --registry-repo "$GITHUB_REPOSITORY" \
+                --routing-file "$ROUTING_FILE")
+          if [[ "$APPLY" == "true" ]]; then args+=(--apply); fi
+          python3 scripts/backfill-provenance.py "${args[@]}"
