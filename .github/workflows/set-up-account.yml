@@ -15,11 +15,16 @@
 # real read_accounts parser, and the handle is appended to policy/repos.toml account_pool with a
 # contents-API compare-and-swap (rebase-retry) so no human policy edit is left dangling.
 #
-# STALE-SNAPSHOT fix (#186): the handle/secret in `meta` are picked BEFORE a login lasting up to
-# ~13 min, and concurrency serializes only this workflow's own runs — not manual account creation
-# or other writers. So the store step re-reads live state (issue titles + secret names) and re-derives
-# the slot immediately before the irreversible `gh secret set`, failing closed if it cannot prove the
-# slot is free; downstream steps consume that reserved slot via steps.store.outputs, not the snapshot.
+# STALE-SNAPSHOT fix (#186, hardened after review round 1 of #236): the handle/secret in `meta`
+# are only a pre-login HINT. A re-read before the write is still a TOCTOU check, so the store step
+# instead takes ATOMIC ownership of the slot by creating `refs/acct-claims/<handle>` — git ref
+# creation is first-writer-wins on the server, and claims are never deleted (a failed run burns its
+# slot instead of releasing it, so a retry can never overwrite an in-flight credential). The slot is
+# derived from the COMPLETE union (fully paginated, never a capped page) of claim refs, acctNN issue
+# titles in ANY state, and ACCTNN_TOKEN secret names; if any listing fails, freeness cannot be
+# proven and the run fails closed. The claim-ref namespace is the canonical allocation record every
+# automated account writer must claim in BEFORE writing; downstream steps consume the claimed slot
+# via steps.store.outputs, not the stale snapshot.
 name: set-up-account
 on:
   issues:
@@ -86,7 +91,8 @@ jobs:
           if [ "$prov" = openai ]; then models='[terra]'; else models='[fable, opus, sonnet, haiku]'; fi
           # handle/secret here are only a PRE-LOGIN RESERVATION HINT: the login below can take ~13 min,
           # during which another (non-serialized) writer may claim this number, so the store step
-          # re-reads live state and re-validates the reservation before writing (#186).
+          # derives the real slot from complete live state and atomically claims it (an acct-claims
+          # ref) before writing (#186). This hint only makes a retry converge on the same slot.
           n=$(gh issue list -R "${{ github.repository }}" --state all --json title \
                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]|max // 0' 2>/dev/null || echo 0)
           {
@@ -122,7 +128,7 @@ jobs:
           fi
           if wait "$BR"; then echo "status=ok" >> "$GITHUB_OUTPUT"; else echo "status=fail" >> "$GITHUB_OUTPUT"; fi
 
-      - name: Reserve (re-read live state) + store token + register — fail closed on a taken slot
+      - name: Claim slot atomically (acct-claims ref) + store token + register — fail closed
         id: store
         if: steps.login.outputs.status == 'ok'
         env:
@@ -132,38 +138,69 @@ jobs:
           RESERVED_HANDLE: ${{ steps.meta.outputs.handle }}
         run: |
           set -euo pipefail
-          # #186 stale-snapshot fix. `meta` picked the handle/secret from a snapshot taken BEFORE a
-          # login that lasts up to ~13 min, and this workflow's concurrency group serializes only its
-          # OWN runs — NOT manual account creation or other writers. So that slot may now be taken;
-          # proceeding blind would OVERWRITE a live credential (`gh secret set` is an upsert) and mint
-          # a DUPLICATE acctNN issue title (GitHub permits duplicate titles). Re-read live state here,
-          # immediately before the irreversible write, and re-derive the slot from the union of every
-          # acctNN issue title (ANY state) and every ACCTNN_TOKEN secret name so it is free in BOTH
-          # namespaces. If either listing fails we CANNOT prove the slot is free -> fail closed. The
-          # pre-login reservation is REUSED when still free (so a retry converges on the same slot);
-          # only a real collision bumps to max(taken)+1.
-          if ! taken_issues=$(gh issue list -R "${{ github.repository }}" --state all --limit 500 \
-                 --json title \
-                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]'); then
-            echo "::error::could not list account issues to validate the reservation — refusing to store (fail closed)"; exit 1
-          fi
-          if ! taken_secrets=$(GH_TOKEN="$REGISTRY_PAT" gh secret list -R "${{ github.repository }}" \
-                 --json name \
-                 --jq '[.[].name|select(test("^ACCT[0-9]+_TOKEN$"))|ltrimstr("ACCT")|rtrimstr("_TOKEN")|tonumber]'); then
-            echo "::error::could not list existing secrets to validate the reservation — refusing to store (fail closed)"; exit 1
-          fi
+          # #186 stale-snapshot fix, hardened after review round 1 of #236. `meta` picked the slot
+          # from a snapshot taken BEFORE a login lasting up to ~13 min, and the concurrency group
+          # serializes only this workflow's own runs — NOT manual account creation or other writers.
+          # Proceeding blind would OVERWRITE a live credential (`gh secret set` is an upsert) and
+          # mint a DUPLICATE acctNN title (GitHub permits duplicate titles). A re-read immediately
+          # before the write is STILL a TOCTOU check, so ownership is taken atomically instead:
+          # creating `refs/acct-claims/acctNN` is first-writer-wins on the server — exactly one
+          # writer can ever create a given ref — and claims are NEVER deleted (a run that fails
+          # after claiming burns its slot rather than releasing it, so a different credential can
+          # never overwrite an in-flight one). The acct-claims namespace is the canonical allocation
+          # record; every automated account writer MUST create its claim ref before writing a secret
+          # or an acctNN issue. Out-of-band manual writes cannot be forced through this protocol;
+          # they are caught by deriving the slot from the COMPLETE union of claim refs, acctNN issue
+          # titles in ANY state, and ACCTNN_TOKEN secret names — each fully paginated, because any
+          # capped listing silently treats every unseen slot as free — plus a
+          # secret-absence probe right before the upsert. If any listing fails, freeness cannot be
+          # proven -> fail closed. The pre-login hint is reused when still free so a retry converges
+          # on the same slot.
           reserved=${RESERVED_HANDLE#acct}; reserved=$((10#$reserved))
-          # Keep the reservation if it is still free in BOTH namespaces; otherwise take the next slot
-          # above everything taken (always free). Retries re-derive identically.
-          n=$(jq -n --argjson i "$taken_issues" --argjson s "$taken_secrets" --argjson r "$reserved" \
-                'if (($i + $s) | index($r)) then (([$i[], $s[], 0] | max) + 1) else $r end')
-          HANDLE=$(printf 'acct%02d' "$n")
-          SECRET_NAME=$(printf 'ACCT%02d_TOKEN' "$n")
-          # Invariant guard before the irreversible upsert: the chosen slot MUST be free in both
-          # namespaces. Never silently overwrite a credential or duplicate a title.
-          if jq -e -n --argjson i "$taken_issues" --argjson s "$taken_secrets" --argjson n "$n" \
-               '($i + $s) | index($n)' >/dev/null; then
-            echo "::error::reserved slot $HANDLE is already taken after re-read — refusing to overwrite (fail closed)"; exit 1
+          claimed=""
+          for attempt in 1 2 3 4 5; do
+            if ! claim_nums=$(gh api --paginate "repos/${{ github.repository }}/git/matching-refs/acct-claims/" \
+                   --jq '.[].ref | select(test("^refs/acct-claims/acct[0-9]+$")) | ltrimstr("refs/acct-claims/acct")'); then
+              echo "::error::could not list acct-claims refs — refusing to store (fail closed)"; exit 1
+            fi
+            if ! issue_nums=$(gh api --paginate "repos/${{ github.repository }}/issues?state=all&per_page=100" \
+                   --jq '.[] | select(has("pull_request") | not) | .title | select(test("^acct[0-9]+$")) | ltrimstr("acct")'); then
+              echo "::error::could not enumerate every account issue — refusing to store (fail closed)"; exit 1
+            fi
+            if ! secret_nums=$(GH_TOKEN="$REGISTRY_PAT" gh api --paginate "repos/${{ github.repository }}/actions/secrets?per_page=100" \
+                   --jq '.secrets[].name | select(test("^ACCT[0-9]+_TOKEN$")) | ltrimstr("ACCT") | rtrimstr("_TOKEN")'); then
+              echo "::error::could not enumerate existing secrets — refusing to store (fail closed)"; exit 1
+            fi
+            taken=$(printf '%s\n%s\n%s\n' "$claim_nums" "$issue_nums" "$secret_nums" \
+                      | jq -Rn '[inputs | select(test("^[0-9]+$")) | tonumber]')
+            n=$(jq -n --argjson t "$taken" --argjson r "$reserved" \
+                  'if ($t | index($r)) then (([$t[], 0] | max) + 1) else $r end')
+            cand=$(printf 'acct%02d' "$n")
+            # First-writer-wins claim: 422 "already exists" means we lost a race -> re-derive.
+            # Any OTHER failure is indistinguishable from "claim state unknown" -> fail closed.
+            if out=$(gh api "repos/${{ github.repository }}/git/refs" \
+                       -f ref="refs/acct-claims/$cand" -f sha="$GITHUB_SHA" 2>&1); then
+              claimed=$n
+              break
+            fi
+            if ! printf '%s' "$out" | grep -qi 'already exists'; then
+              echo "::error::claim-ref creation for $cand failed for a non-collision reason — refusing to store (fail closed)"; exit 1
+            fi
+            echo "slot $cand was claimed concurrently; re-deriving (attempt $attempt)"
+          done
+          if [ -z "$claimed" ]; then
+            echo "::error::could not obtain an account-slot claim after 5 attempts — refusing to store (fail closed)"; exit 1
+          fi
+          HANDLE=$(printf 'acct%02d' "$claimed")
+          SECRET_NAME=$(printf 'ACCT%02d_TOKEN' "$claimed")
+          # Last probe before the irreversible upsert: the claim defeats every protocol-observing
+          # writer; this narrows the residual out-of-protocol (manual) window to probe->set. Only an
+          # explicit 404 proves absence — any other outcome (exists, network error) refuses.
+          if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/actions/secrets/$SECRET_NAME" 2>&1); then
+            echo "::error::secret $SECRET_NAME already exists despite an owned claim (out-of-band write) — refusing to overwrite (fail closed)"; exit 1
+          fi
+          if ! printf '%s' "$probe" | grep -q 'HTTP 404'; then
+            echo "::error::could not prove $SECRET_NAME is absent — refusing to store (fail closed)"; exit 1
           fi
           # The secret lives on THIS registry repo: worker.yml resolves secrets[secret_ref] here,
           # the dispatch usage probe reads registry secrets, and the rotation write-back targets the
@@ -176,7 +213,7 @@ jobs:
             --title "$HANDLE" \
             --label "provider:$PROVIDER" --label status:available \
             --body "$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nnotes: registered via set-up-account broker\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME")"
-          # Publish the RESERVED slot so every downstream step uses it, not the stale pre-login snapshot.
+          # Publish the CLAIMED slot so every downstream step uses it, not the stale pre-login snapshot.
           {
             printf 'handle=%s\n' "$HANDLE"
             printf 'secret=%s\n' "$SECRET_NAME"

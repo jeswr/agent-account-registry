@@ -119,6 +119,23 @@ a rolling `data/cache-affinity.json`), never in the public repos.
 `ACCTNN_TOKEN` (the handle upper-cased + `_TOKEN`, e.g. `ACCT05_TOKEN`). The account issue's
 `secret_ref:` field MUST equal that secret name.
 
+**Slot claim (REQUIRED before any write).** Slot numbers are allocated through the
+`refs/acct-claims/` ref namespace — the canonical allocation record that EVERY account writer
+(the `set-up-account` broker and this manual runbook alike) must claim in before touching a
+secret or an issue. Ref creation is first-writer-wins on the server, so exactly one writer can
+ever own a number:
+
+```bash
+gh api repos/jeswr/agent-account-registry/git/refs \
+  -f ref='refs/acct-claims/acct05' \
+  -f sha="$(gh api repos/jeswr/agent-account-registry/commits/master --jq .sha)"
+```
+
+If this fails with `Reference already exists`, the number is taken — bump `NN` and retry. Never
+delete a claim ref: a claimed-but-unused slot is merely burned (safe), while reusing a number can
+silently overwrite a live credential (`gh secret set` is an upsert) or mint a duplicate issue
+title (GitHub does not enforce unique titles).
+
 ### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
 
 - **Anthropic** (Claude models): run `claude setup-token` while logged into the target account. It
