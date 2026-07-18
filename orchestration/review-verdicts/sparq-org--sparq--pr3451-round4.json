@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`is_utc_datetime_lexical` validates only the fixed separators, digit positions, optional fractional digits, and trailing `Z`. Values such as `2026-99-99T99:99:99Z`, `2026-02-30T00:00:00Z`, or `2026-07-05T24:61:61Z` therefore pass `parse_envelope`, despite `BadDateTime` and the public docs promising rejection of malformed/non-UTC `xsd:dateTime` values. This input becomes the timestamp literal in every status and certification FILTER, so accepting an invalid lexical makes behavior depend on downstream engine handling rather than enforcing the stated fail-closed boundary. The test `utc_datetime_lexical_validation_is_strict` is non-vacuous for syntax/zone cases but misses calendar and clock validity.",
+   "file": "crates/sparq-trust/src/expression.rs",
+   "fix_hint": "Parse and validate the lexical with a standards-compliant xsd:dateTime/date-time parser (including Gregorian calendar and clock ranges), require an explicit UTC `Z`, and serialize the validated value canonically before interpolation. Add regression cases for invalid month/day (including leap-day rules), hour/minute/second ranges, and at least one valid leap-day/fractional value.",
+   "severity": "major",
+   "title": "UTC dateTime validation accepts impossible dates and times"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The prior round's trust-boundary finding remains resolved, but this round found a new validation defect in the load-bearing status-time input. The implementation claims to require a valid UTC xsd:dateTime lexical, while its validator checks only punctuation and digit positions and accepts impossible calendar/time values. Because that value is interpolated into the normative rewrite and controls every status/certification validity FILTER, malformed typed input is admitted at the contract boundary instead of being refused as documented. The existing strictness test does not cover range-invalid lexicals. No reviewer-directed instruction was detected in the diff.",
+ "verdict": "request_changes"
+}
