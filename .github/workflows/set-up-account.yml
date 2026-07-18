@@ -435,7 +435,13 @@ jobs:
               # never an inference from an unchanged byte string.
               pending = ga.pending_targets(before, targets, handle)
               if not pending:
-                  print(f"{handle} already present in every target pool (verified via parsed TOML)")
+                  # The no-op path must prove the SAME parsed postcondition as the write path
+                  # (#260 r5): pending_targets treats a handle present two+ times as "already
+                  # granted", but the grant invariant requires EXACTLY one occurrence per target.
+                  # verify_grant(before, before, ...) refuses a doubled (or otherwise malformed)
+                  # pool, so an all-present pool is only accepted when it is genuinely well-formed.
+                  ga.verify_grant(before, before, targets, handle)
+                  print(f"{handle} already present exactly once in every target pool (verified via parsed TOML)")
                   break
               new_text = ga.grant_targets(text, handle, pending)
               after = tomllib.loads(new_text).get("repos", {})  # refuse a policy the resolver can't parse

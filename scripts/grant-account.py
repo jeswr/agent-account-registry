@@ -206,6 +206,19 @@ def _self_test():
     # --- genuine membership (parsed) IS a verified no-op: nothing pending.
     chk("parsed membership makes the target non-pending",
         pending_targets(before, ["o/single", "o/multiline"], "acct01"), [])
+    # --- THE #260 r5 regression: the no-op path (pending == []) must apply the SAME exact
+    # postcondition as the write path — verify_grant(before, before, ...). A valid
+    # single-occurrence no-op is accepted, but a target that already holds the handle MORE
+    # THAN ONCE is still non-pending (pending_targets only tests `handle not in pool`) and so
+    # would take the no-op path; without this check it would be reported "already granted"
+    # despite violating the exactly-once grant invariant. Both directions must hold.
+    verify_grant(before, before, ["o/single", "o/multiline"], "acct01")
+    print("  ok   verify_grant accepts a valid single-occurrence no-op (before == after)")
+    doubled_present = dict(before, **{"o/single": {"account_pool": ["acct01", "acct01"]}})
+    chk("a doubled handle is still non-pending — it takes the no-op path",
+        pending_targets(doubled_present, ["o/single"], "acct01"), [])
+    raises("the no-op path refuses a target that already holds the handle twice",
+           lambda: verify_grant(doubled_present, doubled_present, ["o/single"], "acct01"))
 
     # --- single-line + empty pools keep the compact append form; non-targets stay byte-identical.
     g2 = grant_targets(FIXTURE, "acct09", ["o/single", "o/empty"])
