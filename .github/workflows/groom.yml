@@ -36,17 +36,32 @@ jobs:
       # copy of this workflow on every scheduled tick, so it cannot be bypassed by content on
       # the ledger branch itself. The platform already blocks the confined actor (Actions'
       # GITHUB_TOKEN cannot create/update .github/workflows/** — it never holds the `workflows`
-      # permission); this sweep detects and fails LOUD if executable content ever appears on
-      # `ledger` regardless of how it got there.
+      # permission); this sweep detects and fails LOUD if anything beyond the documented data
+      # plane ever appears on `ledger` regardless of how it got there.
+      #
+      # WHITELIST, not blacklist (review round 3): every tree entry must be one of
+      #   100644 blob README.md            (the branch's tombstone/pointer doc)
+      #   040000 tree data                 (the data directory itself)
+      #   100644 blob data/<name>.json     (regular, non-executable JSON blobs, no subdirs)
+      # so executable-mode blobs (100755), symlinks (120000), submodules (160000),
+      # extensionless files, and data/evil.py all fail regardless of naming tricks. A
+      # truncated tree listing also fails: unverified means violated.
       - name: Assert the ledger branch is still data-only
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tree=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/ledger?recursive=1" --jq '.tree[].path')
-          bad=$(grep -E '^(\.github|scripts)(/|$)|\.(yml|yaml|sh|py)$' <<<"$tree" | grep -v '^data/' || true)
+          resp=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/ledger?recursive=1")
+          if [ "$(jq -r '.truncated' <<<"$resp")" != "false" ]; then
+            echo "::error::ledger tree listing is truncated — data-only invariant cannot be verified"
+            exit 1
+          fi
+          bad=$(jq -r '.tree[] | [.mode, .type, .path] | @tsv' <<<"$resp" | awk -F'\t' '
+            !(($1 == "100644" && $2 == "blob" && $3 == "README.md") ||
+              ($1 == "040000" && $2 == "tree" && $3 == "data") ||
+              ($1 == "100644" && $2 == "blob" && $3 ~ /^data\/[^\/]+\.json$/))')
           if [ -n "$bad" ]; then
-            printf '::error::ledger branch carries executable/workflow content (data-only invariant violated):\n%s\n' "$bad"
+            printf '::error::ledger branch carries non-whitelisted content (data-only invariant violated):\n%s\n' "$bad"
             exit 1
           fi
 
@@ -82,8 +97,9 @@ jobs:
       # Model-access health decision (registry #32): the groom sweep already runs on schedule, so it
       # is the natural place to evaluate the health record window and raise/close alerts (keeps
       # dispatch.yml lean). Reads data/model-health.json + the enabled provider->account fleet, then
-      # upserts ONE ops-alert issue per (condition, provider). Best-effort: an evaluation hiccup must
-      # never fail the maintenance sweep. Account identifiers stay salted (decision 22a).
+      # upserts ONE ops-alert issue per (condition, provider). An unreadable ledger exits NONZERO
+      # (every reader fails loud, review r3); continue-on-error keeps the maintenance sweep alive
+      # while this step goes visibly red. Account identifiers stay salted (decision 22a).
       - name: Decide + raise/close model-access health alerts
         continue-on-error: true
         env:

@@ -704,8 +704,12 @@ def _cmd_decide(args):
     try:
         records = prune(read_ledger(api, registry_repo)[0], now)
     except HealthError as exc:
-        print(f"::warning::model-health decide: cannot read ledger ({exc}); no action")
-        return 0
+        # Every ledger reader fails LOUD (review r3, issue #28): an unreadable/missing ledger is
+        # the exact outage class this branch exists to surface, so warn-and-exit-0 would hide it.
+        # groom.yml's decide step is continue-on-error, so the maintenance sweep still completes
+        # while this step goes visibly red.
+        print(f"::error::model-health decide: cannot read ledger ({exc})")
+        return 1
     provider_accounts = _enabled_provider_accounts(
         api, registry_repo, args.policy_file, salt)
     actions = classify_records(records, provider_accounts, now)
@@ -932,6 +936,9 @@ def _self_test():
     # ---- record exits NONZERO on CAS exhaustion (defect #8) ----------------------------------
     ok = _test_record_exit(chk) and ok
 
+    # ---- decide exits NONZERO on an unreadable ledger (review r3) ----------------------------
+    ok = _test_decide_exit(chk) and ok
+
     # ---- #39 routing fallback ---------------------------------------------------------------
     ok = _test_routing(chk) and ok
 
@@ -1104,6 +1111,29 @@ def _test_record_exit(chk):
         args = _ap.Namespace(provider="anthropic", account="", model_alias="fable",
                              exit_class="auth", run_id="1", reset_hint=None)
         chk("record exits nonzero on CAS exhaustion", _cmd_record(args), 1)
+    finally:
+        GitHubAPI = real_api
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_decide_exit(chk):
+    """_cmd_decide exits NONZERO when the ledger cannot be read (review r3) — every ledger
+    reader fails LOUD; groom.yml's continue-on-error keeps the sweep alive while the step
+    goes red, so this must never be softened back to warn-and-exit-0."""
+    import argparse as _ap
+    global GitHubAPI
+    real_api = GitHubAPI
+    saved = {k: os.environ.get(k) for k in ("REGISTRY_REPO", "GH_TOKEN")}
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", GH_TOKEN="tok")
+        GitHubAPI = lambda token: _StubAPI(seed=None, branch_missing=True)
+        chk("decide exits nonzero on an unreadable ledger",
+            _cmd_decide(_ap.Namespace(policy_file="policy/repos.toml")), 1)
     finally:
         GitHubAPI = real_api
         for k, v in saved.items():
