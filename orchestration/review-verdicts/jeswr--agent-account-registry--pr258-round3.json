@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-2 approved fix remains correct and complete. Review/fix allocator exceptions increment the tick's shared lease-error histogram, dispatch derives both the persisted ledger health and the zero-dispatch fail-loud decision from that same histogram, and the summary is written before DispatchError is raised. None-return contention remains distinct from ledger failure, while partial-success ticks preserve per-item resilience. The tests are non-vacuous: they exercise an actual review/fix item with both a raising allocator and a None-returning allocator, assert the propagated counter, and independently cover the health and fail-loud truth tables. The workflow surfaces frontier_size, ledger, and dispatched without exposing item or account identifiers. No new correctness, trust-plane, security, or test-validity issue is supported by the diff.",
+ "verdict": "approve"
+}
