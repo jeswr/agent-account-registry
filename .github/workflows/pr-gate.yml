@@ -64,7 +64,8 @@ jobs:
           suite="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
           plan-snapshot.py triage.py \
           dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
-          account-usage.py usage-alert.py broker-refresh.py backfill-provenance.py dashboard-gen.py"
+          account-usage.py usage-alert.py pat-validity.py broker-refresh.py \
+          backfill-provenance.py dashboard-gen.py"
           for s in $suite; do
             if [[ -f "scripts/$s" ]]; then
               echo "== self-test $s =="

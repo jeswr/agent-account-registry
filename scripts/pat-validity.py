@@ -21,15 +21,20 @@
 # FAIL-CLOSED AGAINST FALSE ALARMS: an unreachable/throttled/5xx-ing API proves nothing about the
 # PAT, so `network-unknown` is NOT `invalid` — it neither opens the rolling alert issue NOR closes
 # an existing one (unknown is not recovery either). GitHub answers 403 for primary/secondary rate
-# limits too (x-ratelimit-remaining: 0 / retry-after), so a throttle-shaped secrets 403 is also
-# network-unknown, never insufficient-scope. Only 401 (invalid), an authenticated-but-denied
-# secrets read (insufficient-scope), and near-expiry alert.
+# limits too: primary carries x-ratelimit-remaining: 0 and secondary usually retry-after, but a
+# secondary-limit 403 can arrive with NO retry-after and NONZERO remaining quota — there the
+# DOCUMENTED discriminator is the error body's message ("You have exceeded a secondary rate
+# limit"), so the JSON error message is inspected alongside the headers. A throttle-shaped
+# secrets 403 is network-unknown, never insufficient-scope. Only 401 (invalid), an
+# authenticated-but-denied secrets read (insufficient-scope), and near-expiry alert.
 #
 # Alerting mirrors usage-alert.py: ONE rolling `from:agent` issue, upserted by exact title —
 # edited when open, REOPENED (never duplicated) when closed, closed with a comment on recovery.
 # The lookup is the PAGINATED Issues REST API (authoritative — no fixed --limit window that an
 # old closed alert could fall out of), and a FAILED lookup raises instead of writing: a blind
-# create on top of an unlisted existing issue would duplicate the roll.
+# create on top of an unlisted existing issue would duplicate the roll. A FAILED WRITE raises
+# too (sanitized to op + returncode): a swallowed `issue create` failure would leave the run
+# green while nobody was paged.
 # The token is NEVER printed: a CR/LF-bearing (header-injecting) value is rejected before any
 # request is built — http.client's "Invalid header value b'Bearer …'" ValueError embeds the full
 # secret — and network/header-serialization failures are reduced to the exception class name so
@@ -64,11 +69,31 @@ class AlertLookupError(RuntimeError):
     create on top of an existing (merely unlisted) alert would duplicate the rolling issue."""
 
 
+class AlertWriteError(RuntimeError):
+    """A rolling-issue write (create/reopen/edit/comment/close) failed. Must propagate to a red
+    run: a swallowed write failure reports 'alerted' while nobody was paged. The message carries
+    op + returncode only — gh stderr under GH_DEBUG=api can echo request bodies."""
+
+
+def _body_message(raw):
+    """The `message` field of a GitHub JSON error body (truncated), or "". Used only to
+    discriminate rate limits from real denials — never echoed to logs, and it comes from the
+    server's response, so it cannot contain the token."""
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return ""
+    message = parsed.get("message") if isinstance(parsed, dict) else None
+    return message[:300] if isinstance(message, str) else ""
+
+
 def _get(url, token, timeout=20):
-    """One authenticated GET -> {"status": int, "headers": {lowercased}} or
-    {"status": None, "error": <exception class name>}. The token exists only in the
-    Authorization header; on failure only the exception CLASS is kept (URLError strings can
-    embed proxy/request detail — never risk echoing request material into a public log)."""
+    """One authenticated GET -> {"status": int, "headers": {lowercased}, "message": str} or
+    {"status": None, "error": <exception class name>}. `message` is the JSON error body's
+    message field (empty on success) — a secondary rate limit's only reliable marker. The token
+    exists only in the Authorization header; on failure only the exception CLASS is kept
+    (URLError strings can embed proxy/request detail — never risk echoing request material into
+    a public log)."""
     request = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -78,10 +103,18 @@ def _get(url, token, timeout=20):
     try:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             return {"status": resp.status,
-                    "headers": {k.lower(): v for k, v in resp.headers.items()}}
+                    "headers": {k.lower(): v for k, v in resp.headers.items()},
+                    "message": ""}
     except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read(2048).decode("utf-8", "replace")
+        except (OSError, ValueError, AttributeError):
+            # AttributeError: a body-less HTTPError (fp=None) has no read(). No body is fine —
+            # the message is a best-effort discriminator, not a required field.
+            raw = ""
         return {"status": exc.code,
-                "headers": {k.lower(): v for k, v in (exc.headers or {}).items()}}
+                "headers": {k.lower(): v for k, v in (exc.headers or {}).items()},
+                "message": _body_message(raw)}
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         # ValueError: http.client header serialization ("Invalid header value b'Bearer …'")
         # embeds the FULL credential in its message — class name only, like every other failure.
@@ -89,18 +122,26 @@ def _get(url, token, timeout=20):
         return {"status": None, "error": type(exc).__name__}
 
 
-def _throttled(headers):
-    """True when a 403 is a rate limit, not a permission verdict: GitHub answers 403 for both
-    primary (x-ratelimit-remaining: 0) and secondary (retry-after) limits."""
-    headers = headers or {}
-    return headers.get("x-ratelimit-remaining") == "0" or "retry-after" in headers
+def _throttled(resp):
+    """True when a 403 is a rate limit, not a permission verdict. Headers first — primary limits
+    carry x-ratelimit-remaining: 0 and secondary limits usually retry-after — but a secondary
+    403 can arrive with NO retry-after and NONZERO remaining quota; there the docs say the error
+    MESSAGE is the discriminator ("You have exceeded a secondary rate limit", legacy "abuse
+    detection mechanism"), so the retained body message is checked too."""
+    headers = resp.get("headers") or {}
+    message = (resp.get("message") or "").lower()
+    return (headers.get("x-ratelimit-remaining") == "0"
+            or "retry-after" in headers
+            or "secondary rate limit" in message
+            or "abuse detection" in message)
 
 
 def classify(user, secrets):
     """(verdict, detail) from the two probe responses. FAIL-CLOSED against false alarms: only a
     definitive credential signal (401) or an authenticated-but-denied secrets read (403/404 after
     a 200 /user) alerts; every throttling-shaped or server-side status is network-unknown —
-    including a secrets 403 whose headers say rate limit rather than missing scope."""
+    including a secrets 403 whose headers OR error-body message say rate limit rather than
+    missing scope."""
     status = user.get("status")
     if status is None:
         return NETWORK_UNKNOWN, (f"GET /user did not complete "
@@ -122,9 +163,10 @@ def classify(user, secrets):
                        "(the exact read `gh secret set` performs)")
     if sstatus == 401:
         return INVALID, "secrets public-key read returned 401 — the PAT is revoked or expired"
-    if sstatus == 403 and _throttled(secrets.get("headers")):
+    if sstatus == 403 and _throttled(secrets):
         return NETWORK_UNKNOWN, ("secrets public-key read returned a throttle-shaped 403 "
-                                 "(rate limited) — not a credential verdict")
+                                 "(rate limited per its headers or documented error message) "
+                                 "— not a credential verdict")
     if sstatus in (403, 404):
         # A fine-grained PAT with no access to the repo 404s; one with repo access but no
         # Secrets permission 403s. Both mean `gh secret set` will fail.
@@ -221,10 +263,11 @@ def render_alert(result, repo):
 def _gh(args, check=False):
     result = subprocess.run(["gh"] + args, capture_output=True, text=True)
     if check and result.returncode != 0:
-        # Sanitized like usage-alert.py: op + returncode only — gh stderr under GH_DEBUG=api can
-        # echo request bodies.
-        print(f"::warning::pat-validity: gh {args[0]} {args[1] if len(args) > 1 else ''} "
-              f"failed (rc={result.returncode})")
+        # RAISES, not warns (review r2 #2): a warned-and-swallowed write failure let a failed
+        # `issue create` exit green with no alert at all. Sanitized like usage-alert.py: op +
+        # returncode only — gh stderr under GH_DEBUG=api can echo request bodies.
+        raise AlertWriteError(f"gh {args[0]} {args[1] if len(args) > 1 else ''} "
+                              f"failed (rc={result.returncode})")
     return result
 
 
@@ -251,11 +294,14 @@ def _find_alert(repo):
 
 
 def upsert_alert(verdict, body, repo):
-    """Idempotent rolling-issue upsert; returns the ops performed (self-tested). network-unknown
-    performs NO writes at all: it must not false-alarm, and it must not close an existing alert
-    either — an unreachable API is not evidence of recovery. A failed lookup propagates
-    AlertLookupError before any write. expiring-soon alerts like a bad verdict (the whole point
-    of the expiry probe is a page BEFORE the break) but main() keeps the run green."""
+    """Idempotent rolling-issue upsert; returns the ops that SUCCEEDED (self-tested).
+    network-unknown performs NO writes at all: it must not false-alarm, and it must not close an
+    existing alert either — an unreachable API is not evidence of recovery. A failed lookup
+    propagates AlertLookupError before any write; a failed write propagates AlertWriteError
+    (every write runs under _gh(check=True)), skipping any later ops — so `ops` never claims a
+    write that didn't land. expiring-soon alerts like a bad verdict (the whole point of the
+    expiry probe is a page BEFORE the break) but main() keeps the run green when the page
+    lands."""
     if verdict == NETWORK_UNKNOWN:
         return []
     number, state = _find_alert(repo)
@@ -300,10 +346,11 @@ def main(argv):
     if not probe_only:
         try:
             upsert_alert(result["verdict"], render_alert(result, repo), repo)
-        except AlertLookupError as exc:
-            # Fail red WITHOUT writing: creating blind on a failed lookup is how the rolling
-            # issue gets duplicated. The message carries op + rc only (sanitized in _find_alert).
-            print(f"::error::pat-validity: {exc} — alert not written")
+        except (AlertLookupError, AlertWriteError) as exc:
+            # Fail red WITHOUT pretending the alert landed: creating blind on a failed lookup is
+            # how the rolling issue gets duplicated, and a swallowed write failure pages nobody.
+            # Both messages are sanitized at raise time (op + rc only, never gh stderr).
+            print(f"::error::pat-validity: {exc} — alert not (fully) written")
             return 1
     # Red run on a definitive bad verdict (so the scheduled run itself signals), green on
     # valid AND network-unknown (no false alarms). expiring-soon stays green too — secret
@@ -331,11 +378,20 @@ def _self_test():
     U_403 = {"status": 403, "headers": {"retry-after": "60"}}
     S_OK = {"status": 200, "headers": {"content-type": "application/json; charset=utf-8"}}
     S_403 = {"status": 403, "headers": {"content-type": "application/json; charset=utf-8"}}
-    # GitHub answers 403 for rate limits too — distinguished only by the retained headers.
+    # GitHub answers 403 for rate limits too. Primary: x-ratelimit-remaining 0. Secondary:
+    # usually retry-after — but a secondary 403 can carry NONZERO remaining quota and NO
+    # retry-after (review r2 #1), where the DOCUMENTED discriminator is the error message.
+    SECONDARY_MSG = ("You have exceeded a secondary rate limit. "
+                     "Please wait a few minutes before you retry your request.")
     S_403_LIMIT = {"status": 403, "headers": {"x-ratelimit-remaining": "0",
                                               "x-ratelimit-reset": "1752817000"}}
     S_403_RETRY = {"status": 403, "headers": {"retry-after": "60"}}
-    S_403_BUDGET = {"status": 403, "headers": {"x-ratelimit-remaining": "42"}}
+    S_403_SECONDARY = {"status": 403, "headers": {"x-ratelimit-remaining": "42"},
+                       "message": SECONDARY_MSG}
+    S_403_ABUSE = {"status": 403, "headers": {"x-ratelimit-remaining": "42"},
+                   "message": "You have triggered an abuse detection mechanism."}
+    S_403_DENIED = {"status": 403, "headers": {"x-ratelimit-remaining": "42"},
+                    "message": "Resource not accessible by personal access token"}
     S_404 = {"status": 404, "headers": {"content-type": "application/json; charset=utf-8"}}
     S_502 = {"status": 502, "headers": {}}
     NET_FAIL = {"status": None, "error": "TimeoutError"}
@@ -350,8 +406,13 @@ def _self_test():
         classify(U_OK, S_403_LIMIT)[0], NETWORK_UNKNOWN)
     chk("network-unknown: secrets 403 + retry-after (secondary limit) is NOT scope",
         classify(U_OK, S_403_RETRY)[0], NETWORK_UNKNOWN)
-    chk("insufficient: secrets 403 WITH rate-limit budget left is a real denial",
-        classify(U_OK, S_403_BUDGET)[0], INSUFFICIENT)
+    chk("network-unknown: secondary-limit 403 with NONZERO remaining + no retry-after — the "
+        "documented discriminator is the error message (review r2 #1)",
+        classify(U_OK, S_403_SECONDARY)[0], NETWORK_UNKNOWN)
+    chk("network-unknown: legacy abuse-detection message is a secondary limit too",
+        classify(U_OK, S_403_ABUSE)[0], NETWORK_UNKNOWN)
+    chk("insufficient: 403 with budget left AND a denial-shaped message is a real denial",
+        classify(U_OK, S_403_DENIED)[0], INSUFFICIENT)
     chk("network-unknown: /user timeout", classify(NET_FAIL, None)[0], NETWORK_UNKNOWN)
     chk("network-unknown: /user 403 throttle-shaped is NOT invalid",
         classify(U_403, None)[0], NETWORK_UNKNOWN)
@@ -428,6 +489,29 @@ def _self_test():
         urllib.request.urlopen = real_urlopen
     chk("_get reduces header-serialization ValueError to its class name",
         leaked, {"status": None, "error": "ValueError"})
+    # _get must actually RETAIN the error-body message (review r2 #1) — otherwise the
+    # secondary-limit fixtures above test a field the live path never populates.
+    import email.message
+
+    def _http_secondary(*_a, **_kw):
+        hdrs = email.message.Message()
+        hdrs["X-RateLimit-Remaining"] = "42"
+        raise urllib.error.HTTPError(
+            f"{API}/x", 403, "Forbidden", hdrs,
+            io.BytesIO(json.dumps({"message": SECONDARY_MSG,
+                                   "documentation_url": "https://docs.github.com"}).encode()))
+    urllib.request.urlopen = _http_secondary
+    try:
+        got = _get(f"{API}/user", SENTINEL)
+    finally:
+        urllib.request.urlopen = real_urlopen
+    chk("_get keeps status, lowercased headers AND the error-body message",
+        (got["status"], got["headers"].get("x-ratelimit-remaining"),
+         "secondary rate limit" in got["message"]), (403, "42", True))
+    chk("_get end-to-end: a bare-budget secondary-limit 403 classifies network-unknown",
+        classify(U_OK, got)[0], NETWORK_UNKNOWN)
+    chk("_body_message: non-JSON body degrades to empty", _body_message("<html>oops"), "")
+    chk("_body_message: non-dict JSON degrades to empty", _body_message("[1, 2]"), "")
     # End-to-end: main() with a CR/LF token must go red WITHOUT the token on stdout/stderr
     # (uncaught tracebacks land on stderr — capture both).
     saved_env = {k: os.environ.get(k) for k in ("REGISTRY_PAT", "REGISTRY_REPO",
@@ -450,15 +534,20 @@ def _self_test():
 
     # --- upsert: idempotent rolling issue against a stubbed gh (usage-alert.py pattern).
     class _Run:
-        def __init__(self, stdout="[]", returncode=0):
-            self.returncode, self.stdout, self.stderr = returncode, stdout, ""
+        def __init__(self, stdout="[]", returncode=0, stderr=""):
+            self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
 
-    def stub_gh(list_json, list_rc=0):
+    def stub_gh(list_json, list_rc=0, fail_op=None):
         calls = []
 
         def run(args, **_kw):
             calls.append(list(args))
-            return _Run(list_json, list_rc) if args[1] == "api" else _Run()
+            if args[1] == "api":
+                return _Run(list_json, list_rc)
+            if fail_op and args[2] == fail_op:
+                # stderr carries a marker that must NEVER surface in the raised message.
+                return _Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
+            return _Run()
         return calls, run
 
     # Lookup fixtures in `gh api --paginate --slurp` shape: an ARRAY OF PAGES, REST-cased.
@@ -515,6 +604,57 @@ def _self_test():
                 raised = True
             chk(f"{name} -> AlertLookupError, zero writes",
                 (raised, [c for c in calls if c[1] != "api"]), (True, []))
+        # A FAILED WRITE must raise AlertWriteError (review r2 #2) — pre-fix, _gh only
+        # ::warning'd and upsert_alert recorded the op as done; a failed `issue create` on an
+        # expiring-soon verdict exited green with no alert at all. Every write op is exercised;
+        # ops AFTER the failed one must not run, and the sanitized message carries op + rc only.
+        for name, verdict, listing, fail_op, want_issue_ops in [
+            ("failed create raises", INVALID, EMPTY, "create", ["create"]),
+            ("failed reopen raises (edit never attempted)", INVALID, CLOSED_HIT_P2,
+             "reopen", ["reopen"]),
+            ("failed edit raises", INVALID, OPEN_HIT, "edit", ["edit"]),
+            ("failed recovery comment raises (close never attempted)", VALID, OPEN_HIT,
+             "comment", ["comment"]),
+            ("failed recovery close raises", VALID, OPEN_HIT, "close", ["comment", "close"]),
+        ]:
+            calls, subprocess.run = stub_gh(listing, fail_op=fail_op)
+            raised_msg = None
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    upsert_alert(verdict, "body", "o/r")
+            except AlertWriteError as exc:
+                raised_msg = str(exc)
+            chk(name, (raised_msg is not None,
+                       [c[2] for c in calls if c[1] == "issue"]), (True, want_issue_ops))
+            chk(f"  …{fail_op} message sanitized (op + rc, never gh stderr)",
+                raised_msg is not None and f"gh issue {fail_op} failed (rc=1)" == raised_msg,
+                True)
+        # End-to-end through main() (review r2 #2): expiring-soon exits green ONLY when the
+        # page lands — with a failed create the run must go red, not silently pass.
+        calls, subprocess.run = stub_gh(EMPTY, fail_op="create")
+        module = globals()
+        real_probe = module["probe"]
+        module["probe"] = lambda token, repo: {"verdict": EXPIRING, "detail": "stub",
+                                               "expires_at": None, "days_left": 3.0}
+        saved_env = {k: os.environ.get(k) for k in ("REGISTRY_PAT", "REGISTRY_REPO",
+                                                    "GITHUB_OUTPUT")}
+        os.environ["REGISTRY_PAT"] = "stub"
+        os.environ["REGISTRY_REPO"] = "o/r"
+        os.environ.pop("GITHUB_OUTPUT", None)
+        main_out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(main_out):
+                failed_create_rc = main([])
+        finally:
+            module["probe"] = real_probe
+            for key, val in saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+        chk("main(): expiring-soon + FAILED create -> rc=1 with ::error (never a green no-page "
+            "run)", (failed_create_rc, "::error::pat-validity" in main_out.getvalue()
+                     and "LEAKY-STDERR" not in main_out.getvalue()), (1, True))
         # The create call must carry the rolling label + title (what find-by-title keys on).
         calls, subprocess.run = stub_gh(EMPTY)
         with contextlib.redirect_stdout(io.StringIO()):
