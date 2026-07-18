@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly adds `errexit` to the model-health alert step, so a failing self-test prevents the subsequent live decision command from running and a failing decision makes the step visibly fail (while the existing step-level `continue-on-error` preserves the wider maintenance sweep). This is a narrow fail-closed improvement with no trust-check weakening, test-vacuity change, permission expansion, secret exposure, or untrusted-input execution introduced by the diff.",
+ "verdict": "approve"
+}
