@@ -1,0 +1,51 @@
+# [FABLE-5] Retriage cron (self-driving gap, 2026-07-18): `status:untriaged` used to be
+# TERMINAL — triage-issue.yml only fires on opened/edited/reopened, and GitHub's `edited`
+# event does not cover label changes, so an issue parked untriaged (or one whose status
+# labels vanished entirely) sat invisible to dispatch forever (observed: 7 untriaged +
+# 9 label-lost of 39 open). This sweep re-runs the SAME static triage (scripts/triage.py,
+# imported by scripts/retriage.py — no duplicated logic) over parked/label-lost issues by
+# trusted authors. Fail-closed: no default priority (this repo IS the trust plane), gated
+# (needs:*) and machine-owned states are never touched, and an unreadable lease ledger
+# skips every status:in-progress issue. Mirrors the sparq target's retriage.yml.
+name: retriage
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 30 min, offset from groom-leases (*/15 -> :00/:15/:30/:45) and groom
+    # (7-59/15 -> :07/:22/:37/:52). Retriage only READS the ledger, so this is scheduler
+    # spread, not CAS-contention avoidance.
+    - cron: '13,43 * * * *'
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: retriage
+  cancel-in-progress: false
+
+env:
+  # Exact-match trusted logins, same gate as triage-issue.yml: the maintainer plus the
+  # registry orchestrator App bot slug (repo variable overrides the documented default).
+  # NO blanket [bot] trust.
+  MAINTAINER_LOGIN: jeswr
+  APP_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'agent-account-registry[bot]' }}
+
+jobs:
+  retriage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Re-run static triage over parked and label-lost issues
+        run: |
+          set -euo pipefail
+          python3 scripts/triage.py --self-test
+          python3 scripts/retriage.py --self-test
+          python3 scripts/retriage.py --repo "$GITHUB_REPOSITORY" --apply
