@@ -16,6 +16,8 @@ on:
   # dispatch a modified branch copy of this workflow. That is why every secret-bearing job here
   # (claim, plan-alert) is bound to the default-branch-only `dispatch-secrets` environment: it is
   # the only server-side lever that survives an attacker-controlled workflow file (issue #101).
+  # Because that lever lives in REPO SETTINGS, the `secrets-guard` job below verifies it is
+  # actually in effect every tick, fail closed, before any secret-bearing job runs.
   workflow_dispatch:
   schedule:
     # Explicit minutes (not */10): GitHub degrades wildcard schedules under load — measured
@@ -545,9 +547,53 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # SECRET-EXFIL SETTINGS GUARD (issue #101, review round 1 on the #101 PR). The
+  # `dispatch-secrets` environment binding on CLAIM / plan-alert below is enforced by REPO
+  # SETTINGS, not by this file — GitHub silently AUTO-CREATES a referenced environment with no
+  # deployment-branch policy, so an unconfigured binding is a default-ALLOW no-op (repo-scope
+  # secrets stay readable by a modified workflow copy dispatched at an attacker ref). This job
+  # verifies both load-bearing settings every tick, fail closed, BEFORE any secret-bearing job:
+  #   (1) EMPTY REPO SCOPE — this job is deliberately NOT bound to the environment, so its
+  #       `secrets` context is exactly what a stripped-binding attacker copy would see;
+  #       asserting it holds nothing beyond the ephemeral github_token proves the stripped-file
+  #       exfil path yields nothing (key NAMES only are ever read or printed);
+  #   (2) DEFAULT-BRANCH-ONLY ENVIRONMENT — `dispatch-secrets` must exist with a CUSTOM
+  #       deployment-branch policy naming exactly the default branch (branch type only), so a
+  #       kept-binding copy at any other ref is refused server-side.
+  # Until the maintainer applies both settings, this fails every tick and CLAIM/plan-alert are
+  # SKIPPED: dispatch pauses loudly (default-DENY) instead of running in the prior silent
+  # default-allow window. The guard is read-only (`gh api` GETs; asserted by its self-test).
+  secrets-guard:
+    name: GUARD (verify secret-exfil settings, fail closed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out ONLY scripts/dispatch-secrets-guard.py (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: scripts/dispatch-secrets-guard.py
+          sparse-checkout-cone-mode: false
+
+      - name: Verify empty repo-scope secrets + default-branch-only environment policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          # Unbound-job secrets context: in the verified end state this holds ONLY the ephemeral
+          # github_token. The guard inspects and prints key NAMES exclusively, never values
+          # (asserted by sentinel checks in its self-test).
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/dispatch-secrets-guard.py --self-test
+          python3 registry/scripts/dispatch-secrets-guard.py
+
   claim:
     name: CLAIM (validate, lease, launch)
-    needs: plan
+    needs: [plan, secrets-guard]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # SECRET-EXFIL GUARD (issue #101). This job holds the App private key, every repository secret
@@ -562,11 +608,14 @@ jobs:
     # policy, or (b) strips it and sees EMPTY secrets (they live in the environment, not at repo
     # level) — no exfiltration either way. Every legitimate trigger runs from the default branch
     # (schedule; workflow_run; the doorbell rings `gh workflow run dispatch.yml` with no --ref),
-    # so none are starved. REQUIRED maintainer settings for this to bite — until they are applied
-    # the binding is an inert no-op (repo-level secrets stay reachable from the default branch and
-    # nothing breaks): create the `dispatch-secrets` environment, restrict its deployment branches
-    # to the default branch only, and MOVE every secret this job and plan-alert consume out of
-    # repo scope into it (tracked follow-up).
+    # so none are starved. REQUIRED maintainer settings for this to bite: create the
+    # `dispatch-secrets` environment, restrict its deployment branches to a CUSTOM policy naming
+    # ONLY the default branch, and MOVE every repo-scope secret into it (this job reads
+    # toJSON(secrets), so EVERY repo-scope secret is in its blast radius). Those settings live
+    # outside this file, so the `secrets-guard` job verifies them every tick and this job runs
+    # only after it passes (review round 1 on the #101 PR): until the settings are applied — and
+    # again if they ever regress — no secret-bearing job runs (default-DENY, loud red tick),
+    # never a silent default-allow window.
     environment: dispatch-secrets
     permissions:
       actions: write
@@ -921,12 +970,15 @@ jobs:
   # (it downloads no PLAN artifact); it only reads the plan JOB RESULT.
   plan-alert:
     name: ALERT (hard PLAN-job failure)
-    needs: plan
-    # Runs every tick (always()) so a healthy PLAN can auto-close a prior alert; scripts/plan-alert.py
-    # keys on needs.plan.result — close happens ONLY on an explicit success (a skipped PLAN is not a
-    # recovery, review r1), and a success tick with no open alert does only a bare `gh issue list`,
-    # so a green tick stays cheap and side-effect-free.
-    if: always()
+    needs: [plan, secrets-guard]
+    # Runs every tick regardless of the PLAN result so a healthy PLAN can auto-close a prior
+    # alert; scripts/plan-alert.py keys on needs.plan.result — close happens ONLY on an explicit
+    # success (a skipped PLAN is not a recovery, review r1), and a success tick with no open alert
+    # does only a bare `gh issue list`, so a green tick stays cheap and side-effect-free.
+    # secrets-guard gate (issue #101 review round 1): this job mounts ALERT_TOKEN/ALERT_REPO, so
+    # it must NOT run while the secret-exfil settings are unverified — a guard failure skips it
+    # (fail closed; the guard-red tick is itself the loud signal).
+    if: ${{ always() && needs.secrets-guard.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # SECRET-EXFIL GUARD (issue #101): this job reads ALERT_TOKEN/ALERT_REPO (the private-alert
