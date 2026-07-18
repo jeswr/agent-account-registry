@@ -251,6 +251,130 @@ def _window_rows(account, usage_entry):
     return rows
 
 
+def _quota_state(account, entry, now):
+    """Availability for the CUMULATIVE provider view: the per-account trichotomy from
+    _availability, except that a probe-exempt account under an ACTIVE reactive backoff (its only
+    quota signal — issue #29) counts as capped until the backoff expires. Returns
+    (state, backoff_epoch_or_None). Pure — unit-tested by --self-test."""
+    availability = _availability(account, entry)
+    if availability == "available" and isinstance(entry, dict) and entry.get("exempt") is True:
+        until = entry.get("backoff_until")
+        if isinstance(until, (int, float)) and not isinstance(until, bool) and until > now:
+            return "capped", until
+    return availability, None
+
+
+def _provider_quota(accounts, usage, now):
+    """Per-provider CUMULATIVE quota rows (maintainer request 2026-07-18): where a provider has
+    several accounts, the AGGREGATE headroom across them; single-account providers still emit a
+    row, marked `single_account`. HONEST aggregation of the signals that actually exist — no
+    invented precision:
+
+    * Probed (anthropic) accounts expose per-window utilization FRACTIONS (plus a raw unit-less
+      `*-limit` header value when the provider sends one), so the aggregate unit is
+      "account-windows free": Σ over reporting accounts of that account's remaining window
+      fraction (a provider with 2.4 of 3 account-windows free has, e.g., one fresh account, one
+      at 60% and one capped). `limit_remaining` additionally sums limit×remaining, but ONLY over
+      the accounts whose limit header is known — `limits_known`/`accounts_reporting` says how
+      partial that sum is, and its unit is whatever the provider's opaque limit header means.
+    * Probe-exempt providers (openai) have NO usage observability at all (issue #29): the row
+      aggregates only the availability trichotomy + active reactive backoffs, and `signal` says
+      so — `windows` stays empty rather than fabricating a remaining-quota number.
+
+    Accounts fail-closed omitted from the usage snapshot count in `accounts_total` (and their
+    catalog availability) but never in `accounts_reporting`. `soonest_reset`/`oldest_reset` span
+    every known window-reset/backoff stamp for the provider: soonest = the first moment ANY
+    quota refills, oldest = when the last known window has refilled. Pure — unit-tested by
+    --self-test; rows carry provider names + counts only (decision 22: no account identifiers,
+    salted or otherwise, on this surface)."""
+    groups = {}
+    for account in accounts:
+        groups.setdefault(account["provider"], []).append(account)
+    rows = []
+    for provider in sorted(groups):
+        members = groups[provider]
+        counts = {"available": 0, "capped": 0, "unavailable": 0}
+        probed = exempt = False
+        stats = {prefix: {"reporting": 0, "remaining": 0.0, "limits_known": 0,
+                          "limit_remaining": 0.0, "resets": []}
+                 for prefix, _ in WINDOWS}
+        provider_resets = []
+        for account in members:
+            entry = usage.get(account["handle"])
+            state, backoff_until = _quota_state(account, entry, now)
+            counts[state] += 1
+            backoff_iso = _utc_iso(backoff_until)
+            if backoff_iso:
+                provider_resets.append(backoff_iso)
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("exempt") is True:
+                exempt = True
+            elif entry:
+                probed = True
+            for prefix, _name in WINDOWS:
+                used = _percent(entry.get(f"{prefix}_util"))
+                if used is None:
+                    continue
+                window = stats[prefix]
+                window["reporting"] += 1
+                remaining = max(0.0, 100.0 - used) / 100.0
+                window["remaining"] += remaining
+                limit = entry.get(f"{prefix}_limit")
+                if limit is None:
+                    limit = account["limits"].get(f"{prefix}_limit")
+                try:
+                    limit_number = float(limit)
+                except (TypeError, ValueError):
+                    limit_number = None
+                if limit_number is not None and math.isfinite(limit_number) and limit_number >= 0:
+                    window["limits_known"] += 1
+                    window["limit_remaining"] += limit_number * remaining
+                # _utc_iso emits a fixed-width "...Z" format, so lexicographic min/max below is
+                # chronological.
+                reset_iso = _utc_iso(entry.get(f"{prefix}_reset"))
+                if reset_iso:
+                    window["resets"].append(reset_iso)
+                    provider_resets.append(reset_iso)
+        windows = []
+        for prefix, name in WINDOWS:
+            window = stats[prefix]
+            if not window["reporting"]:
+                continue  # nothing measured for this window (e.g. fable on a non-fable provider)
+            windows.append({
+                "name": name,
+                "accounts_reporting": window["reporting"],
+                "remaining_account_windows": round(window["remaining"], 2),
+                "limit_remaining": round(window["limit_remaining"])
+                if window["limits_known"] else None,
+                "limits_known": window["limits_known"],
+                "soonest_reset": min(window["resets"], default=None),
+                "oldest_reset": max(window["resets"], default=None),
+            })
+        if probed and exempt:
+            signal = "mixed: live rate-limit-header probe + probe-exempt accounts"
+        elif probed:
+            signal = "live rate-limit-header probe (per-window utilization)"
+        elif exempt:
+            signal = ("not observable (probe-exempt provider): catalog availability "
+                      "+ reactive rate-limit backoff only")
+        else:
+            signal = "no live usage signal (catalog availability only)"
+        rows.append({
+            "provider": provider,
+            "accounts_total": len(members),
+            "accounts_available": counts["available"],
+            "accounts_capped": counts["capped"],
+            "accounts_unavailable": counts["unavailable"],
+            "single_account": len(members) == 1,
+            "signal": signal,
+            "windows": windows,
+            "soonest_reset": min(provider_resets, default=None),
+            "oldest_reset": max(provider_resets, default=None),
+        })
+    return rows
+
+
 def _parse_dispatch_log(log_text):
     complete = DISPATCH_COMPLETE_RE.findall(log_text)
     dispatched = int(complete[-1]) if complete else len(DISPATCHED_RE.findall(log_text))
@@ -757,6 +881,9 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         "schema": SCHEMA,
         "generated_at": _utc_iso(now),
         "accounts": rows,
+        # Cumulative per-provider headroom (maintainer request 2026-07-18) — rendered by the
+        # dashboard's "Provider quota (cumulative)" section, above the per-account cards.
+        "provider_quota": _provider_quota(accounts, usage, now),
         "fleet": {
             "active_agents": len(live),
             "capacity": capacity,
@@ -845,6 +972,20 @@ def _self_test():
                 {"name": "7 day", "used_percent": 80.0,
                  "reset_at": "2025-06-16T15:06:40Z", "limit": "7000"},
             ],
+        }],
+        "provider_quota": [{
+            "provider": "anthropic", "accounts_total": 1, "accounts_available": 1,
+            "accounts_capped": 0, "accounts_unavailable": 0, "single_account": True,
+            "signal": "live rate-limit-header probe (per-window utilization)",
+            "windows": [
+                {"name": "5 hour", "accounts_reporting": 1, "remaining_account_windows": 0.58,
+                 "limit_remaining": 580, "limits_known": 1,
+                 "soonest_reset": "2025-06-15T16:06:40Z", "oldest_reset": "2025-06-15T16:06:40Z"},
+                {"name": "7 day", "accounts_reporting": 1, "remaining_account_windows": 0.2,
+                 "limit_remaining": 1400, "limits_known": 1,
+                 "soonest_reset": "2025-06-16T15:06:40Z", "oldest_reset": "2025-06-16T15:06:40Z"},
+            ],
+            "soonest_reset": "2025-06-15T16:06:40Z", "oldest_reset": "2025-06-16T15:06:40Z",
         }],
         "fleet": {
             "active_agents": 1,
@@ -965,6 +1106,65 @@ def _self_test():
     }])
     check("expanded fixture preserves private account identities",
           all(account_handle not in json.dumps(ordered) for account_handle in ordered_handles), True)
+
+    # --- provider-cumulative quota (maintainer request 2026-07-18): 2 providers — one
+    # multi-account anthropic with mixed capped/free (+ one fail-closed-omitted account), one
+    # single-account probe-exempt openai under an active backoff. Asserts the aggregation math,
+    # the honest signal labels, and that no raw handle reaches the rows (decision 22). ----------
+    quota_handles = ["multi-a", "multi-b", "multi-c", "solo-openai"]
+    quota_accounts = [
+        {"handle": "multi-a", "provider": "anthropic", "catalog_available": True, "limits": {}},
+        {"handle": "multi-b", "provider": "anthropic", "catalog_available": True,
+         "limits": {"5h_limit": "1000"}},  # overridden by the probe's live 5h_limit below
+        {"handle": "multi-c", "provider": "anthropic", "catalog_available": True, "limits": {}},
+        {"handle": "solo-openai", "provider": "openai", "catalog_available": True, "limits": {}},
+    ]
+    quota_usage = {
+        "multi-a": {"status": "allowed", "5h_util": "0.25", "5h_reset": now + 600,
+                    "7d_util": "0.5", "7d_reset": now + 4000},
+        "multi-b": {"status": "allowed", "5h_util": "1.0", "5h_reset": now + 1200,
+                    "5h_limit": "2000", "7d_util": "0.9", "7d_reset": now + 90000},
+        # multi-c: probe fail-closed omitted — counts in the total, never in accounts_reporting
+        "solo-openai": {"exempt": True, "backoff_until": now + 300},
+    }
+    quota_rows = _provider_quota(quota_accounts, quota_usage, now)
+    check("cumulative quota: multi-account provider aggregates mixed capped/free", quota_rows[0], {
+        "provider": "anthropic", "accounts_total": 3, "accounts_available": 2,
+        "accounts_capped": 1, "accounts_unavailable": 0, "single_account": False,
+        "signal": "live rate-limit-header probe (per-window utilization)",
+        "windows": [
+            # 0.75 free (multi-a) + 0.0 free (capped multi-b); only multi-b's live limit is
+            # known, so the limit-weighted sum is PARTIAL (limits_known 1 of 2) and here 0.
+            {"name": "5 hour", "accounts_reporting": 2, "remaining_account_windows": 0.75,
+             "limit_remaining": 0, "limits_known": 1,
+             "soonest_reset": _utc_iso(now + 600), "oldest_reset": _utc_iso(now + 1200)},
+            # no account exposes a 7d limit -> no limit-weighted sum is fabricated
+            {"name": "7 day", "accounts_reporting": 2, "remaining_account_windows": 0.6,
+             "limit_remaining": None, "limits_known": 0,
+             "soonest_reset": _utc_iso(now + 4000), "oldest_reset": _utc_iso(now + 90000)},
+        ],
+        "soonest_reset": _utc_iso(now + 600), "oldest_reset": _utc_iso(now + 90000),
+    })
+    check("cumulative quota: single-account probe-exempt provider stays honest", quota_rows[1], {
+        "provider": "openai", "accounts_total": 1, "accounts_available": 0,
+        "accounts_capped": 1, "accounts_unavailable": 0, "single_account": True,
+        "signal": ("not observable (probe-exempt provider): catalog availability "
+                   "+ reactive rate-limit backoff only"),
+        "windows": [],  # no usage signal exists -> no remaining-quota number is fabricated
+        "soonest_reset": _utc_iso(now + 300), "oldest_reset": _utc_iso(now + 300),
+    })
+    check("cumulative quota: expired backoff no longer counts as capped",
+          [(row["accounts_available"], row["accounts_capped"]) for row in _provider_quota(
+              quota_accounts[3:], {"solo-openai": {"exempt": True, "backoff_until": now - 1}},
+              now)],
+          [(1, 0)])
+    check("cumulative quota rows carry no raw account identifier (decision 22)",
+          all(h not in json.dumps(quota_rows) for h in quota_handles), True)
+    check("ordered fixture publishes one cumulative row per provider, single-account marked",
+          [(row["provider"], row["accounts_total"], row["single_account"])
+           for row in ordered["provider_quota"]],
+          [("anthropic", 3, False), ("future-provider", 1, True), ("openai", 1, True)])
+
     health = _normalize_model_health({
         "generated_at": now,
         "models": [{"model": "fable", "provider": "anthropic", "status": "ok"}],
