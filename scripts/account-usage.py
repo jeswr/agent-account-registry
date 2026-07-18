@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # [OPUS-4.8] Probe live per-account usage for usage-aware dispatch. Emits a JSON map
 #   {handle: {"status","5h_util","5h_reset","7d_util","7d_reset", (fable fields)}}  for anthropic accounts
-#   {handle: {"exempt": true}}                                        for non-metered providers (codex)
+#   {handle: {"exempt": true, ("backoff_until": epoch...)}}  for PROBE-EXEMPT providers (openai/codex)
+#
+# PROBE EXEMPTION + REACTIVE BACKOFF (maintainer decision 2026-07-17, registry issue #29): openai
+# usage is not observable via any API, so those accounts are exempt from probing and admitted
+# WITHOUT usage data. They are governed reactively instead: the model-health ledger already records
+# a host-derived rate-limit exit class per salted account, and this script stamps the DERIVED
+# `backoff_until` onto the exempt entry so usage_eligible excludes the account until it expires.
+# The overlay FAILS OPEN with a loud log line (an unreadable ledger/missing salt only disables the
+# backoff optimization — the exemption must never reintroduce fail-closed starvation).
 # to stdout. Each anthropic token is probed with a max_tokens:1 POST /v1/messages and the
 # anthropic-ratelimit-unified-* response headers are read. Tokens come from SECRETS_JSON (toJSON(secrets))
 # by each account's secret_ref and are NEVER printed. FAIL-CLOSED: an account whose token is missing or
@@ -152,6 +160,106 @@ def _load_accounts(script_dir, registry_repo):
     return module.read_accounts(registry_repo)
 
 
+def _load_model_health(script_dir):
+    spec = importlib.util.spec_from_file_location(
+        "registry_model_health", os.path.join(script_dir, "model-health.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_backoffs(mh, now, api=None):
+    """{salted_account_hash: backoff} via the already-loaded model-health module `mh`. The ledger
+    lives on the LEDGER branch (the mutable data plane), NOT in this job's checkout: the CLAIM job
+    checks out the DEFAULT ref, whose data/model-health.json is the empty master seed, so a
+    checkout-relative read validated cleanly, warned about nothing, and made the reactive backoff
+    silently inert (cross-provider review r3 finding 2). The read therefore goes through
+    model-health's contents API pinned to ?ref=ledger (mh.read_ledger) under the ambient
+    GH_TOKEN; MODEL_HEALTH_FILE remains as an explicit file override (self-test / a caller that
+    already holds a ledger-branch checkout), and `api` is injectable for the self-test. FAIL-OPEN
+    by design, for ANY failure class (unreadable file, API/transport error, missing ledger
+    branch, missing token/env): return {} after a LOUD log line — a lost backoff ledger merely
+    admits a possibly rate-limited openai account (one wasted run), while failing closed here
+    would starve the whole exempt provider, the exact regression the exemption removes."""
+    try:
+        path = os.environ.get("MODEL_HEALTH_FILE")
+        if path:
+            with open(path, encoding="utf-8") as handle:
+                records = mh.validate_ledger(json.load(handle))
+        else:
+            if api is None:
+                api = mh.GitHubAPI(os.environ.get("GH_TOKEN")
+                                   or os.environ.get("GITHUB_TOKEN", ""))
+            records, _sha = mh.read_ledger(api, os.environ["REGISTRY_REPO"])
+        return mh.account_backoffs(mh.prune(records, now), now)
+    except Exception:
+        # Broad by design: the fail-open contract above must hold no matter what the ledger
+        # read raises (mh.HealthError, OSError, ValueError, KeyError, ...).
+        print("::warning::account-usage: model-health ledger unreadable — exempt accounts admitted "
+              "WITHOUT rate-limit backoff this tick (fail-open; fix the ledger to restore backoff)",
+              file=sys.stderr)
+        return {}
+
+
+# The exempt PROVIDER allowlist (cross-provider review r1): the maintainer decision names openai;
+# binding the exemption to an explicit allowlist (vs "any non-anthropic string") keeps a missing,
+# misspelled, or unknown provider on the fail-closed probe path (it will surface as UNAVAILABLE in
+# usage-alert — loud), so a catalog typo can never silently exempt an account from usage gating.
+EXEMPT_PROVIDERS = frozenset({"openai"})
+
+
+def _is_exempt_provider(provider):
+    """True only for the explicitly probe-exempt providers (pure; whitespace/case tolerant)."""
+    return str(provider or "").strip().lower() in EXEMPT_PROVIDERS
+
+
+def _probe_account(account, secrets, probe=None, fable_probe=None):
+    """Probed usage entry for ONE non-exempt account, or None (fail-closed omit). The provider
+    MUST normalize to `anthropic` BEFORE the secret is even dereferenced (cross-provider review
+    r3 finding 3): the probe below is addressed to the Anthropic API, so a missing, misspelled,
+    or unknown provider (e.g. `openia`) previously TRANSMITTED that account's token to a provider
+    the catalog never named — and admitted the account on the response. Unknown providers now
+    never reach a probe; the omitted entry surfaces as UNAVAILABLE in usage-alert (loud), like
+    every other fail-closed omit. `probe`/`fable_probe` are injectable for the self-test ONLY."""
+    if str(account.get("provider") or "").strip().lower() != "anthropic":
+        return None
+    ref = account.get("secret_ref")
+    if not isinstance(ref, str) or SECRET_REF_RE.fullmatch(ref) is None:
+        return None  # fail-closed omit: never dereference a non-worker-token secret name
+    token = secrets.get(ref)
+    if not token:
+        return None  # fail-closed omit
+    probed = (probe or _probe_anthropic)(token)
+    if probed is None:
+        return None
+    # [FABLE-5] Only fable-capable accounts need the extra Claude-Code-shaped fable probe. A missing
+    # or failed fable probe leaves the fable sub-quota fields absent -> usage_eligible fail-closes FABLE
+    # routing for this account, while its base 5h/7d signal still admits it for non-fable models.
+    if "fable" in account.get("models", []):
+        fable = (fable_probe or _probe_fable)(token)
+        if fable is not None:
+            probed.update(fable)
+    return probed
+
+
+def _apply_backoff(entry, backoff):
+    """Annotate one exempt usage entry with an ACTIVE backoff record (pure). Tolerant fail-open:
+    a malformed/forged record (non-dict, non-numeric/non-finite backoff_until) leaves the entry
+    untouched — never crashes the sweep, never blocks the account."""
+    if not isinstance(backoff, dict):
+        return entry
+    try:
+        until = int(float(backoff.get("backoff_until")))
+    except (TypeError, ValueError, OverflowError):
+        return entry               # nan/inf/garbage: fail open (int() rejects non-finite floats)
+    entry["backoff_until"] = until
+    if isinstance(backoff.get("consecutive"), int):
+        entry["backoff_consecutive"] = backoff["consecutive"]
+    if isinstance(backoff.get("last_signal"), str):
+        entry["backoff_signal"] = backoff["last_signal"]
+    return entry
+
+
 def _load_secrets():
     """The ACCT_* token subset. SECRETS_FILE (a host-filtered file containing ONLY worker-account
     tokens) is preferred; SECRETS_JSON (toJSON(secrets)) remains as a fallback for older callers."""
@@ -242,34 +350,55 @@ def persist_limits(usage_path):
 
 
 def main():
+    import time
     script_dir = os.path.dirname(os.path.abspath(__file__))
     registry_repo = os.environ["REGISTRY_REPO"]
     secrets = _load_secrets()
     pool = json.loads(os.environ.get("ACCOUNT_POOL", "[]"))  # optional handle allow-list
+    now = time.time()
+    salt = os.environ.get("PROVENANCE_SALT", "")
+    backoffs = None    # lazily loaded on the first probe-exempt account
+    mh = None          # the model-health module once loaded (None until then / on load failure)
+    salt_warned = False
     usage = {}
     for account in _load_accounts(script_dir, registry_repo):
         handle = account["handle"]
         if pool and handle not in pool:
             continue
-        if str(account.get("provider", "")).lower() != "anthropic":
-            usage[handle] = {"exempt": True}
+        if _is_exempt_provider(account.get("provider")):
+            # Probe-exempt provider (decision 2026-07-17, issue #29): eligible without usage data,
+            # reactively backed off via the model-health rate-limit records. No salt -> no hash
+            # mapping -> loud fail-open (backoff disabled, exemption intact). Any provider NOT on
+            # the explicit allowlist (incl. missing/misspelled) is fail-closed OMITTED by
+            # _probe_account below — never probed — and surfaces as UNAVAILABLE in usage-alert.
+            entry = {"exempt": True}
+            if salt:
+                if backoffs is None:
+                    # Guarded module load (cross-provider review r1): an import failure here must
+                    # fail OPEN like an unreadable ledger — an uncaught exception would crash the
+                    # probe, the shell would write '{}', and EVERY account (anthropic included)
+                    # would fail closed: the exact starvation the exemption exists to prevent.
+                    try:
+                        mh = _load_model_health(script_dir)
+                        backoffs = _load_backoffs(mh, now)
+                    except Exception:
+                        print("::warning::account-usage: model-health module unavailable — exempt "
+                              "accounts admitted WITHOUT rate-limit backoff this tick (fail-open)",
+                              file=sys.stderr)
+                        mh, backoffs = None, {}
+                if mh is not None:
+                    entry = _apply_backoff(entry, backoffs.get(mh.account_hash(handle, salt)))
+            elif not salt_warned:
+                # Once, not per account: a per-account repeat would leak the exempt-account COUNT
+                # into the public log (locked decision 22b) and drown the signal.
+                salt_warned = True
+                print("::warning::account-usage: PROVENANCE_SALT missing — exempt accounts "
+                      "admitted WITHOUT rate-limit backoff (fail-open)", file=sys.stderr)
+            usage[handle] = entry
             continue
-        ref = account.get("secret_ref")
-        if not isinstance(ref, str) or SECRET_REF_RE.fullmatch(ref) is None:
-            continue  # fail-closed omit: never dereference a non-worker-token secret name
-        token = secrets.get(ref)
-        if not token:
-            continue  # fail-closed omit
-        probed = _probe_anthropic(token)
+        probed = _probe_account(account, secrets)
         if probed is None:
-            continue
-        # [FABLE-5] Only fable-capable accounts need the extra Claude-Code-shaped fable probe. A missing
-        # or failed fable probe leaves the fable sub-quota fields absent -> usage_eligible fail-closes FABLE
-        # routing for this account, while its base 5h/7d signal still admits it for non-fable models.
-        if "fable" in account.get("models", []):
-            fable = _probe_fable(token)
-            if fable is not None:
-                probed.update(fable)
+            continue  # fail-closed omit: unknown provider / bad secret_ref / no token / failed probe
         usage[handle] = probed
     json.dump(usage, sys.stdout)
     return 0
@@ -349,6 +478,137 @@ def _self_test():
         "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n"))
     chk("fable good sans limit: fable_ok", (fable_nolimit or {}).get("fable_ok"), True)
     chk("fable good sans limit: no limit key", "fable_7d_oi_limit" in (fable_nolimit or {}), False)
+    # ---- probe-exempt backoff overlay (decision 2026-07-17, registry issue #29) ----
+    import tempfile
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    #   pure annotation: active backoff lands on the entry; malformed/absent stays fail-open
+    chk("apply backoff annotates the exempt entry",
+        _apply_backoff({"exempt": True}, {"backoff_until": 2000, "consecutive": 2,
+                                          "last_signal": "transient"}),
+        {"exempt": True, "backoff_until": 2000, "backoff_consecutive": 2,
+         "backoff_signal": "transient"})
+    chk("apply backoff: absent record leaves entry untouched",
+        _apply_backoff({"exempt": True}, None), {"exempt": True})
+    chk("apply backoff: forged/malformed record fails open (no crash)",
+        _apply_backoff({"exempt": True}, {"backoff_until": "garbage"}), {"exempt": True})
+    chk("apply backoff: non-dict record fails open", _apply_backoff({"exempt": True}, "x"),
+        {"exempt": True})
+    #   non-finite stamps must fail OPEN, not crash (cross-provider review r1: int(nan) raises
+    #   ValueError, int(inf) raises OverflowError — both outside a naive float() guard)
+    chk("apply backoff: nan fails open (no crash)",
+        _apply_backoff({"exempt": True}, {"backoff_until": "nan"}), {"exempt": True})
+    chk("apply backoff: inf fails open (no indefinite sideline)",
+        _apply_backoff({"exempt": True}, {"backoff_until": "inf"}), {"exempt": True})
+    #   the exemption is bound to an explicit provider allowlist (cross-provider review r1):
+    #   missing/misspelled/unknown providers stay on the fail-closed probe path
+    chk("exempt allowlist: openai (case/space tolerant)",
+        (_is_exempt_provider("openai"), _is_exempt_provider(" OpenAI ")), (True, True))
+    chk("exempt allowlist: anthropic/missing/typo/unknown all fail closed",
+        (_is_exempt_provider("anthropic"), _is_exempt_provider(""), _is_exempt_provider(None),
+         _is_exempt_provider("antropic"), _is_exempt_provider("codex")),
+        (False, False, False, False, False))
+    #   ledger round-trip: a rate-limit record for a salted handle surfaces as an active backoff
+    mh = _load_model_health(script_dir)
+    test_now = 1_000_000
+    hashed = mh.account_hash("codex01", "s3cret")
+    ledger_record = {"ts": test_now, "provider": "openai", "account": hashed,
+                     "model_alias": "gpt", "exit_class": "transient", "run_id": "1"}
+    good_ledger = {"records": [ledger_record]}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(good_ledger, fh)
+        good_path = fh.name
+    os.environ["MODEL_HEALTH_FILE"] = good_path
+    backoffs = _load_backoffs(mh, test_now + 60)
+    chk("ledger round-trip: active backoff derived for the salted handle",
+        backoffs.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_BASE_SECONDS)
+    #   (v) malformed ledger -> loud fail-open {} (never crashes the sweep). CAPTURED stderr
+    #   (cross-provider review r1): un-captured, these intentional failures would emit REAL
+    #   ::warning:: annotations on every workflow run (the step runs --self-test first) and
+    #   destroy the warning's operational signal. Capturing also lets us ASSERT the loudness.
+    import contextlib
+    import io
+
+    def _load_backoffs_captured(now_arg, api=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            result = _load_backoffs(mh, now_arg, api=api)
+        return result, buf.getvalue()
+
+    with open(good_path, "w", encoding="utf-8") as fh:
+        fh.write('{"records": "not-a-list"}')
+    got, err = _load_backoffs_captured(test_now)
+    chk("malformed ledger fails open to no-backoff", got, {})
+    chk("malformed ledger fail-open is LOUD (::warning::)", "::warning::" in err, True)
+    with open(good_path, "w", encoding="utf-8") as fh:
+        fh.write("not json at all")
+    got, err = _load_backoffs_captured(test_now)
+    chk("unparseable ledger fails open", got, {})
+    chk("unparseable ledger fail-open is LOUD", "::warning::" in err, True)
+    os.environ["MODEL_HEALTH_FILE"] = os.path.join(good_path, "nope")  # unreadable path
+    got, err = _load_backoffs_captured(test_now)
+    chk("missing ledger file fails open", got, {})
+    chk("missing ledger fail-open is LOUD", "::warning::" in err, True)
+    #   the warning line itself must stay sanitized: no handle, no salt, no count
+    chk("fail-open warning carries no handle/salt", ("codex01" in err, "s3cret" in err),
+        (False, False))
+    del os.environ["MODEL_HEALTH_FILE"]
+    os.unlink(good_path)
+    #   (vi) ledger-BRANCH API read (cross-provider review r3 finding 2): without MODEL_HEALTH_FILE
+    #   the read must go through model-health's contents API pinned to ?ref=ledger — the job's
+    #   checkout is the DEFAULT ref whose data/model-health.json is the empty master seed, so a
+    #   checkout-relative read made the reactive backoff silently inert. mh._StubAPI enforces the
+    #   ledger pin structurally (an unpinned GET misses).
+    saved_repo = os.environ.get("REGISTRY_REPO")
+    os.environ["REGISTRY_REPO"] = "o/r"
+    got, err = _load_backoffs_captured(test_now + 60, api=mh._StubAPI(seed=[ledger_record]))
+    chk("no MODEL_HEALTH_FILE -> ledger-pinned API read derives the backoff",
+        got.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_BASE_SECONDS)
+    chk("API-read success path emits no warning", err, "")
+    #   a MISSING ledger branch fails open (never crashes the probe) but stays LOUD
+    got, err = _load_backoffs_captured(test_now, api=mh._StubAPI(branch_missing=True))
+    chk("missing ledger branch fails open to no-backoff", got, {})
+    chk("missing ledger branch fail-open is LOUD", "::warning::" in err, True)
+    #   a missing ledger FILE on a present branch is the legitimate first-write state: genuinely
+    #   no backoffs, and NOT a warning (an always-on warning would destroy the signal)
+    got, err = _load_backoffs_captured(test_now, api=mh._StubAPI(seed=None))
+    chk("first-write empty ledger -> no backoffs, no warning", (got, err), ({}, ""))
+    if saved_repo is None:
+        os.environ.pop("REGISTRY_REPO", None)
+    else:
+        os.environ["REGISTRY_REPO"] = saved_repo
+    # ---- provider-addressed probing (cross-provider review r3 finding 3) ----
+    #   an unknown/missing/misspelled provider must NEVER reach a probe: the probe is addressed
+    #   to the Anthropic API, so transmitting the token there both leaks the credential to an
+    #   endpoint the catalog never named AND admits the account on the response. Fail-closed
+    #   omit (None), with ZERO probe invocations.
+    probe_calls = []
+
+    def _rec_probe(token):
+        probe_calls.append(token)
+        return {"status": "allowed", "5h_util": "0.1"}
+
+    stub_secrets = {"ACCT01_TOKEN": "tok"}
+    for prov in ("openia", "codex", "gemini", "", None):
+        got = _probe_account({"handle": "x", "provider": prov, "secret_ref": "ACCT01_TOKEN",
+                              "models": ["haiku"]}, stub_secrets,
+                             probe=_rec_probe, fable_probe=_rec_probe)
+        chk(f"unknown provider {prov!r} fail-closed omitted", got, None)
+    chk("unknown providers never invoked a probe", probe_calls, [])
+    got = _probe_account({"handle": "x", "provider": " Anthropic ", "secret_ref": "ACCT01_TOKEN",
+                          "models": ["haiku"]}, stub_secrets,
+                         probe=_rec_probe, fable_probe=_rec_probe)
+    chk("anthropic account still probes (normalized match)", (got or {}).get("status"), "allowed")
+    chk("non-fable account probes exactly once", probe_calls, ["tok"])
+    probe_calls.clear()
+    _probe_account({"handle": "x", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+                    "models": ["fable"]}, stub_secrets, probe=_rec_probe, fable_probe=_rec_probe)
+    chk("fable account gets the second (fable) probe", probe_calls, ["tok", "tok"])
+    probe_calls.clear()
+    chk("non-worker secret_ref still never dereferenced/probed",
+        (_probe_account({"handle": "x", "provider": "anthropic",
+                         "secret_ref": "REGISTRY_ADMIN_APP_KEY"},
+                        {"REGISTRY_ADMIN_APP_KEY": "priv"},
+                        probe=_rec_probe, fable_probe=_rec_probe), probe_calls), (None, []))
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

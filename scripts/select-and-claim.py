@@ -16,6 +16,7 @@ and heartbeat are keyed by the unique claim_id.
 import argparse
 import base64
 import json
+import math
 import os
 import subprocess
 import sys
@@ -65,9 +66,12 @@ FABLE_WINDOW = "fable_7d_oi"  # prefix of the fable sub-quota util/reset keys in
 
 
 def _usage_num(v):
+    # OverflowError (cross-provider review r2 finding 3): a forged `backoff_until: 10**400` is
+    # valid JSON (Python ints are unbounded) but float() of it RAISES rather than returning inf —
+    # uncaught, it aborted the whole dispatch instead of failing open to no-backoff.
     try:
         return float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -89,13 +93,32 @@ def _fable_eligible(u, margin):
     return util is not None and (1.0 - util) >= margin
 
 
-def usage_eligible(u, margin=SAFETY_MARGIN, model=None):
+def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
     """Fail-closed admission test for STARTING a worker (of `model`) on an account. Beyond the whole-account
-    5h/7d headroom, a PREMIUM_MODELS route (fable) additionally requires FABLE sub-quota headroom."""
+    5h/7d headroom, a PREMIUM_MODELS route (fable) additionally requires FABLE sub-quota headroom.
+
+    PROBE-EXEMPT providers (openai/codex — maintainer decision 2026-07-17, registry issue #29): their
+    usage is not observable via any API, so the fail-closed require-usage arm does NOT apply to them —
+    they are eligible WITHOUT usage data and are governed REACTIVELY instead: account-usage.py stamps
+    `backoff_until` (derived from the model-health rate-limit records) onto an exempt entry, and the
+    account is excluded while now < backoff_until. A missing or malformed stamp means NO backoff
+    (fail-open — the backoff is an optimization; the exemption must never reintroduce the fail-closed
+    starvation it removes). Anthropic accounts keep the fail-closed probing below unchanged."""
     if not isinstance(u, dict):
         return False                                  # no probe data -> do not risk it
-    if u.get("exempt"):
-        return True                                   # non-metered provider (e.g. codex) — not gated
+    if u.get("exempt") is True:                       # STRICT: only the literal producer-set flag —
+        # a forged truthy string (e.g. "false") must not ride the exempt arm (cross-provider r1).
+        until = _usage_num(u.get("backoff_until"))
+        # Finite stamps only (cross-provider review r1): `inf` would sideline the account FOREVER
+        # (now < inf is always True) while usage-alert's nan/inf guard reports it healthy — a
+        # dispatch/monitoring split. Non-finite = no backoff, matching _apply_backoff's fail-open.
+        if until is not None and math.isfinite(until):
+            if now is None:
+                import time
+                now = time.time()
+            if now < until:
+                return False                          # rate-limited earlier — backed off until it expires
+        return True                                   # non-metered provider (e.g. codex) — not probe-gated
     if str(u.get("status", "")).lower() not in ("allowed", ""):
         return False                                  # throttled/rejected -> skip until it resets
     for prefix in ("5h", "7d"):
@@ -156,7 +179,7 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
                    and active_for(live, a["handle"]) < int(a.get("max_concurrent_workers", 4))]
         if usage is not None:
             serving = [a for a in serving
-                       if usage_eligible(usage.get(a["handle"]), margin, model=model)]
+                       if usage_eligible(usage.get(a["handle"]), margin, model=model, now=now)]
         if not serving:
             continue
 
@@ -165,7 +188,8 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
     return None
 
 
-def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, margin=SAFETY_MARGIN):
+def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, margin=SAFETY_MARGIN,
+                        now=None):
     """How many workers may run right now = sum of per-account slots over accounts eligible to START
     (available, optionally serving `model_chain`, and `usage_eligible`). Starts HIGH when many accounts
     have headroom and BACKS OFF automatically as utilisation climbs (ineligible accounts drop out), so
@@ -186,7 +210,7 @@ def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, ma
         if model_chain is not None and not servable:
             continue
         u = usage.get(a["handle"])
-        if any(usage_eligible(u, margin, model=m) for m in servable):
+        if any(usage_eligible(u, margin, model=m, now=now) for m in servable):
             total += int(a.get("max_concurrent_workers", 4))
     if absolute_cap is not None:
         total = min(total, absolute_cap)
@@ -389,7 +413,8 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         # also be usage_eligible; with usage=None this is the original chain-order pick (backward compatible).
         if usage is not None:
             model = next((m for m in model_chain
-                          if m in a["models"] and usage_eligible(usage.get(acct), margin, model=m)), None)
+                          if m in a["models"] and usage_eligible(usage.get(acct), margin, model=m,
+                                                                 now=now)), None)
             if model is None:
                 return None  # no chain model is eligible for the admitted account (defensive; shouldn't happen)
         else:
@@ -585,6 +610,51 @@ def _self_test():
     check("ineligible: 7d full", usage_eligible({**fresh, "7d_util": 0.95}), False)
     check("ineligible: unknown window", usage_eligible({"status": "allowed", "5h_util": 0.1}), False)
     check("eligible: exempt provider (codex)", usage_eligible({"exempt": True}), True)
+
+    # ---- probe-exempt (openai) + reactive backoff (decision 2026-07-17, registry issue #29) ----
+    # (i) openai/codex accounts are eligible WITHOUT usage data — deleting the exempt arm turns
+    # this red (the entry has no 5h/7d windows, so the fail-closed arm would reject it).
+    check("exempt (openai): eligible with NO usage windows at all",
+          usage_eligible({"exempt": True}, now=now), True)
+    # (iv) the exemption must NOT leak across providers: a non-exempt (anthropic) entry with the
+    # same missing windows stays ineligible.
+    check("anthropic without windows still fail-closed (no cross-provider leak)",
+          usage_eligible({"status": "allowed"}, now=now), False)
+    # (ii) an ACTIVE backoff excludes the account; (iii) an EXPIRED one readmits it.
+    check("exempt with ACTIVE backoff excluded",
+          usage_eligible({"exempt": True, "backoff_until": now + 60}, now=now), False)
+    check("exempt with EXPIRED backoff eligible again",
+          usage_eligible({"exempt": True, "backoff_until": now - 1}, now=now), True)
+    # (v) a forged/malformed stamp fails OPEN to no-backoff (never crashes, never starves).
+    check("malformed backoff stamp fails open",
+          usage_eligible({"exempt": True, "backoff_until": "garbage"}, now=now), True)
+    # (cross-provider review r1) non-finite stamps fail OPEN — inf must not sideline forever…
+    check("inf backoff stamp fails open (no indefinite sideline)",
+          usage_eligible({"exempt": True, "backoff_until": "inf"}, now=now), True)
+    check("nan backoff stamp fails open",
+          usage_eligible({"exempt": True, "backoff_until": "nan"}, now=now), True)
+    # a huge JSON int (10**400) makes float() RAISE OverflowError, not return inf — the forged
+    # stamp must fail open to no-backoff, never abort dispatch (cross-provider review r2 f3)
+    check("huge-int backoff stamp fails open (OverflowError, no dispatch abort)",
+          usage_eligible({"exempt": True, "backoff_until": 10**400}, now=now), True)
+    # …and the exempt flag is STRICT: a forged truthy string must not exempt an account whose
+    # entry otherwise lacks usage windows (would-be anthropic bypass).
+    check("forged exempt='false' string does NOT exempt (fail-closed)",
+          usage_eligible({"exempt": "false", "status": "allowed"}, now=now), False)
+    check("forged exempt=1 does NOT exempt (fail-closed)",
+          usage_eligible({"exempt": 1, "status": "allowed"}, now=now), False)
+    # choose_account skips a backed-off exempt account and picks the free one; None when all backed off.
+    OA = [{"handle": "cx1", "models": ["terra"], "max_concurrent_workers": 1, "available": True},
+          {"handle": "cx2", "models": ["terra"], "max_concurrent_workers": 1, "available": True}]
+    ousage = {"cx1": {"exempt": True, "backoff_until": now + 500}, "cx2": {"exempt": True}}
+    check("choose_account skips the backed-off exempt account",
+          choose_account(OA, [], ["terra"], "p", "r", now, usage=ousage), "cx2")
+    check("choose_account None when every exempt account is backed off",
+          choose_account(OA, [], ["terra"], "p", "r", now,
+                         usage={h: {"exempt": True, "backoff_until": now + 500} for h in ("cx1", "cx2")}),
+          None)
+    check("dynamic concurrency excludes the backed-off exempt account",
+          dynamic_concurrency(OA, ousage, ["terra"], now=now), 1)
     U = [{"handle": "soon", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "middle", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "late", "models": ["fable"], "max_concurrent_workers": 1, "available": True},

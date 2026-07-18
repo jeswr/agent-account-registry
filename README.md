@@ -237,7 +237,31 @@ with the **soonest whole-account `7d_reset`** (use-it-or-lose-it). Accounts with
 sort last while retaining the existing cache-affinity/load/handle order. The Fable `7d_oi` bucket remains
 an additional eligibility gate for Fable routes, but does not replace the fleet-wide drain-order signal.
 **Skip** an account whose status is not `allowed` or whose utilisation leaves less than
-`usage_safety_margin` headroom. (OpenAI/codex exposes analogous limits; TODO confirm its headers.)
+`usage_safety_margin` headroom.
+
+### OpenAI/codex accounts — probe-EXEMPT, reactive backoff (maintainer decision 2026-07-17)
+
+OpenAI exposes **no API to observe a codex subscription's usage**, so `provider: openai` accounts
+are **exempt from health/usage probing** by maintainer decision
+([issue #29](https://github.com/jeswr/agent-account-registry/issues/29)): they are eligible
+**without usage data** (`{"exempt": true}` in the usage map — the fail-closed require-usage arm
+applies to anthropic accounts only) and are simply **used until a run hits a rate limit**. They
+remain subject to `max_concurrent_workers` caps and leases, plus a **reactive backoff** derived
+from the `data/model-health.json` records the worker/review outcome jobs already CAS-append:
+
+- **Signal (host-observable only):** the worker harness's exit class (`rate-limit`/`session-limit`)
+  is derived from the CLI's own stderr + `[error]`-prefixed lines, never model-authored stdout.
+- **Duration:** the provider's machine-parseable reset hint (`try again in 20s`, `retry-after: 120`)
+  when present, else **15 min doubling per consecutive hit, capped at 5 h**; a successful run
+  resets the multiplier.
+- **Enforcement:** `account-usage.py` reads the ledger from the `ledger` **branch** via the
+  pinned contents API (the job's checkout is the default ref, whose seed file is empty) and
+  stamps `backoff_until` onto the exempt entry;
+  `usage_eligible` excludes the account until it expires; `usage-alert.py` surfaces active
+  backoffs (`BACKED OFF`) instead of flagging exempt accounts probe-missing.
+- **Fail-open by design:** an unreadable ledger or missing salt disables only the backoff (loud
+  `::warning::`), never the exemption — the backoff is an optimization and must not reintroduce
+  fail-closed starvation.
 
 ## Security posture
 

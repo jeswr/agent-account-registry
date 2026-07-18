@@ -668,12 +668,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
+          # Reactive backoff for probe-exempt providers (decision 2026-07-17, registry issue #29):
+          # the salt maps catalog handles to the salted hashes in data/model-health.json so active
+          # rate-limit backoffs land on the exempt usage entries. This job runs registry code only
+          # (same posture as the claim step's PROVENANCE_SALT below) — the salt never enters a job
+          # that executes target code. A missing salt or unreadable ledger fails OPEN (backoff
+          # disabled, exemption intact) with a loud ::warning:: line.
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -uo pipefail
           python3 registry/scripts/account-usage.py --self-test
-          python3 registry/scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null || printf '{}' > "$RUNNER_TEMP/usage.json"
+          python3 registry/scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2> "$RUNNER_TEMP/usage-probe.stderr" || printf '{}' > "$RUNNER_TEMP/usage.json"
           # Privacy (locked decision 22b): the public log never carries account counts; a wholesale
           # probe failure is surfaced by the fail-loud usage-alert step below, not by this line.
+          # Only explicitly ::warning::-prefixed diagnostics (sanitized by construction — no
+          # handles/counts) are re-surfaced from stderr; everything else stays discarded.
+          grep -a '^::warning::' "$RUNNER_TEMP/usage-probe.stderr" || true
           echo 'usage-probe: snapshot written'
 
       # Capacity model (2026-07-17): persist the live anthropic-ratelimit-unified-* LIMIT headers

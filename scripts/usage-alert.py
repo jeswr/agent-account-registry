@@ -64,9 +64,12 @@ def _util(value):
     headers are decimal so this is a guard, not a currently-reachable path."""
     if value is None:
         return None
+    # OverflowError (cross-provider review r2 finding 3): float() of a forged huge JSON int
+    # (10**400) RAISES rather than returning inf — uncaught, the monitoring tick died and the
+    # alert was dropped. Unparseable, exactly like nan/inf.
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if parsed != parsed or parsed in (float("inf"), float("-inf")):  # NaN (self-inequality) or ±inf
         return None
@@ -87,10 +90,16 @@ def _alert_route(alert_repo, alert_token, registry_repo):
     return registry_repo, None, bool(alert_repo)
 
 
-def classify(pool, usage, margin):
+def classify(pool, usage, margin, now=None):
     """Return (eligible_count, rows[(handle, status_str, ok_bool)]). Mirrors usage_eligible's
     fail-closed posture: an account is usable ONLY with a positive, parseable probe result — missing
-    entry, non-allowed status, or a missing/unparseable 5h/7d window is UNAVAILABLE."""
+    entry, non-allowed status, or a missing/unparseable 5h/7d window is UNAVAILABLE. PROBE-EXEMPT
+    providers (openai/codex — maintainer decision 2026-07-17, registry issue #29) are `ok` by design
+    (never flagged probe-missing) UNLESS the reactive-backoff stamp on the entry is still active, in
+    which case the backoff is surfaced (BACKED OFF) so degraded exempt capacity is visible."""
+    if now is None:
+        import time
+        now = time.time()
     rows = []
     eligible = 0
     for h in pool:
@@ -98,9 +107,15 @@ def classify(pool, usage, margin):
         if u is None:
             rows.append((h, "UNAVAILABLE — token invalid/expired or probe failed (rotate setup-token)", False))
             continue
-        if u.get("exempt"):
+        if u.get("exempt") is True:  # STRICT, mirroring usage_eligible (cross-provider review r1)
+            until = _util(u.get("backoff_until"))
+            if until is not None and now < until:
+                rows.append((h, f"BACKED OFF — provider rate limit hit "
+                                f"(x{u.get('backoff_consecutive', 1)}); resumes at epoch "
+                                f"{int(until)} (self-clearing)", False))
+                continue
             eligible += 1
-            rows.append((h, "ok — non-metered provider", True))
+            rows.append((h, "ok — probe-exempt provider (reactive rate-limit backoff)", True))
             continue
         if str(u.get("status", "")).lower() not in ("allowed", ""):
             rows.append((h, f"UNAVAILABLE — provider status `{u.get('status')}` (throttled/rejected)", False))
@@ -133,8 +148,13 @@ def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redac
         # carries counts only — never an account handle (decision 22a).
         capped = sum(1 for _h, s, _ok in rows if s.startswith("CAPPED"))
         unavailable = sum(1 for _h, s, _ok in rows if s.startswith("UNAVAILABLE"))
-        ok_count = len(rows) - capped - unavailable
-        lines.append(f"- ⛔ capped: {capped} · unavailable: {unavailable} · ✅ ok: {ok_count}")
+        backed_off = sum(1 for _h, s, _ok in rows if s.startswith("BACKED OFF"))
+        # healthy comes from ok_bool, never len-minus-categories (cross-provider review r3
+        # finding 4): a BACKED OFF row is neither capped nor unavailable, so the remainder
+        # arithmetic counted it healthy — "Usable workers: 0/1" alongside "✅ ok: 1".
+        ok_count = sum(1 for _h, _s, ok_bool in rows if ok_bool)
+        lines.append(f"- ⛔ capped: {capped} · unavailable: {unavailable} · backed off: "
+                     f"{backed_off} · ✅ ok: {ok_count}")
         lines.append("\n⚠️ Per-account detail suppressed: the private alert route is HALF-configured "
                      "(`ALERT_REPO` is set but the `ALERT_TOKEN` secret is missing), so this alert "
                      "fell back to the public registry repo. Set `ALERT_TOKEN` to receive per-account "
@@ -291,8 +311,16 @@ def _self_test():
     chk("redacted body carries no handle",
         ("acct-priv-h1" in red, "acct-priv-h2" in red, "acct-priv-h3" in red), (False, False, False))
     chk("redacted body keeps counts + hint",
-        ("capped: 1" in red, "unavailable: 1" in red, "ok: 1" in red, "ALERT_TOKEN" in red),
+        ("capped: 1" in red, "unavailable: 1" in red, "✅ ok: 1" in red, "ALERT_TOKEN" in red),
         (True, True, True, True))
+    # a BACKED OFF row is NOT healthy in the redacted render (cross-provider review r3 finding 4):
+    # ok comes from ok_bool, and the backed-off state gets its own visible category — one active
+    # backoff must not read as "Usable workers: 0/1" next to "✅ ok: 1"
+    rback = render(0, [("acct-priv-h4", "BACKED OFF — provider rate limit hit (x2); resumes at "
+                        "epoch 99 (self-clearing)", False)], ["p"], 1, "m", redact_handles=True)
+    chk("redacted backed-off row counted backed-off, not ok",
+        ("backed off: 1" in rback, "✅ ok: 0" in rback, "acct-priv-h4" in rback),
+        (True, True, False))
     # _gh(check=True) fail-loud + sanitization (review r1): a non-zero gh returncode must emit a
     # ::warning:: naming the op + rc, and must NOT republish gh stderr (GH_DEBUG=api can echo the
     # request body) nor any argument content.
@@ -358,6 +386,32 @@ def _self_test():
     chk("main() half-configured: body is redacted END-TO-END",
         ("acct-wire-h1" in body_arg, "acct-wire-h2" in body_arg, "unavailable: 2" in body_arg),
         (False, False, True))
+    # Probe-exempt backoff surfacing (decision 2026-07-17, registry issue #29): an exempt account
+    # is `ok` by design (never probe-missing), but an ACTIVE backoff is surfaced + not eligible,
+    # an EXPIRED one clears, and a forged/malformed stamp fails open to `ok` (never crashes).
+    tnow = 5_000
+    e8, r8 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow + 300,
+                                      "backoff_consecutive": 2}}, 0.10, now=tnow)
+    chk("active backoff surfaced + not eligible",
+        (e8, "BACKED OFF" in r8[0][1], "x2" in r8[0][1], r8[0][2]), (0, True, True, False))
+    e9, r9 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow - 1}}, 0.10, now=tnow)
+    chk("expired backoff -> ok again", (e9, r9[0][2]), (1, True))
+    e10, r10 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "garbage"}}, 0.10, now=tnow)
+    chk("malformed backoff stamp fails open to ok", (e10, r10[0][2]), (1, True))
+    # inf/nan stamps fail open to ok (matches usage_eligible's finite-only comparison, r1)
+    e11, r11 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "inf"}}, 0.10, now=tnow)
+    chk("inf backoff stamp fails open to ok (no dispatch/alert split)", (e11, r11[0][2]), (1, True))
+    # a huge JSON int (10**400) makes float() RAISE OverflowError, not return inf — the monitoring
+    # tick must survive it: exempt backoff fails OPEN to ok, a usage window fails CLOSED to
+    # UNAVAILABLE (cross-provider review r2 finding 3)
+    e13, r13 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": 10**400}}, 0.10, now=tnow)
+    chk("huge-int backoff stamp fails open to ok (no alert drop)", (e13, r13[0][2]), (1, True))
+    e14, r14 = classify(["a"], {"a": {"status": "allowed", "5h_util": 10**400, "7d_util": 0.1}},
+                        0.10, now=tnow)
+    chk("huge-int usage window classifies fail-closed UNAVAILABLE", (e14, r14[0][2]), (0, False))
+    # a forged truthy exempt STRING does not ride the exempt arm (STRICT flag, r1)
+    e12, r12 = classify(["cx"], {"cx": {"exempt": "false"}}, 0.10, now=tnow)
+    chk("forged exempt string classifies fail-closed UNAVAILABLE", (e12, r12[0][2]), (0, False))
     # NaN/inf guard (issue #39): a literal `nan`/`inf` header must classify UNAVAILABLE, not `ok`
     # (NaN comparisons are all False, so it would otherwise slip past the CAPPED threshold).
     chk("nan header -> None (fail-closed)", _util("nan"), None)
