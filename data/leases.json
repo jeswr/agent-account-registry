@@ -19,16 +19,6 @@
    "model": "opus",
    "issued_at": 1784380747,
    "expires_at": 1784381947
-  },
-  {
-   "account": "acct01",
-   "claim_id": "1ea2d877004e452fa4858a9ff9d3921e",
-   "holder": "review:sparq-org/sparq#3451@dispatch-29645854760.1",
-   "package": "sparq-trust",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784380779,
-   "expires_at": 1784381979
   }
  ]
 }
