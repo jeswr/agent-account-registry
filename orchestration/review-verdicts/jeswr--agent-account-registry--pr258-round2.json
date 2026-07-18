@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-1 defect is fixed. The review/fix allocator exception path now increments the same shared defer_reasons histogram used by the worker-item path, and dispatch passes that shared Counter into _dispatch_review_items before deriving the final summary and fail-loud decision. Thus an all-review/fix frontier whose claims raise records lease-error, emits ledger=error, and raises DispatchError when dispatched remains zero; partial-success ticks retain the intended per-item resilience. The added wiring test exercises a real review/fix item with an allocator that raises and asserts the propagated counter, error health, and fail-loud predicate, while the contention case confirms a None claim does not falsely mark ledger rot. No new correctness, trust-plane, security, or non-vacuity issue is supported by the diff.",
+ "verdict": "approve"
+}
