@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The hdt 0.4->0.7 bump drops sophia + all sophia_* subcrates, sucds, rio_api, rio_turtle, and resiter from Cargo.lock, but their [[exemptions.*]] entries (config.toml lines ~1366, 1382, 1386, 1565-1601, 1641) are left behind and are now unused. This is a cleanliness issue, not a correctness one: cargo-vet tolerates unused exemptions (it emits a prune note, it does not fail the check), which is consistent with the round-1 CI-repair commit leaving them in place without breaking the gate. Worth pruning so the vet manifest keeps tracking only the live dependency surface.",
+   "file": "supply-chain/config.toml",
+   "fix_hint": "Run `cargo vet prune` (or delete the entries by hand) to remove the exemptions for sophia, sophia_api, sophia_c14n, sophia_inmem, sophia_iri, sophia_isomorphism, sophia_resource, sophia_rio, sophia_term, sophia_turtle, sucds, rio_api, rio_turtle, and resiter. No functional impact if left; purely hygiene.",
+   "severity": "nit",
+   "title": "Stale exemptions remain for crates removed from the lockfile (sophia*, sucds, rio_api, rio_turtle, resiter)"
+  },
+  {
+   "body": "The RUSTSEC-2025-0141 ignore justifies itself with 'sparq does not deserialize untrusted bincode input' (mirrored in the VEX detail). bincode reaches the graph transitively via qwt 0.4 (a rank/select support structure), below the opt-in hdt surface; sparq-hdt source references neither bincode nor qwt, supporting the claim that sparq itself never invokes bincode deserialization. Whether upstream hdt 0.7 ever bincode-deserializes qwt state directly out of an attacker-supplied .hdt archive (vs building qwt in-memory from the standard BitmapTriples layout) was not confirmable in this environment. This is non-blocking regardless: RUSTSEC-2025-0141 is an informational maintenance-status advisory (severity 'none', no CVE/exploit), so the ignore+VEX pair is appropriate on availability grounds even if the reachability wording is slightly stronger than proven.",
+   "file": "deny.toml",
+   "fix_hint": "Optionally soften the wording to 'sparq does not itself deserialize bincode; it is internal to qwt below the opt-in HDT surface', or confirm hdt 0.7 builds qwt from the raw BitmapTriples bitstream rather than bincode-decoding it from the archive. Safe to leave as-is given the advisory is maintenance-only.",
+   "severity": "nit",
+   "title": "bincode 'does not deserialize untrusted input' rationale is plausible but unverified against hdt's .hdt load path"
+  }
+ ],
+ "progress": "improving",
+ "summary": "Round 2 adds the supply-chain plumbing that round 1 flagged as the one open item (confirm cargo-deny/cargo-vet stays green for the new hdt-0.7 transitive surface). The round-1-fix commit (d95f8bcf) touches only deny.toml, supply-chain/config.toml, and supply-chain/vex.cdx.json; no source changes on top of the already-approved round-1 diff, so the empirically-verified build/test/format-compat results from round 1 stand. I verified: (1) all 24 new lockfile crates (anstream/anstyle-*/bincode/binout/bitset-core/clap_derive/co_sort/colorchoice/dyn_size_of/env_filter/env_logger/fsum/generic-tests/is_terminal_polyfill/mem_dbg(+derive)/minimum_redundancy/once_cell_polyfill/qwt/serde-big-array/strsim/utf8parse) have matching config.toml exemptions; (2) hdt's exemption version was bumped 0.4.0->0.7.3; (3) anstyle/clap/clap_builder/clap_lex correctly moved safe-to-run -> safe-to-deploy now that hdt 0.7 makes them runtime (not just dev/bench) deps; (4) vex.cdx.json is valid JSON and the RUSTSEC-2025-0141 (bincode unmaintained) VEX matches the new deny.toml ignore; (5) sparq-hdt source references neither bincode nor qwt directly \u2014 they sit below the wrapped hdt crate, consistent with the 'does not deserialize untrusted bincode' rationale. RUSTSEC-2025-0141 is an informational maintenance advisory (severity none), not a vulnerability, so the ignore+VEX pair is appropriate. The change is correct and complete. Two nit-level cleanliness items only (below). Progress vs round 1: the sole substantive open item (supply-chain gate confirmation) is now addressed and only lower-severity nits remain -> improving. Note: I did not re-run cargo-vet/cargo-deny in this env; assessment is from static inspection of the lockfile<->exemption<->VEX correspondence.",
+ "verdict": "approve"
+}
