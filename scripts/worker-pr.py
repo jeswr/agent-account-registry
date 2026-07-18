@@ -1753,6 +1753,7 @@ def _self_test():
     # surfaces as ONE structured per-PR error the dispatch caller can skip per item ----
     net = {}
     disarm_calls = []
+    compare_paths = []
     fake_outputs = {}
     real_disarm_io = {name: wiring_globals[name]
                       for name in ("_gh_json", "_run_gh", "_write_outputs",
@@ -1780,6 +1781,7 @@ def _self_test():
         if path.startswith("repos/o/r/commits?"):
             return net["commits"]
         if path.startswith("repos/o/r/compare/"):
+            compare_paths.append(path.split("compare/", 1)[1])
             return net["compare"][path.split("compare/", 1)[1]]
         raise WorkerPrError(f"unexpected API path {path}")
 
@@ -1791,6 +1793,7 @@ def _self_test():
 
     def run_disarm(base_ref="main", draft=False, armed=True, **overrides):
         disarm_calls.clear()
+        compare_paths.clear()
         fake_outputs.clear()
         net.clear()
         net.update({
@@ -1879,6 +1882,26 @@ def _self_test():
         check("non-default base: genuine merge-only advance carries forward on base.ref",
               (f"rebind:{head_69}" in disarm_calls, fake_outputs.get("carried_forward")),
               (True, True))
+        # Issue #84 (red if the second-parent PROBE reverts to the default branch): the
+        # fixture answers "behind" for BOTH main...tip and release...tip, so the trap and
+        # genuine cases above cannot see which base the probe used — pin the exact compare
+        # paths instead: every live compare targets base.ref, never the default branch.
+        check("non-default base: every compare targets base.ref, never the default branch",
+              (sorted(set(compare_paths)),
+               any(path.startswith("main...") for path in compare_paths)),
+              (sorted({f"release...{main_tip}", f"release...{rev_sha}",
+                       f"release...{head_69}"}), False))
+        # Issue #84, behavioural half: the merge's second parent is reachable from the
+        # DEFAULT branch ("behind") but foreign to the PR's actual base ("diverged"),
+        # while the fingerprints vs the base agree — only a base.ref probe rejects this
+        # advance; a default-branch probe would carry an unreviewed merge forward.
+        foreign = json.loads(json.dumps(both_bases))
+        foreign[f"release...{main_tip}"]["status"] = "diverged"
+        run_disarm(base_ref="release", compare=foreign)
+        check("non-default base: second parent foreign to base.ref still disarms",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls,
+               f"rebind:{head_69}" in disarm_calls, fake_outputs.get("disarmed")),
+              (True, False, True))
 
         run_disarm(queued=True, commits=[dict(row) for row in plain_advance])
         check("queued mismatch dequeues via GraphQL",
