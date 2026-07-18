@@ -1,23 +1,32 @@
-# [FABLE-5] Unified loud-fail pipeline alarm — the shared FINAL step every pipeline workflow wires
-# in as `if: ${{ failure() || cancelled() }}`. On any job failure/cancel/skip it classifies the
+# [FABLE-5] Unified loud-fail pipeline alarm — invoked from a dedicated `needs:`-gated always()
+# alarm/recover JOB in every pipeline workflow. On any job failure/cancel/skip it classifies the
 # failure, captures a credential-safe diagnostic tail, and upserts the single rolling
 # "⚠️ pipeline failures" issue (label `pipeline-alert`, deduped by a hidden body marker). See
-# scripts/pipeline-alarm.py for the full contract. FAIL-SOFT: this action never masks the primary
-# failure — its own step is `continue-on-error`-safe and the script always exits 0.
+# scripts/pipeline-alarm.py for the full contract. The SCRIPT is fail-soft (always exits 0 — it
+# can never substitute its own failure for a primary one); the ACTION's own checkout hard-fails
+# (below), and that red alarm job is itself a loud, unmissable signal.
 #
-# SELF-CONTAINED BY DESIGN — and enforced, not merely claimed (review P2): the action performs its
-# OWN pinned checkout of the registry at the RUNNING WORKFLOW's commit (${{ github.sha }}, sparse:
-# just scripts/pipeline-alarm.py) into a private action-owned path, and executes ONLY that copy. It
-# NEVER prefers ${GITHUB_WORKSPACE}/scripts — a workspace copy is whatever the calling job's earlier
-# steps left there, and the documented in-job usage runs AFTER those steps, so a hostile target
-# checkout could otherwise substitute the script that receives the registry/alert tokens. The
-# isolated checkout works whether or not the caller ever checked the registry out, and its own
-# failure degrades fail-soft (continue-on-error + a loud ::error:: annotation), never masking the
-# primary failure and never reddening a healthy `mode: resolve` run.
+# FRESH-JOB-ONLY BY CONTRACT (round-3 review P2 — the prior "hostile-workspace safe" claim was
+# FALSE and is deleted): a local `./.github/actions/...` composite is itself LOADED from the
+# caller's workspace checkout, so no amount of in-action hardening can defend against a hostile
+# step that ran EARLIER in the same job — such a step could rewrite this very file before it
+# loads. Therefore this action MUST only be invoked from a dedicated alarm/recover job whose
+# FIRST step is a pinned registry checkout and which runs no target/model code — exactly how
+# every registry workflow wires it (a `needs:`-gated always() job). Never append it after
+# untrusted steps.
+#
+# Within that contract, defense-in-depth is REAL and fail-closed: the action still performs its
+# own pinned checkout of scripts/pipeline-alarm.py at ${{ github.sha }} into an action-owned path
+# and executes ONLY that copy. The checkout HARD-FAILS the step on error (no continue-on-error,
+# no exists-check fallback), so a pre-existing file at that path can never be executed with the
+# registry/alert tokens: a failed checkout means nothing runs, and the red alarm/recover job is
+# itself the loud signal. (A red alarm job never masks the primary failure — it is a separate
+# always() job; the failing job's own red X stands regardless.)
 name: pipeline-alarm
 description: >-
-  Loud, deduped, credential-safe pipeline-failure alarm. Wire as the final
-  `if: ${{ failure() || cancelled() }}` step so no pipeline failure is ever silent.
+  Loud, deduped, credential-safe pipeline-failure alarm. Invoke ONLY from a dedicated
+  needs:-gated always() alarm/recover job (fresh-job-only contract — see header) so no
+  pipeline failure is ever silent.
 inputs:
   mode:
     description: >-
@@ -33,8 +42,8 @@ inputs:
     default: ""
   job-result:
     description: >-
-      The failing job's result. From a FINAL-alarm job pass `needs.<job>.result`; from an in-job
-      final step pass the empty string (the step only runs on failure(), so failure is implied).
+      The failing job's result — pass `needs.<job>.result` from the dedicated alarm job
+      (fresh-job-only contract; in-job final-step usage is NOT supported, see header).
     required: false
     default: "failure"
   failed-step:
@@ -72,14 +81,15 @@ inputs:
 runs:
   using: composite
   steps:
-    # The pinned ISOLATED checkout that makes the header's hostile-workspace guarantee true: the
-    # registry at the exact commit the running workflow was loaded from (github.sha — never a
+    # Pinned action-owned checkout (defense-in-depth under the fresh-job-only contract above):
+    # the registry at the exact commit the running workflow was loaded from (github.sha — never a
     # movable ref a concurrent push could swap under us), sparse to the one script, into an
-    # action-owned path. actions/checkout's default clean pass wipes anything a hostile earlier
-    # step pre-planted at this path. continue-on-error: an unreachable checkout must neither mask
-    # the primary failure nor redden a healthy resolve run — the run step below degrades LOUD.
-    - name: Isolated pinned checkout of the registry alarm script
-      continue-on-error: true
+    # action-owned path. actions/checkout's default clean pass wipes anything pre-existing at
+    # this path. HARD-FAIL by design (round-3 P2: continue-on-error + an exists-check let a
+    # pre-existing file surviving a failed checkout run with both tokens): if this checkout
+    # fails, the composite ABORTS here — nothing below executes, no pre-existing file can ever
+    # be run, and the red alarm/recover job is itself the loud failure surface.
+    - name: Pinned checkout of the registry alarm script (hard-fail)
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         repository: ${{ github.repository }}
@@ -109,16 +119,15 @@ runs:
         set -uo pipefail
         printf '::add-mask::%s\n' "$ALARM_GH_TOKEN"
         if [ -n "${ALERT_TOKEN:-}" ]; then printf '::add-mask::%s\n' "$ALERT_TOKEN"; fi
-        # ONLY the isolated pinned checkout above — NEVER a caller-workspace copy, which the
-        # calling job's earlier (possibly hostile-target) steps could have substituted before this
-        # final step runs with the registry/alert tokens in its environment.
+        # ONLY the action-owned pinned checkout above — never a caller-workspace copy. The
+        # checkout step HARD-FAILS on error, so reaching this line means the file below came from
+        # the pinned sparse checkout; a missing file here is an invariant breach and FAILS the
+        # step (round-3 P2: it must never fall back to executing anything pre-existing, and a
+        # silent exit-0 would hide a broken alarm).
         script="${GITHUB_WORKSPACE}/.pipeline-alarm-isolated/scripts/pipeline-alarm.py"
         if [ ! -f "$script" ]; then
-          # Degrade LOUD but never mask the primary failure (the script IS the alarm; if even its
-          # isolated checkout failed, this annotation is the alarm surface). exit 0 also keeps a
-          # healthy `mode: resolve` run green (recovery is best-effort, retried next tick).
-          echo "::error::pipeline-alarm: isolated pinned checkout failed — pipeline ${ALARM_MODE} for ${GITHUB_WORKFLOW}/${GITHUB_JOB} is NOT recorded to an issue (a failure is still red in Actions; a recovery retries next healthy tick)"
-          exit 0
+          echo "::error::pipeline-alarm: pinned checkout succeeded but the alarm script is absent — refusing to run anything else (pipeline ${ALARM_MODE} for ${GITHUB_WORKFLOW}/${GITHUB_JOB} is NOT recorded; this red job is the alarm surface)"
+          exit 1
         fi
         # Self-test first (the alarm's own correctness is load-bearing); a self-test failure still
         # degrades to an annotation, never to masking the primary failure.

@@ -34,9 +34,12 @@
 #       red X with the alarm's own). Its own internal failure degrades to a plain `::error::`
 #       annotation. The load-bearing invariant, enforced by --self-test.
 #
-# The alert body table is bounded to MAX_TABLE_ROWS newest classes and each cell is redacted; the
-# ledger-of-failures lives in the issue body itself (a hidden JSON block), so no extra data branch
-# is needed and a torn issue-read degrades to "append a fresh row" rather than losing the alarm.
+# The alert body table is bounded to MAX_TABLE_ROWS newest classes and each cell is redacted. The
+# DURABLE record of each failure is an atomic issue COMMENT (server-serialized append — see the
+# concurrency-model note at MAX_WRITE_ATTEMPTS); the issue body is a materialized view of the
+# comment log plus the hidden JSON ledger block (rows + fold watermark), so no extra data branch
+# is needed, a torn issue-read degrades to "append a fresh row", and a concurrent body clobber
+# self-heals from the log rather than losing the alarm.
 
 import argparse
 import json
@@ -57,19 +60,39 @@ ALERT_COLOR = "b60205"
 MARKER = "<!-- pipeline-alarm:rolling -->"            # keys the single rolling issue's upsert
 LEDGER_MARKER_OPEN = "<!-- pipeline-alarm:ledger"     # opens the hidden JSON failure ledger block
 LEDGER_MARKER_CLOSE = "pipeline-alarm:ledger -->"
+ROW_COMMENT_MARKER = "<!-- pipeline-alarm:row -->"    # keys a durable per-failure row comment
 ALERT_TITLE = "⚠️ pipeline failures"
+# Comment-fold trust gate: comments are world-writable on a public repo, so only a row comment
+# authored by the repo's own actors (the workflow bot / a collaborator) may be folded into the
+# ledger — the same trusted-association posture dispatch.yml applies to target issues. An
+# untrusted row comment is IGNORED (never folded), so a drive-by commenter cannot inject rows.
+TRUSTED_COMMENT_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
-# --- bounds (WHY): the issue body is the durable store; keep it small + readable. ----------------
+# --- bounds (WHY): the issue body is the rendered view; keep it small + readable. ----------------
 MAX_TABLE_ROWS = 30          # newest N (workflow/job/class) rows shown in the table + kept in ledger
 MAX_DETAIL_LEN = 400         # per-row sanitized diagnostic tail cap (chars)
 GH_TIMEOUT_S = 45            # per gh call
-# Optimistic-concurrency bound: the issue body is a SHARED ledger with no server-side CAS, so every
-# writer runs a read/merge/write/RE-READ loop — if the re-read shows a concurrent writer clobbered
-# our merge (our row absent / our prune undone), we retry against THEIR body so concurrent alarms
-# MERGE instead of overwrite. Bounded: exhaustion degrades to a loud ::error:: (fail-soft), and the
-# row retries on the next failing tick anyway.
+# CONCURRENCY MODEL (round-3 P1: the body-only optimistic loop could still LOSE a row — A edits and
+# verifies, then B overwrites from a stale base and verifies only its own row). GitHub issues offer
+# no server-side CAS on the body, so the body can never be the durable store under concurrency.
+# The protocol is therefore two-layer:
+#   LAYER 1 (durability, server-serialized): every failure row is APPENDED as an issue COMMENT
+#   first (`_append_row_comment`). Comment creation is atomic — each writer gets its own
+#   monotonically-increasing comment id — so a concurrent writer can NEVER erase another's row.
+#   LAYER 2 (visibility): the body is a MATERIALIZED VIEW. Each writer folds every trusted pending
+#   row comment newer than the body's `folded_through` watermark into the ledger, merges its own
+#   row, and writes body+watermark atomically (one edit). A clobbered body write loses the
+#   watermark advance TOGETHER with the folded rows, so the next writer re-folds exactly what the
+#   lost write had folded — the view self-heals from the comment log; nothing is ever lost.
+# The read/merge/edit/RE-READ retry loop below remains as the fast path that usually converges the
+# view within the same tick. Bounded: exhaustion degrades to a loud ::error:: (fail-soft) — but the
+# row itself is already durable in the comment log by then.
 MAX_WRITE_ATTEMPTS = 4
-RETRY_SLEEP_S = 0.5          # small linear backoff between optimistic-concurrency retries
+RETRY_SLEEP_S = 0.5          # small linear backoff between view-convergence retries
+MAX_FOLD_COMMENTS = 50       # oldest-first pending-comment fold bound per write (rest fold next tick)
+GC_MIN_AGE_S = 3600          # never GC a folded row comment younger than this (job timeouts are
+                             # minutes, so no in-flight stale writer's watermark regression can
+                             # reach a comment this old)
 
 # --- credential-safe redaction (reuse worker-live.sh's "sanitized class only" posture) ----------
 # Any diagnostic string is scrubbed BEFORE it can reach the issue body. These patterns are
@@ -121,7 +144,8 @@ def _sanitize(text):
     # forged `<!-- pipeline-alarm:ledger ... -->` pair can never truncate/wipe the accumulated JSON
     # ledger on the next _parse_ledger tick. (Char-stripping alone would break the `<!--` but the
     # `pipeline-alarm:ledger` word-run would survive; kill the whole marker token explicitly.)
-    for marker in (LEDGER_MARKER_OPEN, LEDGER_MARKER_CLOSE, MARKER, "pipeline-alarm:ledger"):
+    for marker in (LEDGER_MARKER_OPEN, LEDGER_MARKER_CLOSE, MARKER, ROW_COMMENT_MARKER,
+                   "pipeline-alarm:ledger", "pipeline-alarm:row"):
         s = s.replace(marker, "[marker]")
     # single line, printable only, bounded; strip markdown-active + table-breaking chars so a
     # detail can never inject a link/image/mention or forge a delimiter into the issue body
@@ -151,18 +175,60 @@ def classify_failure(job_result, step_conclusion, cancelled):
 # ------------------------------------------------------------------------------------------------
 # issue body (de)serialization: the hidden JSON ledger + the rendered table
 # ------------------------------------------------------------------------------------------------
-def _parse_ledger(body):
-    """Extract the hidden JSON failure ledger from an existing issue body. A torn/garbled/missing
-    ledger degrades to [] (the alarm APPENDS a fresh row rather than ever losing the signal)."""
+def _safe_count(value, default=0):
+    """int() that can never raise on hostile ledger data (round-3 P1: a retained `"count":"oops"`
+    row reached int() in render_body and wedged EVERY subsequent alarm)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_row(row):
+    """Validate + coerce one ledger/comment row of HOSTILE data into the canonical shape, or None
+    when the row is unkeyable (no usable workflow/job/failure_class — merging is impossible, so it
+    is DROPPED; round-3 P1: a semantically malformed retained row must never wedge the alarm).
+    Rebuilds a fresh dict so unknown/hostile extra fields never persist through the ledger."""
+    if not isinstance(row, dict):
+        return None
+    out = {}
+    for field in ("workflow", "job", "failure_class"):
+        value = row.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        out[field] = value
+    out["count"] = max(1, _safe_count(row.get("count", 1), 1))
+    last_seen = row.get("last_seen")
+    out["last_seen"] = last_seen if isinstance(last_seen, str) else ""
+    first_seen = row.get("first_seen")
+    if isinstance(first_seen, str):
+        out["first_seen"] = first_seen
+    detail = row.get("detail")
+    out["detail"] = detail if isinstance(detail, str) else None
+    failed_step = row.get("failed_step")
+    out["failed_step"] = failed_step if isinstance(failed_step, str) else ""
+    url = row.get("run_url")
+    out["run_url"] = url if isinstance(url, str) else ""
+    return out
+
+
+def _parse_ledger_doc(body):
+    """Extract (rows, folded_through) from the hidden JSON ledger block of an issue body.
+    `folded_through` is the comment-fold watermark: every durable row comment with id <= it has
+    already been merged into `rows` by some successful body write. A torn/garbled/missing ledger
+    degrades to ([], 0) — the alarm APPENDS a fresh row (and re-folds the comment log) rather than
+    ever losing the signal. Every row is validated/coerced (_coerce_row); malformed rows are
+    DROPPED so a hostile/corrupt persisted ledger can never wedge subsequent alarms. The legacy
+    bare-list format (pre-watermark) parses as (rows, 0)."""
     if not body:
-        return []
+        return [], 0
     start = body.find(LEDGER_MARKER_OPEN)
     if start < 0:
-        return []
+        return [], 0
     start = body.find("\n", start)
     end = body.find(LEDGER_MARKER_CLOSE, start if start >= 0 else 0)
     if start < 0 or end < 0:
-        return []
+        return [], 0
     blob = body[start:end].strip()
     # blob is a ```json fenced block; strip fences defensively
     blob = blob.strip("`").strip()
@@ -170,9 +236,22 @@ def _parse_ledger(body):
         blob = blob[4:].strip()
     try:
         data = json.loads(blob)
-        return data if isinstance(data, list) else []
     except (ValueError, TypeError):
-        return []
+        return [], 0
+    if isinstance(data, dict):
+        raw_rows = data.get("rows")
+        folded_through = max(0, _safe_count(data.get("folded_through"), 0))
+    else:
+        raw_rows, folded_through = data, 0
+    if not isinstance(raw_rows, list):
+        return [], folded_through
+    rows = [coerced for coerced in (_coerce_row(row) for row in raw_rows) if coerced is not None]
+    return rows, folded_through
+
+
+def _parse_ledger(body):
+    """Rows-only view of _parse_ledger_doc (the watermark is a body-write concern)."""
+    return _parse_ledger_doc(body)[0]
 
 
 def _merge_row(ledger, new_row):
@@ -182,7 +261,7 @@ def _merge_row(ledger, new_row):
     key = (new_row["workflow"], new_row["job"], new_row["failure_class"])
     for row in ledger:
         if (row.get("workflow"), row.get("job"), row.get("failure_class")) == key:
-            row["count"] = int(row.get("count", 0)) + 1
+            row["count"] = _safe_count(row.get("count", 0), 0) + 1
             row["last_seen"] = new_row["last_seen"]
             row["run_url"] = new_row["run_url"]
             row["detail"] = new_row["detail"]
@@ -208,22 +287,31 @@ def _sanitize_row(row):
     out["failed_step"] = _sanitize(row.get("failed_step") or "")
     url = row.get("run_url", "")
     out["run_url"] = url if isinstance(url, str) and url.startswith("https://") else ""
+    # count/last_seen are structural, not free-text, but a tampered ledger can carry any type in
+    # them — normalize so nothing non-JSON-safe or int()-hostile survives into the persisted block.
+    if "count" in out:
+        out["count"] = max(1, _safe_count(out.get("count"), 1))
+    if not isinstance(out.get("last_seen", ""), str):
+        out["last_seen"] = ""
     return out
 
 
 def _prune(ledger):
     """Keep the newest MAX_TABLE_ROWS rows by last_seen so the body stays bounded + readable, and
     re-sanitize every retained row (defense-in-depth against a tampered/inherited ledger)."""
-    ledger.sort(key=lambda r: r.get("last_seen", ""), reverse=True)
+    ledger.sort(key=lambda r: str(r.get("last_seen", "")), reverse=True)
     return [_sanitize_row(r) for r in ledger[:MAX_TABLE_ROWS]]
 
 
-def render_body(ledger, maintainer):
+def render_body(ledger, maintainer, folded_through=0):
     """Render the rolling failure issue: the marker, a maintainer @-mention, the compact
-    class×count×last-seen×run-link table, and the hidden JSON ledger block for the next tick.
-    EVERY rendered cell is re-sanitized — the body is the only thing a human reads, so nothing
-    unsanitized may reach it even if a prior tick's ledger was tampered."""
-    total = sum(int(r.get("count", 0)) for r in ledger)
+    class×count×last-seen×run-link table, and the hidden JSON ledger block for the next tick
+    (rows + the comment-fold watermark, written ATOMICALLY together in one body — the property the
+    self-healing fold protocol rests on). EVERY rendered cell is re-sanitized — the body is the
+    only thing a human reads, so nothing unsanitized may reach it even if a prior tick's ledger
+    was tampered — and every count read is exception-proof (_safe_count), so a semantically
+    malformed retained row can never wedge the render (round-3 P1)."""
+    total = sum(_safe_count(r.get("count"), 0) for r in ledger)
     lines = [
         MARKER,
         f"> 🤖 SPARQ agent — automated pipeline-failure alarm. @{maintainer}",
@@ -240,14 +328,14 @@ def render_body(ledger, maintainer):
         wf = _sanitize(r.get("workflow", "?"))
         job = _sanitize(r.get("job", "?"))
         cls = _sanitize(r.get("failure_class", "?"))
-        cnt = int(r.get("count", 0))
+        cnt = _safe_count(r.get("count"), 0)
         last = _sanitize(r.get("last_seen", "?"))
         url = r.get("run_url", "")
         run_cell = f"[run]({url})" if url.startswith("https://") else "—"
         lines.append(f"| {wf} | {job} | `{cls}` | {cnt} | {last} | {run_cell} |")
     lines.append("")
     lines.append("**Most recent diagnostic tails (credential-safe, host-observable only):**")
-    for r in sorted(ledger, key=lambda x: x.get("last_seen", ""), reverse=True)[:5]:
+    for r in sorted(ledger, key=lambda x: str(x.get("last_seen", "")), reverse=True)[:5]:
         step = _sanitize(r.get("failed_step") or "")
         detail = _sanitize(r.get("detail"))
         loc = f" · step `{step}`" if step and step != "(no diagnostic captured)" else ""
@@ -258,11 +346,13 @@ def render_body(ledger, maintainer):
                  "Recovery IS auto-detected: a healthy run of a workflow prunes its rows, and the "
                  "issue auto-closes once the ledger empties (ported from the plan-alert #51 "
                  "auto-close-on-heal, generalized to every workflow)._")
-    # hidden ledger for the next tick
+    # hidden ledger for the next tick: rows + comment-fold watermark, one atomic body write
     lines.append("")
     lines.append(f"{LEDGER_MARKER_OPEN}")
     lines.append("```json")
-    lines.append(json.dumps(_prune(ledger), separators=(",", ":")))
+    lines.append(json.dumps({"rows": _prune(ledger),
+                             "folded_through": max(0, _safe_count(folded_through, 0))},
+                            separators=(",", ":")))
     lines.append("```")
     lines.append(f"{LEDGER_MARKER_CLOSE}")
     return "\n".join(lines)
@@ -358,15 +448,140 @@ def _create_issue(repo, token, rendered):
     return int(match.group(1)) if match else 0   # 0 = created but number unknown (best-effort)
 
 
+# ------------------------------------------------------------------------------------------------
+# durable row-comment log (LAYER 1 of the concurrency protocol — see the MAX_WRITE_ATTEMPTS note)
+# ------------------------------------------------------------------------------------------------
+def _row_comment_body(row):
+    """A durable row comment: the hidden marker + the sanitized row as a fenced JSON block. The
+    row is _sanitize_row'd by the caller, and _sanitize strips backticks/angle-brackets from every
+    free-text field, so a hostile detail can neither close the fence early nor forge a marker."""
+    payload = json.dumps(_sanitize_row(row), separators=(",", ":"), sort_keys=True)
+    return (f"{ROW_COMMENT_MARKER}\n"
+            "⚠️ failure row durably recorded (folds into the table above on the next write).\n"
+            f"```json\n{payload}\n```")
+
+
+def _append_row_comment(num, repo, token, row):
+    """ATOMIC durable append of the failure row as an issue comment — the server assigns each
+    comment its own monotonically-increasing id, so concurrent writers can never erase each
+    other's rows (the round-3 lost-update repro is impossible at this layer). Returns the comment
+    id, 0 when created-but-id-unreadable, or None on failure (caller degrades to body-merge-only,
+    loudly)."""
+    proc = _gh(["api", f"repos/{repo}/issues/{int(num)}/comments",
+                "-f", f"body={_row_comment_body(row)}"], token, capture=True)
+    if proc.returncode != 0:
+        return None
+    try:
+        doc = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return 0
+    cid = doc.get("id") if isinstance(doc, dict) else None
+    return cid if isinstance(cid, int) and not isinstance(cid, bool) and cid > 0 else 0
+
+
+def _list_row_comments(num, repo, token):
+    """[(comment_id, coerced_row, created_at)] of every TRUSTED pending row comment on the rolling
+    issue, oldest-first, bounded to MAX_FOLD_COMMENTS (the rest fold next tick — delayed, never
+    lost). Untrusted authors are ignored (comment-injection gate: comments are world-writable on a
+    public repo; only the workflow bot / collaborators may feed the ledger). Returns None when the
+    listing itself failed (callers degrade to a body-only write — fail-soft), [] when readable but
+    empty/garbled."""
+    proc = _gh(["api", "--paginate", "--slurp",
+                f"repos/{repo}/issues/{int(num)}/comments?per_page=100"], token, capture=True)
+    if proc.returncode != 0:
+        return None
+    try:
+        pages = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return []
+    if not isinstance(pages, list):
+        return []
+    comments = []
+    for page in pages:                       # --slurp wraps pages: [[...], [...]]
+        if isinstance(page, list):
+            comments.extend(page)
+        elif isinstance(page, dict):         # tolerate an unwrapped single page
+            comments.append(page)
+    out = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        cid = comment.get("id")
+        body = comment.get("body")
+        if (not isinstance(cid, int) or isinstance(cid, bool) or cid <= 0
+                or not isinstance(body, str) or ROW_COMMENT_MARKER not in body):
+            continue
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        login = user.get("login") if isinstance(user.get("login"), str) else ""
+        association = str(comment.get("author_association") or "").upper()
+        if not (login.endswith("[bot]") or association in TRUSTED_COMMENT_ASSOCIATIONS):
+            continue
+        match = re.search(r"```json\s*(\{.*?\})\s*```", body, re.DOTALL)
+        if not match:
+            continue
+        try:
+            row = _coerce_row(json.loads(match.group(1)))
+        except ValueError:
+            continue
+        if row is None:
+            continue
+        out.append((cid, row, str(comment.get("created_at") or "")))
+    out.sort(key=lambda entry: entry[0])
+    return out[:MAX_FOLD_COMMENTS]
+
+
+def _fold_pending(rows, pending, own_comment_id, folded_through):
+    """Merge every pending row comment newer than the watermark into `rows`; returns
+    (rows, new_watermark). The caller merges its OWN row in-memory (fresher detail), so its own
+    comment id only advances the watermark. Because the watermark is written atomically WITH the
+    folded rows in one body edit, a clobbered write regresses both together and the next fold
+    repeats exactly the lost work — idempotent, so a row can neither be lost nor double-counted."""
+    watermark = folded_through
+    for cid, row, _created in pending or []:
+        if cid <= folded_through:
+            continue
+        if own_comment_id and cid == own_comment_id:
+            watermark = max(watermark, cid)
+            continue
+        rows = _merge_row(rows, dict(row))
+        watermark = max(watermark, cid)
+    return rows, watermark
+
+
+def _gc_folded_comments(num, repo, token, pending, folded_through, now=None):
+    """Best-effort deletion of row comments a durable body write has ALREADY folded (id <= the
+    watermark READ from the body, i.e. covered before this write even started). Age-gated by
+    GC_MIN_AGE_S: any concurrent stale writer's watermark regression is bounded by job lifetimes
+    (minutes), so it can never reach back to a comment this old — deletion cannot orphan a row.
+    Bounded per tick; a failed delete just retries on a later tick."""
+    deleted = 0
+    now_dt = _now(now)
+    for cid, _row, created in pending or []:
+        if cid > folded_through or deleted >= 10:
+            continue
+        try:
+            age = (now_dt - datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ")
+                   .replace(tzinfo=timezone.utc)).total_seconds()
+        except ValueError:
+            continue
+        if age < GC_MIN_AGE_S:
+            continue
+        _gh(["api", "-X", "DELETE", f"repos/{repo}/issues/comments/{cid}"], token)
+        deleted += 1
+
+
 def upsert_alarm(new_row, repo, token, maintainer):
-    """Idempotent single-rolling-issue upsert under OPTIMISTIC CONCURRENCY. The issue body is a
-    shared ledger with no server-side CAS, so every write is read/merge/edit/RE-READ: if the re-read
-    shows a concurrent writer overwrote our merge (our row absent), we retry the merge against
-    THEIR body — concurrent alarms from different workflows MERGE instead of losing rows. Racing
-    first-creates converge on the lowest-numbered marker issue (the loser closes its duplicate and
-    folds its row in). A verify that finds the issue CLOSED (a racing --resolve closed it after our
-    row landed) REOPENS it — a live failure row never hides behind a closed alert. Every gh return
-    code is checked; failure degrades LOUD to ::error:: and never raises (fail-soft)."""
+    """Idempotent single-rolling-issue upsert under the TWO-LAYER protocol (see the
+    MAX_WRITE_ATTEMPTS note): the row is first APPENDED as a durable issue comment (atomic,
+    server-serialized — a concurrent writer can never erase it, closing the round-3 lost-update),
+    then the body view is converged via read/fold/merge/edit/RE-READ. Racing first-creates
+    converge on the lowest-numbered marker issue (the loser closes its duplicate and folds its
+    row in). A CLOSED issue must be SUCCESSFULLY reopened before the row write counts (round-3
+    P1: a failed reopen used to report success while the alarm stayed hidden behind a closed
+    issue) — the reopen rc is checked, transient failures retry, and the post-write verify
+    re-checks the final state is OPEN, reopening (rc-checked) if a racing --resolve closed it.
+    Every gh return code is checked; failure degrades LOUD to ::error:: and never raises
+    (fail-soft)."""
     if not repo or not token:
         print("::error::pipeline-alarm: no alert repo/token resolved; failure NOT recorded to an "
               "issue (still visible as the run's red X). Set REGISTRY_REPO + a token env.")
@@ -377,14 +592,15 @@ def upsert_alarm(new_row, repo, token, maintainer):
     # Sanitize the key fields UP FRONT so the merge key matches the (sanitized) persisted ledger —
     # otherwise a workflow name carrying a stripped char could never verify and would spin the loop.
     new_row = _sanitize_row(new_row)
+    own_comment_id = None      # set once the durable row comment lands (LAYER 1)
     for attempt in range(MAX_WRITE_ATTEMPTS):
         if attempt:
             time.sleep(RETRY_SLEEP_S * attempt)
         num, body = _find_rolling_issue(repo, token, "open")
-        reopened = False
+        was_closed = False
         if num is None:
             num, body = _find_rolling_issue(repo, token, "closed")
-            reopened = num is not None
+            was_closed = num is not None
         if num is None:
             rendered = render_body(_prune(_merge_row([], dict(new_row))), maintainer)
             created = _create_issue(repo, token, rendered)
@@ -403,31 +619,71 @@ def upsert_alarm(new_row, repo, token, maintainer):
                 continue
             print("::warning::pipeline-alarm: raised the rolling pipeline-failure alert")
             return True
-        ledger = _merge_row(_parse_ledger(body), dict(new_row))
-        rendered = render_body(_prune(ledger), maintainer)
-        if reopened:
-            _gh(["issue", "reopen", str(num), "-R", repo], token)
+        if was_closed:
+            # The reopen MUST succeed before this attempt counts (round-3 P1: rc was ignored and
+            # both rows landed invisibly inside a still-CLOSED issue reported as success). A
+            # transient failure retries the loop; exhaustion falls through to the loud failure.
+            if _gh(["issue", "reopen", str(num), "-R", repo], token).returncode != 0:
+                print(f"::error::pipeline-alarm: reopening closed alert #{num} FAILED "
+                      f"(attempt {attempt + 1}/{MAX_WRITE_ATTEMPTS}); the failure row must not "
+                      "hide behind a closed issue — retrying")
+                continue
+        if own_comment_id is None:
+            # LAYER 1: durable, atomic row append. From here the row can no longer be lost to any
+            # concurrent body write — the view below merely makes it visible in the table.
+            own_comment_id = _append_row_comment(num, repo, token, new_row)
+            if own_comment_id is None:
+                print("::warning::pipeline-alarm: durable row-comment append failed; relying on "
+                      "the body merge alone this tick")
+        rows, folded_before = _parse_ledger_doc(body)
+        pending = _list_row_comments(num, repo, token)
+        # The watermark may only advance through ids the fold actually SAW: when the listing
+        # succeeded it includes our own just-appended comment (folded via the in-memory merge), so
+        # the watermark covers it; when the listing FAILED, the watermark must stay put — jumping
+        # to our own id would silently claim every lower unfolded id (another writer's pending
+        # row) as folded and orphan it. The fail direction of a stuck watermark is a duplicate
+        # count bump on a later re-fold, never a lost row.
+        rows, watermark = _fold_pending(rows, pending, own_comment_id, folded_before)
+        rows = _merge_row(rows, dict(new_row))
+        rendered = render_body(_prune(rows), maintainer, folded_through=watermark)
         rc = _gh(["issue", "edit", str(num), "-R", repo, "--body", rendered], token).returncode
         if rc != 0:
+            if own_comment_id is not None:
+                print(f"::warning::pipeline-alarm: body refresh failed on #{num}, but the failure "
+                      "row IS durably recorded as a comment on the alert and folds into the table "
+                      "on the next write")
+                return True
             print("::error::pipeline-alarm: updating the alert FAILED (retries next failing "
                   "tick); primary failure still visible as the run's red X")
             return False
-        # RE-READ verify: did our merge survive, or did a concurrent writer clobber it?
+        # RE-READ verify: did our merge survive, or did a concurrent writer clobber the view?
         current, state = _issue_view(num, repo, token)
         if current is None or _row_reflected(current, new_row):
-            # (an unreadable verify degrades to trusting our own write — fail-soft; the row
-            # re-merges on the next failing tick regardless)
-            if state and state.upper() == "CLOSED" and not reopened:
-                # close-vs-failure race: a concurrent --resolve closed the issue AFTER our row
-                # landed. A live failure row must never hide behind a closed alert — reopen.
-                _gh(["issue", "reopen", str(num), "-R", repo], token)
+            # (an unreadable verify degrades to trusting our own write — fail-soft; the row is
+            # durable in the comment log regardless)
+            if state and state.upper() == "CLOSED":
+                # Final state MUST be OPEN (round-3 P1) — whether we reopened above and something
+                # re-closed it, or a concurrent --resolve closed over our fresh row. rc-checked:
+                # a failed reopen is a FAILURE, never silent success behind a closed alert.
+                if _gh(["issue", "reopen", str(num), "-R", repo], token).returncode != 0:
+                    print(f"::error::pipeline-alarm: alert #{num} is CLOSED over a live failure "
+                          "row and reopening FAILED; retrying next failing tick")
+                    return False
                 print(f"::warning::pipeline-alarm: reopened #{num} — a concurrent recovery "
                       "closed it over this still-live failure row")
-            print(f"::warning::pipeline-alarm: {'reopened' if reopened else 'refreshed'} "
+            # GC only comments the PRE-EXISTING body watermark already covered (folded by a prior
+            # durable write), never anything folded first by this write.
+            _gc_folded_comments(num, repo, token, pending, folded_before)
+            print(f"::warning::pipeline-alarm: {'reopened' if was_closed else 'refreshed'} "
                   f"the rolling pipeline-failure alert (#{num})")
             return True
-        print(f"::warning::pipeline-alarm: concurrent writer clobbered the merge on #{num}; "
+        print(f"::warning::pipeline-alarm: concurrent writer clobbered the view on #{num}; "
               f"retrying against the fresh body (attempt {attempt + 1}/{MAX_WRITE_ATTEMPTS})")
+    if own_comment_id is not None:
+        print(f"::warning::pipeline-alarm: the body view did not converge after "
+              f"{MAX_WRITE_ATTEMPTS} attempts, but the failure row IS durably recorded as a "
+              "comment on the alert and folds into the table on the next write")
+        return True
     print("::error::pipeline-alarm: could not converge the ledger merge after "
           f"{MAX_WRITE_ATTEMPTS} attempts of concurrent writes (retries next failing tick); "
           "primary failure still visible as the run's red X")
@@ -468,12 +724,14 @@ def resolve_alarm(workflow, repo, token, maintainer, now=None):
     workflows still failing, or a CONCURRENT new failure landed) the issue is refreshed; if the
     ledger empties, the rolling issue is COMMENTED + CLOSED (it reopens on the next failure).
 
-    Concurrency: the same read/edit/RE-READ optimistic loop as upsert_alarm — a concurrent writer
-    that clobbers the prune triggers a retry against the fresh body, and rows recorded AFTER this
-    healthy tick started (last_seen >= `before`) are never pruned, so --resolve cannot close over a
-    concurrent new failure. After a close, the body is re-read ONCE more: if a writer slipped a row
-    in between the verify and the close, the issue is REOPENED (the writer-side verify carries the
-    symmetric guard). A green tick with no open alert is a cheap no-op (one list).
+    Concurrency: the resolver participates in the same two-layer protocol as upsert_alarm — it
+    FOLDS every pending durable row comment into the ledger BEFORE deciding (a row whose writer's
+    body view was clobbered must be weighed, never closed over), then runs the read/edit/RE-READ
+    view-convergence loop. Rows recorded AFTER this healthy tick started (last_seen >= `before`)
+    are never pruned, so --resolve cannot close over a concurrent new failure. After a close, the
+    body AND the comment log are re-read once more: if a writer slipped a row in between the
+    verify and the close, the issue is REOPENED (the writer-side verify carries the symmetric
+    guard). A green tick with no open alert is a cheap no-op (one list).
     Fail-soft: every gh rc is checked, never raises, returns a bool for the self-test."""
     if not repo or not token:
         # No target to read/close — nothing to do on a healthy tick (do NOT redden: success path).
@@ -489,13 +747,21 @@ def resolve_alarm(workflow, repo, token, maintainer, now=None):
             # No open alert for this fleet — a healthy tick is a cheap no-op (matches #51's
             # green-tick-is-side-effect-free posture).
             return False
-        ledger = _parse_ledger(body)
+        ledger, folded_before = _parse_ledger_doc(body)
+        # Fold every pending durable row comment BEFORE deciding: a failure row that only exists
+        # in the comment log (its writer's body view was clobbered or never converged) must be
+        # weighed by the recovery decision, never closed over. The resolver had the symmetric
+        # stale-write race (round-3 P1); with the comment log as source of truth, a row the prune
+        # never observed stays durable regardless of what this body write does.
+        pending = _list_row_comments(num, repo, token)
+        ledger, watermark = _fold_pending(ledger, pending, None, folded_before)
         kept, dropped = _resolve_ledger(ledger, workflow, before)
         if dropped == 0:
             # This workflow had no open failure rows; leave the alert untouched (another workflow
             # owns it). Never close an issue whose failures we did not just recover.
             return False
-        rendered = render_body(_prune(kept), maintainer) if kept else render_body([], maintainer)
+        rendered = render_body(_prune(kept), maintainer, folded_through=watermark) if kept \
+            else render_body([], maintainer, folded_through=watermark)
         rc = _gh(["issue", "edit", str(num), "-R", repo, "--body", rendered], token).returncode
         if rc != 0:
             print("::error::pipeline-alarm: pruning the recovered rows FAILED (retries next tick)")
@@ -520,9 +786,12 @@ def resolve_alarm(workflow, repo, token, maintainer, now=None):
             print("::error::pipeline-alarm: closing the recovered alert FAILED (retries next tick)")
             return False
         # Close-vs-failure race guard: re-read AFTER the close — a writer that landed a row
-        # between our verify and the close must not stay hidden behind a closed alert.
+        # (in the body OR as a durable row comment newer than our fold watermark) between our
+        # verify and the close must not stay hidden behind a closed alert.
         post, _post_state = _issue_view(num, repo, token)
-        if post is not None and _parse_ledger(post):
+        post_pending = _list_row_comments(num, repo, token)
+        if ((post is not None and _parse_ledger(post))
+                or any(cid > watermark for cid, _row, _created in post_pending or [])):
             _gh(["issue", "reopen", str(num), "-R", repo], token)
             print(f"::warning::pipeline-alarm: reopened #{num} — a failure row landed "
                   "concurrently with the recovery close")
@@ -1173,6 +1442,376 @@ def _self_test():
         resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr", now=now)
         chk("a failure landing at close time REOPENS the alert (never silently closed)",
             race["reopened"], 1)
+    finally:
+        globals()["_gh"] = real_gh
+
+# --- HOSTILE LEDGER (round-3 P1): a semantically malformed retained row must never wedge -----
+    # the alarm. The reviewer reproduced `"count":"oops"` reaching int() in render_body and raising
+    # on EVERY subsequent alarm. Coercion at parse (+_safe_count everywhere) must drop/repair.
+    chk("coerce: non-dict row dropped", _coerce_row("not-a-dict"), None)
+    chk("coerce: unkeyable row dropped (blank workflow)",
+        _coerce_row({"workflow": "", "job": "j", "failure_class": "c"}), None)
+    chk("coerce: missing failure_class dropped", _coerce_row({"workflow": "w", "job": "j"}), None)
+    ok("coerce: count 'oops' repairs to 1",
+       _coerce_row({"workflow": "w", "job": "j", "failure_class": "c",
+                    "count": "oops"})["count"] == 1)
+    ok("coerce: count None repairs to 1",
+       _coerce_row({"workflow": "w", "job": "j", "failure_class": "c",
+                    "count": None})["count"] == 1)
+    ok("coerce: count list repairs to 1",
+       _coerce_row({"workflow": "w", "job": "j", "failure_class": "c",
+                    "count": [9, 9]})["count"] == 1)
+    ok("coerce: non-str last_seen repairs to ''",
+       _coerce_row({"workflow": "w", "job": "j", "failure_class": "c",
+                    "last_seen": 12345})["last_seen"] == "")
+    ok("coerce: hostile extra fields never persist",
+       "evil" not in _coerce_row({"workflow": "w", "job": "j", "failure_class": "c",
+                                  "evil": "payload"}))
+    hostile_rows = [
+        {"workflow": "wa", "job": "ja", "failure_class": "job-failure", "count": "oops",
+         "last_seen": "2026-07-18T10:00:00Z", "run_url": "https://x/1", "detail": "d",
+         "failed_step": ""},
+        "not-a-dict",
+        {"workflow": "", "job": "j", "failure_class": "c", "count": 2},
+        {"workflow": "wb", "job": "jb", "failure_class": "job-failure", "count": None,
+         "last_seen": 12345, "run_url": None, "detail": {"k": "v"}},
+    ]
+    hostile_body = "\n".join([
+        MARKER, LEDGER_MARKER_OPEN, "```json",
+        json.dumps({"rows": hostile_rows, "folded_through": "evil"}),
+        "```", LEDGER_MARKER_CLOSE,
+    ])
+    hostile_parsed, hostile_wm = _parse_ledger_doc(hostile_body)
+    chk("hostile ledger: malformed rows dropped, repairable rows kept", len(hostile_parsed), 2)
+    chk("hostile ledger: non-int watermark coerces to 0", hostile_wm, 0)
+    ok("hostile ledger: every retained count is a usable int",
+       all(isinstance(r["count"], int) and r["count"] >= 1 for r in hostile_parsed))
+    rendered_hostile = render_body(hostile_parsed, "jeswr")   # must not raise (the repro'd wedge)
+    ok("hostile ledger renders (no int() wedge)", MARKER in rendered_hostile)
+    # a subsequent alarm against the hostile body must REPAIR the persisted ledger, not crash:
+    heal = {"body": hostile_body}
+
+    def hostile_gh(args, token, capture=False):
+        if args and args[0] == "api":
+            return subprocess.CompletedProcess(args, 0, "", "")
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 13, "body": heal["body"]}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            heal["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": heal["body"], "state": "OPEN"}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = hostile_gh
+    try:
+        ok("upsert against a hostile ledger succeeds (repairs, never wedges)",
+           upsert_alarm({"workflow": "wc", "job": "jc", "failure_class": "job-failure",
+                         "failed_step": "", "detail": "d", "run_url": "https://x/9",
+                         "last_seen": "2026-07-18T12:00:00Z"}, "jeswr/x", "tok", "jeswr") is True)
+        healed = _parse_ledger(heal["body"])
+        ok("hostile ledger is REPAIRED in place (all counts int, junk rows gone)",
+           len(healed) == 3 and all(isinstance(r.get("count"), int) for r in healed)
+           and any(r.get("workflow") == "wc" for r in healed))
+    finally:
+        globals()["_gh"] = real_gh
+    # legacy bare-list ledger format (pre-watermark bodies) still parses — a deploy across the
+    # format change must not drop the accumulated ledger.
+    legacy_body = "\n".join([
+        MARKER, LEDGER_MARKER_OPEN, "```json",
+        json.dumps([{"workflow": "w", "job": "j", "failure_class": "job-failure", "count": 2,
+                     "last_seen": "2026-07-18T10:00:00Z"}]),
+        "```", LEDGER_MARKER_CLOSE,
+    ])
+    legacy_rows, legacy_wm = _parse_ledger_doc(legacy_body)
+    chk("legacy list-format ledger still parses", len(legacy_rows), 1)
+    chk("legacy list-format ledger implies watermark 0", legacy_wm, 0)
+
+    # --- DURABLE ROW COMMENTS (round-3 P1: the body-only loop LOST rows under concurrency) ------
+    # The reproduced interleave: A writes+verifies, then B — merging from a STALE base — over-
+    # writes A's body and verifies only its own row. With the two-layer protocol A's row lives in
+    # the comment log, so B's stale-base fold restores it: the lost update is impossible.
+    def make_comment_gh(initial_body):
+        log = {"body": initial_body, "comments": [], "next_id": 101, "fail_listing": False}
+
+        def fake(args, token, capture=False):
+            if args and args[0] == "api":
+                if len(args) >= 4 and args[1].endswith("/comments") and args[2] == "-f":
+                    cid = log["next_id"]
+                    log["next_id"] += 1
+                    log["comments"].append({
+                        "id": cid, "body": args[3][len("body="):],
+                        "user": {"login": "github-actions[bot]"},
+                        "author_association": "NONE",
+                        "created_at": "2026-07-18T12:00:00Z"})
+                    return subprocess.CompletedProcess(args, 0, json.dumps({"id": cid}), "")
+                if "--slurp" in args:
+                    if log["fail_listing"]:
+                        return subprocess.CompletedProcess(args, 1, "", "boom")
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps([log["comments"]]), "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+            verb = args[1] if len(args) > 1 else ""
+            if verb == "list":
+                state = args[args.index("--state") + 1] if "--state" in args else ""
+                if state == "open":
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps([{"number": 21, "body": log["body"]}]), "")
+                return subprocess.CompletedProcess(args, 0, "[]", "")
+            if verb == "edit" and "--body" in args:
+                log["body"] = args[args.index("--body") + 1]
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if verb == "view":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"body": log["body"], "state": "OPEN"}), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return fake, log
+
+    base_body = render_body([], "jeswr")
+    row_a = {"workflow": "dispatch", "job": "plan", "failure_class": "job-failure",
+             "failed_step": "", "detail": "a", "run_url": "https://x/1",
+             "last_seen": "2026-07-18T12:00:00Z"}
+    row_b = {"workflow": "worker", "job": "run", "failure_class": "job-failure",
+             "failed_step": "", "detail": "b", "run_url": "https://x/2",
+             "last_seen": "2026-07-18T12:05:00Z"}
+    fake, log = make_comment_gh(base_body)
+    globals()["_gh"] = fake
+    try:
+        ok("writer A converges", upsert_alarm(dict(row_a), "jeswr/x", "tok", "jeswr") is True)
+        _rows_a, wm_a = _parse_ledger_doc(log["body"])
+        ok("A's durable comment landed and A's body write covers it (watermark advanced)",
+           len(log["comments"]) == 1 and wm_a >= log["comments"][0]["id"])
+        # B merges from a STALE base (the exact reproduced interleave: B never saw A's write)
+        log["body"] = base_body
+        ok("writer B (stale base) converges", upsert_alarm(dict(row_b), "jeswr/x", "tok",
+                                                           "jeswr") is True)
+        final_rows = _parse_ledger(log["body"])
+        ok("A's row SURVIVES B's stale-base overwrite (folded from the durable comment log — "
+           "the round-3 lost-update is impossible)",
+           any(r.get("workflow") == "dispatch" for r in final_rows)
+           and any(r.get("workflow") == "worker" for r in final_rows))
+    finally:
+        globals()["_gh"] = real_gh
+    # Worst case: B cannot even LIST the comment log (fold degraded) and clobbers A's view. A's
+    # row must still be durable (pending comment above the watermark) and the NEXT writer heals
+    # the view from the log.
+    fake, log = make_comment_gh(base_body)
+    globals()["_gh"] = fake
+    try:
+        upsert_alarm(dict(row_a), "jeswr/x", "tok", "jeswr")
+        log["body"] = base_body          # B reads a stale base…
+        log["fail_listing"] = True       # …and its comment-log fold fails
+        upsert_alarm(dict(row_b), "jeswr/x", "tok", "jeswr")
+        rows_after_b, wm_after_b = _parse_ledger_doc(log["body"])
+        ok("degraded-fold clobber: A's row is out of the VIEW but never out of the LOG",
+           all(r.get("workflow") != "dispatch" for r in rows_after_b)
+           and any(c["id"] > wm_after_b and "dispatch" in c["body"] for c in log["comments"]))
+        log["fail_listing"] = False
+        upsert_alarm({"workflow": "groom", "job": "groom", "failure_class": "job-failure",
+                      "failed_step": "", "detail": "c", "run_url": "https://x/3",
+                      "last_seen": "2026-07-18T12:10:00Z"}, "jeswr/x", "tok", "jeswr")
+        healed_rows = _parse_ledger(log["body"])
+        ok("the next writer HEALS the view from the durable log (A restored)",
+           any(r.get("workflow") == "dispatch" for r in healed_rows)
+           and any(r.get("workflow") == "worker" for r in healed_rows)
+           and any(r.get("workflow") == "groom" for r in healed_rows))
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- comment-injection gate: an UNTRUSTED row comment is never folded ------------------------
+    inj_comments = [[
+        {"id": 301, "body": f"{ROW_COMMENT_MARKER}\n```json\n" + json.dumps(
+            {"workflow": "evil", "job": "evil", "failure_class": "job-failure"}) + "\n```",
+         "user": {"login": "drive-by-user"}, "author_association": "NONE",
+         "created_at": "2026-07-18T12:00:00Z"},
+        {"id": 302, "body": f"{ROW_COMMENT_MARKER}\n```json\n" + json.dumps(
+            {"workflow": "worker", "job": "run", "failure_class": "job-failure"}) + "\n```",
+         "user": {"login": "github-actions[bot]"}, "author_association": "NONE",
+         "created_at": "2026-07-18T12:00:00Z"},
+        {"id": 303, "body": f"{ROW_COMMENT_MARKER}\n```json\n" + json.dumps(
+            {"workflow": "groom", "job": "g", "failure_class": "job-failure"}) + "\n```",
+         "user": {"login": "jeswr"}, "author_association": "OWNER",
+         "created_at": "2026-07-18T12:00:00Z"},
+    ]]
+
+    def inj_gh(args, token, capture=False):
+        return subprocess.CompletedProcess(args, 0, json.dumps(inj_comments), "")
+
+    globals()["_gh"] = inj_gh
+    try:
+        listed = _list_row_comments(21, "jeswr/x", "tok")
+        chk("untrusted row comment is IGNORED (injection gate)",
+            [cid for cid, _r, _c in listed], [302, 303])
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- GC of folded comments: only ≤ watermark AND old enough --------------------------------
+    gc_deletes = []
+
+    def gc_gh(args, token, capture=False):
+        if args and args[0] == "api" and "-X" in args:
+            gc_deletes.append(args[-1])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = gc_gh
+    try:
+        gc_row = {"workflow": "w", "job": "j", "failure_class": "c", "count": 1,
+                  "last_seen": "", "detail": None, "failed_step": "", "run_url": ""}
+        _gc_folded_comments(21, "jeswr/x", "tok", [
+            (1, gc_row, "2026-07-18T09:00:00Z"),   # folded + old -> deleted
+            (2, gc_row, "2026-07-18T11:59:00Z"),   # folded but YOUNG -> kept (regression window)
+            (3, gc_row, "2026-07-18T09:00:00Z"),   # above the watermark -> NEVER deleted
+        ], 2, now=now)
+        chk("GC deletes only folded, old comments", gc_deletes,
+            ["repos/jeswr/x/issues/comments/1"])
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- REOPEN MUST SUCCEED (round-3 P1: a failed reopen was reported as success while the ----
+    # alarm stayed hidden behind a CLOSED issue). Transient failure retries; permanent failure
+    # returns False LOUDLY; the post-write verify enforces final-state-open too.
+    def make_reopen_gh(closed_body_text, reopen_rcs):
+        st = {"body": closed_body_text, "state": "CLOSED", "reopens": 0,
+              "rcs": list(reopen_rcs)}
+
+        def fake(args, token, capture=False):
+            if args and args[0] == "api":
+                return subprocess.CompletedProcess(args, 0, "", "")
+            verb = args[1] if len(args) > 1 else ""
+            if verb == "list":
+                state = args[args.index("--state") + 1] if "--state" in args else ""
+                if (state == "open") == (st["state"] == "OPEN"):
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps([{"number": 31, "body": st["body"]}]), "")
+                return subprocess.CompletedProcess(args, 0, "[]", "")
+            if verb == "reopen":
+                st["reopens"] += 1
+                rc = st["rcs"].pop(0) if st["rcs"] else 0
+                if rc == 0:
+                    st["state"] = "OPEN"
+                return subprocess.CompletedProcess(args, rc, "", "")
+            if verb == "edit" and "--body" in args:
+                st["body"] = args[args.index("--body") + 1]
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if verb == "view":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"body": st["body"], "state": st["state"]}), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return fake, st
+
+    closed_body2 = render_body([{"workflow": "w", "job": "j", "failure_class": "job-failure",
+                                 "count": 1, "last_seen": "2026-07-18T10:00:00Z",
+                                 "run_url": "https://x/1", "detail": "d"}], "jeswr")
+    flap_row = {"workflow": "w", "job": "j", "failure_class": "job-failure", "failed_step": "",
+                "detail": "again", "run_url": "https://x/2", "last_seen": "2026-07-18T12:00:00Z"}
+    fake, st = make_reopen_gh(closed_body2, [1, 0])
+    globals()["_gh"] = fake
+    try:
+        ok("transient reopen failure RETRIES and succeeds",
+           upsert_alarm(dict(flap_row), "jeswr/x", "tok", "jeswr") is True)
+        ok("the reopen was actually retried", st["reopens"] >= 2)
+        chk("final state is OPEN after the retried reopen", st["state"], "OPEN")
+    finally:
+        globals()["_gh"] = real_gh
+    fake, st = make_reopen_gh(closed_body2, [1, 1, 1, 1, 1, 1])
+    globals()["_gh"] = fake
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            permanent = upsert_alarm(dict(flap_row), "jeswr/x", "tok", "jeswr")
+        ok("permanent reopen failure returns False (NEVER success behind a closed alert)",
+           permanent is False)
+        ok("permanent reopen failure is LOUD (::error::)", "::error::" in buf.getvalue())
+        chk("the issue was never edited while closed", _parse_ledger(st["body"]),
+            _parse_ledger(closed_body2))
+    finally:
+        globals()["_gh"] = real_gh
+    # verify-detects-closed variant: the write lands on an OPEN issue, a racing --resolve closes
+    # it, and the rc-checked reopen FAILS -> the writer must report failure, not success.
+    cvrf = {"body": "", "reopen_rc": 1}
+
+    def closed_verify_reopen_fails_gh(args, token, capture=False):
+        if args and args[0] == "api":
+            return subprocess.CompletedProcess(args, 0, "", "")
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 2, "body": render_body([], "jeswr")}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            cvrf["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": cvrf["body"], "state": "CLOSED"}), "")
+        if verb == "reopen":
+            return subprocess.CompletedProcess(args, cvrf["reopen_rc"], "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = closed_verify_reopen_fails_gh
+    try:
+        ok("a failed reopen at verify time is a FAILURE, not silent success",
+           upsert_alarm(dict(flap_row), "jeswr/x", "tok", "jeswr") is False)
+    finally:
+        globals()["_gh"] = real_gh
+
+    # --- resolver folds the durable comment log BEFORE deciding (never closes over a pending ---
+    # row whose writer's body view was clobbered) -----------------------------------------------
+    rf_body = render_body([{"workflow": "dispatch", "job": "plan",
+                            "failure_class": "job-failure", "count": 1,
+                            "last_seen": "2026-07-18T10:00:00Z", "run_url": "https://x/1",
+                            "detail": "d", "failed_step": ""}], "jeswr", folded_through=400)
+    rf = {"body": rf_body, "closes": 0, "edits": 0}
+    rf_comments = [[{
+        "id": 401, "body": f"{ROW_COMMENT_MARKER}\n```json\n" + json.dumps(
+            {"workflow": "worker", "job": "run", "failure_class": "job-failure", "count": 1,
+             "last_seen": "2026-07-18T11:00:00Z", "run_url": "https://x/7", "detail": "d",
+             "failed_step": ""}) + "\n```",
+        "user": {"login": "github-actions[bot]"}, "author_association": "NONE",
+        "created_at": "2026-07-18T11:00:00Z"}]]
+
+    def resolver_fold_gh(args, token, capture=False):
+        if args and args[0] == "api":
+            if "--slurp" in args:
+                return subprocess.CompletedProcess(args, 0, json.dumps(rf_comments), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "list":
+            state = args[args.index("--state") + 1] if "--state" in args else ""
+            if state == "open":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"number": 41, "body": rf["body"]}]), "")
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if verb == "edit" and "--body" in args:
+            rf["edits"] += 1
+            rf["body"] = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "close":
+            rf["closes"] += 1
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "view":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"body": rf["body"], "state": "OPEN"}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    globals()["_gh"] = resolver_fold_gh
+    try:
+        resolve_alarm("dispatch", "jeswr/x", "tok", "jeswr", now=now)
+        chk("resolver NEVER closes over a pending durable row comment", rf["closes"], 0)
+        ok("resolver folds the pending comment row into the refreshed body",
+           rf["edits"] >= 1
+           and any(r.get("workflow") == "worker" for r in _parse_ledger(rf["body"]))
+           and all(r.get("workflow") != "dispatch" for r in _parse_ledger(rf["body"])))
+        ok("resolver advances the watermark over the folded comment",
+           _parse_ledger_doc(rf["body"])[1] >= 401)
     finally:
         globals()["_gh"] = real_gh
 

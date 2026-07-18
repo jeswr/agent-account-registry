@@ -271,6 +271,8 @@ jobs:
           cancelled: ${{ needs.login.result == 'cancelled' }}
           detail: "set-up-account login job ${{ needs.login.result }} — account onboarding broker crashed at the job level"
           registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
 
   # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): a healthy
   # login run prunes set-up-account's rows from the rolling pipeline alert (--resolve), so a
@@ -292,3 +294,5 @@ jobs:
         with:
           mode: resolve
           registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}

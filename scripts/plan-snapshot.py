@@ -468,6 +468,23 @@ def _self_test():
     assert folded == [{"repo": bad, "pr_number": 0, "reason": "repo-degraded:listing-failed"}]
     assert all(skip["reason"] in claim.SNAPSHOT_SKIP_REASONS for skip in folded)
 
+    # FIRST-target degradation (round-3 review: only the LAST-target case was exercised): the
+    # degraded repo at index 0 must degrade IN PLACE — the healthy second target still snapshots
+    # fully into ITS OWN index-1 artifacts (the index-shift regression made the second target
+    # read index 0). The full index-sensitive ASSEMBLY of both orderings runs in
+    # dispatch-claim.py's end-to-end self-test against the actual dispatch.yml heredocs.
+    with tempfile.TemporaryDirectory() as out_dir:
+        # bad is index 0 (FIRST), good is index 1
+        snapshot_targets(two_repo_fetch, claim, [bad, good], out_dir)
+        first_bad = json.loads(Path(out_dir, "raw-issues-0.json").read_text(encoding="utf-8"))
+        second_good = json.loads(Path(out_dir, "raw-issues-1.json").read_text(encoding="utf-8"))
+        second_good_pulls = json.loads(
+            Path(out_dir, "raw-pulls-1.json").read_text(encoding="utf-8"))
+    assert first_bad["complete"] is False and first_bad["snapshot_error"] == "listing-failed", \
+        "a FIRST-target failure must degrade in place at index 0"
+    assert second_good["complete"] is True and second_good_pulls["complete"] is True, \
+        "a FIRST-target degradation must leave the second target fully snapshotted at index 1"
+
     # BUT a FLEET-WIDE listing failure (EVERY target fails) stays FATAL: an all-empty plan must not
     # masquerade as a healthy empty backlog — the dispatch alarm job needs the PLAN failure to fire.
     def all_fail_fetch(url):

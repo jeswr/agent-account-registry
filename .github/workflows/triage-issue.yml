@@ -96,6 +96,8 @@ jobs:
           cancelled: ${{ needs.triage.result == 'cancelled' }}
           detail: "triage-issue ${{ needs.triage.result }} on issue #${{ github.event.issue.number }}"
           registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
 
   # [FABLE-5] Auto-close-on-heal (review P2: recovery was wired only for dispatch): a healthy
   # triage prunes triage-issue's rows from the rolling pipeline alert (--resolve), so a recovered
@@ -116,3 +118,5 @@ jobs:
         with:
           mode: resolve
           registry-token: ${{ github.token }}
+          alert-repo: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          alert-token: ${{ secrets.ALERT_TOKEN || '' }}
