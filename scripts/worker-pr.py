@@ -405,15 +405,21 @@ def batch_outcome_eligible(status):
 
 
 def outcome_item_revalidation(repo, pull, issue_labels, reviewed_sha, opened_sha,
-                              opened_to_reviewed, reviewed_to_head, extra_keywords=()):
+                              opened_to_reviewed, extra_keywords=()):
     """[FABLE-5 round-2 #3] Per-item LIVE trust re-admission at OUTCOME time (label/arm). The plan
     manifest is up to a whole batch runtime stale by now, so every posture bit is re-derived from
     live data, mirroring what the single path validates in its resolve step: open draft, same-repo
     head, no human-hold PR label, no needs:* on the provenance-bound SOURCE issue, provenance
     head_sha_at_open ancestry (the reviewed sha equals/descends from the worker-opened commit),
-    and the reviewed sha still being an ancestor of / equal to the live head (a rewritten branch
-    invalidates the review). `opened_to_reviewed` / `reviewed_to_head` are the gh compare `status`
-    strings the caller fetched ("identical" when the shas are equal, no API call needed).
+    and the live head being EXACTLY the reviewed sha. `opened_to_reviewed` is the gh compare
+    `status` string the caller fetched ("identical" when the shas are equal, no API call needed).
+
+    [FABLE-5 r9 #5] Exact-equality on the live head, not ancestry: accepting a head that merely
+    DESCENDS from the reviewed sha let a stale request_changes verdict label the newer,
+    never-reviewed head `review:changes`, whereupon the dispatcher immediately emitted a fix run
+    fed by findings from the old diff. ready-and-arm protected only the approval side. Any head
+    advance — descending or rewritten — now defers the item; the sweep re-plans a fresh review of
+    the new head, so no outcome mutation ever binds a verdict to bytes it did not judge.
 
     Returns (defer_reason or None, security_live). security_live is the label-derived security
     posture RECOMPUTED from the LIVE PR + source-issue labels (builtin keywords + trust:* +
@@ -441,8 +447,8 @@ def outcome_item_revalidation(repo, pull, issue_labels, reviewed_sha, opened_sha
     if opened_sha != reviewed_sha and opened_to_reviewed not in {"identical", "ahead"}:
         return "reviewed sha does not descend from the worker-opened commit", security_live
     head_sha = str(head.get("sha", ""))
-    if head_sha != reviewed_sha and reviewed_to_head not in {"identical", "ahead"}:
-        return "live head no longer descends from the reviewed sha", security_live
+    if head_sha != reviewed_sha:
+        return "live head is not exactly the reviewed sha", security_live
     return None, security_live
 
 
@@ -1025,6 +1031,19 @@ def _registry_write_many(registry_repo, files, message, *, ref=None, retries=6):
     # CAS rebase reuses the blob shas without re-POSTing). The absent/identical/different decision is
     # NOT precomputed here — it is re-derived per attempt against the live ref inside the loop.
     canonical = [(path, _canonical_verdict_bytes(document)) for path, document in files]
+    # [FABLE-5 r9 #3] BOTH record locations gate EVERY path, exactly like `_registry_put_file`
+    # (sol r1 on #100): the legacy pre-migration DEFAULT-branch copy is probed once per path
+    # (master records are immutable, so once is sound) before any ledger commit may include it. A
+    # DIVERGENT legacy record fails that path closed ("conflict") even when the ledger ref has no
+    # copy yet — without this, the batch writer could land a ledger verdict whose content differs
+    # from the existing legacy verdict, and every ledger-first reader plus the outcome job would
+    # silently switch to the new meaning. A byte-identical legacy record with no ledger copy is
+    # idempotent success ("identical"): nothing to commit, exactly the single writer's return.
+    legacy_state = {}
+    for path, body in canonical:
+        legacy, _legacy_sha = _probe_registry_file(registry_repo, path)
+        legacy_state[path] = ("absent" if legacy is None
+                              else "identical" if legacy == body else "conflict")
     blob_shas = {}
 
     def blob_sha_for(path, body):
@@ -1049,10 +1068,21 @@ def _registry_write_many(registry_repo, files, message, *, ref=None, retries=6):
         result = {}
         to_write = []  # (path, canonical_bytes) still needing a commit on the fresh ref
         for path, body in canonical:
+            if legacy_state[path] == "conflict":
+                # A divergent legacy default-branch record: never write, never claim success —
+                # regardless of the ledger ref's state ([FABLE-5 r9 #3], mirrors the single
+                # writer's pre-loop raise).
+                result[path] = "conflict"
+                continue
             existing = _git_data_existing_bytes(registry_repo, ref, path)
             if existing is None:
-                to_write.append((path, body))
-                result[path] = "written"
+                if legacy_state[path] == "identical":
+                    # Byte-identical pre-migration record, no ledger copy: idempotent success
+                    # (the single writer returns False here — nothing to commit).
+                    result[path] = "identical"
+                else:
+                    to_write.append((path, body))
+                    result[path] = "written"
             elif existing == body:
                 result[path] = "identical"  # idempotent success — nothing to commit
             else:
@@ -2399,17 +2429,18 @@ def _self_test():
     def reval(**kw):
         params = dict(pull=live_pr(head_sha=open_sha), issue_labels=[],
                       reviewed_sha=open_sha, opened_sha=open_sha,
-                      opened_to_reviewed="identical", reviewed_to_head="identical",
-                      extra_keywords=())
+                      opened_to_reviewed="identical", extra_keywords=())
         params.update(kw)
         return outcome_item_revalidation("o/r", params["pull"], params["issue_labels"],
                                          params["reviewed_sha"], params["opened_sha"],
-                                         params["opened_to_reviewed"],
-                                         params["reviewed_to_head"], params["extra_keywords"])
+                                         params["opened_to_reviewed"], params["extra_keywords"])
 
     check("clean live item admits", reval(), (None, False))
-    check("descending head advance still admits (labels apply; arm re-checks the head)",
-          reval(pull=live_pr(), reviewed_to_head="ahead"), (None, False))
+    # [FABLE-5 r9 #5] EXACT live-head equality: even a DESCENDING head advance defers every
+    # outcome mutation — a stale request_changes must never label a newer, unreviewed head
+    # (the dispatcher would instantly dispatch a fix against findings from the old diff).
+    check("descending head advance DEFERS (no outcome mutation on an unreviewed head)",
+          reval(pull=live_pr())[0], "live head is not exactly the reviewed sha")
     check("closed PR defers", reval(pull=live_pr(state="closed"))[0], "PR is not open")
     check("undrafted PR defers", reval(pull=live_pr(head_sha=open_sha, draft=False))[0],
           "PR is no longer a draft")
@@ -2426,8 +2457,8 @@ def _self_test():
           reval(opened_sha="3" * 40, opened_to_reviewed="diverged")[0],
           "reviewed sha does not descend from the worker-opened commit")
     check("rewritten live head defers",
-          reval(pull=live_pr(), reviewed_to_head="diverged")[0],
-          "live head no longer descends from the reviewed sha")
+          reval(pull=live_pr(head_sha="4" * 40))[0],
+          "live head is not exactly the reviewed sha")
     check("post-plan security label recomputes LIVE (routing keyword, source issue)",
           reval(issue_labels=["area:worker"], extra_keywords=("area:worker",)), (None, True))
     check("post-plan trust:* label recomputes LIVE (PR label)",
@@ -2568,8 +2599,12 @@ def _self_test():
         verdict, or a disjoint file), which advances the head and makes THIS PATCH non-fast-forward.
         It fires once per PATCH until it returns a falsey value (so the first attempt loses, the
         retry — after re-read + re-filter — wins)."""
-        def __init__(self, existing=None, on_before_patch=None):
+        def __init__(self, existing=None, on_before_patch=None, legacy=None):
             self.files = dict(existing or {})   # path -> canonical bytes (the current ref tree)
+            # [FABLE-5 r9 #3] path -> canonical bytes on the DEFAULT branch (the immutable legacy
+            # pre-migration records); a contents GET WITHOUT ?ref= reads here, mirroring the real
+            # API's default-branch resolution.
+            self.legacy_files = dict(legacy or {})
             self.blobs = {}                      # blob sha -> content bytes
             self.ref_sha = "0" * 40
             # commit/tree sha -> {path: bytes}; commit sha resolves to its own tree in this model.
@@ -2619,12 +2654,17 @@ def _self_test():
                 self.files = dict(self.trees[new_sha])
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             if path.startswith("repos/") and "/contents/" in path:
-                # GET contents/<path>?ref=<ref> — idempotency probe against the CURRENT ref tree.
-                rel = path.split("/contents/", 1)[1].split("?", 1)[0]
-                if rel in self.files:
-                    content = base64.b64encode(self.files[rel].encode()).decode()
+                # GET contents/<path>[?ref=<ref>] — with ?ref= this is the idempotency probe
+                # against the CURRENT ref tree; withOUT it, the legacy DEFAULT-branch probe
+                # ([FABLE-5 r9 #3]). The "sha" field rides along for _probe_registry_file.
+                rel_query = path.split("/contents/", 1)[1]
+                rel, _, query = rel_query.partition("?")
+                store = self.files if "ref=" in query else self.legacy_files
+                if rel in store:
+                    content = base64.b64encode(store[rel].encode()).decode()
                     return argparse.Namespace(
-                        returncode=0, stdout=json.dumps({"content": content}), stderr="")
+                        returncode=0,
+                        stdout=json.dumps({"content": content, "sha": "f" * 40}), stderr="")
                 return argparse.Namespace(returncode=1, stdout="", stderr="HTTP 404: Not Found")
             if path.endswith(f"/git/ref/heads/{VERDICT_REF}"):
                 return argparse.Namespace(
@@ -2765,6 +2805,32 @@ def _self_test():
           res[vpath(9, 1)], "identical")
     check("batch: same-path identical race still records the other path",
           res[vpath(9, 2)], "written")
+
+    # (4d) [FABLE-5 r9 #3] LEGACY default-branch records gate the batch exactly like the single
+    # writer: a DIVERGENT legacy verdict fails that path closed even though the ledger ref has no
+    # copy — the batch must never write a ledger verdict whose meaning differs from the existing
+    # legacy record (ledger-first readers + the outcome job would silently adopt the new content).
+    reg = FakeRegistry(legacy={vpath(1, 1): _canonical_verdict_bytes(reject)})
+    res = run_batch(reg, [(vpath(1, 1), approve), (vpath(2, 1), approve)],
+                    "legacy divergence")
+    check("batch: divergent LEGACY record fails closed (never shadowed on the ledger)",
+          (res[vpath(1, 1)], vpath(1, 1) in reg.files), ("conflict", False))
+    check("batch: the healthy path still commits alongside a legacy conflict",
+          (res[vpath(2, 1)], vpath(2, 1) in reg.files), ("written", True))
+    # (4e) byte-identical legacy record with NO ledger copy -> idempotent success, ZERO commits
+    # (mirrors the single writer's already-recorded return; nothing is duplicated to the ledger).
+    reg = FakeRegistry(legacy={vpath(1, 1): _canonical_verdict_bytes(approve)})
+    res = run_batch(reg, [(vpath(1, 1), approve)], "legacy identical")
+    check("batch: identical LEGACY record is idempotent success",
+          res[vpath(1, 1)], "identical")
+    check("batch: identical legacy record makes ZERO commits", reg.commits, 0)
+    # (4f) divergent legacy + identical LEDGER copy: still "conflict" — success is only claimable
+    # when EVERY existing copy matches (sol r1 on #100, same rule as _registry_put_file).
+    reg = FakeRegistry(existing={vpath(1, 1): _canonical_verdict_bytes(approve)},
+                       legacy={vpath(1, 1): _canonical_verdict_bytes(reject)})
+    res = run_batch(reg, [(vpath(1, 1), approve)], "legacy vs ledger divergence")
+    check("batch: divergent legacy beats an identical ledger copy (fail closed)",
+          res[vpath(1, 1)], "conflict")
 
     # (5) persistent non-fast-forward beyond the retry budget -> raise (no silent loss). A writer
     # that keeps advancing the head on EVERY PATCH (never returns falsey) starves the CAS budget.

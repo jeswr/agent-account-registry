@@ -189,12 +189,30 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
     reserves K): capacity admits an account only if active slot-weighted load + `slots` fits under
     max_concurrent_workers, and the usage headroom requirement scales to `margin * slots` — K
     parallel workers burn ~K times a single worker's per-window rate, so admitting them behind a
-    single-worker margin defeats the mid-run rate-limit protection the gate exists for."""
+    single-worker margin defeats the mid-run rate-limit protection the gate exists for.
+
+    [FABLE-5 r9 #6] Per-ACCOUNT single-batch EXCLUSIVITY: a batch lease (slots > 1) is only ever
+    granted on an account with NO other live lease, and no claim of any kind joins an account that
+    holds a live batch lease. A batch's outcome job performs the account's credential write-back
+    (`gh secret set`), which is serialized only WITHIN one batch — two co-resident batches (the old
+    two-4-slot-leases-under-a-cap-of-8 admission), or a single review racing a batch's outcome,
+    could interleave unconditional secret updates and let an older refresh generation overwrite a
+    newer one, stranding the account for every future claim. Exclusivity for the lease's whole TTL
+    (which covers the outcome job) removes the cross-run race entirely; capacity costs nothing in
+    practice because a batch already reserves K of the account's slots."""
     live = reclaim_expired(leases, now)
     slots = max(1, int(slots))
+
+    def rotation_exclusive(account):
+        held = [lease for lease in live if lease.get("account") == account["handle"]]
+        if any(lease_slots(lease) > 1 for lease in held):
+            return False          # a live batch owns this account exclusively
+        return not (slots > 1 and held)   # a new batch requires an idle account
+
     for model in model_chain:
         serving = [a for a in accounts
                    if a.get("available", True) and model in a.get("models", [])
+                   and rotation_exclusive(a)
                    and active_for(live, a["handle"]) + slots
                    <= int(a.get("max_concurrent_workers", 4))]
         if usage is not None:
@@ -422,7 +440,17 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         key = holder_key(holder)
         if key and any(holder_key(lease.get("holder")) == key for lease in live):
             return None
-        if holder_prefix and not partition_available(live, holder_prefix, package):
+        # [FABLE-5 r9 #1] The package/global partition serializes WRITERS: two impl/fix workers in
+        # one package (or anything under a __global__ item) would race pushes to the same crate.
+        # Review claims are exempt — a review is READ-ONLY against a pinned head sha, so N
+        # same-package (or __global__-package) reviews are as safe concurrently as the K calls
+        # already running inside one batch. Partitioning reviews silently serialized a same-package
+        # backlog to ONE batch per tick (4 concurrent calls), voiding the >40-reviews-in-flight
+        # design point; review parallelism is bounded by the slot-weighted holder-prefix cap, each
+        # account's max_concurrent_workers, and the usage margin instead. Per-PR duplicate
+        # suppression stays with the holder_key check above, never the partition.
+        if holder_prefix and role != "review" \
+                and not partition_available(live, holder_prefix, package):
             return None
         if max_holder_concurrent is not None:
             if max_holder_concurrent <= 0 or not holder_prefix:
@@ -592,8 +620,42 @@ def _self_test():
           partition_available(mixed, "review:", "crate-b"), True)
     check("review lease invisible to the impl partition (partition cross-check)",
           partition_available([mixed[1]], "owner/repo#", "crate-a"), True)
-    check("same-crate reviews still serialize under the shared review: prefix",
+    check("partition_available itself still reports a same-crate review collision "
+          "(claim() bypasses it for the read-only review role)",
           partition_available(mixed, "review:", "crate-a"), False)
+
+    # ---- [FABLE-5 r9 #1] review claims are NOT package-partitioned ----
+    # Reviews are READ-ONLY against pinned heads: N same-package (or __global__) review leases are
+    # safe concurrently, and partitioning them silently collapsed a same-package backlog to ONE
+    # batch (4 concurrent calls) per tick — far under the >40-reviews design point. Writers
+    # (impl/fix) stay strictly partitioned.
+    same_pkg_review = [make_lease("acct01", "review:o/r#40@r.1", "crate-a", "review", "terra",
+                                  now, 100)]
+    two_accounts = [{"handle": "acct01", "models": ["terra"], "max_concurrent_workers": 3,
+                     "available": True, "secret_ref": "ACCT01_TOKEN"},
+                    {"handle": "acct02", "models": ["terra"], "max_concurrent_workers": 3,
+                     "available": True, "secret_ref": "ACCT02_TOKEN"}]
+    with _StubLedger(two_accounts, same_pkg_review):
+        same_pkg = claim("r", "crate-a", "review", ["terra"], "review:o/r#41@r.1", now,
+                         account_pool=["acct01", "acct02"], holder_prefix="review:",
+                         max_holder_concurrent=24)
+    check("a second SAME-package review claim is admitted (reviews are read-only)",
+          bool(same_pkg), True)
+    global_review = [make_lease("acct01", "review:o/r#40@r.1", "__global__", "review", "terra",
+                                now, 100)]
+    with _StubLedger(two_accounts, global_review):
+        past_global = claim("r", "crate-b", "review", ["terra"], "review:o/r#41@r.1", now,
+                            account_pool=["acct01", "acct02"], holder_prefix="review:",
+                            max_holder_concurrent=24)
+    check("a live __global__ review lease does not block other review claims",
+          bool(past_global), True)
+    with _StubLedger(two_accounts,
+                     [make_lease("acct01", "o/r#7@r.1", "crate-a", "impl", "terra", now, 100)]):
+        impl_same_pkg = claim("r", "crate-a", "impl", ["terra"], "o/r#9@r.1", now,
+                              account_pool=["acct01", "acct02"], holder_prefix="o/r#",
+                              max_holder_concurrent=24)
+    check("impl claims STAY package-partitioned (writers still serialize)",
+          impl_same_pkg, None)
 
     # Two live review leases for DISTINCT PRs are bounded by the SHARED `review:` prefix cap
     # (max_holder_concurrent=2 = the static codex slot bound; codex is usage-exempt so the CLI
@@ -847,10 +909,21 @@ def _self_test():
     one = [make_lease("acct05", "h", "p", "review", "terra", now, 100)]
     check("K-batch over per-account capacity is refused (1 active + 4 > 4)",
           choose_account(B, one, ["terra"], "p", "review", now, slots=4), None)
-    check("K-batch within per-account capacity is admitted (1 active + 3 <= 4)",
-          choose_account(B, one, ["terra"], "p", "review", now, slots=3), "acct05")
-    check("a live K-slot lease blocks the next single claim at the account cap",
+    # [FABLE-5 r9 #6] Per-account single-batch EXCLUSIVITY: a batch performs the account's
+    # credential write-back at outcome time, so it must never share the account with ANY other
+    # lease — a co-resident writer could overwrite a newer refresh generation with an older one.
+    check("K-batch refused on an account with ANY live lease (rotation exclusivity)",
+          choose_account(B, one, ["terra"], "p", "review", now, slots=3), None)
+    B8 = [{"handle": "acct05", "models": ["terra"], "max_concurrent_workers": 8,
+           "available": True}]
+    check("K-batch admitted only on an IDLE account",
+          choose_account(B8, [], ["terra"], "p", "review", now, slots=4), "acct05")
+    check("a live batch lease excludes a second K-batch even under the account cap (4+4<=8)",
+          choose_account(B8, [batch_lease], ["terra"], "p", "review", now, slots=4), None)
+    check("a live K-slot lease blocks the next single claim (batch account is exclusive)",
           choose_account(B, [batch_lease], ["terra"], "p", "review", now), None)
+    check("a live K-slot lease blocks a single claim even BELOW the account cap",
+          choose_account(B8, [batch_lease], ["terra"], "p", "review", now), None)
     # usage headroom scales to margin*slots: headroom 0.30 admits 2 workers at margin 0.10 but
     # never 4 (K parallel calls burn ~K times a single worker's rate).
     tight = {"status": "allowed", "5h_util": 0.7, "5h_reset": 5000, "7d_util": 0.1, "7d_reset": 9000}
@@ -872,10 +945,13 @@ def _self_test():
           None)
     # claim(): the ONE CAS write records the K-slot lease, and the shared holder-prefix cap is
     # slot-weighted — a second K-batch that would push review: workers past the cap gets None.
+    # [FABLE-5 r9 #6] The first batch's lease sits on a DIFFERENT account (acct08): the shared
+    # prefix cap sums across accounts, while per-ACCOUNT exclusivity (tested above and below)
+    # forbids two batches on one account regardless of that cap.
     slot_writes = []
     with _StubLedger([{"handle": "acct07", "models": ["terra"], "max_concurrent_workers": 8,
                        "available": True, "secret_ref": "ACCT07_TOKEN"}],
-                     [make_lease("acct07", "review:o/r#batch-9@r.1", "p", "review", "terra",
+                     [make_lease("acct08", "review:o/r#batch-9@r.1", "p", "review", "terra",
                                  now, 100, slots=4)]):
         globals()["_write_ledger"] = \
             lambda repo, leases, sha, msg: slot_writes.append(leases) or True
@@ -888,12 +964,29 @@ def _self_test():
           [lease_slots(x) for x in slot_writes[-1]], [4, 4])
     with _StubLedger([{"handle": "acct07", "models": ["terra"], "max_concurrent_workers": 8,
                        "available": True, "secret_ref": "ACCT07_TOKEN"}],
-                     [make_lease("acct07", "review:o/r#batch-9@r.1", "p", "review", "terra",
+                     [make_lease("acct08", "review:o/r#batch-9@r.1", "p", "review", "terra",
                                  now, 100, slots=4)]):
         over_cap = claim("r", "crate-z", "review", ["terra"], "review:o/r#batch-2@r.1", now,
                          account_pool=["acct07"], holder_prefix="review:",
                          max_holder_concurrent=7, slots=4)
     check("K-batch past the slot-weighted holder cap is refused (4 + 4 > 7)", over_cap, None)
+    # [FABLE-5 r9 #6] End-to-end through claim(): the SAME account already runs a batch — a second
+    # batch AND a single review are both refused there even though every cap has room, so the
+    # credential write-back of a batch outcome can never race another run on the account.
+    with _StubLedger([{"handle": "acct07", "models": ["terra"], "max_concurrent_workers": 8,
+                       "available": True, "secret_ref": "ACCT07_TOKEN"}],
+                     [make_lease("acct07", "review:o/r#batch-9@r.1", "p", "review", "terra",
+                                 now, 100, slots=4)]):
+        same_acct_batch = claim("r", "crate-z", "review", ["terra"],
+                                "review:o/r#batch-2@r.1", now, account_pool=["acct07"],
+                                holder_prefix="review:", max_holder_concurrent=24, slots=4)
+        same_acct_single = claim("r", "crate-z", "review", ["terra"],
+                                 "review:o/r#77@r.1", now, account_pool=["acct07"],
+                                 holder_prefix="review:", max_holder_concurrent=24)
+    check("claim(): a second batch on the SAME account is refused (account-exclusive rotation)",
+          same_acct_batch, None)
+    check("claim(): a single review never joins an account with a live batch lease",
+          same_acct_single, None)
 
     # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
     # Literal "ledger" on purpose: pointing either helper back at the default branch (or changing

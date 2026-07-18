@@ -97,10 +97,15 @@ permissions: {}
 concurrency:
   # [FABLE-5 round-2 #6] One batch per adopted CLAIM at a time. The account is the shared resource,
   # but its RAW handle must never surface in the concurrency-group name (shown in the Actions
-  # UI/scheduling — no-raw-handle posture, locked decision 22); the CAS lease already serializes
-  # the account (one live lease per account), so keying on the dispatcher's non-sensitive claim id
-  # dedups a double-dispatch of the same claim without leaking the handle. cancel-in-progress
-  # false so a running batch is never severed mid-review (a severed batch just re-plans).
+  # UI/scheduling — no-raw-handle posture, locked decision 22). [FABLE-5 r9 #6] Account
+  # serialization is ENFORCED by the allocator, not assumed here: select-and-claim's
+  # choose_account grants a batch lease (slots > 1) only on an account with NO other live lease
+  # and refuses ANY claim on an account holding a live batch lease — so for the lease's whole TTL
+  # (which covers commit-outcome's single credential write-back) this batch is the account's only
+  # tenant, and two runs can never interleave `gh secret set` generations. Keying on the
+  # dispatcher's non-sensitive claim id therefore only dedups a double-dispatch of the same claim
+  # without leaking the handle. cancel-in-progress false so a running batch is never severed
+  # mid-review (a severed batch just re-plans).
   group: review-batch-${{ inputs.target_repo }}-${{ inputs.claim_id }}
   cancel-in-progress: false
 
@@ -467,6 +472,24 @@ jobs:
               except json.JSONDecodeError:
                   return None
 
+          def gh_comments(number):
+              # [FABLE-5 r9 #7] FULL pagination (--paginate --slurp, the worker-pr.py comment
+              # reader's own convention): the trusted round markers this admission re-derives the
+              # round from may sit past page one on a long-lived PR.
+              out = subprocess.run(
+                  ["gh", "api", "--paginate", "--slurp",
+                   f"repos/{repo}/issues/{number}/comments?per_page=100"],
+                  capture_output=True, text=True)
+              if out.returncode != 0:
+                  return None
+              try:
+                  pages = json.loads(out.stdout or "null")
+              except json.JSONDecodeError:
+                  return None
+              if not isinstance(pages, list):
+                  return None
+              return [c for page in pages for c in (page if isinstance(page, list) else [])]
+
           bot_login = None
           admitted = []
           for entry in manifest:
@@ -564,6 +587,29 @@ jobs:
                   if any(lb.startswith("needs:") for lb in issue_labels):
                       print(f"drop #{number}: source issue is human-owned (needs:*)")
                       continue
+                  # [FABLE-5 r9 #7] review_round is HOSTILE, potentially STALE manifest data:
+                  # admission previously int()-converted it, and the review leg RECORDED it
+                  # (round-record) before worker-live.sh's grammar check ever ran — a
+                  # malformed/manual dispatch could write an enormous bot-authored round marker
+                  # and force terminal budget exhaustion. Enforce the single path's
+                  # [1-9][0-9]{0,2} grammar HERE, before anything records it, AND re-derive the
+                  # EXPECTED round from live trusted comments exactly as the dispatcher does
+                  # (count_rounds over the bot's own markers, + 1): a mismatching manifest round
+                  # is stale or forged and defers the item to a fresh plan.
+                  raw_round = str(entry.get("review_round", ""))
+                  if not re.fullmatch(r"[1-9][0-9]{0,2}", raw_round):
+                      print(f"drop #{number}: review_round fails the [1-9][0-9]{{0,2}} grammar")
+                      continue
+                  review_round = int(raw_round)
+                  comments = gh_comments(number)
+                  if comments is None:
+                      print(f"drop #{number}: PR comments unreadable (fail closed)")
+                      continue
+                  expected_round = worker_pr.count_rounds(comments, login) + 1
+                  if review_round != expected_round:
+                      print(f"drop #{number}: manifest review_round {review_round} != "
+                            f"live-derived round {expected_round}; re-plan")
+                      continue
                   # [FABLE-5 round-2 #3c] Label-derived security RECOMPUTED from the LIVE PR +
                   # source-issue labels; unioned with the plan flag so a post-plan label can only
                   # ESCALATE the posture, never relax it. The outcome job recomputes AGAIN at
@@ -583,7 +629,8 @@ jobs:
                       # review leg can re-assert the ancestry binding LIVE, immediately before
                       # its model call ([GPT-5.6 r4 #6]).
                       "opened_sha": opened_sha,
-                      "review_round": int(entry.get("review_round", 1)),
+                      # [FABLE-5 r9 #7] grammar-validated AND equal to the live-derived round.
+                      "review_round": review_round,
                       "security": bool(entry.get("security", False)) or security_live,
                       "bot_login": login,
                   })
@@ -736,9 +783,10 @@ jobs:
           if opened_sha != expect_head:
               compare = gh_json(f"repos/{repo}/compare/{opened_sha}...{expect_head}")
               opened_to_reviewed = str((compare or {}).get("status", ""))
+          # [FABLE-5 r9 #5] outcome_item_revalidation now asserts the live head EXACTLY equals
+          # the reviewed sha itself (no ancestry/compare argument — descending advances defer).
           reason, _security = worker_pr.outcome_item_revalidation(
-              repo, pull, issue_labels, expect_head, opened_sha,
-              opened_to_reviewed, "identical")
+              repo, pull, issue_labels, expect_head, opened_sha, opened_to_reviewed)
           if reason:
               raise SystemExit(f"#{number} failed live re-admission: {reason}")
           print(f"live re-admission OK for #{number}")
@@ -1025,12 +1073,16 @@ jobs:
 
       # [GPT-5.6 r4 #5] Model-access health (registry #32), single-path semantics per LEG:
       # a successful review is `success`; a skipped model step after the batch claim is a
-      # pre-launch abort (admission/prep failure, timeout, cancellation) recorded as `unknown`
+      # pre-launch abort (admission/prep failure, step timeout) recorded as `unknown`
       # (counted toward persistence, never a provider-outage); a FAILED launch records the
       # sanitized WORKER_EXIT_CLASS worker-live.sh put in $GITHUB_ENV (+ WORKER_RESET_HINT on
       # session-limit) — so rate-limit failures actually populate the reactive backoff the
       # dispatcher consults. Lifted as a tiny artifact because matrix job outputs are
       # last-writer-wins; the separate no-target-code model_health job records every leg's class.
+      # [FABLE-5 r9 #4] A JOB-level timeout/cancellation kills the leg before this always() step
+      # can run at all (no artifact is ever uploaded) — model_health covers that case by
+      # synthesizing exit_class=unknown from the ADMITTED matrix for any leg with no artifact,
+      # so this step only needs to handle aborts it can actually observe.
       - name: Capture model exit class for the health record
         if: ${{ always() }}
         env:
@@ -1124,8 +1176,17 @@ jobs:
 
   # ---- 2b. Model-access health (registry #32, [GPT-5.6 r4 #5]): consume every leg's sanitized
   #          exit CLASS into the registry health ledger. A SEPARATE always()-guarded job — like the
-  #          single path's model_health — so the ledger-write token never rides in a leg, and one
-  #          record per model call keeps the reactive-backoff signal per-invocation accurate. ----
+  #          single path's model_health — so the ledger-write token never rides in a leg.
+  #          [FABLE-5 r9 #4] The whole batch's records land in ONE CAS write (model-health.py
+  #          record-batch): the old per-leg loop ran up to eight independent six-retry CAS appends
+  #          against the hottest ref in the system, re-creating exactly the same-ref contention
+  #          this PR removes (one batch could advance the ledger ref eight times while its own
+  #          verdict commit had six attempts). Per-invocation accuracy is preserved — the single
+  #          write still carries one record per admitted leg. A leg with NO health artifact (a
+  #          TIMED-OUT/cancelled matrix job cannot run its later always() capture/upload steps) is
+  #          synthesized as exit_class=unknown from the ADMITTED matrix, so those legs are
+  #          recorded rather than silently absent. commit-outcome `needs` this job, so the two
+  #          remaining ledger-ref writers of the batch DAG are sequenced, never racing. ----
   model_health:
     name: Record model-access health (no target code runs here)
     needs: [resolve-batch, review]
@@ -1147,7 +1208,7 @@ jobs:
           path: ${{ runner.temp }}/health-items
           pattern: batch-health-*
 
-      - name: Append one model-access health record per leg (salted account hash only)
+      - name: Append ALL leg health records in ONE CAS write (salted account hash only)
         env:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
@@ -1157,34 +1218,63 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
           PROVIDER: ${{ inputs.reviewer_provider }}
           MODEL_ALIAS: ${{ inputs.reviewer_model }}
+          # [FABLE-5 r9 #4] The ADMITTED matrix is the record roster, not the artifact listing:
+          # a timed-out/cancelled leg cannot run its always() capture/upload steps, so its
+          # missing artifact must synthesize an `unknown` record rather than vanish.
+          ADMITTED_MATRIX: ${{ needs.resolve-batch.outputs.matrix }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          recorded=0
-          for item in "$RUNNER_TEMP"/health-items/batch-health-*/health.json; do
-            pr="$(basename "$(dirname "$item")")"; pr="${pr#batch-health-}"
-            [[ "$pr" =~ ^[0-9]+$ ]] || { echo "::warning::skipping malformed health artifact"; continue; }
-            cls="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("exit_class",""))' "$item")"
-            hint="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("reset_hint",""))' "$item")"
-            [[ -n "$cls" ]] || cls=unknown
-            # Per-leg isolation: one bad record never drops the rest of the batch's signal.
-            python3 registry/scripts/model-health.py record \
-              --provider "$PROVIDER" \
-              --model-alias "$MODEL_ALIAS" \
-              --exit-class "$cls" \
-              --reset-hint "$hint" \
-              --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT.$pr" \
-              || echo "::warning::model-health record failed for leg #$pr"
-            recorded=$((recorded + 1))
-          done
-          echo "model-health: processed $recorded leg record(s)"
+          python3 - <<'PY'
+          import json, os
+
+          matrix = json.loads(os.environ.get("ADMITTED_MATRIX") or '{"include": []}')
+          items = []
+          synthesized = 0
+          for entry in matrix.get("include", []):
+              pr = entry.get("pr_number") if isinstance(entry, dict) else None
+              if not isinstance(pr, int):
+                  continue
+              path = os.path.join(os.environ["RUNNER_TEMP"], "health-items",
+                                  f"batch-health-{pr}", "health.json")
+              cls, hint = "", ""
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      doc = json.load(fh)
+                  if isinstance(doc, dict):
+                      cls = str(doc.get("exit_class") or "")
+                      hint = str(doc.get("reset_hint") or "")
+              except (OSError, ValueError):
+                  pass  # leg died before its capture step (timeout/cancel): synthesize below
+              if not cls:
+                  cls = "unknown"
+                  synthesized += 1
+              items.append({
+                  "exit_class": cls,
+                  "reset_hint": hint,
+                  "run_id": (f"{os.environ['GITHUB_RUN_ID']}."
+                             f"{os.environ['GITHUB_RUN_ATTEMPT']}.{pr}"),
+              })
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "health-batch.json"), "w",
+                    encoding="utf-8") as fh:
+              json.dump(items, fh)
+          print(f"model-health: staged {len(items)} leg record(s), "
+                f"{synthesized} synthesized as unknown (no uploaded artifact)")
+          PY
+          python3 registry/scripts/model-health.py record-batch \
+            --provider "$PROVIDER" \
+            --model-alias "$MODEL_ALIAS" \
+            --items-file "$RUNNER_TEMP/health-batch.json"
 
   # ---- 3. ONE atomic verdict commit for the whole batch, then per-PR label/arm (no target code
   #         runs here). Collect every leg's artifact, build the manifest, verdict-record-batch in ONE
   #         Git-Data-API commit, then iterate the recorded PRs to apply the SINGLE-path outcome. ----
   commit-outcome:
     name: Atomic multi-verdict commit + per-PR outcome
-    needs: [resolve-batch, review]
+    # [FABLE-5 r9 #4] model_health in `needs` SEQUENCES the batch DAG's two ledger-ref writers:
+    # the (single) health CAS append fully lands before the verdict commit starts, so they never
+    # race the same ref. always() still runs this job when model_health fails — telemetry loss
+    # must never strand recorded verdicts without their label/arm outcome.
+    needs: [resolve-batch, review, model_health]
     if: ${{ always() && needs.resolve-batch.outputs.count != '0' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1601,13 +1691,14 @@ jobs:
               opened_to_reviewed = ""
               if re.fullmatch(r"[0-9a-f]{40}", opened_sha):
                   opened_to_reviewed = compare_status(opened_sha, reviewed)
-              live_head = str(((pull or {}).get("head") or {}).get("sha", ""))
-              reviewed_to_head = ""
-              if re.fullmatch(r"[0-9a-f]{40}", live_head):
-                  reviewed_to_head = compare_status(reviewed, live_head)
+              # [FABLE-5 r9 #5] No reviewed->head compare any more: outcome_item_revalidation
+              # itself requires the LIVE head to EXACTLY equal the reviewed sha. A head that
+              # merely descends from the reviewed sha is an UNREVIEWED head — labelling it
+              # (review:changes) would make the dispatcher fix it against the old diff's
+              # findings, so any advance defers the item and the sweep re-plans a fresh review.
               reason, security_live = worker_pr.outcome_item_revalidation(
                   repo, pull, issue_labels, reviewed, opened_sha,
-                  opened_to_reviewed, reviewed_to_head, extra_keywords=keywords)
+                  opened_to_reviewed, extra_keywords=keywords)
               if reason:
                   print(f"defer {key}: {reason} (no label/arm this run)")
                   continue
