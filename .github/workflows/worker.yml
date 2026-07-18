@@ -288,15 +288,17 @@ jobs:
               "codex-auth-json", "claude-credentials-json", "claude-oauth-token", "anthropic-api-key"
           }:
               raise SystemExit("resolved model has an unsupported credential format")
-          # Harness-aware contract (2026-07-18): for codex, an unpinned provider_model
-          # (absent/empty/legacy "TBD") normalizes to EMPTY -> worker-live.sh omits --model
-          # and the codex CLI default tracks the account's supported model. The literal
-          # "TBD" placeholder previously passed the old non-empty check and reached
-          # `codex exec --model TBD` -> API 400 / degraded no-tool-call fallback on every
-          # terra fleet worker. For claude, a concrete id remains mandatory.
+          # Harness-aware contract (2026-07-18): "TBD" is the WIRE sentinel for an
+          # unpinned codex model — it must survive GITHUB_OUTPUT's non-empty value check
+          # (the later resolvers already normalize unset/empty -> "TBD" for exactly that
+          # reason), and worker-live.sh omits --model for it so the codex CLI default
+          # tracks the account's supported model. The incident: worker-live previously
+          # omitted only on EMPTY, so the sentinel reached `codex exec --model TBD` ->
+          # API 400 / degraded no-tool-call fallback on every terra fleet worker.
+          # For claude, a concrete id remains mandatory.
           if provider_model in (None, "", "TBD"):
               if harness == "codex":
-                  provider_model = ""
+                  provider_model = "TBD"
               else:
                   raise SystemExit("resolved claude model has no concrete provider model")
           elif not isinstance(provider_model, str):
