@@ -864,14 +864,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read  # check out the registry to run scripts/plan-alert.py
+      contents: read  # minimum for the sparse checkout below — the job runs a script from the repo
       issues: write   # upsert/close the rolling plan-failure ops-alert issue
     steps:
-      - name: Check out the registry (pinned, no persisted token)
+      # Codex r4 privilege review: the job DOES need a checkout (the alert logic lives in
+      # scripts/plan-alert.py), but only that one file — sparse-checkout scopes the working copy
+      # to it, pinned and with no persisted token, so nothing else from the repo reaches this job.
+      - name: Check out ONLY scripts/plan-alert.py (pinned, sparse, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
           persist-credentials: false
+          sparse-checkout: scripts/plan-alert.py
+          sparse-checkout-cone-mode: false
 
       - name: Alert maintainer that the dispatch PLAN job hard-failed
         continue-on-error: true

@@ -15,6 +15,9 @@
 #  - _gh(check=True): a non-zero gh returncode is surfaced as a sanitized ::warning:: (op +
 #    returncode only — never stderr, which can echo request bodies under GH_DEBUG=api) and main()
 #    returns non-zero so the step outcome goes red (continue-on-error isolates the dispatcher).
+#  - Codex r4: a SUCCESSFUL `gh issue list` returning MALFORMED JSON (truncation, HTML error page)
+#    fails SOFT — sanitized ::warning:: (payload never echoed) and a graceful no-mutation skip,
+#    never an uncaught JSONDecodeError crashing the alert; the next scheduled tick retries.
 #
 # Pure decide()/_alert_route() + a stubbed-gh flow test run under --self-test (registry-selftest).
 import json
@@ -97,7 +100,18 @@ def main():
         # Fail loud (review r1): without the list we can neither dedupe an upsert nor prove
         # recovery — go red (the job's continue-on-error keeps the dispatcher isolated).
         return 1
-    found = json.loads(listed.stdout or "[]")
+    # Codex r4: a SUCCESSFUL gh call can still hand back malformed JSON (truncated output, an HTML
+    # error page, a proxy interposing). That must degrade, not crash the whole alert: without a
+    # parseable list we can neither dedupe nor prove recovery, so warn (sanitized — never echo the
+    # payload, which is remote/user-controlled) and skip this tick; the next tick retries.
+    try:
+        found = json.loads(listed.stdout or "[]")
+        if not isinstance(found, list):
+            raise ValueError("expected a JSON array")
+    except ValueError:  # json.JSONDecodeError is a ValueError
+        print("::warning::plan-alert: gh issue list succeeded but returned unparseable "
+              "JSON — skipping this tick (no dedupe/recovery data; next tick retries)")
+        return 0
     # r3 residual: match the stable body MARKER first (survives a retitled alert), exact title
     # second (legacy alerts filed before the marker existed).
     num = next((i["number"] for i in found if ALERT_MARKER in (i.get("body") or "")), None)
@@ -230,6 +244,19 @@ def _self_test():
         rc_e, out_e = run_main("failure", fail=(("issue", "list"),))
         chk("flow: list failure -> rc=1 + sanitized warning",
             (rc_e, "::warning::" in out_e, "SENTINEL-STDERR" in out_e), (1, True, False))
+        # Codex r4: a SUCCESSFUL list handing back malformed JSON must fail SOFT — warning +
+        # graceful no-mutation skip (rc=0, no exception), and the payload is never echoed.
+        rc_m, out_m = run_main("failure", "SENTINEL-MALFORMED-PAYLOAD {not json")
+        chk("flow: malformed list JSON -> warning + graceful skip, payload not echoed",
+            (rc_m, "::warning::" in out_m, "SENTINEL-MALFORMED-PAYLOAD" in out_m,
+             [s for s in subs() if s != ("issue", "list")]),
+            (0, True, False, []))
+        # ...and valid-JSON-but-not-a-list (e.g. a gh/API error OBJECT) takes the same soft path.
+        rc_n, out_n = run_main("success", '{"message": "sentinel-error-object"}')
+        chk("flow: non-array list JSON -> warning + graceful skip, payload not echoed",
+            (rc_n, "::warning::" in out_n, "sentinel-error-object" in out_n,
+             [s for s in subs() if s != ("issue", "list")]),
+            (0, True, False, []))
         # r2 finding 2: EVERY mutation's returncode must fail the run (not just the list's).
         for failing in (("issue", "create"), ("issue", "edit")):
             rc_f, out_f = run_main("failure", open_json if failing == ("issue", "edit") else "[]",
