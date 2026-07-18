@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-1 fail-closed defect is corrected. `_open_blockers` now accepts only the exact live states `open` and `closed`, treats `open` as blocking, and raises `DispatchError` for null, unknown, wrongly cased, non-string, or otherwise malformed states, so CLAIM cannot dispatch without positive proof of closure. The added self-test directly exercises malformed present states as well as unreadable, open, closed, epic, and deferred-retry cases; these assertions are non-vacuous and cover the corrected control flow. No new correctness, soundness, security, or trust-plane weakening issue is supported by the diff.",
+ "verdict": "approve"
+}
