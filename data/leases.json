@@ -72,16 +72,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "e75d036a0c04466dae85ee4bda6314c0",
-   "holder": "review:sparq-org/sparq#3472@dispatch-29646004745.1",
-   "package": "sparq-sim",
-   "role": "review",
-   "model": "terra",
-   "issued_at": 1784381199,
-   "expires_at": 1784382399
-  },
-  {
-   "account": "acct01",
    "claim_id": "28d8e9458d084bbdaabd343a0a726305",
    "holder": "review:sparq-org/sparq#3484@dispatch-29646004745.1",
    "package": "gui",
