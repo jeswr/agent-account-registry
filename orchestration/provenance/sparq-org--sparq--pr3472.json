@@ -1,0 +1,9 @@
+{
+ "head_sha_at_open": "529a822d3b9c78a3cc589d3611b04834f17b7714",
+ "impl_account_h": "58b7c92faa5b5ca5",
+ "impl_alias": "sonnet",
+ "impl_provider": "anthropic",
+ "issue": 3403,
+ "pr_number": 3472,
+ "recorded_at_run": "backfill:29627718532.1"
+}
