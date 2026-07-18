@@ -99,6 +99,16 @@
    "model": "opus",
    "issued_at": 1784343539,
    "expires_at": 1784349839
+  },
+  {
+   "account": "acct06",
+   "claim_id": "5d0f664d5f5644b8b3a5efe13ebfd75e",
+   "holder": "sparq-org/sparq#3152@dispatch-29627900112.1",
+   "package": "zk-xpath",
+   "role": "ci",
+   "model": "opus",
+   "issued_at": 1784343544,
+   "expires_at": 1784349844
   }
  ]
 }
