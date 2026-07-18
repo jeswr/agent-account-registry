@@ -181,6 +181,24 @@ jobs:
           path: registry
           persist-credentials: false
 
+      # Provenance records live on the unprotected `ledger` data-plane branch (issue #96):
+      # master's required `gate` check rejects every direct contents-API PUT, so post-outage
+      # records exist ONLY at this ref; the master checkout keeps the pre-outage copies.
+      # Fails the job LOUDLY if the ledger branch is missing.
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          persist-credentials: false
+
+      # Trust guard (issue #28 review round 1): the ledger branch is DATA-ONLY by design.
+      - name: Ledger checkout is data-only (trust guard)
+        run: |
+          set -euo pipefail
+          test ! -e ledger/.github
+          test ! -e ledger/scripts
+
       - name: Checkout public target for protected routing data (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -252,9 +270,13 @@ jobs:
 
           # REGISTRY provenance is the root of trust for the implementer identity. Missing
           # record => never reviewed (fail closed); the target model has no registry token.
+          # The `ledger` branch checkout is the PRIMARY record location (issue #96 — post-outage
+          # records land only there); the master checkout is the legacy pre-outage fallback.
           owner, name = repo.split("/", 1)
-          record_path = Path("registry", "orchestration", "provenance",
-                             f"{owner}--{name}--pr{pull['number']}.json")
+          record_name = f"{owner}--{name}--pr{pull['number']}.json"
+          record_path = Path("ledger", "orchestration", "provenance", record_name)
+          if not record_path.is_file():
+              record_path = Path("registry", "orchestration", "provenance", record_name)
           if not record_path.is_file():
               raise SystemExit("no registry provenance record for this PR (fail closed)")
           try:
@@ -731,6 +753,23 @@ jobs:
           path: registry
           persist-credentials: false
 
+      # Verdict records are staged from the unprotected `ledger` data-plane branch first
+      # (issue #96 — post-outage records land only there); the master checkout keeps the
+      # pre-outage copies. Fails the job LOUDLY if the ledger branch is missing.
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          persist-credentials: false
+
+      # Trust guard (issue #28 review round 1): the ledger branch is DATA-ONLY by design.
+      - name: Ledger checkout is data-only (trust guard)
+        run: |
+          set -euo pipefail
+          test ! -e ledger/.github
+          test ! -e ledger/scripts
+
       # Per-phase least-privilege App tokens. The REVIEW token cannot write target contents (the
       # reviewer never pushes); the FIX token can (it pushes the fix commit). The ARM path mints
       # its own token in the separate `outcome` job only when the verdict approves. No token
@@ -936,7 +975,9 @@ jobs:
           owner="${TARGET_REPO%%/*}"
           name="${TARGET_REPO##*/}"
           prior=$((REVIEW_ROUND - 1))
-          record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${prior}.json"
+          # Ledger-branch record first (issue #96), legacy master-checkout copy as fallback.
+          record="ledger/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${prior}.json"
+          [[ -f "$record" ]] || record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${prior}.json"
           if [[ -f "$record" ]]; then
             install -m 600 "$record" "$WORKER_ROOT/prior-verdict.json"
             printf 'staged the round %s verdict for the progress comparison\n' "$prior"
@@ -1004,7 +1045,9 @@ jobs:
           set -euo pipefail
           owner="${TARGET_REPO%%/*}"
           name="${TARGET_REPO##*/}"
-          record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
+          # Ledger-branch record first (issue #96), legacy master-checkout copy as fallback.
+          record="ledger/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
+          [[ -f "$record" ]] || record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
           [[ -f "$record" ]] || { echo "::error::no registry verdict record for round $REVIEW_ROUND"; exit 1; }
           install -m 600 "$record" "$WORKER_ROOT/review-verdict.json"
 

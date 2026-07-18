@@ -992,8 +992,21 @@ def _pr_comments(repo, pr_number):
     return [item for page in pages if isinstance(page, list) for item in page]
 
 
+def record_file_path(ledger_root, registry_root, relative):
+    """Resolve a provenance/verdict record file: the `ledger` data-plane branch checkout is the
+    PRIMARY location (issue #96 — master's required `gate` check rejects every direct
+    contents-API PUT, so post-outage records land ONLY on the ledger branch), and the legacy
+    master registry checkout is the fallback so pre-outage records (<= sparq#2542) stay
+    visible. An empty ledger_root (no ledger checkout wired) reads the legacy path only."""
+    if ledger_root:
+        candidate = Path(ledger_root) / relative
+        if candidate.is_file():
+            return candidate
+    return Path(registry_root) / relative
+
+
 def latest_recorded_progress(worker_pr, registry_root, repo, number, rounds, comments,
-                             bot_login):
+                             bot_login, ledger_root=""):
     """The LATEST verdict's progress grade for decide_budget. Primary source: the registry
     verdict record for the newest recorded round (written FIRST in the outcome ordering, so it
     survives a crash before the findings comment); fallback: the durable progress marker in the
@@ -1001,7 +1014,8 @@ def latest_recorded_progress(worker_pr, registry_root, repo, number, rounds, com
     that as not-improving — fail closed toward a human, never toward a silent extension)."""
     if rounds < 1:
         return None
-    path = Path(registry_root) / worker_pr.verdict_path(repo, number, rounds)
+    path = record_file_path(ledger_root, registry_root,
+                            worker_pr.verdict_path(repo, number, rounds))
     if path.is_file():
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
@@ -1042,7 +1056,8 @@ def _resolvable_chain(chain, routing):
 
 
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
-                           registry_repo, registry_root, workflow_ref, bot_login, usage, margin):
+                           registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
+                           ledger_root=""):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
     that item (per-item resilience, like the issue loop)."""
     launched = 0
@@ -1083,7 +1098,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 print(f"defer review {repo}#{number}: human-owned "
                       f"({'/'.join(sorted(held))})")
                 continue
-            record_path = Path(registry_root) / worker_pr.provenance_path(repo, number)
+            record_path = record_file_path(ledger_root, registry_root,
+                                           worker_pr.provenance_path(repo, number))
             if not record_path.is_file():
                 print(f"defer review {repo}#{number}: no registry provenance record (fail closed)")
                 continue
@@ -1205,7 +1221,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 fix_models = sorted({model for models in round_models.values()
                                      for model in models})
                 progress = latest_recorded_progress(worker_pr, registry_root, repo, number,
-                                                    rounds, comments, bot_login)
+                                                    rounds, comments, bot_login,
+                                                    ledger_root=ledger_root)
                 pin_floor = worker_pr.pinned_fix_floor(comments, bot_login, impl_provider)
                 # A needs-review head whose LATEST round carries a fix-model marker is a PUSHED
                 # fix awaiting its re-review (an executed fix flips the label to review:needs).
@@ -1301,7 +1318,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    f"{len(missed)} consecutive fix dispatches missed for round "
                                    f"{rounds}; a human must unstick this PR")
                     continue
-                verdict_file = Path(registry_root) / worker_pr.verdict_path(repo, number, rounds)
+                verdict_file = record_file_path(ledger_root, registry_root,
+                                                worker_pr.verdict_path(repo, number, rounds))
                 if not verdict_file.is_file():
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "record-marker", "--repo", repo, "--pr", str(number), "--kind", "missed",
@@ -1515,7 +1533,7 @@ def _load_usage():
 
 
 def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
-             registry_root=".", bot_login=""):
+             registry_root=".", bot_login="", ledger_root=""):
     policy_module = _load_module("registry_policy_resolve", script_dir / "policy-resolve.py")
     allocator = _load_module("registry_select_and_claim", script_dir / "select-and-claim.py")
     worker_pr = _load_module("registry_worker_pr", script_dir / "worker-pr.py")
@@ -1751,7 +1769,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             dispatched += _dispatch_review_items(
                 repo_review_items, repo, policy, routing, allocator, worker_pr,
                 registry_repo, registry_root, workflow_ref, bot_login, usage,
-                float(policy.get("usage_safety_margin", 0.10)))
+                float(policy.get("usage_safety_margin", 0.10)),
+                ledger_root=ledger_root)
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
 
     # Final summary (registry #28/#32): overwrite the early claim-start write with the real
@@ -2354,17 +2373,21 @@ def _self_test():
         helper_calls.clear()
         _dispatch_review_items(items, repo, {"max_review_rounds": 3, "account_pool": []},
                                routing or {}, allocator, wiring_worker_pr, "reg/repo",
-                               wiring_root, "main", bot, None, 0.10)
+                               wiring_root, "main", bot, None, 0.10,
+                               ledger_root=wiring_ledger_root)
 
     ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
                "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
                "security": False, "context": "js"}
     real_io = (_gh_json, _run_target_helper, _target_token)
     with tempfile.TemporaryDirectory() as tmp:
-        wiring_root = tmp
+        wiring_root = str(Path(tmp) / "registry")
+        # A separate `ledger` branch checkout root (issue #96): records land there post-outage;
+        # the legacy registry root remains the fallback for pre-outage records.
+        wiring_ledger_root = str(Path(tmp) / "ledger")
         wiring_worker_pr = _load_module(
             "registry_worker_pr_wiring", Path(__file__).resolve().parent / "worker-pr.py")
-        record_file = Path(tmp) / wiring_worker_pr.provenance_path(repo, 41)
+        record_file = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, 41)
         record_file.parent.mkdir(parents=True)
         record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
         try:
@@ -2429,8 +2452,9 @@ def _self_test():
                 return [bot_comment(f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->")
                         for i in range(1, count + 1)]
 
-            def write_verdict(round_n, progress):
-                path = Path(tmp) / wiring_worker_pr.verdict_path(repo, 41, round_n)
+            def write_verdict(round_n, progress, root=None):
+                path = Path(root or wiring_root) / wiring_worker_pr.verdict_path(
+                    repo, 41, round_n)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps({
                     "verdict": "request_changes", "injection_detected": False,
@@ -2569,16 +2593,51 @@ def _self_test():
             # latest_recorded_progress: the registry record is primary, the findings-comment
             # marker is the fallback, and unknown/absent degrades to None (never extends)
             write_verdict(5, "regressing")
-            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 5, [],
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 5, [],
                                             bot) == "regressing"
             marker_only = [bot_comment(
                 f"y {wiring_worker_pr.PROGRESS_MARKER} round=9 progress=improving -->")]
-            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 9, marker_only,
-                                            bot) == "improving"
-            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 8, marker_only,
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 9,
+                                            marker_only, bot) == "improving"
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 8,
+                                            marker_only, bot) is None
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 0,
+                                            marker_only, bot) is None
+
+            # ---- ledger-first record resolution (issue #96): post-outage records exist ONLY
+            # on the `ledger` branch checkout; the legacy master-checkout copy remains visible
+            # as the fallback so pre-outage records (<= sparq#2542) keep working ----
+            verdict_rel = wiring_worker_pr.verdict_path(repo, 41, 7)
+            assert record_file_path(wiring_ledger_root, wiring_root, verdict_rel) == \
+                Path(wiring_root) / verdict_rel        # ledger miss -> legacy fallback
+            write_verdict(7, "improving", root=wiring_ledger_root)
+            assert record_file_path(wiring_ledger_root, wiring_root, verdict_rel) == \
+                Path(wiring_ledger_root) / verdict_rel  # ledger hit wins
+            assert record_file_path("", wiring_root, verdict_rel) == \
+                Path(wiring_root) / verdict_rel        # no ledger checkout -> legacy only
+            # a ledger-only verdict is found (the outage class: master copy never lands) ...
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 7, [],
+                                            bot, ledger_root=wiring_ledger_root) == "improving"
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 7, [],
                                             bot) is None
-            assert latest_recorded_progress(wiring_worker_pr, tmp, repo, 41, 0, marker_only,
-                                            bot) is None
+            # ... and where both branches carry the round, the ledger copy governs
+            write_verdict(5, "improving", root=wiring_ledger_root)
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 5, [],
+                                            bot, ledger_root=wiring_ledger_root) == "improving"
+            # end-to-end CLAIM wiring on a LEDGER-ONLY provenance record: the legacy record is
+            # gone (post-outage reality) and the review item still admits + defers normally
+            record_file.unlink()
+            ledger_record = Path(wiring_ledger_root) / wiring_worker_pr.provenance_path(
+                repo, 41)
+            ledger_record.parent.mkdir(parents=True, exist_ok=True)
+            ledger_record.write_text(json.dumps(provenance[41]), encoding="utf-8")
+            fake["comments"] = round_markers(2)
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            write_verdict(2, None, root=wiring_ledger_root)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io
@@ -2715,7 +2774,12 @@ def main():
     parser.add_argument("--policy-file", default="policy/repos.toml")
     parser.add_argument("--registry-repo", default="jeswr/agent-account-registry")
     parser.add_argument("--registry-root", default=".",
-                        help="registry checkout root (provenance + verdict records)")
+                        help="registry checkout root (legacy pre-outage provenance + verdict "
+                             "records)")
+    parser.add_argument("--ledger-root", default="",
+                        help="`ledger` data-plane branch checkout root — the PRIMARY location "
+                             "of provenance + verdict records (issue #96); empty reads the "
+                             "legacy registry root only")
     parser.add_argument("--bot-login", default="",
                         help="target App bot login (<slug>[bot]); required for review/deferred")
     parser.add_argument("--workflow-ref", default="")
@@ -2735,6 +2799,7 @@ def main():
             Path(__file__).resolve().parent,
             registry_root=args.registry_root,
             bot_login=args.bot_login,
+            ledger_root=args.ledger_root,
         )
     except DispatchError as exc:
         print(f"dispatch-claim: {exc}", file=sys.stderr)

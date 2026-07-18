@@ -32,6 +32,18 @@ jobs:
         with:
           persist-credentials: false
 
+      # Provenance records live on the unprotected `ledger` data-plane branch (issue #96):
+      # master's required `gate` check rejects every direct contents-API PUT, so post-outage
+      # records exist ONLY at this ref — a master-only read would orphan-park every
+      # ledger-recorded draft. The master checkout keeps the pre-outage copies as fallback.
+      # Fails the job LOUDLY if the ledger branch is missing.
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          persist-credentials: false
+
       # Out-of-band DATA-ONLY invariant sweep (review round 2): this step runs from MASTER's
       # copy of this workflow on every scheduled tick, so it cannot be bypassed by content on
       # the ledger branch itself. The platform already blocks the confined actor (Actions'
@@ -43,6 +55,8 @@ jobs:
       #   100644 blob README.md            (the branch's tombstone/pointer doc)
       #   040000 tree data                 (the data directory itself)
       #   100644 blob data/<name>.json     (regular, non-executable JSON blobs, no subdirs)
+      #   040000 tree orchestration[/provenance|/review-verdicts]   (issue #96 record dirs)
+      #   100644 blob orchestration/{provenance,review-verdicts}/<name>.json
       # so executable-mode blobs (100755), symlinks (120000), submodules (160000),
       # extensionless files, and data/evil.py all fail regardless of naming tricks. A
       # truncated tree listing also fails: unverified means violated.
@@ -59,7 +73,11 @@ jobs:
           bad=$(jq -r '.tree[] | [.mode, .type, .path] | @tsv' <<<"$resp" | awk -F'\t' '
             !(($1 == "100644" && $2 == "blob" && $3 == "README.md") ||
               ($1 == "040000" && $2 == "tree" && $3 == "data") ||
-              ($1 == "100644" && $2 == "blob" && $3 ~ /^data\/[^\/]+\.json$/))')
+              ($1 == "100644" && $2 == "blob" && $3 ~ /^data\/[^\/]+\.json$/) ||
+              ($1 == "040000" && $2 == "tree" && ($3 == "orchestration" ||
+                 $3 == "orchestration/provenance" || $3 == "orchestration/review-verdicts")) ||
+              ($1 == "100644" && $2 == "blob" &&
+                 $3 ~ /^orchestration\/(provenance|review-verdicts)\/[^\/]+\.json$/))')
           if [ -n "$bad" ]; then
             printf '::error::ledger branch carries non-whitelisted content (data-only invariant violated):\n%s\n' "$bad"
             exit 1
@@ -92,7 +110,8 @@ jobs:
             --registry-repo "$GITHUB_REPOSITORY" \
             --policy-file policy/repos.toml \
             --policy-resolver scripts/policy-resolve.py \
-            --bot-slug "$APP_SLUG"
+            --bot-slug "$APP_SLUG" \
+            --ledger-root ledger
 
       # Model-access health decision (registry #32): the groom sweep already runs on schedule, so it
       # is the natural place to evaluate the health record window and raise/close alerts (keeps
