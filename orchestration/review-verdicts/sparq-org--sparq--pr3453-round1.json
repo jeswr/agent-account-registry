@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change is a semantics-preserving type-alias refactor: ByteCache exactly aliases the prior FxHashMap<Box<[u8]>, u32> type, and every modified initialization continues to use Default for that same concrete map. The added comment documents the hasher decision without changing behavior. No correctness, soundness, security, or test-validity issue is introduced by this diff.",
+ "verdict": "approve"
+}
