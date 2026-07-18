@@ -333,12 +333,23 @@ def classify_records(records, provider_accounts, now):
             if r.get("exit_class") in PERSISTENCE_CLASSES
             and (now - r["ts"]) <= TRANSIENT_WINDOW_SECONDS]
         persistent = len(transient_recent) >= TRANSIENT_MIN_FAILS
+        # Failure-class composition (review #72 finding 2): the persistence bucket mixes
+        # provider-attributed transients (429/529/overloaded) with UNATTRIBUTABLE `unknown`
+        # failures (timeouts/cancellations/pre-launch aborts). The advice layer needs the split:
+        # a green status page only supports a self-induced-rate-limit diagnosis when the burst
+        # was actually attributed to rate limits.
+        counts = {cls: sum(1 for r in transient_recent if r.get("exit_class") == cls)
+                  for cls in (CLASS_TRANSIENT, CLASS_UNKNOWN)}
+        composition = ", ".join(f"{counts[c]} {c}"
+                                for c in (CLASS_TRANSIENT, CLASS_UNKNOWN) if counts[c])
         actions.append({
             "condition": "persistent-transient",
             "provider": provider,
             "fire": bool(persistent) and not recovered,
-            "reason": (f"{len(transient_recent)} transient API failures in "
-                       f"{TRANSIENT_WINDOW_SECONDS // 60} min (persistent, not a blip)"
+            "class_counts": counts,
+            "reason": (f"{len(transient_recent)} transient/unknown API failures in "
+                       f"{TRANSIENT_WINDOW_SECONDS // 60} min "
+                       f"({composition}; persistent, not a blip)"
                        if persistent
                        else "a model launch succeeded again" if recovered
                        else "transient failures are within blip tolerance"),
@@ -404,9 +415,17 @@ def render_body(action, maintainer):
                      "or credits exhausted. Check the provider status page; rotate tokens "
                      "(`claude setup-token` / codex `login --device-auth`) if it is credential.")
     elif cond == "persistent-transient":
-        lines.append(f"⚠️ **Provider `{action['provider']}` is throwing sustained transient errors.** "
-                     f"{action['reason']}. These are individually retryable (429/529/overloaded) "
-                     "but the burst is degrading throughput.")
+        if (action.get("class_counts") or {}).get(CLASS_UNKNOWN):
+            # Review #72 finding 2: an unknown/mixed burst must not be described as retryable
+            # 429s — part of it was never attributed to the provider at all.
+            lines.append(f"⚠️ **Provider `{action['provider']}` launches are failing in a "
+                         f"sustained burst.** {action['reason']}. Part of the burst is "
+                         "UNATTRIBUTABLE (timeouts/cancellations/pre-launch aborts), so treat "
+                         "the failure class as unconfirmed until the run logs say otherwise.")
+        else:
+            lines.append(f"⚠️ **Provider `{action['provider']}` is throwing sustained transient "
+                         f"errors.** {action['reason']}. These are individually retryable "
+                         "(429/529/overloaded) but the burst is degrading throughput.")
     elif cond == "provider-capped":
         lines.append(f"⏳ **Every enabled `{action['provider']}` account is usage-capped.** "
                      f"{action['reason']}.")
@@ -444,14 +463,19 @@ def classify_status_payload(payload):
 def _fetch_status_json(url):
     """GET one of the two fixed PROVIDER_STATUS_URLS (never a caller-built URL) with a hard
     10s timeout; any transport or parse failure raises HealthError for the fail-open above."""
-    from urllib.error import HTTPError, URLError
+    import http.client
     from urllib.request import Request, urlopen
     request = Request(url, headers={"User-Agent": "registry-model-health"})
     try:
         with urlopen(request, timeout=STATUS_PROBE_TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode())
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        # ValueError covers both JSONDecodeError and UnicodeDecodeError.
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        # OSError subsumes URLError/HTTPError/TimeoutError AND the raw socket errors
+        # (ConnectionResetError etc.) that response.read() can raise mid-body; HTTPException
+        # covers a truncated/half-closed response (http.client.IncompleteRead). Review #72
+        # finding 1: neither was normalized before, so a mid-read failure escaped HealthError
+        # and aborted _cmd_decide BEFORE the alert upsert — the one failure mode the fail-open
+        # design forbids. ValueError covers both JSONDecodeError and UnicodeDecodeError.
         raise HealthError("provider status probe failed") from exc
 
 
@@ -465,6 +489,12 @@ def probe_provider_status(provider, fetch=None):
     try:
         payload = (fetch or _fetch_status_json)(url)
     except HealthError:
+        return STATUS_UNKNOWN, ""
+    except Exception:
+        # Defensive backstop at the annotation boundary (review #72 finding 1): the probe is
+        # ANNOTATION ONLY and must NEVER be able to abort `decide` (which would suppress the
+        # alert upsert), so even an exception class the fetch failed to normalize folds to
+        # unknown. Deliberately broad — narrowing it reopens the suppress-on-crash hole.
         return STATUS_UNKNOWN, ""
     return classify_status_payload(payload)
 
@@ -503,11 +533,25 @@ def _status_advice(action):
             f"{_status_display(status, action.get('status_indicator') or '')}`")
     if status == STATUS_OPERATIONAL:
         if action["condition"] == "persistent-transient":
-            return (head + " — **likely SELF-INDUCED.** The provider's public status page "
-                    "reports no incident, so this burst is most consistent with over-"
-                    "parallelization on our side (concurrent workers sharing the same rate-limit "
-                    "windows). SHED PARALLELISM — run fewer concurrent workers on this provider — "
-                    "rather than retrying at the same width.")
+            # SELF-INDUCED is claimed ONLY for a qualifying TRUE-transient burst: the
+            # provider-attributed transient count must clear the persistence threshold on its
+            # own (review #72 finding 2 — an unknown/mixed burst that fired on unattributable
+            # timeouts/cancellations proves nothing about rate limits, so advising "shed
+            # parallelism" there is a false diagnosis). Missing counts fall to the unverified
+            # framing: never claim self-induction on evidence we do not hold.
+            counts = action.get("class_counts") or {}
+            if counts.get(CLASS_TRANSIENT, 0) >= TRANSIENT_MIN_FAILS:
+                return (head + " — **likely SELF-INDUCED.** The provider's public status page "
+                        "reports no incident, so this burst is most consistent with over-"
+                        "parallelization on our side (concurrent workers sharing the same "
+                        "rate-limit windows). SHED PARALLELISM — run fewer concurrent workers "
+                        "on this provider — rather than retrying at the same width.")
+            return (head + " — **cause UNVERIFIED.** The status page is green, but this burst "
+                    "is not a clean rate-limit signature: it leans on UNATTRIBUTABLE failures "
+                    "(timeouts / cancellations / pre-launch aborts the host could not pin on "
+                    "the provider). Do NOT assume self-induced rate limiting — inspect the "
+                    "failing run logs to attribute the burst before shedding parallelism or "
+                    "blaming the provider.")
         return (head + " — the status page is green while every launch fails, which points at "
                 "our side (expired tokens / exhausted credits), not a provider incident.")
     if status in (STATUS_DEGRADED, STATUS_OUTAGE):
@@ -963,6 +1007,18 @@ def _self_test():
     chk("unknown counts toward persistent-transient",
         fires(classify_records(unknown_burst, {}, now + 200), "persistent-transient", "anthropic"),
         True)
+    # ...yet an unknown burst must NOT be sold as self-induced rate limiting (review #72
+    # finding 2): composition rides the action, and a green status page renders the
+    # unverified framing end-to-end — never SELF-INDUCED / shed-parallelism.
+    ub_acts = annotate_provider_status(classify_records(unknown_burst, {}, now + 200),
+                                       probe=lambda p: (STATUS_OPERATIONAL, "none"))
+    ub = next(a for a in ub_acts if a["condition"] == "persistent-transient")
+    chk("burst action carries its failure-class composition",
+        ub["class_counts"], {CLASS_TRANSIENT: 0, CLASS_UNKNOWN: 5})
+    chk("burst reason discloses the composition", "5 unknown" in ub["reason"], True)
+    ub_body = render_body(ub, "m")
+    chk("green-status unknown burst renders UNVERIFIED end-to-end (never SELF-INDUCED)",
+        ("SELF-INDUCED" in ub_body, "cause UNVERIFIED" in ub_body), (False, True))
     # too-old failures fall outside the 30-min window
     stale = [rec("anthropic", "acct01", CLASS_AUTH, dt=-4000),
              rec("anthropic", "acct02", CLASS_AUTH, dt=-3900),
@@ -981,6 +1037,15 @@ def _self_test():
     burst_ok = burst + [rec("anthropic", "acct01", SUCCESS, dt=200)]
     chk("transient RECOVERS on success",
         fires(classify_records(burst_ok, {}, now + 300), "persistent-transient", "anthropic"), False)
+    # a TRUE-transient burst keeps the self-induced diagnosis end-to-end (mutation guard for
+    # review #72 finding 2: dropping the class_counts attachment turns this red).
+    tb_acts = annotate_provider_status(classify_records(burst, {}, now + 200),
+                                       probe=lambda p: (STATUS_OPERATIONAL, "none"))
+    tb = next(a for a in tb_acts if a["condition"] == "persistent-transient")
+    chk("pure transient burst carries its composition",
+        tb["class_counts"], {CLASS_TRANSIENT: 5, CLASS_UNKNOWN: 0})
+    chk("green-status TRUE-transient burst still renders SELF-INDUCED end-to-end",
+        "SELF-INDUCED" in render_body(tb, "m"), True)
 
     # ---- PROVIDER-CAPPED: ACT (all capped) / DO-NOTHING (one capped) -------------------------
     fleet = {"anthropic": {account_hash("acct01", salt), account_hash("acct02", salt)}}
@@ -1076,6 +1141,7 @@ def _self_test():
 
     # ---- provider status probe + annotation (issue #70) --------------------------------------
     ok = _test_provider_status(chk) and ok
+    ok = _test_probe_fetch(chk) and ok
     ok = _test_decide_annotation(chk) and ok
 
     print("model-health self-test", "PASSED" if ok else "FAILED")
@@ -1406,16 +1472,44 @@ def _test_provider_status(chk):
     chk("operational NEVER suppresses: fire flags untouched by annotation",
         [a["fire"] for a in actions], [True, True, True, False])
 
-    # body rendering: SELF-INDUCED / known-incident / fail-open framings
-    def body(cond, status, indicator):
-        return render_body({"condition": cond, "provider": "anthropic", "fire": True,
-                            "reason": "5 transient API failures in 15 min",
-                            "provider_status": status, "status_indicator": indicator}, "m")
+    # body rendering: SELF-INDUCED / unverified / known-incident / fail-open framings.
+    # counts defaults to a pure TRUE-transient burst; finding-2 checks override it.
+    def body(cond, status, indicator, counts=None):
+        action = {"condition": cond, "provider": "anthropic", "fire": True,
+                  "reason": "5 transient/unknown API failures in 15 min",
+                  "provider_status": status, "status_indicator": indicator}
+        if cond == "persistent-transient":
+            action["class_counts"] = (counts if counts is not None
+                                      else {CLASS_TRANSIENT: 5, CLASS_UNKNOWN: 0})
+        return render_body(action, "m")
 
     green = body("persistent-transient", STATUS_OPERATIONAL, "none")
-    chk("operational burst is labelled SELF-INDUCED", "SELF-INDUCED" in green, True)
+    chk("operational TRUE-transient burst is labelled SELF-INDUCED", "SELF-INDUCED" in green, True)
     chk("...with shed-parallelism advice", "SHED PARALLELISM" in green, True)
     chk("...and the provider-status annotation", "provider-status: operational" in green, True)
+    # review #72 finding 2: unknown/mixed bursts get the UNVERIFIED framing, never SELF-INDUCED
+    all_unknown = body("persistent-transient", STATUS_OPERATIONAL, "none",
+                       counts={CLASS_TRANSIENT: 0, CLASS_UNKNOWN: 5})
+    chk("operational all-unknown burst is NOT labelled SELF-INDUCED",
+        ("SELF-INDUCED" in all_unknown, "SHED PARALLELISM" in all_unknown), (False, False))
+    chk("...it gets the unverified framing instead",
+        ("cause UNVERIFIED" in all_unknown, "UNATTRIBUTABLE" in all_unknown), (True, True))
+    chk("...and its headline drops the retryable-429 claim",
+        "individually retryable" in all_unknown, False)
+    mixed = body("persistent-transient", STATUS_OPERATIONAL, "none",
+                 counts={CLASS_TRANSIENT: 2, CLASS_UNKNOWN: 3})
+    chk("mixed burst below the true-transient threshold is unverified",
+        ("SELF-INDUCED" in mixed, "cause UNVERIFIED" in mixed), (False, True))
+    qualified = body("persistent-transient", STATUS_OPERATIONAL, "none",
+                     counts={CLASS_TRANSIENT: 5, CLASS_UNKNOWN: 2})
+    chk("a qualifying true-transient burst keeps SELF-INDUCED despite extra unknowns",
+        "SELF-INDUCED" in qualified, True)
+    no_counts = render_body({"condition": "persistent-transient", "provider": "anthropic",
+                             "fire": True, "reason": "r",
+                             "provider_status": STATUS_OPERATIONAL,
+                             "status_indicator": "none"}, "m")
+    chk("missing composition never claims SELF-INDUCED (evidence not held)",
+        "SELF-INDUCED" in no_counts, False)
     minor = body("persistent-transient", STATUS_DEGRADED, "minor")
     chk("degraded carries the qualified annotation",
         "provider-status: degraded (minor)" in minor, True)
@@ -1434,6 +1528,53 @@ def _test_provider_status(chk):
     plain = render_body({"condition": "persistent-transient", "provider": "anthropic",
                          "fire": True, "reason": "r"}, "m")
     chk("unprobed action renders no provider-status line", "provider-status" in plain, False)
+    return True
+
+
+def _test_probe_fetch(chk):
+    """The PRODUCTION fetch path (review #72 finding 1): failures raised by response.read()
+    MID-BODY — a raw OSError (connection reset) or http.client.IncompleteRead (truncated
+    response) — must normalize to HealthError so the probe fails OPEN instead of aborting
+    `decide` before the alert upsert. urlopen is patched; no network is touched. Mutation
+    strength: dropping the OSError/HTTPException normalization crashes these checks red
+    (the raw exception escapes _raises)."""
+    import http.client
+    import urllib.request
+
+    class _MidReadResponse:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self):
+            raise self._exc
+
+    real_urlopen = urllib.request.urlopen
+    try:
+        for name, exc in (("OSError (connection reset)", ConnectionResetError("reset")),
+                          ("IncompleteRead", http.client.IncompleteRead(b"partial"))):
+            urllib.request.urlopen = (
+                lambda request, timeout=None, _exc=exc: _MidReadResponse(_exc))
+            chk(f"fetch normalizes mid-read {name} to HealthError",
+                _raises(lambda: _fetch_status_json(PROVIDER_STATUS_URLS["anthropic"])), True)
+            chk(f"probe production path fails OPEN on mid-read {name}",
+                probe_provider_status("anthropic"), (STATUS_UNKNOWN, ""))
+    finally:
+        urllib.request.urlopen = real_urlopen
+
+    # The annotation boundary itself is a backstop: even an exception class the fetch failed
+    # to normalize folds to unknown (mutation: drop the broad except in probe_provider_status
+    # -> this crashes red), so a probe surprise can never abort `decide`.
+    def unnormalized(url):
+        raise RuntimeError("stub: exception class the fetch did not normalize")
+
+    chk("annotation boundary fails OPEN on an unnormalized exception",
+        probe_provider_status("anthropic", fetch=unnormalized), (STATUS_UNKNOWN, ""))
     return True
 
 
