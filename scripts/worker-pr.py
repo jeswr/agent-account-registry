@@ -49,6 +49,12 @@ MARKER_KINDS = {
 # fix-model FLOOR, and the findings comment records the reviewer's progress grade for its round.
 # All are parsed with the same bot-login trust filter as the round markers.
 FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
+# Successful-push AUTHOR marker (sol audit 2026-07-18): recorded ONLY when a fix round actually
+# PUSHED, and bound to the pushed head SHA. This — never the per-attempt fix-model markers above —
+# is what derives the CONTENT author for the review direction: attempt markers are recorded for
+# no-change and gate-failed runs too, so an opus attempt followed by a luna success in the same
+# round would otherwise read as "conflicting providers" and park the PR.
+FIX_AUTHOR_MARKER = "<!-- sparq-fix-author:v1"
 MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
 PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -185,6 +191,86 @@ def fix_round_models(comments, bot_login):
     return {round_n: sorted(models) for round_n, models in result.items()}
 
 
+def fix_push_authors(comments, bot_login):
+    """Ordered [(round, model, sha)] from the bot's successful-push AUTHOR markers, in comment
+    order (comments arrive chronologically, so the last entry is the latest recorded push)."""
+    authors = []
+    pattern = re.compile(
+        re.escape(FIX_AUTHOR_MARKER)
+        + r" round=([1-9][0-9]*) model=([A-Za-z0-9][A-Za-z0-9_.-]*) sha=([0-9a-f]{40})"
+        + r" run=\S+ -->")
+    for comment in _bot_comments(comments, bot_login):
+        for match in pattern.finditer(str(comment.get("body", ""))):
+            entry = (int(match.group(1)), match.group(2), match.group(3))
+            if entry not in authors:  # idempotent re-runs re-post the same marker content
+                authors.append(entry)
+    return authors
+
+
+def content_author_alias(authors, head_sha):
+    """The model alias that authored the CONTENT at `head_sha`, from the ordered successful-push
+    author markers (fix_push_authors). None => no fix ever pushed, the provenance implementer
+    authored the content. Preference order: a marker bound to EXACTLY this head; otherwise the
+    LATEST recorded push author (the head can advance past the last push only via base-branch
+    merges — every loop push records a marker — so the last push author still owns the content).
+    Two markers binding the SAME sha to different models is corrupt/forged marker data and
+    raises (fail closed: the caller escalates to a human, never guesses a review direction)."""
+    if not authors:
+        return None
+    by_sha = {}
+    for _, model, sha in authors:
+        by_sha.setdefault(sha, set()).add(model)
+    if any(len(models) > 1 for models in by_sha.values()):
+        raise WorkerPrError("conflicting successful-push author markers for one head sha")
+    if head_sha in by_sha:
+        return next(iter(by_sha[head_sha]))
+    return authors[-1][1]
+
+
+def route_fix_constraint(labels, routing):
+    """The ORIGINAL route's model chain for a PR's source-issue labels (sol audit 2026-07-18):
+    the same first-match-wins precedence as route-resolve.py / policy-resolve.py — a
+    match_labels (security) rule matches if any keyword is a substring of any label, else the
+    role row, else [defaults]. The unified fix ladder must be INTERSECTED with this chain
+    (constrained_ladder below): an opus-only trust-surface PR may only be fixed by opus, and a
+    frontier-only ci PR never falls below frontier. Returns the winning model_chain list
+    (possibly empty when the routing document is malformed — the caller fails closed)."""
+    if not isinstance(routing, dict):
+        return []
+    labels = {label for label in labels if isinstance(label, str)}
+    role = next((label[5:] for label in sorted(labels) if label.startswith("role:")), None)
+    routes = routing.get("route", [])
+    for rule in routes if isinstance(routes, list) else []:
+        if not isinstance(rule, dict):
+            continue
+        keywords = rule.get("match_labels")
+        if keywords:
+            if any(isinstance(keyword, str) and keyword in label
+                   for label in labels for keyword in keywords):
+                return list(rule.get("model_chain") or [])
+        elif role is not None and rule.get("role") == role:
+            return list(rule.get("model_chain") or [])
+    defaults = routing.get("defaults")
+    return list(defaults.get("model_chain") or []) if isinstance(defaults, dict) else []
+
+
+def constrained_ladder(provider, route_chain):
+    """Intersect the provider's unified fix escalation ladder with the ORIGINAL route's model
+    chain (after LEGACY_TIERS translation), preserving ladder order. Raises when the
+    intersection is empty (fail closed: a PR whose route names no ladder tier must go to a
+    human, never silently run the full ladder)."""
+    ladder = ESCALATION_LADDERS.get(provider)
+    if not ladder:
+        raise WorkerPrError("unknown provider for the escalation ladder")
+    allowed = {LEGACY_TIERS.get(model, model) for model in route_chain
+               if isinstance(model, str)}
+    constrained = [tier for tier in ladder if tier in allowed]
+    if not constrained:
+        raise WorkerPrError("the original route's model chain shares no tier with the fix "
+                            "ladder; a human must fix this PR")
+    return constrained
+
+
 def round_progress(comments, bot_login):
     """{round: progress} recorded in the bot's findings comments (the durable round-marker copy
     of each verdict's progress grade; the registry verdict record is the primary source)."""
@@ -198,12 +284,13 @@ def round_progress(comments, bot_login):
     return result
 
 
-def pinned_fix_floor(comments, bot_login, provider):
-    """Highest recorded fix-model floor pin, validated against the provider ladder. A bot marker
-    naming a tier OUTSIDE the ladder raises (fail closed): silently ignoring a corrupt pin would
-    run the unpinned chain — exactly the fall-back-down the pin exists to prevent — so the
-    caller escalates loudly instead."""
-    ladder = ESCALATION_LADDERS.get(provider)
+def pinned_fix_floor(comments, bot_login, provider, ladder=None):
+    """Highest recorded fix-model floor pin, validated against the provider ladder — or, when
+    `ladder` is given, the ROUTE-CONSTRAINED sub-ladder (constrained_ladder). A bot marker
+    naming a tier OUTSIDE the (sub-)ladder raises (fail closed): silently ignoring a corrupt or
+    constraint-violating pin would run the unpinned chain — exactly the fall-back-down the pin
+    exists to prevent — so the caller escalates loudly instead."""
+    ladder = ladder or ESCALATION_LADDERS.get(provider)
     if not ladder:
         raise WorkerPrError("unknown provider for the escalation ladder")
     pattern = re.compile(
@@ -220,11 +307,11 @@ def pinned_fix_floor(comments, bot_login, provider):
     return floor
 
 
-def pinned_fix_chain(provider, floor):
+def pinned_fix_chain(provider, floor, ladder=None):
     """FLOOR semantics for a pinned fix chain: only ladder members AT OR ABOVE the pin, cheapest
-    first. Tiers below the floor are never offered to the allocator — see the defer-not-fallback
-    rationale on decide_budget."""
-    ladder = ESCALATION_LADDERS.get(provider)
+    first — over the route-constrained sub-ladder when `ladder` is given. Tiers below the floor
+    are never offered to the allocator — see the defer-not-fallback rationale on decide_budget."""
+    ladder = ladder or ESCALATION_LADDERS.get(provider)
     floor = LEGACY_TIERS.get(floor, floor)
     if not ladder or floor not in ladder:
         raise WorkerPrError("model pin must be a ladder member for its provider")
@@ -233,7 +320,7 @@ def pinned_fix_chain(provider, floor):
 
 def decide_budget(rounds_used, per_round_models, latest_progress, provider,
                   base_rounds=3, hard_cap=HARD_CAP_ROUNDS,
-                  pending_fix_models=(), pin_floor=None):
+                  pending_fix_models=(), pin_floor=None, ladder=None):
     """PURE combined round-budget policy (maintainer directive 2026-07-17): decide whether the
     review<->fix loop continues, extends, or hands the PR to a human once the base round budget
     is spent. Every input derives from hostile-parsed marker/verdict data and is validated.
@@ -279,8 +366,13 @@ def decide_budget(rounds_used, per_round_models, latest_progress, provider,
     below it must never run another fix round for the PR. The extended budget exists precisely
     because the below-floor model already burned the base budget without converging; if the
     pinned tier has no available account the fix DEFERS to a later tick — falling back down the
-    chain would silently spend the extension re-running the model that already failed."""
-    ladder = ESCALATION_LADDERS.get(provider)
+    chain would silently spend the extension re-running the model that already failed.
+
+    `ladder` (sol audit 2026-07-18): the ROUTE-CONSTRAINED sub-ladder (constrained_ladder) —
+    "the top tier" then means the top tier THE ROUTE ALLOWS, so an opus-only trust-surface PR
+    whose opus fixes exhausted the budget goes to progress/needs-user instead of minting a pin
+    the route forbids. A recorded model outside the sub-ladder raises (fail closed, human)."""
+    ladder = ladder or ESCALATION_LADDERS.get(provider)
     if not ladder:
         raise WorkerPrError("unknown provider for the escalation ladder")
     if not isinstance(rounds_used, int) or isinstance(rounds_used, bool) or rounds_used < 0:
@@ -745,6 +837,26 @@ def record_fix_model(repo, pr_number, round_n, model, run_key, bot_login):
     print(f"fix model recorded for round {round_n}: {model}")
 
 
+def record_fix_author(repo, pr_number, round_n, model, sha, run_key, bot_login):
+    """Durably record the successful-push AUTHOR of a fix round, BOUND to the pushed head SHA
+    (sol audit 2026-07-18). Recorded only when the fix actually pushed — this marker (never the
+    per-attempt fix-model markers) derives the CONTENT author for the review direction.
+    Idempotent per marker content."""
+    if not SAFE_ALIAS_RE.fullmatch(model or ""):
+        raise WorkerPrError("fix author alias is unsafe")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+        raise WorkerPrError("fix author sha must be a 40-hex commit id")
+    comments = _paginated_comments(repo, pr_number)
+    marker = f"{FIX_AUTHOR_MARKER} round={round_n} model={model} sha={sha} run={run_key} -->"
+    if any(marker in str(c.get("body", "")) for c in _bot_comments(comments, bot_login)):
+        print(f"fix author already recorded for round {round_n}")
+        return
+    _comment(repo, pr_number,
+             f"> 🤖 SPARQ agent — fix round {round_n} pushed `{sha[:12]}` authored by "
+             f"`{model}`.\n\n{marker}")
+    print(f"fix author recorded for round {round_n}: {model} @ {sha[:12]}")
+
+
 def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_login):
     """Durably pin the fix-model floor after a budget extension (idempotent: an existing
     equal-or-higher recorded floor wins — the floor only ever moves UP the ladder)."""
@@ -1189,8 +1301,8 @@ def disarm(repo, pr_number, when):
     print(f"disarm applied ({when}): {','.join(actions)}")
 
 
-def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
-                  reviewer_account, arm, issue=None, surface_paths=None):
+def ready_and_arm(repo, pr_number, reviewed_sha, content_provider, impl_account_h,
+                  reviewer_provider, reviewer_account, arm, issue=None, surface_paths=None):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval).
 
@@ -1207,9 +1319,19 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     a gate-weakening / orchestration-control path (renamed paths included, since the check is live
     against the actual diff, not the planning-time list), WITHHOLDS auto-arm and escalates to a
     human (review:needs-user). The PR is NOT undrafted/armed; the automated review already ran, the
-    final arm click is a human's for gate-weakening paths regardless of issue labels."""
-    if reviewer_provider == impl_provider:
-        raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
+    final arm click is a human's for gate-weakening paths regardless of issue labels.
+
+    Cross-provider integrity is asserted against the CONTENT author (sol audit 2026-07-18): on
+    the unified fix ladder a fix round may cross providers, so the reviewed head's author
+    provider — derived from the successful-push author markers against the LIVE head in the
+    resolve step, falling back to the provenance implementer — is what the reviewer must
+    oppose. The reviewer!=IMPLEMENTER salted-account check stays: the original implementer's
+    account must never approve its own PR regardless of who authored the latest head."""
+    if content_provider not in {"anthropic", "openai"}:
+        raise WorkerPrError("refusing to arm: content author provider is missing or unsafe")
+    if reviewer_provider == content_provider:
+        raise WorkerPrError("refusing to arm: reviewer provider equals the content author "
+                            "provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
     if account_hash(reviewer_account, salt) == impl_account_h:
         raise WorkerPrError("refusing to arm: reviewer account equals implementer account")
@@ -1296,8 +1418,14 @@ def review_outcome(args):
         models = sorted({model
                          for models in fix_round_models(comments, args.bot_login).values()
                          for model in models})
+        # Route-constrained escalation (sol audit 2026-07-18): --allowed-tier carries the
+        # ORIGINAL route's ladder intersection from the resolve step, so "the top tier" is the
+        # top tier the route allows — an opus-only PR never mints a pin the route forbids.
+        # Absent (legacy caller) => the full unified ladder.
+        ladder = (constrained_ladder(args.impl_provider, args.allowed_tier)
+                  if args.allowed_tier else None)
         budget = decide_budget(args.round, models, document.get("progress"),
-                               args.impl_provider, base_rounds=args.max_rounds)
+                               args.impl_provider, base_rounds=args.max_rounds, ladder=ladder)
     decision = decide_review(document["verdict"], has_blockers,
                              document["injection_detected"], args.round, args.max_rounds,
                              security, budget_action=budget["action"])
@@ -1348,6 +1476,15 @@ def fix_outcome(args):
         # round on this model, which is exactly what the escalation mechanism must know.
         record_fix_model(args.repo, args.pr, args.round, args.model, args.run_key,
                          args.bot_login)
+    if pushed:
+        # Successful-push AUTHOR marker bound to the pushed SHA (sol audit 2026-07-18): the
+        # ONLY durable source of the content author for the review direction. A pushed fix
+        # without a valid sha is a plumbing failure and must be LOUD — a silently missing
+        # author marker would mis-derive the next review's direction.
+        if not args.model:
+            raise WorkerPrError("a pushed fix outcome requires --model for the author record")
+        record_fix_author(args.repo, args.pr, args.round, args.model, args.pushed_sha,
+                          args.run_key, args.bot_login)
     nochange_runs = gatefail_runs = 0
     if not injection:
         if not made_changes:
@@ -1519,9 +1656,10 @@ def _self_test():
                         budget_action="extend-progress"), "needs-user")
 
     # ---- decide_budget (directive 2026-07-17): the combined round-budget policy ----
-    def budget(rounds, models, progress, provider="anthropic", base=3, pending=(), pin=None):
+    def budget(rounds, models, progress, provider="anthropic", base=3, pending=(), pin=None,
+               ladder=None):
         return decide_budget(rounds, models, progress, provider, base_rounds=base,
-                             pending_fix_models=pending, pin_floor=pin)
+                             pending_fix_models=pending, pin_floor=pin, ladder=ladder)
 
     check("budget below base continues", budget(2, ["sonnet"], "regressing"),
           {"action": "continue", "pin": None})
@@ -1595,6 +1733,24 @@ def _self_test():
     check("openai top tier + improving extends", budget(3, ["sol"], "improving",
                                                         provider="openai"),
           {"action": "extend-progress", "pin": None})
+    # Route-constrained sub-ladder (sol audit 2026-07-18): "the top tier" is the top tier THE
+    # ROUTE ALLOWS — an opus-only trust-surface PR never mints a pin the route forbids, and a
+    # frontier-only ci PR escalates only within the frontier tiers.
+    check("opus-only route: opus exhaustion is terminal, no forbidden luna pin",
+          budget(3, ["opus"], "stagnant", ladder=["opus"]),
+          {"action": "needs-user", "pin": None})
+    check("opus-only route: improving opus still extends on progress",
+          budget(3, ["opus"], "improving", ladder=["opus"]),
+          {"action": "extend-progress", "pin": None})
+    check("frontier-only route: fable exhaustion pins sol (never below frontier)",
+          budget(3, ["fable"], "stagnant", ladder=["fable", "sol"]),
+          {"action": "extend-model-pin", "pin": "sol"})
+    try:
+        budget(3, ["luna"], None, ladder=["opus", "fable"])
+    except WorkerPrError:
+        check("recorded model outside the route ladder fails closed", "rejected", "rejected")
+    else:
+        check("recorded model outside the route ladder fails closed", "accepted", "rejected")
     # an explicit policy base above the hard cap is respected up to the base, never extended
     check("base above cap continues below base", budget(6, ["sonnet"], "improving", base=8),
           {"action": "continue", "pin": None})
@@ -1672,6 +1828,97 @@ def _self_test():
         check("unknown pin fails closed", "rejected", "rejected")
     else:
         check("unknown pin fails closed", "accepted", "rejected")
+    # Route-constrained pins/chains (sol audit 2026-07-18): floors and chains resolve over the
+    # route-allowed sub-ladder; a pin the route forbids is LOUD, never silently widened.
+    check("pinned chain over a frontier-only sub-ladder",
+          pinned_fix_chain("anthropic", "fable", ladder=["fable", "sol"]), ["fable", "sol"])
+    try:
+        pinned_fix_chain("anthropic", "luna", ladder=["opus", "fable"])
+    except WorkerPrError:
+        check("pin outside the route ladder fails closed", "rejected", "rejected")
+    else:
+        check("pin outside the route ladder fails closed", "accepted", "rejected")
+    try:
+        pinned_fix_floor([{"user": {"login": bot},
+                           "body": f"z {MODEL_PIN_MARKER} round=1 tier=luna run=1.1 -->"}],
+                         bot, "anthropic", ladder=["opus"])
+    except WorkerPrError:
+        check("recorded pin outside the route ladder fails closed", "rejected", "rejected")
+    else:
+        check("recorded pin outside the route ladder fails closed", "accepted", "rejected")
+
+    # ---- successful-push author markers (sol audit 2026-07-18): the CONTENT author is bound
+    # to the pushed head sha; per-attempt fix-model markers never derive the review direction ----
+    sha_p, sha_q = "1" * 40, "2" * 40
+    author_comments = [
+        {"user": {"login": bot},
+         "body": f"a {FIX_AUTHOR_MARKER} round=1 model=opus sha={sha_p} run=1.1 -->"},
+        {"user": {"login": bot},
+         "body": f"a {FIX_AUTHOR_MARKER} round=2 model=luna sha={sha_q} run=2.1 -->"},
+        {"user": {"login": "mallory"},
+         "body": f"a {FIX_AUTHOR_MARKER} round=3 model=sol sha={sha_q} run=6.6 -->"},
+    ]
+    authors = fix_push_authors(author_comments, bot)
+    check("push authors are bot-only and ordered", authors,
+          [(1, "opus", sha_p), (2, "luna", sha_q)])
+    check("content author binds to the exact head sha",
+          content_author_alias(authors, sha_q), "luna")
+    check("an earlier pushed head resolves its own author",
+          content_author_alias(authors, sha_p), "opus")
+    check("head advanced past the last push: the latest push author governs",
+          content_author_alias(authors, "3" * 40), "luna")
+    check("no push authors means implementer-authored content",
+          content_author_alias([], "3" * 40), None)
+    try:
+        content_author_alias([(1, "opus", sha_p), (2, "luna", sha_p)], sha_p)
+    except WorkerPrError:
+        check("conflicting same-sha authors fail closed", "rejected", "rejected")
+    else:
+        check("conflicting same-sha authors fail closed", "accepted", "rejected")
+    # THE parking defect: an opus attempt + a luna success in ONE round pollutes the attempt
+    # markers with two providers, but the push author is unambiguous.
+    mixed_round = [
+        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=2 model=opus run=2.1 -->"},
+        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=2 model=luna run=2.2 -->"},
+        {"user": {"login": bot},
+         "body": f"a {FIX_AUTHOR_MARKER} round=2 model=luna sha={sha_q} run=2.2 -->"},
+    ]
+    check("attempt-polluted round still yields ONE push author",
+          content_author_alias(fix_push_authors(mixed_round, bot), sha_q), "luna")
+
+    # ---- route-constrained fix ladder (sol audit 2026-07-18) ----
+    constraint_routing = {
+        "defaults": {"model_chain": ["fable", "sol", "opus"]},
+        "route": [
+            {"match_labels": ["worker", "dispatch"], "model_chain": ["opus"]},
+            {"role": "ci", "model_chain": ["fable", "sol"]},
+            {"role": "docs", "model_chain": ["haiku", "sonnet", "terra", "fable"]},
+        ],
+    }
+    check("security match_labels win the route constraint (substring match)",
+          route_fix_constraint({"role:ci", "area:worker"}, constraint_routing), ["opus"])
+    check("role route matches when no security rule fires",
+          route_fix_constraint({"role:ci", "area:ci"}, constraint_routing), ["fable", "sol"])
+    check("defaults apply when nothing matches",
+          route_fix_constraint({"area:usage"}, constraint_routing), ["fable", "sol", "opus"])
+    check("malformed routing yields an empty constraint (caller fails closed)",
+          route_fix_constraint({"area:usage"}, {"route": "nope"}), [])
+    check("opus-only trust surface constrains the ladder to opus",
+          constrained_ladder("anthropic", ["opus"]), ["opus"])
+    check("frontier-only ci never falls below frontier",
+          constrained_ladder("anthropic", ["fable", "sol"]), ["fable", "sol"])
+    check("legacy tiers translate into the constrained ladder",
+          constrained_ladder("anthropic", ["haiku", "sonnet", "terra", "fable"]),
+          ["opus", "fable"])
+    check("the default impl chain keeps ladder order",
+          constrained_ladder("anthropic", ["fable", "sol", "opus"]),
+          ["opus", "fable", "sol"])
+    try:
+        constrained_ladder("anthropic", ["haiku"])
+    except WorkerPrError:
+        check("no shared ladder tier fails closed", "rejected", "rejected")
+    else:
+        check("no shared ladder tier fails closed", "accepted", "rejected")
 
     # decide_disarm (issue #42): the sweep invariant acts on mismatch when the PR is armed OR
     # ready-but-unarmed (interrupted-disarm crash-window re-entry); matching SHAs are NEVER
@@ -1773,7 +2020,7 @@ def _self_test():
             files_file = Path(tmp) / "files.txt"
             files_file.write_text("src/a.rs\n", encoding="utf-8")
 
-            def outcome(progress, comments):
+            def outcome(progress, comments, allowed=()):
                 wiring_calls.clear()
                 fake_state["comments"] = comments
                 verdict_file.write_text(json.dumps({
@@ -1783,13 +2030,15 @@ def _self_test():
                     repo="o/r", pr=41, verdict_file=str(verdict_file),
                     files_file=str(files_file), round=3, max_rounds=3, security=False,
                     surface_path=[], issue=None, impl_provider="anthropic", bot_login=bot,
-                    run_key="9.1"))
+                    run_key="9.1", allowed_tier=list(allowed)))
                 return list(wiring_calls)
 
             sonnet_fix = [{"user": {"login": bot},
                            "body": f"x {FIX_MODEL_MARKER} round=1 model=sonnet run=1.1 -->"}]
             sol_fix = [{"user": {"login": bot},
                         "body": f"x {FIX_MODEL_MARKER} round=1 model=sol run=1.1 -->"}]
+            opus_fix = [{"user": {"login": bot},
+                         "body": f"x {FIX_MODEL_MARKER} round=1 model=opus run=1.1 -->"}]
             check("outcome model extension pins + stays changes",
                   outcome("stagnant", sonnet_fix),
                   [("findings", 3), ("pin", "luna"), ("state", "changes")])
@@ -1800,8 +2049,101 @@ def _self_test():
                   [entry[0] for entry in terminal], ["findings", "needs-user"])
             check("terminal reason names the exhausted budget",
                   "round budget is exhausted" in terminal[1][1], True)
+            # Route-constrained outcome (sol audit): on an opus-only route the exhausted opus
+            # fix is terminal — no luna pin the route forbids.
+            check("opus-only route outcome escalates instead of pinning luna",
+                  [entry[0] for entry in outcome("stagnant", opus_fix, allowed=("opus",))],
+                  ["findings", "needs-user"])
+            check("unconstrained outcome still pins past opus (flip side)",
+                  outcome("stagnant", opus_fix),
+                  [("findings", 3), ("pin", "luna"), ("state", "changes")])
     finally:
         wiring_globals.update(real_io)
+
+    # ---- fix_outcome wiring (sol audit 2026-07-18): the sha-bound author marker is recorded
+    # ONLY on a successful push; attempts still record the per-round fix-model marker ----
+    fo_calls = []
+    real_fo = {name: wiring_globals[name]
+               for name in ("record_fix_model", "record_fix_author", "record_marker",
+                            "set_review_state", "_paginated_comments", "_write_outputs")}
+    try:
+        wiring_globals["record_fix_model"] = (
+            lambda repo, pr, rn, model, run, login: fo_calls.append(("model", model)))
+        wiring_globals["record_fix_author"] = (
+            lambda repo, pr, rn, model, sha, run, login:
+            fo_calls.append(("author", model, sha)))
+        wiring_globals["record_marker"] = (
+            lambda repo, pr, kind, rn, run, login: fo_calls.append(("marker", kind)))
+        wiring_globals["set_review_state"] = (
+            lambda repo, pr, state: fo_calls.append(("state", state)))
+        wiring_globals["_paginated_comments"] = lambda repo, pr: []
+        wiring_globals["_write_outputs"] = lambda values: None
+
+        def fo(pushed, made_changes="true", gate="success", sha="4" * 40, model="luna"):
+            fo_calls.clear()
+            fix_outcome(argparse.Namespace(
+                repo="o/r", pr=41, round=2, run_key="9.1", bot_login=bot,
+                injection="false", made_changes=made_changes, gate_outcome=gate,
+                pushed=pushed, pushed_sha=sha, issue=None, model=model))
+            return list(fo_calls)
+
+        check("pushed fix records the sha-bound author then re-reviews",
+              fo("true"),
+              [("model", "luna"), ("author", "luna", "4" * 40), ("state", "needs")])
+        check("gate-failed attempt records NO author marker",
+              [entry for entry in fo("false", gate="failure") if entry[0] == "author"], [])
+        check("no-change attempt records NO author marker",
+              [entry for entry in fo("false", made_changes="false")
+               if entry[0] == "author"], [])
+        try:
+            fo("true", model="")
+        except WorkerPrError:
+            check("a pushed outcome without a model fails closed", "rejected", "rejected")
+        else:
+            check("a pushed outcome without a model fails closed", "accepted", "rejected")
+    finally:
+        wiring_globals.update(real_fo)
+    try:
+        record_fix_author("o/r", 41, 2, "luna", "not-a-sha", "9.1", bot)
+    except WorkerPrError:
+        check("author marker rejects a malformed sha before any I/O", "rejected", "rejected")
+    else:
+        check("author marker rejects a malformed sha before any I/O", "accepted", "rejected")
+
+    # ---- ready_and_arm cross-provider guard is CONTENT-keyed (sol audit 2026-07-18) ----
+    try:
+        ready_and_arm("o/r", 41, "a" * 40, "openai", "f" * 16, "openai", "acct02", True)
+    except WorkerPrError as exc:
+        check("arm refuses reviewer == content author provider",
+              "content author provider" in str(exc), True)
+    else:
+        check("arm refuses reviewer == content author provider", "accepted", "rejected")
+    try:
+        ready_and_arm("o/r", 41, "a" * 40, "", "f" * 16, "anthropic", "acct02", True)
+    except WorkerPrError:
+        check("arm refuses a missing content provider", "rejected", "rejected")
+    else:
+        check("arm refuses a missing content provider", "accepted", "rejected")
+    # Post-switch acceptance: a luna-authored head on an anthropic-implemented PR is reviewed
+    # by anthropic — the reviewer provider EQUALS the original implementer provider and must be
+    # ACCEPTED (the old impl-keyed guard rejected exactly this). I/O is faked past the guards.
+    arm_calls = []
+    real_arm_io = {name: wiring_globals[name]
+                   for name in ("_gh_json", "set_review_state", "_write_outputs")}
+    try:
+        os.environ["PROVENANCE_SALT"] = "s3cret"
+        wiring_globals["_gh_json"] = (
+            lambda args, **kwargs: {"state": "open", "head": {"sha": "b" * 40}})
+        wiring_globals["set_review_state"] = (
+            lambda repo, pr, state: arm_calls.append(state))
+        wiring_globals["_write_outputs"] = lambda values: arm_calls.append(dict(values))
+        ready_and_arm("o/r", 41, "a" * 40, "openai", account_hash("acct01", "s3cret"),
+                      "anthropic", "acct02", True)
+        check("post-switch review passes the arm guards (head-moved path reached)",
+              arm_calls, ["needs", {"armed": False, "head_moved": True}])
+    finally:
+        os.environ.pop("PROVENANCE_SALT", None)
+        wiring_globals.update(real_arm_io)
 
     # ---- registry record writes pin the `ledger` data-plane branch (issue #96): master's
     # required `gate` status check permanently rejects every direct contents-API PUT from
@@ -2234,7 +2576,11 @@ def main():
     # into public logs) and is compared against the recorded hash under PROVENANCE_SALT.
     arm = subparsers.add_parser("ready-and-arm", parents=[common])
     arm.add_argument("--reviewed-sha", required=True)
-    arm.add_argument("--impl-provider", required=True)
+    # The CONTENT author's provider (sol audit 2026-07-18): derived from the successful-push
+    # author markers against the live head in the resolve step (= the provenance implementer
+    # when no fix ever pushed). The reviewer must OPPOSE this provider; the salted account
+    # check below still asserts against the ORIGINAL implementer's account.
+    arm.add_argument("--content-provider", required=True)
     arm.add_argument("--impl-account-h", required=True)
     arm.add_argument("--reviewer-provider", required=True)
     arm.add_argument("--arm", choices=("true", "false"), required=True)
@@ -2262,6 +2608,11 @@ def main():
     rout.add_argument("--impl-provider", required=True)
     rout.add_argument("--bot-login", required=True)
     rout.add_argument("--run-key", required=True)
+    # Route-constrained fix ladder (sol audit 2026-07-18): the resolve step's intersection of
+    # the unified ladder with the ORIGINAL route's model chain (repeatable, ladder order).
+    # Empty -> the full unified ladder (legacy caller compatibility).
+    rout.add_argument("--allowed-tier", action="append", default=[],
+                      help="route-allowed fix ladder tier (repeatable; from the resolve step)")
 
     fout = subparsers.add_parser("fix-outcome", parents=[common])
     fout.add_argument("--round", required=True, type=int)
@@ -2271,6 +2622,9 @@ def main():
     fout.add_argument("--made-changes", choices=("true", "false"), required=True)
     fout.add_argument("--gate-outcome", required=True)
     fout.add_argument("--pushed", choices=("true", "false"), required=True)
+    fout.add_argument("--pushed-sha", default="",
+                      help="head sha of a successful push; recorded as the sha-bound author "
+                           "marker (required when --pushed true)")
     fout.add_argument("--issue", type=int)
     fout.add_argument("--model", default="",
                       help="executed fix-model alias; recorded as a durable round marker")
@@ -2337,7 +2691,7 @@ def main():
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when)
         elif args.command == "ready-and-arm":
-            ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
+            ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.content_provider,
                           args.impl_account_h, args.reviewer_provider,
                           os.environ.get("WORKER_REVIEWER_ACCOUNT", ""),
                           args.arm == "true", issue=args.issue,

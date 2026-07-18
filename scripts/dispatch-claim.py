@@ -113,17 +113,17 @@ BUSY_OR_GATED = {
 # Busy/gated set for the deferred-RETRY path: status:deferred is the retry trigger, everything
 # else still gates (locked decision 20).
 DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
-# Cross-provider chains (locked decisions 14/17, revised by maintainer 2026-07-18): the REVIEW
-# chain is keyed by the CONTENT author's provider (the latest fix round's model, else the
-# provenance implementer) and lists strictly OPPOSITE-provider reviewers, strongest first —
-# an anthropic model only reviews codex-authored content and vice versa. The FIX chain is the
-# UNIFIED cross-provider escalation ladder in ascending capability order opus < luna < fable
-# < sol, shared by both implementer providers, so a hard fix escalates across providers.
-# Computed HERE, never through policy-resolve.resolve() (whose role=review row is always
-# [opus]); resolve() supplies account_pool/caps/gate/arm only.
+# Cross-provider chains (locked decisions 14/17, revised by maintainer 2026-07-18 + sol audit):
+# the REVIEW chain is keyed by the CONTENT author's provider (the successful-push author marker
+# bound to the live head, else the provenance implementer) and lists strictly OPPOSITE-provider
+# reviewers, strongest first — an anthropic model only reviews codex-authored content and vice
+# versa. The FIX chain is the UNIFIED cross-provider escalation ladder in ascending capability
+# order opus < luna < fable < sol (worker_pr.ESCALATION_LADDERS), INTERSECTED per PR with the
+# ORIGINAL route's model chain (worker_pr.constrained_ladder — an opus-only trust-surface PR is
+# only ever fixed by opus; a frontier-only ci PR never falls below frontier). Computed HERE,
+# never through policy-resolve.resolve() (whose role=review row is always [opus]); resolve()
+# supplies account_pool/caps/gate/arm only.
 REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["fable", "opus"]}
-FIX_CHAIN = {"anthropic": ["opus", "luna", "fable", "sol"],
-             "openai": ["opus", "luna", "fable", "sol"]}
 # Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
 # 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
 # earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
@@ -1131,7 +1131,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # maintainer ping) — the repair loop must never disarm/redraft/push (nor review
             # past) a PR whose work item a human explicitly owns. Live read, fail closed.
             source_issue = _gh_json(["api", f"repos/{repo}/issues/{issue_number}"])
-            if any(label.startswith("needs:") for label in _labels(source_issue)):
+            issue_labels = _labels(source_issue)
+            if any(label.startswith("needs:") for label in issue_labels):
                 print(f"defer review {repo}#{number}: source issue #{issue_number} is "
                       "human-owned (needs:*)")
                 continue
@@ -1214,6 +1215,20 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             impl_provider = record["impl_provider"]
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
+            # Route-constrained fix ladder (sol audit 2026-07-18): RE-DERIVED per PR every tick
+            # from the source issue's live labels against the plan-sha routing, then intersected
+            # with the unified ladder — an opus-only trust-surface PR may only be fixed by opus,
+            # and a frontier-only ci PR never falls below frontier. An empty intersection is a
+            # loud human hand-off, never a silent widening to the full ladder.
+            try:
+                fix_ladder = worker_pr.constrained_ladder(
+                    impl_provider,
+                    worker_pr.route_fix_constraint(issue_labels, routing))
+            except worker_pr.WorkerPrError as exc:
+                _pr_needs_user(script_dir, repo, number, issue_number,
+                               f"the original route constraint for this PR is unresolvable "
+                               f"({exc}); a human must fix or re-route it")
+                continue
             # Round budget via the PURE decide_budget (maintainer directive 2026-07-17): the
             # flat rounds>=max needs-user is replaced by exhaustion-with-escalation — first a
             # model-tier extension (pin the fix floor one tier up when a weaker model burned the
@@ -1229,7 +1244,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 progress = latest_recorded_progress(worker_pr, registry_root, repo, number,
                                                     rounds, comments, bot_login,
                                                     ledger_root=ledger_root)
-                pin_floor = worker_pr.pinned_fix_floor(comments, bot_login, impl_provider)
+                pin_floor = worker_pr.pinned_fix_floor(comments, bot_login, impl_provider,
+                                                       ladder=fix_ladder)
                 # A needs-review head whose LATEST round carries a fix-model marker is a PUSHED
                 # fix awaiting its re-review (an executed fix flips the label to review:needs).
                 # decide_budget authorizes grading it even at exhaustion — otherwise the model
@@ -1243,7 +1259,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 budget = worker_pr.decide_budget(rounds, fix_models, progress, impl_provider,
                                                  base_rounds=max_rounds,
                                                  pending_fix_models=pending_fix,
-                                                 pin_floor=pin_floor)
+                                                 pin_floor=pin_floor, ladder=fix_ladder)
             except worker_pr.WorkerPrError as exc:
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"round-budget escalation-marker validation failed ({exc}); a "
@@ -1267,8 +1283,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     "--round", str(max(rounds, 1)), "--tier", budget["pin"],
                     "--provider", impl_provider, "--run-key", run_key,
                     "--bot-login", bot_login])
-                ladder = worker_pr.ESCALATION_LADDERS[impl_provider]
-                if pin_floor is None or ladder.index(budget["pin"]) > ladder.index(pin_floor):
+                if (pin_floor is None
+                        or fix_ladder.index(budget["pin"]) > fix_ladder.index(pin_floor)):
                     pin_floor = budget["pin"]
             # DEFER-NOT-FALLBACK (the WHY): once a floor is pinned, tiers BELOW it are never
             # offered to the allocator again for this PR. The extended budget exists precisely
@@ -1277,8 +1293,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # simply DEFERS to the next tick — falling back down the chain would silently spend
             # the extension re-running the model that already failed. (The missed-fix marker
             # budget still bounds how long it can defer before a loud needs-user.)
-            fix_aliases = (worker_pr.pinned_fix_chain(impl_provider, pin_floor)
-                           if pin_floor else FIX_CHAIN[impl_provider])
+            fix_aliases = (worker_pr.pinned_fix_chain(impl_provider, pin_floor,
+                                                      ladder=fix_ladder)
+                           if pin_floor else fix_ladder)
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # raw-handle/missing hash already deferred above (provenance_admission_error).
             impl_account_h = record["impl_account_h"]
@@ -1295,24 +1312,36 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     print(f"defer review {repo}#{number}: empty diff vs merge base (no-op rebase)")
                     continue
                 mode, role = "review", "review"
-                # Reviews are strictly CROSS-PROVIDER against the CONTENT author (maintainer
-                # 2026-07-18): on the unified fix ladder a fix round may cross providers, so
-                # the head under review can be authored by the LATEST fix round's model, not
-                # the provenance implementer. An alias the target routing does not name (or a
-                # round whose markers disagree on provider) is hostile/corrupt marker data —
-                # loud human hand-off, never a guessed review direction.
-                if round_models:
-                    latest_aliases = round_models[max(round_models)]
-                    providers = {
-                        str((routing.get("models", {}).get(alias) or {}).get("provider", ""))
-                        for alias in latest_aliases}
-                    if len(providers) != 1 or not providers <= {"anthropic", "openai"}:
+                # Reviews are strictly CROSS-PROVIDER against the CONTENT author (sol audit
+                # 2026-07-18): the author derives from the successful-push AUTHOR markers,
+                # each BOUND to its pushed head sha — never from the per-attempt fix-model
+                # markers, which also record no-change/gate-failed attempts and so can span
+                # providers within one round (an opus attempt + a luna success previously
+                # read as "conflicting providers" and parked). No author marker => the
+                # provenance implementer authored the head. Conflicting markers or an alias
+                # the target routing does not name are hostile/corrupt marker data — loud
+                # human hand-off, never a guessed review direction.
+                try:
+                    author_alias = worker_pr.content_author_alias(
+                        worker_pr.fix_push_authors(comments, bot_login), head_sha)
+                except worker_pr.WorkerPrError:
+                    _pr_needs_user(script_dir, repo, number, issue_number,
+                                   "cannot derive the content provider for the review "
+                                   "direction (conflicting successful-push author markers); "
+                                   "a human must inspect this PR's fix-author markers")
+                    continue
+                if author_alias is not None:
+                    author_provider = str(
+                        (routing.get("models", {}).get(author_alias) or {})
+                        .get("provider", ""))
+                    if author_provider not in {"anthropic", "openai"}:
                         _pr_needs_user(script_dir, repo, number, issue_number,
                                        "cannot derive the content provider for the review "
-                                       "direction (unknown or conflicting fix-model markers); "
-                                       "a human must inspect this PR's fix-model markers")
+                                       "direction (the recorded push author is unknown to "
+                                       "the target routing); a human must inspect this PR's "
+                                       "fix-author markers")
                         continue
-                    content_provider = providers.pop()
+                    content_provider = author_provider
                 chain = _resolvable_chain(REVIEW_CHAIN[content_provider], routing)
                 holder_prefix, cap, ttl = "review:", REVIEW_MAX_CONCURRENT, REVIEW_TTL
                 round_number = rounds + 1
@@ -1416,8 +1445,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 or not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f]{32}", claim_id) \
                 or claim.get("model") not in chain:
             violation = "allocator returned an unsafe/out-of-policy claim"
-        elif mode == "review" and (not claim_provider or claim_provider == impl_provider):
-            violation = "reviewer provider would equal implementer provider"
+        elif mode == "review" and (not claim_provider or claim_provider == content_provider):
+            # Content-keyed (sol audit 2026-07-18): after a provider-switching fix the correct
+            # reviewer opposes the CONTENT author and may equal the ORIGINAL implementer's
+            # provider — the salted account assertion below still bars the implementer account.
+            violation = "reviewer provider would equal the content author provider"
         elif mode == "review" and not salt:
             violation = "PROVENANCE_SALT unavailable; cannot assert reviewer != implementer"
         elif mode == "review" and worker_pr.account_hash(account, salt) == impl_account_h:
@@ -2504,7 +2536,13 @@ def _self_test():
                         "harness": "codex"},
                 "luna": {"provider": "openai", "provider_model": "gpt-5.6-luna",
                          "harness": "codex"},
-            }}
+            }, "defaults": {"model_chain": ["opus", "luna", "fable", "sol"], "agent": "x"},
+                # route rows for the ORIGINAL-route fix constraint (sol audit 2026-07-18):
+                # a `worker`-labelled trust surface is opus-only; role:ci is frontier-only.
+                "route": [
+                    {"match_labels": ["worker"], "model_chain": ["opus"], "agent": "rev"},
+                    {"role": "ci", "model_chain": ["fable", "sol"], "agent": "ci"},
+                ]}
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
                         check_runs=gate_green, issue_labels=["area:crate-a"])
             fix_model = wiring_worker_pr.FIX_MODEL_MARKER
@@ -2675,7 +2713,147 @@ def _self_test():
             write_verdict(2, None, root=wiring_ledger_root)
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+            # (post-#100 rebase: the unified route-constrained ladder replaced the legacy
+            # same-provider ["fable", "sonnet"] chain this ledger-only test used to pin)
+            assert alloc.chains == [["opus", "luna", "fable", "sol"]], alloc.chains
+
+            # ---- route-constrained fix chains (sol audit 2026-07-18): the unified ladder is
+            # intersected with the ORIGINAL route's chain, re-derived per PR ----
+            # an opus-only trust surface (issue label hits the routing's `worker` keyword):
+            # the offered fix chain is exactly [opus], never the full unified ladder
+            fake["issue_labels"] = ["area:worker"]
+            fake["comments"] = round_markers(2)
+            write_verdict(2, None, root=wiring_ledger_root)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["opus"]], alloc.chains
+            # opus-only + budget exhausted on opus + stagnant: terminal needs-user — NO pin
+            # to a tier the route forbids (unconstrained decide_budget would pin luna here)
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->")]
+            write_verdict(3, "stagnant", root=wiring_ledger_root)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+            # frontier-only ci route: fable exhaustion pins sol — never below frontier
+            fake["issue_labels"] = ["role:ci", "area:ci"]
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->")]
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-model-pin"),
+                ("worker-pr.py", "record-marker")], helper_calls
+            ci_pin_args = helper_calls[0][1]
+            assert ci_pin_args[ci_pin_args.index("--tier") + 1] == "sol", ci_pin_args
+            assert alloc.chains == [["sol"]], alloc.chains
+            fake["issue_labels"] = ["area:crate-a"]
+
+            # ---- content-keyed review direction from PUSH-AUTHOR markers (sol audit): an
+            # opus ATTEMPT + a luna SUCCESS in one round no longer parks — the sha-bound
+            # author marker names the single actual content author ----
+            fix_author = wiring_worker_pr.FIX_AUTHOR_MARKER
+            author_review_item = dict(fix_item, state="needs-review")
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
+            fake["comments"] = round_markers(2) + [
+                bot_comment(f"x {fix_model} round=2 model=opus run=2.1 -->"),
+                bot_comment(f"x {fix_model} round=2 model=luna run=2.2 -->"),
+                bot_comment(f"a {fix_author} round=2 model=luna sha={sha_a} run=2.2 -->")]
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            # mixed-provider ATTEMPT markers with NO push author derive the implementer
+            # direction (previously this parked as "conflicting providers")
+            fake["comments"] = round_markers(2) + [
+                bot_comment(f"x {fix_model} round=2 model=opus run=2.1 -->"),
+                bot_comment(f"x {fix_model} round=2 model=luna run=2.2 -->")]
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
+            # the head advanced past the last push (base merges): the LATEST push author
+            # still owns the content
+            fake["comments"] = round_markers(2) + [
+                bot_comment(f"a {fix_author} round=2 model=luna sha={sha_b} run=2.1 -->")]
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            # a forged NON-bot author marker is inert (bot-login trust filter)
+            fake["comments"] = round_markers(2) + [
+                {"user": {"login": "mallory"},
+                 "body": f"a {fix_author} round=2 model=luna sha={sha_a} run=6.6 -->"}]
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
+            # conflicting bot markers for ONE sha are corrupt: loud park, never a guess
+            fake["comments"] = round_markers(2) + [
+                bot_comment(f"a {fix_author} round=2 model=luna sha={sha_a} run=2.1 -->"),
+                bot_comment(f"a {fix_author} round=2 model=opus sha={sha_a} run=2.2 -->")]
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+            # a push author the routing does not name is equally loud
+            fake["comments"] = round_markers(2) + [
+                bot_comment(f"a {fix_author} round=2 model=ghost sha={sha_a} run=2.1 -->")]
+            alloc = FakeAllocator()
+            run_items([author_review_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+
+            # ---- claim-layer guard is CONTENT-keyed (sol audit; previously unreachable —
+            # the deferring allocator never returned a claim) ----
+            class GrantingAllocator:
+                def __init__(self, model, provider):
+                    self.model, self.provider = model, provider
+                    self.released = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    return {"account": "acct02", "claim_id": "ab" * 16,
+                            "model": self.model, "provider": self.provider}
+
+                def release(self, _repo, claim_id, _now):
+                    self.released.append(claim_id)
+                    return True
+
+            gh_runs = []
+            real_run_gh = globals()["_run_gh"]
+            real_salt = os.environ.get("PROVENANCE_SALT")
+            try:
+                globals()["_run_gh"] = lambda args, **kwargs: (
+                    gh_runs.append(list(args)),
+                    argparse.Namespace(returncode=0, stdout="", stderr=""))[1]
+                os.environ["PROVENANCE_SALT"] = "s3cret"
+                # post-switch ACCEPTED: luna-authored head, anthropic reviewer — the reviewer
+                # provider EQUALS the original implementer provider and must dispatch
+                fake["comments"] = round_markers(2) + [
+                    bot_comment(f"a {fix_author} round=2 model=luna sha={sha_a} run=2.1 -->")]
+                grant = GrantingAllocator("opus", "anthropic")
+                run_items([author_review_item], allocator=grant, routing=routing_ok)
+                assert grant.released == [], grant.released
+                launched = [args for args in gh_runs if args[:2] == ["workflow", "run"]]
+                assert len(launched) == 1, gh_runs
+                assert "-f" in launched[0] and "content_provider=openai" in launched[0], \
+                    launched[0]
+                # VIOLATION: a claim on the CONTENT author's own provider is released +
+                # skipped (here: anthropic-authored head, anthropic-provider claim)
+                gh_runs.clear()
+                fake["comments"] = round_markers(2)
+                grant = GrantingAllocator("sol", "anthropic")
+                run_items([author_review_item], allocator=grant, routing=routing_ok)
+                assert grant.released == ["ab" * 16], grant.released
+                assert not any(args[:2] == ["workflow", "run"] for args in gh_runs), gh_runs
+            finally:
+                globals()["_run_gh"] = real_run_gh
+                if real_salt is None:
+                    os.environ.pop("PROVENANCE_SALT", None)
+                else:
+                    os.environ["PROVENANCE_SALT"] = real_salt
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io

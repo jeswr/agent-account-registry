@@ -956,8 +956,8 @@ run_review() {
   local head_branch=${WORKER_PR_HEAD_BRANCH:-}
   local expected_head=${WORKER_PR_HEAD_SHA:-}
   local review_file=${WORKER_REVIEW_FILE:-}
-  local impl_provider=${WORKER_IMPL_PROVIDER:-}
-  local impl_alias=${WORKER_IMPL_ALIAS:-}
+  local content_provider=${WORKER_CONTENT_PROVIDER:-}
+  local content_alias=${WORKER_CONTENT_ALIAS:-}
   local model_alias=${WORKER_MODEL_ALIAS:-}
   local default_branch=${TARGET_DEFAULT_BRANCH:-}
   local review_round=${WORKER_REVIEW_ROUND:-1}
@@ -979,19 +979,23 @@ run_review() {
   fi
   safe_atom "$default_branch" || die 'unsafe target default branch'
   safe_atom "$model_alias" || die 'unsafe reviewer model alias'
-  safe_atom "$impl_alias" || die 'unsafe implementer model alias'
+  safe_atom "$content_alias" || die 'unsafe content author model alias'
 
-  # Fail-closed cross-provider assertions (locked decision 6, script layer). The implementer
-  # identity comes from the REGISTRY provenance record via the workflow — never the PR.
-  # The reviewer!=implementer ACCOUNT assertion runs claim-side on SALTED HASHES (locked
-  # decision 22a): the raw handle never reaches this job, and PROVENANCE_SALT must never enter
-  # a job that executes target code, so only the provider/alias checks live here.
-  [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
-    die 'implementer provider is missing or unsafe'
-  [[ "${WORKER_PROVIDER:-}" != "$impl_provider" ]] ||
-    die 'reviewer provider equals implementer provider; refusing self-review'
-  [[ "$model_alias" != "$impl_alias" ]] ||
-    die 'reviewer model alias equals implementer alias; refusing self-review'
+  # Fail-closed cross-provider assertions (locked decision 6, script layer; content-keyed per
+  # the sol audit 2026-07-18). The CONTENT author's identity is derived by the workflow's
+  # resolve job from the successful-push author markers against the LIVE head (falling back
+  # to the registry provenance implementer) — never from the PR itself. On the unified fix
+  # ladder a fix round may cross providers, so the reviewer must oppose the CONTENT author;
+  # comparing against the ORIGINAL implementer would reject every legitimate post-switch
+  # review. The reviewer!=implementer ACCOUNT assertion runs claim-side on SALTED HASHES
+  # (locked decision 22a): the raw handle never reaches this job, and PROVENANCE_SALT must
+  # never enter a job that executes target code, so only the provider/alias checks live here.
+  [[ "$content_provider" == anthropic || "$content_provider" == openai ]] ||
+    die 'content author provider is missing or unsafe'
+  [[ "${WORKER_PROVIDER:-}" != "$content_provider" ]] ||
+    die 'reviewer provider equals the content author provider; refusing self-review'
+  [[ "$model_alias" != "$content_alias" ]] ||
+    die 'reviewer model alias equals the content author alias; refusing self-review'
 
   git fetch origin "refs/heads/$head_branch"
   git switch --detach FETCH_HEAD
@@ -1170,9 +1174,12 @@ run_fix() {
   if [[ "$fix_kind" == verdict ]]; then
     [[ -f "$review_file" && ! -L "$review_file" ]] || die 'validated review verdict is missing'
   fi
-  # The fixer runs on the implementer's OWN provider (same-provider fix, locked architecture).
-  [[ "${WORKER_PROVIDER:-}" == "$impl_provider" ]] ||
-    die 'fixer provider must equal implementer provider'
+  # NO fixer-provider assertion (sol audit 2026-07-18): the unified fix escalation ladder
+  # opus < luna < fable < sol deliberately crosses providers, so the fixer may run on either
+  # provider — the workflow's resolved (route-constrained) model chain is what bounds it.
+  # Review integrity is preserved by the content-keyed reviewer direction in run_review.
+  [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
+    die 'implementer provider is missing or unsafe'
 
   git fetch origin "refs/heads/$head_branch"
   git switch -c "$head_branch" FETCH_HEAD

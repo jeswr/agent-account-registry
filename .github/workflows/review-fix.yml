@@ -15,12 +15,14 @@
 # Trust posture (locked decisions):
 # - The implementer identity comes ONLY from the registry provenance record written at publish
 #   time (orchestration/provenance/...); commit trailers and PR body markers are audit-only.
-# - mode=review claims the OPPOSITE provider (anthropic impl -> terra, openai impl -> opus),
+# - mode=review claims the provider OPPOSITE the CONTENT author (sol audit 2026-07-18: the
+#   successful-push author marker bound to the live head, else the provenance implementer),
 #   asserted fail-closed at claim AND script layer; the reviewer model is read-only (mutation=deny,
 #   no GitHub token in the container) and its verdict is VOID unless the tree is byte-identical.
 # - Arming (gh pr ready + gh pr merge --auto) happens ONLY here, host-side, one-shot, gated on a
-#   schema-valid approve verdict + reviewer!=implementer (provider AND account) + the armed head
-#   SHA equalling the reviewed SHA re-read live. Security-labelled surfaces never auto-arm.
+#   schema-valid approve verdict + reviewer provider != content author provider + reviewer
+#   account != implementer account (salted hashes) + the armed head SHA equalling the reviewed
+#   SHA re-read live. Security-labelled surfaces never auto-arm.
 # - rc=3 (none-free) claim handling is copied verbatim from worker.yml: skip-and-retry, never a
 #   failure — scarcity is a queue, not a deadlock. Short TTLs + groom-leases free crashed runs.
 # - Job split: `run` executes the model (and, in fix mode, hostile target code in the gate) with
@@ -42,7 +44,7 @@ on:
         required: true
         type: string
       mode:
-        description: review (opposite provider, read-only) or fix (same provider, edit+push)
+        description: review (opposite the content author's provider, read-only) or fix (route-constrained unified ladder, edit+push)
         required: true
         type: choice
         options: [review, fix]
@@ -63,7 +65,7 @@ on:
         default: ''
         type: string
       content_provider:
-        description: Provider of the model that authored the current head (dispatcher-derived from the latest fix-model marker; empty = the provenance implementer; review mode only)
+        description: Dispatcher HINT for the current head's author provider — cross-checked against the value the resolve job derives from the live head's push-author markers, never trusted (empty = no hint; review mode only)
         required: false
         default: ''
         type: string
@@ -104,6 +106,9 @@ jobs:
       impl_provider: ${{ steps.pr.outputs.impl_provider }}
       impl_alias: ${{ steps.pr.outputs.impl_alias }}
       impl_account_h: ${{ steps.pr.outputs.impl_account_h }}
+      content_provider: ${{ steps.pr.outputs.content_provider }}
+      content_alias: ${{ steps.pr.outputs.content_alias }}
+      fix_ladder: ${{ steps.pr.outputs.fix_ladder }}
       already_done: ${{ steps.pr.outputs.already_done }}
       issue: ${{ steps.pr.outputs.issue }}
       security: ${{ steps.pr.outputs.security }}
@@ -225,9 +230,13 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           MODE: ${{ inputs.mode }}
           FIX_KIND: ${{ inputs.fix_kind }}
+          CONTENT_PROVIDER: ${{ inputs.content_provider }}
         run: |
           set -euo pipefail
           gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pull.json"
+          gh api --paginate --slurp \
+            "repos/$TARGET_REPO/issues/$PR_NUMBER/comments?per_page=100" \
+            > "$RUNNER_TEMP/pr-comments.json"
           python3 - "$RUNNER_TEMP/pull.json" <<'PY'
           import json
           import os
@@ -362,6 +371,62 @@ jobs:
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
           if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
               raise SystemExit("source issue has an unsafe area:* label")
+
+          # Content author + route-constrained fix ladder (sol audit 2026-07-18), RE-DERIVED
+          # against the LIVE head here — the dispatcher's content_provider input is an
+          # UNAUTHENTICATED hint that is only cross-checked, never trusted. The successful-push
+          # author markers (bot-authored, bound to their pushed sha) are the durable source;
+          # no marker => the provenance implementer authored the content. The fix ladder is
+          # the unified escalation ladder intersected with the ORIGINAL route's chain for the
+          # source issue's labels (an opus-only trust surface stays opus-only; a frontier-only
+          # ci PR never falls below frontier). Everything fails CLOSED: unreadable routing,
+          # conflicting markers, or an unknown author alias stop the run here.
+          worker_pr_spec = importlib.util.spec_from_file_location(
+              "registry_worker_pr", Path("registry", "scripts", "worker-pr.py"))
+          worker_pr = importlib.util.module_from_spec(worker_pr_spec)
+          worker_pr_spec.loader.exec_module(worker_pr)
+          comment_pages = json.loads(
+              Path(os.environ["RUNNER_TEMP"], "pr-comments.json").read_text(encoding="utf-8"))
+          if not isinstance(comment_pages, list):
+              raise SystemExit("PR comment listing is malformed (fail closed)")
+          pr_comments = [c for page in comment_pages if isinstance(page, list) for c in page]
+          try:
+              _pol_strict = tomllib.loads(
+                  _Path("registry/policy/repos.toml").read_text(encoding="utf-8"))
+              _ptr_strict = _pol_strict["repos"][repo]["routing"]
+              routing_doc = tomllib.loads(
+                  _Path("target-routing").joinpath(*_PPP(_ptr_strict).parts)
+                  .read_text(encoding="utf-8"))
+          except (OSError, KeyError, tomllib.TOMLDecodeError) as exc:
+              raise SystemExit(f"cannot load target routing for the content/route "
+                               f"derivation (fail closed): {exc}")
+          try:
+              author_alias = worker_pr.content_author_alias(
+                  worker_pr.fix_push_authors(pr_comments, author), head_sha)
+          except worker_pr.WorkerPrError as exc:
+              raise SystemExit(f"content author derivation failed (fail closed): {exc}")
+          if author_alias is None:
+              content_provider, content_alias = impl_provider, impl_alias
+          else:
+              content_provider = str(
+                  (routing_doc.get("models", {}).get(author_alias) or {})
+                  .get("provider", ""))
+              content_alias = author_alias
+          if content_provider not in {"anthropic", "openai"}:
+              raise SystemExit("the content author's provider is missing or unsafe "
+                               "(fail closed)")
+          supplied_content = os.environ.get("CONTENT_PROVIDER", "")
+          if mode == "review" and supplied_content and supplied_content != content_provider:
+              raise SystemExit("dispatcher content_provider disagrees with the content "
+                               "author derived from the live head; refusing a stale or "
+                               "forged review direction")
+          try:
+              fix_ladder = worker_pr.constrained_ladder(
+                  impl_provider,
+                  worker_pr.route_fix_constraint(set(issue_labels), routing_doc))
+          except worker_pr.WorkerPrError as exc:
+              raise SystemExit(f"route-constraint derivation failed (fail closed): {exc}")
+
           values = {
               "head_branch": head_branch,
               "head_sha": head_sha,
@@ -374,13 +439,18 @@ jobs:
               "security": "true" if security else "false",
               "packages": ",".join(packages),
               "package": packages[0] if packages else "__global__",
+              "content_provider": content_provider,
+              "content_alias": content_alias,
+              "fix_ladder": ",".join(fix_ladder),
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in values.items():
                   if "\n" in value or "\r" in value:
                       raise SystemExit(f"unsafe resolved value: {key}")
                   output.write(f"{key}={value}\n")
-          print(f"PR bound to provenance: impl={impl_provider}/{impl_alias} issue=#{issue}")
+          print(f"PR bound to provenance: impl={impl_provider}/{impl_alias} issue=#{issue} "
+                f"content={content_provider}/{content_alias} "
+                f"fix-ladder={','.join(fix_ladder)}")
           PY
 
       - name: Resolve policy and compute the mode chain (inverse chain outside resolve())
@@ -390,7 +460,10 @@ jobs:
           MODE: ${{ inputs.mode }}
           MODEL_PIN: ${{ inputs.model_pin }}
           IMPL_PROVIDER: ${{ steps.pr.outputs.impl_provider }}
-          CONTENT_PROVIDER: ${{ inputs.content_provider }}
+          # DERIVED against the live head in the snapshot step (never the raw dispatch input,
+          # which is only cross-checked there) + the route-constrained fix ladder.
+          CONTENT_PROVIDER: ${{ steps.pr.outputs.content_provider }}
+          FIX_LADDER: ${{ steps.pr.outputs.fix_ladder }}
         run: |
           set -euo pipefail
           role=review
@@ -418,42 +491,46 @@ jobs:
           with open(routing_path, "rb") as handle:
               routing = tomllib.load(handle)
 
-          # The review chain is keyed by the CONTENT author's provider (the dispatcher derives
-          # it from the latest fix-model marker and passes it as content_provider; empty =
-          # the provenance implementer) and lists strictly OPPOSITE-provider reviewers,
-          # strongest first — an anthropic model only reviews codex-authored content and vice
-          # versa (maintainer 2026-07-18). Computed HERE, never via resolve() (whose
-          # role=review row is always [opus]); resolve() supplies account_pool / gate / arm /
-          # caps only. Fix uses the UNIFIED cross-provider escalation ladder.
+          # The review chain is keyed by the CONTENT author's provider — DERIVED against the
+          # live head by the snapshot step (successful-push author markers, sol audit
+          # 2026-07-18; the dispatcher's input is only cross-checked there) — and lists
+          # strictly OPPOSITE-provider reviewers, strongest first: an anthropic model only
+          # reviews codex-authored content and vice versa. Computed HERE, never via resolve()
+          # (whose role=review row is always [opus]); resolve() supplies account_pool / gate /
+          # arm / caps only. Fix uses the UNIFIED cross-provider escalation ladder.
           # A CODEX alias with a missing/TBD provider_model is RESOLVABLE (locked decision 14):
           # the proven codex drain passes no --model flag (CLI default), and worker-live.sh omits
           # --model in that case. A claude alias still needs a concrete id.
-          content_provider = os.environ.get("CONTENT_PROVIDER", "") or impl_provider
+          content_provider = os.environ.get("CONTENT_PROVIDER", "")
           if content_provider not in {"anthropic", "openai"}:
-              raise SystemExit("content_provider must be anthropic, openai, or empty")
+              raise SystemExit("derived content_provider must be anthropic or openai")
           review_chain = {"anthropic": ["sol", "luna"], "openai": ["fable", "opus"]}
           # UNIFIED fix ladder in ascending capability order opus < luna < fable < sol —
-          # mirrors worker-pr.py ESCALATION_LADDERS (maintainer 2026-07-18): both implementer
-          # providers share it, so a hard fix escalates ACROSS providers. A pinned fix-model
-          # FLOOR replaces the default fix chain with the ladder tiers at/above the pin,
-          # cheapest first: tiers below the floor are DELIBERATELY absent (defer-not-fallback —
-          # with no at/above-floor account free, the claim defers to a later tick instead of
-          # burning the extended round budget on the model that already failed; see
-          # dispatch-claim.py). A pin outside the ladder fails closed after legacy translation
-          # (pre-unification sonnet/terra pins map to the ladder bottom tiers).
+          # mirrors worker-pr.py ESCALATION_LADDERS (maintainer 2026-07-18) — INTERSECTED with
+          # the ORIGINAL route's chain by the snapshot step (FIX_LADDER, sol audit 2026-07-18:
+          # an opus-only trust-surface PR is only ever fixed by opus; a frontier-only ci PR
+          # never falls below frontier). A pinned fix-model FLOOR replaces the constrained
+          # chain with its tiers at/above the pin, cheapest first: tiers below the floor are
+          # DELIBERATELY absent (defer-not-fallback — with no at/above-floor account free, the
+          # claim defers to a later tick instead of burning the extended round budget on the
+          # model that already failed; see dispatch-claim.py). A pin outside the constrained
+          # ladder fails closed after legacy translation (pre-unification sonnet/terra pins
+          # map to the ladder bottom).
           unified_ladder = ["opus", "luna", "fable", "sol"]
-          fix_chain = {"anthropic": unified_ladder, "openai": unified_ladder}
-          ladders = {"anthropic": unified_ladder, "openai": unified_ladder}
+          fix_ladder = [tier for tier in os.environ.get("FIX_LADDER", "").split(",") if tier]
+          if not fix_ladder or any(tier not in unified_ladder for tier in fix_ladder):
+              raise SystemExit("fix ladder must be a non-empty subset of the unified ladder")
+          fix_ladder = [tier for tier in unified_ladder if tier in fix_ladder]
           model_pin = os.environ.get("MODEL_PIN", "")
           model_pin = {"sonnet": "opus", "terra": "opus"}.get(model_pin, model_pin)
           if mode == "fix" and model_pin:
-              ladder = ladders[impl_provider]
-              if model_pin not in ladder:
-                  raise SystemExit("model_pin is not a ladder tier for the implementer provider")
-              wanted = ladder[ladder.index(model_pin):]
+              if model_pin not in fix_ladder:
+                  raise SystemExit("model_pin is not a tier of this PR's route-constrained "
+                                   "fix ladder")
+              wanted = fix_ladder[fix_ladder.index(model_pin):]
           else:
               wanted = (review_chain[content_provider] if mode == "review"
-                        else fix_chain[impl_provider])
+                        else fix_ladder)
           models = routing.get("models", {})
           chain = []
           for alias in wanted:
@@ -540,7 +617,7 @@ jobs:
           printf 'acquired=false\n' >> "$GITHUB_OUTPUT"
           printf 'This head was already reviewed end-to-end; nothing to do.\n'
 
-      - name: CAS claim from the opposite/same-provider pool
+      - name: CAS claim from the mode-resolved chain (content-opposed review / route-constrained fix)
         id: claim
         if: ${{ inputs.claim_id == '' && needs.resolve.outputs.already_done != 'true' }}
         env:
@@ -551,7 +628,10 @@ jobs:
           MODELS: ${{ needs.resolve.outputs.model_chain }}
           ACCOUNT_POOL: ${{ needs.resolve.outputs.account_pool }}
           PACKAGE: ${{ needs.resolve.outputs.package }}
-          IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          # The reviewer opposes the CONTENT author's provider (sol audit 2026-07-18) — after
+          # a provider-switching fix it may legitimately equal the ORIGINAL implementer's
+          # provider; the salted account assertion still bars the implementer's own account.
+          CONTENT_PROVIDER: ${{ needs.resolve.outputs.content_provider }}
           IMPL_ACCOUNT_H: ${{ needs.resolve.outputs.impl_account_h }}
           # Salt for the reviewer!=implementer account-hash assertion (locked decision 22a).
           # This job runs registry code only — the salt never enters a job executing target code.
@@ -588,7 +668,11 @@ jobs:
             exit 0
           fi
           [[ "$rc" -eq 0 ]] || { echo '::error::lease claim failed'; exit "$rc"; }
-          python3 - "$RUNNER_TEMP/claim.json" "$ACCOUNT_POOL" "$MODELS" <<'PY'
+          # A claim that fails validation must RELEASE its fresh lease before failing the job
+          # (sol audit 2026-07-18): validation runs before acquired=true reaches the outputs,
+          # so the always() release job is skipped for this run — without the inline release
+          # the rejected lease would dangle until its TTL/groom.
+          if ! python3 - "$RUNNER_TEMP/claim.json" "$ACCOUNT_POOL" "$MODELS" <<'PY'
           import hashlib
           import json
           import os
@@ -601,7 +685,7 @@ jobs:
           pool = pool_csv.split(",")
           models = models_csv.split(",")
           mode = os.environ["MODE"]
-          impl_provider = os.environ["IMPL_PROVIDER"]
+          content_provider = os.environ["CONTENT_PROVIDER"]
           impl_account_h = os.environ["IMPL_ACCOUNT_H"]
           salt = os.environ.get("PROVENANCE_SALT", "")
           account = claim.get("account")
@@ -617,20 +701,23 @@ jobs:
               raise SystemExit("allocator returned an unsafe or mismatched secret_ref")
           if not re.fullmatch(r"[0-9a-f]{32}", str(claim_id)):
               raise SystemExit("allocator returned an unsafe claim_id")
-          # Fail-closed cross-provider assertions (claim layer, locked decision 6). The account
-          # comparison runs on SALTED HASHES (locked decision 22a) because the public provenance
-          # record never stores a raw handle; a missing salt fails closed.
+          # Fail-closed cross-provider assertions (claim layer, locked decision 6, revised by
+          # the sol audit 2026-07-18): the reviewer opposes the CONTENT author's provider —
+          # after a provider-switching fix on the unified ladder it may equal the ORIGINAL
+          # implementer's provider. The account comparison still runs against the RECORDED
+          # IMPLEMENTER hash on SALTED HASHES (locked decision 22a) because the public
+          # provenance record never stores a raw handle; a missing salt fails closed. No
+          # fixer-provider assertion: the unified fix ladder deliberately crosses providers,
+          # and the resolved model chain already constrains what the allocator may return.
           if not provider:
               raise SystemExit("claimed account has no provider metadata; failing closed")
-          if mode == "review" and provider == impl_provider:
-              raise SystemExit("reviewer provider equals implementer provider; refusing")
+          if mode == "review" and provider == content_provider:
+              raise SystemExit("reviewer provider equals the content author provider; refusing")
           if mode == "review":
               if not salt:
                   raise SystemExit("PROVENANCE_SALT is unavailable; refusing to assert reviewer identity")
               if hashlib.sha256(f"{account}:{salt}".encode()).hexdigest()[:16] == impl_account_h:
                   raise SystemExit("reviewer account equals implementer account; refusing")
-          if mode == "fix" and provider != impl_provider:
-              raise SystemExit("fixer provider must equal implementer provider; refusing")
           values = {
               "acquired": "true",
               "account": account,
@@ -649,6 +736,15 @@ jobs:
           # Privacy (locked decision 22b): public workflow logs never carry account handles.
           print(f"lease claimed: model={model}, claim={claim_id[:8]}")
           PY
+          then
+            claim_id=$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1])).get("claim_id") or ""))' "$RUNNER_TEMP/claim.json")
+            if [[ "$claim_id" =~ ^[0-9a-f]{32}$ ]]; then
+              python3 registry/scripts/select-and-claim.py \
+                --release "$claim_id" \
+                --repo "$GITHUB_REPOSITORY" || true
+            fi
+            exit 1
+          fi
 
       - name: Adopt dispatcher-owned CAS claim
         id: adopt
@@ -663,7 +759,8 @@ jobs:
           MODELS: ${{ needs.resolve.outputs.model_chain }}
           ACCOUNT_POOL: ${{ needs.resolve.outputs.account_pool }}
           PACKAGE: ${{ needs.resolve.outputs.package }}
-          IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          # Content-keyed reviewer direction (sol audit 2026-07-18) — see the CAS claim step.
+          CONTENT_PROVIDER: ${{ needs.resolve.outputs.content_provider }}
           IMPL_ACCOUNT_H: ${{ needs.resolve.outputs.impl_account_h }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
@@ -684,7 +781,7 @@ jobs:
           with open(sys.argv[1], encoding="utf-8") as handle:
               claim = json.load(handle)
           mode = os.environ["MODE"]
-          impl_provider = os.environ["IMPL_PROVIDER"]
+          content_provider = os.environ["CONTENT_PROVIDER"]
           impl_account_h = os.environ["IMPL_ACCOUNT_H"]
           salt = os.environ.get("PROVENANCE_SALT", "")
           account = claim.get("account")
@@ -707,16 +804,16 @@ jobs:
               raise SystemExit("dispatcher claim secret_ref is unsafe")
           if not provider:
               raise SystemExit("claimed account has no provider metadata; failing closed")
-          if mode == "review" and provider == impl_provider:
-              raise SystemExit("reviewer provider equals implementer provider; refusing")
+          # Content-keyed reviewer direction + NO fixer-provider assertion (sol audit
+          # 2026-07-18) — same rationale as the CAS claim step above.
+          if mode == "review" and provider == content_provider:
+              raise SystemExit("reviewer provider equals the content author provider; refusing")
           if mode == "review":
               # Salted-hash account assertion (locked decision 22a); missing salt fails closed.
               if not salt:
                   raise SystemExit("PROVENANCE_SALT is unavailable; refusing to assert reviewer identity")
               if hashlib.sha256(f"{account}:{salt}".encode()).hexdigest()[:16] == impl_account_h:
                   raise SystemExit("reviewer account equals implementer account; refusing")
-          if mode == "fix" and provider != impl_provider:
-              raise SystemExit("fixer provider must equal implementer provider; refusing")
           values = {
               "acquired": "true",
               "account": account,
@@ -764,6 +861,9 @@ jobs:
       injection_detected: ${{ steps.fix.outputs.injection_detected }}
       gate_outcome: ${{ steps.gate.outcome }}
       pushed: ${{ steps.push.outcome == 'success' && 'true' || 'false' }}
+      # The pushed head SHA (worker-live push-fix output): binds the successful-push AUTHOR
+      # marker to the exact content it authored (sol audit 2026-07-18).
+      pushed_sha: ${{ steps.push.outputs.pushed_sha }}
       # Model-access health (registry #32): the sanitized exit CLASS of the review/fix model launch,
       # recorded by the separate no-target-code `model_health` job (success or failure), plus the
       # sanitized session-limit reset time (review defect #9; empty for every other class).
@@ -1023,8 +1123,12 @@ jobs:
           WORKER_REVIEW_FILE: ${{ runner.temp }}/registry-worker/review-verdict.json
           WORKER_REVIEW_ROUND: ${{ inputs.review_round }}
           WORKER_PRIOR_REVIEW_FILE: ${{ runner.temp }}/registry-worker/prior-verdict.json
-          WORKER_IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
-          WORKER_IMPL_ALIAS: ${{ needs.resolve.outputs.impl_alias }}
+          # The CONTENT author's provider/alias (sol audit 2026-07-18): derived against the
+          # live head in the resolve job; worker-live.sh asserts the reviewer OPPOSES these
+          # (the provenance implementer's identity may legitimately match the reviewer after
+          # a provider-switching fix on the unified ladder).
+          WORKER_CONTENT_PROVIDER: ${{ needs.resolve.outputs.content_provider }}
+          WORKER_CONTENT_ALIAS: ${{ needs.resolve.outputs.content_alias }}
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
           WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
           WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
@@ -1282,6 +1386,9 @@ jobs:
           # [OPUS-4.8] B3: the target policy row's security_paths (base64 JSON list). Each path
           # becomes a --surface-path so a trust-surface diff routes its arm to a human.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
+          # Route-constrained fix ladder (sol audit 2026-07-18): each tier becomes an
+          # --allowed-tier so the budget escalation never pins a tier the route forbids.
+          FIX_LADDER: ${{ needs.resolve.outputs.fix_ladder }}
         run: |
           set -euo pipefail
           args=(
@@ -1297,6 +1404,10 @@ jobs:
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           )
+          IFS=',' read -ra ladder_tiers <<< "${FIX_LADDER}"
+          for tier in "${ladder_tiers[@]}"; do
+            [[ -n "$tier" ]] && args+=(--allowed-tier "$tier")
+          done
           [[ "$SECURITY" == "true" ]] && args+=(--security)
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
@@ -1343,7 +1454,7 @@ jobs:
             --repo "${{ inputs.target_repo }}"
             --pr "${{ inputs.pr_number }}"
             --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
-            --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
+            --content-provider "${{ needs.resolve.outputs.content_provider }}"
             --impl-account-h "${{ needs.resolve.outputs.impl_account_h }}"
             --reviewer-provider "${{ needs.claim.outputs.provider }}"
             --arm "${{ needs.resolve.outputs.arm_auto_merge }}"
@@ -1389,6 +1500,7 @@ jobs:
             --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \
             --gate-outcome "${{ needs.run.outputs.gate_outcome }}" \
             --pushed "${{ needs.run.outputs.pushed }}" \
+            --pushed-sha "${{ needs.run.outputs.pushed_sha }}" \
             --issue "${{ needs.resolve.outputs.issue }}"
 
   # Escalate an unresolvable inverse chain to a human immediately (never silent-queue): if the
