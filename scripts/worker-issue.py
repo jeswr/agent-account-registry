@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
@@ -396,6 +397,87 @@ def _self_test():
     assert find_maintainer_approval([failure, app_user], "sparq[bot]", maintainers) is None
     # With no prior attempt receipt there is nothing to be stale against: approval stands.
     assert find_maintainer_approval([human_after], "sparq[bot]", maintainers) is human_after
+
+    # (v) each identity filter is load-bearing on its own (review r1). A trust-everyone stub
+    # removes the trusted-set probe as a confounding rejector, so ONLY the bot/App filters can
+    # be doing the rejecting here — deleting any one of them turns a case green.
+    trust_all = lambda login: True  # noqa: E731 — trivial trusted-set stub
+    app_typed = {"user": {"login": "registry-app", "type": "Bot"},
+                 "body": "approved", "created_at": "2026-07-11T00:00:00Z"}
+    suffixed = {"user": {"login": "helper[bot]", "type": "User"},
+                "body": "approved", "created_at": "2026-07-11T00:00:00Z"}
+    assert find_maintainer_approval([failure, app_typed], "sparq[bot]", trust_all) is None
+    assert find_maintainer_approval([failure, suffixed], "sparq[bot]", trust_all) is None
+    # The worker's own login never self-approves, even typed User with no [bot] suffix.
+    own_receipt = {"user": {"login": "sparq-svc", "type": "User"},
+                   "body": f"x {ATTEMPT_MARKER} run=9 -->", "created_at": "2026-07-10T00:00:00Z"}
+    own_approval = {"user": {"login": "sparq-svc", "type": "User"},
+                    "body": "approved", "created_at": "2026-07-11T00:00:00Z"}
+    assert find_maintainer_approval([own_receipt, own_approval], "sparq-svc", trust_all) is None
+    # trust_all admits a genuine human, proving the rejections above came from the identity
+    # filters and not from the stub being secretly restrictive.
+    assert find_maintainer_approval([failure, human_after], "sparq[bot]", trust_all) is human_after
+
+    # (vi) the approval predicate is load-bearing: a trusted human comment after the receipt
+    # that never says "approved" is NOT approval.
+    unmarked = {"user": {"login": "jeswr", "type": "User"},
+                "body": "looks good to me", "created_at": "2026-07-11T00:00:00Z"}
+    assert find_maintainer_approval([failure, unmarked], "sparq[bot]", maintainers) is None
+
+    # (vii) staleness is strict at-or-before: an approval stamped EXACTLY at the receipt time
+    # is stale (it cannot postdate the failure it must bless).
+    equal_ts = {**human_after, "created_at": failure["created_at"]}
+    assert find_maintainer_approval([failure, equal_ts], "sparq[bot]", maintainers) is None
+
+    # (viii) with multiple receipts the NEWEST governs, independent of list order: an approval
+    # between two receipts blessed the older failure and is stale; one after both stands.
+    failure2 = {**failure, "body": f"x {ATTEMPT_MARKER} run=10 -->",
+                "created_at": "2026-07-12T00:00:00Z"}
+    after_both = {**human_after, "created_at": "2026-07-13T00:00:00Z"}
+    assert find_maintainer_approval([failure, human_after, failure2], "sparq[bot]", maintainers) is None
+    assert find_maintainer_approval([failure2, human_after, failure], "sparq[bot]", maintainers) is None
+    assert find_maintainer_approval(
+        [failure, human_after, failure2, after_both], "sparq[bot]", maintainers) is after_both
+
+    # (ix) reverify exit-3 wiring (review r1): the fail-closed guard itself, not just the pure
+    # helper. A stub trust-gate exits 3 (third-party author); real subprocess wiring, with only
+    # the GitHub API seams patched. Without fresh approval reverify must raise the approval
+    # error (NOT the generic gate error) and write no issue snapshot; with fresh approval it
+    # must rerun the gate --maintainer-approved and accept its "promoted" verdict.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = Path(tmp) / "gate.py"
+        gate.write_text(
+            "import sys\n"
+            "if '--maintainer-approved' in sys.argv:\n"
+            "    print('promoted')\n"
+            "    sys.exit(0)\n"
+            "sys.exit(3)\n",
+            encoding="utf-8",
+        )
+        issue_file = Path(tmp) / "issue.json"
+        item = {"state": "open", "user": {"login": "third-party"}, "body": "task",
+                "labels": [{"name": "status:ready"}]}
+        comments = [failure]
+        seams = {"_gh_json": lambda args, *, input_doc=None: dict(item),
+                 "_paginated": lambda repo, issue, resource: list(comments),
+                 "_is_human_maintainer": lambda repo, login: login == "jeswr"}
+        saved = {name: globals()[name] for name in seams}
+        globals().update(seams)
+        try:
+            refused = False
+            try:
+                reverify("o/r", 1, "third-party", body_sha("task"), str(gate),
+                         "sparq[bot]", str(issue_file))
+            except WorkerIssueError as exc:
+                refused = "no fresh maintainer approval" in str(exc)
+            assert refused
+            assert not issue_file.exists()
+            comments.append(human_after)
+            reverify("o/r", 1, "third-party", body_sha("task"), str(gate),
+                     "sparq[bot]", str(issue_file))
+            assert json.loads(issue_file.read_text(encoding="utf-8")) == item
+        finally:
+            globals().update(saved)
     print("worker-issue self-test PASSED")
 
 
