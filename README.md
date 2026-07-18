@@ -151,10 +151,14 @@ title (GitHub does not enforce unique titles).
 
 ### Step 1 — save the token as a secret (via stdin, never as a visible arg)
 
+Secrets live in the **`dispatch-secrets` environment**, NOT at repo scope (issue #101): the
+dispatch secrets-guard fails every tick closed while ANY repo-scope secret exists, so a
+repo-scope write here re-breaks dispatch until the migration is re-run.
+
 ```bash
-tr -d '[:space:]' < ~/.claude-acct5-token | gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry
+tr -d '[:space:]' < ~/.claude-acct5-token | gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry --env dispatch-secrets
 # or from a value you already hold, without it hitting the shell history/ps:
-#   gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry   # then paste at the prompt
+#   gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry --env dispatch-secrets   # then paste at the prompt
 ```
 
 ### Step 2 — validate the token works (and see its live usage)
@@ -213,7 +217,8 @@ Commit + push to `master`. An account that is available + in the catalog but **n
 ### Verify
 
 ```bash
-gh secret list -R jeswr/agent-account-registry | grep ACCT           # secret present
+gh secret list -R jeswr/agent-account-registry --env dispatch-secrets | grep ACCT  # secret present (env scope)
+gh secret list -R jeswr/agent-account-registry                        # repo scope must stay EMPTY
 gh issue view <ISSUE#> -R jeswr/agent-account-registry --json labels  # status:available + provider:*
 grep account_pool policy/repos.toml                                   # handle present
 ```
@@ -282,8 +287,15 @@ from the `data/model-health.json` records the worker/review outcome jobs already
 
 ## Security posture
 
-- Tokens: only in GitHub secrets (encrypted at rest, masked in logs).
-- `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the Actions secrets public-key read, then an authoritative `gh secret set` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only `Secrets: read`, so it would bless a read-only PAT that onboarding's write still breaks on) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and network blips never false-alarm.
+- Tokens: only in GitHub secrets (encrypted at rest, masked in logs), and only in the
+  **`dispatch-secrets` environment** — repo scope stays EMPTY, enforced fail-closed every tick by
+  `scripts/dispatch-secrets-guard.py` (issue #101). The environment's custom deployment-branch
+  policy admits ONLY `master`, so a modified workflow copy dispatched at any other ref is refused
+  the secrets server-side. This covers the 14 pipeline secrets AND `REGISTRY_SECRETS_PAT`
+  (currently unset; when restored it goes into the environment — mint it fine-grained with
+  **Secrets: read/write + Environments: read/write** on this repo, the latter because env-secret
+  endpoints sit under the fine-grained "Environments" permission).
+- `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the `dispatch-secrets` environment secrets public-key read, then an authoritative `gh secret set --env dispatch-secrets` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only read access, so it would bless a read-only PAT that onboarding's env write still breaks on; a repo-scope canary would re-trip the secrets-guard weekly) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and network blips never false-alarm.
 - Account metadata + selection logic: only in this private repo.
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
 
@@ -300,6 +312,8 @@ You don't paste tokens manually. Instead:
    as a secret.
 
 Providers: **OpenAI** via `codex login --device-auth` (native device flow); **Anthropic** via
-`claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_ADMIN_TOKEN` (a
-fine-grained PAT with Secrets:write on the token-target repo) — until it's set, the broker still
-surfaces the URL but reports that the secret couldn't be stored.
+`claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_SECRETS_PAT` (a
+fine-grained PAT with Secrets: read/write + Environments: read/write on this registry repo,
+stored in the `dispatch-secrets` environment — the broker job is env-bound to resolve it, and it
+stores captured tokens into that same environment) — until it's set, the broker still surfaces
+the URL but reports that the secret couldn't be stored.

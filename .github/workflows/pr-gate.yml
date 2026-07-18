@@ -65,7 +65,7 @@ jobs:
           plan-snapshot.py triage.py \
           dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
           account-usage.py usage-alert.py model-health.py plan-alert.py pat-validity.py broker-refresh.py \
-          backfill-provenance.py dashboard-gen.py trust-gate.py"
+          backfill-provenance.py dashboard-gen.py trust-gate.py dispatch-secrets-guard.py"
           for s in $suite; do
             # An enrolled script that is MISSING is a hard failure (sol r3 on #227): the
             # silent [[ -f ]] skip would keep this gate green after deleting a security
@@ -80,6 +80,8 @@ jobs:
           done
           echo "== self-test worker-live.sh =="
           bash scripts/worker-live.sh self-test
+          echo "== self-test migrate-secrets.sh =="
+          bash scripts/migrate-secrets.sh --self-test
 
       - name: bash -n every shell script
         run: |

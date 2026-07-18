@@ -42,6 +42,11 @@ jobs:
   login:
     if: github.event.label.name == 'set-up-account'
     runs-on: ubuntu-latest
+    # REGISTRY_SECRETS_PAT's canonical home is the dispatch-secrets environment (post-#101 the
+    # repo scope must stay EMPTY — the secrets-guard fails dispatch closed otherwise), so the
+    # broker job must be env-bound to resolve it. `issues: labeled` events run on the default
+    # branch, which the environment's custom deployment-branch policy admits.
+    environment: dispatch-secrets
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
@@ -62,8 +67,11 @@ jobs:
           done
 
       # The workflow's own github.token cannot write Actions secrets; REGISTRY_SECRETS_PAT is the
-      # existing jeswr-owned fine-grained PAT with Secrets:write on THIS registry repo (already
-      # proven by the rotation write-back in worker-live.sh).
+      # jeswr-owned fine-grained PAT on THIS registry repo (already proven by the rotation
+      # write-back in worker-live.sh). Post-#101 it lives in the dispatch-secrets environment
+      # (this job is env-bound to resolve it) and needs Secrets: read/write AND
+      # Environments: read/write — the env-secret endpoints the broker/write-back now use sit
+      # under the fine-grained "Environments" permission.
       - name: Preflight — require REGISTRY_SECRETS_PAT before any login
         env:
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}

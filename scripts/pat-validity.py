@@ -6,13 +6,20 @@
 # expire silently on a calendar) was discovered exactly when a new account was being onboarded,
 # the one moment a human is waiting on the flow. This probe runs on a weekly cron instead.
 #
-# Probe targets (what the pipeline actually needs, in dependency order):
+# Probe targets (what the pipeline actually needs, in dependency order). Post-#101 the canonical
+# secret home is the `dispatch-secrets` ENVIRONMENT (repo scope must stay EMPTY — the dispatch
+# secrets-guard fails every tick closed otherwise), so BOTH capability probes target the
+# environment: a weekly repo-scope canary write would re-trip that guard, and env-secret
+# endpoints sit under the fine-grained "Environments" permission (doc-verified), which a
+# Secrets-only PAT does not carry — validating repo-write would bless a PAT the real env writes
+# still break on.
 #   1. GET /user                                    — does the token authenticate at all
-#   2. GET /repos/{repo}/actions/secrets/public-key — the read `gh secret set` performs before
-#      encrypting a secret.
-#   3. `gh secret set` on a DEDICATED DISPOSABLE CANARY secret (REGISTRY_PAT_PROBE_CANARY).
-#      Review r3 #1: the public-key GET needs only `Secrets: read`, while the `gh secret set`
-#      that onboarding and the rotation write-back actually run needs `Secrets: write` — so a
+#   2. GET /repos/{repo}/environments/dispatch-secrets/secrets/public-key — the read
+#      `gh secret set --env` performs before encrypting a secret (needs `Environments: read`).
+#   3. `gh secret set --env dispatch-secrets` on a DEDICATED DISPOSABLE CANARY secret
+#      (REGISTRY_PAT_PROBE_CANARY).
+#      Review r3 #1: the public-key GET needs only read access, while the `gh secret set` that
+#      onboarding and the rotation write-back actually run needs `Environments: write` — so a
 #      read-only PAT passed probes 1–2 and was declared healthy (even auto-closing the rolling
 #      alert) while onboarding stayed broken. Only a real write is authoritative for write
 #      permission, so the probe overwrites a canary secret that exists solely for this purpose:
@@ -63,8 +70,12 @@ from datetime import datetime, timezone
 
 API = "https://api.github.com"
 # The write probe's target: a secret that exists ONLY to be overwritten by this probe. Its value
-# is a fixed non-secret marker — nothing reads it, so probing it risks nothing real.
+# is a fixed non-secret marker — nothing reads it, so probing it risks nothing real. It lives in
+# the dispatch-secrets ENVIRONMENT (post-#101): a repo-scope canary would re-trip the dispatch
+# secrets-guard weekly, and the pipeline's real writes are env-scope, so only an env write is a
+# faithful capability probe.
 CANARY_SECRET = "REGISTRY_PAT_PROBE_CANARY"
+CANARY_ENV = "dispatch-secrets"
 CANARY_VALUE = "pat-validity write-probe canary - holds no secret material"
 ALERT_TITLE = "🔑 REGISTRY_SECRETS_PAT is invalid or under-scoped — secret writes will fail"
 ALERT_LABEL = "from:agent"
@@ -166,17 +177,17 @@ def _write_env(token):
 
 
 def _secret_write(token, repo, run=subprocess.run):
-    """The authoritative write probe (review r3 #1): `gh secret set` on the disposable canary
-    secret — the EXACT operation onboarding performs, exercising `Secrets: write` which the
-    public-key GET (read-only) cannot. Returns the same response shape as _get() so classify()
-    treats it uniformly: {"status", "headers": {}, "message"} on an HTTP verdict, {"status":
+    """The authoritative write probe (review r3 #1): `gh secret set --env dispatch-secrets` on
+    the disposable canary secret — the EXACT operation onboarding and the rotation write-back
+    perform post-#101, exercising `Environments: write` which the public-key GET (read-only)
+    cannot. Returns the same response shape as _get() so classify() treats it uniformly: {"status", "headers": {}, "message"} on an HTTP verdict, {"status":
     None, "error": …} when nothing conclusive happened. gh's stderr is retained ONLY as the
     throttle-vs-denial discriminator; it never carries the token (the PAT travels via GH_TOKEN
     in the child env and GH_DEBUG is stripped) and is never echoed into details or logs. The
     canary value goes via stdin — never argv — purely to keep the repo's no-secrets-in-argv
     convention, though the value is not secret."""
     try:
-        result = run(["gh", "secret", "set", CANARY_SECRET, "-R", repo, "--app", "actions"],
+        result = run(["gh", "secret", "set", CANARY_SECRET, "-R", repo, "--env", CANARY_ENV],
                      input=CANARY_VALUE, capture_output=True, text=True,
                      env=_write_env(token), timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -196,10 +207,10 @@ def classify(user, secrets, write=None):
     a definitive credential signal (401) or an authenticated-but-denied secrets read/write
     (403/404 after a 200 /user) alerts; every throttling-shaped or server-side status is
     network-unknown — including a 403 whose headers OR error message say rate limit rather than
-    missing scope. FAIL-CLOSED against false health too (review r3 #1): a 200 public-key read
-    only proves `Secrets: read`; `valid` additionally requires the canary write to have
-    SUCCEEDED, so a read-only PAT is insufficient-scope and a read-success with no completed
-    write verdict is network-unknown, never valid."""
+    missing scope. FAIL-CLOSED against false health too (review r3 #1): a 200 env public-key
+    read only proves `Environments: read`; `valid` additionally requires the canary write to
+    have SUCCEEDED, so a read-only PAT is insufficient-scope and a read-success with no
+    completed write verdict is network-unknown, never valid."""
     status = user.get("status")
     if status is None:
         return NETWORK_UNKNOWN, (f"GET /user did not complete "
@@ -225,9 +236,10 @@ def classify(user, secrets, write=None):
                                      f"complete ({write.get('error', 'no write result')}) — "
                                      "write permission unknown")
         if wstatus in (201, 204):
-            return VALID, ("authenticates, reads the Actions secrets public key, AND wrote the "
-                           f"disposable canary secret {CANARY_SECRET} — the exact write "
-                           "`gh secret set` performs")
+            return VALID, ("authenticates, reads the dispatch-secrets environment public key, "
+                           f"AND wrote the disposable canary secret {CANARY_SECRET} into the "
+                           f"{CANARY_ENV} environment — the exact write `gh secret set --env` "
+                           "performs")
         if wstatus == 401:
             return INVALID, "canary secret write returned 401 — the PAT is revoked or expired"
         if wstatus == 403 and _throttled(write):
@@ -235,10 +247,11 @@ def classify(user, secrets, write=None):
                                      "(rate limited per its documented error message) — not a "
                                      "credential verdict")
         if wstatus in (403, 404):
-            return INSUFFICIENT, (f"authenticates and READS the secrets public key, but the "
-                                  f"canary secret write returned {wstatus} — the PAT is "
-                                  "read-only (Secrets: read) where `gh secret set` needs "
-                                  "Secrets: write")
+            return INSUFFICIENT, (f"authenticates and READS the environment public key, but "
+                                  f"the canary environment-secret write returned {wstatus} — "
+                                  "the PAT is read-only where `gh secret set --env` needs "
+                                  "Environments: write (the env-secret PUT sits under the "
+                                  "fine-grained 'Environments' permission)")
         return NETWORK_UNKNOWN, (f"canary secret write returned {wstatus} — "
                                  "not a credential verdict")
     if sstatus == 401:
@@ -248,10 +261,12 @@ def classify(user, secrets, write=None):
                                  "(rate limited per its headers or documented error message) "
                                  "— not a credential verdict")
     if sstatus in (403, 404):
-        # A fine-grained PAT with no access to the repo 404s; one with repo access but no
-        # Secrets permission 403s. Both mean `gh secret set` will fail.
-        return INSUFFICIENT, (f"authenticates, but the Actions secrets public-key read returned "
-                              f"{sstatus} — the PAT lacks Secrets access to the registry repo")
+        # A fine-grained PAT with no access to the repo (or a missing environment) 404s; one
+        # with repo access but no Environments permission 403s. Both mean `gh secret set --env`
+        # will fail.
+        return INSUFFICIENT, (f"authenticates, but the {CANARY_ENV} environment secrets "
+                              f"public-key read returned {sstatus} — the PAT lacks Environments "
+                              "access to the registry repo (or the environment is missing)")
     return NETWORK_UNKNOWN, (f"secrets public-key read returned {sstatus} — "
                              "not a credential verdict")
 
@@ -307,7 +322,8 @@ def probe(token, repo, fetch=_get, write=_secret_write, now=None):
     user = fetch(f"{API}/user", token)
     secrets = written = None
     if user.get("status") == 200:
-        secrets = fetch(f"{API}/repos/{repo}/actions/secrets/public-key", token)
+        secrets = fetch(
+            f"{API}/repos/{repo}/environments/{CANARY_ENV}/secrets/public-key", token)
         if secrets.get("status") == 200:
             written = write(token, repo)
     verdict, detail = classify(user, secrets, written)
@@ -337,10 +353,13 @@ def render_alert(result, repo):
              impact]
     if result.get("expires_at"):
         lines.append(f"Token expiry (from the API's expiration header): {result['expires_at']}\n")
-    lines.append(f"**Fix:** mint a fine-grained PAT with **Secrets: read and write** on `{repo}`, "
-                 f"then `gh secret set REGISTRY_SECRETS_PAT -R {repo}` (paste at the prompt — "
-                 "never as a visible argument). This issue updates itself on the weekly probe and "
-                 "closes automatically once the PAT passes.")
+    lines.append(f"**Fix:** mint a fine-grained PAT with **Secrets: read and write** AND "
+                 f"**Environments: read and write** on `{repo}` (env-secret writes sit under the "
+                 f"'Environments' permission), then "
+                 f"`gh secret set REGISTRY_SECRETS_PAT -R {repo} --env {CANARY_ENV}` (paste at "
+                 "the prompt — never as a visible argument; the environment is its canonical "
+                 "home post-#101, repo scope must stay empty). This issue updates itself on the "
+                 "weekly probe and closes automatically once the PAT passes.")
     return "\n".join(lines)
 
 
@@ -561,9 +580,10 @@ def _self_test():
     now = datetime(2026, 7, 17, 4, 33, 41, tzinfo=timezone.utc)
     r = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK, S_OK]), write=fake_write(W_OK), now=now)
     chk("probe valid end-to-end (read AND canary write)", r["verdict"], VALID)
-    chk("probe hits /user, the secrets public-key read, then the canary write",
+    chk("probe hits /user, the ENV secrets public-key read, then the canary write",
         (fetched, writes),
-        ([f"{API}/user", f"{API}/repos/o/r/actions/secrets/public-key"], ["o/r"]))
+        ([f"{API}/user",
+          f"{API}/repos/o/r/environments/{CANARY_ENV}/secrets/public-key"], ["o/r"]))
     chk("expiry header inspected (15 days out)", r["days_left"], 15.0)
     fetched.clear(), writes.clear()
     r_ro = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK, S_OK]), write=fake_write(W_DENIED),
@@ -708,9 +728,10 @@ def _self_test():
                 os.environ[key] = val
     chk("_secret_write: rc 0 -> write-succeeded verdict",
         w_ok, {"status": 204, "headers": {}, "message": ""})
-    chk("_secret_write: targets the canary via gh, value on STDIN (never argv)",
+    chk("_secret_write: targets the ENV canary via gh (--env dispatch-secrets), value on STDIN "
+        "(never argv)",
         (seen["argv"], seen["kw"].get("input")),
-        (["gh", "secret", "set", CANARY_SECRET, "-R", "o/r", "--app", "actions"], CANARY_VALUE))
+        (["gh", "secret", "set", CANARY_SECRET, "-R", "o/r", "--env", CANARY_ENV], CANARY_VALUE))
     env = seen["kw"].get("env") or {}
     chk("_secret_write: child env holds ONLY the probed PAT (ambient token + GH_DEBUG stripped)",
         (env.get("GH_TOKEN"), "GITHUB_TOKEN" in env, "GH_DEBUG" in env),

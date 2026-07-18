@@ -1,10 +1,13 @@
 # [FABLE-5] Weekly REGISTRY_SECRETS_PAT validity probe (issue #37): a rotated/expired PAT used to
 # be discovered only when set-up-account or the rotation write-back actually ran `gh secret set` —
-# i.e. while a human was waiting on onboarding. This probes ahead of time: GET /user, the Actions
-# secrets public-key read, then an AUTHORITATIVE `gh secret set` on the disposable canary secret
-# REGISTRY_PAT_PROBE_CANARY (review r3: the public-key read needs only Secrets: read, so it alone
+# i.e. while a human was waiting on onboarding. This probes ahead of time: GET /user, the
+# dispatch-secrets ENVIRONMENT secrets public-key read, then an AUTHORITATIVE
+# `gh secret set --env dispatch-secrets` on the disposable canary secret
+# REGISTRY_PAT_PROBE_CANARY (review r3: the public-key read needs only read access, so it alone
 # would bless a read-only PAT that onboarding's write still breaks on; the canary holds no secret
-# material and is overwritten weekly). Upserts ONE rolling `from:agent` alert issue on
+# material and is overwritten weekly). Post-#101 both probes target the ENVIRONMENT: the
+# pipeline's real writes are env-scope, and a weekly repo-scope canary write would re-trip the
+# dispatch secrets-guard (repo scope must stay empty). Upserts ONE rolling `from:agent` alert issue on
 # invalid/insufficient-scope/near-expiry; network-unknown never alerts and never closes an
 # existing alert (no false alarms, no false recoveries). The token is never printed.
 name: pat-validity
@@ -29,6 +32,11 @@ concurrency:
 jobs:
   probe:
     runs-on: ubuntu-latest
+    # REGISTRY_SECRETS_PAT's canonical home is the dispatch-secrets environment (post-#101 the
+    # repo scope must stay EMPTY — the secrets-guard fails dispatch closed otherwise), so this
+    # job must be env-bound to resolve it. Scheduled + workflow_dispatch runs execute on the
+    # default branch, which the environment's custom deployment-branch policy admits.
+    environment: dispatch-secrets
     timeout-minutes: 10
     steps:
       - name: Checkout (pinned)
