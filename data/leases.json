@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct06",
-   "claim_id": "7bba15ce93f543819237e7990bf36a4c",
-   "holder": "sparq-org/sparq#2561@dispatch-29625933900.1",
-   "package": "sparq-e2ee-ng",
-   "role": "soundness",
-   "model": "opus",
-   "issued_at": 1784339535,
-   "expires_at": 1784345835
-  },
-  {
    "account": "acct02",
    "claim_id": "455492d5908b4124a333b148f7952385",
    "holder": "sparq-org/sparq#2850@dispatch-29625933900.1",
