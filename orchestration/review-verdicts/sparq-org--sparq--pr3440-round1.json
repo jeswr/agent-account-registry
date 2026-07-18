@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "methods_ttl_dims_are_policy_or_trust_vocab_or_vendored searches only for the literal `secx:property secx:`. Turtle permits comments and arbitrary whitespace, including a newline, between the predicate and object. If one annotation is reformatted as `secx:property\\n  secx:Soundness`, that dimension is no longer checked, but `found > 0` still succeeds because other annotations retain the old formatting. Thus the test's stated invariant that every methods-TTL dimension is checked is not established, and a typo in the skipped assertion can pass.",
+   "file": "crates/sparq-policy/src/secprop.rs",
+   "fix_hint": "Parse secprop-methods.ttl as Turtle and enumerate triples whose predicate is the expanded secx:property IRI, then validate every IRI object. If adding a parser is intentionally avoided, implement a whitespace/comment-aware tokenizer and add a regression fixture/test with a multiline predicate/object plus a typo proving the guard fails; do not rely on a global `found > 0` count alone.",
+   "severity": "major",
+   "title": "Exact-text scan silently skips valid Turtle property assertions"
+  }
+ ],
+ "progress": null,
+ "summary": "The new cross-crate guard does not reliably inspect every secx:property value in the Turtle graph. It recognizes only one exact whitespace spelling and merely asserts that at least one match exists, so valid Turtle formatting changes can silently remove individual assertions from coverage while the test remains green. The guard should parse Turtle (preferred) or otherwise prove that all property predicates/objects are enumerated independent of whitespace and comments.",
+ "verdict": "request_changes"
+}
