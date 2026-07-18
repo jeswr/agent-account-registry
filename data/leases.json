@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct03",
-   "claim_id": "f2989e5921034104a452a62080f9ee19",
-   "holder": "fix:sparq-org/sparq#3478@dispatch-29654326159.1",
-   "package": "sparq-shacl",
-   "role": "fix",
-   "model": "opus",
-   "issued_at": 1784396530,
-   "expires_at": 1784400130
-  },
-  {
    "account": "acct3css",
    "claim_id": "4b22dc01079e42459b2ebb3873f70a46",
    "holder": "fix:sparq-org/sparq#3476@dispatch-29654827783.1",
