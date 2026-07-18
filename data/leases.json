@@ -39,6 +39,16 @@
    "model": "sonnet",
    "issued_at": 1784393855,
    "expires_at": 1784397455
+  },
+  {
+   "account": "acct2css",
+   "claim_id": "0b1617bab0a34ca28077ba79e1963fc2",
+   "holder": "fix:jeswr/agent-account-registry#231@dispatch-29652967804.1",
+   "package": "worker",
+   "role": "fix",
+   "model": "opus",
+   "issued_at": 1784394082,
+   "expires_at": 1784397682
   }
  ]
 }
