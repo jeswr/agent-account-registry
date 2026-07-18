@@ -1,5 +1,11 @@
-# [OPUS-4.8] Resolve the acct02 Anthropic account EMAIL behind its stored setup-token, for registry
-# metadata accuracy. Prints ONLY presence/status/email/keys — the token is a masked secret, never echoed.
+# [FABLE-5] Identify the acct02 Anthropic account behind its stored setup-token — WITHOUT PII.
+# PII POLICY (README lines 4-7 + locked decision 22/22a — sol review round 5 of #275, finding 2):
+# this repo and its Actions logs are PUBLIC, so raw account handles/EMAILS never appear in any
+# output. Identity is conveyed ONLY as the registry's salted-hash convention
+# sha256(email + ':' + PROVENANCE_SALT)[:16] (identical to worker-pr.py account_hash /
+# model-health.py / backfill-provenance.py) — the maintainer recomputes it over the private
+# email map to match. The token is a masked secret, never echoed; only non-PII provider/format
+# fields are printed raw.
 name: account-whoami
 on:
   workflow_dispatch: {}
@@ -7,19 +13,42 @@ permissions: {}
 jobs:
   whoami:
     runs-on: ubuntu-latest
-    # SECRET-EXFIL GUARD (issue #101): reads ACCT02_TOKEN, which lives in the `dispatch-secrets`
-    # environment (deployment-branch policy: default branch only) — full rationale on the `claim`
-    # job in dispatch.yml. A dispatch from any non-default ref is refused server-side.
+    # SECRET-EXFIL GUARD (issue #101): reads ACCT02_TOKEN + PROVENANCE_SALT, which live in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml. A dispatch from any non-default ref is
+    # refused server-side.
     environment: dispatch-secrets
     steps:
-      - name: Resolve acct02 email (email only; token never printed)
+      - name: Resolve acct02 identity (salted email hash only — the raw email is NEVER printed)
         env:
           TOK: ${{ secrets.ACCT02_TOKEN }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           echo "token_present=$([ -n "$TOK" ] && echo yes || echo no)"
+          # Non-PII FORMAT field: classify the token by its PUBLIC prefix class (never print
+          # the token itself — prefix classes are public Anthropic documentation, not secret).
+          case "$TOK" in
+            sk-ant-oat*) echo "token_format=oauth-setup-token" ;;
+            sk-ant-api*) echo "token_format=api-key" ;;
+            "")          echo "token_format=<absent>" ;;
+            *)           echo "token_format=other" ;;
+          esac
+          echo "provider=anthropic"
           code=$(curl -s -o /tmp/p.json -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" https://api.anthropic.com/api/oauth/profile || echo curlfail)
           echo "http_status=$code"
-          echo "email=$(jq -r '.email // "<no-email-key>"' /tmp/p.json 2>/dev/null || echo parsefail)"
+          # PII policy (README line 4 + locked decision 22a): the raw email NEVER reaches the
+          # log — only sha256(email:PROVENANCE_SALT)[:16], the exact account_hash convention
+          # (scripts/worker-pr.py), matchable against the maintainer's private email map hashed
+          # the same way. No salt => print NOTHING email-derived (fail closed, never raw).
+          email=$(jq -r '.email // empty' /tmp/p.json 2>/dev/null || true)
+          if [ -z "$email" ]; then
+            echo "email_hash=<no-email-key>"
+          elif [ -z "$PROVENANCE_SALT" ]; then
+            echo "email_hash=<no-salt-refusing-to-derive>"
+          else
+            echo "email_hash=$(printf '%s:%s' "$email" "$PROVENANCE_SALT" | sha256sum | cut -c1-16)"
+          fi
+          # Response FORMAT (key names only — field names carry no PII, values are never dumped).
           echo "response_keys=$(jq -r 'try (keys | join(",")) catch "<non-object>"' /tmp/p.json 2>/dev/null || echo -)"
           # usage fingerprint (per-account rate-limit window): identifies the account even when
           # /api/oauth/profile is 403 for a setup-token. Same account => same 5h/7d reset timestamps.

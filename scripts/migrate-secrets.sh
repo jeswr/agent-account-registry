@@ -12,15 +12,19 @@
 # the guard red while a rerun cannot mint (the unbound job cannot read the env copies) — BRICKED.
 # So `--phase` selects one of two explicit state machines:
 #
-#   --phase main (env-UNBOUND job; needs Secrets RW + Environments RW + Actions R):
-#     M0. pre-flight: refuse (fail closed) while any live secret-WRITER workflow run is queued or
-#         in_progress (worker / review-fix / set-up-account / pat-validity) — none are serialized
-#         with this migration. `gh run list` sits under the fine-grained "Actions" permission
-#         (read) — a token without it dies HERE, before any listing or mutation. RESIDUAL
-#         (accepted + documented): a run that started BEFORE the env-binding PRs merged executes
-#         an old workflow snapshot and could still write a repo-scope secret AFTER this migration
-#         completes; the dispatch secrets-guard catches that loudly and re-running this
-#         idempotent migration heals it.
+#   --phase main (env-UNBOUND job; needs Secrets RW + Environments RW + Actions RW):
+#     M0a. QUIESCE (sol round-5 finding 1a — the late-writer race): `gh workflow disable` each of
+#          the four secret-WRITER workflows (worker / review-fix / set-up-account / pat-validity)
+#          BEFORE anything else — a disabled workflow cannot start a NEW run (and a `gh run
+#          rerun` of an old pre-env-binding snapshot is refused too), so no writer can begin
+#          mid-migration. The workflow's always() `reenable-writers` job re-enables them after
+#          cleanup via `--phase resume-writers`. Workflow disable/enable sit under the
+#          fine-grained "Actions" WRITE permission — an under-granted token dies HERE, before any
+#          listing or mutation.
+#     M0b. pre-flight: refuse (fail closed) while any live secret-writer run is queued or
+#          in_progress. Quiesce stops NEW runs; this stops the migration while ALREADY-RUNNING
+#          runs (which a disable does not cancel) are still alive. `gh run list` sits under the
+#          fine-grained "Actions" permission (read).
 #     M1. list the environment's secret NAMES (a failed listing is a hard refusal, never "empty").
 #     M2. pre-mutation input check: every name the env does NOT yet hold must have a non-empty
 #         S_<name> value — asserted for ALL 14 BEFORE any mutation. An env-held name needs no
@@ -43,10 +47,30 @@
 #     C1. list the environment; assert it holds all 14 — with a DISTINCT refusal if a BOOTSTRAP
 #         name is missing: deleting its repo-scope original then would destroy the last mint
 #         credential (re-run the main phase first).
-#     C2. delete whichever of the 2 bootstrap repo-scope secrets remain (2/1/0 — a rerun after a
-#         mid-cleanup cancellation converges; zero-remaining = success no-op).
-#     C3. assert repo scope holds none of the 14 and surface any stray by NAME. Only after this
-#         phase succeeds does the dispatch secrets-guard go green.
+#     C2. EXACT-SET check (sol round-5 finding 1b — recoverable ordering): BEFORE deleting
+#         ANYTHING, assert the repo-scope listing holds ONLY (a subset of) the 2 bootstrap names.
+#         Any other name — a migrated non-bootstrap leftover (a late old-snapshot writer
+#         re-created it, or the main phase did not converge) OR an unknown stray — is a hard
+#         abort with a distinct message that deletes NOTHING: both bootstrap mint credentials
+#         stay at repo scope, so a fresh migration remains fully MINTABLE and RERUNNABLE after
+#         the stray is removed (`gh secret delete <NAME> -R <owner>/<repo>`).
+#     C3. only after C2 passes: delete whichever of the 2 bootstrap repo-scope secrets remain
+#         (2/1/0 — a rerun after a mid-cleanup cancellation converges; zero-remaining = success
+#         no-op). RESIDUAL (tiny, documented): a stray written between C2's listing and these 2
+#         deletes — eliminated in practice by the M0a quiesce (no writer workflow can start) and
+#         excluded for already-running runs by C0.
+#     C4. assert repo scope holds none of the 14 and surface any stray by NAME. Only after this
+#         phase succeeds does the dispatch secrets-guard go green. POST-CLEANUP RUNBOOK: a stray
+#         appearing LATER (e.g. an old-snapshot run re-run after re-enable) trips the dispatch
+#         secrets-guard loudly; the remediation is direct admin deletion
+#         (`gh secret delete <NAME> -R jeswr/agent-account-registry`) — NOT a migration rerun
+#         (nothing is left to migrate, and by design the bootstrap repo copies are gone).
+#
+#   --phase resume-writers (the workflow's always() `reenable-writers` job, env-BOUND so its
+#     mint resolves in every reachable state — repo-scope bootstrap copies before the migration,
+#     environment copies after cleanup drains them; needs Actions RW ONLY): re-enable the four
+#     quiesced writer workflows. Tries ALL four before failing (one failure never leaves the
+#     rest disabled) and any failure names the manual remediation.
 #
 # Any other inconsistency is a hard fail with a distinct message. Secret VALUES are never echoed,
 # never traced, never placed in argv; only NAMES are printed.
@@ -58,13 +82,16 @@
 # `--self-test` / `self-test`: hermetic fake-`gh` PATH-shim suite (trust-gate.py precedent) —
 # fresh-main, cleanup from 2/1/0-remaining, converged reruns of both phases,
 # interrupted-after-partial-copy, interrupted-mid-deletion, set-verify-mismatch, repo-stray (both
-# phases), missing-input, in-flight-writer, listing-failure (both phases), env-missing-bootstrap,
-# and PER-ENDPOINT PERMISSION-model failures (run-list without actions:read; env-secret write
-# without environments:write) so an under-granted mint is caught by the harness, not production.
-# Exact argv sequences (env set via STDIN, no --body, and — load-bearing — ZERO bootstrap deletes
-# in the main phase) are asserted. The suite also STATICALLY pins the WORKFLOW's declared mint
-# grants (round-4 finding 3: the fake-gh model alone never noticed a permission line deleted
-# from migrate-secrets-to-env.yml): check_workflow_mint_contract asserts both mint steps'
+# phases — cleanup now deletes NOTHING on a stray), late-writer leftover at cleanup time,
+# missing-input, in-flight-writer, listing-failure (both phases), env-missing-bootstrap,
+# resume-writers (happy / one-enable-fails / under-granted), and PER-ENDPOINT PERMISSION-model
+# failures (workflow disable without actions:write — incl. the old actions:read-only mint shape;
+# env-secret write without environments:write) so an under-granted mint is caught by the
+# harness, not production. Exact argv sequences (4 disables BEFORE any set, env set via STDIN,
+# no --body, ZERO bootstrap deletes in the main phase, 4 enables in the always path) are
+# asserted. The suite also STATICALLY pins the WORKFLOW's declared mint grants (round-4 finding
+# 3: the fake-gh model alone never noticed a permission line deleted from
+# migrate-secrets-to-env.yml): check_workflow_mint_contract asserts all THREE mint steps'
 # exact phase-specific `permission-*` sets and goes red on any removal/weakening/widening.
 # Wired into pr-gate.yml and worker-live's FULL_SELFTEST_SUITE so it gates. When the migration
 # workflow is deleted after its successful run, delete this script too and unenrol it from BOTH
@@ -118,6 +145,19 @@ setup() {
   [[ "$ENV_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die 'SECRETS_ENV is unsafe (fail closed)'
 }
 
+# Quiesce (sol round-5 finding 1a): disable every writer workflow BEFORE the migration touches
+# anything, so no NEW writer run — including a `gh run rerun` of an old pre-env-binding snapshot
+# — can start mid-migration. Idempotent (disabling a disabled workflow succeeds). The always()
+# reenable-writers job undoes this via `--phase resume-writers` even when a phase fails.
+quiesce_writers() {
+  local wf
+  for wf in "${WRITER_WORKFLOWS[@]}"; do
+    gh workflow disable "$wf" -R "$REPO" \
+      || die "gh workflow disable ${wf} failed — cannot quiesce the secret writers, refusing before any listing or mutation (fail closed; NOTE: workflow disable needs the App token's Actions: write grant)"
+    printf 'quiesced (workflow disabled): %s\n' "$wf"
+  done
+}
+
 preflight_no_live_writers() {
   local wf status count
   for wf in "${WRITER_WORKFLOWS[@]}"; do
@@ -137,7 +177,9 @@ preflight_no_live_writers() {
 
 phase_main() {
   setup
-  echo '== phase M0: pre-flight — no live secret-writer runs =='
+  echo '== phase M0a: quiesce — disable the 4 secret-writer workflows (no NEW writer run can start mid-migration) =='
+  quiesce_writers
+  echo '== phase M0b: pre-flight — no ALREADY-RUNNING secret-writer runs (quiesce does not cancel in-flight runs) =='
   preflight_no_live_writers
 
   echo '== phase M1: list the environment secret names (resume state) =='
@@ -247,10 +289,36 @@ phase_cleanup() {
     || die 'environment does not hold all 14 — re-run the main phase first; no repo-scope deletion until it converges'
   printf 'all 14 present in %s (both bootstrap mint credentials verified)\n' "$ENV_NAME"
 
-  echo '== phase C2: delete whichever of the 2 bootstrap repo-scope secrets remain (2/1/0) =='
+  echo '== phase C2: EXACT-SET check — repo scope must hold ONLY (a subset of) the 2 bootstrap names BEFORE any deletion =='
+  # RECOVERABLE ORDERING (sol round-5 finding 1b): this check runs BEFORE either bootstrap
+  # delete. Any non-bootstrap name in the listing — however it got there (a late old-snapshot
+  # writer run, an unconverged main phase, an unrelated stray) — aborts the phase with ZERO
+  # deletions, so both bootstrap mint credentials survive and a fresh migration stays mintable
+  # and rerunnable once the stray is removed. The only residual window is a stray written
+  # between this listing and the 2 deletes in C3 — eliminated in practice by the M0a quiesce
+  # (no writer workflow can start) plus C0 (no already-running writer).
   local repo_names
   repo_names=$(_repo_names) \
     || die 'could not list repo-scope secrets — refusing to delete blind (fail closed)'
+  local stray=0 leftover=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if _in "$name" "${BOOTSTRAP_NAMES[@]}"; then
+      printf 'repo scope holds (expected; will delete): %s\n' "$name"
+    elif _in "$name" "${NONBOOTSTRAP_NAMES[@]}"; then
+      printf '::error::migrate-secrets: migrated non-bootstrap secret %s present at repo scope at cleanup time (a late writer run re-created it, or the main phase did not converge)\n' "$name" >&2
+      leftover=1
+    else
+      printf '::error::migrate-secrets: unexpected non-migrated repo-scope secret at cleanup time: %s\n' "$name" >&2
+      stray=1
+    fi
+  done <<<"$repo_names"
+  if [[ "$leftover" -ne 0 || "$stray" -ne 0 ]]; then
+    die 'repo scope is NOT exactly the bootstrap set — deleting NOTHING (both bootstrap mint credentials stay at repo scope, so the migration remains fully mintable + rerunnable): remove the stray (gh secret delete <NAME> -R <owner>/<repo>) or re-run the main phase for a migrated leftover, then re-run this cleanup phase'
+  fi
+  printf 'repo scope holds only (a subset of) the 2 bootstrap names — safe to delete\n'
+
+  echo '== phase C3: delete whichever of the 2 bootstrap repo-scope secrets remain (2/1/0) =='
   for name in "${BOOTSTRAP_NAMES[@]}"; do
     if _has_name "$name" "$repo_names"; then
       gh secret delete "$name" --repo "$REPO" \
@@ -261,10 +329,10 @@ phase_cleanup() {
     fi
   done
 
-  echo '== phase C3: assert repo scope holds none of the 14 (and surface any stray by NAME) =='
+  echo '== phase C4: assert repo scope holds none of the 14 (and surface any stray by NAME) =='
   repo_names=$(_repo_names) \
     || die 'could not list repo-scope secrets for the final assertion (fail closed)'
-  local stray=0 leftover=0
+  stray=0; leftover=0
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     if _in "$name" "${SECRET_NAMES[@]}"; then
@@ -277,8 +345,28 @@ phase_cleanup() {
   done <<<"$repo_names"
   [[ "$leftover" -eq 0 ]] || die 'repo scope still holds migrated names — re-run to converge'
   [[ "$stray" -eq 0 ]] \
-    || die 'both phases have converged for the 14, but the secrets-guard requires an EMPTY repo scope — move or remove the stray secret(s) named above, then dispatch recovers'
-  printf 'MIGRATION COMPLETE (both phases): all 14 live in %s and the repo scope holds none of them — the secrets-guard goes green now. Delete migrate-secrets-to-env.yml (and unenrol+delete this script).\n' "$ENV_NAME"
+    || die 'both phases have converged for the 14, but the secrets-guard requires an EMPTY repo scope — an admin deletes the stray secret(s) named above directly (gh secret delete <NAME> -R <owner>/<repo>); a migration rerun is NOT the remediation here (nothing is left to migrate)'
+  printf 'MIGRATION COMPLETE (both phases): all 14 live in %s and the repo scope holds none of them — the secrets-guard goes green now. Delete migrate-secrets-to-env.yml (and unenrol+delete this script). Any LATER repo-scope stray trips the secrets-guard loudly; remediation is direct admin deletion, not a migration rerun.\n' "$ENV_NAME"
+}
+
+# Re-enable the four quiesced writer workflows (the workflow's always() reenable-writers job).
+# Tries ALL four before failing so one failure never leaves the rest disabled; idempotent
+# (enabling an enabled workflow succeeds).
+phase_resume() {
+  setup
+  echo '== phase R: re-enable the 4 quiesced secret-writer workflows (always path) =='
+  local wf failures=0
+  for wf in "${WRITER_WORKFLOWS[@]}"; do
+    if gh workflow enable "$wf" -R "$REPO"; then
+      printf 're-enabled: %s\n' "$wf"
+    else
+      printf '::error::migrate-secrets: gh workflow enable %s failed — re-enable it manually: gh workflow enable %s -R %s (NOTE: workflow enable needs the App token'"'"'s Actions: write grant)\n' "$wf" "$wf" "$REPO" >&2
+      failures=1
+    fi
+  done
+  [[ "$failures" -eq 0 ]] \
+    || die 'one or more writer workflows are still DISABLED — re-enable them manually (gh workflow enable <file> -R <owner>/<repo>), then verify with gh workflow list'
+  printf 'all %d writer workflows re-enabled\n' "${#WRITER_WORKFLOWS[@]}"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -287,9 +375,13 @@ phase_cleanup() {
 # tied the WORKFLOW's declared mint grants to it — deleting both `permission-actions: read`
 # lines from migrate-secrets-to-env.yml still passed every scenario. This static assertion
 # (anchored awk over the stable two-space job indentation — the repo toolchain carries no
-# PyYAML) pins BOTH create-github-app-token steps' EXACT phase-specific grant sets:
-#   main job `migrate`:            secrets: write + environments: write + actions: read
+# PyYAML) pins ALL THREE create-github-app-token steps' EXACT phase-specific grant sets
+# (round-5 finding 1a moved the main mint's Actions grant read -> WRITE for the quiesce
+# `gh workflow disable`, and added the always() reenable job with an Actions-write-ONLY mint;
+# the cleanup mint stays at Actions read — it never disables/enables):
+#   main job `migrate`:            secrets: write + environments: write + actions: write
 #   job `cleanup-bootstrap`:       secrets: write + environments: read  + actions: read
+#   job `reenable-writers`:        actions: write ONLY (no secrets/environments power at all)
 # The comparison is against the FULL sorted set, so REMOVING, WEAKENING (write -> read), or
 # silently WIDENING any `permission-*` declaration goes red in --self-test (wired into
 # pr-gate.yml and worker-live's FULL_SELFTEST_SUITE). When the workflow is deleted after the
@@ -308,16 +400,22 @@ check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
     printf '::error::migrate-secrets: workflow contract: %s not found (delete this script together with the workflow)\n' "$wf" >&2
     return 1
   fi
-  want=$(printf 'permission-actions: read\npermission-environments: write\npermission-secrets: write')
+  want=$(printf 'permission-actions: write\npermission-environments: write\npermission-secrets: write')
   got=$(_mint_grants "$wf" migrate)
   if [[ "$got" != "$want" ]]; then
-    printf '::error::migrate-secrets: workflow contract violated — the MAIN mint (job migrate) must declare EXACTLY {permission-secrets: write, permission-environments: write, permission-actions: read}; found:\n%s\n' "${got:-<none>}" >&2
+    printf '::error::migrate-secrets: workflow contract violated — the MAIN mint (job migrate) must declare EXACTLY {permission-secrets: write, permission-environments: write, permission-actions: write (round-5 quiesce: gh workflow disable)}; found:\n%s\n' "${got:-<none>}" >&2
     rc=1
   fi
   want=$(printf 'permission-actions: read\npermission-environments: read\npermission-secrets: write')
   got=$(_mint_grants "$wf" cleanup-bootstrap)
   if [[ "$got" != "$want" ]]; then
     printf '::error::migrate-secrets: workflow contract violated — the CLEANUP mint (job cleanup-bootstrap) must declare EXACTLY {permission-secrets: write, permission-environments: read, permission-actions: read}; found:\n%s\n' "${got:-<none>}" >&2
+    rc=1
+  fi
+  want=$(printf 'permission-actions: write')
+  got=$(_mint_grants "$wf" reenable-writers)
+  if [[ "$got" != "$want" ]]; then
+    printf '::error::migrate-secrets: workflow contract violated — the RE-ENABLE mint (job reenable-writers) must declare EXACTLY {permission-actions: write} and NOTHING else (least privilege: it only runs gh workflow enable); found:\n%s\n' "${got:-<none>}" >&2
     rc=1
   fi
   return "$rc"
@@ -327,9 +425,10 @@ check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
 # Hermetic self-test: a fake `gh` on PATH (trust-gate.py precedent) records every argv line and
 # every STDIN payload, serves listings from a mutable state dir, and — new in review round 3 —
 # models PER-ENDPOINT fine-grained PERMISSIONS via an optional grants file (absent = fully
-# granted), so an under-granted App mint (e.g. no Actions: read for the pre-flight `gh run
-# list`, no Environments: write for the env-secret set) is caught by this harness instead of a
-# live 403. Fresh, resumed, cleanup-remaining, mismatched, stray, under-granted, and in-flight
+# granted), so an under-granted App mint (e.g. no Actions: write for the quiesce `gh workflow
+# disable` — including the old Actions: read-only mint shape — no Environments: write for the
+# env-secret set) is caught by this harness instead of a live 403. Fresh, resumed,
+# cleanup-remaining, mismatched, stray, late-writer, under-granted, resume-writers, and in-flight
 # states are all exercised end-to-end through CHILD invocations of this script, with exact call
 # sequences asserted — including the load-bearing "the main phase NEVER deletes a bootstrap
 # secret" argv invariant (the old single-phase design bricked on a cancellation after the
@@ -359,15 +458,25 @@ set -u
 state="$FAKE_GH_STATE"
 printf '%s\n' "$*" >> "$state/calls.log"
 # Fine-grained-permission model: a grants file lists the token's granted permissions one per
-# line (actions:read, secrets:read, secrets:write, environments:read, environments:write). An
-# ABSENT grants file means fully granted (the pre-round-3 scenarios). Each endpoint checks the
-# permission the REST docs put it under and answers a 403-shaped failure without it — so a
-# finding-1-class defect (a mint missing a load-bearing grant) turns a scenario red here.
+# line (actions:read, actions:write, secrets:read, secrets:write, environments:read,
+# environments:write). An ABSENT grants file means fully granted (the pre-round-3 scenarios).
+# Each endpoint checks the permission the REST docs put it under and answers a 403-shaped
+# failure without it — so a finding-1-class defect (a mint missing a load-bearing grant) turns
+# a scenario red here. Workflow disable/enable (the round-5 quiesce) sit under Actions: WRITE.
 _grant() {
   [[ ! -f "$state/grants" ]] && return 0
   grep -qxF -- "$1" "$state/grants"
 }
 case "$*" in
+  "workflow disable "*" -R o/r")
+    _grant actions:write \
+      || { echo "HTTP 403: Resource not accessible by integration (workflow disable needs Actions: write)" >&2; exit 1; }
+    exit 0 ;;
+  "workflow enable "*" -R o/r")
+    _grant actions:write \
+      || { echo "HTTP 403: Resource not accessible by integration (workflow enable needs Actions: write)" >&2; exit 1; }
+    [[ -f "$state/fail_enable_$3" ]] && exit 1
+    exit 0 ;;
   "run list -R o/r --workflow "*" --status "*" --json databaseId --jq length")
     _grant actions:read \
       || { echo "HTTP 403: Resource not accessible by integration (workflow-run listing needs Actions: read)" >&2; exit 1; }
@@ -447,6 +556,16 @@ FAKE
       printf 'run list -R o/r --workflow %s --status %s --json databaseId --jq length\n' "$wf" "$st" >> "$expected_preflight"
     done
   done
+  # The round-5 quiesce prefix: the main phase disables all 4 writer workflows BEFORE the
+  # pre-flight (disable-then-check is the race-free order: no NEW run can start after the
+  # disable, and the pre-flight then proves no already-running run remains).
+  local expected_quiesce="$tmp/expected-quiesce.log" expected_resume="$tmp/expected-resume.log"
+  : > "$expected_quiesce"
+  : > "$expected_resume"
+  for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
+    printf 'workflow disable %s -R o/r\n' "$wf" >> "$expected_quiesce"
+    printf 'workflow enable %s -R o/r\n' "$wf" >> "$expected_resume"
+  done
 
   # --- scenario 1: FRESH MAIN PHASE — env empty, repo holds all 14, no in-flight writers. Also
   # the exact argv-sequence assertion (env sets via STDIN with --env, verify listings, exactly
@@ -475,8 +594,13 @@ FAKE
     "$(grep -c -- '--body' "$s1/calls.log" || true)" 0
   chk "fresh main: no secret VALUE ever appears in argv" \
     "$(grep -c -- 'v-ACC' "$s1/calls.log" || true)" 0
+  chk "fresh main: exactly 4 workflow disables (the quiesce), each writer once" \
+    "$(grep -cE '^workflow disable ' "$s1/calls.log")" 4
+  chk "fresh main: EVERY workflow disable precedes the FIRST secret set (quiesce before mutation)" \
+    "$(awk '/^workflow disable /{last=NR} /^secret set /{if(!first)first=NR} END{print (last && first && last<first) ? "yes" : "no"}' "$s1/calls.log")" yes
   local expected="$tmp/expected-main.log"
-  cat "$expected_preflight" > "$expected"
+  cat "$expected_quiesce" > "$expected"
+  cat "$expected_preflight" >> "$expected"
   printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n' >> "$expected"
   for n in "${names[@]}"; do
     printf 'secret set %s --env dispatch-secrets --repo o/r\n' "$n" >> "$expected"
@@ -488,7 +612,7 @@ FAKE
     printf 'secret delete %s --repo o/r\n' "$n" >> "$expected"
   done
   printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n' >> "$expected"
-  chk "fresh main: EXACT gh argv sequence (preflight -> list -> set+verify x14 -> assert -> delete x12 NON-BOOTSTRAP ONLY -> assert)" \
+  chk "fresh main: EXACT gh argv sequence (quiesce x4 -> preflight -> list -> set+verify x14 -> assert -> delete x12 NON-BOOTSTRAP ONLY -> assert)" \
     "$(diff -q "$expected" "$s1/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
 
   # --- scenario 2: CLEANUP FROM 2-REMAINING — the state the main phase leaves. Exact argv
@@ -624,17 +748,43 @@ FAKE
   chk "extra env name (REGISTRY_SECRETS_PAT) is tolerated" \
     "$(grep -c 'REGISTRY_SECRETS_PAT' "$tmp/s10.out" || true)" 0
 
-  # --- scenario 11: REPO-SCOPE STRAY (cleanup) — bootstrap drained, stray surfaced, hard fail.
+  # --- scenario 11: REPO-SCOPE STRAY (cleanup) — round-5 finding 1b RECOVERABLE ORDERING: the
+  # exact-set check runs BEFORE any deletion, so a stray aborts the phase with ZERO deletions —
+  # both bootstrap mint credentials survive and the migration stays mintable + rerunnable after
+  # the stray is removed. (Pre-round-5 this scenario drained the bootstrap FIRST and only then
+  # failed on the stray — the unrecoverable state the review found.)
   local s11="$tmp/s11"
   mkdir -p "$s11"
   printf '%s\n' "${names[@]}" > "$s11/env_secrets"
   { printf '%s\n' "${bootstrap[@]}"; echo SOME_LEGACY_SECRET; } > "$s11/repo_secrets"
   rc=$(run_case "$s11" "$tmp/s11.out" cleanup-bootstrap none)
-  chk "cleanup repo stray -> hard fail" "$rc" 1
-  chk "cleanup repo stray: bootstrap still drained (cleanup itself converged)" \
-    "$(grep -cE '^secret delete REGISTRY_ADMIN_APP_(ID|KEY) ' "$s11/calls.log")" 2
-  chk "cleanup repo stray: the stray itself is NEVER deleted" \
-    "$(grep -c 'secret delete SOME_LEGACY_SECRET' "$s11/calls.log" || true)" 0
+  chk "cleanup repo stray -> hard fail BEFORE any deletion" "$rc" 1
+  chk "cleanup repo stray: ZERO deletions (bootstrap mint credentials preserved — recoverable)" \
+    "$(grep -cE '^secret delete ' "$s11/calls.log" || true)" 0
+  chk "cleanup repo stray: distinct deleting-NOTHING message with the admin runbook" \
+    "$(grep -c 'deleting NOTHING' "$tmp/s11.out")" 1
+  chk "cleanup repo stray: both bootstrap names STILL at repo scope (still fully mintable)" \
+    "$(sort "$s11/repo_secrets" | paste -sd' ' -)" \
+    "REGISTRY_ADMIN_APP_ID REGISTRY_ADMIN_APP_KEY SOME_LEGACY_SECRET"
+
+  # --- scenario 11b: LATE WRITER at cleanup time (the round-5 finding-1 race): a writer run
+  # that slipped in AFTER the main phase's pre-flight (e.g. an old-snapshot `gh run rerun`)
+  # re-created a MIGRATED non-bootstrap name at repo scope before cleanup's exact-set check.
+  # Cleanup must abort with ZERO bootstrap deletes — the previously-unrecoverable ordering
+  # deleted both mint credentials first and THEN discovered the stray.
+  local s11b="$tmp/s11b"
+  mkdir -p "$s11b"
+  printf '%s\n' "${names[@]}" > "$s11b/env_secrets"
+  { printf '%s\n' "${bootstrap[@]}"; echo ACCT02_TOKEN; } > "$s11b/repo_secrets"
+  rc=$(run_case "$s11b" "$tmp/s11b.out" cleanup-bootstrap none)
+  chk "late-writer leftover at cleanup -> hard fail BEFORE any deletion" "$rc" 1
+  chk "late-writer leftover: ZERO deletions (no bootstrap delete ever issued)" \
+    "$(grep -cE '^secret delete ' "$s11b/calls.log" || true)" 0
+  chk "late-writer leftover: distinct message names the late-writer cause" \
+    "$(grep -c 'a late writer run re-created it, or the main phase did not converge' "$tmp/s11b.out")" 1
+  chk "late-writer leftover: both bootstrap names STILL at repo scope (migration rerunnable)" \
+    "$(sort "$s11b/repo_secrets" | paste -sd' ' -)" \
+    "ACCT02_TOKEN REGISTRY_ADMIN_APP_ID REGISTRY_ADMIN_APP_KEY"
 
   # --- scenario 12: IN-FLIGHT WRITER — fail closed before ANY listing or mutation (main).
   local s12="$tmp/s12"
@@ -646,8 +796,8 @@ FAKE
   chk "in-flight writer -> fail closed" "$rc" 1
   chk "in-flight writer: distinct message names the workflow" \
     "$(grep -c '1 in_progress run(s) of worker.yml' "$tmp/s12.out")" 1
-  chk "in-flight writer: ONLY run-list calls issued (no listing, no mutation)" \
-    "$(grep -cvE '^run list ' "$s12/calls.log" || true)" 0
+  chk "in-flight writer: ONLY quiesce + run-list calls issued (no listing, no mutation)" \
+    "$(grep -cvE '^(workflow disable |run list )' "$s12/calls.log" || true)" 0
 
   # --- scenario 13: ENV LISTING FAILURE (main) — a dead listing is a refusal, never "empty env".
   local s13="$tmp/s13"
@@ -685,21 +835,35 @@ FAKE
   chk "env missing a bootstrap name: ZERO deletions" \
     "$(grep -cE '^secret delete ' "$s15/calls.log" || true)" 0
 
-  # --- scenario 16: PERMISSION MODEL — token WITHOUT actions:read (the finding-1 class): the
-  # pre-flight `gh run list` 403s and the run fails closed before any listing or mutation. This
-  # is exactly the defect the round-3 review found in the workflow's mint (secrets+environments
-  # only); with this scenario the harness catches any regression to an under-granted mint shape.
+  # --- scenario 16: PERMISSION MODEL — token WITHOUT any Actions grant: the quiesce's very
+  # first `gh workflow disable` 403s and the run fails closed before any listing or mutation.
   local s16="$tmp/s16"
   mkdir -p "$s16"
   printf '%s\n' "${names[@]}" > "$s16/repo_secrets"
   : > "$s16/env_secrets"
   printf 'secrets:read\nsecrets:write\nenvironments:read\nenvironments:write\n' > "$s16/grants"
   rc=$(run_case "$s16" "$tmp/s16.out" main all)
-  chk "no actions:read grant -> pre-flight fails closed" "$rc" 1
-  chk "no actions:read grant: distinct fail-closed message on the FIRST run-list" \
-    "$(grep -c 'could not list queued runs of worker.yml' "$tmp/s16.out")" 1
-  chk "no actions:read grant: zero listings, zero mutations (only the one denied run-list)" \
-    "$(grep -cvE '^run list ' "$s16/calls.log" || true)" 0
+  chk "no actions grant -> quiesce fails closed" "$rc" 1
+  chk "no actions grant: distinct fail-closed message on the FIRST workflow disable" \
+    "$(grep -c 'gh workflow disable worker.yml failed' "$tmp/s16.out")" 1
+  chk "no actions grant: zero listings, zero mutations (only the one denied disable)" \
+    "$(grep -cvE '^workflow disable ' "$s16/calls.log" || true)-$(grep -cE '^workflow disable ' "$s16/calls.log")" 0-1
+
+  # --- scenario 16b: PERMISSION MODEL — token with actions:READ only (the EXACT pre-round-5
+  # mint shape): quiesce needs Actions WRITE, so the old grant set now fails closed at the
+  # first disable, before any listing or mutation. This is the regression class the round-5
+  # contract change guards against end-to-end.
+  local s16b="$tmp/s16b"
+  mkdir -p "$s16b"
+  printf '%s\n' "${names[@]}" > "$s16b/repo_secrets"
+  : > "$s16b/env_secrets"
+  printf 'actions:read\nsecrets:read\nsecrets:write\nenvironments:read\nenvironments:write\n' > "$s16b/grants"
+  rc=$(run_case "$s16b" "$tmp/s16b.out" main all)
+  chk "actions:read-only grant (the pre-round-5 mint shape) -> quiesce fails closed" "$rc" 1
+  chk "actions:read-only grant: message names the Actions: write requirement" \
+    "$(grep -c 'needs the App token.s Actions: write grant' "$tmp/s16b.out")" 1
+  chk "actions:read-only grant: zero mutations" \
+    "$(grep -cE '^secret (set|delete) ' "$s16b/calls.log" || true)" 0
 
   # --- scenario 17: PERMISSION MODEL — token WITHOUT environments:write: the first env-secret
   # set 403s; hard fail with the repo scope untouched (no deletions ever reached).
@@ -707,7 +871,7 @@ FAKE
   mkdir -p "$s17"
   printf '%s\n' "${names[@]}" > "$s17/repo_secrets"
   : > "$s17/env_secrets"
-  printf 'actions:read\nsecrets:read\nsecrets:write\nenvironments:read\n' > "$s17/grants"
+  printf 'actions:read\nactions:write\nsecrets:read\nsecrets:write\nenvironments:read\n' > "$s17/grants"
   rc=$(run_case "$s17" "$tmp/s17.out" main all)
   chk "no environments:write grant -> env-secret set fails closed" "$rc" 1
   chk "no environments:write grant: distinct message names the grant" \
@@ -724,9 +888,17 @@ FAKE
   wf_real="$(dirname -- "$me")/../.github/workflows/migrate-secrets-to-env.yml"
   rc=0; check_workflow_mint_contract "$wf_real" > "$tmp/s18.out" 2>&1 || rc=$?
   chk "workflow mint contract holds on the real migrate-secrets-to-env.yml" "$rc" 0
-  grep -v 'permission-actions: read' "$wf_real" > "$wf_mut"   # strips BOTH actions:read mints
+  grep -v 'permission-actions: read' "$wf_real" > "$wf_mut"   # strips the cleanup mint's actions:read
   rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18b.out" 2>&1 || rc=$?
-  chk "contract goes RED when the permission-actions: read declarations are removed (the exact round-4 vacuity gap)" "$rc" 1
+  chk "contract goes RED when the cleanup permission-actions: read declaration is removed (the exact round-4 vacuity gap)" "$rc" 1
+  grep -v 'permission-actions: write' "$wf_real" > "$wf_mut"  # strips the migrate AND reenable actions:write mints
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18e.out" 2>&1 || rc=$?
+  chk "contract goes RED when the permission-actions: write declarations (round-5 quiesce/re-enable) are removed" "$rc" 1
+  chk "contract names BOTH under-granted mints when actions:write is stripped" \
+    "$(grep -c 'workflow contract violated' "$tmp/s18e.out")" 2
+  sed 's/permission-actions: write/permission-actions: read/' "$wf_real" > "$wf_mut"  # the pre-round-5 shape
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18f.out" 2>&1 || rc=$?
+  chk "contract goes RED when actions is WEAKENED write -> read (regression to the pre-quiesce mint shape)" "$rc" 1
   sed 's/permission-environments: write/permission-environments: read/' "$wf_real" > "$wf_mut"
   rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18c.out" 2>&1 || rc=$?
   chk "contract goes RED when the main-phase environments grant is WEAKENED to read" "$rc" 1
@@ -734,6 +906,37 @@ FAKE
     "$wf_real" > "$wf_mut"
   rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18d.out" 2>&1 || rc=$?
   chk "contract goes RED when an extra grant is silently WIDENED in (exact-set pin)" "$rc" 1
+
+  # --- scenario 19: RESUME-WRITERS happy path (the always() job after cleanup) — exactly the
+  # 4 enables, in the canonical writer order, and nothing else.
+  local s19="$tmp/s19"
+  mkdir -p "$s19"
+  rc=$(run_case "$s19" "$tmp/s19.out" resume-writers none)
+  chk "resume-writers succeeds" "$rc" 0
+  chk "resume-writers: EXACT gh argv sequence (4 enables, nothing else)" \
+    "$(diff -q "$expected_resume" "$s19/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
+
+  # --- scenario 20: RESUME-WRITERS with ONE enable failing — still ATTEMPTS all 4 (one failure
+  # must never leave the remaining writers disabled), then fails loud with the manual runbook.
+  local s20="$tmp/s20"
+  mkdir -p "$s20"
+  touch "$s20/fail_enable_review-fix.yml"
+  rc=$(run_case "$s20" "$tmp/s20.out" resume-writers none)
+  chk "resume-writers with one enable failing -> hard fail" "$rc" 1
+  chk "resume-writers with one enable failing: still attempts ALL 4 enables" \
+    "$(grep -cE '^workflow enable ' "$s20/calls.log")" 4
+  chk "resume-writers with one enable failing: names the manual remediation" \
+    "$(grep -c 'gh workflow enable review-fix.yml failed — re-enable it manually' "$tmp/s20.out")" 1
+
+  # --- scenario 21: PERMISSION MODEL — resume-writers without actions:write fails loud (the
+  # writers would silently stay disabled otherwise).
+  local s21="$tmp/s21"
+  mkdir -p "$s21"
+  printf 'actions:read\n' > "$s21/grants"
+  rc=$(run_case "$s21" "$tmp/s21.out" resume-writers none)
+  chk "resume-writers without actions:write -> hard fail" "$rc" 1
+  chk "resume-writers without actions:write: still attempts ALL 4 enables" \
+    "$(grep -cE '^workflow enable ' "$s21/calls.log")" 4
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'migrate-secrets self-test PASSED\n'
@@ -749,7 +952,8 @@ case "${1:-}" in
     case "${2:-}" in
       main) phase_main ;;
       cleanup-bootstrap) phase_cleanup ;;
-      *) die 'usage: migrate-secrets.sh --phase main|cleanup-bootstrap | --self-test' ;;
+      resume-writers) phase_resume ;;
+      *) die 'usage: migrate-secrets.sh --phase main|cleanup-bootstrap|resume-writers | --self-test' ;;
     esac ;;
-  *) die 'usage: migrate-secrets.sh --phase main|cleanup-bootstrap | --self-test' ;;
+  *) die 'usage: migrate-secrets.sh --phase main|cleanup-bootstrap|resume-writers | --self-test' ;;
 esac
