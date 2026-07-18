@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_open_blockers` only raises when the `state` key is absent and only records the blocker when `str(state).lower() == \"open\"`. Thus responses such as `{\"state\": null}`, `{\"state\": \"unknown\"}`, or any unexpected schema value fall through as if the referenced issue were confirmed closed, allowing dispatch without proving readiness. This contradicts the function's stated fail-closed contract and the requirement that every referenced issue be confirmed closed. The self-test covers a missing blocker response but not a present malformed state, so it does not catch this path.",
+   "file": "scripts/dispatch-claim.py",
+   "fix_hint": "Accept exactly a valid closed state as unblocked; treat `open` as blocked and raise `DispatchError` for every other value/type. Add a self-test where the blocker response has a present but invalid/null `state` and assert that `_current_issue_matches` raises rather than dispatches.",
+   "severity": "major",
+   "title": "Malformed blocker state is silently treated as closed"
+  }
+ ],
+ "progress": null,
+ "summary": "The new claim-side blocker revalidation has the right overall shape and its open/closed/epic/deferred tests are meaningful, but its live-state check is not actually fail-closed. Any present state value other than `open` is treated as proof that the blocker is closed, including null or malformed API data. Because this is a trust-plane admission check, CLAIM must positively prove `closed` before dispatching.",
+ "verdict": "request_changes"
+}
