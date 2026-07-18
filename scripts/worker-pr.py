@@ -1155,17 +1155,27 @@ def disarm(repo, pr_number, when):
                             _queue_disarm_mutation("disablePullRequestAutoMerge", node_id)
                             print("auto-merge disabled (GraphQL; the PR was queued)")
                     else:
-                        # Idempotent re-entry (2026-07-18 defer-loop): an interrupted disarm
-                        # leaves auto-merge already OFF; `gh pr merge --disable-auto` then
-                        # errors ("Can't disable auto-merge"), the partial-disarm failure
-                        # re-defers the review EVERY tick, and the PR strands. Same guard the
-                        # queued path already uses.
-                        if live.get("auto_merge") is not None:
+                        # Idempotent convergence on READ STALENESS (2026-07-18 defer-loop,
+                        # sol r1 on #234): the planning read can be stale/raced — auto-merge
+                        # may already be off by the time the mutation runs, and
+                        # `gh pr merge --disable-auto` then errors ("Can't disable
+                        # auto-merge"). On failure, RE-QUERY authoritative state: success is
+                        # accepted ONLY when a fresh read confirms auto-merge absent and the
+                        # PR not queued; anything else retains the structured failure.
+                        try:
                             _run_gh(["pr", "merge", str(pr_number), "-R", repo,
                                      "--disable-auto"])
                             print("auto-merge disabled (stale arm latch removed)")
-                        else:
-                            print("auto-merge already off (idempotent disarm re-entry)")
+                        except WorkerPrError:
+                            fresh = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+                            _, fresh_queued = _merge_queue_state(repo, pr_number)
+                            if (isinstance(fresh, dict)
+                                    and fresh.get("auto_merge") is None
+                                    and not fresh_queued):
+                                print("auto-merge freshly confirmed off "
+                                      "(idempotent disarm convergence)")
+                            else:
+                                raise
                 elif action == "redraft":
                     _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"])
                     print("pull request returned to draft for the review sweep")
@@ -1922,6 +1932,8 @@ def _self_test():
                 "id": "PR_node69",
                 "mergeQueueEntry": {"id": "MQE_1"} if net.get("queued") else None}}}}
         if path.startswith("repos/o/r/pulls/"):
+            if net.get("live_seq"):
+                return net["live_seq"].pop(0)
             return net["live"]
         if path.startswith("repos/o/r/commits?"):
             return net["commits"]
@@ -1934,6 +1946,11 @@ def _self_test():
         disarm_calls.append(" ".join(args))
         failing = net.get("fail_mutation", "")
         code = 1 if failing and any(failing in part for part in args) else 0
+        # Mirror production _run_gh: check=True (the default the REST disarm path uses)
+        # RAISES on failure — only the GraphQL wrappers inspect returncode themselves.
+        if code and _kwargs.get("check", True) and args[0] != "api":
+            raise WorkerPrError(
+                f"GitHub API request failed for {args[1] if len(args) > 1 else 'request'}")
         return argparse.Namespace(returncode=code, stdout="", stderr="")
 
     def run_disarm(base_ref="main", draft=False, armed=True, **overrides):
@@ -2001,6 +2018,37 @@ def _self_test():
                and "state:needs" in disarm_calls
                and f"rebind:{head_69}" not in disarm_calls), True)
         check("content change reports disarmed", fake_outputs.get("disarmed"), True)
+
+        # #234 sol r1: idempotent convergence must come from a FRESH re-read, not the stale
+        # planning dict. (a) mutation fails but the re-read confirms auto-merge off and not
+        # queued -> the disarm CONVERGES (safety actions run, no structured failure);
+        armed_live = None  # captured below from the standard fixture
+        run_disarm(compare=json.loads(json.dumps(evil)))
+        armed_live = json.loads(json.dumps(net["live"]))
+        unarmed_fresh = json.loads(json.dumps(armed_live)); unarmed_fresh["auto_merge"] = None
+        run_disarm(compare=json.loads(json.dumps(evil)), fail_mutation="--disable-auto",
+                   live_seq=[json.loads(json.dumps(armed_live)),
+                             json.loads(json.dumps(unarmed_fresh))])
+        check("stale-read disable-auto failure converges on a fresh confirmed-off read",
+              ("pr ready 41 -R o/r --undo" in disarm_calls,
+               fake_outputs.get("disarmed"), "disarm_error" in fake_outputs),
+              (True, True, False))
+        # (b) mutation fails and the fresh read STILL shows armed -> the structured failure
+        # is retained (never a silent success on unverified state).
+        try:
+            run_disarm(compare=json.loads(json.dumps(evil)),
+                       fail_mutation="--disable-auto",
+                       live_seq=[json.loads(json.dumps(armed_live)),
+                                 json.loads(json.dumps(armed_live))])
+        except WorkerPrError as exc:
+            check("genuine disable-auto failure retains the structured error",
+                  str(exc).startswith("disarm o/r#41:") and "disable-auto" in str(exc), True)
+        else:
+            check("genuine disable-auto failure retains the structured error",
+                  "no error", "raised")
+        check("genuine failure records the skippable output row",
+              (fake_outputs.get("disarmed"), bool(fake_outputs.get("disarm_error"))),
+              (False, True))
 
         # Issue #81 finding 1 (red if the compare base reverts to the repo default branch):
         # the PR targets a non-default base. The default-branch compares fingerprint
