@@ -1068,9 +1068,13 @@ def _resolvable_chain(chain, routing):
 
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
-                           ledger_root=""):
+                           defer_reasons, ledger_root=""):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
-    that item (per-item resilience, like the issue loop)."""
+    that item (per-item resilience, like the issue loop). `defer_reasons` is the tick's SHARED
+    histogram: allocator lease errors here must fold into the same `lease-error` counter the
+    issue loop uses, because _ledger_health/_ledger_rot_zeroed_dispatch (issue #28) read that
+    counter — an all-review/fix tick whose claims all errored would otherwise report ledger=ok
+    and dodge the zero-dispatch fail-loud."""
     launched = 0
     script_dir = Path(__file__).resolve().parent
     max_rounds = int(policy.get("max_review_rounds", 3))
@@ -1374,6 +1378,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 margin=margin,
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            defer_reasons["lease-error"] += 1
             print(f"defer review {repo}#{number}: lease allocation errored ({exc}); skipped")
             continue
         if claim is None:
@@ -1781,7 +1786,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 repo_review_items, repo, policy, routing, allocator, worker_pr,
                 registry_repo, registry_root, workflow_ref, bot_login, usage,
                 float(policy.get("usage_safety_margin", 0.10)),
-                ledger_root=ledger_root)
+                defer_reasons, ledger_root=ledger_root)
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
 
     # Final summary (registry #28/#32): overwrite the early claim-start write with the real
@@ -2460,10 +2465,13 @@ def _self_test():
 
     def run_items(items, allocator=None, routing=None):
         helper_calls.clear()
-        _dispatch_review_items(items, repo, {"max_review_rounds": 3, "account_pool": []},
-                               routing or {}, allocator, wiring_worker_pr, "reg/repo",
-                               wiring_root, "main", bot, None, 0.10,
-                               ledger_root=wiring_ledger_root)
+        reasons = Counter()
+        launched = _dispatch_review_items(
+            items, repo, {"max_review_rounds": 3, "account_pool": []},
+            routing or {}, allocator, wiring_worker_pr, "reg/repo",
+            wiring_root, "main", bot, None, 0.10, reasons,
+            ledger_root=wiring_ledger_root)
+        return launched, reasons
 
     ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
                "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
@@ -2725,8 +2733,29 @@ def _self_test():
                         check_runs=gate_green, issue_labels=["area:crate-a"])
             write_verdict(2, None, root=wiring_ledger_root)
             alloc = FakeAllocator()
-            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+            # a deferring (None-claim) allocator is contention, NOT ledger rot: no lease-error,
+            # ledger stays ok, and the zero-dispatch tick stays green
+            assert launched == 0 and reasons["lease-error"] == 0, (launched, reasons)
+            assert _ledger_health(reasons) == "ok", reasons
+            assert _ledger_rot_zeroed_dispatch(launched, reasons) is False
+
+            # ---- review/fix lease-error propagation (PR #258 review defect): an allocator
+            # that RAISES inside the review/fix loop must land in the tick's SHARED
+            # lease-error counter — dispatch() feeds this same histogram to _ledger_health
+            # (summary `ledger` field) and _ledger_rot_zeroed_dispatch (the fail-loud raise),
+            # so an all-review/fix frontier whose every claim errored now reports
+            # ledger=error and fails the run instead of masquerading as an empty frontier ----
+            class RaisingAllocator:
+                def claim(self, *_args, **_kwargs):
+                    raise RuntimeError("ledger CAS failed")
+
+            launched, reasons = run_items([fix_item], allocator=RaisingAllocator(),
+                                          routing=routing_ok)
+            assert launched == 0 and reasons["lease-error"] == 1, (launched, reasons)
+            assert _ledger_health(reasons) == "error", reasons
+            assert _ledger_rot_zeroed_dispatch(launched, reasons) is True
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io
