@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`BridgeLedger::refresh` collapses `static_baseline: None` and `Some(empty)` with `unwrap_or_default()`, while `reset_auth_view` decides whether to preserve the marker solely from the auth graph's current presence. In a store that never ran static materialization but did materialize an ODRL grant, the auth graph exists. When that ledger entry later becomes invalid, refresh calls `reset_auth_view` with empty terms and preserves an empty graph, even though `static_baseline` is still `None`. After replay emits nothing, `decide` therefore reports `Resolved` rather than the documented `Unloaded` state for a never-statically-materialized store. The added `refresh_does_not_invent_the_materialized_marker` test is insufficient because it refreshes a fresh store before any bridged grant has created the graph.",
+   "file": "crates/sparq-solid/src/odrl_bridge.rs",
+   "fix_hint": "Preserve the empty auth graph only when a static baseline was actually captured. Keep the `Option` distinction in `refresh` (for example, pass an explicit `preserve_empty_marker = self.static_baseline.is_some()` to the reset helper), and add a regression test that starts without static materialization, bridges a grant, updates/retracts it so replay emits nothing, refreshes, and asserts the final status remains `Unloaded`.",
+   "severity": "major",
+   "title": "Reset invents a materialized marker after bridged-only grant retraction"
+  }
+ ],
+ "progress": null,
+ "summary": "The fix correctly preserves an empty auth graph after static materialization, but it also preserves that graph in a bridged-only store whose static baseline was never materialized. That changes the documented refresh contract and misclassifies a retracted bridged-only grant as a definitive Resolved deny instead of Unloaded. The new bare-refresh test does not exercise this case because no auth graph exists yet.",
+ "verdict": "request_changes"
+}
