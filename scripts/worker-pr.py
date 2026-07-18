@@ -1241,7 +1241,12 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     if reviewed_base and live_base != reviewed_base:
         # Base retarget changes the EFFECTIVE diff without moving the head, and
         # --match-head-commit cannot see it (sol r5 on #257) — the approval bound a
-        # different comparison; re-review against the new base.
+        # different comparison; re-review against the new base. RESIDUAL RISK, DOCUMENTED
+        # (sol r7): GitHub exposes no base-CAS primitive, so a retarget in the window
+        # between this check and the merge latch cannot be excluded mechanically; the
+        # actor able to retarget is a write+ collaborator (already inside the trust
+        # boundary), resolution REJECTS non-default-base PRs outright, and this pre-arm
+        # check plus the head CAS bound everything GitHub's API allows us to bind.
         set_review_state(repo, pr_number, "needs")
         _write_outputs({"armed": False, "head_moved": True, "base_moved": True})
         print("live base ref differs from the reviewed base; returned to review:needs")
@@ -1291,19 +1296,6 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
                        "restored; a human must re-arm or re-draft this PR",
                        issue=issue, alert_repo=alert_repo, alert_token=alert_token)
             raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated")
-    if arm and reviewed_base:
-        # Post-arm base re-verification (sol r6): --match-head-commit CAS covers only the
-        # head; a retarget DURING audit/ready/arm changes the effective diff. A fresh read
-        # after the latch either confirms the binding or the latch is retracted.
-        confirm = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
-        if str((confirm.get("base") or {}).get("ref", "")) != reviewed_base:
-            _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--disable-auto"],
-                    check=False)
-            _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
-            set_review_state(repo, pr_number, "needs")
-            _write_outputs({"armed": False, "head_moved": True, "base_moved": True})
-            print("base retargeted during arm; latch retracted, returned to review:needs")
-            return
     set_review_state(repo, pr_number, "pass")
     if issue:
         # Deferred issue completion (locked decision 16): complete only on arm, not on publish.

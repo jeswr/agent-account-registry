@@ -1349,7 +1349,10 @@ jobs:
       # everything before it is re-derivable, so a crash anywhere above re-converges via the
       # sweep instead of permanently skipping an unfinished PR.
       - name: Bind the reviewed sha (terminal marker for this head)
-        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && (steps.outcome.outputs.decision != 'arm' || steps.arm.outcome == 'success') }}
+        # sol r7 on #257: step SUCCESS is not enough — the head/base-race paths exit 0 with
+        # armed=false after setting review:needs, and binding reviewed-sha there wedges the
+        # sweep into skipping the pending re-review. Key on the armed OUTPUT.
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.armed == 'true')) }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
         run: |
