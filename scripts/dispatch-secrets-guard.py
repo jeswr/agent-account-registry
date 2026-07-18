@@ -33,15 +33,26 @@
 # verification. The self-test statically parses .github/workflows/dispatch.yml and asserts the
 # guard job's permission map stays exactly {actions: read, contents: read}.
 #
-# SET-UP-ACCOUNT SLOT-UNION CONTRACT (sol round 6 on the #275 PR, finding 3): post-#101 the
-# ACCTNN_TOKEN secrets live in the dispatch-secrets ENVIRONMENT, and set-up-account.yml's store
-# step derives its slot-allocation union BEFORE creating the IRREVERSIBLE acct-claims ref. That
-# union is pure workflow-shell (no script seam), so this guard's self-test statically asserts —
-# same pattern as the dispatch.yml permission pin — that the store step enumerates ALL FOUR
-# paginated listings (claim refs, acctNN issues in any state, repo-scope secrets, AND the
-# dispatch-secrets environment secrets); dropping the env listing would make an env-only token
-# invisible and permanently burn the claimed slot. set-up-account.yml ships in the guard job's
-# sparse checkout so the assertion also runs live every tick.
+# SET-UP-ACCOUNT SLOT-UNION CONTRACT (sol round 6 on the #275 PR, finding 3; STRENGTHENED in
+# round 8 after sol mutation-tested it in round 7): post-#101 the ACCTNN_TOKEN secrets live in
+# the dispatch-secrets ENVIRONMENT, and set-up-account.yml's store step derives its
+# slot-allocation union BEFORE creating the IRREVERSIBLE acct-claims ref. That union is pure
+# workflow-shell (no script seam), so this guard's self-test statically asserts — same pattern
+# as the dispatch.yml permission pin — that the store step:
+#   (presence)      enumerates ALL FOUR paginated listings (claim refs, acctNN issues in any
+#                   state, repo-scope secrets, AND the dispatch-secrets environment secrets);
+#   (ordering)      issues every one of them textually BEFORE the `git/refs` claim mutation —
+#                   sol's round-7 mutation moved the env listing AFTER the claim and the old
+#                   presence-only check still passed, though a post-claim listing cannot stop
+#                   a burned slot;
+#   (participation) captures each listing into a variable that FLOWS INTO the `taken=$(...)`
+#                   union the claimed slot is computed from — sol's other round-7 mutation
+#                   dropped "$env_secret_nums" from the union while the listing still ran,
+#                   leaving the env scope enumerated but IGNORED (a dead listing), and the old
+#                   check still passed.
+# Dropping the env listing (or breaking either property) would make an env-only token invisible
+# and permanently burn the claimed slot. set-up-account.yml ships in the guard job's sparse
+# checkout so the assertion also runs live every tick.
 #
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
@@ -145,15 +156,27 @@ SETUP_ACCOUNT_UNION_REQUIRED = (
     f"environments/{ENVIRONMENT}/secrets?per_page=100",
 )
 
+# A paginated listing captured into a shell variable: `[if !] VAR=$([GH_TOKEN=...] gh api
+# --paginate "repos/${{ github.repository }}/<path>"...`. Group 1 = the variable, group 2 = the
+# API path. Narrow on purpose (see setup_account_store_step_lines).
+SETUP_ACCOUNT_LISTING_RE = re.compile(
+    r'(?:if\s+!\s+)?([A-Za-z_][A-Za-z0-9_]*)=\$\(\s*(?:GH_TOKEN="\$REGISTRY_PAT"\s+)?'
+    r'gh api --paginate "repos/\$\{\{ github\.repository \}\}/([^"]+)"')
+# The irreversible claim mutation: the `git/refs` ref-creation POST (distinct from the
+# read-only `git/matching-refs/acct-claims/` listing, whose path never equals `git/refs`).
+SETUP_ACCOUNT_CLAIM_RE = re.compile(
+    r'gh api\s+"repos/\$\{\{ github\.repository \}\}/git/refs"')
+# The union the claimed slot is computed from.
+SETUP_ACCOUNT_UNION_RE = re.compile(r'\btaken=\$\(')
 
-def setup_account_store_union_paths(workflow_text):
-    """Pure: extract the `gh api --paginate` API paths the set-up-account store step (`id:
-    store`) issues, or None when the step cannot be located (callers treat None as a failure —
-    fail closed). The union is pure workflow-shell — there is no script seam to unit-test — so,
-    exactly like `workflow_guard_permissions` above, this is a deliberately NARROW,
-    dependency-free line parser over the one step this repo controls, not a general YAML
-    reader; reshaping the step out of recognition goes red in the self-test rather than
-    silently passing."""
+
+def setup_account_store_step_lines(workflow_text):
+    """Pure: the lines of the set-up-account store step (`id: store`), or None when the step
+    cannot be located (callers treat None as a failure — fail closed). The union is pure
+    workflow-shell — there is no script seam to unit-test — so, exactly like
+    `workflow_guard_permissions` above, this is a deliberately NARROW, dependency-free line
+    parser over the one step this repo controls, not a general YAML reader; reshaping the step
+    out of recognition goes red in the self-test rather than silently passing."""
     lines = workflow_text.splitlines()
     start = None
     for index, line in enumerate(lines):
@@ -162,28 +185,70 @@ def setup_account_store_union_paths(workflow_text):
             break
     if start is None:
         return None
-    paths = []
+    step = []
     for line in lines[start + 1:]:
         if line.startswith("      - name:"):
             break  # dedented into the next step
-        paths.extend(re.findall(
-            r'gh api --paginate "repos/\$\{\{ github\.repository \}\}/([^"]+)"', line))
-    return paths
+        step.append(line)
+    return step
 
 
-def setup_account_union_verdict(paths):
-    """Pure: (ok, reason). The store step's pre-claim union must enumerate EVERY required
+def setup_account_union_verdict(step_lines):
+    """Pure: (ok, reason). The store step's pre-claim union must (a) enumerate EVERY required
     listing (claim refs, acctNN issues in any state, and ACCTNN_TOKEN secret names at BOTH the
-    repository scope and the dispatch-secrets environment), each via `gh api --paginate`.
-    A missing store step or any absent listing is a refusal naming what is missing."""
-    if paths is None:
+    repository scope and the dispatch-secrets environment), each via `gh api --paginate`;
+    (b) ORDERING (round 8): issue each listing textually BEFORE the irreversible `git/refs`
+    claim mutation — a post-claim listing cannot stop a burned slot; and (c) PARTICIPATION
+    (round 8): capture each listing into a variable that appears in the `taken=$(...)` union
+    the claimed slot is computed from — a listing whose variable never reaches the union is
+    DEAD and its slots invisible. A missing store step, claim mutation, or union construction
+    is a refusal (fail closed); every refusal names what is missing."""
+    if step_lines is None:
         return False, "store step (`id: store`) not found in set-up-account.yml (fail closed)"
-    missing = sorted(set(SETUP_ACCOUNT_UNION_REQUIRED) - set(paths))
+    listings = {}  # path -> (variable, first line index)
+    claim_index = None
+    union_index = None
+    union_text = None
+    for index, line in enumerate(step_lines):
+        for match in SETUP_ACCOUNT_LISTING_RE.finditer(line):
+            listings.setdefault(match.group(2), (match.group(1), index))
+        if claim_index is None and SETUP_ACCOUNT_CLAIM_RE.search(line):
+            claim_index = index
+        if union_index is None and SETUP_ACCOUNT_UNION_RE.search(line):
+            union_index = index
+            # Join shell continuation lines so participation sees the whole command.
+            parts = [line.rstrip()]
+            follow = index
+            while parts[-1].endswith("\\") and follow + 1 < len(step_lines):
+                follow += 1
+                parts.append(step_lines[follow].rstrip())
+            union_text = " ".join(part.rstrip("\\").strip() for part in parts)
+    if claim_index is None:
+        return False, ("irreversible claim mutation (the `git/refs` creation) not found in "
+                       "the store step — cannot prove the union precedes it (fail closed)")
+    if union_text is None:
+        return False, ("slot-union construction (`taken=$(`) not found in the store step — "
+                       "cannot prove the listings flow into the claimed slot (fail closed)")
+    missing = sorted(set(SETUP_ACCOUNT_UNION_REQUIRED) - set(listings))
     if missing:
         return False, ("pre-claim slot union is missing paginated listing(s): "
                        + ", ".join(missing)
                        + " — an unseen slot is silently treated as free and the irreversible "
                        "acct-claims ref burns it")
+    if union_index >= claim_index:
+        return False, ("the `taken` union is computed AFTER the irreversible `git/refs` claim "
+                       "creation — the claimed slot cannot have depended on it (fail closed)")
+    for path in SETUP_ACCOUNT_UNION_REQUIRED:
+        variable, index = listings[path]
+        if index >= claim_index:
+            return False, (f"listing `{path}` (captured into ${variable}) appears AFTER the "
+                           "irreversible `git/refs` claim creation — a post-claim listing "
+                           "cannot stop a burned slot; every listing must run BEFORE the claim")
+        if (f'"${variable}"' not in union_text
+                and f'"${{{variable}}}"' not in union_text):
+            return False, (f"listing `{path}` is captured into ${variable} but ${variable} "
+                           "does not flow into the `taken` union construction — the listing "
+                           "is DEAD and every slot it sees stays invisible to the claim")
     return True, "ok"
 
 
@@ -299,52 +364,79 @@ def _self_test():
     chk("workflow: guard job grants exactly {actions: read, contents: read}",
         live_permissions, {"actions": "read", "contents": "read"})
 
-    # Static set-up-account slot-union contract (sol round 6 on the #275 PR, finding 3). The
-    # broker's pre-claim union is pure workflow-shell (no script seam), so — following the
-    # dispatch.yml permission pin above and migrate-secrets.sh's workflow mint contract — it is
-    # asserted statically over the workflow text: dropping ANY of the four paginated listings
-    # (claim refs / acctNN issues / repo-scope secrets / dispatch-secrets ENV secrets) goes red
+    # Static set-up-account slot-union contract (sol round 6 on the #275 PR, finding 3;
+    # strengthened round 8 with the ORDERING + PARTICIPATION properties after sol
+    # mutation-tested the presence-only version in round 7). The broker's pre-claim union is
+    # pure workflow-shell (no script seam), so — following the dispatch.yml permission pin
+    # above and migrate-secrets.sh's workflow mint contract — it is asserted statically over
+    # the workflow text: dropping ANY of the four paginated listings, moving one AFTER the
+    # `git/refs` claim creation, or severing one's variable from the `taken` union goes red
     # here. set-up-account.yml ships in the guard job's sparse checkout so this also runs live
     # every tick.
-    union_sample = "\n".join([
+    store_step_sample = [
         "      - name: Claim slot atomically",
         "        id: store",
         "        run: |",
-        '          claim_nums=$(gh api --paginate "repos/${{ github.repository }}/git/matching-refs/acct-claims/" \\',
-        "                 --jq '.[].ref')",
+        '          if ! claim_nums=$(gh api --paginate "repos/${{ github.repository }}/git/matching-refs/acct-claims/" \\',
+        "                 --jq '.[].ref'); then exit 1; fi",
         '          issue_nums=$(gh api --paginate "repos/${{ github.repository }}/issues?state=all&per_page=100" --jq .)',
-        '          secret_nums=$(gh api --paginate "repos/${{ github.repository }}/actions/secrets?per_page=100" --jq .)',
+        '          secret_nums=$(GH_TOKEN="$REGISTRY_PAT" gh api --paginate "repos/${{ github.repository }}/actions/secrets?per_page=100" --jq .)',
         '          env_secret_nums=$(gh api --paginate "repos/${{ github.repository }}/environments/dispatch-secrets/secrets?per_page=100" --jq .)',
+        "          taken=$(printf '%s\\n%s\\n%s\\n%s\\n' \"$claim_nums\" \"$issue_nums\" \"$secret_nums\" \"$env_secret_nums\" \\",
+        "                    | jq -Rn '[inputs | tonumber]')",
+        '          out=$(gh api "repos/${{ github.repository }}/git/refs" \\',
+        '                  -f ref="refs/acct-claims/$cand" -f sha="$GITHUB_SHA")',
         "      - name: Validate the registration",
         '        run: gh api --paginate "repos/${{ github.repository }}/not/part/of/the/store/step"',
-    ])
-    chk("setup-account parse: extracts exactly the store step's paginated paths (next step ignored)",
-        setup_account_store_union_paths(union_sample),
-        ["git/matching-refs/acct-claims/", "issues?state=all&per_page=100",
-         "actions/secrets?per_page=100",
-         "environments/dispatch-secrets/secrets?per_page=100"])
-    chk("setup-account union: all four listings present -> ok",
-        setup_account_union_verdict(setup_account_store_union_paths(union_sample)),
+    ]
+    union_sample = "\n".join(store_step_sample)
+    chk("setup-account union: four listings before the claim, all flowing into taken -> ok",
+        setup_account_union_verdict(setup_account_store_step_lines(union_sample)),
         (True, "ok"))
-    dropped_env = "\n".join(line for line in union_sample.splitlines()
-                            if "environments/dispatch-secrets/secrets" not in line)
-    verdict_dropped = setup_account_union_verdict(setup_account_store_union_paths(dropped_env))
+    dropped_env = "\n".join(line for line in store_step_sample
+                            if "environments/dispatch-secrets/secrets?" not in line)
+    verdict_dropped = setup_account_union_verdict(setup_account_store_step_lines(dropped_env))
     chk("setup-account union: env-secret listing dropped -> refuse, missing path NAMED",
         (verdict_dropped[0],
          "environments/dispatch-secrets/secrets?per_page=100" in verdict_dropped[1]),
         (False, True))
+    # sol round-7 mutation A (PARTICIPATION): the env listing still RUNS but its variable is
+    # severed from the union — a dead listing whose slots stay invisible to the claim.
+    dead_env = union_sample.replace(' "$env_secret_nums"', "", 1)
+    verdict_dead = setup_account_union_verdict(setup_account_store_step_lines(dead_env))
+    chk("setup-account union: sol mutation A ($env_secret_nums dropped from taken) -> refuse, DEAD listing named",
+        (verdict_dead[0], "$env_secret_nums" in verdict_dead[1],
+         "does not flow into" in verdict_dead[1]),
+        (False, True, True))
+    # sol round-7 mutation B (ORDERING): the env listing is moved AFTER the claim creation —
+    # too late to stop a burned slot.
+    reordered = list(store_step_sample)
+    env_listing_line = reordered.pop(7)
+    reordered.insert(11, env_listing_line)  # after the two claim-creation lines
+    verdict_reordered = setup_account_union_verdict(
+        setup_account_store_step_lines("\n".join(reordered)))
+    chk("setup-account union: sol mutation B (env listing AFTER the claim) -> refuse, ordering named",
+        (verdict_reordered[0], "AFTER the irreversible `git/refs` claim" in verdict_reordered[1]),
+        (False, True))
     chk("setup-account union: missing store step -> refuse (fail closed)",
-        setup_account_union_verdict(setup_account_store_union_paths("jobs:\n  login:\n"))[0],
+        setup_account_union_verdict(setup_account_store_step_lines("jobs:\n  login:\n"))[0],
         False)
+    no_claim = "\n".join(line for line in store_step_sample if "/git/refs\"" not in line)
+    chk("setup-account union: missing claim mutation -> refuse (cannot prove ordering, fail closed)",
+        setup_account_union_verdict(setup_account_store_step_lines(no_claim))[0], False)
+    no_union = "\n".join(line for line in store_step_sample if "taken=$(" not in line)
+    chk("setup-account union: missing taken construction -> refuse (cannot prove participation, fail closed)",
+        setup_account_union_verdict(setup_account_store_step_lines(no_union))[0], False)
     setup_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               os.pardir, ".github", "workflows", "set-up-account.yml")
     try:
         with open(setup_path, encoding="utf-8") as handle:
             live_union_verdict = setup_account_union_verdict(
-                setup_account_store_union_paths(handle.read()))
+                setup_account_store_step_lines(handle.read()))
     except OSError:
         live_union_verdict = (False, "set-up-account.yml unreadable (fail closed)")
-    chk("workflow: set-up-account pre-claim union enumerates BOTH secret scopes + claims + issues, all paginated",
+    chk("workflow: set-up-account pre-claim union enumerates BOTH secret scopes + claims + issues, "
+        "all paginated, all BEFORE the claim, all flowing into taken",
         live_union_verdict, (True, "ok"))
 
     # Pure scope verdict — accept AND reject directions.
