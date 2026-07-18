@@ -31,16 +31,6 @@
    "expires_at": 1784396246
   },
   {
-   "account": "acct2css",
-   "claim_id": "b72288364b074e78be206ce9e2fcd0c0",
-   "holder": "review:sparq-org/sparq#3437@dispatch-29652321272.1",
-   "package": "sparq-vectors",
-   "role": "review",
-   "model": "opus",
-   "issued_at": 1784392833,
-   "expires_at": 1784394033
-  },
-  {
    "account": "acct06",
    "claim_id": "09ad9ae33eb74b189f43742c519b1cba",
    "holder": "fix:sparq-org/sparq#3478@dispatch-29652321272.1",
