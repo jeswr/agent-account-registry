@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The change remains correct and fail-closed: absent or malformed probe outcomes normalize to unknown, unmeasured catalog accounts cannot appear available and are excluded from eligible capacity, and the explicit workflow marker distinguishes successful from failed probes. The self-tests are non-vacuous and directly assert degraded availability, zero eligible capacity, surfaced failure state, and rejection of malformed markers. The dashboard exposes both failed probe state and stale generation warnings without weakening trust checks or expanding untrusted content into execution. No blocker, major, or other actionable diff-scoped issue is supported. Round 2 is materially unchanged from the prior approved round with no findings, so progress is stagnant under the required scale.",
+ "verdict": "approve"
+}
