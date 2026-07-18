@@ -95,6 +95,14 @@
    "model_alias": "terra",
    "exit_class": "success",
    "run_id": "29623129350.1"
+  },
+  {
+   "ts": 1784334596,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "success",
+   "run_id": "29623069443.1"
   }
  ]
 }
