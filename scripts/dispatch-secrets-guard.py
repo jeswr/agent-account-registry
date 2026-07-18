@@ -26,6 +26,13 @@
 # the known default-allow state. Read-only by construction — every gh call is a bare `gh api`
 # GET; the self-test asserts no mutation flag ever appears in the argv.
 #
+# LIVE AUTHORIZATION DEPENDENCY (review round 2 on the #101 PR): the environment and
+# deployment-branch-policy GETs require `actions: read` on the guard job's fine-grained
+# GITHUB_TOKEN. The job declares an explicit permissions map (unlisted permissions become none),
+# so dropping that grant would make BOTH reads fail on every tick — a permanent denial, not a
+# verification. The self-test statically parses .github/workflows/dispatch.yml and asserts the
+# guard job's permission map stays exactly {actions: read, contents: read}.
+#
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
 import json
@@ -81,6 +88,37 @@ def branch_policy_verdict(environment_doc, policies_doc, default_branch):
         return False, (f"policy names {names!r} must be exactly [{default_branch!r}] "
                        "(the default branch, nothing else)")
     return True, "ok"
+
+
+def workflow_guard_permissions(workflow_text):
+    """Pure: extract the secrets-guard job's `permissions:` map from dispatch.yml text, or None
+    when it cannot be located unambiguously (callers treat None as a failure — fail closed).
+    Deliberately dependency-free — the live runner image and the gate host need not share a
+    PyYAML install — so this is a NARROW line parser over the two-space-indented block this
+    repo controls, not a general YAML reader; reshaping the job that confuses it goes red in
+    the self-test rather than silently passing."""
+    lines = workflow_text.splitlines()
+    try:
+        start = lines.index("  secrets-guard:")
+    except ValueError:
+        return None
+    permissions = None
+    for line in lines[start + 1:]:
+        stripped = line.split("#", 1)[0].rstrip()
+        if not stripped:
+            continue
+        if not line.startswith("    "):
+            break  # dedented out of the secrets-guard job
+        if stripped == "    permissions:":
+            permissions = {}
+            continue
+        if permissions is not None:
+            if line.startswith("      ") and ":" in stripped:
+                key, _, value = stripped.strip().partition(":")
+                permissions[key.strip()] = value.strip()
+                continue
+            break  # end of the permissions mapping
+    return permissions
 
 
 def _api(path):
@@ -152,6 +190,48 @@ def _self_test():
         good = got == want
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got} (want {want})")
+
+    # Pure workflow-permission extraction — accept AND reject directions on synthetic text.
+    sample = "\n".join([
+        "jobs:",
+        "  plan:",
+        "    permissions:",
+        "      contents: read",
+        "  secrets-guard:",
+        "    permissions:",
+        "      # actions:read is load-bearing",
+        "      actions: read",
+        "      contents: read  # sparse checkout",
+        "    steps:",
+        "      - run: true",
+        "  claim:",
+        "    permissions:",
+        "      actions: write",
+    ])
+    chk("workflow parse: extracts the guard job's map (comments stripped, other jobs ignored)",
+        workflow_guard_permissions(sample), {"actions": "read", "contents": "read"})
+    chk("workflow parse: missing guard job -> None (fail closed)",
+        workflow_guard_permissions("jobs:\n  plan:\n    permissions:\n      contents: read"),
+        None)
+    chk("workflow parse: guard job without a permissions map -> None (fail closed)",
+        workflow_guard_permissions("jobs:\n  secrets-guard:\n    steps:\n      - run: true"),
+        None)
+
+    # Static workflow-permission assertion (review round 2 on the #101 PR): the environment +
+    # deployment-branch-policy GETs need `actions: read` on the job token, and the guard job's
+    # explicit permissions map zeroes everything unlisted — a silent drop (or widening) of its
+    # grants must go red HERE. Any read/parse failure yields None and fails the check (fail
+    # closed); the workflow file ships in the guard job's sparse checkout so this also runs
+    # live every tick.
+    workflow_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 os.pardir, ".github", "workflows", "dispatch.yml")
+    try:
+        with open(workflow_path, encoding="utf-8") as handle:
+            live_permissions = workflow_guard_permissions(handle.read())
+    except OSError:
+        live_permissions = None
+    chk("workflow: guard job grants exactly {actions: read, contents: read}",
+        live_permissions, {"actions": "read", "contents": "read"})
 
     # Pure scope verdict — accept AND reject directions.
     chk("scope: only github_token -> ok",

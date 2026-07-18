@@ -568,14 +568,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read
+      # actions:read is LOAD-BEARING (review round 2 on the #101 PR): the environment and
+      # deployment-branch-policy REST reads in dispatch-secrets-guard.py require Actions
+      # repository read on the fine-grained GITHUB_TOKEN, and an explicit permissions map sets
+      # everything unlisted to none — without this line both GETs fail on EVERY tick, turning
+      # the guard into a permanent denial (CLAIM/plan-alert stay skipped even once the
+      # maintainer settings are correct). The guard's self-test statically asserts this map
+      # stays exactly this least-privilege pair.
+      actions: read
+      contents: read  # minimum for the sparse checkout below
     steps:
-      - name: Check out ONLY scripts/dispatch-secrets-guard.py (pinned, sparse, no persisted token)
+      - name: Check out the guard script + this workflow (pinned, sparse, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
           persist-credentials: false
-          sparse-checkout: scripts/dispatch-secrets-guard.py
+          # The workflow file feeds the self-test's static assertion that the guard job keeps
+          # its load-bearing `actions: read` permission (see the permissions map above).
+          sparse-checkout: |
+            scripts/dispatch-secrets-guard.py
+            .github/workflows/dispatch.yml
           sparse-checkout-cone-mode: false
 
       - name: Verify empty repo-scope secrets + default-branch-only environment policy
