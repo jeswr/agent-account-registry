@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct03",
-   "claim_id": "350186a4dd464277b2d4da4ff26f0d0c",
-   "holder": "jeswr/agent-account-registry#168@dispatch-29656633252.1",
-   "package": "groom",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784400783,
-   "expires_at": 1784403483
-  },
-  {
    "account": "acct3css",
    "claim_id": "0865d497e7d54c29aa269d039aad22aa",
    "holder": "sparq-org/sparq#3406@dispatch-29656913730.1",
