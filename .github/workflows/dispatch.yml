@@ -805,6 +805,10 @@ jobs:
           planned = (summary or {}).get("planned", 0)
           dispatched = (summary or {}).get("dispatched", 0)
           reasons = (summary or {}).get("defer_reasons", {})
+          # Issue #28: ready-frontier size + lease-ledger health, so this line tells an empty
+          # frontier apart from a ledger failure (both otherwise read as a green 0-dispatch tick).
+          frontier_size = (summary or {}).get("frontier_size", planned)
+          ledger = (summary or {}).get("ledger", "ok")
           zero = isinstance(planned, int) and planned > 0 and dispatched == 0
           productive = isinstance(planned, int) and planned > 0 and \
               isinstance(dispatched, int) and dispatched > 0
@@ -812,6 +816,13 @@ jobs:
           # (validation/API/setup); that is a zero-dispatch-shaped tick, not a quiet one.
           abort = summary is None and os.environ.get("CLAIM_OUTCOME") == "failure"
           step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          # Every tick with a summary emits the frontier/ledger health line (issue #28) — an
+          # empty frontier (frontier_size=0) is now visibly distinct from a ledger failure
+          # (ledger=error), which the claim step also fails loud on when nothing dispatched.
+          if summary is not None and step_summary:
+              with open(step_summary, "a", encoding="utf-8") as out:
+                  out.write(f"dispatch tick: frontier_size={frontier_size}, "
+                            f"ledger={ledger}, dispatched={dispatched}\n\n")
           if zero and step_summary:
               with open(step_summary, "a", encoding="utf-8") as out:
                   out.write("### ⚠️ Zero-dispatch tick\n\n")
