@@ -131,16 +131,6 @@
    "expires_at": 1784346747
   },
   {
-   "account": "acct01",
-   "claim_id": "91d9100f902d4597a8c9754914a74082",
-   "holder": "sparq-org/sparq#3254@dispatch-29626390979.1",
-   "package": "knowledge-graph",
-   "role": "ci",
-   "model": "terra",
-   "issued_at": 1784340457,
-   "expires_at": 1784346757
-  },
-  {
    "account": "acct03",
    "claim_id": "628b821350494635860396c43d2164a9",
    "holder": "sparq-org/sparq#2560@dispatch-29626494323.1",
