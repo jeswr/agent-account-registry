@@ -32,16 +32,6 @@
   },
   {
    "account": "acct4css",
-   "claim_id": "31fef0a0cf7e42af8cf9f6cd992d0b12",
-   "holder": "fix:sparq-org/sparq#3456@dispatch-29646900320.1",
-   "package": "sparq-reason",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784382784,
-   "expires_at": 1784386384
-  },
-  {
-   "account": "acct4css",
    "claim_id": "aa2b8f72901e483f896f8a30ef3b92bd",
    "holder": "fix:sparq-org/sparq#3464@dispatch-29646968214.1",
    "package": "sparq-e2ee-ng",
