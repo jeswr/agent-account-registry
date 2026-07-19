@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-1 major finding is resolved. The live lookup now verifies the authoritative ledger ref, validates its commit SHA, and pins the Contents read to that SHA before treating a 404 as conclusive file absence. Missing, malformed, or unavailable ref resolution and unusable content all remain indeterminate, and both terminal-mutation callers defer with an alert in that state. The added direct and mutation-boundary tests non-vacuously cover the previously unsafe missing-ref case as well as successful admission, verified-tip absence, malformed content, and unavailable reads. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+ "verdict": "approve"
+}
