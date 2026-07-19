@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 383,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2483d2738b8d4a524d3f33d157083fb21b860d62",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `activate` job resolves the account issue with `([.[]|select(.title==\"$handle\")][0]).number`, which accepts multiple exact-title matches and silently chooses the first. Duplicate records are possible after retries or partial runs because registration creates an issue without first proving uniqueness. The inline path correctly requires exactly one match, but the normal post-merge path does not. A merged account-pool PR can therefore relabel an arbitrary duplicate, potentially one with different metadata or request linkage, instead of failing closed on ambiguous identity.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Collect all exact-title matches in the merge-driven `activate` job and require the count to be exactly one before reading labels or mutating anything, matching the inline activation invariant. Add a non-vacuous self-test or test fixture proving zero and two exact matches fail while exactly one proceeds. Consider making registration itself idempotent or explicitly rejecting a pre-existing exact-title issue so retries cannot create the ambiguous state.",
+    "severity": "major",
+    "title": "Merge activation does not require a unique exact-title account issue"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 no-PR activation flaw is materially fixed: inline activation now requires one exact-title issue, checks its state, performs the label change without suppressing failure, verifies the result, and feeds failure into the partial-enrollment alarm. However, the merge-driven activation path still does not enforce the same exact-target invariant. It silently selects the first exact-title match, so duplicate account issues can cause the workflow to activate an arbitrary record. Because exact-match target resolution is part of the trust boundary, this remains a major fail-closed correctness issue. This is a new finding relative to round 1, so progress is regressing under the required scale despite the prior finding being resolved.",
+  "verdict": "request_changes"
+ }
+}
