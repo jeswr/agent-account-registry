@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 383,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "de6fe39a83fd7685d79fab80e6c1be62ad556b80",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "When `policy_pr` outputs `pr=none`, the next step treats the account as activated even if the exact account issue cannot be found or `gh issue edit` fails. The lookup permits an empty result, and the label mutation is followed by `|| true`; execution then posts an activation-success comment and closes the request unconditionally. The always-alarm cannot catch this because `policy_pr` itself succeeded. Thus a transient API/permission failure can leave the account issue `status:pending` while the only enrollment request is closed and claims success. This is operationally incomplete and contradicts the promised two-phase state transition, even though allocation itself remains fail-closed.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Require exactly one exact-title account issue, require it to be `status:pending` (or verify an idempotent `status:available` state), perform the label edit without suppressing failure, and re-read/verify `status:available` before commenting success or closing the request. Give this activation stage an outcome included in the partial-enrollment alarm so any failed transition produces actionable recovery instead of a false success.",
+    "severity": "major",
+    "title": "Already-present policy path closes the request without proving activation"
+   }
+  ],
+  "progress": null,
+  "summary": "The pending-then-activate architecture closes the original allocation hole for the normal PR path: pending accounts are excluded by both the availability label and policy pool, the App-authored policy change receives the normal PR gate, and the merge-triggered activation rechecks the merged policy and exact issue title. However, the no-PR/idempotent path is not sound as an enrollment state machine. It suppresses failure (or absence) of the pending-to-available transition, then announces success and closes the request, while the always-alarm considers the policy step successful. This can leave a captured account permanently pending with no open recovery request despite reporting activation. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
