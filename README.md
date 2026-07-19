@@ -30,8 +30,10 @@ secret_ref: ACCT_<HANDLE>_TOKEN   # the NAME of the GitHub secret holding this a
 notes: "..."
 ```
 
-The **token value** for each account is stored ONLY as a repository/organization **secret** named by
-`secret_ref` — never in the issue body, never in a comment, never in a public repo.
+The **token value** for each account is stored ONLY as a secret in this repo's
+**`dispatch-secrets` environment**, named by `secret_ref` — never at repository/organization
+scope (issue #101: the dispatch secrets-guard fails closed while ANY repo-scope secret exists),
+never in the issue body, never in a comment, never in a public repo.
 
 ## Lease-based claim / release (the cross-codebase mutex)
 
@@ -153,10 +155,18 @@ title (GitHub does not enforce unique titles).
 
 ### Step 1 — save the token as a secret (via stdin, never as a visible arg)
 
+Secrets live in the **`dispatch-secrets` environment**, NOT at repo scope (issue #101): the
+dispatch secrets-guard fails every tick closed while ANY repo-scope secret exists. If you
+accidentally write one at repo scope, recover by **deleting the stray directly**
+(`gh secret delete <NAME> -R jeswr/agent-account-registry`) and re-running the env-scoped
+command below — **never** by re-running the migration workflow: post-cleanup it cannot mint
+(the bootstrap repo copies are gone by design) and there is nothing left to migrate (see the
+header of `.github/workflows/migrate-secrets-to-env.yml`).
+
 ```bash
-tr -d '[:space:]' < ~/.claude-acct5-token | gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry
+tr -d '[:space:]' < ~/.claude-acct5-token | gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry --env dispatch-secrets
 # or from a value you already hold, without it hitting the shell history/ps:
-#   gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry   # then paste at the prompt
+#   gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry --env dispatch-secrets   # then paste at the prompt
 ```
 
 ### Step 2 — validate the token works (and see its live usage)
@@ -216,7 +226,8 @@ Commit + push to `master`. An account that is available + in the catalog but **n
 ### Verify
 
 ```bash
-gh secret list -R jeswr/agent-account-registry | grep ACCT           # secret present
+gh secret list -R jeswr/agent-account-registry --env dispatch-secrets | grep ACCT  # secret present (env scope)
+gh secret list -R jeswr/agent-account-registry                        # repo scope must stay EMPTY
 gh issue view <ISSUE#> -R jeswr/agent-account-registry --json labels  # status:available + provider:*
 grep account_pool policy/repos.toml                                   # handle present
 ```
@@ -285,8 +296,18 @@ from the `data/model-health.json` records the worker/review outcome jobs already
 
 ## Security posture
 
-- Tokens: only in GitHub secrets (encrypted at rest, masked in logs).
-- `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the Actions secrets public-key read, then an authoritative `gh secret set` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only `Secrets: read`, so it would bless a read-only PAT that onboarding's write still breaks on) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and network blips never false-alarm.
+- Tokens: only in GitHub secrets (encrypted at rest, masked in logs), and only in the
+  **`dispatch-secrets` environment** — repo scope stays EMPTY, enforced fail-closed every tick by
+  `scripts/dispatch-secrets-guard.py` (issue #101). The environment's custom deployment-branch
+  policy admits ONLY `master`, so a modified workflow copy dispatched at any other ref is refused
+  the secrets server-side. This covers the 14 pipeline secrets AND `REGISTRY_SECRETS_PAT`
+  (currently unset; when restored it goes into the environment — mint it fine-grained with
+  repository **Secrets: read + Environments: read/write** on this repo: least privilege, because
+  post-cutover the PAT only LISTs/GETs repo-scope secrets (onboarding's both-scopes absence
+  probe) and WRITEs environment secrets — env-secret endpoints sit under the fine-grained
+  "Environments" permission, whose read half covers the env public-key read. Store it with
+  `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`).
+- `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the `dispatch-secrets` environment secrets public-key read, then an authoritative `gh secret set --env dispatch-secrets` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only read access, so it would bless a read-only PAT that onboarding's env write still breaks on; a repo-scope canary would re-trip the secrets-guard weekly) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and network blips never false-alarm.
 - Account metadata + selection logic: only in this private repo.
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
 
@@ -298,11 +319,19 @@ You don't paste tokens manually. Instead:
 2. The `set-up-account` workflow (trust-gated to the maintainer) runs the provider's device/OAuth
    login and **comments a sign-in URL + one-time code** on the issue.
 3. Sign in with the account you want to register. The broker captures the resulting token, stores it
-   as the account **secret** (`ACCTNN_TOKEN`) on the token-target repo, registers the account issue,
-   and closes the request. **The token is never printed** — only written to a mode-600 file and set
-   as a secret.
+   as the account **secret** (`ACCTNN_TOKEN`) in this registry's `dispatch-secrets` environment,
+   registers the account issue, and closes the request. **The token is never printed** — only
+   written to a mode-600 file and set as a secret.
 
 Providers: **OpenAI** via `codex login --device-auth` (native device flow); **Anthropic** via
-`claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_ADMIN_TOKEN` (a
-fine-grained PAT with Secrets:write on the token-target repo) — until it's set, the broker still
-surfaces the URL but reports that the secret couldn't be stored.
+`claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_SECRETS_PAT` (a
+fine-grained PAT with repository **Secrets: read + Environments: read/write** on this registry
+repo — least privilege; the broker only lists/reads repo-scope secrets and writes environment
+secrets — stored in the `dispatch-secrets` environment: the broker job is env-bound to resolve
+it, and it stores captured tokens into that same environment). The broker **fails closed before
+any login**: its preflight proves the PAT can actually store a credential (a non-mutating
+repo-secret listing plus an authoritative environment canary write) and, if the PAT is missing
+or under-scoped, exits **without ever surfacing a sign-in URL** — remediation (the exact mint
+grants and the storage command
+`gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`)
+is posted on the issue, so a credential is never captured that cannot be stored.

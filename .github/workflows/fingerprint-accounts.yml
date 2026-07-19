@@ -1,6 +1,11 @@
 # [OPUS-4.8] Fingerprint EVERY ACCTNN_TOKEN secret by its Anthropic weekly (7d) rate-limit reset,
 # so a setup-token account can be identified by email via the maintainer's email→reset map (a
 # setup-token can't introspect its email directly — 403 on /api/oauth/profile). Tokens never printed.
+# PII POLICY (sol round 21 of #275, mirroring account-whoami.yml): this repo's Actions logs are
+# PUBLIC and the reset/utilization values are account-identifying BY DESIGN (that map is the whole
+# point of the probe), so every identity-bearing output — the secret handle, reset timestamp,
+# London reset time, utilization — is logged ONLY as the registry's salted-hash convention
+# sha256(value + ':' + PROVENANCE_SALT)[:16]; no salt => fail closed (header counts only).
 name: fingerprint-accounts
 on:
   workflow_dispatch: {}
@@ -8,10 +13,16 @@ permissions: {}
 jobs:
   fingerprint:
     runs-on: ubuntu-latest
+    # SECRET-EXFIL GUARD (issue #101): reads toJSON(secrets) (ACCT_* probe subset), which lives
+    # in the `dispatch-secrets` environment (deployment-branch policy: default branch only) —
+    # full rationale on the `claim` job in dispatch.yml. Without this binding the probe would
+    # silently see an EMPTY subset once the repo-scope secrets are migrated.
+    environment: dispatch-secrets
     steps:
       # Least-exposure filter (audit-2026-07-17, issue #41): only this tiny inline step ever sees the
-      # full secrets map; the fingerprint step below receives ONLY the ACCT_* worker-token subset via a
-      # file, so REGISTRY_SECRETS_PAT/PROVENANCE_SALT/ALERT_TOKEN never transit the probe environment.
+      # full secrets map; the fingerprint step below receives ONLY the ACCT_* worker-token subset via
+      # a file, plus PROVENANCE_SALT (required there to salt the identity hashes — sol round 21), so
+      # REGISTRY_SECRETS_PAT/ALERT_TOKEN never transit the probe environment.
       - name: Materialize the ACCT_* worker-token subset for the probe
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}
@@ -35,18 +46,38 @@ jobs:
               json.dump(subset, handle)
           PY
 
-      - name: Fingerprint all ACCT tokens (reset day/time in London; tokens never printed)
+      # Step NAME kept GENERIC (sol round 20 of #275, same rule as account-whoami.yml): step
+      # names render in the public Actions run UI, so no raw account handle appears here.
+      - name: Fingerprint the configured accounts (salted-hash identity only — no raw handles or reset values)
         env:
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set +e +o pipefail   # tolerate 401/no-header responses (codex tokens 401 on the anthropic endpoint)
           rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/h.txt 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | head -1; }
+          # PII policy (sol round 21 of #275): the reset timestamp / London reset time /
+          # utilization identify the account through the maintainer's private email→reset map —
+          # identification is this probe's whole purpose — and the handle names the slot; this
+          # log is PUBLIC. Every identity-bearing value is therefore logged ONLY as the
+          # registry's salted-hash convention sha256(value:PROVENANCE_SALT)[:16] (identical to
+          # account-whoami.yml / worker-pr.py account_hash): the maintainer probes their
+          # candidate accounts privately and hashes the same way to match. No salt => per-slot
+          # header COUNTS only (fail closed, never raw). The HTTP code and `status` are generic
+          # non-identifying enums and stay raw.
+          h() { if [ -z "$1" ]; then echo '-'; else printf '%s:%s' "$1" "$PROVENANCE_SALT" | sha256sum | cut -c1-16; fi; }
           # ONE canonical allowlist (review r2): the same ^ACCT[A-Z0-9]+_TOKEN$ the materializer and
           # both reference workflows (dashboard.yml, dispatch.yml) use — a looser/tighter second
           # filter here would silently drop (or admit) accounts the other step selected.
           names=$(jq -r 'keys[] | select(test("^ACCT[A-Z0-9]+_TOKEN$"))' "$SECRETS_FILE" | sort)
-          echo "handle | http | 7d_reset_ts | London(day HH:MM) | 7d_util | 5h_util | status"
+          if [ -n "$PROVENANCE_SALT" ]; then
+            echo "slot_hash | http | 7d_reset_hash | london_hash | 7d_util_hash | 5h_util_hash | status"
+          else
+            echo "no-salt-refusing-to-derive: per-slot header COUNTS only (fail closed)"
+            echo "slot | http | ratelimit_headers_present | status"
+          fi
+          slot=0
           for name in $names; do
+            slot=$((slot+1))
             tok=$(jq -r --arg k "$name" '.[$k]' "$SECRETS_FILE")
             rm -f /tmp/h.txt
             code=$(curl -s -D /tmp/h.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
@@ -54,8 +85,14 @@ jobs:
               -H "anthropic-beta: oauth-2025-04-20" \
               -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' -w '%{http_code}')
             [ -z "$code" ] && code=curlfail
-            r7=$(rl 7d-reset)
-            if [ -n "$r7" ]; then lon=$(TZ=Europe/London date -d @"$r7" '+%a %H:%M' 2>/dev/null); else lon='-'; fi
-            printf '%s | %s | %s | %s | %s | %s | %s\n' \
-              "$name" "$code" "${r7:--}" "${lon:--}" "$(rl 7d-utilization)" "$(rl 5h-utilization)" "$(rl status)"
+            if [ -n "$PROVENANCE_SALT" ]; then
+              r7=$(rl 7d-reset)
+              if [ -n "$r7" ]; then lon=$(TZ=Europe/London date -d @"$r7" '+%a %H:%M' 2>/dev/null); else lon=''; fi
+              printf '%s | %s | %s | %s | %s | %s | %s\n' \
+                "$(h "$name")" "$code" "$(h "$r7")" "$(h "$lon")" \
+                "$(h "$(rl 7d-utilization)")" "$(h "$(rl 5h-utilization)")" "$(rl status)"
+            else
+              printf '%s | %s | %s | %s\n' \
+                "$slot" "$code" "$(grep -ci '^anthropic-ratelimit-unified-' /tmp/h.txt || true)" "$(rl status)"
+            fi
           done

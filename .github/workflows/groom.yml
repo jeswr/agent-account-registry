@@ -22,6 +22,10 @@ jobs:
     name: Reclaim and repair orchestration state
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + PROVENANCE_SALT, which
+    # live in the `dispatch-secrets` environment (deployment-branch policy: default branch only)
+    # — full rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       actions: read       # inspect registry worker run state
       contents: write     # CAS data/leases.json + read data/model-health.json (both on the `ledger` branch)

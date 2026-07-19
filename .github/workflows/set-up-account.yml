@@ -21,8 +21,10 @@
 # creation is first-writer-wins on the server, and claims are never deleted (a failed run burns its
 # slot instead of releasing it, so a retry can never overwrite an in-flight credential). The slot is
 # derived from the COMPLETE union (fully paginated, never a capped page) of claim refs, acctNN issue
-# titles in ANY state, and ACCTNN_TOKEN secret names; if any listing fails, freeness cannot be
-# proven and the run fails closed. The claim-ref namespace is the canonical allocation record every
+# titles in ANY state, and ACCTNN_TOKEN secret names at BOTH scopes — repository AND the
+# dispatch-secrets environment, the post-#101 canonical home (an env-only token with no claim ref
+# or issue would otherwise be invisible and the broker would burn its claim ref on an occupied
+# slot); if any listing fails, freeness cannot be proven and the run fails closed. The claim-ref namespace is the canonical allocation record every
 # automated account writer must claim in BEFORE writing; downstream steps consume the claimed slot
 # via steps.store.outputs, not the stale snapshot.
 name: set-up-account
@@ -42,6 +44,11 @@ jobs:
   login:
     if: github.event.label.name == 'set-up-account'
     runs-on: ubuntu-latest
+    # REGISTRY_SECRETS_PAT's canonical home is the dispatch-secrets environment (post-#101 the
+    # repo scope must stay EMPTY — the secrets-guard fails dispatch closed otherwise), so the
+    # broker job must be env-bound to resolve it. `issues: labeled` events run on the default
+    # branch, which the environment's custom deployment-branch policy admits.
+    environment: dispatch-secrets
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
@@ -62,17 +69,51 @@ jobs:
           done
 
       # The workflow's own github.token cannot write Actions secrets; REGISTRY_SECRETS_PAT is the
-      # existing jeswr-owned fine-grained PAT with Secrets:write on THIS registry repo (already
-      # proven by the rotation write-back in worker-live.sh).
-      - name: Preflight — require REGISTRY_SECRETS_PAT before any login
+      # jeswr-owned fine-grained PAT on THIS registry repo (already proven by the rotation
+      # write-back in worker-live.sh). Post-#101 it lives in the dispatch-secrets environment
+      # (this job is env-bound to resolve it). LEAST-PRIVILEGE GRANTS (sol review round 4 of
+      # #275): repository Secrets: READ (the store step only LISTS repo-scope secrets and GETs
+      # the candidate name for the both-scopes absence probe — it never writes at repo scope)
+      # + Environments: READ AND WRITE (the env public-key read `gh secret set --env` performs
+      # and the store step's env-secret union listing sit under Environments: read; the
+      # env-secret PUT under Environments: write).
+      #
+      # PRESENCE ALONE IS NOT ENOUGH (round-4 finding 1): a PAT that exists but was minted
+      # under-scoped — or stored at repo scope by a well-meaning operator following a vague
+      # recovery hint, re-tripping the secrets-guard — would fail only AFTER the credential was
+      # captured. So BOTH capabilities are proven HERE, before any login starts or sign-in URL
+      # is surfaced: (1) the NON-MUTATING repo-scope secrets listing the store step's absence
+      # probe performs, and (2) an AUTHORITATIVE environment write — a real `gh secret set
+      # --env` on the disposable REGISTRY_PAT_PROBE_CANARY secret pat-validity.py already
+      # overwrites weekly (it holds NO secret material; only a completed write proves write
+      # access — a read probe would bless a read-only PAT). Fail closed pre-login on either.
+      - name: Preflight — REGISTRY_SECRETS_PAT present AND store-capable, before any login
         env:
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: |
-          if [ -z "${REGISTRY_PAT:-}" ]; then
+          set -euo pipefail
+          fail() {
             gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "❌ REGISTRY_SECRETS_PAT is not set, so a captured token could not be stored. Refusing to start login. Add the fine-grained PAT (Secrets:write on ${{ github.repository }}) as \`REGISTRY_SECRETS_PAT\`, then re-apply the label." || true
+              --body "❌ $1 Refusing to start login — no sign-in URL is surfaced until the broker has proven it can store what the login captures (fail closed). **Fix:** mint a fine-grained PAT on \`${{ github.repository }}\` with repository **Secrets: read** + **Environments: read and write** (least privilege — the broker only lists/reads repo-scope secrets and writes environment secrets), store it with \`gh secret set REGISTRY_SECRETS_PAT --repo ${{ github.repository }} --env dispatch-secrets\` (the dispatch-secrets ENVIRONMENT is its canonical home — a repo-scope copy would re-trip the secrets-guard), then re-apply the \`set-up-account\` label." || true
             exit 1
+          }
+          if [ -z "${REGISTRY_PAT:-}" ]; then
+            fail "\`REGISTRY_SECRETS_PAT\` is not set (not resolvable from the \`dispatch-secrets\` environment), so a captured token could not be stored."
           fi
+          # Capability probe 1 — repository Secrets: READ, via the same NON-MUTATING listing the
+          # store step's both-scopes absence probe performs (never a repo-scope write, which
+          # would re-trip the secrets-guard).
+          if ! GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/actions/secrets?per_page=1" --jq .total_count >/dev/null; then
+            fail "\`REGISTRY_SECRETS_PAT\` resolves but cannot LIST repository-scope secrets — it lacks repository **Secrets: read**, so the store step's both-scopes absence probe would fail closed only AFTER the credential was captured."
+          fi
+          # Capability probe 2 — authoritative Environments: WRITE, via a real env-secret write
+          # to the disposable canary pat-validity.py overwrites weekly (holds no secret
+          # material; value via stdin, never argv, per the repo convention).
+          if ! printf '%s' "set-up-account preflight write-probe canary - holds no secret material" \
+              | GH_TOKEN="$REGISTRY_PAT" gh secret set REGISTRY_PAT_PROBE_CANARY -R "${{ github.repository }}" --env dispatch-secrets; then
+            fail "\`REGISTRY_SECRETS_PAT\` resolves but cannot WRITE a \`dispatch-secrets\` environment secret — it lacks **Environments: read and write**, so storing the captured credential would fail only AFTER capture."
+          fi
+          echo "preflight: REGISTRY_SECRETS_PAT proven store-capable (repo Secrets:read listing + authoritative dispatch-secrets canary write)"
 
       - name: Determine provider (structured — no silent default)
         id: meta
@@ -199,8 +240,10 @@ jobs:
           # record; every automated account writer MUST create its claim ref before writing a secret
           # or an acctNN issue. Out-of-band manual writes cannot be forced through this protocol;
           # they are caught by deriving the slot from the COMPLETE union of claim refs, acctNN issue
-          # titles in ANY state, and ACCTNN_TOKEN secret names — each fully paginated, because any
-          # capped listing silently treats every unseen slot as free — plus a
+          # titles in ANY state, and ACCTNN_TOKEN secret names at BOTH scopes (repository AND the
+          # dispatch-secrets environment — the post-#101 canonical home; an env-only stray must be
+          # visible BEFORE the irreversible claim, not first at the absence probe) — each fully
+          # paginated, because any capped listing silently treats every unseen slot as free — plus a
           # secret-absence probe right before the upsert. If any listing fails, freeness cannot be
           # proven -> fail closed. The pre-login hint is reused when still free so a retry converges
           # on the same slot.
@@ -219,7 +262,18 @@ jobs:
                    --jq '.secrets[].name | select(test("^ACCT[0-9]+_TOKEN$")) | ltrimstr("ACCT") | rtrimstr("_TOKEN")'); then
               echo "::error::could not enumerate existing secrets — refusing to store (fail closed)"; exit 1
             fi
-            taken=$(printf '%s\n%s\n%s\n' "$claim_nums" "$issue_nums" "$secret_nums" \
+            # Post-cutover (#101) ACCTNN_TOKEN secrets live in the dispatch-secrets ENVIRONMENT,
+            # so the union MUST enumerate that scope too (sol round-6 finding 3): an env-only
+            # token with no claim ref or issue yet would otherwise be invisible here, the broker
+            # would create the claim ref IRREVERSIBLY (claims are never deleted) and only then
+            # fail at the env absence-probe below — permanently burning the slot. Fully
+            # paginated, same PAT (its Environments read+write grant is proven by the preflight
+            # canary write; env-secret listing sits under Environments: read).
+            if ! env_secret_nums=$(GH_TOKEN="$REGISTRY_PAT" gh api --paginate "repos/${{ github.repository }}/environments/dispatch-secrets/secrets?per_page=100" \
+                   --jq '.secrets[].name | select(test("^ACCT[0-9]+_TOKEN$")) | ltrimstr("ACCT") | rtrimstr("_TOKEN")'); then
+              echo "::error::could not enumerate dispatch-secrets environment secrets — refusing to store (fail closed)"; exit 1
+            fi
+            taken=$(printf '%s\n%s\n%s\n%s\n' "$claim_nums" "$issue_nums" "$secret_nums" "$env_secret_nums" \
                       | jq -Rn '[inputs | select(test("^[0-9]+$")) | tonumber]')
             n=$(jq -n --argjson t "$taken" --argjson r "$reserved" \
                   'if ($t | index($r)) then (([$t[], 0] | max) + 1) else $r end')
@@ -250,10 +304,20 @@ jobs:
           if ! printf '%s' "$probe" | grep -q 'HTTP 404'; then
             echo "::error::could not prove $SECRET_NAME is absent — refusing to store (fail closed)"; exit 1
           fi
-          # The secret lives on THIS registry repo: worker.yml resolves secrets[secret_ref] here,
-          # the dispatch usage probe reads registry secrets, and the rotation write-back targets the
-          # registry too. Never echo the token — gh reads the file.
-          GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" -R "${{ github.repository }}" < "$LOGIN_DIR/token"
+          # Post-#101 the canonical home is the `dispatch-secrets` environment: probe it too
+          # (BOTH scopes must 404 — a repo-scope stray would trip the secrets-guard, an env
+          # stray means the claim protocol was bypassed).
+          if envprobe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/environments/dispatch-secrets/secrets/$SECRET_NAME" 2>&1); then
+            echo "::error::secret $SECRET_NAME already exists in the dispatch-secrets environment despite an owned claim — refusing to overwrite (fail closed)"; exit 1
+          fi
+          if ! printf '%s' "$envprobe" | grep -q 'HTTP 404'; then
+            echo "::error::could not prove $SECRET_NAME is absent from the dispatch-secrets environment — refusing to store (fail closed)"; exit 1
+          fi
+          # The secret lives on THIS registry repo, in the `dispatch-secrets` ENVIRONMENT
+          # (post-#101): worker.yml/review-fix.yml resolve secrets[secret_ref] from env-bound
+          # jobs, and the rotation write-back targets the same environment. A repo-scope write
+          # would re-trip the secrets-guard. Never echo the token — gh reads the file.
+          GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" -R "${{ github.repository }}" --env dispatch-secrets < "$LOGIN_DIR/token"
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
           harness=$([ "$PROVIDER" = openai ] && echo codex || echo claude)
           # registry issue + comment use the workflow's own github.token (same-owner)

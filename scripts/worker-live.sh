@@ -602,7 +602,7 @@ FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch
 plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
 groom.py account-usage.py usage-alert.py plan-alert.py dispatch-secrets-guard.py model-health.py \
 pat-validity.py broker-refresh.py \
-backfill-provenance.py dashboard-gen.py trust-gate.py worker-live.sh"
+backfill-provenance.py dashboard-gen.py trust-gate.py worker-live.sh migrate-secrets.sh"
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
@@ -1329,9 +1329,15 @@ PY
       ;;
     *) die 'unsafe credential format for write-back' ;;
   esac
-  GH_TOKEN="$pat" /usr/bin/gh secret set "$secret_ref" --repo "$registry_repo" < "$current"
+  # --env: post-#101 the canonical secret home is the `dispatch-secrets` environment; a
+  # repo-scope write would re-trip the secrets-guard AND leave the env copy stale (the
+  # env-bound consumers would keep resolving the pre-rotation token).
+  # WORKER_GH_BIN is a seam for the HERMETIC self-test's argv-capturing fake gh only; live runs
+  # never set it (absolute-path default). It crosses no new trust boundary: an actor who controls
+  # this process's environment already holds REGISTRY_SECRETS_PAT itself from that same env.
+  GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$current"
   write_output rotated true
-  printf 'worker-live: wrote the full refreshed credential back to %s\n' "$secret_ref"
+  printf 'worker-live: wrote the full refreshed credential back to %s (env dispatch-secrets)\n' "$secret_ref"
 }
 
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
@@ -1686,6 +1692,48 @@ TOML
   else
     printf '  skip (d) live cargo crash-reproduction (cargo not on PATH)\n'
   fi
+
+  # --- rotation write_back env-scope contract (sol review on #275): the PAT-authed gh call MUST
+  # target the `dispatch-secrets` ENVIRONMENT (a repo-scope write re-trips the secrets-guard AND
+  # leaves the env copy stale) and the credential MUST travel via stdin, never argv. Hermetic:
+  # WORKER_GH_BIN points at an argv+stdin-capturing fake gh; a regression back to `--repo`-only
+  # (or to `--body`) turns the exact-argv chk red. ---
+  local wbcap="$tmp/wbcap" wbroot="$tmp/wbroot" wb_out="$tmp/wb-github-output" wb_rc
+  mkdir -p "$wbcap" "$wbroot"
+  cat > "$tmp/wb-gh" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$WB_CAPTURE/argv"
+cat > "$WB_CAPTURE/stdin"
+printf '%s\n' "${GH_TOKEN:-}" > "$WB_CAPTURE/token"
+FAKE
+  chmod +x "$tmp/wb-gh"
+  printf 'sk-ant-oat-ROTATED-SENTINEL' > "$wbroot/current"
+  printf 'sk-ant-oat-old-baseline' > "$wbroot/baseline"
+  : > "$wb_out"
+  # Subshell so the fixture env never leaks; `if` so a die() surfaces as a red chk, not a silent
+  # set -e abort of the whole self-test.
+  if (
+    export WORKER_ROOT="$wbroot" \
+           WORKER_CREDENTIAL_PATH="$wbroot/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot/baseline" \
+           WORKER_CREDENTIAL_FORMAT=claude-oauth-token \
+           WORKER_ACCOUNT=acct05 WORKER_SECRET_REF=ACCT05_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$wbcap"
+    write_back
+  ) > "$tmp/wb.log" 2>&1; then wb_rc=0; else wb_rc=$?; fi
+  chk "write_back succeeds on a rotated credential" "$wb_rc" "0"
+  chk "write_back gh argv targets the dispatch-secrets ENVIRONMENT (exact, no --body)" \
+    "$(cat "$wbcap/argv" 2>/dev/null)" \
+    "secret set ACCT05_TOKEN --repo o/r --env dispatch-secrets"
+  chk "write_back streams the credential via STDIN (never argv)" \
+    "$(cat "$wbcap/stdin" 2>/dev/null)" "sk-ant-oat-ROTATED-SENTINEL"
+  chk "write_back authenticates gh with the registry PAT" \
+    "$(cat "$wbcap/token" 2>/dev/null)" "fake-pat-value"
+  chk "write_back reports rotated=true" \
+    "$(grep -c '^rotated=true$' "$wb_out" || true)" "1"
+  chk "write_back never echoes the credential value" \
+    "$(grep -c 'ROTATED-SENTINEL' "$tmp/wb.log" || true)" "0"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'

@@ -16,6 +16,11 @@ jobs:
     name: Build privacy-safe Pages artifact
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # SECRET-EXFIL GUARD (issue #101): reads toJSON(secrets) (ACCT_* probe subset) and
+    # PROVENANCE_SALT, which live in the `dispatch-secrets` environment (deployment-branch
+    # policy: default branch only) — full rationale on the `claim` job in dispatch.yml.
+    # The `deploy` job below keeps its own `github-pages` environment (no secrets there).
+    environment: dispatch-secrets
     permissions:
       actions: read
       contents: read
