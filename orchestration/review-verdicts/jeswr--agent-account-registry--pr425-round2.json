@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 425,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7a01b2c12914243ee07135cb98eda21df6505766",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. The workflows now carry the producing job's GITHUB_RUN_ATTEMPT alongside the outcome and construct the idempotency run_id from that preserved output: retrying only the recorder reuses the same key, while re-running the producing job receives a fresh attempt and remains countable. Dispatch records in the producing job and already has the same property. The self-test is non-vacuous: it separately asserts same-producing-attempt deduplication and same-GITHUB_RUN_ID/fresh-producing-attempt append behavior, including the resulting consecutive-failure count. The bounded full-jitter CAS retry tests also exercise placement and exact RNG bounds. No new correctness, fail-closed, security, or test-validity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
