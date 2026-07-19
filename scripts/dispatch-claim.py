@@ -174,8 +174,37 @@ PROBE_EXEMPT_PROVIDERS = frozenset({"openai"})
 # cap IS the codex slot bound, and `fix:` bounds concurrent same-provider fix agents.
 REVIEW_MAX_CONCURRENT = 10
 FIX_MAX_CONCURRENT = 8
-REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
-FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
+# Lease TTL must OUTLIVE the owning review-fix.yml workflow's worst-case wall-clock, or the
+# allocator reclaims a still-live account and two sessions race on one credential / write-back
+# (issue #159). A DISPATCHER-claimed lease (adopted by review-fix.yml's `claim` job) is created
+# BEFORE the workflow's resolve/claim/run jobs run, so the bound is every job timeout on the
+# claim -> run -> release critical path PLUS GitHub runner queue slack between jobs — NOT the run
+# job alone. The pre-#159 1200/3600 were the run-job timeout itself (25m/60m), so a lease expired
+# mid-run and the account was reclaimed while the original session was still live. Keep these job
+# bounds in sync with .github/workflows/review-fix.yml `timeout-minutes:` (the _self_test pins the
+# derivation so a silent cut below the run bound flips red).
+_WF_RESOLVE_TIMEOUT = 600    # review-fix.yml resolve job (10m)
+_WF_CLAIM_TIMEOUT = 600      # review-fix.yml claim/adopt job (10m)
+_WF_RELEASE_TIMEOUT = 600    # review-fix.yml release job — the job that frees the lease (10m)
+_WF_RUN_TIMEOUT = {"review": 1500, "fix": 3600}  # run job, per mode (25m / 60m)
+# Slack for runner queue time (the dispatch queue plus inter-job handoffs); a lease must NEVER
+# expire while its workflow can still be scheduling or running the credential-using `run` job.
+_WF_QUEUE_SLACK = 900        # 15m
+
+
+def _lease_ttl(mode):
+    """The minimum lease TTL that outlives the owning review-fix.yml workflow's worst-case
+    wall-clock (issue #159): every job timeout on the claim -> run -> release critical path plus
+    queue slack, measured from the DISPATCHER claim (before resolve runs — the longest path).
+    Fail-closed: an unknown mode takes the longest (fix) run bound, never a shorter one, so a
+    typo can only over-hold an account, never free a live one early."""
+    run = _WF_RUN_TIMEOUT.get(mode, _WF_RUN_TIMEOUT["fix"])
+    return (_WF_RESOLVE_TIMEOUT + _WF_CLAIM_TIMEOUT + run
+            + _WF_RELEASE_TIMEOUT + _WF_QUEUE_SLACK)
+
+
+REVIEW_TTL = _lease_ttl("review")   # 10+10+25+10+15 = 70m (was 20m — shorter than the 25m run job)
+FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly the run job, no slack)
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
@@ -2721,6 +2750,59 @@ def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None):
         print(f"::warning::dispatch summary write failed ({exc}); continuing")
 
 
+def _review_fix_workflow_values():
+    """Extract the trust-critical timeout / local-claim-TTL literals straight from
+    .github/workflows/review-fix.yml so the self-test can pin the DISPATCHER TTL derivation to
+    the WORKFLOW it must outlive (issue #159), not just to sibling constants in this module. A
+    raised job timeout or an edited local `ttl=` that is not mirrored back into `_WF_*` /
+    REVIEW_TTL / FIX_TTL flips the asserts below red instead of silently re-expiring a still-live
+    lease. Text-parsed (no PyYAML dependency in the self-test path) but JOB-SCOPED, so a timeout
+    in a non-critical-path job is never mistaken for a critical-path one. A missing/unparsable
+    workflow raises AssertionError — fail closed, never a skipped check."""
+    path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
+    assert path.is_file(), f"review-fix.yml not found for TTL sync check: {path}"
+    text = path.read_text(encoding="utf-8")
+    marker = "\njobs:\n"
+    assert marker in text, "review-fix.yml has no top-level jobs: block"
+    jobs_at = text.index(marker)
+    # Top-level job headers sit at exactly two-space indent under `jobs:` with nothing after the
+    # colon; every nested key inside a job is indented four or more spaces, so this never matches
+    # a step-level `run:`/`timeout-minutes:` or an `on:`/`concurrency:` key above `jobs:`.
+    heads = [m for m in re.finditer(r"(?m)^  ([a-z_]+):$", text) if m.start() > jobs_at]
+    assert heads, "review-fix.yml exposed no job headers"
+    spans = {}
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        spans[m.group(1)] = text[m.start():end]
+
+    def _fixed_minutes(job):
+        span = spans.get(job)
+        assert span is not None, f"review-fix.yml is missing the {job} job"
+        m = re.search(r"(?m)^    timeout-minutes: (\d+)$", span)
+        assert m, f"{job} job has no plain integer timeout-minutes"
+        return int(m.group(1))
+
+    run_span = spans.get("run")
+    assert run_span is not None, "review-fix.yml is missing the run job"
+    run_m = re.search(
+        r"timeout-minutes:\s*\$\{\{[^}]*?'review'\s*&&\s*(\d+)\s*\|\|\s*(\d+)", run_span)
+    assert run_m, "run job timeout expression (review && N || M) not found"
+    claim_span = spans.get("claim")
+    assert claim_span is not None, "review-fix.yml is missing the claim job"
+    ttl_review = re.search(r'prefix="review:";[^\n]*\bttl=(\d+)', claim_span)
+    ttl_fix = re.search(r'prefix="fix:";[^\n]*\bttl=(\d+)', claim_span)
+    assert ttl_review and ttl_fix, "claim job local review/fix ttl= literals not found"
+    return {
+        "resolve_s": _fixed_minutes("resolve") * 60,
+        "claim_s": _fixed_minutes("claim") * 60,
+        "release_s": _fixed_minutes("release") * 60,
+        "run_review_s": int(run_m.group(1)) * 60,
+        "run_fix_s": int(run_m.group(2)) * 60,
+        "local_review_ttl": int(ttl_review.group(1)),
+        "local_fix_ttl": int(ttl_fix.group(1)),
+    }
+
+
 def _self_test():
     # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are DOCS-ONLY
     # models — they must never appear in any review/fix chain (review-fix.yml asserts the same
@@ -2729,6 +2811,38 @@ def _self_test():
     for name, table in (("REVIEW_CHAIN", REVIEW_CHAIN), ("FIX_CHAIN", FIX_CHAIN)):
         offenders = docs_only & {alias for chain in table.values() for alias in chain}
         assert not offenders, f"docs-only model in {name}: {sorted(offenders)}"
+
+    # Lease TTL must outlive the owning review-fix.yml workflow (issue #159): a lease that expires
+    # mid-run lets the allocator reclaim a live account, racing two sessions on one credential /
+    # write-back. Every mode's TTL must EXCEED its run-job timeout alone (the pre-#159 1200/3600 did
+    # not) and cover the whole claim -> run -> release DAG path plus queue slack. These re-derive if
+    # review-fix.yml raises a job bound; the asserts flip red if a TTL is ever cut below the bound.
+    for _mode, _run_to in _WF_RUN_TIMEOUT.items():
+        _ttl = _lease_ttl(_mode)
+        assert _ttl > _run_to, f"{_mode} lease TTL {_ttl} <= run timeout {_run_to} (issue #159)"
+        assert _ttl >= (_WF_RESOLVE_TIMEOUT + _WF_CLAIM_TIMEOUT + _run_to
+                        + _WF_RELEASE_TIMEOUT + _WF_QUEUE_SLACK), f"{_mode} TTL under DAG bound"
+    assert REVIEW_TTL == _lease_ttl("review") == 4200, REVIEW_TTL
+    assert FIX_TTL == _lease_ttl("fix") == 6300, FIX_TTL
+    # Fail-closed: an unknown mode never gets a shorter hold than the longest known mode.
+    assert _lease_ttl("bogus") >= max(_lease_ttl("review"), _lease_ttl("fix"))
+    # The asserts above only tie the derivation to THIS module's `_WF_*` mirror; on their own
+    # they stay green if review-fix.yml raises a job timeout or edits its local claim TTL without
+    # updating the mirror — the exact silent drift that re-expires a live lease (issue #159 round
+    # 1 finding). Pin the mirror to the WORKFLOW itself: parse review-fix.yml and require every
+    # critical-path job timeout AND both local claim-TTL literals to agree with what the
+    # dispatcher derives / claims. Any workflow-only change now flips these red.
+    _wf = _review_fix_workflow_values()
+    assert _wf["resolve_s"] == _WF_RESOLVE_TIMEOUT, _wf["resolve_s"]
+    assert _wf["claim_s"] == _WF_CLAIM_TIMEOUT, _wf["claim_s"]
+    assert _wf["release_s"] == _WF_RELEASE_TIMEOUT, _wf["release_s"]
+    assert _wf["run_review_s"] == _WF_RUN_TIMEOUT["review"], _wf["run_review_s"]
+    assert _wf["run_fix_s"] == _WF_RUN_TIMEOUT["fix"], _wf["run_fix_s"]
+    # The workflow's own adopt-path claim TTLs (dispatch.yml comment: kept in sync with these)
+    # must equal the dispatcher bound, or a DISPATCHER-claimed lease and a workflow self-claim
+    # would hold the same account for different windows.
+    assert _wf["local_review_ttl"] == REVIEW_TTL, _wf["local_review_ttl"]
+    assert _wf["local_fix_ttl"] == FIX_TTL, _wf["local_fix_ttl"]
 
     fixture = {
         "schema": SCHEMA,

@@ -590,10 +590,14 @@ jobs:
           # impl `<repo>#`, so neither cap counts the other. The shared per-mode prefix bounds
           # concurrent reviews to the static codex slot count (codex is usage-exempt; the CLI
           # claim path does not usage-gate, so this static cap IS the bound — by design).
+          # TTL must outlive this workflow's remaining wall-clock (claim -> run -> release) plus
+          # queue slack, or the allocator reclaims this still-live account and two sessions race
+          # on one credential (issue #159). Kept in sync with dispatch-claim.py REVIEW_TTL/FIX_TTL
+          # (which use the DISPATCHER-claim path's longer bound; adopting that bound here is safe).
           if [[ "$MODE" == review ]]; then
-            prefix="review:"; cap=10; ttl=1200; role=review
+            prefix="review:"; cap=10; ttl=4200; role=review
           else
-            prefix="fix:"; cap=3; ttl=3600; role=fix
+            prefix="fix:"; cap=3; ttl=6300; role=fix
           fi
           holder="$prefix$TARGET_REPO#$PR_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           set +e
