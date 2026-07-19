@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 410,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "840ddccdd378add57e0e16e1284dc8c04fbf2b27",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new step uses `if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}`. Because that expression has no status-check function, GitHub Actions implicitly gates it with `success()`. If `Run policy-selected local gate` fails, the mint is skipped, contrary to the comment that it is not gate-gated and refreshes the token for a followups-only run after a long failed build. In that case app-token-post and app-token-live can both be expired, which is exactly the stale-token failure this change claims to prevent. The follow-up step itself has the same implicit-success behavior, so the documented follow-up-on-gate-failure flow cannot run as written.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Use an explicit status function such as `always()` in the mint condition while retaining the model-success and non-dry-run checks. If follow-ups are intended to run after a failed gate, likewise give their condition an explicit status function; add a workflow self-test/assertion that a model-success + gate-failure case schedules both the refresh and follow-up steps.",
+    "severity": "major",
+    "title": "Post-gate token mint is skipped when the gate fails"
+   }
+  ],
+  "progress": null,
+  "summary": "The fresh post-gate mint correctly covers the successful-gate publish path, but it does not implement the documented gate-failure/follow-up path. GitHub Actions implicitly applies success() to an if expression that contains no status-check function, so the new step is skipped after a failed gate. The fallback tokens may then already be expired after the long gate this change is intended to handle. This makes the change incomplete and contradicts its stated control flow.",
+  "verdict": "request_changes"
+ }
+}
