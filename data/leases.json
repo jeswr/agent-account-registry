@@ -12,16 +12,6 @@
   },
   {
    "account": "acct3css",
-   "claim_id": "fc425971f1974c8c9eab1c5a7d8819c0",
-   "holder": "sparq-org/sparq#2689@dispatch-29669831149.1",
-   "package": "sparq-crdt",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784427315,
-   "expires_at": 1784433615
-  },
-  {
-   "account": "acct3css",
    "claim_id": "c841f49d9f75458e9cccac387f7e36de",
    "holder": "sparq-org/sparq#3230@dispatch-29670211883.1",
    "package": "sparq-reason",
