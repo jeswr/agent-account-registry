@@ -49,10 +49,19 @@
 #                   union the claimed slot is computed from — sol's other round-7 mutation
 #                   dropped "$env_secret_nums" from the union while the listing still ran,
 #                   leaving the env scope enumerated but IGNORED (a dead listing), and the old
-#                   check still passed.
-# Dropping the env listing (or breaking either property) would make an env-only token invisible
-# and permanently burn the claimed slot. set-up-account.yml ships in the guard job's sparse
-# checkout so the assertion also runs live every tick.
+#                   check still passed;
+#   (determination) round 16: pins the FULL dependency chain `taken -> n -> cand -> git/refs
+#                   claim` — everything flowing INTO `taken` proves nothing unless `taken`
+#                   also flows OUT into the claimed ref. Sol's round-16 mutation replaced the
+#                   `n=$(jq ... "$taken" ...)` slot computation with `n=$reserved` and the old
+#                   check still passed, though the union no longer determined the slot and a
+#                   reserved-but-occupied slot would be burned. Every `n=` assignment must
+#                   reference "$taken", every `cand=` must derive from "$n", and the `git/refs`
+#                   creation must claim `refs/acct-claims/$cand` — replacing any link with a
+#                   constant/reserved value goes red.
+# Dropping the env listing (or breaking any of these properties) would make an env-only token
+# invisible and permanently burn the claimed slot. set-up-account.yml ships in the guard job's
+# sparse checkout so the assertion also runs live every tick.
 #
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
@@ -168,6 +177,13 @@ SETUP_ACCOUNT_CLAIM_RE = re.compile(
     r'gh api\s+"repos/\$\{\{ github\.repository \}\}/git/refs"')
 # The union the claimed slot is computed from.
 SETUP_ACCOUNT_UNION_RE = re.compile(r'\btaken=\$\(')
+# The slot computation and candidate construction the union must DETERMINE (sol round 16 on
+# the #275 PR): listings flowing into `taken` prove nothing if `n` is not computed FROM it —
+# `n=$reserved` reintroduces the burned-slot regression with every listing still green.
+# Statement-anchored (start-of-line or whitespace) so `taken=$(`, `claim_nums=$(`, `GH_TOKEN=`
+# and other names merely CONTAINING the letter never match.
+SETUP_ACCOUNT_SLOT_RE = re.compile(r"(?:^|\s)n=")
+SETUP_ACCOUNT_CAND_RE = re.compile(r"(?:^|\s)cand=")
 
 
 def setup_account_store_step_lines(workflow_text):
@@ -198,31 +214,48 @@ def setup_account_union_verdict(step_lines):
     listing (claim refs, acctNN issues in any state, and ACCTNN_TOKEN secret names at BOTH the
     repository scope and the dispatch-secrets environment), each via `gh api --paginate`;
     (b) ORDERING (round 8): issue each listing textually BEFORE the irreversible `git/refs`
-    claim mutation — a post-claim listing cannot stop a burned slot; and (c) PARTICIPATION
+    claim mutation — a post-claim listing cannot stop a burned slot; (c) PARTICIPATION
     (round 8): capture each listing into a variable that appears in the `taken=$(...)` union
     the claimed slot is computed from — a listing whose variable never reaches the union is
-    DEAD and its slots invisible. A missing store step, claim mutation, or union construction
-    is a refusal (fail closed); every refusal names what is missing."""
+    DEAD and its slots invisible; and (d) DETERMINATION (round 16): the claimed ref must be
+    COMPUTED FROM that union through the full chain `taken -> n -> cand -> git/refs claim` —
+    every `n=` assignment references "$taken", every `cand=` derives from "$n", and the
+    `git/refs` creation claims `refs/acct-claims/$cand` — otherwise the union is a dead
+    computation and e.g. `n=$reserved` burns a reserved-but-occupied slot with every listing
+    green. A missing store step, claim mutation, union, slot, or candidate construction is a
+    refusal (fail closed); every refusal names what is missing."""
     if step_lines is None:
         return False, "store step (`id: store`) not found in set-up-account.yml (fail closed)"
+
+    def joined(index):
+        # Join shell continuation lines so a check sees the whole command.
+        parts = [step_lines[index].rstrip()]
+        follow = index
+        while parts[-1].endswith("\\") and follow + 1 < len(step_lines):
+            follow += 1
+            parts.append(step_lines[follow].rstrip())
+        return " ".join(part.rstrip("\\").strip() for part in parts)
+
     listings = {}  # path -> (variable, first line index)
     claim_index = None
+    claim_text = None
     union_index = None
     union_text = None
+    slot_texts = []  # every `n=` assignment (joined) — ALL must reference the union
+    cand_texts = []  # every `cand=` assignment (joined) — ALL must derive from $n
     for index, line in enumerate(step_lines):
         for match in SETUP_ACCOUNT_LISTING_RE.finditer(line):
             listings.setdefault(match.group(2), (match.group(1), index))
         if claim_index is None and SETUP_ACCOUNT_CLAIM_RE.search(line):
             claim_index = index
+            claim_text = joined(index)
         if union_index is None and SETUP_ACCOUNT_UNION_RE.search(line):
             union_index = index
-            # Join shell continuation lines so participation sees the whole command.
-            parts = [line.rstrip()]
-            follow = index
-            while parts[-1].endswith("\\") and follow + 1 < len(step_lines):
-                follow += 1
-                parts.append(step_lines[follow].rstrip())
-            union_text = " ".join(part.rstrip("\\").strip() for part in parts)
+            union_text = joined(index)
+        if SETUP_ACCOUNT_SLOT_RE.search(line):
+            slot_texts.append(joined(index))
+        if SETUP_ACCOUNT_CAND_RE.search(line):
+            cand_texts.append(joined(index))
     if claim_index is None:
         return False, ("irreversible claim mutation (the `git/refs` creation) not found in "
                        "the store step — cannot prove the union precedes it (fail closed)")
@@ -249,6 +282,35 @@ def setup_account_union_verdict(step_lines):
             return False, (f"listing `{path}` is captured into ${variable} but ${variable} "
                            "does not flow into the `taken` union construction — the listing "
                            "is DEAD and every slot it sees stays invisible to the claim")
+    # DETERMINATION (sol round 16): everything above proves the listings flow INTO `taken`,
+    # which is vacuous unless `taken` also flows OUT into the claimed ref — mutating the slot
+    # computation to `n=$reserved` bypasses the union entirely (every listing still green,
+    # still pre-claim, still participating) and burns a reserved-but-occupied slot exactly as
+    # the contract exists to prevent. Pin each edge of `taken -> n -> cand -> git/refs claim`
+    # so replacing any link with a constant/reserved value goes red.
+    if not slot_texts:
+        return False, ("slot computation (`n=`) not found in the store step — cannot prove "
+                       "the `taken` union determines the claimed slot (fail closed)")
+    for text in slot_texts:
+        if '"$taken"' not in text and '"${taken}"' not in text:
+            return False, ("a slot assignment `n=` does not reference the `taken` union "
+                           "(e.g. `n=$reserved`) — the union is computed but IGNORED, and "
+                           "the irreversible claim burns whatever slot `n` names regardless "
+                           "of the listings")
+    if not cand_texts:
+        return False, ("candidate construction (`cand=`) not found in the store step — "
+                       "cannot prove the claimed ref derives from the computed slot "
+                       "(fail closed)")
+    for text in cand_texts:
+        if '"$n"' not in text and '"${n}"' not in text:
+            return False, ("a candidate assignment `cand=` does not derive from \"$n\" (the "
+                           "union-determined slot) — a hardcoded candidate burns a slot the "
+                           "union never blessed")
+    if ("refs/acct-claims/$cand" not in claim_text
+            and "refs/acct-claims/${cand}" not in claim_text):
+        return False, ("the `git/refs` claim creation does not create `refs/acct-claims/$cand` "
+                       "— the claimed ref is severed from the union-derived candidate, so the "
+                       "union cannot have determined the claimed slot")
     return True, "ok"
 
 
@@ -366,13 +428,15 @@ def _self_test():
 
     # Static set-up-account slot-union contract (sol round 6 on the #275 PR, finding 3;
     # strengthened round 8 with the ORDERING + PARTICIPATION properties after sol
-    # mutation-tested the presence-only version in round 7). The broker's pre-claim union is
-    # pure workflow-shell (no script seam), so — following the dispatch.yml permission pin
-    # above and migrate-secrets.sh's workflow mint contract — it is asserted statically over
-    # the workflow text: dropping ANY of the four paginated listings, moving one AFTER the
-    # `git/refs` claim creation, or severing one's variable from the `taken` union goes red
-    # here. set-up-account.yml ships in the guard job's sparse checkout so this also runs live
-    # every tick.
+    # mutation-tested the presence-only version in round 7; strengthened round 16 with the
+    # DETERMINATION chain `taken -> n -> cand -> git/refs claim` after sol mutation-tested
+    # THAT version with `n=$reserved`). The broker's pre-claim union is pure workflow-shell
+    # (no script seam), so — following the dispatch.yml permission pin above and
+    # migrate-secrets.sh's workflow mint contract — it is asserted statically over the
+    # workflow text: dropping ANY of the four paginated listings, moving one AFTER the
+    # `git/refs` claim creation, severing one's variable from the `taken` union, or severing
+    # any link of the `taken -> n -> cand -> claim` chain goes red here. set-up-account.yml
+    # ships in the guard job's sparse checkout so this also runs live every tick.
     store_step_sample = [
         "      - name: Claim slot atomically",
         "        id: store",
@@ -384,6 +448,9 @@ def _self_test():
         '          env_secret_nums=$(gh api --paginate "repos/${{ github.repository }}/environments/dispatch-secrets/secrets?per_page=100" --jq .)',
         "          taken=$(printf '%s\\n%s\\n%s\\n%s\\n' \"$claim_nums\" \"$issue_nums\" \"$secret_nums\" \"$env_secret_nums\" \\",
         "                    | jq -Rn '[inputs | tonumber]')",
+        '          n=$(jq -n --argjson t "$taken" --argjson r "$reserved" \\',
+        "                'if ($t | index($r)) then (([$t[], 0] | max) + 1) else $r end')",
+        "          cand=$(printf 'acct%02d' \"$n\")",
         '          out=$(gh api "repos/${{ github.repository }}/git/refs" \\',
         '                  -f ref="refs/acct-claims/$cand" -f sha="$GITHUB_SHA")',
         "      - name: Validate the registration",
@@ -412,11 +479,36 @@ def _self_test():
     # too late to stop a burned slot.
     reordered = list(store_step_sample)
     env_listing_line = reordered.pop(7)
-    reordered.insert(11, env_listing_line)  # after the two claim-creation lines
+    reordered.insert(14, env_listing_line)  # after the two claim-creation lines
     verdict_reordered = setup_account_union_verdict(
         setup_account_store_step_lines("\n".join(reordered)))
     chk("setup-account union: sol mutation B (env listing AFTER the claim) -> refuse, ordering named",
         (verdict_reordered[0], "AFTER the irreversible `git/refs` claim" in verdict_reordered[1]),
+        (False, True))
+    # sol round-16 mutation C (DETERMINATION, edge taken->n): the jq slot computation is
+    # replaced by `n=$reserved` — every listing still runs pre-claim and flows into `taken`,
+    # but `taken` never determines the claimed slot, burning a reserved-but-occupied slot.
+    slot_bypass = list(store_step_sample)
+    slot_bypass[10:12] = ["          n=$reserved"]
+    verdict_slot = setup_account_union_verdict(
+        setup_account_store_step_lines("\n".join(slot_bypass)))
+    chk("setup-account union: sol mutation C (n=$reserved bypasses taken) -> refuse, ignored union named",
+        (verdict_slot[0], "does not reference the `taken` union" in verdict_slot[1]),
+        (False, True))
+    # round-16 edge n->cand: the candidate is hardcoded instead of derived from $n.
+    cand_hardcoded = list(store_step_sample)
+    cand_hardcoded[12] = "          cand=acct99"
+    verdict_cand = setup_account_union_verdict(
+        setup_account_store_step_lines("\n".join(cand_hardcoded)))
+    chk("setup-account union: candidate hardcoded (cand=acct99) -> refuse, severed derivation named",
+        (verdict_cand[0], "does not derive from" in verdict_cand[1]), (False, True))
+    # round-16 edge cand->claim: the git/refs creation claims a ref that ignores $cand.
+    unbound_claim = union_sample.replace(
+        'ref="refs/acct-claims/$cand"', 'ref="refs/acct-claims/$RESERVED_HANDLE"', 1)
+    verdict_unbound = setup_account_union_verdict(
+        setup_account_store_step_lines(unbound_claim))
+    chk("setup-account union: claim ref ignores cand -> refuse, severed claim named",
+        (verdict_unbound[0], "severed from the union-derived candidate" in verdict_unbound[1]),
         (False, True))
     chk("setup-account union: missing store step -> refuse (fail closed)",
         setup_account_union_verdict(setup_account_store_step_lines("jobs:\n  login:\n"))[0],
@@ -427,6 +519,15 @@ def _self_test():
     no_union = "\n".join(line for line in store_step_sample if "taken=$(" not in line)
     chk("setup-account union: missing taken construction -> refuse (cannot prove participation, fail closed)",
         setup_account_union_verdict(setup_account_store_step_lines(no_union))[0], False)
+    no_slot = list(store_step_sample)
+    del no_slot[10:12]  # both lines of the n= computation
+    chk("setup-account union: missing slot computation -> refuse (cannot prove determination, fail closed)",
+        setup_account_union_verdict(setup_account_store_step_lines("\n".join(no_slot)))[0],
+        False)
+    no_cand = "\n".join(line for line in store_step_sample
+                        if not line.lstrip().startswith("cand="))
+    chk("setup-account union: missing candidate construction -> refuse (cannot prove determination, fail closed)",
+        setup_account_union_verdict(setup_account_store_step_lines(no_cand))[0], False)
     setup_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               os.pardir, ".github", "workflows", "set-up-account.yml")
     try:
@@ -436,7 +537,8 @@ def _self_test():
     except OSError:
         live_union_verdict = (False, "set-up-account.yml unreadable (fail closed)")
     chk("workflow: set-up-account pre-claim union enumerates BOTH secret scopes + claims + issues, "
-        "all paginated, all BEFORE the claim, all flowing into taken",
+        "all paginated, all BEFORE the claim, all flowing into taken, taken determining the "
+        "claimed ref (taken -> n -> cand -> claim)",
         live_union_verdict, (True, "ok"))
 
     # Pure scope verdict — accept AND reject directions.
