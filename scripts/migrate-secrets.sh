@@ -893,22 +893,58 @@ phase_resume() {
 #                                  remain; still no secret-WRITE and no environments power)
 # The comparison is against the FULL sorted set, so REMOVING, WEAKENING (write -> read), or
 # silently WIDENING any `permission-*` declaration goes red in --self-test (wired into
-# pr-gate.yml and worker-live's FULL_SELFTEST_SUITE). When the workflow is deleted after the
-# migration succeeds, this script is deleted with it (see header), taking the contract along.
+# pr-gate.yml and worker-live's FULL_SELFTEST_SUITE). Round 18 (sol): the grant set is read
+# from the mint STEP's own `with:` mapping, and the contract additionally pins EXACTLY ONE
+# create-github-app-token step per phase job plus EXACTLY FIVE in the whole workflow — the
+# old job-wide aggregate let an ADDED second mint step with NO permission-* inputs pass
+# byte-identically, though create-github-app-token treats "no permission-* inputs" as
+# "inherit EVERY permission of the App installation" (a full-power token minted behind an
+# exact-grants green tick). When the workflow is deleted after the migration succeeds, this
+# script is deleted with it (see header), taking the contract along.
 
-_mint_grants() {  # _mint_grants WORKFLOW_FILE JOB_KEY -> that job's sorted permission-* lines
+_mint_grants() {  # _mint_grants WORKFLOW_FILE JOB_KEY -> the permission-* lines of that job's mint step's OWN `with:` mapping, sorted
   awk -v job="$2" '
+    /^[ \t]*#/ { next }
     /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
-    injob && /^ +permission-[a-z-]+:/ { sub(/^ +/, ""); sub(/[ \t]+$/, ""); print }
+    injob && /^      - / { inmint = 0 }
+    injob && /uses:[ \t]*actions\/create-github-app-token/ { inmint = 1 }
+    injob && inmint && /^ +permission-[a-z-]+:/ { sub(/^ +/, ""); sub(/[ \t]+$/, ""); print }
   ' "$1" | sort
 }
 
+_mint_step_count() {  # _mint_step_count WORKFLOW_FILE JOB_KEY -> how many create-github-app-token steps that job holds
+  awk -v job="$2" '
+    /^[ \t]*#/ { next }
+    /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
+    injob && /uses:[ \t]*actions\/create-github-app-token/ { count++ }
+    END { print count + 0 }
+  ' "$1"
+}
+
 check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
-  local wf=$1 want got rc=0
+  local wf=$1 want got rc=0 total job count
   if [[ ! -f "$wf" ]]; then
     printf '::error::migrate-secrets: workflow contract: %s not found (delete this script together with the workflow)\n' "$wf" >&2
     return 1
   fi
+  # ONE-MINT-PER-JOB (sol round 18 of #275, finding 3): the exact-grants pins below read the
+  # mint step's own `with:` mapping — but an ADDED second create-github-app-token step with NO
+  # permission-* inputs contributes nothing to any grant listing while minting a token that
+  # inherits EVERY permission of the App installation. Exactly ONE mint per phase job, and
+  # exactly the FIVE phase mints in the whole file: an extra mint ANYWHERE (inside a covered
+  # job or smuggled into a new job) is a refusal.
+  total=$(grep -vE '^[[:space:]]*#' "$wf" | grep -c 'uses:[[:space:]]*actions/create-github-app-token' || true)
+  if [[ "$total" -ne 5 ]]; then
+    printf '::error::migrate-secrets: workflow contract violated — %s must hold EXACTLY FIVE create-github-app-token mint steps (one per phase job), found %s: an additional mint step with no permission-* inputs silently inherits EVERY permission of the App installation (round 18)\n' "$wf" "$total" >&2
+    rc=1
+  fi
+  for job in quiesce migrate cleanup-bootstrap cleanup-standalone reenable-writers; do
+    count=$(_mint_step_count "$wf" "$job")
+    if [[ "$count" -ne 1 ]]; then
+      printf '::error::migrate-secrets: workflow contract violated — job %s must hold EXACTLY ONE create-github-app-token mint step, found %s: a second mint with no permission-* inputs silently inherits EVERY installation permission, bypassing the exact-grants pin (round 18)\n' "$job" "$count" >&2
+      rc=1
+    fi
+  done
   want=$(printf 'permission-actions: write')
   got=$(_mint_grants "$wf" quiesce)
   if [[ "$got" != "$want" ]]; then
@@ -1930,6 +1966,32 @@ FAKE
   chk "contract goes RED when the resume mint's permission-secrets: read (round 14 R0 listing) is removed" "$rc" 1
   chk "contract names the under-granted RE-ENABLE mint when secrets:read is stripped" \
     "$(grep -c 'the RE-ENABLE mint' "$tmp/s18p.out")" 1
+  # Round 18 (sol finding 3): a SECOND create-github-app-token step with NO permission-*
+  # inputs added to the migrate job leaves every grant listing byte-identical (the old
+  # job-wide permission-* aggregate stayed green) while minting a token that inherits EVERY
+  # permission of the App installation. The one-mint-per-job pin must go red — and an extra
+  # mint smuggled into a NEW (non-phase) job must trip the whole-file five-mint pin too.
+  awk '
+    { print }
+    !done && $0 == "          permission-actions: read" {
+      print "      - name: Second mint (round-18 mutation: no permission inputs)"
+      print "        id: app-token-2"
+      print "        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0"
+      print "        with:"
+      print "          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}"
+      print "          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}"
+      done = 1
+    }
+  ' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18q.out" 2>&1 || rc=$?
+  chk "contract goes RED when a SECOND permissionless mint step is added to the migrate job (round 18: no permission-* inputs = EVERY installation grant, invisible to the grant aggregate)" "$rc" 1
+  chk "contract names the double-minting job (EXACTLY ONE mint per phase job)" \
+    "$(grep -c 'job migrate must hold EXACTLY ONE create-github-app-token' "$tmp/s18q.out")" 1
+  { cat "$wf_real"; printf '  smuggled:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0\n'; } > "$wf_mut"
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18r.out" 2>&1 || rc=$?
+  chk "contract goes RED when an extra mint step arrives in a NEW non-phase job (whole-file five-mint pin)" "$rc" 1
+  chk "contract names the whole-file mint count" \
+    "$(grep -c 'EXACTLY FIVE create-github-app-token' "$tmp/s18r.out")" 1
 
   # --- scenario 18h: ACTOR CONTRACT (round-9 finding 2 — the RE-RUN bypass): github.actor
   # stays the ORIGINAL initiator when a run is re-run, while github.triggering_actor is the

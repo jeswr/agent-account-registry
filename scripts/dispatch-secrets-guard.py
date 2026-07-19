@@ -15,11 +15,12 @@
 #      path yields nothing. CLAIM reads toJSON(secrets), so EVERY repo-scope secret is in its
 #      blast radius — the assertion is total, not a name allowlist.
 #   2. DEFAULT-BRANCH-ONLY ENVIRONMENT — the `dispatch-secrets` environment must exist with a
-#      CUSTOM deployment-branch policy naming exactly the default branch, `branch` type only:
-#      protected-branches mode admits every protected branch (an admin-configurable SET, not
-#      the default branch), and a `tag`-type policy admits a collaborator-created tag of the
-#      same name pointing at arbitrary code. A kept-binding attacker copy at any other ref is
-#      then refused server-side.
+#      CUSTOM deployment-branch policy naming exactly the default branch, EXPLICITLY `branch`
+#      typed (round 18: an entry with a MISSING type is refused — absence cannot prove
+#      non-tag): protected-branches mode admits every protected branch (an admin-configurable
+#      SET, not the default branch), and a `tag`-type policy admits a collaborator-created tag
+#      of the same name pointing at arbitrary code. A kept-binding attacker copy at any other
+#      ref is then refused server-side.
 #
 # Any API failure, malformed document, or missing setting is a hard refusal (never a warning):
 # the dispatcher pauses LOUDLY (red tick every ten minutes) instead of running one more tick in
@@ -73,7 +74,10 @@
 # every other real secret: post-#101 the repo scope is provably empty, so any non-ephemeral name
 # resolves ONLY inside the environment), a dynamic `${{ secrets[...] }}` read (worker/review-fix
 # resolve secrets[secret_ref]), or a whole-context `${{ toJSON(secrets) }}` read — must carry
-# the binding. The ONLY hardcoded entries are the deliberate exceptions (BINDING_EXCEPTIONS):
+# the binding (round 18: the scan is CASE-INSENSITIVE — GitHub resolves secret names that
+# way — and folded-scalar-aware: each job body is scanned as one joined text, since GitHub
+# evaluates expressions only after YAML folding has already erased the line breaks). The ONLY
+# hardcoded entries are the deliberate exceptions (BINDING_EXCEPTIONS):
 # dispatch.yml's secrets-guard job (its UNBOUND toJSON(secrets) read IS check 1 above) and the
 # one-shot migration's quiesce/migrate jobs (env-UNBOUND by design — documented in that file's
 # header); an exception whose job stops consuming, disappears, or gains the binding goes red as
@@ -113,9 +117,11 @@ def repo_scope_verdict(secret_keys):
 
 def branch_policy_verdict(environment_doc, policies_doc, default_branch):
     """Pure: (ok, reason). Accepts ONLY a custom deployment-branch policy whose entries are
-    exactly one `branch`-type policy naming the default branch. Everything else — all-branches
-    default, protected-branches mode, tag-type entries, extra/wrong names, malformed docs —
-    is a refusal with the specific reason."""
+    exactly one EXPLICITLY `branch`-typed policy naming the default branch. Everything else —
+    all-branches default, protected-branches mode, tag-type entries, entries MISSING a type
+    (round 18: absence proves nothing about non-tag, so it fails closed like any other
+    unproven setting), extra/wrong names, malformed docs — is a refusal with the specific
+    reason."""
     if not isinstance(environment_doc, dict):
         return False, "environment document is unreadable"
     policy = environment_doc.get("deployment_branch_policy")
@@ -132,9 +138,15 @@ def branch_policy_verdict(environment_doc, policies_doc, default_branch):
     for entry in policies_doc["branch_policies"]:
         if not isinstance(entry, dict):
             return False, "deployment-branch policy entry is malformed"
-        if entry.get("type", "branch") != "branch":
-            return False, (f"policy type {entry.get('type')!r} is not 'branch' (a tag-type "
-                           "policy admits collaborator-created tags at arbitrary commits)")
+        # Round 18 (sol, #275): the type must be EXPLICITLY "branch". The old default-to-
+        # "branch" on a MISSING key meant a degraded/lenient document whose entries carry
+        # only a name ({"name": "master"}) passed without ever proving the entry is not a
+        # tag policy — this guard exists to verify settings, so an absent setting is an
+        # unproven setting (fail closed), never a default.
+        if entry.get("type") != "branch":
+            return False, (f"policy type {entry.get('type')!r} is not explicitly 'branch' "
+                           "(a missing type cannot prove non-tag, and a tag-type policy "
+                           "admits collaborator-created tags at arbitrary commits)")
         names.append(entry.get("name"))
     if names != [default_branch]:
         return False, (f"policy names {names!r} must be exactly [{default_branch!r}] "
@@ -336,17 +348,30 @@ def setup_account_union_verdict(step_lines):
     return True, "ok"
 
 
-# BINDING-MAP CONTRACT (sol round 17 on the #275 PR) — secrets-context reads that make a job a
-# secret CONSUMER. All three require the `${{` expression opener on the same line: a jq
+# BINDING-MAP CONTRACT (sol round 17 on the #275 PR; scan hardened round 18) — secrets-context
+# reads that make a job a secret CONSUMER. All three require the `${{` expression opener: a jq
 # `.secrets[].name` filter over an API listing, or prose quoting a reference, is not a context
-# read (comment lines/tails are stripped besides). The dotted form accepts ANY uppercase name
-# except the ephemeral GITHUB_TOKEN — post-#101 the repo scope is provably empty (check 1), so
-# every real secret, the 14 migrated names included, resolves ONLY inside the environment and
-# any dotted reference demands the binding. Same-line scope is asserted by the self-test's
-# accept directions over the LIVE workflow texts, not assumed.
-BINDING_SECRET_REF_RE = re.compile(r"\$\{\{[^}]*\bsecrets\.([A-Z][A-Z0-9_]*)")
-BINDING_DYNAMIC_READ_RE = re.compile(r"\$\{\{[^}]*\bsecrets\s*\[")
-BINDING_CONTEXT_READ_RE = re.compile(r"\$\{\{[^}]*toJSON\(\s*secrets\s*\)")
+# read (comment lines/tails are stripped besides — and the opener-to-read span is the negated
+# class `[^}]*`, which can never cross an earlier expression's `}}` closer, so a jq filter
+# appearing after some unrelated expression still never matches). Round 18 (sol finding 2):
+# GitHub resolves secret NAMES case-insensitively (`secrets.acct02_token` reads ACCT02_TOKEN)
+# and evaluates expressions AFTER YAML folds a `>-`/`>` scalar into one string — so a
+# lowercase reference, or an opener and its `secrets.` reference split across folded-scalar
+# continuation lines, is a REAL secret read the old uppercase-only line-at-a-time scan let
+# escape the derived map. The patterns are therefore IGNORECASE and matched over the JOB BODY
+# JOINED into one text (job_secret_reads): `[^}]*` is a negated class, so it spans newlines
+# WITHOUT re.DOTALL, exactly as YAML folding erases them before GitHub ever parses the
+# expression — robust to any scalar style (folded, literal, quoted-flow) with no YAML
+# re-implementation. The dotted form accepts ANY name in any case except the ephemeral
+# GITHUB_TOKEN (compared case-insensitively: GitHub resolves `secrets.github_token` to the
+# same ephemeral token) — post-#101 the repo scope is provably empty (check 1), so every real
+# secret, the 14 migrated names included, resolves ONLY inside the environment and any dotted
+# reference demands the binding. This scope is asserted by the self-test's accept AND reject
+# directions over synthetic and LIVE workflow texts, not assumed.
+BINDING_SECRET_REF_RE = re.compile(
+    r"\$\{\{[^}]*\bsecrets\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+BINDING_DYNAMIC_READ_RE = re.compile(r"\$\{\{[^}]*\bsecrets\s*\[", re.IGNORECASE)
+BINDING_CONTEXT_READ_RE = re.compile(r"\$\{\{[^}]*toJSON\s*\(\s*secrets\s*\)", re.IGNORECASE)
 BINDING_JOB_HEADER_RE = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*):\s*(?:#.*)?$")
 
 # The ONLY jobs allowed to consume secrets UNBOUND — each deliberate, each documented at the
@@ -417,21 +442,28 @@ def job_environment(body_lines):
 
 
 def job_secret_reads(body_lines):
-    """Pure: sorted secret-consuming expressions in one job's body lines (see the BINDING_*
-    regexes above). Full-line comments and ` #` comment tails are stripped first, so prose
-    ABOUT a secret never demands a binding."""
-    reads = set()
+    """Pure: sorted secret-consuming expressions in one job's body (see the BINDING_* regexes
+    above). Full-line comments and ` #` comment tails are stripped first, so prose ABOUT a
+    secret never demands a binding; the surviving code lines are then scanned as ONE joined
+    text (round 18) so an expression split across YAML folded-scalar continuation lines —
+    one string by the time GitHub evaluates it — still registers as a read. Names are
+    reported UPPERCASED: GitHub resolves them case-insensitively, so `secrets.acct02_token`
+    and `secrets.ACCT02_TOKEN` are the same secret (and the ephemeral-token exemption must be
+    case-insensitive for the same reason)."""
+    code_lines = []
     for line in body_lines:
         if line.lstrip().startswith("#"):
             continue
-        code = line.split(" #", 1)[0]
-        for name in BINDING_SECRET_REF_RE.findall(code):
-            if name != "GITHUB_TOKEN":
-                reads.add(f"secrets.{name}")
-        if BINDING_DYNAMIC_READ_RE.search(code):
-            reads.add("secrets[...]")
-        if BINDING_CONTEXT_READ_RE.search(code):
-            reads.add("toJSON(secrets)")
+        code_lines.append(line.split(" #", 1)[0])
+    body = "\n".join(code_lines)
+    reads = set()
+    for name in BINDING_SECRET_REF_RE.findall(body):
+        if name.upper() != "GITHUB_TOKEN":
+            reads.add(f"secrets.{name.upper()}")
+    if BINDING_DYNAMIC_READ_RE.search(body):
+        reads.add("secrets[...]")
+    if BINDING_CONTEXT_READ_RE.search(body):
+        reads.add("toJSON(secrets)")
     return sorted(reads)
 
 
@@ -794,6 +826,49 @@ def _self_test():
             "    environment: dispatch-secrets", "    environment: github-pages")})
     chk("binding map: consumer bound to the WRONG environment -> refuse, binding named",
         (rebound[0], "'github-pages'" in rebound[1]), (False, True))
+    # Round 18 (sol finding 2): GitHub resolves secret names CASE-INSENSITIVELY and evaluates
+    # expressions only AFTER YAML folding — a lowercase reference and a folded multiline
+    # expression are both REAL reads that must demand the binding exactly like the canonical
+    # single-line uppercase spelling.
+    lowercase_doc = "\n".join([
+        "on: workflow_dispatch",
+        "jobs:",
+        "  drift:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: deploy",
+        "        env:",
+        "          CRED: ${{ secrets.acct02_token }}",
+    ])
+    lowercase = binding_map_verdict({"worker.yml": bound_doc, "drift.yml": lowercase_doc})
+    chk("binding map: LOWERCASE secret reference in an unbound job -> refuse, file::job and "
+        "canonical NAME surfaced (GitHub resolves names case-insensitively)",
+        (lowercase[0], "drift.yml::drift" in lowercase[1],
+         "secrets.ACCT02_TOKEN" in lowercase[1]),
+        (False, True, True))
+    folded_doc = "\n".join([
+        "on: workflow_dispatch",
+        "jobs:",
+        "  folded:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: >-",
+        '          echo "${{',
+        '          secrets.ACCT03_TOKEN }}" > /tmp/out',
+    ])
+    folded = binding_map_verdict({"worker.yml": bound_doc, "folded.yml": folded_doc})
+    chk("binding map: FOLDED multiline expression in an unbound job -> refuse (YAML folds the "
+        "scalar into one line before GitHub evaluates it; the scan must too)",
+        (folded[0], "folded.yml::folded" in folded[1],
+         "secrets.ACCT03_TOKEN" in folded[1]),
+        (False, True, True))
+    folded_bound = binding_map_verdict(
+        {"worker.yml": bound_doc,
+         "folded.yml": folded_doc.replace(
+             "    runs-on: ubuntu-latest",
+             "    runs-on: ubuntu-latest\n    environment: dispatch-secrets")})
+    chk("binding map: the same folded read WITH the binding -> ok (accept direction)",
+        folded_bound, (True, "ok"))
     guard_doc = "\n".join([
         "jobs:",
         "  secrets-guard:",
@@ -921,6 +996,12 @@ def _self_test():
         branch_policy_verdict(good_env,
                               {"branch_policies": [{"name": "master", "type": "tag"}]},
                               "master")[0], False)
+    # Round 18 (sol): a policy entry with NO type key must refuse — the old default-to-branch
+    # let a {"name": "master"} entry pass without ever proving it is not a tag policy.
+    missing_type = branch_policy_verdict(
+        good_env, {"branch_policies": [{"name": "master"}]}, "master")
+    chk("policy: entry MISSING an explicit type -> refuse (absence cannot prove non-tag)",
+        (missing_type[0], "not explicitly 'branch'" in missing_type[1]), (False, True))
     chk("policy: wrong branch name -> refuse",
         branch_policy_verdict(good_env,
                               {"branch_policies": [{"name": "staging", "type": "branch"}]},
