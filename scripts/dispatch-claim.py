@@ -1490,7 +1490,9 @@ def latest_recorded_progress(worker_pr, registry_root, repo, number, rounds, com
         except (OSError, json.JSONDecodeError):
             document = None
         if isinstance(document, dict):
-            progress = document.get("progress")
+            # Issue #156: records are now the host envelope {host_envelope, verdict}; unwrap to
+            # the model document (a legacy bare-document record returns itself unchanged).
+            progress = worker_pr.envelope_verdict(document).get("progress")
             if progress in worker_pr.PROGRESS_VALUES:
                 return progress
     return worker_pr.round_progress(comments, bot_login).get(rounds)
@@ -3556,6 +3558,18 @@ def _self_test():
             write_verdict(5, "improving", root=wiring_ledger_root)
             assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 5, [],
                                             bot, ledger_root=wiring_ledger_root) == "improving"
+            # issue #156: a HOST-ENVELOPE record (the new on-disk format) is unwrapped so the
+            # nested verdict's progress grade is still read (the reader is not fooled into
+            # reading progress off the envelope top level, which would degrade to None).
+            env_rel = wiring_worker_pr.verdict_path(repo, 41, 6)
+            env_path = Path(wiring_ledger_root) / env_rel
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.write_text(json.dumps(wiring_worker_pr.verdict_envelope(
+                repo, 41, 6, "a" * 40,
+                {"verdict": "request_changes", "injection_detected": False, "summary": "s",
+                 "issues": [], "progress": "regressing"})), encoding="utf-8")
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 6, [],
+                                            bot, ledger_root=wiring_ledger_root) == "regressing"
             # end-to-end CLAIM wiring on a LEDGER-ONLY provenance record: the legacy record is
             # gone (post-outage reality) and the review item still admits + defers normally
             record_file.unlink()

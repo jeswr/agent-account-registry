@@ -796,6 +796,10 @@ jobs:
       injection_detected: ${{ steps.fix.outputs.injection_detected }}
       gate_outcome: ${{ steps.gate.outcome }}
       pushed: ${{ steps.push.outcome == 'success' && 'true' || 'false' }}
+      # Issue #156: the exact commit the fix pushed. The fix-outcome revalidates the live head
+      # against the head THIS run produced (this sha on a push, else the unchanged reviewed head)
+      # so a stale re-review/needs-user never acts on a head another push produced.
+      pushed_sha: ${{ steps.push.outputs.pushed_sha }}
       # Model-access health (registry #32): the sanitized exit CLASS of the review/fix model launch,
       # recorded by the separate no-target-code `model_health` job (success or failure), plus the
       # sanitized session-limit reset time (review defect #9; empty for every other class).
@@ -1096,6 +1100,11 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           REVIEW_ROUND: ${{ inputs.review_round }}
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          # Issue #156: the head the fixer is about to check out and edit. stage-verdict only
+          # unwraps the recorded verdict when its host envelope binds it to THIS sha; a stale or
+          # legacy-unbound record sets staged=false and the fix step below skips (the sweep
+          # re-reviews the advanced head) — the fixer is never seeded against unreviewed code.
+          EXPECTED_SHA: ${{ needs.resolve.outputs.head_sha }}
         run: |
           set -euo pipefail
           owner="${TARGET_REPO%%/*}"
@@ -1104,13 +1113,17 @@ jobs:
           record="ledger/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
           [[ -f "$record" ]] || record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
           [[ -f "$record" ]] || { echo "::error::no registry verdict record for round $REVIEW_ROUND"; exit 1; }
-          install -m 600 "$record" "$WORKER_ROOT/review-verdict.json"
+          python3 registry/scripts/worker-pr.py stage-verdict \
+            --record-file "$record" \
+            --out-file "$WORKER_ROOT/review-verdict.json" \
+            --expected-sha "$EXPECTED_SHA"
 
       - name: Run same-provider fix (findings framed as untrusted data)
         id: fix
-        # kind=verdict requires the staged verdict; the ci/rebase flavours run whenever prepare
-        # succeeded (stage-verdict is skipped for them, and a FAILED stage still blocks verdict).
-        if: ${{ inputs.mode == 'fix' && steps.prepare.outcome == 'success' && (steps.stage-verdict.outcome == 'success' || steps.stage-verdict.outcome == 'skipped') }}
+        # kind=verdict requires the verdict STAGED against the live head (issue #156:
+        # staged=false means the record was stale/unbound — skip so the sweep re-reviews); the
+        # ci/rebase flavours run whenever prepare succeeded (stage-verdict is skipped for them).
+        if: ${{ inputs.mode == 'fix' && steps.prepare.outcome == 'success' && (steps.stage-verdict.outcome == 'skipped' || steps.stage-verdict.outputs.staged == 'true') }}
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
@@ -1289,6 +1302,7 @@ jobs:
             --target-repo "${{ inputs.target_repo }}" \
             --pr "${{ inputs.pr_number }}" \
             --round "${{ inputs.review_round }}" \
+            --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}" \
             --verdict-file "$RUNNER_TEMP/review-verdict.json"
 
       - name: Mint outcome-scoped App token (PR labels/comments only, no target contents)
@@ -1332,6 +1346,7 @@ jobs:
             --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+            --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
           while IFS= read -r p; do
@@ -1411,7 +1426,10 @@ jobs:
         # [round-5 P1] decision == 'hold' is the hold-wins DROP (a human/groom park landed
         # after the review resolved): the outcome applied NOTHING, so reviewed-sha must stay
         # unbound — the sweep re-derives this head once a human clears the park.
-        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
+        # [issue #156] decision == 'stale' is the head-moved DROP (the live head advanced off
+        # the reviewed sha during the run): the outcome applied NOTHING, so reviewed-sha must
+        # stay unbound — the sweep re-reviews the current head.
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && steps.outcome.outputs.decision != 'stale' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
         run: |
@@ -1441,6 +1459,7 @@ jobs:
             --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \
             --gate-outcome "${{ needs.run.outputs.gate_outcome }}" \
             --pushed "${{ needs.run.outputs.pushed }}" \
+            --reviewed-sha "${{ needs.run.outputs.pushed == 'true' && needs.run.outputs.pushed_sha || needs.resolve.outputs.head_sha }}" \
             --issue "${{ needs.resolve.outputs.issue }}"
 
   # Escalate an unresolvable inverse chain to a human immediately (never silent-queue): if the
