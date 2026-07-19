@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 416,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3906d010adee319ab4b5b7f3c0a29808fb4bf703",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly removes bearer credentials from curl argv by supplying the Authorization header through curl's stdin-backed header input, while preserving token normalization and fail-closed probe behavior. The new self-test assertions are non-vacuous and cover both standard and Claude-Code-shaped probes. Both workflows now create the filtered secret file atomically with mode 0600, eliminating the prior creation-to-chmod exposure window. No trust checks, routing gates, permissions, or audit controls are weakened.",
+  "verdict": "approve"
+ }
+}
