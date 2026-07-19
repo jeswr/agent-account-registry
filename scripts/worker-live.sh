@@ -816,6 +816,26 @@ _workflow_step_if() {
   ' "$file"
 }
 
+# PURE (self-tested): print a workflow step's FULL text — its `- name:` line through the line
+# before the next `- name:` — selected by its exact `id:`. The `if:`-only extractor above cannot
+# see a step's `run:` block, but the #144 trust-root property is about WHICH program the
+# pre-publish re-check executes, and that lives in the body. Empty when the step is absent.
+# (Comment lines that sit BETWEEN steps buffer with the PRECEDING step — assertions must match
+# text inside the step, e.g. flags in its run block, not prose in surrounding comments.)
+_workflow_step_body() {
+  local file="$1" id="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk -v id="$id" '
+    /^[[:space:]]*-[[:space:]]+name:/ {
+      if (started && has_id) { printf "%s", buf; found=1; exit }
+      started=1; has_id=0; buf=""
+    }
+    started { buf = buf $0 "\n" }
+    started && $0 ~ ("^[[:space:]]*id:[[:space:]]*" id "[[:space:]]*$") { has_id=1 }
+    END { if (started && has_id && !found) printf "%s", buf }
+  ' "$file"
+}
+
 # [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
 # unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
 # workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
@@ -2140,6 +2160,59 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(_workflow_step_if "$wf" pr | grep -Fc "steps.republish-trust.outcome == 'success'" || true)" "1"
   chk "the pre-publish trust re-check runs on the gate-success publish path (issue #144)" \
     "$(_workflow_step_if "$wf" republish-trust | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
+
+  # --- [issue #144 review r1] the re-check's TRUST ROOT. The re-check runs AFTER the model
+  # mutated the target tree, so it must execute the verifier snapshot the `pin-trust-gate` step
+  # captured pre-model (from the SHA-pinned checkout, into RUNNER_TEMP outside every model-container
+  # mount) — NEVER target/scripts/trust-gate.py, where the candidate change would control the
+  # program authorizing its own publish. First prove the body extractor on a fixture (per-step in
+  # both directions + fail-closed on an unknown id), then assert the property on the real workflow.
+  # The pre-model `trust` step doubles as the live negative control: it legitimately uses the
+  # target-tree path (pre-model = still the pinned revision), so the extractor demonstrably
+  # separates the two reverify call sites rather than matching anywhere in the file. ---
+  cat > "$tmp/wf-body.yml" <<'YAML'
+      - name: one
+        id: alpha
+        run: |
+          echo alpha-marker
+      - name: two
+        id: beta
+        run: |
+          echo beta-marker
+YAML
+  chk "step-body extractor returns ONLY the selected step's text (per-step, non-vacuous)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" alpha | grep -c 'marker' || true)" "1"
+  chk "step-body extractor reaches the file's LAST step too (END path)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" beta | grep -Fc 'beta-marker' || true)" "1"
+  chk "step-body extractor yields NOTHING for an unknown id (fail-closed)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" gamma | grep -c . || true)" "0"
+  chk "pre-publish re-check executes the PINNED verifier snapshot (issue #144 r1)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "verifier='\${{ runner.temp }}/trust-verifier/trust-gate.py'" || true)" "1"
+  chk "pre-publish re-check NEVER resolves the model-mutable target verifier (issue #144 r1)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -c 'target/scripts/trust-gate' || true)" "0"
+  chk "pre-publish re-check re-binds the snapshot to the pin step's recorded digest" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "expected='\${{ steps.pin-trust-gate.outputs.sha256 }}'" || true)" "1"
+  chk "pre-publish re-check enforces that digest with sha256sum --check --strict" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Fc 'sha256sum --check --strict' || true)" "1"
+  chk "pre-publish re-check requires the snapshot step to have succeeded" \
+    "$(_workflow_step_if "$wf" republish-trust \
+       | grep -Fc "steps.pin-trust-gate.outcome == 'success'" || true)" "1"
+  chk "verifier snapshot copies FROM the SHA-pinned pre-model checkout" \
+    "$(_workflow_step_body "$wf" pin-trust-gate \
+       | grep -Fc 'src="$GITHUB_WORKSPACE/target/scripts/trust-gate.py"' || true)" "1"
+  chk "pre-model trust step still reverifies with the pinned-checkout copy (negative control)" \
+    "$(_workflow_step_body "$wf" trust \
+       | grep -Fc -- '--trust-gate "$GITHUB_WORKSPACE/target/scripts/trust-gate.py"' || true)" "1"
+  # Capture ORDER is the immutability argument: the snapshot's content is trustworthy only because
+  # it is taken before any model code can run. Moving the pin step below the model step flips this.
+  local pin_at model_at
+  pin_at=$(awk '/^[[:space:]]*id:[[:space:]]*pin-trust-gate[[:space:]]*$/{print NR; exit}' "$wf")
+  model_at=$(awk '/^[[:space:]]*id:[[:space:]]*model[[:space:]]*$/{print NR; exit}' "$wf")
+  chk "verifier snapshot is captured BEFORE the model step runs" \
+    "$([[ -n "$pin_at" && -n "$model_at" && "$pin_at" -lt "$model_at" ]] \
+       && echo before || echo after-or-missing)" "before"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
