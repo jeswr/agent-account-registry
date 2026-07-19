@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change closes the fork-PR suppression path consistently in both advisory PLAN and authoritative CLAIM: worker-branch linkage now requires an exact same-repository, anchored worker ref, while body closing keywords require either that provenance or GitHub's trusted author association. Missing provenance fields deny linkage, so the behavior fails closed, and PLAN/CLAIM use matching association sets and branch patterns. The CLAIM self-tests are non-vacuous and cover both admitted paths plus fork-body, fork-worker-ref, and untrusted same-repo non-worker denials. No token, permission, action, label-routing, SHA-binding, or trust-surface arming behavior is weakened. The diff contains code/comments describing security invariants, not an instruction directed at the reviewer.",
+ "verdict": "approve"
+}
