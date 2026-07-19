@@ -891,17 +891,20 @@ def get_review_state(repo, pr_number):
 def record_round(repo, pr_number, round_n, run_key, bot_login, head_sha):
     """Record the pre-model round marker, BOUND to the head sha this round reviews (issue #162).
     The `sha=` content key ties the charged round to concrete content so a stale-head outcome can
-    be voided (see record_round_void); a malformed/absent head sha degrades to `none` (still
-    sha-agnostic for counting) rather than dropping the accounting."""
+    be voided (see record_round_void). The head sha is a trust-plane identity field: a missing or
+    malformed value STOPS the mutation (fail closed) rather than degrading to a weaker unbound
+    marker — no round is ever charged unless it is bound to the concrete 40-hex head it reviewed.
+    (Legacy pre-#162 markers carry no `sha=` key at all; count_rounds still parses those.)"""
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha or ""):
+        raise WorkerPrError("round marker requires a 40-hex head sha (fail closed; issue #162)")
     comments = _paginated_comments(repo, pr_number)
     if round_recorded(comments, bot_login, round_n, run_key):
         print(f"review round already recorded: {round_n}")
         return
-    sha = head_sha if re.fullmatch(r"[0-9a-f]{40}", head_sha or "") else "none"
     body = (f"> 🤖 SPARQ agent — cross-provider review round {round_n} recorded.\n\n"
-            f"{ROUND_MARKER} n={round_n} run={run_key} sha={sha} -->")
+            f"{ROUND_MARKER} n={round_n} run={run_key} sha={head_sha} -->")
     _comment(repo, pr_number, body)
-    print(f"review round recorded: {round_n} @ {sha[:12]}")
+    print(f"review round recorded: {round_n} @ {head_sha[:12]}")
 
 
 def record_round_void(repo, pr_number, round_n, run_key, bot_login):
@@ -2522,7 +2525,35 @@ def _self_test():
     check("sha-bound markers still count", count_rounds(sha_bound, bot), 2)
     check("sha-bound marker matches round_recorded (sha-agnostic)",
           round_recorded(sha_bound, bot, 2, "11.1"), True)
-    check("sha=none marker parses",
+    # record_round NO LONGER writes an unbound `sha=none` marker: a missing/malformed head sha is a
+    # trust-plane identity failure that STOPS the mutation (fail closed) instead of degrading to a
+    # weaker durable marker. Both directions are asserted here — the reject path (no comment posted)
+    # and the accept path (a concrete 40-hex sha is bound into the marker).
+    rr_posts = []
+    saved_pag = globals()["_paginated_comments"]
+    saved_comment = globals()["_comment"]
+    try:
+        globals()["_paginated_comments"] = lambda repo, pr: []
+        globals()["_comment"] = lambda repo, pr, body: rr_posts.append(body)
+        for bad in ("", "none", "z" * 40, "b" * 39, "B" * 40, ("b" * 40) + "0"):
+            rr_posts.clear()
+            try:
+                record_round("o/r", 7, 1, "9.1", bot, bad)
+                check(f"record_round rejects head sha {bad!r}", "no error", "raised")
+            except WorkerPrError:
+                check(f"record_round rejects head sha {bad!r} without posting", rr_posts, [])
+        rr_posts.clear()
+        record_round("o/r", 7, 3, "9.1", bot, "a" * 40)
+        check("record_round binds a valid head sha into the marker",
+              rr_posts and f"sha={'a' * 40} -->" in rr_posts[0] and "sha=none" not in rr_posts[0],
+              True)
+    finally:
+        globals()["_paginated_comments"] = saved_pag
+        globals()["_comment"] = saved_comment
+    # Legacy read tolerance only: a pre-#162 marker with NO `sha=` key still counts, and count_rounds
+    # also tolerates a stray `sha=none` on READ (writing one is now impossible) so accounting is
+    # never lost — the WRITE path above is what enforces the binding.
+    check("legacy sha=none marker still counts on read",
           count_rounds([{"user": {"login": bot},
                          "body": f"x {ROUND_MARKER} n=3 run=9.1 sha=none -->"}], bot), 3)
     # A voided (round, run) is not charged: the top round drops back to the last unvoided round,
@@ -4581,9 +4612,10 @@ def main():
     rrec.add_argument("--run-key", required=True)
     rrec.add_argument("--bot-login", required=True)
     # Issue #162: the head sha this round reviews binds the marker to concrete content so a
-    # stale-head outcome can be voided rather than charged. A malformed/absent value degrades to
-    # `none` inside record_round (the round is still recorded and counted).
-    rrec.add_argument("--head-sha", default="")
+    # stale-head outcome can be voided rather than charged. It is a trust-plane identity field, so
+    # record_round REJECTS a missing/malformed value (fail closed) rather than writing an unbound
+    # marker — --head-sha is required and must be a 40-hex commit id.
+    rrec.add_argument("--head-sha", required=True)
 
     rchk = subparsers.add_parser("round-check", parents=[common])
     rchk.add_argument("--max-rounds", required=True, type=int)
