@@ -1275,7 +1275,10 @@ def _issue_is_trusted(issue, trusted_bots):
     any unrelated or compromised GitHub App into the dispatch pipeline (the defect this closes)."""
     if not isinstance(issue, dict):
         return False
-    author = (issue.get("user") or {}).get("login")
+    # A truthy non-dict `user` (string/list) must DENY, not raise AttributeError — the CLAIM loop
+    # catches only DispatchError, so an uncaught exception here would abort the whole dispatch.
+    user = issue.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
     association = str(issue.get("author_association", "")).upper()
     return (
         isinstance(author, str)
@@ -1346,7 +1349,8 @@ def _current_issue_matches(repo, item, trusted_bots):
     labels = _labels(issue)
     if labels != item["labels"]:
         return False, "issue labels changed after planning"
-    author = issue.get("user", {}).get("login")
+    user = issue.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
     if author != item["author"]:
         return False, "issue author changed after planning"
     body = issue.get("body") or ""
@@ -2618,6 +2622,10 @@ def _self_test():
     # a non-collaborator human is never trusted; malformed shapes fail closed
     assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"}, allow)
     assert not _issue_is_trusted({"user": None, "author_association": "MEMBER"}, allow)
+    # a truthy non-dict `user` must DENY, never raise (an AttributeError would escape the CLAIM
+    # loop's DispatchError-only handler and abort the whole dispatch)
+    assert not _issue_is_trusted({"user": "malformed", "author_association": "MEMBER"}, allow)
+    assert not _issue_is_trusted({"user": ["x"], "author_association": "OWNER"}, allow)
     assert not _issue_is_trusted("nope", allow)
 
     # ---- issue #102: CLAIM independently RE-PROVES the readiness predicate (non-dispatchable
@@ -2666,6 +2674,12 @@ def _self_test():
     assert ok_bot, "allowlisted bot author must claim"
     denied_bot, denied_reason = match_with(bot_issue, {}, bot_item, frozenset())
     assert not denied_bot and "authored" in denied_reason, denied_reason
+    # a malformed nested `user` shape DENIES the item on the author leg — it must never surface as
+    # an AttributeError, which the per-item DispatchError handler would not catch (whole-run abort)
+    mal_issue = {"state": "open", "user": "malformed", "author_association": "MEMBER",
+                 "labels": [{"name": name} for name in ready_labels], "body": plain_body}
+    mal_ok, mal_reason = match_with(mal_issue, {}, item102)
+    assert not mal_ok and "author" in mal_reason, mal_reason
     # kind:epic is independently rejected even though the plan emitted it (and its labels match)
     epic_labels = sorted(ready_labels + [NON_DISPATCHABLE])
     epic_item = dict(item102, labels=epic_labels)
