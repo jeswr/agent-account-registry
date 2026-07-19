@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 361,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e20d8fdcae44fa332d2a43c7070ab3bdabe0d3ce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change closes the public device-challenge disclosure path without weakening existing trust gates. It fails before starting provider login when the issue requester has no importable, encryption-capable GitHub-published GPG key, preserves the isolated keyring across the preflight and login steps, encrypts the challenge to the exact fingerprint proven usable, and posts only armored ciphertext. Missing recipient state and encryption/comment failures terminate the login step under set -euo pipefail; no new permissive fallback, secret logging, unpinned action, or privilege expansion is introduced. I found no blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
