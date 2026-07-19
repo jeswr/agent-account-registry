@@ -757,11 +757,17 @@ jobs:
           PY
           # Resolve the account issue by EXACT title. It must exist (only the trust-gated broker
           # creates acctNN issues); if already available this is an idempotent re-trigger (no-op).
-          num=$(gh issue list -R "$REPO" --state all --search "\"$handle\" in:title" \
-                  --json number,title --jq "([.[]|select(.title==\"$handle\")][0]).number // empty")
-          if [ -z "$num" ]; then
-            echo "::error::no account issue titled '$handle' — nothing to activate (fail closed)"; exit 1
+          # Require EXACTLY ONE exact-title match, matching the inline activation invariant: a
+          # `[...][0]` first-match pick would silently relabel an arbitrary duplicate (duplicate
+          # acctNN issues are possible after a retried/partial enrollment, since registration
+          # creates the issue without proving title uniqueness), so zero OR two+ matches fail
+          # closed on ambiguous identity rather than mutating the wrong account (round 2 of #383).
+          mapfile -t nums < <(gh issue list -R "$REPO" --state all --search "\"$handle\" in:title" \
+                  --json number,title --jq ".[]|select(.title==\"$handle\")|.number")
+          if [ "${#nums[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one account issue titled '$handle' in any state, found ${#nums[@]} — refusing to activate (fail closed)"; exit 1
           fi
+          num=${nums[0]}
           labels=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
           case " $labels " in
             *" status:available "*) echo "$handle (issue #$num) already status:available — nothing to do"; exit 0 ;;
