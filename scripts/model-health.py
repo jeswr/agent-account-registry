@@ -37,6 +37,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -870,11 +871,70 @@ def read_ledger(api, registry_repo):
     return validate_ledger(document), sha
 
 
-def append_record(api, registry_repo, record, now, retries=6):
-    """CAS-append one record and prune the window (bounded write). Retries on conflict exactly like
-    the lease-ledger writer. Returns the pruned record count on success."""
-    for _ in range(retries):
+# --- CAS retry backoff (issue #200; same full-jitter schedule as select-and-claim._sleep_backoff,
+# issue #179). The record writer is one of the CAS writers #179 named as STILL retrying in
+# lockstep: every worker/reviewer/fixer/dispatch tick appends to this single blob, so a synchronized
+# completion burst collided on every one of its six NO-DELAY attempts and exhausted them, silently
+# discarding records (an outage then reads below threshold). An exponential FULLY JITTERED sleep
+# between attempts decorrelates the writers so a loser backs off a random amount and the tip has
+# settled by its next read; the count is raised so a genuinely contended write still lands. The
+# ceiling is split from the random draw so the schedule is unit-tested without the RNG, and
+# _sleep_backoff is module-level so --self-test can stub it without sleeping.
+CAS_RETRIES = 8
+
+
+def _backoff_ceiling(attempt, base=0.5, cap=8.0):
+    """Upper bound (seconds) for the sleep before CAS retry `attempt` (1-based): exponential
+    base*2**(attempt-1), clamped to `cap`."""
+    return min(cap, base * (2 ** (attempt - 1)))
+
+
+def _backoff_delay(attempt):
+    return random.uniform(0, _backoff_ceiling(attempt))
+
+
+def _sleep_backoff(attempt):
+    """Sleep a full-jitter exponential backoff before CAS retry `attempt` (module-level so the
+    self-test can stub it without sleeping)."""
+    time.sleep(_backoff_delay(attempt))
+
+
+def _record_identity(record):
+    """Idempotency key (issue #200): the fields that identify one underlying OUTCOME, so a REPLAY of
+    the same outcome is recognised and never appended twice — a duplicate would double-count toward
+    the derived per-account backoff and the alert thresholds (a false escalation). Keyed on the
+    GITHUB_RUN_ID — the part of run_id BEFORE the `.RUN_ATTEMPT` suffix — plus provider, salted
+    account, folded class and model alias. Deliberately NOT the write-time ts NOR the run ATTEMPT:
+    re-running ONLY the failed recorder bumps GITHUB_RUN_ATTEMPT while replaying the identical
+    outcome (the exact duplication the issue describes), so an attempt-sensitive key would miss it.
+    Returns None when run_id is empty — an unkeyed record cannot be safely deduplicated (distinct
+    outcomes could share the remaining fields), so it always appends (fail toward recording)."""
+    if not isinstance(record, dict):
+        return None
+    run_id = record.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    return (run_id.split(".", 1)[0], record.get("provider"), record.get("account"),
+            record.get("exit_class"), record.get("model_alias"))
+
+
+def append_record(api, registry_repo, record, now, retries=CAS_RETRIES):
+    """CAS-append one record and prune the window (bounded write). Retries on conflict with a
+    full-jitter exponential backoff BETWEEN attempts (issue #200) — a synchronized completion burst
+    that retried in lockstep with no delay could exhaust the budget and DISCARD records. The write
+    is IDEMPOTENT: if this exact outcome is already on the ledger (a re-run of the failed recorder
+    replaying it — GITHUB_RUN_ATTEMPT bumped, outcome unchanged), the append is a confirmed no-op,
+    so a duplicate can never falsely escalate the derived backoff or an alert. Returns the pruned
+    record count on success, or the unchanged window count on a dedup no-op."""
+    identity = _record_identity(record)
+    for attempt in range(retries):
+        if attempt:
+            _sleep_backoff(attempt)   # backoff fires BETWEEN attempts, never before the first read
         records, sha = read_ledger(api, registry_repo)
+        # Idempotent no-op: this outcome is already recorded (a replayed recorder). Do NOT append a
+        # duplicate that would double-count toward backoff/alert escalation (issue #200).
+        if identity is not None and any(_record_identity(r) == identity for r in records):
+            return len(prune(records, now))
         records = prune(records + [record], now)
         encoded = base64.b64encode(
             (json.dumps({"records": records}, indent=1) + "\n").encode()).decode()
@@ -1777,6 +1837,8 @@ def _self_test():
 
     # ---- CAS writer against a stub API (create + append + conflict retry) --------------------
     ok = _test_cas(chk) and ok
+    # ---- #200: CAS writer is idempotent (dedup) + bounded jittered retry ---------------------
+    ok = _test_cas_dedup_jitter(chk) and ok
 
     # ---- alert upsert operational idempotency (defect #7) ------------------------------------
     ok = _test_upsert(chk) and ok
@@ -1883,10 +1945,18 @@ def _test_cas(chk):
     kept = append_record(api, "o/r", make_record(
         "anthropic", account_hash("acct02", salt), "fable", "success", "10", now + 1), now + 1)
     chk("CAS appends", kept, 2)
-    # conflict retry
-    apic = _StubAPI(seed=[], conflict_first=True)
-    kept = append_record(apic, "o/r", r, now)
+    # conflict retry: rides out one CAS conflict, backing off exactly once BETWEEN the two attempts
+    # (issue #200 — the backoff must never fire before the first read, and must fire on a conflict)
+    real_sleep = globals()["_sleep_backoff"]
+    backoff_attempts = []
+    globals()["_sleep_backoff"] = lambda attempt: backoff_attempts.append(attempt)
+    try:
+        apic = _StubAPI(seed=[], conflict_first=True)
+        kept = append_record(apic, "o/r", r, now)
+    finally:
+        globals()["_sleep_backoff"] = real_sleep
     chk("CAS retries past a conflict", kept, 1)
+    chk("CAS backs off once, only between attempts (issue #200)", backoff_attempts, [1])
     # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
     chk("ledger read targets the ledger ref",
         ledger_read_path("o/r"), f"/repos/o/r/contents/{LEDGER_PATH}?ref=ledger")
@@ -1899,6 +1969,65 @@ def _test_cas(chk):
     chk("missing ledger BRANCH fails loud (never silently-empty)", missing_branch_loud, True)
     chk("missing ledger FILE on a present branch seeds empty (first-write path)",
         read_ledger(_StubAPI(seed=None), "o/r"), ([], None))
+    return True
+
+
+def _test_cas_dedup_jitter(chk):
+    """Issue #200: the CAS writer is IDEMPOTENT (a replayed outcome does not append a duplicate that
+    would double-count toward backoff/alert escalation) and its conflict retries use a bounded
+    FULL-JITTER backoff (a synchronized burst retrying in lockstep must not exhaust the budget and
+    discard records). Every assertion is non-vacuous: deleting the dedup check flips the idempotency
+    block red, and flattening the backoff schedule flips the jitter block red."""
+    salt, now = "s3cret", 3_000_000
+    ah = account_hash("codex01", salt)
+    real_sleep = globals()["_sleep_backoff"]
+    globals()["_sleep_backoff"] = lambda attempt: None   # no real sleeping in the dedup paths
+    try:
+        # --- IDEMPOTENCY: the SAME outcome replayed is a no-op, not a duplicate -----------------
+        api = _StubAPI(seed=[])
+        r = make_record("openai", ah, "sol", "rate-limit", "9999.1", now)
+        n1 = append_record(api, "o/r", r, now)
+        # a re-run of ONLY the failed recorder bumps GITHUB_RUN_ATTEMPT (.1 -> .2) but replays the
+        # identical outcome with a fresh write-time ts — keyed on GITHUB_RUN_ID it is a duplicate.
+        replay = make_record("openai", ah, "sol", "rate-limit", "9999.2", now + 30)
+        n2 = append_record(api, "o/r", replay, now + 30)
+        chk("replayed recorder (bumped RUN_ATTEMPT) is an idempotent no-op",
+            (n1, n2, len(api.records())), (1, 1, 1))
+        # ...so the derived backoff reflects ONE hit, never a falsely-escalated two
+        chk("dedup keeps the derived backoff at a single consecutive hit",
+            account_backoffs(api.records(), now + 60).get(ah, {}).get("consecutive"), 1)
+        # a DISTINCT run (different GITHUB_RUN_ID) is a genuine second outcome and DOES append
+        r2 = make_record("openai", ah, "sol", "rate-limit", "10000.1", now + 40)
+        n3 = append_record(api, "o/r", r2, now + 40)
+        chk("a distinct GITHUB_RUN_ID is a genuine hit and appends",
+            (n3, len(api.records())), (2, 2))
+        chk("two distinct runs escalate the backoff to consecutive=2",
+            account_backoffs(api.records(), now + 60).get(ah, {}).get("consecutive"), 2)
+        # a record with NO run_id cannot be keyed -> always appends (never falsely deduped)
+        unkeyed = make_record("openai", ah, "sol", "rate-limit", "", now + 50)
+        napp = append_record(_StubAPI(seed=[dict(unkeyed)]), "o/r", unkeyed, now + 50)
+        chk("an unkeyed (no run_id) record is never deduped", napp, 2)
+    finally:
+        globals()["_sleep_backoff"] = real_sleep
+
+    # --- BOUNDED FULL-JITTER BACKOFF SCHEDULE (deterministic, RNG split out) --------------------
+    # Exponential then capped: dropping the exponent (linear) or the cap flips this red.
+    chk("backoff ceiling is exponential then capped at 8 s",
+        [_backoff_ceiling(a) for a in (1, 2, 3, 4, 5, 6, 10)],
+        [0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0])
+    # Full jitter: the delay must BE the RNG draw over exactly [0, ceiling]. Stubbing random.uniform
+    # pins both properties — a deterministic delay would either never call the RNG or discard its
+    # draw, flipping these red.
+    real_uniform = random.uniform
+    uniform_calls, sentinel = [], 4.2
+    random.uniform = lambda lo, hi: (uniform_calls.append((lo, hi)), sentinel)[1]
+    try:
+        draws = [_backoff_delay(a) for a in range(1, 7)]
+    finally:
+        random.uniform = real_uniform
+    chk("backoff delay draws uniform(0, ceiling) with exact bounds",
+        uniform_calls, [(0, _backoff_ceiling(a)) for a in range(1, 7)])
+    chk("backoff delay propagates the RNG draw unchanged", draws, [sentinel] * 6)
     return True
 
 
@@ -2080,6 +2209,8 @@ def _test_record_exit(chk):
                 return None    # empty ledger; every PUT below loses the CAS race
             raise HealthConflict("stub: permanent CAS contention")
 
+    real_sleep = globals()["_sleep_backoff"]
+    globals()["_sleep_backoff"] = lambda attempt: None   # never sleep the jittered backoff in-test
     try:
         os.environ.update(REGISTRY_REPO="o/r", WORKER_ACCOUNT_HANDLE="acct01",
                           PROVENANCE_SALT="s3cret", GH_TOKEN="tok")
@@ -2089,6 +2220,7 @@ def _test_record_exit(chk):
         chk("record exits nonzero on CAS exhaustion", _cmd_record(args), 1)
     finally:
         GitHubAPI = real_api
+        globals()["_sleep_backoff"] = real_sleep
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
