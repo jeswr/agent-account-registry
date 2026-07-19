@@ -757,6 +757,71 @@ def _self_test():
     check("sol lease on a legacy [terra] record is adoptable (adoption path normalized)",
           adopted and adopted.get("secret_ref"), "L_TOKEN")
 
+    # ---- WORKER.YML DRY-RUN PATH (round 5): the embedded "Validate dry-run account" heredoc
+    # imports this module and must route its parsed record through the SAME read-time
+    # legacy-shape normalization as read_accounts. It historically called _parse_account()
+    # directly (literal model membership), so a legacy `models: [terra]` record failed the
+    # sol-led dry-run even though the live claim path normalizes it. This extracts the REAL
+    # heredoc from worker.yml and runs it against a legacy fixture that a sol route must
+    # accept — red if the normalization call is ever dropped again. Fail closed: a missing
+    # worker.yml / heredoc marker is a failure, not a skip (the enrolled-suite convention).
+    import tempfile
+    import textwrap
+    from pathlib import Path
+
+    wf_path = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "worker.yml"
+    dryrun_rc, dryrun_out, dryrun_err, dryrun_gh_output = None, "", "", ""
+    try:
+        wf_text = wf_path.read_text(encoding="utf-8")
+        step_at = wf_text.index("Validate dry-run account against resolved policy")
+        hd_start = wf_text.index("<<'PY'\n", step_at) + len("<<'PY'\n")
+        hd_end = wf_text.index("\n          PY\n", hd_start)
+        dryrun_script = textwrap.dedent(wf_text[hd_start:hd_end])
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            (tdp / "target-routing").mkdir()
+            (tdp / "target-routing" / "routing.toml").write_text(
+                '[models.sol]\nprovider = "openai"\nharness = "codex"\n'
+                'provider_model = "gpt-5.6-sol"\ncredential_format = "codex-auth-json"\n',
+                encoding="utf-8")
+            policy_path = tdp / "policy.json"
+            policy_path.write_text(json.dumps({
+                "routing": "routing.toml",
+                "model_chain": ["sol", "luna", "terra"],
+                "account_pool": ["acctlegacy"],
+            }), encoding="utf-8")
+            accounts_path = tdp / "accounts.json"
+            accounts_path.write_text(json.dumps([{
+                "title": "acctlegacy",
+                "body": "provider: openai\nharness: codex\nmodels: [terra]\n"
+                        "secret_ref: ACCTLEGACY_TOKEN\nmax_concurrent_workers: 2",
+                "labels": [{"name": "status:available"}],
+            }]), encoding="utf-8")
+            gh_output_path = tdp / "github_output"
+            env = {k: v for k, v in os.environ.items() if k != "PROVENANCE_SALT"}
+            env.update({"GITHUB_WORKSPACE": str(tdp), "ACCOUNT": "acctlegacy",
+                        "GITHUB_OUTPUT": str(gh_output_path)})
+            proc = subprocess.run(
+                [sys.executable, "-", str(Path(__file__).resolve()),
+                 str(policy_path), str(accounts_path)],
+                input=dryrun_script, capture_output=True, text=True, env=env, check=False)
+            dryrun_rc, dryrun_out, dryrun_err = proc.returncode, proc.stdout, proc.stderr
+            if gh_output_path.exists():
+                dryrun_gh_output = gh_output_path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(f"  FAIL worker.yml dry-run heredoc extraction: {exc}")
+        ok = False
+    dryrun_err_tail = dryrun_err.strip().splitlines()[-1] if dryrun_err.strip() else ""
+    check(f"worker.yml dry-run validates a legacy [terra] record for a sol route "
+          f"(stderr tail: {dryrun_err_tail!r})", dryrun_rc, 0)
+    check("worker.yml dry-run resolves model=sol through the shared normalization",
+          "model=sol" in dryrun_gh_output and "harness=codex" in dryrun_gh_output, True)
+    check("worker.yml dry-run normalization diagnostic fires (shared function, not a re-impl)",
+          "legacy-shape normalization" in dryrun_err, True)
+    check("NEGATIVE: worker.yml dry-run leaks no raw handle to stdout/stderr",
+          [s for s in ("stdout", "stderr")
+           if "acctlegacy" in {"stdout": dryrun_out, "stderr": dryrun_err}[s]], [])
+
     full1 = [make_lease("acct01", "h", "p", "r", "terra", now, 100)]
     check("cap fallthrough", choose_account(A, full1, ["terra", "fable"], "p", "r", now), "acct02")
     exp = [make_lease("acct01", "h", "p", "r", "terra", 0, 10)]  # expires_at=10 < now → reclaimed

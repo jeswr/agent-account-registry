@@ -266,7 +266,13 @@ jobs:
           if account_name not in policy["account_pool"]:
               raise SystemExit(f"selected account {account_name} is outside the resolved account pool")
 
-          account = allocator._parse_account(item.get("body"))
+          # Round 5: route the parsed record through the SAME read-time legacy-shape
+          # normalization read_accounts applies (sol r3 f1). A raw _parse_account() here gates
+          # model membership LITERALLY, so a legacy `models: [terra]` record would fail this
+          # sol-led dry-run even though the live claim path normalizes it. (Privacy: the parsed
+          # record carries no handle and this step exports no PROVENANCE_SALT, so the shared
+          # diagnostic stays handle-free in these public logs.)
+          account = allocator.normalize_legacy_models(allocator._parse_account(item.get("body")))
           model = next((candidate for candidate in policy["model_chain"]
                         if candidate in account.get("models", [])), None)
           if model is None:
