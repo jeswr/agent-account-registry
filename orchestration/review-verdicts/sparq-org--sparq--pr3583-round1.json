@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3583,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ba3403ddcf06319fb43840ea7325909f81ce918f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The design-of-record R4 scope quoted by this change covers both dead jeswr.github.io/sparq links and stale github.com/jeswr/sparq repository references, but DEAD_ORIGIN checks only the former. At the PR head, site/src/data/served-conformance.generated.json still contains https://github.com/jeswr/sparq/actions, so the migration is incomplete and this new test nevertheless passes. This contradicts the sweep's completeness claim and leaves a user-facing/generated-data path pointing at the prior repository location.",
+    "file": "site/e2e/no-dead-origins.spec.ts",
+    "fix_hint": "Extend the static guard to reject both stale patterns (with narrowly justified exclusions only where required), update the test name/error text accordingly, and migrate the remaining site/src/data/served-conformance.generated.json reference to https://github.com/sparq-org/sparq/actions. Ensure any generated-data source is updated too so regeneration does not restore it.",
+    "severity": "major",
+    "title": "Guard omits stale github.com/jeswr/sparq references"
+   }
+  ],
+  "progress": null,
+  "summary": "The repository-origin migration is incomplete and the new regression guard only covers the dead GitHub Pages origin, despite the stated R4 scope covering stale github.com/jeswr/sparq references too. A stale old-repository URL remains under site/src and will pass this test.",
+  "verdict": "request_changes"
+ }
+}
