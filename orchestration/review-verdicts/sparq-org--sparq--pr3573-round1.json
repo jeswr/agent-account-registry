@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The start barrier releases the reader and writers together, but scheduling may let all 4,000 reader polls finish before any writer commits (or all writers finish before the first poll). Thus the test reliably proves that the captured snapshot is unchanged before and after commits, but it does not deterministically establish the documented reader-under-writer overlap.",
+   "file": "crates/sparq-engine/tests/txn_concurrency.rs",
+   "fix_hint": "If simultaneous activity is load-bearing, add explicit mid-test coordination (for example channels or a second barrier/phase) that proves at least one writer completes while the reader polling phase is active, while retaining the final pinned-snapshot assertion. Otherwise narrow the comments/name to describe snapshot pinning across concurrent committers without claiming forced polling overlap.",
+   "severity": "minor",
+   "title": "Reader polling is not guaranteed to overlap a commit"
+  }
+ ],
+ "progress": null,
+ "summary": "The new feature-gated integration tests correctly exercise the real TransactionManager path: barriers ensure writers share a base generation before commit, conflicting write sets permit exactly one winner, disjoint stale writers preserve every delta, and a begin-time ReadTxn remains pinned after concurrent commits. Assertions cover both cardinality and concrete triples, so they are not vacuous. No security or soundness defect is apparent in the diff. One minor limitation is that the reader test's barrier does not itself guarantee that any polling query overlaps a writer's commit, although its before/after assertions still validate the claimed snapshot-pinning behavior. Cargo was unavailable in the review environment, so execution could not be independently repeated.",
+ "verdict": "approve"
+}
