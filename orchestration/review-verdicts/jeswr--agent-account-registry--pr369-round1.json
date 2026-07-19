@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 369,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a0fa7748e0f705ea141480348be1a17da626f6ab",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The two job-level guards correctly prevent these secret-reading diagnostic jobs from running in a public repository. The explicit boolean comparison is fail-closed for a false or unavailable repository privacy value, is evaluated before job steps and environment secret access, and leaves the existing least-privilege permissions and secret-handling controls intact. The change is complete for both affected probe workflows, and the diff contains no reviewer-directed prompt injection.",
+  "verdict": "approve"
+ }
+}
