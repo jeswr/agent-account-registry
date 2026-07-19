@@ -12,16 +12,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "4c2f391dfe2b402eb6ce9c0b3ae802a7",
-   "holder": "sparq-org/sparq#3067@29704147567.1",
-   "package": "bench",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784495993,
-   "expires_at": 1784502293
-  },
-  {
-   "account": "acct01",
    "claim_id": "e238e1d84ef34d38997c4db147cbd8f2",
    "holder": "review:sparq-org/sparq#3635@dispatch-29703935563.1",
    "package": "sparq-mpc",
