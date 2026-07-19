@@ -251,21 +251,34 @@ jobs:
                   return True
               return author in trusted_bots or author.endswith("[bot]")
 
-          def linked_issue_numbers(pulls):
+          def linked_issue_numbers(pulls, repo):
+              # Fork PRs must NEVER suppress an issue (registry issue #110). Only a same-repo
+              # `sparq-agent/issue-N-*` head is pipeline-owned provenance (a fork PR's head lives
+              # on the fork, so its branch text is attacker-controlled); a trusted collaborator's
+              # closing keyword is admitted after an explicit author-association check. PLAN is
+              # advisory — CLAIM's _linked_open_pr_issues re-derives the SAME gate authoritatively
+              # before any launch, so PLAN can only over-suppress rows CLAIM then re-admits.
               linked = set()
               for pull in pulls:
                   if not isinstance(pull, dict):
                       raise SystemExit("target pull-request entry is malformed")
-                  head = pull.get("head", {}).get("ref", "")
+                  head = pull.get("head") or {}
+                  ref = head.get("ref", "")
                   body = pull.get("body") or ""
-                  if not isinstance(head, str) or not isinstance(body, str):
+                  if not isinstance(ref, str) or not isinstance(body, str):
                       raise SystemExit("target pull-request fields are malformed")
-                  linked.update(int(number) for number in re.findall(
-                      r"(?:^|/)issue-([1-9][0-9]*)-", head
-                  ))
-                  linked.update(int(number) for number in re.findall(
-                      r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9][0-9]*)\b", body
-                  ))
+                  head_repo = (head.get("repo") or {}).get("full_name")
+                  association = str(pull.get("author_association", "")).upper()
+                  app_pr = (head_repo == repo
+                            and re.match(r"^sparq-agent/issue-[1-9][0-9]*-", ref) is not None)
+                  if app_pr:
+                      linked.update(int(number) for number in re.findall(
+                          r"(?:^|/)issue-([1-9][0-9]*)-", ref
+                      ))
+                  if app_pr or association in trusted_associations:
+                      linked.update(int(number) for number in re.findall(
+                          r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9][0-9]*)\b", body
+                      ))
               return linked
 
           repositories = []
@@ -299,7 +312,7 @@ jobs:
                   details[number] = (issue, labels, body)
 
               pulls = snapshot("pulls", index)
-              linked = linked_issue_numbers(pulls)
+              linked = linked_issue_numbers(pulls, repo)
               ready = dispatch.compute_ready(readiness_input)
               ready = [
                   issue for issue in ready
