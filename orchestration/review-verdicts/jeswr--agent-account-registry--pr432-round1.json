@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 432,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5243e0f0872fd485d189c15407670e345143a650",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "main() prints json.dumps(result) before routing/redaction. That object includes verdict, free-text detail, expires_at, and days_left, and the EXPIRING branch separately logs days_left. Thus an alert routed to the generic public issue still publishes exactly the credential validity/lifecycle information this change says is suppressed in the public repository's workflow logs. The new tests redirect stdout but never assert that the captured output omits these fields.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "Keep sensitive probe fields out of public stdout (use a generic status there and pass detailed values only through a protected channel if required). Add an end-to-end assertion over captured stdout for invalid, insufficient, and expiring results, including a distinctive detail and expiry value.",
+    "severity": "blocker",
+    "title": "Public workflow output still exposes the redacted credential details"
+   },
+   {
+    "body": "_alert_route() returns redact=False whenever ALERT_REPO and ALERT_TOKEN are merely non-empty. In particular, ALERT_REPO equal to REGISTRY_REPO sends the full verdict/detail/expiry to the known-public registry. Token presence also does not verify destination visibility. This contradicts the claimed invariant that full details are emitted only over a verified private route and makes a simple configuration error fail open.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "Fail closed unless the destination is positively validated as private; at minimum reject equality with REGISTRY_REPO, and verify repository visibility with the route token before rendering or writing details. Add self-tests for same-repo and failed/private-visibility lookup cases.",
+    "severity": "major",
+    "title": "Route selection does not establish that the detailed destination is private"
+   },
+   {
+    "body": "primary_redact is based on repo == REGISTRY_REPO, which protects the exact same-repo case, but a different public ALERT_REPO is still assumed private solely because a token exists. No visibility check establishes the documented verified-private invariant, so fleet counts, reset hints, and diagnostics can be written to another public repository.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Validate the selected ALERT_REPO's visibility using ALERT_TOKEN and render the detailed body only after a confirmed private result. Treat lookup failure or public visibility as redacted/fallback, and exercise both cases in self-test.",
+    "severity": "major",
+    "title": "Same-repository configuration bypasses model-health redaction"
+   },
+   {
+    "body": "_alert_route() considers any non-empty ALERT_REPO+ALERT_TOKEN a verified private route. ALERT_REPO may equal the public registry or name any other public repository, in which case raw handles, counts, pool size, and reset times are rendered and written unredacted. The route tests cover only presence/absence and cannot catch this fail-open disclosure.",
+    "file": "scripts/usage-alert.py",
+    "fix_hint": "Require a successful visibility check proving the target repository is private before selecting the full render. Explicitly reject REGISTRY_REPO and redact on public or indeterminate visibility; add mutation-resistant route tests for these cases.",
+    "severity": "major",
+    "title": "Detailed usage route trusts configuration instead of verifying privacy"
+   },
+   {
+    "body": "When ALERT_REPO+ALERT_TOKEN are set but the token cannot read/write that repo, _find_alert or a write raises and main exits red; it never retries a redacted alert on REGISTRY_REPO. This conflicts with the stated EVERY-fallback behavior and means the exact stale/wrong-token condition can leave maintainers with no rolling credential signal. Model-health already implements the analogous runtime fallback.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "On private-route lookup/write failure, retry a separately rendered redacted body on REGISTRY_REPO with the ambient token, without reusing any detailed body or leaking the private error. Test both lookup and write failure and require successful generic fallback or a nonzero result if both routes fail.",
+    "severity": "major",
+    "title": "Unusable private token drops the generic public alert"
+   }
+  ],
+  "progress": null,
+  "summary": "The public-body redaction is well tested, but the change does not actually enforce its central privacy claim. A configured ALERT_REPO is treated as private based only on non-empty strings, so setting it to the public registry publishes the full body. PAT validity also continues to emit the supposedly suppressed verdict, diagnostic detail, and expiry into workflow output, and its private-route failure has no generic public fallback. These are material fail-closed and disclosure gaps.",
+  "verdict": "request_changes"
+ }
+}
