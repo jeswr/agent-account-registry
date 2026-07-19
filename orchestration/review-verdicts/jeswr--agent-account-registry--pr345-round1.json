@@ -1,0 +1,15 @@
+{
+ "injection_detected": true,
+ "issues": [
+  {
+   "body": "safe_outbound_verdict deliberately leaves each issue's `file` untouched, yet validate_verdict only checks that it exactly matches a path in the PR diff. PR filenames are attacker-controlled and can contain values such as an account handle or email address. post_findings interpolates that field into a public comment and verdict_record persists it to the public registry, preserving a disclosure path despite the stated all-verdict-string boundary. The current tests use only `src/a.rs`, so they do not exercise this sink.",
+   "file": "scripts/worker-pr.py",
+   "fix_hint": "Fail closed during validation when a diff-backed issue path contains a prohibited identifier, or apply a safe representation at both outbound sinks while retaining any required internal exact-path semantics. Add sink tests using a crafted diff filename containing an account handle/email and assert that neither the posted comment nor the registry document contains it.",
+   "severity": "major",
+   "title": "Untrusted issue filenames bypass outbound redaction"
+  }
+ ],
+ "progress": null,
+ "summary": "The new outbound scrubber closes the principal summary/title/body/fix_hint sinks and the added sink tests are non-vacuous, but it leaves the issue `file` string unchanged. That value is derived from an untrusted PR path and is emitted both in the public findings comment and the durable public registry record, so a crafted filename can still carry exactly the account handle, email, or credential-shaped data this change promises never to publish. The diff also contains an instruction-like prompt-injection test string, so injection_detected is true.",
+ "verdict": "request_changes"
+}
