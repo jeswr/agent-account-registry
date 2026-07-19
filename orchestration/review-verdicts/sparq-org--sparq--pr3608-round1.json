@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3608,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e4e04259925d1ba6246553bb470cb10c2aa14a25",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 3.2 and 4 concede that either proposed binding lets a malicious or compromised trusted issuer sign a desynchronized leaf while claiming conformance. The verifier therefore gains attribution or governance evidence, but no check that value_component equals parse(committed_lexical). This is still precisely an honest-issuer assumption, not a conformance mechanism that restores INV-VL for the adversarial-issuer threat model. The linked field-native document nevertheless calls it the named precondition for relying on that lane against an adversarial issuer, making the design's central security characterization internally inconsistent.",
+    "file": "research/zk-canonical-form-issuance.md",
+    "fix_hint": "Either design an enforceable mechanism that supplies evidence of same-byte derivation (for example an audited issuance proof or trusted enforcement boundary), or rename and scope this as issuer self-attestation that does not restore INV-VL against malicious/compromised issuers. Update every 'restores', 'closes', and 'against an adversarial issuer' statement consistently; attribution and revocation should be described only as governance mitigations.",
+    "severity": "major",
+    "title": "Attestation does not restore INV-VL against an adversarial issuer"
+   },
+   {
+    "body": "Section 6 says existing dual-leaf commitments can gain a conformance attestation retroactively with no recommit. A present assertion about a key does not demonstrate that previously issued leaves were produced under CI-DISCIPLINE, especially when the proposed signature-covered marker was absent from their signed messages. Accepting those credentials under the new gate would silently extend an unverifiable present policy claim to historical issuance.",
+    "file": "research/zk-canonical-form-issuance.md",
+    "fix_hint": "Make conformance effective from a registry epoch/version and reject or explicitly grandfather earlier commitments outside the conformance-backed lane. For signature-covered conformance, require reissuance/re-signing with the marker; do not claim old credentials acquire that evidence retroactively.",
+    "severity": "major",
+    "title": "Retroactive key attestation cannot establish historical credential conformance"
+   },
+   {
+    "body": "Section 4 states that value identity is equivalent to term identity for hooked datatypes under CI-DISCIPLINE, but the proposal later acknowledges many-to-one cases such as signed zero, NaNs, and fixed-scale decimals. Canonical lexical issuance does not by itself make SPARQL value equality and RDF term identity interchangeable. This overbroad premise risks authorizing lexical-hash collapse on identity-sensitive paths.",
+    "file": "research/zk-canonical-form-issuance.md",
+    "fix_hint": "State the equivalence only for an explicitly enumerated, audited datatype/domain where the value handle is injective over canonical RDF terms. Preserve the lexical identity component and structural reject-list for every other datatype, and make leaf-collapse eligibility a fail-closed per-datatype property rather than a generic consequence of conformance.",
+    "severity": "major",
+    "title": "Value identity is not generally equivalent to RDF term identity"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposal is careful about external-audit status, but its central mechanism does not establish the property it is named as restoring. A registry assertion or signed marker only attributes an issuer's promise; as the document itself acknowledges, a malicious or compromised trusted issuer can sign the marker together with a desynchronized leaf. Thus this remains the existing issuer-honesty assumption and cannot be described as a precondition for relying on the value lane against an adversarial issuer. The proposal also overgeneralizes value/term identity and permits retroactive conformance attestations without evidence that historical credentials followed the discipline.",
+  "verdict": "request_changes"
+ }
+}
