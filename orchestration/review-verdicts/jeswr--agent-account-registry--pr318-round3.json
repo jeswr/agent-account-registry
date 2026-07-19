@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-3 diff remains correct, fail-closed, and non-vacuously tested. CLAIM now binds each hostile disarm row to the paginated live open-PR snapshot, a strict local provenance record, same-repository worker ref, exact current head SHA, live reviewed-SHA mismatch, and the trusted App login before invoking the helper. The helper independently re-reads the PR and requires exact App authorship before any mutation, and both mismatch disarm and unconditional repair defuse receive that identity. Missing token, identity, live row, provenance, matching head, worker ref, or mismatch all stand down. Tests include zero-mutation foreign/missing/stale/valid-arm cases plus positive controls proving the intended disarm still occurs and the trusted identity is propagated. No trust check is weakened, no untrusted plan value supplies the expected identity, and no reviewer-directed injection text appears in the diff.",
+ "verdict": "approve"
+}
