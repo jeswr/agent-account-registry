@@ -174,8 +174,37 @@ PROBE_EXEMPT_PROVIDERS = frozenset({"openai"})
 # cap IS the codex slot bound, and `fix:` bounds concurrent same-provider fix agents.
 REVIEW_MAX_CONCURRENT = 10
 FIX_MAX_CONCURRENT = 8
-REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
-FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
+# Lease TTL must OUTLIVE the owning review-fix.yml workflow's worst-case wall-clock, or the
+# allocator reclaims a still-live account and two sessions race on one credential / write-back
+# (issue #159). A DISPATCHER-claimed lease (adopted by review-fix.yml's `claim` job) is created
+# BEFORE the workflow's resolve/claim/run jobs run, so the bound is every job timeout on the
+# claim -> run -> release critical path PLUS GitHub runner queue slack between jobs — NOT the run
+# job alone. The pre-#159 1200/3600 were the run-job timeout itself (25m/60m), so a lease expired
+# mid-run and the account was reclaimed while the original session was still live. Keep these job
+# bounds in sync with .github/workflows/review-fix.yml `timeout-minutes:` (the _self_test pins the
+# derivation so a silent cut below the run bound flips red).
+_WF_RESOLVE_TIMEOUT = 600    # review-fix.yml resolve job (10m)
+_WF_CLAIM_TIMEOUT = 600      # review-fix.yml claim/adopt job (10m)
+_WF_RELEASE_TIMEOUT = 600    # review-fix.yml release job — the job that frees the lease (10m)
+_WF_RUN_TIMEOUT = {"review": 1500, "fix": 3600}  # run job, per mode (25m / 60m)
+# Slack for runner queue time (the dispatch queue plus inter-job handoffs); a lease must NEVER
+# expire while its workflow can still be scheduling or running the credential-using `run` job.
+_WF_QUEUE_SLACK = 900        # 15m
+
+
+def _lease_ttl(mode):
+    """The minimum lease TTL that outlives the owning review-fix.yml workflow's worst-case
+    wall-clock (issue #159): every job timeout on the claim -> run -> release critical path plus
+    queue slack, measured from the DISPATCHER claim (before resolve runs — the longest path).
+    Fail-closed: an unknown mode takes the longest (fix) run bound, never a shorter one, so a
+    typo can only over-hold an account, never free a live one early."""
+    run = _WF_RUN_TIMEOUT.get(mode, _WF_RUN_TIMEOUT["fix"])
+    return (_WF_RESOLVE_TIMEOUT + _WF_CLAIM_TIMEOUT + run
+            + _WF_RELEASE_TIMEOUT + _WF_QUEUE_SLACK)
+
+
+REVIEW_TTL = _lease_ttl("review")   # 10+10+25+10+15 = 70m (was 20m — shorter than the 25m run job)
+FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly the run job, no slack)
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
@@ -2688,6 +2717,21 @@ def _self_test():
     for name, table in (("REVIEW_CHAIN", REVIEW_CHAIN), ("FIX_CHAIN", FIX_CHAIN)):
         offenders = docs_only & {alias for chain in table.values() for alias in chain}
         assert not offenders, f"docs-only model in {name}: {sorted(offenders)}"
+
+    # Lease TTL must outlive the owning review-fix.yml workflow (issue #159): a lease that expires
+    # mid-run lets the allocator reclaim a live account, racing two sessions on one credential /
+    # write-back. Every mode's TTL must EXCEED its run-job timeout alone (the pre-#159 1200/3600 did
+    # not) and cover the whole claim -> run -> release DAG path plus queue slack. These re-derive if
+    # review-fix.yml raises a job bound; the asserts flip red if a TTL is ever cut below the bound.
+    for _mode, _run_to in _WF_RUN_TIMEOUT.items():
+        _ttl = _lease_ttl(_mode)
+        assert _ttl > _run_to, f"{_mode} lease TTL {_ttl} <= run timeout {_run_to} (issue #159)"
+        assert _ttl >= (_WF_RESOLVE_TIMEOUT + _WF_CLAIM_TIMEOUT + _run_to
+                        + _WF_RELEASE_TIMEOUT + _WF_QUEUE_SLACK), f"{_mode} TTL under DAG bound"
+    assert REVIEW_TTL == _lease_ttl("review") == 4200, REVIEW_TTL
+    assert FIX_TTL == _lease_ttl("fix") == 6300, FIX_TTL
+    # Fail-closed: an unknown mode never gets a shorter hold than the longest known mode.
+    assert _lease_ttl("bogus") >= max(_lease_ttl("review"), _lease_ttl("fix"))
 
     fixture = {
         "schema": SCHEMA,
