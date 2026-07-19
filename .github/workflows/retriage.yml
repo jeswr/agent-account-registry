@@ -1,0 +1,70 @@
+name: retriage
+
+on:
+  schedule:
+    # Explicit minutes avoid the degraded scheduling GitHub applies to */N expressions.
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: registry-retriage
+  cancel-in-progress: false
+
+env:
+  MAINTAINER_LOGIN: jeswr
+  APP_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'agent-account-registry[bot]' }}
+
+jobs:
+  retriage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify retriage planner
+        run: python3 scripts/retriage.py --self-test
+
+      - name: Sweep at most 40 deferred or untriaged issues
+        run: |
+          set -euo pipefail
+          tmp="$RUNNER_TEMP/retriage"
+          mkdir -p "$tmp"
+          gh issue list -R "$REPO" --state open --label status:untriaged --limit 40 \
+            --json number,author,body,labels,updatedAt > "$tmp/untriaged.json"
+          gh issue list -R "$REPO" --state open --label status:deferred --limit 40 \
+            --json number,author,body,labels,updatedAt > "$tmp/deferred.json"
+          jq -s 'add | unique_by(.number) | sort_by(.updatedAt) | .[:40] | .[]' \
+            "$tmp/untriaged.json" "$tmp/deferred.json" | jq -c . > "$tmp/issues.jsonl"
+
+          while IFS= read -r issue; do
+            number=$(jq -r .number <<<"$issue")
+            author=$(jq -r .author.login <<<"$issue")
+            permission=none
+            if [ "$author" != "$MAINTAINER_LOGIN" ] && [ "$author" != "$APP_BOT_LOGIN" ]; then
+              permission=$(gh api "repos/$REPO/collaborators/$author/permission" \
+                --jq .permission 2>/dev/null || echo none)
+            fi
+            decision=$(python3 scripts/retriage.py \
+              --maintainer "$MAINTAINER_LOGIN" --app-bot "$APP_BOT_LOGIN" \
+              --permission "$permission" <<<"$issue")
+            action=$(jq -r .action <<<"$decision")
+            if [ "$action" != promote ]; then
+              echo "skip #$number: $(jq -r .reason <<<"$decision")"
+              continue
+            fi
+
+            args=()
+            while IFS= read -r label; do args+=(--add-label "$label"); done \
+              < <(jq -r '.add[]' <<<"$decision")
+            while IFS= read -r label; do args+=(--remove-label "$label"); done \
+              < <(jq -r '.remove[]' <<<"$decision")
+            gh issue edit "$number" -R "$REPO" "${args[@]}"
+            echo "promoted #$number"
+          done < "$tmp/issues.jsonl"
