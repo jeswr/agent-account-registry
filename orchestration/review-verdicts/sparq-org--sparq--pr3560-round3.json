@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 3 resolves the sole round-2 major finding. The generator now consistently defines LEGAL as dispatch-compatible under the unwired resolver rule, explicitly states that legal cells are not claims of end-to-end provability, and narrowly defines production_selectable as enum/registry selectability rather than operational usability. Those caveats match the README, generated artifact, Rust consistency test, and the referenced configurable-commitment design record. The test remains substantive: it checks snapshot completeness and costs, cell shape with deny_unknown_fields plus a mutation guard, legality rules, summary/comparison integrity, and feature-gated samples against the real resolver. No new correctness, soundness, test-validity, security, or honesty issue is evident in the diff.",
+ "verdict": "approve"
+}
