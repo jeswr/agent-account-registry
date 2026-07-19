@@ -1347,7 +1347,44 @@ def _linked_open_pr_issues(pages, repo):
     return linked
 
 
-def _routing_at_plan_sha(repo, path, sha):
+def _protected_default_tip(repo):
+    """Independently resolve the target's PROTECTED default-branch tip in registry-owned CLAIM
+    code (registry issue #119). PLAN derives the plan's `target_sha` with `git rev-parse HEAD` in
+    the SAME checkout that just executed the hostile target planner, so a malicious target can
+    leave HEAD on an obsolete commit whose routing catalog is weaker or incompatible. CLAIM must
+    never let target-controlled data select the routing revision it trusts, so it re-resolves the
+    default branch (the branch-protected surface the routing file lives on) and reads its tip
+    straight from the GitHub API here. Fail-closed: an unreadable repo, a missing default branch, a
+    default branch that is not branch-protected, or a tip that is not a 40-hex sha raises
+    DispatchError, so the caller defers rather than routing off an unverifiable revision."""
+    meta = _gh_json(["api", f"repos/{repo}"])
+    branch = meta.get("default_branch") if isinstance(meta, dict) else None
+    if not isinstance(branch, str) or not branch:
+        raise DispatchError(f"cannot resolve default branch for {repo}")
+    ref = _gh_json(["api", f"repos/{repo}/branches/{branch}"])
+    # The routing catalog's trust rests on the default branch being branch-PROTECTED — that is the
+    # only reason CLAIM treats its tip as an authority a hostile target cannot rewrite. Prove it
+    # from the API response, not from the branch's name: accept only an explicit `protected is
+    # True`. Anything else (protected false, missing, or non-bool) means the surface is not the
+    # protected control surface we claim, so fail closed rather than route off an unprotected tip.
+    protected = ref.get("protected") if isinstance(ref, dict) else None
+    if protected is not True:
+        raise DispatchError(f"default branch for {repo} is not branch-protected")
+    commit = ref.get("commit") if isinstance(ref, dict) else None
+    sha = commit.get("sha") if isinstance(commit, dict) else None
+    if not isinstance(sha, str) or not SAFE_SHA.fullmatch(sha):
+        raise DispatchError(f"cannot resolve default-branch tip for {repo}")
+    return sha
+
+
+def _protected_routing(repo, path):
+    """Fetch the target's protected routing catalog from the default-branch tip CLAIM resolves
+    ITSELF (registry issue #119) — never from the plan's `target_sha`, which the hostile target
+    planner controls. This is the routing revision every downstream route/policy decision trusts,
+    so sourcing it from a target-selected commit let a malicious target dispatch its own issues
+    against an obsolete, weaker routing catalog. Fail-closed: an unresolvable protected tip, or a
+    missing/malformed routing file at that tip, raises DispatchError."""
+    sha = _protected_default_tip(repo)
     meta = _gh_json(["api", f"repos/{repo}/contents/{path}?ref={sha}"])
     if not isinstance(meta, dict) or meta.get("type") != "file":
         raise DispatchError(f"protected routing file is missing for {repo}")
@@ -2310,7 +2347,11 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         trusted_bots = set(policy.get("trusted_bots", []))
         if bot_login:
             trusted_bots.add(bot_login)
-        routing = _routing_at_plan_sha(repo, policy["routing"], repository["target_sha"])
+        # [issue #119] Read the routing catalog from the protected default-branch tip CLAIM
+        # resolves ITSELF, NOT from repository["target_sha"]: that sha is `git rev-parse HEAD` of
+        # the checkout that ran the hostile target planner, so trusting it let target-controlled
+        # data pick an obsolete/weaker routing revision. target_sha stays an audit-only plan field.
+        routing = _protected_routing(repo, policy["routing"])
         pull_pages = _gh_json([
             "api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100"
         ])
@@ -2906,6 +2947,79 @@ def _self_test():
     assert not _issue_is_trusted({"user": "malformed", "author_association": "MEMBER"}, allow)
     assert not _issue_is_trusted({"user": ["x"], "author_association": "OWNER"}, allow)
     assert not _issue_is_trusted("nope", allow)
+
+    # ---- issue #119: CLAIM reads the trusted routing revision from the PROTECTED default-branch
+    # tip it resolves ITSELF, never from the plan's `target_sha` (the hostile target planner's
+    # `git rev-parse HEAD`). Drive _protected_routing through a fake GitHub reader and prove it
+    # (a) resolves the tip via the repo's own default branch, (b) reads routing AT that tip, and
+    # (c) never lets an attacker-shaped target_sha reach any fetch — every leg fails closed. ----
+    saved_gh_119 = _gh_json
+    try:
+        attacker_sha = "a" * 40           # what a hostile planner could park HEAD on
+        protected_tip = "9" * 40          # the real default-branch tip CLAIM must trust instead
+        routing_b64 = base64.b64encode(
+            b"[models.fable]\nprovider_model = \"x\"\n").decode()
+        seen_refs = []
+
+        def _fake_ok(args):
+            path = args[-1]
+            if path == "repos/example/repo":
+                return {"default_branch": "main"}
+            if path == "repos/example/repo/branches/main":
+                return {"name": "main", "commit": {"sha": protected_tip}, "protected": True}
+            if path.startswith("repos/example/repo/contents/"):
+                seen_refs.append(path)
+                return {"type": "file", "content": routing_b64}
+            raise AssertionError(f"unexpected gh path {path}")
+
+        globals()["_gh_json"] = _fake_ok
+        routing119 = _protected_routing("example/repo", "policy/routing.toml")
+        assert routing119 == {"models": {"fable": {"provider_model": "x"}}}, routing119
+        # routing was read at the INDEPENDENTLY-resolved protected tip — not the plan sha
+        assert seen_refs == [
+            f"repos/example/repo/contents/policy/routing.toml?ref={protected_tip}"], seen_refs
+        assert all(attacker_sha not in ref for ref in seen_refs), seen_refs
+        # fail-closed: a tip that is not a 40-hex sha (the exact class the old format-only check
+        # would have waved through) must DEFER, never route
+        globals()["_gh_json"] = lambda args: (
+            {"default_branch": "main"} if args[-1] == "repos/example/repo"
+            else {"commit": {"sha": "z" * 40}, "protected": True})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("non-hex protected tip must fail closed")
+        except DispatchError:
+            pass
+        # fail-closed: a missing/unreadable default branch must DEFER
+        globals()["_gh_json"] = lambda args: (
+            {} if args[-1] == "repos/example/repo" else {"commit": {"sha": protected_tip}})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("missing default branch must fail closed")
+        except DispatchError:
+            pass
+        # fail-closed: an UNPROTECTED default branch is not the branch-protected control surface
+        # the routing catalog's trust rests on, so its tip must be rejected even though it is a
+        # valid 40-hex sha. This assertion goes red if the `protected is True` check is removed.
+        globals()["_gh_json"] = lambda args: (
+            {"default_branch": "main"} if args[-1] == "repos/example/repo"
+            else {"commit": {"sha": protected_tip}, "protected": False})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("unprotected default branch must fail closed")
+        except DispatchError:
+            pass
+        # fail-closed: a MISSING/non-bool protection field is not proof of protection either —
+        # absence must never be read as protected. Also red if the protection check is removed.
+        globals()["_gh_json"] = lambda args: (
+            {"default_branch": "main"} if args[-1] == "repos/example/repo"
+            else {"commit": {"sha": protected_tip}})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("missing protection field must fail closed")
+        except DispatchError:
+            pass
+    finally:
+        globals()["_gh_json"] = saved_gh_119
 
     # ---- issue #102: CLAIM independently RE-PROVES the readiness predicate (non-dispatchable
     # epic + live blocker state) from registry-owned code, never trusting the hostile planner's
