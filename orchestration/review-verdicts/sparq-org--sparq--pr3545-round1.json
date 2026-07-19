@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly introduces an opt-in sparq-wasm feature that forwards to sparq-core/native-ttl and enables it only in the shipped JS/WASM build, leaving the lean and Cargo-default builds unchanged. The existing non-parallel Turtle load paths are already feature-gated to use the native parser, so wasm receives the intended behavior without API changes or new dependencies. Existing focused differential tests cover native-parser equivalence, and the W3C Turtle ratchet covers the real with-base load path. The benchmark comment is also made resilient to future feature-list changes.",
+ "verdict": "approve"
+}
