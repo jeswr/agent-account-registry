@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 415,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e0217ec4535128af7b53aeb48cdf1c4ca310f897",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "plan() treats status:deferred as a retriageable backlog state and, on promote, returns remove including status:deferred (`remove.update(labels.intersection({'status:untriaged','status:deferred'}))`) plus add status:ready. But status:deferred is a 'Private-registry worker orchestration state' (groom.py:99) owned exclusively by the dispatcher's deferred-retry path \u2014 locked decision 20. groom.py:1234-1235 explicitly leaves it untouched: 're-readying it here would bypass the triage trust gate. status:deferred stays untouched: the dispatcher's deferred-retry path (locked decision 20) is its single owner.' dispatch-claim.py:142-144 makes status:deferred the retry TRIGGER (DEFERRED_GATED), and dispatch.yml:349/dispatch-claim.py:1508-1513 require status:deferred present + status:ready absent for a bounded retry. The plan()'s only gate is needs:*/trust:untrusted, which does NOT cover the escalate-starved auto-retry window: worker-issue.py set_status(...,'deferred') (transitions line 286-287) adds ONLY status:deferred (no needs:user), and dispatch.yml:2557-2563 keeps a starved issue status:deferred WITHOUT needs:user until the persistence grace elapses. So retriage promotes such an issue to status:ready, which: (1) bypasses the deferred-retry budget \u2014 the normal path does not count prior deferred attempts, so an issue that has exhausted max_attempts and should escalate to needs:user (dispatch.yml:2483-2494) instead re-dispatches as fresh every ~30 min; (2) resets the starvation-persistence clock (escalate_persist_decision keys off the issue staying deferred), so a persistently capacity-starved issue \u2014 potentially a soundness/security surface \u2014 never reaches its human terminal; (3) races the dispatcher on the same label (TOCTOU) risking double-dispatch. This opens a default-allow / fail-open path around a trust-plane escalation and violates the documented single-owner invariant.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Do not sweep or mutate status:deferred in retriage. Restrict the workflow's `gh issue list` and plan() to status:untriaged only (that state is triage-owned; the dispatcher never touches it), which is also the state a human lands in after clearing needs:design \u2014 the documented legitimate retriage promotion path (triage.py:16-18). If deferred promotion is genuinely wanted, it must be co-designed with decision 20's owner (dispatcher) so the retry budget and starvation-persistence escalation are preserved, and the self-test's 'status:deferred promotion' check must be revised accordingly.",
+    "severity": "blocker",
+    "title": "retriage steals status:deferred from the dispatcher's deferred-retry path (locked decision 20), fail-open"
+   },
+   {
+    "body": "plan() calls classify(labels, 'task', trusted=True) with a fixed type, discarding the issue's real GitHub type/kind. For an issue lacking an explicit role:/kind:/area: role signal, ROLE_BY_TYPE maps 'task'->impl regardless of whether the issue is a bug, spike, or (untyped) epic, so retriage can assign a different role than the event-driven triage-issue.yml would for the same issue. Ready still requires an area label and kind:epic still blocks, so this is not itself a promote-an-epic hole, but it can silently diverge role assignment between the two triage entry points.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Either read the issue type from the JSON (gh issue list --json includes it via the GraphQL type, or pass --type through like triage-issue.yml does) and forward it to classify(), or document why 'task' is a safe fixed default for the retriage sweep.",
+    "severity": "minor",
+    "title": "issue_type hardcoded to 'task' can mis-derive role for bug/spike/epic issues"
+   }
+  ],
+  "progress": null,
+  "summary": "retriage introduces a SECOND owner of `status:deferred`, which is a dispatcher-owned worker-orchestration state whose SINGLE owner is the deferred-retry path (locked decision 20). groom.py:1234 documents that it leaves status:deferred untouched for exactly this reason; retriage.py:plan() instead sweeps it and, on promote, adds status:ready + removes status:deferred. This is fail-open: the deferred-retry path bounds re-dispatch by durable attempt markers and escalates to needs:user on budget exhaustion (dispatch.yml ~2473-2495), and the escalate-starved path keeps an issue status:deferred WITHOUT needs:user during the auto-retry grace, applying needs:user only after the starvation streak persists (dispatch-claim.py ~2287, ~2557; worker-issue.py set_status('deferred') adds only status:deferred). retriage's gate only skips needs:*/trust:untrusted, so it does NOT skip that no-needs deferred window: it flips the issue to status:ready, handing it to the dispatcher NORMAL path (which resets the retry budget) and resetting the starvation-persistence clock \u2014 a budget-exhausted or persistently-starved (possibly soundness-lane) issue that should reach a human never does. It also races the dispatcher on the same label (TOCTOU / double-dispatch). The self-test is non-vacuous and correctly exercises the trust/gate/hold/idempotency legs, but it ENSHRINES the unsound deferred-promotion behavior. The status:untriaged half is within triage's domain and is fine; the fix is to stop touching status:deferred (retriage only untriaged, or coordinate with decision 20's owner). Any blocker => request_changes.",
+  "verdict": "request_changes"
+ }
+}
