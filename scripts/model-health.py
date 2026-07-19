@@ -1207,10 +1207,28 @@ def _cmd_record(args):
         print(f"::error::model-health record: refusing unknown provider "
               f"{args.provider!r} (must be one of {sorted(VALID_RECORD_PROVIDERS)})")
         return 1
+    # Fail closed on a provider/class MISMATCH (review round 1 of #423): `fleet` is the
+    # pseudo-provider for the fleet-wide zero-dispatch signal ONLY — its legitimate classes are
+    # the zero-dispatch tick (raw `zero-dispatch`/`claim-abort`) and the `success` record that
+    # resets the consecutive-tick run (dispatch.yml's three call sites). A `fleet` record with an
+    # ordinary per-account class (e.g. auth) or a real-provider record claiming zero-dispatch
+    # would corrupt health classification, so neither may reach the ledger.
+    folded_class = _decision_class(args.exit_class)
+    if args.provider == "fleet":
+        if folded_class not in (CLASS_ZERO_DISPATCH, SUCCESS):
+            print(f"::error::model-health record: refusing fleet record with per-account exit "
+                  f"class {args.exit_class!r} (fleet carries only zero-dispatch/claim-abort/"
+                  f"success)")
+            return 1
+    elif folded_class == CLASS_ZERO_DISPATCH:
+        print(f"::error::model-health record: refusing {args.provider!r} record with exit class "
+              f"{args.exit_class!r} (zero-dispatch is the fleet pseudo-provider's signal)")
+        return 1
     salt = os.environ.get("PROVENANCE_SALT", "")
-    # provider=fleet + zero-dispatch carries NO account (there is no single account); everything
-    # else salts the raw handle HERE so a raw handle never reaches the ledger.
-    if args.exit_class == CLASS_ZERO_DISPATCH or args.provider == "fleet":
+    # provider=fleet carries NO account (there is no single account); everything else salts the
+    # raw handle HERE so a raw handle never reaches the ledger. (The pairing guard above already
+    # rejected zero-dispatch classes on real providers, so provider is the sole discriminator.)
+    if args.provider == "fleet":
         # A fleet/zero-dispatch record has no single account; use a fixed hash-shaped sentinel so
         # the ledger's "account is a salted hash" privacy invariant still holds (validate_ledger).
         account_h = hashlib.sha256(b"fleet-zero-dispatch").hexdigest()[:16]
@@ -2083,7 +2101,10 @@ def _test_record_provider_guard(chk):
     """#199: _cmd_record REFUSES a catalog-controlled provider outside VALID_RECORD_PROVIDERS and
     writes NOTHING, while a known provider still records. Non-vacuous: the injection-shaped provider
     must return 1 with the ledger writer NEVER touched (put_count stays 0), and the valid provider
-    must return 0 with exactly one write — so deleting the guard flips BOTH assertions red."""
+    must return 0 with exactly one write — so deleting the guard flips BOTH assertions red.
+    Review round 1 of #423: the provider/class PAIRING is enforced too — `fleet` with a
+    per-account class and a real provider with `zero-dispatch` are both refused without a write,
+    while every legitimate fleet class (zero-dispatch/claim-abort/success) still records."""
     import argparse as _ap
     global GitHubAPI
     real_api = GitHubAPI
@@ -2104,9 +2125,9 @@ def _test_record_provider_guard(chk):
             _CountingAPI.put_count += 1
             return {"content": {"sha": "deadbeef"}}
 
-    def _rec(provider):
+    def _rec(provider, exit_class="auth"):
         return _ap.Namespace(provider=provider, account="", model_alias="fable",
-                             exit_class="auth", run_id="1", reset_hint=None)
+                             exit_class=exit_class, run_id="1", reset_hint=None)
 
     try:
         os.environ.update(REGISTRY_REPO="o/r", WORKER_ACCOUNT_HANDLE="acct01",
@@ -2123,6 +2144,24 @@ def _test_record_provider_guard(chk):
         # A known provider is NOT blocked by the guard — it records exactly once.
         chk("record accepts known provider", _cmd_record(_rec("anthropic")), 0)
         chk("known provider writes one record", _CountingAPI.put_count, 1)
+        # Provider/class pairing (review round 1 of #423): `fleet` with an ordinary per-account
+        # class is refused — it would write a sentinel-account record that corrupts per-account
+        # health classification.
+        chk("record refuses fleet with per-account class", _cmd_record(_rec("fleet")), 1)
+        chk("fleet+auth writes NO record", _CountingAPI.put_count, 1)
+        # ...and the fleet-only zero-dispatch classes are refused on a real provider.
+        chk("record refuses real provider with zero-dispatch",
+            _cmd_record(_rec("anthropic", "zero-dispatch")), 1)
+        chk("record refuses real provider with claim-abort",
+            _cmd_record(_rec("openai", "claim-abort")), 1)
+        chk("real-provider zero-dispatch writes NO record", _CountingAPI.put_count, 1)
+        # Every legitimate fleet call site (dispatch.yml: zero tick, claim abort, tick-run-resetting
+        # success) still records — one write each.
+        chk("record accepts fleet zero-dispatch", _cmd_record(_rec("fleet", "zero-dispatch")), 0)
+        chk("fleet zero-dispatch writes one record", _CountingAPI.put_count, 2)
+        chk("record accepts fleet claim-abort", _cmd_record(_rec("fleet", "claim-abort")), 0)
+        chk("record accepts fleet success", _cmd_record(_rec("fleet", "success")), 0)
+        chk("fleet claim-abort+success each write one record", _CountingAPI.put_count, 4)
     finally:
         GitHubAPI = real_api
         for k, v in saved.items():
