@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 407,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "45794d2111760daf1bf83f60493cfca0387fe42c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-2 major finding is resolved. route-resolve now rejects empty and unconfigured single-role labels before any security, role, or default routing, matching CLAIM-side ordering and preventing permissive fallback. dispatch-plan catches the shared fail-closed error per issue and emits no plan row, while preserving valid neighboring rows. The added resolver and planner self-tests directly assert raises/no-row behavior for empty and unknown roles, include security-label precedence cases, and would fail against the prior implementation, so they are non-vacuous. No new blocker, major, or other diff-scoped issue is supported by the changes.",
+  "verdict": "approve"
+ }
+}
