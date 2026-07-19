@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly moves final issue-state convergence into a separate always-running job, preserves the prior fail-closed status derivation, scopes the fresh App token to the resolved target repository with issues:write only, uses SHA-pinned actions, and makes a failed state write visible. Waiting for both lease release and final-state convergence before ringing the dispatcher closes the transient redispatch race. Worker timeout/cancellation leaves incomplete outputs empty, which selects deferred rather than a permissive state. No hostile reviewer-directed instruction was found in the diff.",
+ "verdict": "approve"
+}
