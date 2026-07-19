@@ -904,10 +904,13 @@ jobs:
             # got far enough to write one; otherwise unknown.
             cls="${WORKER_EXIT_CLASS:-unknown}"
           fi
-          echo "class=$cls" >> "$GITHUB_OUTPUT"
-          echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
-          # the attempt that produced this outcome — the recorder's dedup key (review r1 of #425)
-          echo "outcome_attempt=${GITHUB_RUN_ATTEMPT:-}" >> "$GITHUB_OUTPUT"
+          # outcome_attempt: the attempt that produced this outcome — the recorder's dedup key
+          # (review r1 of #425). Grouped redirect (SC2129): one append, three keys.
+          {
+            echo "class=$cls"
+            echo "reset_hint=${WORKER_RESET_HINT:-}"
+            echo "outcome_attempt=${GITHUB_RUN_ATTEMPT:-}"
+          } >> "$GITHUB_OUTPUT"
 
       # TTL guard (audit-2026-07-17): App installation tokens live 60 minutes and app-token-live is
       # minted BEFORE the heavy checkout + toolchain + model run, so with worker_timeout_minutes=90
