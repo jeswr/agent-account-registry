@@ -1,0 +1,29 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "All build:*wasm* scripts now pass `--no-opt` to wasm-pack and chain `npm run _optimize:wasm`, which runs js/scripts/optimize-wasm.mjs. That script exits 1 when `wasm-opt` is not on PATH (spawnSync ENOENT). Previously (crates/sparq-wasm/Cargo.toml:190-196) `wasm-pack build --profile release-wasm` invoked wasm-pack's OWN bundled wasm-opt (default -O), which needs no system Binaryen. Removing that with `--no-opt` means a system `wasm-opt` is now mandatory.\n\nOnly .github/workflows/bench.yml installs binaryen (`sudo apt-get install -y binaryen`). The lanes that actually run these scripts do NOT:\n- publish.yml: `npm run build` (build:wasm) \u2014 the OIDC trusted-publish release path.\n- pages.yml: build:wasm, build:reason-wasm, build:rsp-wasm, build:text-wasm (live GitHub Pages).\n- gui.yml: build:wasm, build:reason-wasm, build:text-wasm, build:rsp-wasm.\n- site-visual.yml: build:wasm:lean.\nGitHub ubuntu-latest runners do not preinstall binaryen, so these builds will fail at the `_optimize:wasm` step, breaking npm publish and the site/GUI CI.",
+   "file": "js/package.json",
+   "fix_hint": "Add a binaryen install step (mirror bench.yml: `sudo apt-get update && sudo apt-get install -y binaryen`) before the wasm-build steps in publish.yml, pages.yml, gui.yml, and site-visual.yml. Pin/verify a wasm-opt version if bundle determinism matters. Alternatively, if the intent is that CI should keep using wasm-pack's bundled optimizer, gate the explicit pass so it degrades gracefully when wasm-opt is absent \u2014 but that would silently ship an un-optimized/differently-optimized bundle from the published one, so installing binaryen in each lane is preferred. Include the workflow edits in this PR so the release path is exercised.",
+   "severity": "blocker",
+   "title": "build:wasm now hard-requires system wasm-opt on PATH, but the wasm-building CI lanes don't install Binaryen \u2014 publish/Pages/GUI/site builds will fail"
+  },
+  {
+   "body": "The main and lean engine bundles move to `-O3` (speed-first) where the prior shipped path used wasm-pack's default `-O` and the crate metadata otherwise leaned on size (`wasm-opt = [\"-Oz\"]` for the release profile, `opt-level = z` for parser crates). -O3 typically produces a larger `_bg.wasm`, raising both npm download size and browser compile time for the eagerly-loaded main bundle. The README frames this as 'query execution is the priority' but gives no size delta, and the HARD-gated `wasm_bundle_bytes` ratchet is on the raw pre-opt artifact so it won't catch a shipped-size regression.",
+   "file": "js/README.md",
+   "fix_hint": "Record the measured shipped-size delta (main and lean, before/after) in the PR body, and confirm the increase is acceptable for the eagerly-loaded bundle. Consider whether the trend-only `wasm_opt_bundle_bytes` series is enough visibility or whether a soft budget on the shipped size is warranted.",
+   "severity": "minor",
+   "title": "-O3 on the shipped main bundle increases download/compile size vs the prior size-leaning default; tradeoff is asserted but unquantified"
+  },
+  {
+   "body": "A new `build:shacl-wasm` script is introduced, but no workflow runs it (pages.yml builds reason/rsp/text but not shacl) and site/scripts/sync-wasm.mjs references only reason/rsp/text sources \u2014 so the shacl bundle it produces is never consumed. If it's intended for a future surface that's fine, but as-is it's an orphan script.",
+   "file": "js/package.json",
+   "fix_hint": "Either wire build:shacl-wasm into the lane/sync that consumes it (and add the matching sync-wasm.mjs source), or drop it from this PR and add it alongside the consuming surface, tracked by a bead.",
+   "severity": "nit",
+   "title": "build:shacl-wasm added but not wired into any CI lane or site sync"
+  }
+ ],
+ "progress": null,
+ "summary": "The change replaces wasm-pack's implicit wasm-opt pass with `--no-opt` + an explicit post-build `wasm-opt` invocation (js/scripts/optimize-wasm.mjs), applying -O3 to the main/lean engine bundles and -Oz to the lazy reason/rsp/shacl/text bundles. The optimize-wasm.mjs script itself is well-formed (validates level, atomic rename via .optimized + renameSync, cleans partial output on failure, clear ENOENT message). The ci-bench.sh trend metric change and README docs are internally consistent.\n\nBLOCKER: the new build hard-requires system `wasm-opt` on PATH \u2014 optimize-wasm.mjs `process.exit(1)` on ENOENT \u2014 but the CI lanes that run these build scripts do NOT install Binaryen. Only bench.yml installs it (apt-get install -y binaryen). The lanes that run `npm run build:wasm{,:lean}` / `build:reason-wasm` / `build:rsp-wasm` / `build:text-wasm` \u2014 publish.yml (the actual npm trusted-publish `npm run build`), pages.yml (live GitHub Pages), gui.yml, and site-visual.yml \u2014 install only wasm-pack, not binaryen. Per crates/sparq-wasm/Cargo.toml:190-196 the prior shipped build relied on wasm-pack's OWN bundled/auto-downloaded wasm-opt (default `-O`), so those lanes never needed a system binaryen. With `--no-opt` that fallback is removed and `npm run build:wasm` will now fail at the `_optimize:wasm` step on stock ubuntu-latest runners (binaryen is not preinstalled), breaking npm publish, Pages deploy, GUI, and site-visual builds. The PR does not add any binaryen install step to those workflows.\n\nSecondary: -O3 on the shipped main bundle (was wasm-pack default -O / size-leaning) increases download+compile size \u2014 intentional per the README, but unquantified. build:shacl-wasm is newly added but no CI lane or site sync-wasm.mjs consumes it. Note also crates/sparq-wasm/Cargo.toml:190-200 comment now describes the removed behavior ('wasm-opt for --profile release-wasm runs wasm-pack's default -O') and is stale, though that file is outside this diff.",
+ "verdict": "request_changes"
+}
