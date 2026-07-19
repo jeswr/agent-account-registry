@@ -1959,11 +1959,15 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
                   reviewed_base="", security_keywords=None):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
-    mismatch returns the PR to review:needs (a fixer/other push raced the approval). [round-4 P1]
-    the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:* on the source issue) are re-read
-    live immediately before the first mutation: a park that landed mid-review-run aborts the
-    ready+arm untouched (arm_complete=false), so an in-flight run can never arm past a
-    human/groom park the busy-partition carve-out relies on. (sol r2 on #334) the same probe
+    mismatch returns the PR to review:needs (a fixer/other push raced the approval). [issue #139,
+    round-4 P1] EVERY arm precondition — the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:*
+    on the source issue), the open/bot-authored/draft/exact-reviewed-head invariant, the non-fork
+    head, and the base ref — is re-derived from a SECOND, FRESH read taken immediately before the
+    first mutation, NOT from the entry read (which predates the changed-file/label queries and so
+    is stale by seconds): a push or a park that landed mid-review-run aborts the ready+arm
+    untouched (arm_complete=false / head_moved), so an in-flight run can never undraft+arm an
+    unreviewed head or arm past a human/groom park the busy-partition carve-out relies on. (sol r2
+    on #334) the same probe
     re-runs INSIDE the arm retry window — before every retry attempt (see _arm_auto_merge) —
     because a park landing during backoff does not move the head and the expectedHeadOid
     CAS alone cannot refuse it; a mid-arm hold exits with the same human_hold shape after the
@@ -2001,52 +2005,11 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
     if live.get("state") != "open":
         raise WorkerPrError("pull request is no longer open")
-    # [round-4 P1, shared helper since round 5] PARKED-BUT-ARMING RACE: a human/groom park
-    # that landed WHILE this review run was in flight must WIN over the run's stale
-    # mark-ready+arm decision — the busy-partition carve-out (dispatch-claim.py
-    # busy_packages_of_pulls) frees a parked draft's crate on the premise that a parked PR
-    # cannot reach main on its own, and an arm that ignores a mid-run park breaks exactly
-    # that premise (the enumerator excluded holds at PLAN time, but this run launched BEFORE
-    # the park landed). Re-read the hold surfaces HERE, before ANY mutation
-    # (ready/arm/audit-comment/review-state) via live_human_holds — the SAME probe every
-    # outcome mutation runs (round-5 P1: the round-4 recheck covered only this arm path
-    # while a stale `changes` outcome could still strip review:needs-user) — over the live
-    # PR labels from the same fresh read the head CAS uses, plus the source issue's needs:*
-    # state. Unreadable/malformed hold surfaces RAISE (fail closed, round-5 P2: malformed
-    # label payloads previously read as no-hold and the arm still issued ready+merge).
-    # Any hold aborts with the valid-exit shape (arm_complete=false — review-fix.yml then
-    # never binds reviewed-sha) and NO comment/label churn: the PR is human-owned, and the
-    # sweep's enumerator already excludes it for as long as the park stands.
-    holds = live_human_holds(repo, pr_number, issue=issue, live=live)
-    if holds:
-        _write_outputs({"armed": False, "head_moved": False, "human_hold": True,
-                        "arm_complete": False})
-        print(f"ready+arm ABORTED pre-arm: human hold detected ({', '.join(holds)}) — "
-              "the park stands; no ready/arm/review-state mutation was applied")
-        return
-    head_sha = str(live.get("head", {}).get("sha", ""))
-    if head_sha != reviewed_sha:
-        # Not an error: new commits landed between approve and arm; re-review binds to the new head.
-        set_review_state(repo, pr_number, "needs")
-        _write_outputs({"armed": False, "head_moved": True,
-                        "arm_complete": False})
-        print("live head advanced past the reviewed sha; returned to review:needs")
-        return
-    live_base = str((live.get("base") or {}).get("ref", ""))
-    if reviewed_base and live_base != reviewed_base:
-        # Base retarget changes the EFFECTIVE diff without moving the head, and
-        # --match-head-commit cannot see it (sol r5 on #257) — the approval bound a
-        # different comparison; re-review against the new base. RESIDUAL RISK, DOCUMENTED
-        # (sol r7): GitHub exposes no base-CAS primitive, so a retarget in the window
-        # between this check and the merge latch cannot be excluded mechanically; the
-        # actor able to retarget is a write+ collaborator (already inside the trust
-        # boundary), resolution REJECTS non-default-base PRs outright, and this pre-arm
-        # check plus the head CAS bound everything GitHub's API allows us to bind.
-        set_review_state(repo, pr_number, "needs")
-        _write_outputs({"armed": False, "head_moved": True, "base_moved": True,
-                        "arm_complete": False})
-        print("live base ref differs from the reviewed base; returned to review:needs")
-        return
+    # [issue #139] The entry read above is used ONLY for the cheap open-state gate and the
+    # immutable base_ref of the SHA-bound trust-surface compare. EVERY arm precondition —
+    # holds, head/state/author/draft, non-fork head, base ref — is (re-)validated below against
+    # a FRESH read taken immediately before the first mutation, because the changed-file/label
+    # queries between here and the arm are a real window for a push or a human hold to land.
     trust_hits = ()
     if arm:
         # Live trust-surface re-derivation BEFORE any undraft/latch (renamed-path safe).
@@ -2065,16 +2028,73 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             trust_hits = (FILES_TRUNCATED_SENTINEL,)
         else:
             trust_hits = trust_surface_paths_touched(sha_files, surfaces)
-        # Issue #153: the LABEL-derived security posture is recomputed LIVE here too. resolve
-        # classified it ONCE, before a review that may have taken 25min+ (or queued far
+    # [issue #139] RE-READ AND RE-VALIDATE IMMEDIATELY BEFORE THE FIRST MUTATION. Everything
+    # above ran off the single `live` read taken at entry — BEFORE the changed-file compare
+    # (_files_at_sha) and the label posture below, network round-trips wide enough for a push to
+    # advance the head or a human terminal hold to land. `pr ready` (undraft) carries no CAS, and
+    # the arm=False path never reaches _arm_auto_merge's head-CAS / per-attempt hold recheck at
+    # all, so without a FRESH probe here an unreviewed head could be undrafted + marked
+    # review:pass, and a mid-run hold could be armed straight past (the FIRST _arm_auto_merge
+    # attempt does not re-probe holds — only its retries do). Re-read ONCE more and re-assert,
+    # against that fresh snapshot: the hold surfaces, then the open/bot-authored/draft/
+    # exact-reviewed-head invariant (revalidate_outcome_head — the SAME gate every review/fix
+    # outcome runs), the same-repo (non-fork) head, and the base ref. Nothing but the mutations
+    # runs after this read, so it is the tightest boundary GitHub's API allows; the arm path then
+    # also rides expectedHeadOid (GitHub's atomic CAS) and restores the draft on any later move.
+    # Residual: a hold/retarget landing AFTER this read but before the latch is the documented
+    # issue #294 TOCTOU window (no atomic label/base CAS exists) — now narrowed to the
+    # undraft+latch span, itself further covered by the per-retry hold recheck (backoff window)
+    # and, on the arm=False path, by set_review_state's own #138 refusal to strip a live hold.
+    fresh = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    holds = live_human_holds(repo, pr_number, issue=issue, live=fresh)
+    if holds:
+        _write_outputs({"armed": False, "head_moved": False, "human_hold": True,
+                        "arm_complete": False})
+        print(f"ready+arm ABORTED pre-arm: human hold detected ({', '.join(holds)}) — "
+              "the park stands; no ready/arm/review-state mutation was applied")
+        return
+    freshness = revalidate_outcome_head(
+        fresh.get("state"), str((fresh.get("user") or {}).get("login", "")),
+        fresh.get("draft"), str((fresh.get("head") or {}).get("sha", "")),
+        reviewed_sha, bot_login)
+    if freshness == "head-moved":
+        # Not an error: new commits landed between approve and arm; re-review binds the new head.
+        set_review_state(repo, pr_number, "needs")
+        _write_outputs({"armed": False, "head_moved": True, "arm_complete": False})
+        print("live head advanced past the reviewed sha; returned to review:needs")
+        return
+    if freshness != "ok":
+        # closed / author / undrafted / malformed-head / unbound: the reviewed, bot-authored,
+        # open DRAFT is gone; fail closed rather than undraft+arm an unrecognized live PR.
+        raise WorkerPrError(
+            f"refusing to arm: the live PR no longer matches the reviewed commit ({freshness})")
+    if ((fresh.get("head") or {}).get("repo") or {}).get("full_name") != repo:
+        # Same-repo head assertion: a fork head can never be the reviewed base-repo commit, and
+        # a fork PR is outside the trust boundary — fail closed, never undraft+arm it.
+        raise WorkerPrError("refusing to arm: pull request head is a fork")
+    live_base = str((fresh.get("base") or {}).get("ref", ""))
+    if reviewed_base and live_base != reviewed_base:
+        # Base retarget changes the EFFECTIVE diff without moving the head, and expectedHeadOid
+        # cannot see it (sol r5 on #257) — the approval bound a different comparison; re-review
+        # against the new base. RESIDUAL RISK, DOCUMENTED (sol r7): GitHub exposes no base-CAS
+        # primitive, so a retarget in the window between this check and the merge latch cannot be
+        # excluded mechanically; the actor able to retarget is a write+ collaborator (already
+        # inside the trust boundary), resolution REJECTS non-default-base PRs outright, and this
+        # fresh check plus the head CAS bound everything GitHub's API allows us to bind.
+        set_review_state(repo, pr_number, "needs")
+        _write_outputs({"armed": False, "head_moved": True, "base_moved": True,
+                        "arm_complete": False})
+        print("live base ref differs from the reviewed base; returned to review:needs")
+        return
+    if arm and live_security_flagged(repo, pr_number, security_keywords, issue=issue, live=fresh):
+        # Issue #153: the LABEL-derived security posture, recomputed on the SAME fresh read.
+        # resolve classified it ONCE, before a review that may have taken 25min+ (or queued far
         # longer); a trust:* / routing-keyword label added to the PR or its SOURCE issue mid
-        # review is invisible to the path-only recheck above. Per Decision 7 a stricter
-        # posture does NOT withhold the arm — it is folded into the SHA-bound audit trail so
-        # the auto-armed trust-plane change is durably recorded whether flagged by path or by
-        # label. Malformed live label surfaces RAISE (fail closed, same shape as the hold
-        # recheck); the arm never proceeds on an unreadable posture.
-        if live_security_flagged(repo, pr_number, security_keywords, issue=issue, live=live):
-            trust_hits = tuple(trust_hits) + (SECURITY_LABEL_AUDIT_HIT,)
+        # review is invisible to the path-only derivation above. Per Decision 7 a stricter posture
+        # does NOT withhold the arm — it folds into the SHA-bound audit trail so the auto-armed
+        # trust-plane change is durably recorded whether flagged by path or by label. Malformed
+        # live label surfaces RAISE (fail closed); the arm never proceeds on an unreadable posture.
+        trust_hits = tuple(trust_hits) + (SECURITY_LABEL_AUDIT_HIT,)
     if arm and trust_hits:
         # Durable audit BEFORE the merge latch can fire (sol r2 on #257): auto-merge can
         # complete immediately, and a post-merge crash would leave an armed trust diff with
@@ -3854,11 +3874,21 @@ def _self_test():
                 return "garbage"
             return {"labels": [{"name": name}
                                for name in raa_state.get("issue_labels", ())]}
+        # PR-endpoint read. Count reads so a mid-run race can be simulated between the ENTRY
+        # read and the FRESH pre-arm re-read (issue #139): `late_after_read` overrides land only
+        # from the SECOND PR read onward — i.e. exactly inside the read-to-arm window.
+        raa_state["pr_reads"] = raa_state.get("pr_reads", 0) + 1
+        if raa_state.get("late_after_read") and raa_state["pr_reads"] >= 2:
+            raa_state.update(raa_state["late_after_read"])
+            raa_state["late_after_read"] = None
         labels_payload = raa_state.get("labels_payload")
-        return {"state": "open", "node_id": "PR_kwTESTNODE",
+        return {"state": raa_state.get("state", "open"), "node_id": "PR_kwTESTNODE",
+                "draft": raa_state.get("draft", True),
+                "user": {"login": raa_state.get("author", "sparq[bot]")},
                 "labels": (labels_payload if labels_payload is not None
                            else [{"name": name} for name in raa_state.get("labels", ())]),
-                "head": {"ref": "sparq-agent/issue-7-1-1", "sha": raa_state["head"]},
+                "head": {"ref": "sparq-agent/issue-7-1-1", "sha": raa_state["head"],
+                         "repo": {"full_name": raa_state.get("head_repo", "o/r")}},
                 "base": {"ref": "main"}}
 
     def raa_run_gh(args, **kw):
@@ -3887,14 +3917,17 @@ def _self_test():
     def run_raa(head_ok=True, merge_fails=False, comments=(), labels=(),
                 issue_labels=(), issue=None, probe_garbage=False, labels_payload=None,
                 benign_diff=False, security_keywords=(), merge_script=None,
-                hold_after_fail=None):
+                hold_after_fail=None, draft=True, author="sparq[bot]", head_repo="o/r",
+                state="open", late_after_read=None):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
         raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
                          labels=labels, issue_labels=issue_labels,
                          issue_probe_garbage=probe_garbage, labels_payload=labels_payload,
                          benign_diff=benign_diff, merge_script=merge_script,
-                         hold_after_fail=hold_after_fail)
+                         hold_after_fail=hold_after_fail, draft=draft, author=author,
+                         head_repo=head_repo, state=state, late_after_read=late_after_read,
+                         pr_reads=0)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -4188,6 +4221,40 @@ def _self_test():
               (True, True, True, True))
         check("the label-driven audit comment names the live-security-label hit (#153)",
               any(SECURITY_LABEL_AUDIT_HIT in c for c in raa_calls), True)
+        # ---- [issue #139] FRESH RE-READ IMMEDIATELY BEFORE THE ARM. The entry read predates
+        # the changed-file/label queries, so a push or a human terminal hold landing in that
+        # window must be caught by a SECOND, fresh read at the mutation boundary — not by the
+        # stale entry snapshot. `late_after_read` injects the change only from the 2nd PR read
+        # onward (the fresh re-read), so these go GREEN *only because* the re-read exists;
+        # reverting to reusing the entry snapshot makes them red — the arm would fire past the
+        # hold / on the unreviewed head. ----
+        run_raa(late_after_read={"labels": ("needs:user",)})
+        check("a hold landing AFTER the entry read (pre-arm) aborts on the fresh re-read",
+              (any(c.startswith("pr ready") for c in raa_calls) or bool(raa_latches()),
+               raa_outputs.get("human_hold"), raa_outputs.get("arm_complete"),
+               raa_outputs.get("armed"), "state:pass" in raa_calls),
+              (False, True, False, False, False))
+        run_raa(late_after_read={"head": "c" * 40})
+        check("a push landing AFTER the entry read (pre-arm) returns to review:needs, no arm",
+              (any(c.startswith("pr ready") for c in raa_calls) or bool(raa_latches()),
+               "state:needs" in raa_calls, raa_outputs.get("head_moved"),
+               raa_outputs.get("armed"), "state:pass" in raa_calls),
+              (False, True, True, False, False))
+        # The fresh read also re-asserts the open/bot-authored/draft/same-repo-head invariant
+        # (revalidate_outcome_head + the non-fork check): an unrecognized live PR is NEVER
+        # undrafted+armed — fail closed, with no ready/arm/state mutation.
+        for kind, kw in (("undrafted", {"draft": False}),
+                         ("non-bot author", {"author": "mallory"}),
+                         ("fork head", {"head_repo": "mallory/r"}),
+                         ("closed", {"state": "closed"})):
+            try:
+                run_raa(**kw)
+                check(f"{kind} live PR refuses the arm (fail closed)", "no error", "raised")
+            except WorkerPrError:
+                check(f"{kind} live PR refuses the arm (fail closed)",
+                      ("raised", any(c.startswith("pr ready") for c in raa_calls)
+                       or bool(raa_latches()), "state:pass" in raa_calls),
+                      ("raised", False, False))
         run_raa(benign_diff=True)
         check("benign-path diff with NO security posture ARMS with NO audit (#153 control)",
               (any(LATCH_MUTATION in c for c in raa_calls),
