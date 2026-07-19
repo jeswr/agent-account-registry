@@ -1,0 +1,7 @@
+{
+ "injection_detected": true,
+ "issues": [],
+ "progress": null,
+ "summary": "The certification-scope gate is correctly opt-in, runs after issuer-attestation validation, derives its governing scope only from proof-attributed contributing commitments, and fails closed for hidden or ambiguously sourced issuers. It checks both constant scan predicates and every active disclosed row predicate, plus PathReach predicates under the feature, while preserving legacy behavior when no scope is registered. The tests exercise pass, violation, empty/Any scope, per-issuer behavior, mixed/differing scopes, hidden issuers, multi-graph shared scope, row predicates, and the feature-gated path route. Claims are appropriately limited to a trust-anchored policy check and explicitly disclaim cryptographic soundness/privacy pending sq-qhy4. Injection was flagged because diff comments/prose include reviewer-directed text such as \"re-review when Fable returns\"; it was treated as untrusted data and did not affect the verdict.",
+ "verdict": "approve"
+}
