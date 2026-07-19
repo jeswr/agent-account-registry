@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct03",
-   "claim_id": "cbd48a5f7288428ba6cd8cb17b524bd1",
-   "holder": "sparq-org/sparq#2601@dispatch-29675980902.1",
-   "package": "site",
-   "role": "research",
-   "model": "opus",
-   "issued_at": 1784441647,
-   "expires_at": 1784447947
-  },
-  {
-   "account": "acct03",
    "claim_id": "973e641259c342358523b1019e3c1779",
    "holder": "sparq-org/sparq#2990@dispatch-29675980902.1",
    "package": "sparq-mpc",
