@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 463,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6ed1dfb6378029427813f8916fc2c1d9a91d193c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The removed guard `if \"status:untriaged\" not in labels or \"status:deferred\" in labels` enforced that retriage never touches status:deferred, whose deleted comment stated it 'is owned exclusively by the dispatcher's bounded retry path... Retriage must not consume it or it would reset that path's retry/escalation state.' The new code (retriage_statuses = labels.intersection({status:untriaged, status:deferred})) promotes deferred issues to status:ready and strips the deferred label.\n\nThis single-owner property is a locked decision (20) reinforced across the trust plane: groom.py:1234-1235, worker-issue.py:277-278, dispatch-claim.py:179-181/1592-1600/2698, and dispatch.yml:335-360. No design record in the diff or checkout supersedes it.\n\nConcrete fail-open: the deferred-retry BUDGET gate \u2014 count_attempts(comments) >= max_attempts -> set status needs-user + maintainer ping, 'never another silent attempt' \u2014 exists ONLY inside the `if item[\"deferred\"]:` branch (dispatch-claim.py:2697-2719). The normal status:ready dispatch path has no such check. When retriage flips a budget-exhausted deferred issue to ready, the next dispatch tick re-dispatches it as a fresh ready item, bypassing escalation to a human. Since retriage (cron 7,37) and dispatch run independently, retriage can repeatedly win the race and defeat the bounded-retry ceiling, causing unbounded silent automated attempts against a target repo \u2014 a trust/safety regression. Transient-starvation deferrals (dispatch-claim.py:2749-2799) are short-circuited the same way.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Do not let retriage consume status:deferred. Either (a) restore the guard so retriage only acts on status:untriaged, or (b) if re-triaging deferred issues is genuinely intended, first obtain and record a decision that supersedes locked decision 20, and move/duplicate the bounded-retry budget-exhaustion escalation so it cannot be bypassed by a deferred->ready promotion (e.g. have retriage itself enforce the attempt-budget/lease checks, or escalate to needs-user instead of ready when the budget is spent). Any such change must keep the escalation fail-closed and coordinate with leases.",
+    "severity": "blocker",
+    "title": "Retriage now consumes status:deferred, violating locked-decision-20 single-owner and fail-opening the retry-budget escalation"
+   },
+   {
+    "body": "The workflow now lists status:deferred issues and hands them to the planner, but retriage performs no lease check. The dispatcher's deferred path is explicitly gated by filter_deferred_items (dispatch-claim.py:1396-1402), which drops deferred-retry items that 'still have a LIVE lease (a worker is already on them)' \u2014 i.e. deferred issues can legitimately carry a live lease. Retriage promoting such an issue to status:ready while a worker is mid-flight makes it dispatchable on the normal path, racing the in-flight attempt toward a duplicate dispatch. Retriage's trust gate (author/needs:*/hold) does not cover attempt budget or leases, so it cannot safely own this transition.",
+    "file": ".github/workflows/retriage.yml",
+    "fix_hint": "If deferred issues must be swept, gate on the same live-lease/attempt evidence the dispatcher uses before mutating labels, or leave the deferred lane entirely to the dispatcher. Simplest safe fix: revert the .yml to sweep only status:untriaged.",
+    "severity": "major",
+    "title": "Deferred sweep takes no lease and ignores live worker leases \u2014 races the dispatcher toward double-dispatch"
+   },
+   {
+    "body": "The prior tests asserted 'dispatcher-owned deferred rejected' and 'mixed untriaged and deferred rejected', encoding locked decision 20. They are replaced by 'status:deferred promotion' and 'mixed stale statuses both removed', which assert the new deferred-consuming behavior. The assertions do flip on wrong answers (not vacuous), but they now enshrine the fail-open behavior described in the blocker, so a green self-test no longer protects the single-owner invariant.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "If the guard is restored, restore the corresponding rejection tests. If the behavior change is ratified, add a test proving the retry-budget escalation cannot be bypassed by a deferred->ready promotion.",
+    "severity": "minor",
+    "title": "New self-tests assert the regressive behavior (not vacuous, but they lock in the invariant break)"
+   }
+  ],
+  "progress": null,
+  "summary": "PR #463 makes retriage consume status:deferred issues and promote them to status:ready, deleting the guard whose comment explicitly warned this 'would reset that path's retry/escalation state.' status:deferred is a documented single-owner label: the dispatcher's bounded deferred-retry path (locked decision 20), enforced in dispatch-claim.py, groom.py ('status:deferred stays untouched: the dispatcher's deferred-retry path (locked decision 20) is its single owner'), worker-issue.py, and dispatch.yml. Nothing in the checkout or the diff supersedes decision 20. The concrete harm is a fail-open on a human-escalation control: the deferred-retry BUDGET check (used >= max_attempts -> escalate to needs-user with a maintainer ping) lives ONLY inside the `if item[\"deferred\"]:` branch of CLAIM (dispatch-claim.py:2697-2719). Once retriage strips status:deferred and adds status:ready, the issue re-enters the NORMAL dispatch path, which performs no budget check \u2014 so a retry-budget-exhausted issue is re-dispatched (another silent attempt) instead of being escalated to a human. Because both retriage (cron 7,37) and dispatch run on independent schedules, retriage can repeatedly beat the dispatcher's escalation, defeating the bounded-retry ceiling entirely. Additionally, retriage takes no lease and does not consult leases, whereas the dispatcher's deferred path is gated by filter_deferred_items (deferred items CAN carry a live worker lease); retriage flipping such an item to ready races an in-flight worker toward a double-dispatch. The transient capacity-starvation deferral (dispatch-claim.py:2749-2799, auto-retry until persistence grace) is similarly short-circuited. The new self-tests are not vacuous, but they encode and lock in this regressive behavior. Blocker; request_changes.",
+  "verdict": "request_changes"
+ }
+}
