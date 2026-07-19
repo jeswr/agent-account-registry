@@ -1843,7 +1843,7 @@ def _queue_disarm_mutation(mutation, node_id):
         raise WorkerPrError(f"GraphQL {mutation} failed for the queued pull request")
 
 
-def disarm(repo, pr_number, when):
+def disarm(repo, pr_number, when, preserve_review_state=False):
     """Defuse a worker PR's GitHub-side arm/ready state, fail-closed on LIVE data only (the plan
     row that requested this is hostile — every precondition is re-derived from the API here).
 
@@ -1873,7 +1873,14 @@ def disarm(repo, pr_number, when):
     redraft fallback still runs), and all failures surface as ONE structured per-PR error (a
     disarm_error output row + a per-PR exit message) so the dispatch caller's per-item
     handling skips exactly this PR and sibling enumeration continues — the reviewed-sha
-    marker is never advanced on a failed disarm."""
+    marker is never advanced on a failed disarm.
+
+    ``preserve_review_state`` is valid only for when=always label-driven re-entry.  It performs
+    the same latch retraction/redraft but does not rewrite an externally selected
+    review:changes/review:needs label to review:needs; otherwise ready review:changes PRs would
+    re-enter as reviews instead of the requested fixes during the safety transition."""
+    if preserve_review_state and when != "always":
+        raise WorkerPrError("preserve-review-state requires disarm mode always")
     live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
     if not isinstance(live, dict) or live.get("state") != "open":
         _write_outputs({"disarmed": False})
@@ -1890,6 +1897,9 @@ def disarm(repo, pr_number, when):
         _write_outputs({"disarmed": False})
         print("disarm skipped: not a same-repo bot worker PR")
         return
+    if preserve_review_state and not ({"review:needs", "review:changes"} & labels):
+        raise WorkerPrError(
+            "preserve-review-state requires a live review:needs or review:changes label")
     held = human_owned(labels)
     if when == "always" and held:
         # A human hold (review:needs-user / needs:user) parks autonomous PUSHES and reviews, so
@@ -1961,6 +1971,8 @@ def disarm(repo, pr_number, when):
         # it would strip a review:needs-user hold and re-admit the PR to the autonomous review
         # loop. The human's park stands; the unreviewed head simply can no longer auto-merge.
         if held:
+            actions = [action for action in actions if action != "relabel"]
+        if preserve_review_state:
             actions = [action for action in actions if action != "relabel"]
         # Issue #81: per-action isolation — a failed action never skips the SAFETY actions
         # after it. Dequeue can succeed while the auto-merge disable fails; the redraft must
@@ -3994,7 +4006,7 @@ def _self_test():
         return argparse.Namespace(returncode=code, stdout="", stderr="")
 
     def run_disarm(base_ref="main", draft=False, armed=True, labels=(), when="mismatch",
-                   **overrides):
+                   preserve_review_state=False, **overrides):
         disarm_calls.clear()
         compare_paths.clear()
         fake_outputs.clear()
@@ -4012,7 +4024,7 @@ def _self_test():
             "compare": {key: json.loads(json.dumps(doc))
                         for key, doc in identical_compares.items()},
         }, **overrides)
-        disarm("o/r", 41, when)
+        disarm("o/r", 41, when, preserve_review_state=preserve_review_state)
 
     try:
         wiring_globals["_gh_json"] = fake_gh_json
@@ -4060,6 +4072,26 @@ def _self_test():
                and "state:needs" in disarm_calls
                and f"rebind:{head_69}" not in disarm_calls), True)
         check("content change reports disarmed", fake_outputs.get("disarmed"), True)
+
+        # Issue #450 label-driven READY re-entry: retract any latch + return to draft while
+        # preserving review:changes. The ordinary when=always relabel-to-needs would silently
+        # turn the requested fix into another review. Safety mutations are unchanged.
+        run_disarm(when="always", labels=("review:changes",),
+                   preserve_review_state=True,
+                   commits=[dict(row) for row in plain_advance])
+        check("ready changes re-entry redrafts and retracts the latch",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls,
+               "pr ready 41 -R o/r --undo" in disarm_calls,
+               fake_outputs.get("disarmed")), (True, True, True))
+        check("ready changes re-entry preserves the explicit review state",
+              "state:needs" in disarm_calls, False)
+        try:
+            run_disarm(preserve_review_state=True)
+        except WorkerPrError as exc:
+            check("preserve-review-state is restricted to always-defuse",
+                  "requires disarm mode always" in str(exc), True)
+        else:
+            check("preserve-review-state is restricted to always-defuse", "no error", "raised")
 
         # #234 sol r1: idempotent convergence must come from a FRESH re-read, not the stale
         # planning dict. (a) mutation fails but the re-read confirms auto-merge off and not
@@ -5121,6 +5153,9 @@ def main():
 
     dis = subparsers.add_parser("disarm", parents=[common])
     dis.add_argument("--when", choices=("mismatch", "always"), required=True)
+    dis.add_argument("--preserve-review-state", action="store_true",
+                     help="redraft safely without changing review:needs/review:changes "
+                          "(when=always label re-entry only)")
 
     # The live reviewer handle arrives via env WORKER_REVIEWER_ACCOUNT (not argv — argv is echoed
     # into public logs) and is compared against the recorded hash under PROVENANCE_SALT.
@@ -5253,7 +5288,8 @@ def main():
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
                        alert_repo=alert_repo, alert_token=alert_token)
         elif args.command == "disarm":
-            disarm(args.repo, args.pr, args.when)
+            disarm(args.repo, args.pr, args.when,
+                   preserve_review_state=args.preserve_review_state)
         elif args.command == "ready-and-arm":
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,

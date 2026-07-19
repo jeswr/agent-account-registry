@@ -1440,6 +1440,19 @@ def _self_test():
           usage_eligible({**fable_ok, "fable_7d_oi_util": 0.95}, model="fable"), False)
     check("same acct still eligible for haiku when fable bucket exhausted",
           usage_eligible({**fable_ok, "fable_7d_oi_util": 0.95}, model="haiku"), True)
+    # Issue #450: the premium sub-quota is model-specific. A sol-authored PR reviews on OPUS;
+    # exhausting Fable on an otherwise healthy anthropic account must not erase that OPUS slot.
+    fable_capped = {**fable_ok, "fable_7d_oi_util": 1.0}
+    check("Fable-100% account remains eligible for opus review",
+          usage_eligible(fable_capped, model="opus"), True)
+    opus_account = [{"handle": "acctopus", "models": ["fable", "opus"],
+                     "max_concurrent_workers": 2, "available": True}]
+    check("Fable-100% account contributes its opus review slots",
+          available_account_slots(opus_account, [], ["opus", "fable"], now,
+                                  usage={"acctopus": fable_capped}), 2)
+    check("opus review selects the healthy account despite its capped Fable bucket",
+          choose_account(opus_account, [], ["opus", "fable"], "p", "review", now,
+                         usage={"acctopus": fable_capped}), "acctopus")
     check("fable ineligible: probe absent (fable_ok missing) fails closed",
           usage_eligible(fresh, model="fable"), False)
     check("fable ineligible: probe failed (fable_ok False)",

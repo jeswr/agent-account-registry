@@ -137,6 +137,21 @@ def _fix_dispatch_line(counts):
             f"(reasons: {detail})")
 
 
+def _claim_defer_category(reason):
+    """Privacy-safe review/fix claim deferral category for the shared tick histogram.
+
+    The allocator exposes its precise single-flight/capacity reason, while the public dispatch
+    summary needs only a stable coarse category.  Keep lease ownership distinct from package
+    conflict and account capacity so a planned-but-not-launched lane is never reasonless.
+    """
+    return {
+        "pr-single-flight": "lease-held",
+        "package-single-flight": "conflict",
+        "no-account-slots": "no-slot",
+        "lane-cap": "no-slot",
+    }.get(reason or "no-account-slots", "claim-deferred")
+
+
 # Human-owned PR labels: review:needs-user is the loop's own terminal escalation; needs:user is
 # groom's parked-PR marker ("Human attention required"). EITHER parks the whole autonomous
 # surface for the PR — enumeration, repair admission, and worker-pr.py disarm all stand down.
@@ -1163,8 +1178,9 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
       never landed) converges to a loud human hand-off instead of silently stalling,
     - a PR with a LIVE review/fix lease is not re-emitted (the reconciler re-emits a
       review:changes PR with NO live fix lease, so a crashed fix converges),
-    - a needs-review PR whose head equals its reviewed-sha marker is skipped (no re-review
-      without a head advance; the non-empty-diff gate runs at CLAIM time).
+    - an explicit review:needs/review:changes label is a re-entry signal even on a ready PR; for
+      an unlabeled legacy fallback only, a matching reviewed-sha still suppresses re-review. The
+      non-empty-diff gate runs at CLAIM time.
 
     `pr_status` (optional, {number: pr_ci_status(...)}) admits the zero-manual repair states over
     the SAME surface — draft or not, any non-terminal review state:
@@ -1295,15 +1311,30 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             if lease_free:
                 emit("needs-rebase")
             continue
-        if draft:
-            if "review:changes" in labels:
-                if f"fix:{repo}#{number}" in live_keys:
-                    continue              # a fix run is live; the reconciler re-emits if it dies
-                emit("needs-fix")
+        # Explicit review labels are authoritative re-entry signals, independent of GitHub's
+        # draft bit.  An orchestrator/human adjudication can relabel a formerly human-owned READY
+        # worker PR back to review:changes/review:needs without creating a fresh round marker; the
+        # old `if draft:` wrapper made that valid transition invisible forever.  CLAIM safely
+        # redrafts a ready item while preserving this state before any model is launched.
+        if "review:changes" in labels:
+            if f"fix:{repo}#{number}" in live_keys:
+                continue                  # per-PR single-flight; re-emit after release/expiry
+            emit("needs-fix")
+            continue
+        if "review:needs" in labels:
+            if f"review:{repo}#{number}" in live_keys:
+                continue                  # per-PR single-flight; re-emit after release/expiry
+            # Normal drafted flow still avoids re-reviewing an already-bound head so concluded
+            # red CI can fall through to needs-ci-fix. A READY explicit re-entry is different:
+            # the external transition itself requests that the PR be brought back into review.
+            if not draft or not reviewed_match:
+                emit("needs-review")
                 continue
-            # review:needs, a provenance-backfilled pre-migration PR with no review:* label yet,
-            # or a crashed-disarm artifact still carrying review:pass while drafted (no valid
-            # flow leaves a DRAFT labelled review:pass, so re-review is the converging action).
+        if draft:
+            # A provenance-backfilled pre-migration PR with no review:* label yet, or a
+            # crashed-disarm artifact still carrying review:pass while drafted (no valid flow
+            # leaves a DRAFT labelled review:pass).  Unlike an explicit label re-entry, this
+            # fallback retains the reviewed-sha no-repeat guard.
             if f"review:{repo}#{number}" in live_keys:
                 continue
             if not reviewed_match:
@@ -1741,10 +1772,31 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     # HOLDS on a wholesale usage-probe outage rather than dispatching ungated). Enforced per-claim
     # below, with an explicit carve-out for a chain served entirely by probe-exempt accounts.
     require_usage = bool(policy.get("require_usage", False))
+    # Close the preceding item's telemetry at the next iteration (and once after the loop).  This
+    # catches every pre-claim validation/policy `continue` without duplicating counters at the many
+    # already-instrumented lease/error exits.  The exact cause remains in the per-PR log line; the
+    # shared summary gets the stable coarse reason required for lane health.
+    pending_telemetry = None
+
+    def finish_pending():
+        nonlocal pending_telemetry
+        if pending_telemetry is None:
+            return
+        if (not pending_telemetry["launched"]
+                and sum(defer_reasons.values()) == pending_telemetry["reason_total"]):
+            defer_reasons[f"{pending_telemetry['lane']}:preclaim-defer"] += 1
+        pending_telemetry = None
+
     for item in review_items:
+        finish_pending()
         number = item["pr_number"]
         lane = _review_item_lane(item["state"])
         lanes[lane]["planned"] += 1
+        pending_telemetry = {
+            "lane": lane,
+            "launched": False,
+            "reason_total": sum(defer_reasons.values()),
+        }
         try:
             if not bot_login:
                 print(f"defer review {repo}#{number}: bot login unavailable (no App token)")
@@ -1755,9 +1807,6 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 print(f"defer review {repo}#{number}: PR is no longer open")
                 continue
             draft = pull.get("draft") is True
-            if not draft and not repair_state:
-                print(f"defer review {repo}#{number}: PR is no longer an open draft")
-                continue
             head = pull.get("head") or {}
             head_repo = (head.get("repo") or {}).get("full_name")
             head_ref = str(head.get("ref", ""))
@@ -1817,6 +1866,17 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    "the PR head no longer descends from the worker-opened commit "
                                    "(history was rewritten); refusing autonomous review")
                     continue
+            if not draft and item["state"] in {"needs-review", "needs-fix"}:
+                # Label-driven re-entry may arrive while the PR is READY (and possibly armed).
+                # Defuse before any review/fix model runs, but preserve the externally selected
+                # review:needs/review:changes state; the historical disarm relabel-to-needs would
+                # otherwise turn a requested fix into a review during this safety transition.
+                _run_target_helper(script_dir, repo, "worker-pr.py", [
+                    "disarm", "--repo", repo, "--pr", str(number), "--when", "always",
+                    "--preserve-review-state"])
+                draft = True
+                print(f"re-enter review {repo}#{number}: safely returned the ready PR to draft "
+                      f"while preserving {item['state']}")
             fix_kind, fix_context = "verdict", ""
             if repair_state:
                 # The plan row is HOSTILE AND STALE: re-derive the repair trigger from LIVE data
@@ -1972,7 +2032,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # residue of an interrupted defuse/disarm — the reviewed-sha guard is bypassed
                 # for it, and the round budget above bounds how often it may retry.
                 if (item["state"] == "needs-review"
-                        and reviewed and reviewed.group(1) == head_sha):
+                        and reviewed and reviewed.group(1) == head_sha
+                        and "review:needs" not in labels):
                     print(f"defer review {repo}#{number}: head already reviewed")
                     continue
                 base_branch = str((pull.get("base") or {}).get("repo", {}).get(
@@ -2003,30 +2064,42 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
             else:
-                if rounds < 1:
-                    print(f"defer review {repo}#{number}: review:changes with no recorded round")
-                    continue
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", rounds)
+                # Externally relabelled review:changes is a first-class re-entry even when no
+                # bot round marker survived/exists.  Round 1 is the positive workflow round that
+                # corresponds to the clean synthetic round-0 budget posture; the trusted verdict
+                # record is still required below before a verdict-seeded fixer may run.
+                round_number = max(rounds, 1)
+                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
                 if len(missed) >= MISSED_FIX_LIMIT:
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    f"{len(missed)} consecutive fix dispatches missed for round "
-                                   f"{rounds}; a human must unstick this PR")
+                                   f"{round_number}; a human must unstick this PR")
                     continue
                 verdict_file = record_file_path(ledger_root, registry_root,
-                                                worker_pr.verdict_path(repo, number, rounds))
+                                                worker_pr.verdict_path(repo, number, round_number))
                 if not verdict_file.is_file():
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "record-marker", "--repo", repo, "--pr", str(number), "--kind", "missed",
-                        "--round", str(rounds), "--run-key",
+                        "--round", str(round_number), "--run-key",
                         f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                         f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
                         "--bot-login", bot_login])
-                    print(f"defer review {repo}#{number}: round {rounds} verdict record missing")
+                    print(f"defer review {repo}#{number}: round {round_number} trusted verdict "
+                          "record missing")
                     continue
+                if rounds < 1:
+                    # Bind the recovered trusted round-1 verdict back into the durable comment
+                    # state before launching its fix. Without this synthesis the pushed fix would
+                    # be re-reviewed as round 1 and collide with the existing immutable round-1
+                    # verdict path. The budget decision above intentionally saw round 0, so this
+                    # externally adjudicated re-entry starts clean; subsequent ticks see round 1.
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
+                        "round-record", "--repo", repo, "--pr", str(number),
+                        "--round", str(round_number), "--run-key", run_key,
+                        "--head-sha", head_sha, "--bot-login", bot_login])
                 mode, role = "fix", "fix"
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
-                round_number = rounds
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
                 # (e.g. sol/luna not yet in the target routing catalog). Never silent-queue:
@@ -2094,6 +2167,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         else:
             claim, claim_reason = claim_result, "no-account-slots"
         if claim is None:
+            defer_reasons[f"{lane}:{_claim_defer_category(claim_reason)}"] += 1
             if mode == "fix":
                 try:
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
@@ -2191,6 +2265,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             print(f"defer review {repo}#{number}: {mode} dispatch failed; skipped")
             continue
         launched += 1
+        pending_telemetry["launched"] = True
         lanes[lane]["launched"] += 1
         if mode == "fix":
             fix_dispatch["launched"] += 1
@@ -2198,6 +2273,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         kind_note = "" if fix_kind == "verdict" else f"/{fix_kind}"
         print(f"dispatched {mode}{kind_note} {repo}#{number}: round={round_number}, "
               f"claim={claim_id[:8]}")
+    finish_pending()
     return launched
 
 
@@ -3448,10 +3524,18 @@ def _self_test():
         provenance, [], issue_labels, now)
     assert sec and sec[0]["security"] is True
 
-    # reviewed-sha binding: a head equal to the marker is NOT re-enumerated (no advance)
-    marked = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"],
+    # reviewed-sha binding still suppresses the UNLABELLED legacy fallback (no advance).
+    marked = pull(41, "sparq-agent/issue-7-1-1", sha_a,
                   body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
     assert enumerate_review_items(repo, [marked], provenance, [], issue_labels, now) == []
+
+    # Issue #450 re-entry: review:needs on a READY PR is authoritative even when an old
+    # reviewed-sha marker matches. An external adjudication deliberately chose re-review; the
+    # drafted equivalent stays suppressed so red CI may enter needs-ci-fix.
+    marked_needs = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"],
+                        body=f"x <!-- sparq-reviewed-sha:{sha_a} -->", draft=False)
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [marked_needs], provenance, [], issue_labels, now)] == ["needs-review"]
 
     # Round-budget exhaustion is deliberately NOT excluded at enumeration: CLAIM re-derives the
     # live round count and applies the terminal needs-user transition itself, so a crashed final
@@ -3468,6 +3552,17 @@ def _self_test():
     reconciled = enumerate_review_items(repo, [changes], provenance, dead_fix,
                                         issue_labels, now)
     assert reconciled and reconciled[0]["state"] == "needs-fix"
+    # Issue #450 mutation guard: a READY (non-draft) worker PR with valid provenance and an
+    # explicit changes label re-enters as a fix item. Restoring the old `if draft:` wrapper makes
+    # this disappear and flips the assertion red. Human/non-bot PRs remain outside the surface.
+    ready_changes = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                         labels=["review:changes"])
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [ready_changes], provenance, [], issue_labels, now)] == ["needs-fix"]
+    assert enumerate_review_items(
+        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                    login="human", labels=["review:changes"])],
+        provenance, [], issue_labels, now) == []
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
@@ -4046,8 +4141,11 @@ def _self_test():
             # trigger evaporated (gate re-ran green): the ready PR is NOT defused — no mutation
             fake.update(pull=live_pull(draft=False, auto_merge={"merge_method": "squash"}),
                         check_runs=gate_green, issue_labels=["area:crate-a"])
-            run_items([ci_item])
+            launched, reasons = run_items([ci_item])
             assert helper_calls == [], helper_calls
+            # Issue #450 no-silent-defer: even a pre-claim live-trigger drift gets a coarse
+            # non-empty shared telemetry reason (the exact detail remains in the per-PR log).
+            assert launched == 0 and reasons["fix:preclaim-defer"] == 1, reasons
             # trigger still live: the ready PR IS defused (disarm --when always), exactly once
             fake["check_runs"] = gate_red
             run_items([ci_item])
@@ -4090,9 +4188,11 @@ def _self_test():
             # budget remaining (0 recorded rounds): the cross-provider REVIEW chain is offered and
             # NO needs-user is applied (recovery, not escalation)
             alloc = StrandAllocator()
-            run_items([stranded_item], allocator=alloc, routing=strand_routing)
+            launched, reasons = run_items(
+                [stranded_item], allocator=alloc, routing=strand_routing)
             assert helper_calls == [], helper_calls
             assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
+            assert launched == 0 and reasons["review:no-slot"] == 1, reasons
             # repeated failed recovery: the round budget is spent (hard cap) -> loud needs-user,
             # and no review is dispatched — terminal escalation is RESERVED for this case
             fake["comments"] = [
@@ -4154,6 +4254,28 @@ def _self_test():
                         check_runs=gate_green, issue_labels=["area:crate-a"])
             fix_model = wiring_worker_pr.FIX_MODEL_MARKER
             pin_marker = wiring_worker_pr.MODEL_PIN_MARKER
+
+            # Issue #450 CLAIM re-entry + mutation guard: an externally supplied changes label
+            # with valid provenance and NO bot round marker starts from synthetic round 0 (workflow
+            # round 1), is counted fix-eligible, and reaches the allocator. Restoring the old
+            # `if rounds < 1: continue` makes both assertions red. The trusted round-1 verdict
+            # remains mandatory input to the verdict-seeded fixer.
+            fake.update(pull=live_pull(draft=False, labels=["review:changes"]), comments=[])
+            write_verdict(1, None)
+            alloc = FakeAllocator()
+            launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert launched == 0 and alloc.chains == [["fable", "opus"]], \
+                (launched, alloc.chains)
+            assert run_items.fix_dispatch["eligible"] == 1, run_items.fix_dispatch
+            assert reasons["fix:no-slot"] == 1, reasons
+            disarm_calls = [args for script, args in helper_calls
+                            if script == "worker-pr.py" and args[0] == "disarm"]
+            assert disarm_calls and "--preserve-review-state" in disarm_calls[0], disarm_calls
+            synthetic_rounds = [args for script, args in helper_calls
+                                if script == "worker-pr.py" and args[0] == "round-record"]
+            assert synthetic_rounds and synthetic_rounds[0][
+                synthetic_rounds[0].index("--round") + 1] == "1", synthetic_rounds
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]), comments=[])
 
             # ACT: base budget spent on OPUS -> extension escalates UP the ladder
             # (opus < fable, sol r2 f2), fable pin converged, and a chain WITHOUT opus;
