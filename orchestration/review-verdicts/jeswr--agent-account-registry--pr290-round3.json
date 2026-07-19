@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-2 major defect is resolved soundly. Cross-repository fallback is now restricted to firing actions, so a failed private recovery remains undelivered and causes a nonzero decide result instead of being incorrectly satisfied by a no-op on the public registry. The added regression test exercises the exact failed-close scenario, asserts that the action remains undelivered, and verifies that no registry call occurs for recovery. The broader delivery contract is fail-closed: unreadable or non-list tracker results and failed mutations return failure; firing actions retry only a distinct usable fallback route; and exhausted delivery propagates to a nonzero command result. The tests contain behavior-sensitive assertions for routing, mutation failures, malformed tracker responses, partial reopen failure, and command exit status. No blocker, major, or other actionable issue is supported by the diff.",
+ "verdict": "approve"
+}
