@@ -41,16 +41,6 @@
    "expires_at": 1784445789
   },
   {
-   "account": "acct01",
-   "claim_id": "51b621ba976c4c469be2a960df0ac4fa",
-   "holder": "sparq-org/sparq#3352@dispatch-29676304510.1",
-   "package": "bench-wasm-compare",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784442406,
-   "expires_at": 1784448706
-  },
-  {
    "account": "acct03",
    "claim_id": "ca73b4e885184e58b0804b290e07d0b6",
    "holder": "jeswr/agent-account-registry#110@dispatch-29676304510.1",
