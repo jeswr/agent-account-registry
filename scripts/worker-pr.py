@@ -2347,19 +2347,29 @@ def review_outcome(args):
         live.get("draft"), str((live.get("head") or {}).get("sha", "")),
         args.reviewed_sha, args.bot_login)
     if freshness != "ok":
-        # Issue #162: a stale-deferred review is NOT a substantive round — void its pre-model
-        # round marker for THIS (round, run) so legitimate head churn (or a review voided by a
-        # moving head) never burns the global round budget and terminally escalates a head that
+        # Issue #162: legitimate head churn (the reviewed head advanced during the review) is
+        # NOT a substantive round — void its pre-model round marker for THIS (round, run) so a
+        # moving head never burns the global round budget and terminally escalates a head that
         # never received a valid review. The round number is then reused by the next valid
-        # re-review. This is the ONLY mutation on the stale path (additive bot-accounting; no
-        # findings/label/state), so the sweep still re-reviews the current head cleanly.
-        record_round_void(args.repo, args.pr, args.round, args.run_key, args.bot_login)
+        # re-review. But ONLY "head-moved" is legitimate churn: closed / author / undrafted /
+        # malformed-head / unbound are NOT head advancement — they are a terminal, tamper, or
+        # deterministic identity/wiring failure (a wrong author or an undraft is a human/tamper
+        # stop; a missing/malformed live-or-reviewed sha after the model ran is a wiring bug that
+        # recurs identically every tick). Voiding those would let the sweep rerun the SAME failure
+        # forever without ever exhausting max_review_rounds, dissolving the bounded-crash cap and
+        # the human/tamper stop. So DEFER them WITHOUT a void: the charge stands, the budget still
+        # exhausts to needs-user, and the park is preserved (fail closed). The void — when it
+        # fires — is the ONLY mutation on the stale path (additive bot-accounting; no findings/
+        # label/state), so the sweep still re-reviews the current head cleanly.
+        if freshness == "head-moved":
+            record_round_void(args.repo, args.pr, args.round, args.run_key, args.bot_login)
         _write_outputs({"decision": "stale", "stale_reason": freshness,
                         "arm_complete": False})
+        charge = (f"round {args.round} voided (not charged)" if freshness == "head-moved"
+                  else f"round {args.round} stays charged (not head churn)")
         print(f"review outcome DEFERRED: the live PR no longer matches the reviewed commit "
-              f"({freshness}) — round {args.round} voided (not charged); no findings/label/state "
-              "mutation was applied and reviewed-sha stays unbound; the sweep re-reviews the "
-              "current head")
+              f"({freshness}) — {charge}; no findings/label/state mutation was applied and "
+              "reviewed-sha stays unbound; the sweep re-reviews the current head")
         return
     post_findings(args.repo, args.pr, args.verdict_file, args.round)
     # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
@@ -4561,24 +4571,31 @@ def _self_test():
         # path DEFERS — no findings/label/state mutation, decision 'stale' — so stale findings can
         # never label a new head and a stale escalation can never park a replacement head. The
         # head is unheld here (the hold check passed first), proving the freshness gate is a
-        # SEPARATE guard, not a side effect of the hold drop. Issue #162: the ONLY mutation a
-        # stale review makes is voiding its OWN round marker (['round-void']) so the churned round
-        # is not charged against the global budget; findings/label/state stay untouched. ----
+        # SEPARATE guard, not a side effect of the hold drop. Issue #162: for the ONLY legitimate
+        # head churn — "head-moved" — the stale review voids its OWN round marker (['round-void'])
+        # so the churned round is not charged; findings/label/state stay untouched. ----
         for verdict, injection in (("request_changes", False), ("approve", False),
                                    ("request_changes", True)):
             run_review_outcome(verdict, injection=injection, head="d" * 40)
-            check(f"stale-head review outcome ({verdict}, inj={injection}) voids the round only",
+            check(f"stale-head (head-moved) review outcome ({verdict}, inj={injection}) voids "
+                  "the round only",
                   (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
                   (["round-void"], "stale", "head-moved"))
-        # a non-draft (already-armed) or wrong-author live PR defers the same way (round voided)
-        run_review_outcome("request_changes", draft=False)
-        check("undrafted review outcome voids the round only",
-              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
-              (["round-void"], "stale", "undrafted"))
-        run_review_outcome("approve", login="mallory[bot]")
-        check("wrong-author review outcome voids the round only",
-              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
-              (["round-void"], "stale", "author"))
+        # Issue #162 (round 2): a NON-head-churn freshness failure is a tamper stop (undraft /
+        # wrong-author) or a deterministic identity/wiring failure (malformed live head, missing/
+        # malformed reviewed sha). It must DEFER WITHOUT voiding the round — voiding would let the
+        # sweep rerun the SAME failure every tick without ever exhausting max_review_rounds,
+        # dissolving the bounded-crash cap and the human/tamper stop. So: zero mutation (NO
+        # round-void), the charge stands, decision 'stale'. This asserts identity failures remain
+        # charged — the exact fail-closed invariant the void must not weaken.
+        for over, reason in (({"draft": False}, "undrafted"),
+                             ({"login": "mallory[bot]"}, "author"),
+                             ({"head": "z" * 40}, "malformed-head"),
+                             ({"reviewed_sha": "none"}, "unbound")):
+            run_review_outcome("request_changes", **over)
+            check(f"non-churn stale review outcome ({reason}) defers WITHOUT voiding the round",
+                  (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+                  ([], "stale", reason))
         # the fix outcome defers identically when the live head is not the one it produced
         run_fix_outcome(head="d" * 40)
         check("stale-head fix outcome defers with no mutation",
