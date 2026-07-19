@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The prior major finding is resolved. Failed review/fix workflow launches now increment both the shared dispatch-launch-failed histogram and the selected lane's error count, while successful launches increment launched. The new self-test exercises the actual nonzero workflow-run path, verifies lease release, asserts planned=1/launched=0/error=1/deferred=0, and includes a flip-goes-green success case, so it is non-vacuous. The per-lane serialization and workflow health classification preserve masked review/fix stalls and disarm errors even when another lane launches productively. No new correctness, fail-closed, test-validity, or security issue is supported by the diff.",
+ "verdict": "approve"
+}
