@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3622,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d10ac065a6058afbcbdacf4a575a89952bd9bca0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved: the captured-age lookup now fails explicitly when AGE_OPERAND_ENC lacks CAPTURED_AGE, so the cross-file consistency assertion can no longer pass vacuously. The two tests read the committed site sources, require a non-empty age map, compare every parsed map entry and the capture-script operand against the native encoder, and then compare the captured operand against the required matching map entry. No new correctness, soundness, test-validity, or security issue is evident in the diff. I could not execute the focused Rust test because cargo is unavailable in this checkout environment, but the reviewed logic is direct and complete.",
+  "verdict": "approve"
+ }
+}
