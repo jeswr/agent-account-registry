@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "OWL 2's property-hierarchy restriction explicitly permits every property-chain axiom whose superproperty is owl:topObjectProperty, before applying the transitivity/general/left-/right-identity cases. told_rbox_regular has no top-role input or exemption, so (for example) owl:topObjectProperty o owl:topObjectProperty o owl:topObjectProperty \u2291 owl:topObjectProperty returns false via the s < s check even though the normative restriction admits it. This makes Report::rbox_non_regular incorrectly true and contradicts its documented meaning. The focused tests cover the other special forms but not this normative case.",
+   "file": "crates/sparq-reason-el/src/rbox.rs",
+   "fix_hint": "Preserve the identity of owl:topObjectProperty through normalization (or exclude such told chains before this helper), unconditionally accept chains with that superproperty, and add both a helper-level test and an extraction/classify_graph test using a top-superproperty self-chain that currently false-positives. Keep the exception ahead of the self-constraint and cycle checks.",
+   "severity": "major",
+   "title": "Regularity checker omits the owl:topObjectProperty exemption"
+  }
+ ],
+ "progress": null,
+ "summary": "The regularity flag is wired through the extraction-based APIs and the focused tests exercise the real classification path, but the checker omits a normative OWL 2 regularity exception. Property-chain axioms whose superproperty is owl:topObjectProperty are unconditionally admissible; the new algorithm can classify some of them as non-regular. Because the public Report field and documentation claim a true non-regularity verdict, this false positive is a correctness and honesty defect.",
+ "verdict": "request_changes"
+}
