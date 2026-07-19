@@ -1149,14 +1149,105 @@ def _is_registry_transient_error(stderr):
     return "HTTP 403" in text and "rate limit" in text.lower()
 
 
-def _registry_put_file(registry_repo, path, document, message):
+def _run_key_identity(value):
+    """Split a `recorded_at_run` provenance stamp into its immutable run identity (returned) and
+    its volatile trailing attempt (discarded). The stamp is `<run>.<attempt>` — the worker's
+    `GITHUB_RUN_ID.GITHUB_RUN_ATTEMPT` — or the backfill form `backfill:<run>.<attempt>`
+    (backfill-provenance.py). A rerun of a FAILED job re-derives the SAME run with a bumped
+    attempt, so ONLY the trailing `.<attempt>` is volatile; the run identity (everything before it)
+    is the create-only provenance audit link and must match exactly. Returns the run-identity
+    string (e.g. `100` for `100.1`, `backfill:123` for `backfill:123.1`) for a stamp in the
+    validated shape, or None when `value` is not a string in that exact `<run>.<attempt>` shape —
+    a missing, malformed, or wrong-typed stamp is never equivalent (fail closed)."""
+    if not isinstance(value, str):
+        return None
+    if not re.fullmatch(r"(?:backfill:)?\d+\.\d+", value):
+        return None
+    return value[:value.rfind(".")]
+
+
+def _json_type_exact(left, right):
+    """Structural equality that ALSO requires identical JSON types, closing Python's cross-type
+    coercion — `True == 1`, `False == 0`, and `7.0 == 7` all hold under plain `==`. Used for the
+    identifying-field comparison in _registry_record_equivalent (#412 r2): a type-confused stored
+    provenance value (`pr_number: true`, `issue: 7.0`) must NOT compare equal to a candidate
+    (`pr_number: 1`, `issue: 7`) and be reported idempotent — that would let a malformed
+    root-of-trust record masquerade as identical, contradicting the exact-match/fail-closed
+    contract. Recurses through objects and lists; `bool` (an `int` subclass) matches only `bool`,
+    and `int` never matches `float`."""
+    # bool is a subclass of int, so guard it first: only bool-equals-bool is a match.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return (left.keys() == right.keys()
+                and all(_json_type_exact(left[k], right[k]) for k in left))
+    if isinstance(left, list) and isinstance(right, list):
+        return (len(left) == len(right)
+                and all(_json_type_exact(a, b) for a, b in zip(left, right)))
+    # Distinct JSON scalar types never match (int vs float, str vs number, ...).
+    if type(left) is not type(right):
+        return False
+    return left == right
+
+
+def _registry_record_equivalent(existing_text, document, volatile_fields):
+    """True when an already-stored registry record is the SAME logical record as `document`,
+    differing only in the per-attempt component of `volatile_fields` — retry metadata that
+    legitimately changes when a failed job is rerun (issue #131: provenance's `recorded_at_run`
+    is `<run>.<attempt>` carrying GITHUB_RUN_ATTEMPT, so a rerun that re-derives the record flips
+    `100.1` -> `100.2` while every identifying field AND the run identity are unchanged).
+    Byte-identical stored text is always equivalent; when it differs, the stored bytes are parsed
+    and every non-volatile field must match `document` EXACTLY, and each `volatile_field` must be
+    present on BOTH records as a valid `<run>.<attempt>` stamp whose run identity (the `<run>`
+    prefix) matches exactly — only the trailing `.<attempt>` may differ. So a record that differs
+    in ANY identifying field, or carries a DIFFERENT run id (e.g. `100.1` vs `200.1` — a distinct
+    workflow run, not a rerun), or whose stamp is missing / malformed / wrong-typed, is NOT
+    equivalent and still fails closed. Stored text that is not the JSON object we would write is
+    never equivalent. `volatile_fields` empty (the default for every non-provenance record —
+    verdicts stay strict) reduces to exact byte equality, so nothing outside the opted-in field
+    set changes."""
+    body = json.dumps(document, indent=1, sort_keys=True) + "\n"
+    if existing_text == body:
+        return True
+    if not volatile_fields:
+        return False
+    try:
+        stored = json.loads(existing_text)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    # Every identifying (non-volatile) field must match with JSON-TYPE-EXACT equality — NOT Python
+    # `==`, which coerces `True`/`1`, `False`/`0`, and `7.0`/`7` (#412 r2): a type-confused stored
+    # value must never masquerade as an identical record.
+    if not _json_type_exact(
+            {k: v for k, v in stored.items() if k not in volatile_fields},
+            {k: v for k, v in document.items() if k not in volatile_fields}):
+        return False
+    # Each volatile field is a `recorded_at_run` provenance stamp: ignore ONLY the attempt, never
+    # the run identity. BOTH sides must carry a valid stamp sharing the same run — a missing,
+    # malformed, or different-run stamp is a divergence, not a rerun, and fails closed.
+    for field in volatile_fields:
+        stored_identity = _run_key_identity(stored.get(field))
+        candidate_identity = _run_key_identity(document.get(field))
+        if stored_identity is None or stored_identity != candidate_identity:
+            return False
+    return True
+
+
+def _registry_put_file(registry_repo, path, document, message, volatile_fields=frozenset()):
     """Create-or-keep a registry data file via the contents API with the same read-SHA CAS retry
     the lease ledger uses. Probe AND write pin the unprotected `ledger` data-plane branch
     (issue #96): master's required `gate` status check permanently rejects every direct
     contents-API PUT, so an unpinned write can never land regardless of retries. Idempotent: an
     existing byte-identical file — on the ledger branch OR the legacy pre-outage master copy —
     is success; an existing DIFFERENT file fails closed (provenance must never be silently
-    rewritten, and a ledger write must never shadow a divergent legacy record). A genuine CAS
+    rewritten, and a ledger write must never shadow a divergent legacy record). `volatile_fields`
+    (issue #131) names per-attempt retry metadata — e.g. provenance's `recorded_at_run` — that a
+    rerun of a failed job legitimately changes without altering the record's logical identity: an
+    existing record equal on every OTHER field is treated as already-recorded (idempotent success,
+    no rewrite of the immutable record), so a stamp step can be rerun cleanly. Empty by default —
+    every other record (verdicts) keeps strict byte equality. A genuine CAS
     conflict retries under full-jitter backoff until _REGISTRY_CAS_DEADLINE_S (issue #130 — a fixed
     six-attempt budget let a burst exhaust every attempt and strand its PR); a transient 5xx /
     rate-limit failure retries under the small fixed _REGISTRY_TRANSIENT_MAX_ATTEMPTS budget
@@ -1171,7 +1262,7 @@ def _registry_put_file(registry_repo, path, document, message):
     # only claimable when EVERY existing copy matches. Legacy (<= sparq#2542) checked once —
     # master records are immutable; the ledger probe re-runs inside the CAS retry loop.
     legacy, _legacy_sha = _probe_registry_file(registry_repo, path)
-    if legacy is not None and legacy != body:
+    if legacy is not None and not _registry_record_equivalent(legacy, document, volatile_fields):
         raise WorkerPrError(
             f"registry file {path} already exists with different content on the default branch")
     deadline = _registry_now() + _REGISTRY_CAS_DEADLINE_S
@@ -1185,7 +1276,7 @@ def _registry_put_file(registry_repo, path, document, message):
             _registry_sleep_backoff(attempts)
         existing, sha = _probe_registry_file(registry_repo, path, ref=LEDGER_REF)
         if existing is not None:
-            if existing == body:
+            if _registry_record_equivalent(existing, document, volatile_fields):
                 return False  # already recorded — idempotent success
             raise WorkerPrError(f"registry file {path} already exists with different content "
                                 f"on the '{LEDGER_REF}' branch")
@@ -1242,6 +1333,15 @@ def _registry_put_file(registry_repo, path, document, message):
         f"({reason}); last API error: {last_error or 'unknown'}")
 
 
+# Per-attempt provenance metadata that a rerun of a failed job legitimately re-derives without
+# changing the record's logical identity (issue #131): `recorded_at_run` embeds GITHUB_RUN_ATTEMPT,
+# so a rerun flips `.1` -> `.2`. Excluded from _registry_put_file's idempotency comparison so the
+# otherwise byte-identical immutable record is accepted (already-recorded) instead of rejected as
+# "different content" — the identifying fields (pr/head/provider/alias/account-hash/issue) still
+# must match exactly, so a genuinely divergent record still fails closed.
+_PROVENANCE_VOLATILE_FIELDS = frozenset({"recorded_at_run"})
+
+
 def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_provider, impl_alias,
                       impl_account_h, issue, run_key, verify_bot_login=None,
                       verify_head_branch=None):
@@ -1288,7 +1388,8 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
     }
     created = _registry_put_file(
         registry_repo, provenance_path(target_repo, pr_number), document,
-        f"provenance {target_repo}#{pr_number}")
+        f"provenance {target_repo}#{pr_number}",
+        volatile_fields=_PROVENANCE_VOLATILE_FIELDS)
     print(f"provenance {'recorded' if created else 'already recorded'} for {target_repo}#{pr_number}")
 
 
@@ -2809,7 +2910,8 @@ def _self_test():
     try:
         globals()["_gh_json"] = lambda a, **k: json.loads(json.dumps(prov_pull))
         globals()["_registry_put_file"] = (
-            lambda _repo, _path, document, _msg: prov_docs.append(document) or True)
+            lambda _repo, _path, document, _msg, volatile_fields=frozenset():
+            prov_docs.append(document) or True)
         provenance_record("o/registry", repo, 42, "", "anthropic", "opus", "ab" * 8, 7,
                           "10.1", verify_bot_login=bot, verify_head_branch=branch)
         check("provenance verify records the exact run branch",
@@ -3368,6 +3470,129 @@ def _self_test():
               (_registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
                                   doc, "m"),
                any("-X" in call for call in put_calls)), (False, False))
+
+        # issue #131: a rerun of a failed provenance job re-derives the record with a bumped
+        # GITHUB_RUN_ATTEMPT, so `recorded_at_run` flips `.1` -> `.2` while every IDENTIFYING field
+        # is unchanged. Named volatile, the otherwise byte-different record is accepted as
+        # already-recorded (the immutable record is never rewritten) — a clean rerun — instead of
+        # being rejected as "different content", which stranded the failed rerun and blocked the
+        # stamp step. Fail-closed is preserved: only the named field is ignored, and only when the
+        # caller opts in.
+        prov_v1 = {"pr_number": 7, "head_sha_at_open": "a" * 40, "impl_provider": "anthropic",
+                   "impl_alias": "opus", "impl_account_h": "ab" * 8, "issue": 5,
+                   "recorded_at_run": "100.1"}
+        prov_v2 = dict(prov_v1, recorded_at_run="100.2")  # same run id, reran as attempt .2
+        volatile = {"recorded_at_run"}
+        put_calls.clear()
+        put_state["files"] = {ledger_loc: record_meta(prov_v1)}
+        check("a reran provenance record (only recorded_at_run bumped) is idempotent success",
+              _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                 prov_v2, "m", volatile_fields=volatile), False)
+        check("the idempotent rerun rewrites nothing (the immutable record is untouched)",
+              any("-X" in call for call in put_calls), False)
+        put_state["files"] = {legacy_loc: record_meta(prov_v1)}
+        check("a reran provenance record is idempotent against the legacy master copy too",
+              _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                 prov_v2, "m", volatile_fields=volatile), False)
+        # Fail-closed preserved: a record differing in an IDENTIFYING field (not the volatile retry
+        # metadata) is still rejected even with recorded_at_run declared volatile — volatile is a
+        # single named field, not "ignore everything but exact identity".
+        put_state["files"] = {ledger_loc: record_meta(dict(prov_v1, pr_number=8))}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_v2, "m", volatile_fields=volatile)
+            check("a divergent identifying field still fails closed under volatile", "no", "error")
+        except WorkerPrError as exc:
+            check("a divergent identifying field still fails closed under volatile",
+                  "different content" in str(exc), True)
+        # Opt-in only: with NO volatile_fields (the default — verdicts and every other record) the
+        # SAME recorded_at_run-only difference is a divergence and still fails closed, so the fix
+        # never silently loosens equality for records that did not ask for it.
+        put_state["files"] = {ledger_loc: record_meta(prov_v1)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", prov_v2, "m")
+            check("without volatile_fields a metadata-only diff still fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("without volatile_fields a metadata-only diff still fails closed (strict bytes)",
+                  "different content" in str(exc), True)
+        # #412 r1: only the ATTEMPT of `recorded_at_run` is volatile — a DIFFERENT run id is a
+        # distinct workflow run, not a rerun, so accepting it would silently rebind the create-only
+        # provenance audit link. Existing `100.1` vs candidate `200.1` (same identifying fields,
+        # different run) must still fail closed even with the field declared volatile.
+        prov_run200 = dict(prov_v1, recorded_at_run="200.1")
+        put_state["files"] = {ledger_loc: record_meta(prov_v1)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_run200, "m", volatile_fields=volatile)
+            check("a different run id (not just attempt) still fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("a different run id (not just attempt) still fails closed under volatile",
+                  "different content" in str(exc), True)
+        # #412 r1: a rerun of the SAME run under the backfill stamp form is idempotent on run
+        # identity — `backfill:123.1` vs `backfill:123.2` shares run `backfill:123`.
+        prov_bf1 = dict(prov_v1, recorded_at_run="backfill:123.1")
+        prov_bf2 = dict(prov_v1, recorded_at_run="backfill:123.2")
+        put_state["files"] = {ledger_loc: record_meta(prov_bf1)}
+        check("a backfill-stamped rerun (same run, bumped attempt) is idempotent success",
+              _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                 prov_bf2, "m", volatile_fields=volatile), False)
+        # ...but a DIFFERENT backfill run id is still a divergence.
+        prov_bf_other = dict(prov_v1, recorded_at_run="backfill:456.1")
+        put_state["files"] = {ledger_loc: record_meta(prov_bf1)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_bf_other, "m", volatile_fields=volatile)
+            check("a different backfill run id still fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("a different backfill run id still fails closed under volatile",
+                  "different content" in str(exc), True)
+        # #412 r1: a stored record MISSING the volatile stamp (or carrying a malformed / wrong-typed
+        # one) is a truncated/corrupt root-of-trust record — it must fail closed, never be treated
+        # as an idempotent already-recorded success by the filter-then-compare shortcut.
+        prov_no_stamp = {k: v for k, v in prov_v1.items() if k != "recorded_at_run"}
+        put_state["files"] = {ledger_loc: record_meta(prov_no_stamp)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_v1, "m", volatile_fields=volatile)
+            check("a stored record missing the volatile stamp fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("a stored record missing the volatile stamp fails closed",
+                  "different content" in str(exc), True)
+        for bad_stamp in ("garbage", "100", "100.", ".1", 100, None, "100.1.2"):
+            prov_bad = dict(prov_v1, recorded_at_run=bad_stamp)
+            put_state["files"] = {ledger_loc: record_meta(prov_bad)}
+            try:
+                _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                   prov_v1, "m", volatile_fields=volatile)
+                check(f"a malformed stored stamp {bad_stamp!r} fails closed", "no", "error")
+            except WorkerPrError as exc:
+                check(f"a malformed stored stamp {bad_stamp!r} fails closed",
+                      "different content" in str(exc), True)
+        # #412 r2: identifying fields are compared JSON-TYPE-EXACT, not with Python `==`, so a
+        # type-confused stored value (`pr_number: true`, `issue: 7.0`) can never masquerade as an
+        # identical record via `True == 1` / `7.0 == 7` and be reported idempotent. A VALID same-run
+        # stamp is supplied on both sides so ONLY the type confusion drives the rejection (without
+        # the fix these would be reported idempotent success, not raise).
+        prov_bool = dict(prov_v1, pr_number=True, recorded_at_run="100.1")
+        prov_int = dict(prov_v1, pr_number=1, recorded_at_run="100.2")
+        put_state["files"] = {ledger_loc: record_meta(prov_bool)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_int, "m", volatile_fields=volatile)
+            check("stored pr_number:true vs candidate pr_number:1 fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("stored pr_number:true vs candidate pr_number:1 fails closed",
+                  "different content" in str(exc), True)
+        prov_float = dict(prov_v1, issue=7.0, recorded_at_run="100.1")
+        prov_seven = dict(prov_v1, issue=7, recorded_at_run="100.2")
+        put_state["files"] = {ledger_loc: record_meta(prov_float)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_seven, "m", volatile_fields=volatile)
+            check("stored issue:7.0 vs candidate issue:7 fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("stored issue:7.0 vs candidate issue:7 fails closed",
+                  "different content" in str(exc), True)
 
         # issue #130: a sustained burst of GENUINE CAS conflicts (HTTP 409) retries under
         # full-jitter backoff until the wall-clock DEADLINE — NOT a fixed six-attempt budget a
