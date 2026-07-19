@@ -23,10 +23,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import random
 import re
 import subprocess
 import sys
 import tempfile
+import time
 
 REVIEW_LABELS = ("review:needs", "review:changes", "review:pass", "review:needs-user")
 LABEL_COLOURS = {
@@ -137,6 +139,34 @@ def _alert_route():
     repo = os.environ.get("ALERT_REPO") or os.environ.get("REGISTRY_REPO")
     token = os.environ.get("ALERT_TOKEN") or os.environ.get("REGISTRY_ALERT_TOKEN")
     return repo, token
+
+
+def _ops_alert(alert_repo, alert_token, title, body):
+    """Post or refresh ONE deduped ops-alert registry issue (rolling posture, usage-alert.py):
+    an open issue with the same title is commented on, otherwise a new one is opened. Best-effort
+    and credential-scoped — a missing route or a failed alert call never masks the operational
+    error that triggered it: every gh call is check=False AND the whole delivery is wrapped, so
+    even a raising path (the issue lookup goes through _gh_json → check=True + JSON parsing, and
+    an unexpected list shape can KeyError) only logs, never propagates into the caller's raise."""
+    if not (alert_repo and alert_token):
+        return
+    try:
+        env = {"GH_TOKEN": alert_token}
+        _run_gh(["label", "create", "ops-alert", "-R", alert_repo, "--color", "d73a4a",
+                 "--description", "Autonomous worker availability alert (maintainer action)"],
+                check=False, env=env)
+        found = _gh_json(["issue", "list", "-R", alert_repo, "--label", "ops-alert", "--state",
+                          "open", "--json", "number,title", "--limit", "50"], env=env) or []
+        number = next((i["number"] for i in found
+                       if isinstance(i, dict) and i.get("title") == title), None)
+        if number:
+            _run_gh(["issue", "comment", str(number), "-R", alert_repo, "--body", body],
+                    check=False, env=env)
+        else:
+            _run_gh(["issue", "create", "-R", alert_repo, "--title", title, "--label",
+                     "ops-alert", "--body", body], check=False, env=env)
+    except Exception as exc:  # noqa: BLE001 — alert delivery must never mask the caller's error
+        print(f"ops-alert delivery failed (non-fatal): {exc}", file=sys.stderr)
 
 
 def _bot_comments(comments, bot_login):
@@ -852,6 +882,22 @@ def _probe_registry_file(registry_repo, path, ref=None):
         raise WorkerPrError(f"registry file {path} is unreadable") from exc
 
 
+# Parallel per-file record writers (the provenance record plus every review round's verdict) all
+# CAS against the SAME `ledger` branch head, so a fixed un-jittered retry keeps them phase-locked:
+# each loser re-reads the same sha, re-collides on the next PUT, and burns the whole budget in
+# lock-step. A FULL-JITTER exponential backoff BETWEEN attempts decorrelates them (issue #148; the
+# lease ledger hit and fixed the identical thundering-herd in #179). Module-level so --self-test
+# patches it instead of sleeping for real.
+def _registry_backoff_ceiling(attempt, base=0.5, cap=8.0):
+    """Upper bound (seconds) for the sleep before CAS retry `attempt` (1-based): exponential
+    base*2**(attempt-1), clamped to `cap`."""
+    return min(cap, base * (2 ** (attempt - 1)))
+
+
+def _registry_sleep_backoff(attempt):
+    time.sleep(random.uniform(0, _registry_backoff_ceiling(attempt)))
+
+
 def _registry_put_file(registry_repo, path, document, message, retries=6):
     """Create-or-keep a registry data file via the contents API with the same read-SHA CAS retry
     the lease ledger uses. Probe AND write pin the unprotected `ledger` data-plane branch
@@ -873,7 +919,11 @@ def _registry_put_file(registry_repo, path, document, message, retries=6):
         raise WorkerPrError(
             f"registry file {path} already exists with different content on the default branch")
     last_error = ""
-    for _ in range(retries):
+    for attempt in range(retries):
+        if attempt:
+            # Full-jitter backoff BETWEEN attempts (never before the first read) so parallel
+            # per-file writers stop re-colliding in lock-step on the same branch head (#148).
+            _registry_sleep_backoff(attempt)
         existing, sha = _probe_registry_file(registry_repo, path, ref=LEDGER_REF)
         if existing is not None:
             if existing == body:
@@ -891,6 +941,16 @@ def _registry_put_file(registry_repo, path, document, message, retries=6):
         if put.returncode == 0:
             return True
         last_error = (put.stderr or put.stdout or "").strip()
+    # Terminal: the record never landed. A silently-lost provenance record makes the PR
+    # permanently invisible to enumeration; a lost verdict burns a round without applying the
+    # outcome. Page a human with the REAL API error before failing (best-effort — the alert can
+    # never mask the raise below).
+    _ops_alert(*_alert_route(),
+               f"⚠️ Registry record write failing — {registry_repo}",
+               f"> 🤖 SPARQ agent — `{path}` could not be written to the `{LEDGER_REF}` "
+               f"data-plane branch after {retries} attempts. Last API error: "
+               f"{last_error or 'unknown'}. Records are not landing (protection/ref/availability) "
+               f"— a maintainer should check branch protection and the `{LEDGER_REF}` ref.")
     raise WorkerPrError(
         f"registry write for {path} on branch '{LEDGER_REF}' failed after {retries} attempts; "
         f"last API error: {last_error or 'unknown'}")
@@ -963,24 +1023,11 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
              "not be auto-armed.")
     if issue:
         _load_worker_issue().set_status(repo, issue, "needs-user")
-    if alert_repo and alert_token:
-        # Reuse the rolling ops-alert posture (usage-alert.py): one deduped registry issue.
-        title = f"⚠️ Review loop needs a human — {repo}#{pr_number}"
-        env = {"GH_TOKEN": alert_token}
-        _run_gh(["label", "create", "ops-alert", "-R", alert_repo, "--color", "d73a4a",
-                 "--description", "Autonomous worker availability alert (maintainer action)"],
-                check=False, env=env)
-        found = _gh_json(["issue", "list", "-R", alert_repo, "--label", "ops-alert", "--state",
-                          "open", "--json", "number,title", "--limit", "50"], env=env) or []
-        body = (f"> 🤖 SPARQ agent — {reason}\n\nhttps://github.com/{repo}/pull/{pr_number} "
-                f"needs @{handle}.")
-        number = next((i["number"] for i in found if i.get("title") == title), None)
-        if number:
-            _run_gh(["issue", "comment", str(number), "-R", alert_repo, "--body", body],
-                    check=False, env=env)
-        else:
-            _run_gh(["issue", "create", "-R", alert_repo, "--title", title, "--label",
-                     "ops-alert", "--body", body], check=False, env=env)
+    # Reuse the rolling ops-alert posture (usage-alert.py): one deduped registry issue.
+    _ops_alert(alert_repo, alert_token,
+               f"⚠️ Review loop needs a human — {repo}#{pr_number}",
+               f"> 🤖 SPARQ agent — {reason}\n\nhttps://github.com/{repo}/pull/{pr_number} "
+               f"needs @{handle}.")
     print(f"needs-user recorded: {reason}")
 
 
@@ -2077,12 +2124,24 @@ def _self_test():
         body = json.dumps(document, indent=1, sort_keys=True) + "\n"
         return {"content": base64.b64encode(body.encode()).decode(), "sha": "f" * 40}
 
+    # Full-jitter backoff between CAS attempts + a terminal ops-alert (issue #148): stub both
+    # module hooks so the test asserts WHEN each fires without sleeping or hitting the API.
+    backoff_attempts = []
+    alert_calls = []
+    real_backoff = wiring_globals["_registry_sleep_backoff"]
+    real_ops_alert = wiring_globals["_ops_alert"]
+    real_alert_json = wiring_globals["_gh_json"]
+    real_alert_route = wiring_globals["_alert_route"]
+
     real_put_io = wiring_globals["_run_gh"]
     doc = {"pr_number": 7}
     legacy_loc = "repos/reg/repo/contents/orchestration/provenance/o--r--pr7.json"
     ledger_loc = f"{legacy_loc}?ref={LEDGER_REF}"
     try:
         wiring_globals["_run_gh"] = fake_put_run_gh
+        wiring_globals["_registry_sleep_backoff"] = (
+            lambda attempt: backoff_attempts.append(attempt))
+        wiring_globals["_ops_alert"] = lambda *a: alert_calls.append(a)
         created = _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
                                      doc, "m")
         check("fresh record write creates", created, True)
@@ -2092,6 +2151,8 @@ def _self_test():
         put_args = next(call for call in put_calls if "-X" in call)
         check("the PUT pins the ledger branch (never the protected default)",
               f"branch={LEDGER_REF}" in put_args, True)
+        check("a first-attempt success never backs off and never alerts",
+              (backoff_attempts, alert_calls), ([], []))
 
         put_calls.clear()
         put_state["files"] = {ledger_loc: record_meta(doc)}
@@ -2137,6 +2198,8 @@ def _self_test():
                any("-X" in call for call in put_calls)), (False, False))
 
         put_calls.clear()
+        backoff_attempts.clear()
+        alert_calls.clear()
         put_state.update(files={}, put_rc=1,
                          put_stderr="HTTP 409: Required status check \"gate\" is expected.")
         try:
@@ -2149,8 +2212,53 @@ def _self_test():
                   "kept conflicting" in str(exc), False)
         check("write failure retries the full budget",
               sum(1 for call in put_calls if "-X" in call), 6)
+        # #148: jittered backoff fires BETWEEN the 6 attempts (never before the first probe),
+        # so exactly attempts 1..5 sleep — decorrelating parallel writers off the shared head.
+        check("exhausted write backs off between every retry (never before the first)",
+              backoff_attempts, [1, 2, 3, 4, 5])
+        # #148: a terminal write failure is not silent — it pages a human once, naming the
+        # unwritten record and the real API error (a lost provenance record is invisible).
+        check("exhausted write raises ONE ops-alert", len(alert_calls), 1)
+        check("the ops-alert names the unwritten record and the real API error",
+              alert_calls and "o--r--pr7.json" in alert_calls[0][3]
+              and "gate" in alert_calls[0][3], True)
+
+        # sol review r1 on #295: the terminal alert must be best-effort END TO END, so this
+        # runs the REAL _ops_alert (not a stub) with its one raising path — the issue lookup
+        # via _gh_json (check=True + JSON parsing) — blowing up, and asserts the registry-write
+        # error still surfaces carrying the final PUT stderr, never the alert's own failure.
+        def raising_alert_gh_json(args, **_kwargs):
+            raise WorkerPrError("alert issue lookup failed")
+
+        put_state.update(files={}, put_rc=1,
+                         put_stderr="HTTP 409: Required status check \"gate\" is expected.")
+        wiring_globals["_ops_alert"] = real_ops_alert
+        wiring_globals["_alert_route"] = lambda: ("alerts/private", "alert-token")
+        wiring_globals["_gh_json"] = raising_alert_gh_json
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("a raising alert lookup never masks the terminal registry-write error",
+                  "no error", "error")
+        except WorkerPrError as exc:
+            check("a raising alert lookup never masks the terminal registry-write error",
+                  "Required status check \"gate\" is expected" in str(exc)
+                  and "alert issue lookup" not in str(exc), True)
     finally:
         wiring_globals["_run_gh"] = real_put_io
+        wiring_globals["_registry_sleep_backoff"] = real_backoff
+        wiring_globals["_ops_alert"] = real_ops_alert
+        wiring_globals["_gh_json"] = real_alert_json
+        wiring_globals["_alert_route"] = real_alert_route
+
+    # #148: the backoff ceiling is a bounded, non-decreasing full-jitter envelope — exponential
+    # growth from the base, clamped so a long contention run never sleeps unboundedly.
+    check("backoff ceiling starts at the base and grows exponentially",
+          [_registry_backoff_ceiling(a) for a in (1, 2, 3)], [0.5, 1.0, 2.0])
+    check("backoff ceiling is clamped at the cap",
+          _registry_backoff_ceiling(99), 8.0)
+    check("backoff ceiling is non-decreasing",
+          all(_registry_backoff_ceiling(a) <= _registry_backoff_ceiling(a + 1)
+              for a in range(1, 12)), True)
 
     # ---- disarm wiring (monkeypatched I/O), issue #69: a merge-only advance carries the
     # binding forward with the arm intact; a real content change still disarms; a QUEUED
