@@ -1085,18 +1085,39 @@ def _is_registry_transient_error(stderr):
     return "HTTP 403" in text and "rate limit" in text.lower()
 
 
+def _run_key_identity(value):
+    """Split a `recorded_at_run` provenance stamp into its immutable run identity (returned) and
+    its volatile trailing attempt (discarded). The stamp is `<run>.<attempt>` — the worker's
+    `GITHUB_RUN_ID.GITHUB_RUN_ATTEMPT` — or the backfill form `backfill:<run>.<attempt>`
+    (backfill-provenance.py). A rerun of a FAILED job re-derives the SAME run with a bumped
+    attempt, so ONLY the trailing `.<attempt>` is volatile; the run identity (everything before it)
+    is the create-only provenance audit link and must match exactly. Returns the run-identity
+    string (e.g. `100` for `100.1`, `backfill:123` for `backfill:123.1`) for a stamp in the
+    validated shape, or None when `value` is not a string in that exact `<run>.<attempt>` shape —
+    a missing, malformed, or wrong-typed stamp is never equivalent (fail closed)."""
+    if not isinstance(value, str):
+        return None
+    if not re.fullmatch(r"(?:backfill:)?\d+\.\d+", value):
+        return None
+    return value[:value.rfind(".")]
+
+
 def _registry_record_equivalent(existing_text, document, volatile_fields):
     """True when an already-stored registry record is the SAME logical record as `document`,
-    differing only in `volatile_fields` — per-attempt retry metadata that legitimately changes
-    when a failed job is rerun (issue #131: provenance's `recorded_at_run` carries
-    GITHUB_RUN_ATTEMPT, so a rerun that re-derives the record flips `.1` -> `.2` while every
-    identifying field is unchanged). Byte-identical stored text is always equivalent; when it
-    differs, the stored bytes are parsed and compared field-for-field against `document` with
-    every `volatile_field` dropped from BOTH sides — so a record that differs in ANY other field
-    (a genuinely divergent provenance record) is NOT equivalent and still fails closed. Stored
-    text that is not the JSON object we would write is never equivalent. `volatile_fields` empty
-    (the default for every non-provenance record — verdicts stay strict) reduces to exact byte
-    equality, so nothing outside the opted-in field set changes."""
+    differing only in the per-attempt component of `volatile_fields` — retry metadata that
+    legitimately changes when a failed job is rerun (issue #131: provenance's `recorded_at_run`
+    is `<run>.<attempt>` carrying GITHUB_RUN_ATTEMPT, so a rerun that re-derives the record flips
+    `100.1` -> `100.2` while every identifying field AND the run identity are unchanged).
+    Byte-identical stored text is always equivalent; when it differs, the stored bytes are parsed
+    and every non-volatile field must match `document` EXACTLY, and each `volatile_field` must be
+    present on BOTH records as a valid `<run>.<attempt>` stamp whose run identity (the `<run>`
+    prefix) matches exactly — only the trailing `.<attempt>` may differ. So a record that differs
+    in ANY identifying field, or carries a DIFFERENT run id (e.g. `100.1` vs `200.1` — a distinct
+    workflow run, not a rerun), or whose stamp is missing / malformed / wrong-typed, is NOT
+    equivalent and still fails closed. Stored text that is not the JSON object we would write is
+    never equivalent. `volatile_fields` empty (the default for every non-provenance record —
+    verdicts stay strict) reduces to exact byte equality, so nothing outside the opted-in field
+    set changes."""
     body = json.dumps(document, indent=1, sort_keys=True) + "\n"
     if existing_text == body:
         return True
@@ -1108,8 +1129,19 @@ def _registry_record_equivalent(existing_text, document, volatile_fields):
         return False
     if not isinstance(stored, dict):
         return False
-    return ({k: v for k, v in stored.items() if k not in volatile_fields}
-            == {k: v for k, v in document.items() if k not in volatile_fields})
+    # Every identifying (non-volatile) field must match byte-for-byte.
+    if ({k: v for k, v in stored.items() if k not in volatile_fields}
+            != {k: v for k, v in document.items() if k not in volatile_fields}):
+        return False
+    # Each volatile field is a `recorded_at_run` provenance stamp: ignore ONLY the attempt, never
+    # the run identity. BOTH sides must carry a valid stamp sharing the same run — a missing,
+    # malformed, or different-run stamp is a divergence, not a rerun, and fails closed.
+    for field in volatile_fields:
+        stored_identity = _run_key_identity(stored.get(field))
+        candidate_identity = _run_key_identity(document.get(field))
+        if stored_identity is None or stored_identity != candidate_identity:
+            return False
+    return True
 
 
 def _registry_put_file(registry_repo, path, document, message, volatile_fields=frozenset()):
@@ -3306,6 +3338,59 @@ def _self_test():
         except WorkerPrError as exc:
             check("without volatile_fields a metadata-only diff still fails closed (strict bytes)",
                   "different content" in str(exc), True)
+        # #412 r1: only the ATTEMPT of `recorded_at_run` is volatile — a DIFFERENT run id is a
+        # distinct workflow run, not a rerun, so accepting it would silently rebind the create-only
+        # provenance audit link. Existing `100.1` vs candidate `200.1` (same identifying fields,
+        # different run) must still fail closed even with the field declared volatile.
+        prov_run200 = dict(prov_v1, recorded_at_run="200.1")
+        put_state["files"] = {ledger_loc: record_meta(prov_v1)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_run200, "m", volatile_fields=volatile)
+            check("a different run id (not just attempt) still fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("a different run id (not just attempt) still fails closed under volatile",
+                  "different content" in str(exc), True)
+        # #412 r1: a rerun of the SAME run under the backfill stamp form is idempotent on run
+        # identity — `backfill:123.1` vs `backfill:123.2` shares run `backfill:123`.
+        prov_bf1 = dict(prov_v1, recorded_at_run="backfill:123.1")
+        prov_bf2 = dict(prov_v1, recorded_at_run="backfill:123.2")
+        put_state["files"] = {ledger_loc: record_meta(prov_bf1)}
+        check("a backfill-stamped rerun (same run, bumped attempt) is idempotent success",
+              _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                 prov_bf2, "m", volatile_fields=volatile), False)
+        # ...but a DIFFERENT backfill run id is still a divergence.
+        prov_bf_other = dict(prov_v1, recorded_at_run="backfill:456.1")
+        put_state["files"] = {ledger_loc: record_meta(prov_bf1)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_bf_other, "m", volatile_fields=volatile)
+            check("a different backfill run id still fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("a different backfill run id still fails closed under volatile",
+                  "different content" in str(exc), True)
+        # #412 r1: a stored record MISSING the volatile stamp (or carrying a malformed / wrong-typed
+        # one) is a truncated/corrupt root-of-trust record — it must fail closed, never be treated
+        # as an idempotent already-recorded success by the filter-then-compare shortcut.
+        prov_no_stamp = {k: v for k, v in prov_v1.items() if k != "recorded_at_run"}
+        put_state["files"] = {ledger_loc: record_meta(prov_no_stamp)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_v1, "m", volatile_fields=volatile)
+            check("a stored record missing the volatile stamp fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("a stored record missing the volatile stamp fails closed",
+                  "different content" in str(exc), True)
+        for bad_stamp in ("garbage", "100", "100.", ".1", 100, None, "100.1.2"):
+            prov_bad = dict(prov_v1, recorded_at_run=bad_stamp)
+            put_state["files"] = {ledger_loc: record_meta(prov_bad)}
+            try:
+                _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                   prov_v1, "m", volatile_fields=volatile)
+                check(f"a malformed stored stamp {bad_stamp!r} fails closed", "no", "error")
+            except WorkerPrError as exc:
+                check(f"a malformed stored stamp {bad_stamp!r} fails closed",
+                      "different content" in str(exc), True)
 
         # issue #130: a sustained burst of GENUINE CAS conflicts (HTTP 409) retries under
         # full-jitter backoff until the wall-clock DEADLINE — NOT a fixed six-attempt budget a
