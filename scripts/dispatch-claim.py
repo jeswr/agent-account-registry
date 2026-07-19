@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import tomllib
 
@@ -3832,6 +3833,43 @@ def _self_test():
                        if len(line) - len(line.lstrip()) == key_indent}
     assert snapshot_fields == {"number", "state", "draft", "body", "labels",
                                "head", "user"}, snapshot_fields
+
+    # ---- Issue #109: the tick-health recorder must make a snapshot-skip-only tick VISIBLE.
+    # Snapshot skips fold into the defer histogram (snapshot_skip_reasons) but are NOT `planned`
+    # items, so the recorder's planned>0 gate used to record such a tick as a quiet `none`. Exec
+    # the EXACT classification block from dispatch.yml (not a re-implemented copy) so this pins the
+    # workflow's real behavior: a nonempty defer histogram with nothing dispatched is the degraded
+    # zero-dispatch class, while a genuinely empty frontier (no histogram) stays recordless. ----
+    recorder = re.search(
+        r'\n( *planned = \(summary or \{\}\)\.get\("planned", 0\).*?else "none")',
+        workflow, re.DOTALL)
+    assert recorder, "dispatch.yml lost the tick-state classification block"
+    recorder_block = textwrap.dedent(recorder.group(1))
+
+    def tick_state(summary, claim_outcome="success"):
+        # The block reads only os.environ.get (CLAIM_OUTCOME / GITHUB_STEP_SUMMARY) up to the
+        # `state` assignment; a step_summary of None skips every file write, so no real I/O runs.
+        namespace = {"summary": summary,
+                     "os": type("_os", (), {"environ":
+                                            {"CLAIM_OUTCOME": claim_outcome}})()}
+        exec(recorder_block, namespace)  # noqa: S102 — trusted workflow source, no external input
+        return namespace["state"]
+
+    # the exact defect: snapshot-skip-only tick — planned 0, nothing dispatched, but the defer
+    # histogram carries the plan-snapshot degradation -> degraded zero-dispatch, NOT a quiet `none`
+    assert tick_state({"planned": 0, "dispatched": 0,
+                       "defer_reasons": {"snapshot-skip:check-runs-overflow": 1}}) == "zero"
+    # a genuinely empty/quiet frontier (no histogram at all) still records nothing
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # the pre-existing classes are unchanged by the degraded rescue
+    assert tick_state({"planned": 3, "dispatched": 0,
+                       "defer_reasons": {"existing-pr": 3}}) == "zero"
+    assert tick_state({"planned": 3, "dispatched": 2, "defer_reasons": {}}) == "ok"
+    assert tick_state(None, "failure") == "abort"
+    # a PRODUCTIVE tick that also deferred some items must NOT be hijacked to zero by `degraded`
+    # (degraded requires dispatched == 0), else every healthy tick with a single defer flips red
+    assert tick_state({"planned": 3, "dispatched": 1,
+                       "defer_reasons": {"existing-pr": 2}}) == "ok"
 
     def snapshot_row(number, ref, *, draft, labels=()):
         # EXACTLY the dispatch.yml projection: top-level keys pinned to the workflow read

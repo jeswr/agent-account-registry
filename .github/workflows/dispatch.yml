@@ -894,9 +894,10 @@ jobs:
       # ABORTED before writing even the early plan summary records `claim-abort` (review defect
       # #6, counted as a zero-dispatch tick); dispatch-claim writes the plan-derived summary
       # BEFORE claim-side work so a mid-claim abort still surfaces as planned>0/launched-0.
-      # Empty-frontier ticks (planned == 0) stay recordless by design. always() so a claim
-      # FAILURE (exactly when nothing launches) is still surfaced. No issue numbers or account
-      # handles are emitted.
+      # A truly empty frontier (planned == 0 AND an empty defer histogram) stays recordless by
+      # design; a snapshot-skip-only tick (issue #109) is degraded and records zero-dispatch.
+      # always() so a claim FAILURE (exactly when nothing launches) is still surfaced. No issue
+      # numbers or account handles are emitted.
       - name: Surface + record the dispatch-tick health state
         if: always()
         continue-on-error: true
@@ -921,6 +922,7 @@ jobs:
           planned = (summary or {}).get("planned", 0)
           dispatched = (summary or {}).get("dispatched", 0)
           reasons = (summary or {}).get("defer_reasons", {})
+          reasons = reasons if isinstance(reasons, dict) else {}
           # Issue #28: ready-frontier size + lease-ledger health, so this line tells an empty
           # frontier apart from a ledger failure (both otherwise read as a green 0-dispatch tick).
           frontier_size = (summary or {}).get("frontier_size", planned)
@@ -931,6 +933,14 @@ jobs:
           # No summary at all = the claim aborted before even the early plan-summary write
           # (validation/API/setup); that is a zero-dispatch-shaped tick, not a quiet one.
           abort = summary is None and os.environ.get("CLAIM_OUTCOME") == "failure"
+          # Issue #109: a tick can carry NO ready-frontier work (planned == 0) yet still be
+          # DEGRADED — plan-snapshot census/check-run failures fold into the defer histogram
+          # (snapshot_skip_reasons) without ever becoming `planned` items, so the planned>0 gate
+          # above would misrecord such a snapshot-skip-only tick as a quiet `none`, contradicting
+          # the claim that snapshot degradation is visible. Any nonempty defer histogram with
+          # nothing dispatched is degradation the same zero-dispatch class must surface; a truly
+          # empty frontier (no histogram) still records nothing.
+          degraded = isinstance(dispatched, int) and dispatched == 0 and bool(reasons)
           # Issue #108: per-lane health, so a productive WORKER launch can no longer mark the tick
           # healthy while a safety disarm or an entire review/fix lane failed. The disarm lane
           # consumes no account/lease, so it is invisible to the fleet planned/dispatched counts
@@ -965,11 +975,17 @@ jobs:
               with open(step_summary, "a", encoding="utf-8") as out:
                   out.write(f"dispatch tick: frontier_size={frontier_size}, "
                             f"ledger={ledger}, dispatched={dispatched}\n\n")
-          if zero and step_summary:
+          if (zero or degraded) and step_summary:
               with open(step_summary, "a", encoding="utf-8") as out:
                   out.write("### ⚠️ Zero-dispatch tick\n\n")
-                  out.write(f"Planned **{planned}** ready item(s) but launched **0**. "
-                            "Defer-reason histogram:\n\n")
+                  if isinstance(planned, int) and planned > 0:
+                      out.write(f"Planned **{planned}** ready item(s) but launched **0**. "
+                                "Defer-reason histogram:\n\n")
+                  else:
+                      # Issue #109: no ready-frontier work, but the tick is degraded — the defer
+                      # histogram carries plan-snapshot failures that stood down this tick.
+                      out.write("No ready-frontier work, but the tick is **degraded** "
+                                "(plan-snapshot failures stood down). Defer-reason histogram:\n\n")
                   for reason, count in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
                       out.write(f"- `{reason}`: {count}\n")
                   if not reasons:
@@ -993,7 +1009,7 @@ jobs:
           # Emit a marker file the record step reads (keeps the record invocation out of this
           # inline python so the salted-hash discipline stays in model-health.py). A lane stall or a
           # failed safety disarm counts as a zero-dispatch tick even when the fleet dispatched>0.
-          state = "zero" if (zero or lane_unhealthy) else "abort" if abort \
+          state = "zero" if (zero or lane_unhealthy or degraded) else "abort" if abort \
               else "ok" if productive else "none"
           with open(os.environ["RUNNER_TEMP"] + "/dispatch-tick-state", "w",
                     encoding="utf-8") as flag:
