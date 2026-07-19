@@ -650,8 +650,15 @@ _registry_selftest_targets() {
     case "$path" in
       scripts/*.py)
         base=${path#scripts/}
-        # only scripts that are part of the known self-testing suite are run (a data/helper py
-        # with no --self-test would otherwise fail closed spuriously)
+        # [issue #140] EVERY touched python file gets a direct py_compile syntax check. A non-suite
+        # helper/data py was previously classified into NOTHING and slipped through unvalidated while
+        # the always-run suite incremented the counter — so the gate could pass having validated only
+        # unrelated files. Emit a py: compile target for the actual change regardless of suite
+        # membership.
+        printf 'py:%s\n' "$path"
+        # A suite script is ADDITIONALLY run via --self-test (validates the change's behaviour, not
+        # just its syntax). A data/helper py with no --self-test stays compile-only — a spurious
+        # --self-test on it would fail closed for the wrong reason.
         case " $suite " in *" $base "*) printf 'self:%s\n' "$base" ;; esac
         ;;
       scripts/*.sh)
@@ -752,6 +759,102 @@ _workflow_step_if() {
   ' "$file"
 }
 
+# [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
+# unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
+# workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
+# SAME pinned release version + tarball sha256 (keep the two in sync when bumping). The pins are
+# hard-coded here and never read from the environment, so nothing PR- or env-controlled can swap
+# in a different artifact; a failed download, a checksum mismatch, or an arch with no pinned
+# checksum REFUSES and the gate still dies (the fail-closed behaviour is preserved, not weakened).
+# [#428 review r2] The EXTRACTED binary is pinned too (BIN sha, of the `actionlint` file inside
+# the pinned tarball) — it is what the cache fast path re-verifies on every reuse, so cached bytes
+# sit inside the same checksum boundary as a fresh download. When bumping the version, update BOTH
+# digests: tarball sha from the release checksums, binary sha via sha256sum of the extracted file.
+_ACTIONLINT_VERSION=1.7.7
+_ACTIONLINT_SHA256_LINUX_AMD64=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+_ACTIONLINT_BIN_SHA256_LINUX_AMD64=9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c
+
+# _fetch_pinned_actionlint <dest_dir> <url> <tar_sha256> <bin_sha256>: download → sha256-verify
+# the tarball → extract into a FRESH temp dir → sha256-verify the extracted binary → atomically
+# rename it into dest → print the binary path. Refuses (rc 1, nothing printed) unless BOTH digests
+# match EXACTLY — nothing lands in dest before it is fully verified, and EVERY failure also evicts
+# any pre-existing dest binary, so a failed/partial provisioning can never leave bytes behind for
+# the cache fast path to trust. url/sha params exist only so the self-test can prove the accept
+# AND the refuse directions offline via file:// fixtures; the production caller
+# (_ensure_actionlint) always passes the hard-coded pins above.
+_fetch_pinned_actionlint() {
+  local dest=$1 url=$2 tar_sha256=$3 bin_sha256=$4
+  local tmpdir
+  mkdir -p -- "$(dirname -- "$dest")" || return 1
+  # sibling of dest → same filesystem, so the final mv is an atomic rename
+  tmpdir=$(mktemp -d -- "${dest}.tmp.XXXXXX") || return 1
+  if ! _fetch_pinned_actionlint_unpack "$tmpdir" "$url" "$tar_sha256" "$bin_sha256" \
+      || ! mkdir -p -- "$dest" \
+      || ! mv -f -- "$tmpdir/actionlint" "$dest/actionlint"; then
+    rm -rf -- "$tmpdir"
+    rm -f -- "$dest/actionlint" # fail closed: no partial/stale binary survives a failure
+    return 1
+  fi
+  rm -rf -- "$tmpdir"
+  printf '%s\n' "$dest/actionlint"
+}
+
+# helper for the above: all the steps that may fail mid-way, confined to the temp dir so the
+# caller can clean up uniformly. Never touches dest.
+_fetch_pinned_actionlint_unpack() {
+  local tmpdir=$1 url=$2 tar_sha256=$3 bin_sha256=$4
+  local tarball="$tmpdir/actionlint.tar.gz"
+  curl -fsSL --retry 3 -o "$tarball" "$url" || return 1
+  if ! printf '%s  %s\n' "$tar_sha256" "$tarball" | sha256sum -c - >/dev/null 2>&1; then
+    printf 'worker-live: actionlint artifact checksum MISMATCH — refusing it\n' >&2
+    return 1
+  fi
+  tar -C "$tmpdir" -xzf "$tarball" actionlint || return 1
+  [[ -x "$tmpdir/actionlint" ]] || return 1
+  if ! printf '%s  %s\n' "$bin_sha256" "$tmpdir/actionlint" | sha256sum -c - >/dev/null 2>&1; then
+    printf 'worker-live: extracted actionlint binary checksum MISMATCH — refusing it\n' >&2
+    return 1
+  fi
+}
+
+# _ensure_actionlint [bin_sha256 [url [tar_sha256]]]: print a usable actionlint path — a PATH copy
+# if one is already installed, else a cache copy that STILL matches the pinned binary digest, else
+# a fresh pinned download. rc 1 when none can be had; the gate then dies (fail closed) exactly as
+# when the tool was merely absent. [#428 review r2] the cache sits INSIDE the checksum boundary: a
+# cached binary is re-verified against the pinned binary digest on every reuse, and one that fails
+# (tampered, truncated, stale) is DISCARDED and re-provisioned — never executed. The optional
+# params exist only so the self-test can exercise the cache-verification and refusal paths offline
+# via fixtures; the sole production call site passes no arguments, so nothing PR- or
+# env-controlled can swap the pins.
+_ensure_actionlint() {
+  local bin_sha256=${1:-$_ACTIONLINT_BIN_SHA256_LINUX_AMD64}
+  local url=${2:-"https://github.com/rhysd/actionlint/releases/download/v${_ACTIONLINT_VERSION}/actionlint_${_ACTIONLINT_VERSION}_linux_amd64.tar.gz"}
+  local tar_sha256=${3:-$_ACTIONLINT_SHA256_LINUX_AMD64}
+  if command -v actionlint >/dev/null 2>&1; then
+    command -v actionlint
+    return 0
+  fi
+  local cache="${WORKER_TOOL_CACHE:-${HOME:-/tmp}/.cache/worker-tools}/actionlint-${_ACTIONLINT_VERSION}"
+  if [[ -e "$cache/actionlint" ]]; then
+    if [[ -x "$cache/actionlint" ]] \
+        && printf '%s  %s\n' "$bin_sha256" "$cache/actionlint" | sha256sum -c - >/dev/null 2>&1; then
+      printf '%s\n' "$cache/actionlint"
+      return 0
+    fi
+    printf 'worker-live: cached actionlint fails the pinned digest — discarding it\n' >&2
+    rm -f -- "$cache/actionlint"
+  fi
+  # the pinned checksums are the linux/amd64 release artifact; any other arch refuses rather than
+  # downloading a build we cannot verify (the guard applies to the no-arg production call — the
+  # self-test's fixture pins are arch-independent)
+  if [[ $# -eq 0 && "$(uname -m)" != x86_64 ]]; then
+    printf 'worker-live: no pinned actionlint checksum for arch %s (refusing)\n' "$(uname -m)" >&2
+    return 1
+  fi
+  printf 'worker-live: provisioning pinned actionlint v%s (sha256-verified)\n' "$_ACTIONLINT_VERSION" >&2
+  _fetch_pinned_actionlint "$cache" "$url" "$tar_sha256" "$bin_sha256"
+}
+
 registry_selftest_gate() {
   local changed
   changed="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
@@ -759,8 +862,10 @@ registry_selftest_gate() {
   local -a targets=()
   mapfile -t targets < <(printf '%s\n' "$changed" | _registry_selftest_targets "$FULL_SELFTEST_SUITE")
 
-  local ran=0 t kind name
-  # 1) EVERY touched self-testing script, run directly (validates the change itself).
+  # `direct` counts validations of the ACTUAL touched files (targets); `ran` counts the always-run
+  # regression suite. Non-vacuity is measured against `direct`, never the suite — see the final gate.
+  local ran=0 direct=0 t kind name
+  # 1) EVERY touched self-testing script, run directly (validates the change's behaviour).
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == self ]]; then
@@ -770,12 +875,27 @@ registry_selftest_gate() {
       else
         python3 "scripts/$name" --self-test || die "self-test failed: $name"
       fi
-      ran=$((ran + 1))
+      direct=$((direct + 1))
+    fi
+  done
+
+  # 1b) [issue #140] py_compile EVERY touched python file (suite or not). The previous gate only ran
+  #     a touched suite script's --self-test and left a non-suite helper/data py with NO direct check
+  #     — the always-run suite still incremented the counter, so the gate passed having validated only
+  #     unrelated files. A direct compile of the actual change closes that hole.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == py ]]; then
+      printf 'worker-live: py_compile %s\n' "$name"
+      python3 -m py_compile "$name" || die "py_compile failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
   # 2) The FULL recent-wave suite (regression backstop): every suite script present in the tree,
   #    run once. A touched script already ran above; running it twice is harmless + idempotent.
+  #    Suite runs count toward `ran` (coverage exists) but NOT toward `direct`: the suite validates
+  #    unrelated files, so it must never be what makes the gate non-vacuous.
   local script
   for script in $FULL_SELFTEST_SUITE; do
     [[ -f "scripts/$script" ]] || continue
@@ -794,21 +914,27 @@ registry_selftest_gate() {
     if [[ "$kind" == bash ]]; then
       printf 'worker-live: bash -n %s\n' "$name"
       bash -n "$name" || die "bash -n failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
-  # 4) actionlint + a yaml parse on every touched workflow.
+  # 4) yaml parse + actionlint on every touched workflow. [issue #140] actionlint is the SEMANTIC
+  #    linter; a yaml parse only proves the file is well-formed. Silently degrading to yaml-only when
+  #    actionlint was absent let a semantically-broken trust-plane workflow pass the gate. The worker
+  #    lane does not pre-install actionlint, so the gate provisions the pinned, sha256-verified
+  #    release itself (_ensure_actionlint — the same pin as pr-gate.yml) and FAILS CLOSED only when
+  #    neither a present nor a verifiably provisioned binary can be had.
+  local actionlint_bin=''
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == wf ]]; then
       printf 'worker-live: lint workflow %s\n' "$name"
       python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$name" \
         || die "yaml parse failed: $name"
-      if command -v actionlint >/dev/null 2>&1; then
-        actionlint "$name" || die "actionlint failed: $name"
-      else
-        printf 'worker-live: actionlint not on PATH; yaml parse only for %s\n' "$name"
-      fi
+      [[ -n "$actionlint_bin" ]] || actionlint_bin=$(_ensure_actionlint) \
+        || die "actionlint unavailable and pinned provisioning failed: $name (fail closed — a workflow change cannot be under-validated)"
+      "$actionlint_bin" "$name" || die "actionlint failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
@@ -819,12 +945,20 @@ registry_selftest_gate() {
     if [[ "$kind" == dockerfile ]]; then
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
-      ran=$((ran + 1))
+      direct=$((direct + 1))
     fi
   done
 
+  # [issue #140] Non-vacuity is measured against the ACTUAL change: every touched control file
+  # (`targets`) must have been directly validated above. `ran` only proves the regression backstop
+  # ran; `direct == #targets` proves nothing touched slipped through unchecked (and flips closed if a
+  # future classification emits a target kind that no loop validates). A docs/data-only diff
+  # legitimately has no targets — the suite backstop (ran>0) still covers it.
   [[ "$ran" -gt 0 ]] || die 'registry-selftest gate ran no suite (fail closed — nothing validated)'
-  printf 'worker-live: registry-selftest gate passed (%s suite run(s))\n' "$ran"
+  [[ "$direct" -eq "${#targets[@]}" ]] \
+    || die "registry-selftest gate: a touched control file was not directly validated (fail closed): $direct/${#targets[@]}"
+  printf 'worker-live: registry-selftest gate passed (%s direct validation(s), %s suite run(s))\n' \
+    "$direct" "$ran"
 }
 
 # Model naming (maintainer directive 2026-07-18): sol is the codex-side FRONTIER model
@@ -1728,6 +1862,7 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "scripts/backfill-provenance.py" \
     "scripts/dashboard-gen.py" \
     "scripts/pat-validity.py" \
+    "scripts/newhelper.py" \
     "containers/worker-model.Dockerfile" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
@@ -1740,6 +1875,16 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(grep -c 'wf:.github/workflows/dispatch.yml' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate ignores a non-suite data path" \
     "$(grep -c 'leases.json' <<< "${sel//,/$'\n'}" || true)" "0"
+  # [issue #140] every touched python file is compile-checked. A suite py emits BOTH a py: compile
+  # target and its self: run; a NON-suite helper py (previously classified into NOTHING, so it
+  # slipped through the gate unvalidated) now emits a py: compile target — but NO spurious self:,
+  # since it has no --self-test. These flip red if the compile classification regresses.
+  chk "registry gate compiles a touched suite py" \
+    "$(grep -c 'py:scripts/worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate compiles a touched NON-suite py (was unvalidated before #140)" \
+    "$(grep -c 'py:scripts/newhelper.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate does NOT self-test a non-suite py (compile-only, no --self-test)" \
+    "$(grep -c 'self:newhelper.py' <<< "${sel//,/$'\n'}" || true)" "0"
   chk "registry gate runs a touched non-.sh suite py" \
     "$(grep -c 'self:backfill-provenance.py' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate runs the dashboard privacy self-test" \
@@ -1750,6 +1895,84 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   # can validate its base-image pinning.
   chk "registry gate classifies a touched container definition" \
     "$(grep -c 'dockerfile:containers/worker-model.Dockerfile' <<< "${sel//,/$'\n'}" || true)" "1"
+
+  # --- [issue #140 review r1, #428 review r2] pinned actionlint provisioning. The gate fails
+  # closed when a workflow changed and actionlint is missing, so the worker lane must provision a
+  # pinned, sha256-verified binary itself — otherwise every wf: change dies at the gate. Both
+  # directions, offline via file:// fixtures: a digest-matching artifact is installed and runnable
+  # (legitimate workflow maintenance stays passable), while a tarball mismatch, an extracted-binary
+  # mismatch, and an unreachable download are refused with nothing kept — and [r2] the CACHE sits
+  # inside the checksum boundary too: a cached binary is reused only while it still matches the
+  # pinned binary digest; a tampered one is discarded, never executed. ---
+  mkdir -p "$tmp/al-src"
+  printf '#!/usr/bin/env bash\necho stub-actionlint-ok\n' > "$tmp/al-src/actionlint"
+  chmod +x "$tmp/al-src/actionlint"
+  tar -C "$tmp/al-src" -czf "$tmp/al-good.tar.gz" actionlint
+  local al_tar_sha al_bin_sha al_zeros al_bin
+  al_tar_sha=$(sha256sum "$tmp/al-good.tar.gz" | cut -d' ' -f1)
+  al_bin_sha=$(sha256sum "$tmp/al-src/actionlint" | cut -d' ' -f1)
+  al_zeros=$(printf '0%.0s' {1..64})
+  al_bin=$(_fetch_pinned_actionlint "$tmp/al-dest" "file://$tmp/al-good.tar.gz" \
+    "$al_tar_sha" "$al_bin_sha" || true)
+  chk "checksum-matching actionlint artifact installs into the dest dir" \
+    "$al_bin" "$tmp/al-dest/actionlint"
+  chk "provisioned actionlint binary is runnable" \
+    "$([[ -n "$al_bin" ]] && "$al_bin" 2>/dev/null || echo missing)" "stub-actionlint-ok"
+  chk "tarball-checksum-MISMATCHED actionlint artifact is refused (fail closed)" \
+    "$( (_fetch_pinned_actionlint "$tmp/al-bad" "file://$tmp/al-good.tar.gz" \
+      "$al_zeros" "$al_bin_sha" >/dev/null 2>&1 && echo installed) || echo refused)" "refused"
+  chk "refused artifact leaves NO trusted binary behind" \
+    "$([[ -e "$tmp/al-bad/actionlint" ]] && echo present || echo absent)" "absent"
+  # [r2] the tarball digest alone is not the boundary: the EXTRACTED binary is verified too, so a
+  # verified-tarball-but-wrong-binary outcome (e.g. a partial extraction) never installs.
+  chk "extracted-binary-digest MISMATCH is refused even when the tarball digest matched" \
+    "$( (_fetch_pinned_actionlint "$tmp/al-binbad" "file://$tmp/al-good.tar.gz" \
+      "$al_tar_sha" "$al_zeros" >/dev/null 2>&1 && echo installed) || echo refused)" "refused"
+  chk "binary-digest refusal leaves NO binary behind" \
+    "$([[ -e "$tmp/al-binbad/actionlint" ]] && echo present || echo absent)" "absent"
+  chk "unreachable actionlint download is a refusal, not a silent fallback" \
+    "$( (_fetch_pinned_actionlint "$tmp/al-miss" "file://$tmp/no-such-artifact.tar.gz" \
+      "$al_tar_sha" "$al_bin_sha" >/dev/null 2>&1 && echo installed) || echo refused)" "refused"
+  # [r2] a failed provisioning must also EVICT any pre-existing dest binary — otherwise a stale or
+  # partially written leftover would survive for the cache fast path to pick up on a later run.
+  mkdir -p "$tmp/al-stale"
+  printf '#!/usr/bin/env bash\necho stale\n' > "$tmp/al-stale/actionlint"
+  chmod +x "$tmp/al-stale/actionlint"
+  (_fetch_pinned_actionlint "$tmp/al-stale" "file://$tmp/no-such-artifact.tar.gz" \
+    "$al_tar_sha" "$al_bin_sha") >/dev/null 2>&1 || true
+  chk "failed provisioning evicts a pre-existing dest binary (nothing left to mis-trust)" \
+    "$([[ -e "$tmp/al-stale/actionlint" ]] && echo present || echo absent)" "absent"
+  # resolution order: an actionlint already on PATH wins (no download); a cache copy is reused
+  # ONLY while it matches the pinned binary digest; a tampered cache copy is discarded and (with
+  # the fixture download unreachable) the whole resolution refuses rather than executing it.
+  chk "_ensure_actionlint prefers an actionlint already on PATH" \
+    "$(PATH="$tmp/al-src:$PATH" _ensure_actionlint)" "$tmp/al-src/actionlint"
+  # a restricted PATH holding the tools _ensure_actionlint itself needs but NO actionlint, so the
+  # cache branch is deterministic even on hosts that have actionlint installed
+  mkdir -p "$tmp/al-path"
+  local al_tool
+  for al_tool in sha256sum uname mktemp dirname curl tar rm mkdir mv; do
+    ln -sf "$(command -v "$al_tool")" "$tmp/al-path/$al_tool"
+  done
+  mkdir -p "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}"
+  cp "$tmp/al-src/actionlint" "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  chmod +x "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  chk "_ensure_actionlint reuses a cache copy that matches the pinned binary digest" \
+    "$(PATH="$tmp/al-path" WORKER_TOOL_CACHE="$tmp/al-cache" \
+       _ensure_actionlint "$al_bin_sha" "file://$tmp/no-such-artifact.tar.gz" "$al_tar_sha")" \
+    "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  # [r2] the cache fast path is INSIDE the checksum boundary: a tampered/truncated cache copy is
+  # never trusted on executability alone — it is discarded, and with no verifiable download the
+  # resolution refuses (fail closed) instead of executing it.
+  printf '#!/usr/bin/env bash\necho tampered\n' \
+    > "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  chk "_ensure_actionlint REFUSES a cached binary that fails the pinned digest" \
+    "$(PATH="$tmp/al-path" WORKER_TOOL_CACHE="$tmp/al-cache" \
+       _ensure_actionlint "$al_bin_sha" "file://$tmp/no-such-artifact.tar.gz" "$al_tar_sha" \
+       2>/dev/null || echo refused)" "refused"
+  chk "the tampered cache copy is discarded, not left for a later run to trust" \
+    "$([[ -e "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint" ]] && echo present || echo absent)" \
+    "absent"
 
   # --- [issue #145] container base-image pin check (non-vacuous: a mutable-tag base FAILS). Proves
   # the real worker sandbox is digest-pinned, that an unpinned base is rejected, and that a
