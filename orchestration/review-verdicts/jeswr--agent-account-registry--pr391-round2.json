@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 391,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9291c058c34e7b88f0e76568fd6ac556d625bc90",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 blocker is resolved. set_review_state now removes only review labels present in its validated live snapshot, so a review:needs-user hold arriving after the read is not targeted for deletion. The new interleaving self-test is non-vacuous: it would fail under the former full-REVIEW_LABELS removal loop, and it also verifies removal of the observed stale label. Existing live-hold refusal, ambiguous-state fail-closed behavior, malformed-payload rejection, and get_review_state handling are covered with assertions that distinguish incorrect outcomes. I found no blocker, major, or other diff-scoped issue requiring changes.",
+  "verdict": "approve"
+ }
+}
