@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly fail-closes Anthropic usage probing unless the catalog secret_ref exactly matches the account handle's uppercase token name. The check occurs before secrets-map dereference and probe invocation, preventing cross-account credential use while preserving valid mixed-case handles. The added regression tests are non-vacuous: the foreign-token case previously reached the injected probe and returned a non-None entry, and the explicit probe-call assertion verifies that path remains untouched. Existing provider and non-worker-secret tests were updated consistently. No trust check is weakened and no hostile reviewer-directed instruction is present in the diff.",
+ "verdict": "approve"
+}
