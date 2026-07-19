@@ -759,6 +759,66 @@ _workflow_step_if() {
   ' "$file"
 }
 
+# [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
+# unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
+# workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
+# SAME pinned release version + sha256 (keep the two in sync when bumping). The pin is hard-coded
+# here and never read from the environment, so nothing PR- or env-controlled can swap in a
+# different artifact; a failed download, a checksum mismatch, or an arch with no pinned checksum
+# REFUSES and the gate still dies (the fail-closed behaviour is preserved, not weakened).
+_ACTIONLINT_VERSION=1.7.7
+_ACTIONLINT_SHA256_LINUX_AMD64=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+
+# _fetch_pinned_actionlint <dest_dir> <url> <sha256>: download → sha256-verify → extract → print
+# the binary path. Refuses (rc 1, nothing printed, nothing kept in dest) unless the artifact
+# matches the expected checksum EXACTLY — verification happens BEFORE extraction, so an
+# unverified artifact never yields an executable. url/sha256 are parameters only so the self-test
+# can prove both the accept and the refuse direction offline via file:// fixtures; the production
+# caller (_ensure_actionlint) always passes the hard-coded pin above.
+_fetch_pinned_actionlint() {
+  local dest=$1 url=$2 sha256=$3
+  local tarball="$dest/actionlint.tar.gz"
+  mkdir -p -- "$dest" || return 1
+  if ! curl -fsSL --retry 3 -o "$tarball" "$url"; then
+    rm -f -- "$tarball"
+    return 1
+  fi
+  if ! printf '%s  %s\n' "$sha256" "$tarball" | sha256sum -c - >/dev/null 2>&1; then
+    printf 'worker-live: actionlint artifact checksum MISMATCH — refusing it\n' >&2
+    rm -f -- "$tarball"
+    return 1
+  fi
+  tar -C "$dest" -xzf "$tarball" actionlint || { rm -f -- "$tarball"; return 1; }
+  rm -f -- "$tarball"
+  [[ -x "$dest/actionlint" ]] || return 1
+  printf '%s\n' "$dest/actionlint"
+}
+
+# _ensure_actionlint: print a usable actionlint path — a PATH copy if one is already installed,
+# else the previously provisioned cache, else a fresh pinned download. rc 1 when none can be had;
+# the gate then dies (fail closed) exactly as when the tool was merely absent.
+_ensure_actionlint() {
+  if command -v actionlint >/dev/null 2>&1; then
+    command -v actionlint
+    return 0
+  fi
+  local cache="${WORKER_TOOL_CACHE:-${HOME:-/tmp}/.cache/worker-tools}/actionlint-${_ACTIONLINT_VERSION}"
+  if [[ -x "$cache/actionlint" ]]; then
+    printf '%s\n' "$cache/actionlint"
+    return 0
+  fi
+  # the pinned checksum is the linux/amd64 release artifact; any other arch refuses rather than
+  # downloading a build we cannot verify
+  if [[ "$(uname -m)" != x86_64 ]]; then
+    printf 'worker-live: no pinned actionlint checksum for arch %s (refusing)\n' "$(uname -m)" >&2
+    return 1
+  fi
+  printf 'worker-live: provisioning pinned actionlint v%s (sha256-verified)\n' "$_ACTIONLINT_VERSION" >&2
+  _fetch_pinned_actionlint "$cache" \
+    "https://github.com/rhysd/actionlint/releases/download/v${_ACTIONLINT_VERSION}/actionlint_${_ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+    "$_ACTIONLINT_SHA256_LINUX_AMD64"
+}
+
 registry_selftest_gate() {
   local changed
   changed="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
@@ -824,18 +884,20 @@ registry_selftest_gate() {
 
   # 4) yaml parse + actionlint on every touched workflow. [issue #140] actionlint is the SEMANTIC
   #    linter; a yaml parse only proves the file is well-formed. Silently degrading to yaml-only when
-  #    actionlint is absent (the worker gate lane never installs it) let a semantically-broken
-  #    trust-plane workflow pass the gate, so a touched workflow now FAILS CLOSED when actionlint is
-  #    unavailable rather than under-validating it.
+  #    actionlint was absent let a semantically-broken trust-plane workflow pass the gate. The worker
+  #    lane does not pre-install actionlint, so the gate provisions the pinned, sha256-verified
+  #    release itself (_ensure_actionlint — the same pin as pr-gate.yml) and FAILS CLOSED only when
+  #    neither a present nor a verifiably provisioned binary can be had.
+  local actionlint_bin=''
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == wf ]]; then
       printf 'worker-live: lint workflow %s\n' "$name"
       python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$name" \
         || die "yaml parse failed: $name"
-      command -v actionlint >/dev/null 2>&1 \
-        || die "actionlint unavailable but a workflow changed: $name (fail closed — install a pinned actionlint)"
-      actionlint "$name" || die "actionlint failed: $name"
+      [[ -n "$actionlint_bin" ]] || actionlint_bin=$(_ensure_actionlint) \
+        || die "actionlint unavailable and pinned provisioning failed: $name (fail closed — a workflow change cannot be under-validated)"
+      "$actionlint_bin" "$name" || die "actionlint failed: $name"
       direct=$((direct + 1))
     fi
   done
@@ -1797,6 +1859,43 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   # can validate its base-image pinning.
   chk "registry gate classifies a touched container definition" \
     "$(grep -c 'dockerfile:containers/worker-model.Dockerfile' <<< "${sel//,/$'\n'}" || true)" "1"
+
+  # --- [issue #140 review r1] pinned actionlint provisioning. The gate fails closed when a
+  # workflow changed and actionlint is missing, so the worker lane must provision a pinned,
+  # sha256-verified binary itself — otherwise every wf: change dies at the gate. Both directions,
+  # offline via file:// fixtures: a checksum-matching artifact is installed and runnable
+  # (legitimate workflow maintenance stays passable), while a checksum-MISMATCHED artifact and an
+  # unreachable download are refused with nothing kept (flips red if the sha256 verification or
+  # the fail-closed refusal is ever removed). ---
+  mkdir -p "$tmp/al-src"
+  printf '#!/usr/bin/env bash\necho stub-actionlint-ok\n' > "$tmp/al-src/actionlint"
+  chmod +x "$tmp/al-src/actionlint"
+  tar -C "$tmp/al-src" -czf "$tmp/al-good.tar.gz" actionlint
+  local al_sha al_bin
+  al_sha=$(sha256sum "$tmp/al-good.tar.gz" | cut -d' ' -f1)
+  al_bin=$(_fetch_pinned_actionlint "$tmp/al-dest" "file://$tmp/al-good.tar.gz" "$al_sha" || true)
+  chk "checksum-matching actionlint artifact installs into the dest dir" \
+    "$al_bin" "$tmp/al-dest/actionlint"
+  chk "provisioned actionlint binary is runnable" \
+    "$([[ -n "$al_bin" ]] && "$al_bin" 2>/dev/null || echo missing)" "stub-actionlint-ok"
+  chk "checksum-MISMATCHED actionlint artifact is refused (fail closed)" \
+    "$( (_fetch_pinned_actionlint "$tmp/al-bad" "file://$tmp/al-good.tar.gz" \
+      "$(printf '0%.0s' {1..64})" >/dev/null 2>&1 && echo installed) || echo refused)" "refused"
+  chk "refused artifact leaves NO trusted binary behind" \
+    "$([[ -e "$tmp/al-bad/actionlint" ]] && echo present || echo absent)" "absent"
+  chk "unreachable actionlint download is a refusal, not a silent fallback" \
+    "$( (_fetch_pinned_actionlint "$tmp/al-miss" "file://$tmp/no-such-artifact.tar.gz" \
+      "$al_sha" >/dev/null 2>&1 && echo installed) || echo refused)" "refused"
+  # resolution order: an actionlint already on PATH wins (no download); with an empty PATH a
+  # previously provisioned cache copy is used — both keep the gate passable without network.
+  chk "_ensure_actionlint prefers an actionlint already on PATH" \
+    "$(PATH="$tmp/al-src:$PATH" _ensure_actionlint)" "$tmp/al-src/actionlint"
+  mkdir -p "$tmp/al-empty" "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}"
+  cp "$tmp/al-src/actionlint" "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  chmod +x "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  chk "_ensure_actionlint falls back to the provisioned cache when PATH has none" \
+    "$(PATH="$tmp/al-empty" WORKER_TOOL_CACHE="$tmp/al-cache" _ensure_actionlint)" \
+    "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
 
   # --- [issue #145] container base-image pin check (non-vacuous: a mutable-tag base FAILS). Proves
   # the real worker sandbox is digest-pinned, that an unpinned base is rejected, and that a
