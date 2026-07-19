@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly threads the protected routing keyword union into the arm step, re-reads both PR and source-issue labels from live GitHub state, and folds a newly detected label posture into the existing SHA-bound pre-arm audit without weakening the designed approval-to-auto-arm behavior. Malformed live label payloads raise before any arm mutation. The shell handoff uses base64 JSON plus array arguments, and the added self-tests are non-vacuous: they isolate label-only behavior with a benign diff, verify positive and negative keyword controls, cover PR/source-issue union and trust:* handling, assert the merge and audit effects, and exercise fail-closed malformed source state. No reviewer-directed prompt injection was found in the diff.",
+ "verdict": "approve"
+}
