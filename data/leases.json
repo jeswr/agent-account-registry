@@ -59,6 +59,16 @@
    "model": "opus",
    "issued_at": 1784432048,
    "expires_at": 1784434748
+  },
+  {
+   "account": "acct01",
+   "claim_id": "ae51dc7a4c4140cfa81e07663a6b591c",
+   "holder": "sparq-org/sparq#2769@dispatch-29671933868.1",
+   "package": "bench-wasm-compare",
+   "role": "impl",
+   "model": "sol",
+   "issued_at": 1784432262,
+   "expires_at": 1784438562
   }
  ]
 }
