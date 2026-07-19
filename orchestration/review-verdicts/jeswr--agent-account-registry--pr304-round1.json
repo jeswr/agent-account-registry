@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly replaces the unsafe newest-100 snapshot with bounded pagination over worker-run history. It correlates all live claim IDs, stops only after all claims are found, history is exhausted, or the relevant issuance-time window is covered, and fails closed if the 5,000-run ceiling is reached without establishing either condition. Existing run-shape/status validation remains enforced on every inspected entry, and duplicate claim-run evidence remains an error. The added self-tests are non-vacuous: they demonstrate that the former one-page behavior misses the target, require page-2 correlation, verify both safe stopping conditions, and require a loud failure at the exact pagination ceiling. No trust check is weakened and no token, permission, workflow-expression, or injection surface is introduced.",
+ "verdict": "approve"
+}
