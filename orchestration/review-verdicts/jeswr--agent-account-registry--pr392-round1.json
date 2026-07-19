@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 392,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a21b837528e18e9ec9c95e4b292523b240084313",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_protected_default_tip` validates only `commit.sha`; it never checks the branches API response's `protected` field. Thus a repository whose default branch is unprotected (or becomes unprotected) is treated as a protected trust source, allowing routing changes outside the claimed branch-protected control surface. This is a fail-open trust check. The test fixture supplies `\"protected\": True`, but no assertion depends on it: changing that value to false or deleting it still passes, so the protection leg is vacuous.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Require the branch response to report `protected is True` before accepting its SHA and raise `DispatchError` otherwise. Add negative self-tests for both `protected: false` and a missing/malformed protection field, asserting each is rejected; those assertions should fail if the production protection check is removed.",
+    "severity": "major",
+    "title": "Default-branch routing is accepted without proving branch protection"
+   }
+  ],
+  "progress": null,
+  "summary": "The new lookup removes the plan-controlled SHA from routing selection, but it does not establish the property its API and comments claim: that the selected default-branch tip is protected. Because the returned branch protection state is ignored, CLAIM can trust routing from an unprotected branch. The self-test is correspondingly unable to detect this weakened trust boundary.",
+  "verdict": "request_changes"
+ }
+}
