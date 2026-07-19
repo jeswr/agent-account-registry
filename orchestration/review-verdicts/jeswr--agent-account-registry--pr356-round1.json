@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 356,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7e33807ba09e2534a54a7df9adf2c5664c951186",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "On the first network-unknown, `upsert_probe_alert` calls `gh issue create` and only afterward calls `gh issue close`. GitHub issues are necessarily created OPEN, so creation can notify subscribers, trigger issue-created automation, and briefly appear in open-alert views before the close occurs. Closing it afterward does not retract those effects. Thus a single transient unknown is not reliably a silent counter, contrary to the stated threshold contract and the self-test description; the test only asserts the command sequence and cannot establish absence of a page/notification.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "Persist the sub-threshold streak in a mechanism that can be written without first publishing an open alert, and create/reopen the alert issue only when the threshold is reached. Add a test asserting that the first and second unknown perform no alert-creating/opening operation, rather than accepting create-then-close as silent.",
+    "severity": "major",
+    "title": "Below-threshold unknowns create an open issue before being silenced"
+   },
+   {
+    "body": "After `gh issue create` succeeds below threshold, `_issue_number_from_url` may raise if stdout is empty or its format changes. At that point the issue already exists OPEN, and raising `AlertWriteError` does not close it. This directly contradicts the function's fail-closed claim that parsing failure avoids leaving a freshly created probe alert unsilenced, and turns a single transient unknown into an open false page. The self-test checks only that an exception is raised, not the externally visible orphaned issue.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "Avoid creating an issue below threshold. If creation remains necessary, recover the created issue authoritatively by exact identity and close it on output-parse failure, while handling ambiguity without blind writes; add a test covering successful creation with malformed stdout and verifying no open alert remains.",
+    "severity": "major",
+    "title": "Unparseable create output strands a false alert open"
+   }
+  ],
+  "progress": null,
+  "summary": "The persistent-unknown counter is well separated from the credential verdict and the self-tests exercise most state transitions, but the below-threshold path does not actually provide the promised silent behavior. It creates an open issue and only then closes it, which can emit the very issue-created notification/page that the threshold is intended to suppress. Its error handling can also strand that newly created issue open when the create output cannot be parsed. Because these are correctness failures in the new alerting contract, changes are required.",
+  "verdict": "request_changes"
+ }
+}
