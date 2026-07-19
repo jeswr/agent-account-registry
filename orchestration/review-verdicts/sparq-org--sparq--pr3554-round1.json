@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "In `drive`, `scan_to_bindings(...)` constructs all `seed_rows` before the block loop and before the sink can be called. Consequently the module's claim that the seed scan is consumed in blocks, and the test's claim that first output can leave before the seed scan completes, are false. `SEED_PROCESSED` only tracks blocks after materialization; observing it below `SEED_TOTAL` says nothing about whether the store scan has completed. This also means the implementation retains the entire seed relation, contrary to the lazy seed-pull behavior described as the milestone's load-bearing property.",
+   "file": "crates/sparq-engine/src/stream_pipeline.rs",
+   "fix_hint": "Either make the seed scan genuinely incremental (iterate the store scan into bounded blocks and emit before exhausting it), with telemetry tied to actual scan consumption, or narrow all implementation/docs/test claims to the property actually provided (emission before the entire join completes) and replace the seed-scan test with a non-vacuous assertion of that property. Do not use a post-materialization block counter as evidence of incomplete scanning.",
+   "severity": "major",
+   "title": "Seed scan is fully materialized before any emission"
+  }
+ ],
+ "progress": null,
+ "summary": "The bind-join block driver may stream before the full join completes, but it does not stream the seed scan as claimed: it first materializes the complete seed relation. The new first-emission test observes a bookkeeping counter updated after each block, not actual scan progress, so it cannot validate the stated first-emission-before-seed-scan-complete property.",
+ "verdict": "request_changes"
+}
