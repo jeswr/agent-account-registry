@@ -1354,14 +1354,22 @@ def _protected_default_tip(repo):
     leave HEAD on an obsolete commit whose routing catalog is weaker or incompatible. CLAIM must
     never let target-controlled data select the routing revision it trusts, so it re-resolves the
     default branch (the branch-protected surface the routing file lives on) and reads its tip
-    straight from the GitHub API here. Fail-closed: an unreadable repo, a missing default branch,
-    or a tip that is not a 40-hex sha raises DispatchError, so the caller defers rather than
-    routing off an unverifiable revision."""
+    straight from the GitHub API here. Fail-closed: an unreadable repo, a missing default branch, a
+    default branch that is not branch-protected, or a tip that is not a 40-hex sha raises
+    DispatchError, so the caller defers rather than routing off an unverifiable revision."""
     meta = _gh_json(["api", f"repos/{repo}"])
     branch = meta.get("default_branch") if isinstance(meta, dict) else None
     if not isinstance(branch, str) or not branch:
         raise DispatchError(f"cannot resolve default branch for {repo}")
     ref = _gh_json(["api", f"repos/{repo}/branches/{branch}"])
+    # The routing catalog's trust rests on the default branch being branch-PROTECTED — that is the
+    # only reason CLAIM treats its tip as an authority a hostile target cannot rewrite. Prove it
+    # from the API response, not from the branch's name: accept only an explicit `protected is
+    # True`. Anything else (protected false, missing, or non-bool) means the surface is not the
+    # protected control surface we claim, so fail closed rather than route off an unprotected tip.
+    protected = ref.get("protected") if isinstance(ref, dict) else None
+    if protected is not True:
+        raise DispatchError(f"default branch for {repo} is not branch-protected")
     commit = ref.get("commit") if isinstance(ref, dict) else None
     sha = commit.get("sha") if isinstance(commit, dict) else None
     if not isinstance(sha, str) or not SAFE_SHA.fullmatch(sha):
@@ -2975,7 +2983,7 @@ def _self_test():
         # would have waved through) must DEFER, never route
         globals()["_gh_json"] = lambda args: (
             {"default_branch": "main"} if args[-1] == "repos/example/repo"
-            else {"commit": {"sha": "z" * 40}})
+            else {"commit": {"sha": "z" * 40}, "protected": True})
         try:
             _protected_default_tip("example/repo")
             raise AssertionError("non-hex protected tip must fail closed")
@@ -2987,6 +2995,27 @@ def _self_test():
         try:
             _protected_default_tip("example/repo")
             raise AssertionError("missing default branch must fail closed")
+        except DispatchError:
+            pass
+        # fail-closed: an UNPROTECTED default branch is not the branch-protected control surface
+        # the routing catalog's trust rests on, so its tip must be rejected even though it is a
+        # valid 40-hex sha. This assertion goes red if the `protected is True` check is removed.
+        globals()["_gh_json"] = lambda args: (
+            {"default_branch": "main"} if args[-1] == "repos/example/repo"
+            else {"commit": {"sha": protected_tip}, "protected": False})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("unprotected default branch must fail closed")
+        except DispatchError:
+            pass
+        # fail-closed: a MISSING/non-bool protection field is not proof of protection either —
+        # absence must never be read as protected. Also red if the protection check is removed.
+        globals()["_gh_json"] = lambda args: (
+            {"default_branch": "main"} if args[-1] == "repos/example/repo"
+            else {"commit": {"sha": protected_tip}})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("missing protection field must fail closed")
         except DispatchError:
             pass
     finally:
