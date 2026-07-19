@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3622,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a2a6b94de54a75ba13a2cb4e44ac5280cac2a9fd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 approval remains supported. The ownership mappings correctly precede the broad site/** safe rule, so changes to either committed browser anchor trigger sparq-zk-compose. The focused tests read the shipped constants, reject an empty parsed age map, compare every parsed age encoding and the capture-script operand with the native encoder, and require the captured age to exist in and match the browser map. No vacuous assertion, correctness defect, soundness overclaim, or security issue is evident. Because round 2 also had no findings and this round introduces none, progress is stagnant by the required scale.",
+  "verdict": "approve"
+ }
+}
