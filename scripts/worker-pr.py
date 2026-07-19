@@ -1263,6 +1263,12 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             _load_worker_issue().set_status(repo, issue, "needs-user")
         except Exception as exc:  # noqa: BLE001 — continue to the alert, then reconcile on retry
             failures.append(f"source issue #{issue} needs-user routing ({exc})")
+    else:
+        # FAIL CLOSED: the source-issue transition is one of the THREE required mutations, not an
+        # optional step. A missing issue identifier is a missing trust-plane input, never a silent
+        # opt-out — record it as a reconciliation failure so the park is BLOCKED and the PR stays
+        # enumerable rather than parking terminally with its source issue left unrouted.
+        failures.append("source issue identifier absent (cannot route to needs-user)")
     # 3) Delivery-VERIFIED ops alert (the human page): one deduped rolling registry issue. FAIL
     #    CLOSED — _ops_alert returns False on a missing/partial route AND on an unverified delivery;
     #    either way the human page is UNCONFIRMED, so it blocks the park and keeps the PR enumerable.
@@ -2809,7 +2815,7 @@ def _self_test():
             nu_state.update(comments=[], comment_raises=False, issue_raises=False, alert=True)
             nu_state.update(over)
             kw = {"issue": 7, "alert_repo": "reg/r", "alert_token": "t", "bot_login": bot}
-            kw.update({k: over[k] for k in ("alert_repo", "alert_token") if k in over})
+            kw.update({k: over[k] for k in ("alert_repo", "alert_token", "issue") if k in over})
             raised = None
             try:
                 needs_user("o/r", 5, "budget exhausted", **kw)
@@ -2859,6 +2865,18 @@ def _self_test():
         raised = run_needs_user(issue_raises=True)
         check("a failed source-issue routing blocks the park and raises", bool(raised), True)
         check("a failed issue routing never parks", any(c[0] == "park" for c in nu_calls), False)
+
+        # FAIL CLOSED: a MISSING source issue identifier is a missing trust-plane input, not a
+        # silent opt-out — it must block the park exactly like any other unconfirmed mutation. The
+        # comment and alert are still attempted, but the absent issue routing keeps the PR
+        # enumerable so the sweep re-derives and reconciles it rather than parking it unrouted.
+        raised = run_needs_user(issue=None)
+        check("a missing source issue blocks the park and raises", bool(raised), True)
+        check("a missing source issue records the reconciliation failure",
+              "source issue identifier absent" in (raised or ""), True)
+        check("a missing source issue never parks", any(c[0] == "park" for c in nu_calls), False)
+        check("a missing source issue still attempts the comment and alert (issue routing skipped)",
+              [c[0] for c in nu_calls], ["comment", "alert"])
 
         # Idempotent re-entry: a prior run already posted the marker comment, so the reconciling
         # retry must NOT re-post it — but it must still route the issue, alert, and park.
