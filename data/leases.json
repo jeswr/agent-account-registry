@@ -9,16 +9,6 @@
    "model": "opus",
    "issued_at": 1784494567,
    "expires_at": 1784500867
-  },
-  {
-   "account": "acct4css",
-   "claim_id": "6183b68147174e7ba178109639751cc9",
-   "holder": "jeswr/agent-account-registry#165@29703830560.1",
-   "package": "review-loop",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784495340,
-   "expires_at": 1784498040
   }
  ]
 }
