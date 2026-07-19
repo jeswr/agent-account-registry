@@ -1246,8 +1246,9 @@ def parse_fleet_snapshot(document):
     """PURE: {provider: set-of-salted-hashes} from a stored known-good snapshot document, or None if
     the document is not a well-formed snapshot (issue #206). Only 16-hex account hashes are accepted
     — a raw handle in a tampered/garbled snapshot must never re-enter the decision path (the same
-    privacy invariant the ledger validator enforces). An empty/degenerate map yields None so the
-    caller treats it as 'no snapshot' rather than a real (but useless) empty fleet."""
+    privacy invariant the ledger validator enforces). A well-formed EMPTY map parses to {} — a real
+    known-good empty fleet (review #348: a successful empty resolution supersedes the previous
+    membership), which callers must NOT conflate with None (absent/corrupt snapshot)."""
     if not isinstance(document, dict):
         return None
     fleet = document.get("fleet")
@@ -1262,7 +1263,7 @@ def parse_fleet_snapshot(document):
             return None  # a non-hash entry means a corrupt/tampered snapshot — reject the whole map
         if clean:
             result[provider] = clean
-    return result or None
+    return result
 
 
 def fleet_snapshot_read_path(registry_repo):
@@ -1272,9 +1273,10 @@ def fleet_snapshot_read_path(registry_repo):
 
 def _read_fleet_snapshot(api, registry_repo):
     """The last known-good {provider: set-of-salted-hashes} snapshot, or None if it is absent or
-    unreadable (issue #206). BEST-EFFORT by design: the snapshot is a resilience aid for a FAILED
-    live resolution, never an authority that may itself break `decide`, so a missing file, a
-    transport error, or a garbled/tampered body all fold to None (fall back to the empty fleet)."""
+    unreadable (issue #206). A known-good EMPTY fleet reads as {} — distinct from None (review
+    #348). BEST-EFFORT by design: the snapshot is a resilience aid for a FAILED live resolution,
+    never an authority that may itself break `decide`, so a missing file, a transport error, or a
+    garbled/tampered body all fold to None (fall back to the empty fleet)."""
     try:
         result = api.request("GET", fleet_snapshot_read_path(registry_repo), allow_404=True)
     except HealthError:
@@ -1294,8 +1296,10 @@ def _write_fleet_snapshot(api, registry_repo, provider_accounts):
     future FAILED resolution can fall back to it. Stores ONLY salted hashes (never a raw handle),
     skips an identical rewrite so the data-plane branch does not churn a commit every tick, and
     NEVER fails `decide`: a read/write error or CAS conflict just leaves the prior snapshot in place
-    for the next tick. Callers must pass a NON-EMPTY map — a good snapshot is never overwritten with
-    an empty one."""
+    for the next tick. A successfully resolved EMPTY fleet is a valid snapshot (review #348):
+    persisting {} supersedes stale membership so a later FAILED resolution cannot revive
+    provider-capped for accounts that are no longer enabled. Only a failed resolution must never
+    reach this writer."""
     document = {"fleet": {p: sorted(provider_accounts[p]) for p in sorted(provider_accounts)}}
     try:
         existing = api.request("GET", fleet_snapshot_read_path(registry_repo), allow_404=True)
@@ -1400,18 +1404,19 @@ def _cmd_decide(args):
     # fallback. On failure, fall back to the last known-good salted snapshot so detection keeps
     # running, and raise a durable configuration alert (below) so the misconfiguration is visible.
     # On success, refresh the snapshot (best-effort) so a future failure has something to fall back
-    # to. A resolved-but-empty fleet is legitimate and never overwrites a good snapshot.
+    # to. A resolved-but-empty fleet is legitimate AND authoritative (review #348): it supersedes
+    # the previous snapshot, so a later failed resolution falls back to the true (empty)
+    # membership instead of reviving provider-capped for accounts that are no longer enabled.
     resolution = _enabled_provider_accounts(api, registry_repo, args.policy_file, salt)
     if resolution.ok:
         provider_accounts = resolution.accounts
-        if provider_accounts:
-            _write_fleet_snapshot(api, registry_repo, provider_accounts)
+        _write_fleet_snapshot(api, registry_repo, provider_accounts)
     else:
         snapshot = _read_fleet_snapshot(api, registry_repo)
-        provider_accounts = snapshot or {}
+        provider_accounts = snapshot if snapshot is not None else {}
         print(f"::warning::model-health decide: enabled-fleet resolution FAILED "
               f"({resolution.reason}) — "
-              + ("reusing the last known-good fleet snapshot" if snapshot
+              + ("reusing the last known-good fleet snapshot" if snapshot is not None
                  else "no snapshot available, provider-capped is disabled this tick")
               + "; raising a durable configuration alert (detection is degraded, not silent)")
     # Currently-open alert markers on EVERY route this system may have delivered to (issues #205,
@@ -1957,6 +1962,7 @@ def _self_test():
     # ---- #206: fleet-resolution failures degrade (snapshot + config alert), never silently -----
     ok = _test_fleet_snapshot(chk) and ok
     ok = _test_fleet_resolution_decide(chk) and ok
+    ok = _test_fleet_empty_supersedes_decide(chk) and ok
 
     # ---- provider status probe + annotation (issue #70) --------------------------------------
     ok = _test_provider_status(chk) and ok
@@ -2349,12 +2355,15 @@ def _test_delivery(chk):
         #     Stub the ledger + fleet + probe so a firing outage reaches delivery deterministically.
         import argparse as _ap
         global GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
-        real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger)
+        global _write_fleet_snapshot
+        real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger,
+                _write_fleet_snapshot)
         try:
             GitHubAPI = lambda token: object()
             read_ledger = lambda api, repo: ([], None)
             prune = lambda records, now: []
             _enabled_provider_accounts = lambda api, repo, policy, salt: FleetResolution({})
+            _write_fleet_snapshot = lambda api, repo, fleet: None  # hermetic: no contents API here
             annotate_provider_status = lambda actions, **kw: None  # no-op (probe-free)
             # force a single firing action regardless of records
             global classify_records
@@ -2366,7 +2375,7 @@ def _test_delivery(chk):
             classify_records = real_classify
         finally:
             (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
-             prune, read_ledger) = real
+             prune, read_ledger, _write_fleet_snapshot) = real
 
         # (d) no private ALERT_TOKEN at all -> primary IS the registry; no pointless retry, and a
         #     failing ambient token is reported undelivered (fail-closed, never a silent green).
@@ -2422,8 +2431,10 @@ def _test_fallback_orphan(chk):
     import argparse as _ap
     import types
     global _gh, GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
+    global _write_fleet_snapshot
     real_gh = _gh
-    real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger)
+    real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger,
+            _write_fleet_snapshot)
     saved = {k: os.environ.get(k) for k in
              ("REGISTRY_REPO", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN", "GH_TOKEN")}
     priv_repo, reg_repo = "jeswr/agent-account-data", "jeswr/agent-account-registry"
@@ -2482,6 +2493,7 @@ def _test_fallback_orphan(chk):
         read_ledger = lambda api, repo: ([], None)
         prune = lambda records, now: []
         _enabled_provider_accounts = lambda api, repo, policy, salt: FleetResolution({})
+        _write_fleet_snapshot = lambda api, repo, fleet: None  # hermetic: no contents API here
         annotate_provider_status = lambda actions, **kw: None
         ns = _ap.Namespace(policy_file="policy/repos.toml")
 
@@ -2497,7 +2509,7 @@ def _test_fallback_orphan(chk):
     finally:
         _gh = real_gh
         (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
-         prune, read_ledger) = real
+         prune, read_ledger, _write_fleet_snapshot) = real
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -2636,7 +2648,10 @@ def _test_fleet_snapshot(chk):
     chk("snapshot rejects a raw handle (privacy invariant)",
         parse_fleet_snapshot({"fleet": {"anthropic": ["acct01"]}}), None)
     chk("snapshot rejects a non-snapshot document", parse_fleet_snapshot({"records": []}), None)
-    chk("snapshot rejects an empty map", parse_fleet_snapshot({"fleet": {}}), None)
+    # review #348: a well-formed EMPTY fleet is a real known-good state ({}), NOT "no snapshot" —
+    # folding it to None would let a stale non-empty snapshot outlive an emptied policy.
+    chk("snapshot parses a well-formed empty fleet as known-good {}",
+        parse_fleet_snapshot({"fleet": {}}), {})
 
     # ---- read/write round-trip against the stub store -----------------------------------------
     store = _SnapStore()
@@ -2650,6 +2665,13 @@ def _test_fleet_snapshot(chk):
     chk("snapshot skips an identical rewrite (no branch churn)", len(store.puts), 1)
     _write_fleet_snapshot(store, "o/r", {"anthropic": {h1}})
     chk("snapshot rewrites on a changed fleet", len(store.puts), 2)
+    # review #348: a successful EMPTY resolution supersedes the stored fleet and round-trips as
+    # {}, so a later failed resolution falls back to the true empty membership, never the stale one.
+    _write_fleet_snapshot(store, "o/r", {})
+    chk("empty fleet supersedes the previous snapshot", len(store.puts), 3)
+    chk("empty snapshot reads as known-good {}, not None", _read_fleet_snapshot(store, "o/r"), {})
+    _write_fleet_snapshot(store, "o/r", {})
+    chk("identical empty rewrite is skipped (no branch churn)", len(store.puts), 3)
     chk("absent snapshot reads as None", _read_fleet_snapshot(_SnapStore(), "o/r"), None)
 
     # ---- config-alert action + rendered body --------------------------------------------------
@@ -2714,6 +2736,72 @@ def _test_fleet_resolution_decide(chk):
         # Review #348: a failed resolution must LEAVE the known-good snapshot in place — writing
         # the (empty/partial) failed fleet here would poison the very fallback the next tick needs.
         chk("failed resolution never overwrites the known-good snapshot", store.puts, [])
+    finally:
+        (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger,
+         _upsert_alert, _open_alert_markers) = real
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_fleet_empty_supersedes_decide(chk):
+    """Review #348 END-TO-END: a SUCCESSFUL empty resolution must supersede the stored non-empty
+    snapshot, so a LATER failed resolution falls back to the known-good EMPTY fleet — not stale
+    membership — and fires no provider-capped for accounts that are no longer enabled. Red
+    direction: gating the snapshot write on a non-empty fleet (or folding a parsed empty snapshot
+    to None) leaves the old fleet in play and the failure tick revives provider-capped."""
+    import argparse as _ap
+    global GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
+    global _upsert_alert, _open_alert_markers
+    real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger,
+            _upsert_alert, _open_alert_markers)
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "GH_TOKEN", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN")}
+    salt, now = "s3cret", int(time.time())
+    h1, h2 = account_hash("acct01", salt), account_hash("acct02", salt)
+    # Both formerly-enabled accounts look fully capped in the window: the ONLY thing keeping
+    # provider-capped quiet is the fleet membership saying they are no longer enabled.
+    capped = [make_record("anthropic", h1, "fable", CLASS_LIMIT, "1", now - 100, reset_hint="14:00"),
+              make_record("anthropic", h2, "fable", CLASS_LIMIT, "2", now - 50, reset_hint="15:00")]
+    stale_doc = {"fleet": {"anthropic": sorted([h1, h2])}}
+    blob = base64.b64encode((json.dumps(stale_doc) + "\n").encode()).decode()
+    seen = []
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", GH_TOKEN="tok")
+        os.environ.pop("ALERT_REPO", None)
+        os.environ.pop("ALERT_TOKEN", None)
+        store = _SnapStore(blob=blob, sha="s0")
+        GitHubAPI = lambda token: store
+        read_ledger = lambda api, repo: (list(capped), None)
+        prune = lambda records, now_: list(records)
+        annotate_provider_status = lambda actions, **kw: None
+        _open_alert_markers = lambda repo, token: set()
+        _upsert_alert = lambda action, repo, token, maintainer: seen.append(action) or True
+        # tick 1: the policy legitimately empties the enabled pool — resolution SUCCEEDS, empty.
+        _enabled_provider_accounts = lambda api, repo, policy, s: FleetResolution({}, ok=True)
+        rc1 = _cmd_decide(_ap.Namespace(policy_file="policy/repos.toml"))
+        stored = json.loads(base64.b64decode("".join(store.blob.split()), validate=True).decode())
+        chk("successful empty resolution supersedes the stale snapshot", stored, {"fleet": {}})
+        chk("empty-fleet decide exits 0", rc1, 0)
+        puts_after_empty = len(store.puts)
+        # tick 2: resolution now FAILS — the fallback must be the known-good EMPTY fleet.
+        seen.clear()
+        _enabled_provider_accounts = (lambda api, repo, policy, s:
+                                      FleetResolution({}, ok=False,
+                                                      reason="account catalog API is unreadable"))
+        rc2 = _cmd_decide(_ap.Namespace(policy_file="policy/repos.toml"))
+        stale_capped = any(a["condition"] == "provider-capped" and a["fire"] for a in seen)
+        config_fired = any(a["condition"] == "fleet-resolution" and a["fire"] for a in seen)
+        chk("failed resolution does NOT revive provider-capped from the stale fleet",
+            stale_capped, False)
+        chk("failed resolution after an empty fleet still raises the config alert",
+            config_fired, True)
+        chk("failed resolution never writes the snapshot (empty case)",
+            len(store.puts), puts_after_empty)
+        chk("degraded decide on a known-good empty fleet exits 0", rc2, 0)
     finally:
         (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger,
          _upsert_alert, _open_alert_markers) = real
