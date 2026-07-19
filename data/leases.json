@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct01",
-   "claim_id": "0cbeec4924d541fe9bd9e4f5213daf54",
-   "holder": "jeswr/agent-account-registry#414@29701613350.1",
-   "package": "workflows",
-   "role": "ci",
-   "model": "sol",
-   "issued_at": 1784491107,
-   "expires_at": 1784493807
-  },
-  {
    "account": "acct2css",
    "claim_id": "48085ce575d943fea7852bb82f577ca6",
    "holder": "jeswr/agent-account-registry#276@dispatch-29701301593.1",
