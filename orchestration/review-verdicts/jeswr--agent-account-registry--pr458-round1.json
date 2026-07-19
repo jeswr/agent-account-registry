@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 458,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d9ec607b581648aefda13bdd02025a3445c1f3f2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes the built-in trust-surface manifest a mandatory floor and unions policy-supplied paths onto it at both enforcement call sites. Normalization, stable de-duplication, malformed-entry handling, and empty/None fallback are sound for the actual argparse/call-site inputs. The added self-tests are non-vacuous and directly cover the prior replacement weakness, including the concrete case where a narrow custom list omitted scripts/. No trust check, SHA binding, audit behavior, permissions, or token handling is weakened by this diff.",
+  "verdict": "approve"
+ }
+}
