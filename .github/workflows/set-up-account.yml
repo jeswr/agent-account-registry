@@ -132,6 +132,50 @@ jobs:
           fi
           if wait "$BR"; then echo "status=ok" >> "$GITHUB_OUTPUT"; else echo "status=fail" >> "$GITHUB_OUTPUT"; fi
 
+      # [OPUS-4.8] #191: reject an enrollment whose CAPTURED credential format is incompatible with
+      # the routing aliases the account will declare — BEFORE the irreversible secret write. The
+      # Anthropic login broker falls back to `claude-credentials-json` when `claude setup-token`
+      # leaves a credentials file but prints no `sk-ant-` token (account-login.sh:61-62); every
+      # current anthropic alias in orchestration/routing.toml declares `claude-oauth-token`, so such
+      # an account enrolls successfully yet every worker claim of it dies at worker.yml's "credential
+      # format conflicts with protected routing" gate — an unusable account that still burns a slot.
+      # The post-store read_accounts validation only checks `models` is nonempty, so it passes this
+      # through. Assert here that the captured format equals the declared credential_format of EVERY
+      # alias in the account's models list, failing closed on any mismatch / unknown alias / missing
+      # format, so an incompatible credential is never stored (works for both providers).
+      - name: Reject a credential format incompatible with the routing aliases (fail closed, pre-store)
+        if: steps.login.outputs.status == 'ok'
+        env:
+          MODELS: ${{ steps.meta.outputs.models }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || true)
+          reject() {
+            gh issue comment "$ISSUE" -R "$REPO" \
+              --body "❌ Captured credential format \`${fmt:-<none>}\` is incompatible with the routing aliases for this account ($1). The account was **not** registered (no secret stored). $2" || true
+            echo "::error::$1 — refusing to store (fail closed)"; exit 1
+          }
+          [ -n "$fmt" ] || reject "no credential_format was captured" "Re-apply \`set-up-account\` to retry the login."
+          CAPTURED_FMT="$fmt" MODELS="$MODELS" python3 - <<'PY' || reject "the captured format is not compatible with every declared alias" "Fix the login so it yields a routing-compatible credential (e.g. a \`claude-oauth-token\`), or reconcile orchestration/routing.toml."
+          import os, sys, tomllib
+          with open("orchestration/routing.toml", "rb") as fh:
+              catalog = tomllib.load(fh).get("models", {})
+          captured = os.environ["CAPTURED_FMT"]
+          aliases = [m.strip() for m in os.environ["MODELS"].strip().strip("[]").split(",") if m.strip()]
+          if not aliases:
+              print("no declared aliases to validate against", file=sys.stderr); sys.exit(1)
+          for alias in aliases:
+              meta = catalog.get(alias)
+              if not meta or not meta.get("credential_format"):
+                  print(f"alias {alias!r} has no credential_format in routing.toml", file=sys.stderr); sys.exit(1)
+              if meta["credential_format"] != captured:
+                  print(f"alias {alias!r} requires {meta['credential_format']!r} but captured {captured!r}",
+                        file=sys.stderr); sys.exit(1)
+          print(f"credential format {captured!r} is compatible with every declared alias: {aliases}")
+          PY
+
       - name: Claim slot atomically (acct-claims ref) + store token + register — fail closed
         id: store
         if: steps.login.outputs.status == 'ok'
