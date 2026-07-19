@@ -34,6 +34,7 @@ compute_ready = _ready.compute_ready
 packages_of = _ready.packages_of
 labels_of = _ready.labels_of
 valid_priority = _ready.valid_priority
+GLOBAL = _ready.GLOBAL
 resolve = _route.resolve
 
 try:
@@ -49,6 +50,18 @@ def _role_of(labels):
     return None
 
 
+def _plan_package(labels):
+    """The single conflict partition a plan row reserves (registry issue #112). A one-area
+    issue reserves that area; a NO-area OR MULTI-area issue reserves the serializing global
+    partition, so it can never co-run with in-flight work in ANY of its areas. The old
+    `sorted(packages_of(labels))[0]` kept only the alphabetically-first area, silently
+    dropping every secondary area — an A+B issue could dispatch while B was busy. This mirrors
+    packages_of's empty->global rule and extends it to the multi-area case (fail-closed:
+    over-serialize a multi-area row rather than free a busy sibling crate)."""
+    pkgs = packages_of(labels)
+    return next(iter(pkgs)) if len(pkgs) == 1 else GLOBAL
+
+
 def plan_dispatch(ready_issues, routing_doc):
     """Compose the ready frontier + routing into a dispatch plan. PURE — no I/O, no side effects.
     A roleless issue is flagged unresolved (role=None, agent=None) — never guessed (fail-closed)."""
@@ -56,7 +69,7 @@ def plan_dispatch(ready_issues, routing_doc):
     for it in ready_issues:
         labels = labels_of(it)
         role = _role_of(labels)
-        package = sorted(packages_of(labels))[0]
+        package = _plan_package(labels)
         model_chain, agent, escalate = resolve(labels, routing_doc)
         if role is None:
             row = {
@@ -142,6 +155,16 @@ def _self_test():
     p_norole = plan_dispatch([iss(7, ["priority:P1", "area:usage"])], doc)
     row = p_norole[0]
     chk("no-role -> flagged", (row["role"], row["agent"], row["model_chain"]), (None, None, []))
+
+    # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
+    # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
+    # it and it would double-dispatch. A single-area issue still reserves just that area.
+    p_multi = plan_dispatch(
+        compute_ready([iss(8, R + ["priority:P1", "role:impl", "area:usage", "area:worker"])]), doc)
+    chk("multi-area -> global package", p_multi[0]["package"], GLOBAL)
+    chk("single-area -> that package", plan_dispatch(
+        compute_ready([iss(9, R + ["priority:P1", "role:impl", "area:usage"])]), doc)[0]["package"],
+        "usage")
 
     print("dispatch-plan self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
