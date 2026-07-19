@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 422,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4f70c0f87364d296504f06754df2316f0ad2d771",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "model_started is now derived from steps.model-prep.outcome == 'success', but model-prep and model remain separate workflow steps. The workflow can be cancelled or reach its job timeout after model-prep succeeds but before the model step starts worker-live.sh and invokes the provider CLI. In that path model_started is true, the model step is cancelled/skipped, and the always() model_health job records exit_class=unknown even though no provider attempt occurred. Moving the marker later reduces the window but does not close the round-1 pollution path. The added self-test is insufficient because it only asserts the chosen step references; it has no assertion simulating cancellation between prep completion and provider launch and proving that no health record is written.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Create a durable launch marker at the actual provider-invocation boundary, immediately before the CLI process is executed, and expose only that marker to model_health. Add a behavioral test for cancellation after image preparation but before CLI invocation that asserts no ledger record, while retaining a launched attempt whose exit class is lost as unknown.",
+    "severity": "major",
+    "title": "Completed image preparation still does not prove provider launch"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 change narrows the pre-launch window by moving the marker from record-attempt to model-prep, but it does not establish a genuine provider attempt. A cancellation or job timeout after model-prep completes and before the separate model step invokes the provider CLI still yields model_started=true and causes model_health to append unknown despite no provider call. The new self-test only checks static YAML wiring and does not cover that remaining boundary. This is materially the same major finding as round 1, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
