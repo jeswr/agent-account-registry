@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 359,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2c913e4c776bca51064247d0216465ff5766240d",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_ops_alert` always posts a comment when an exact-title alert issue already exists. If alert delivery succeeds but the explanatory comment or source-issue transition fails, `needs_user` raises without parking; the next sweep calls `_ops_alert` again and posts another alert comment. This repeats on every retry, so the three-step transaction is not idempotent and the documented guarantee that retries never double-page is false. The current self-test misses this because it resets state and invokes `_ops_alert` only once per `needs_user` run; it tests PR-comment deduplication but not alert-delivery deduplication across a partial-success retry.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Give the alert mutation a durable per-escalation idempotency key/receipt and check it before posting, while still verifying that the alert remains open. Add a two-invocation self-test where the first call confirms the alert but fails issue routing, the second retries successfully, and exactly one alert post is recorded across both calls.",
+    "severity": "major",
+    "title": "Reconciliation retries can repeatedly page the ops-alert issue"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 major finding is fixed: a missing source issue now records a reconciliation failure, raises, leaves the PR enumerable, and is covered by non-vacuous assertions. However, the new transaction is not idempotent as claimed. If the ops alert succeeds but another required mutation remains unconfirmed, every sweep retry posts another comment to the existing ops-alert issue before retrying the failed mutation. That can repeatedly notify/page humans and violates the stated retry contract. Because this is a new major finding, progress is regressing under the mandated scale.",
+  "verdict": "request_changes"
+ }
+}
