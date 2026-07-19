@@ -12,16 +12,6 @@
   },
   {
    "account": "acct03",
-   "claim_id": "2328a2da23364ca3964f4ce2f8c11c63",
-   "holder": "review:sparq-org/sparq#3581@dispatch-29679516342.1",
-   "package": "ci",
-   "role": "review",
-   "model": "opus",
-   "issued_at": 1784449269,
-   "expires_at": 1784450469
-  },
-  {
-   "account": "acct03",
    "claim_id": "a01fce363b624bd482956f445eb7f585",
    "holder": "jeswr/agent-account-registry#134@29679677938.1",
    "package": "worker",
