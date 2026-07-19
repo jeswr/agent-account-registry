@@ -45,6 +45,7 @@ jobs:
     outputs:
       target_owner: ${{ steps.inputs.outputs.target_owner }}
       target_name: ${{ steps.inputs.outputs.target_name }}
+      target_sha: ${{ steps.target_rev.outputs.target_sha }}
       issue_author: ${{ steps.issue.outputs.issue_author }}
       issue_body_sha: ${{ steps.issue.outputs.issue_body_sha }}
       packages: ${{ steps.issue.outputs.packages }}
@@ -111,6 +112,21 @@ jobs:
           repository: ${{ inputs.target_repo }}
           path: target-routing
           persist-credentials: false
+
+      # Bind the whole decision to ONE target revision (issue #143): routing/model_chain/agent are
+      # resolved from THIS checkout's HEAD, but the worker job later checks out the moving default
+      # branch and only re-checks that the claimed model still exists — so a routing update landing
+      # between the two jobs could run a stale/out-of-policy model+prompt. Export the exact commit
+      # SHA the route was resolved against and pin the worker's target checkout to it, so the model
+      # runs on, and re-reads its routing metadata from, the identical revision policy saw here.
+      - name: Pin the resolved target routing revision
+        id: target_rev
+        run: |
+          set -euo pipefail
+          sha="$(git -C target-routing rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::resolved target revision is not a 40-hex commit sha'; exit 1; }
+          printf 'target_sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'worker: routing resolved against target revision %s\n' "$sha"
 
       - name: Snapshot issue labels and revision
         id: issue
@@ -692,11 +708,17 @@ jobs:
           print(f"target token verified for {repo['full_name']} at {default_branch}")
           PY
 
-      - name: Checkout target default branch with scoped App token (pinned, no persisted token)
+      # Pin to the SHA the resolve job resolved the route against (issue #143), NOT the moving
+      # default-branch tip: the `selected` step below re-reads routing metadata from this checkout,
+      # and the model runs on it, so both must be the exact revision policy + the account claim were
+      # bound to. A routing change that lands after resolve is picked up by the next dispatch cycle,
+      # never mid-run on an already-claimed lease. fetch-depth: 0 makes the SHA fetchable; the PR is
+      # still opened against the branch NAME (steps.target.outputs.default_branch) at publish time.
+      - name: Checkout target at the resolved routing revision (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.target_repo }}
-          ref: ${{ steps.target.outputs.default_branch }}
+          ref: ${{ needs.resolve.outputs.target_sha }}
           path: target
           token: ${{ steps.app-token-dry.outputs.token || steps.app-token-live.outputs.token }}
           fetch-depth: 0
