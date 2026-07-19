@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3624,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f959dc6839f60c074d664f0b82dcf03590587a54",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The design now derives the blank-node branch from a domain-constrained per-position type code and recomputes every active encoding as h2(type, payload), so there is no free selector bypass absent a Poseidon2 second preimage. Witnesses are explicitly indexed by graph, triple slot, and all three term positions, with active-slot gating specified. The verification obligations include a selector-forcing negative test and a subject-plus-object blank-node differential case, making the prior fixes testable on the real circuit path. The document remains explicit that this is design-only, toolchain-gated, defense-in-depth work and does not claim the deferred in-circuit binding is implemented or externally audited.",
+  "verdict": "approve"
+ }
+}
