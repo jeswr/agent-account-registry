@@ -1891,6 +1891,25 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 print(f"recover review {repo}#{number}: stranded residue of an interrupted "
                       "defuse/disarm — re-reviewing the current head under the round budget")
                 # Fall through to the shared round-budget + review dispatch below.
+            # Base admission (issue #164; the #81 precedent in
+            # worker-pr._merge_only_carry_forward): the worker-PR invariant is base == protected
+            # default branch (review-fix.yml resolve rejects a retarget LOUDLY; a human retarget
+            # is an explicit act that removes the PR from the loop). Enforce that same invariant
+            # HERE — BEFORE the round-budget processing below, whose needs-user and
+            # extend-model-pin actions mutate the PR (labels/comments, a durable pin marker) —
+            # so a retargeted or unresolved-base PR leaves the loop with NO mutation, failing
+            # closed rather than probing/dispatching the wrong comparison. Deliberately AFTER
+            # the repair defuse above: defusing a live auto-merge latch is the safety action and
+            # must run whatever the base says.
+            base = pull.get("base") or {}
+            base_ref = str(base.get("ref", ""))
+            default_branch = str((base.get("repo") or {}).get("default_branch", ""))
+            if (not SAFE_ATOM.fullmatch(base_ref) or not default_branch
+                    or base_ref != default_branch):
+                print(f"defer review {repo}#{number}: PR base {base_ref!r} is not the "
+                      "protected default branch (retargeted/unresolved) — refusing to "
+                      "process against the wrong base")
+                continue
             comments = _pr_comments(repo, number)
             rounds = worker_pr.count_rounds(comments, bot_login)
             impl_provider = record["impl_provider"]
@@ -1975,25 +1994,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         and reviewed and reviewed.group(1) == head_sha):
                     print(f"defer review {repo}#{number}: head already reviewed")
                     continue
-                # The empty-diff / no-op-rebase probe must compare against the PR's ACTUAL base
-                # ref, never the repo default branch (issue #164; the #81 precedent in
-                # worker-pr._merge_only_carry_forward): a PR retargeted off the default is diffed
-                # against one base yet reviewed/armed/merged against another, so a wrong-base
-                # probe reads either empty (a silent forever-defer) or non-empty vs a base the arm
-                # can never merge. The worker-PR invariant is base == protected default branch
-                # (review-fix.yml resolve rejects a retarget LOUDLY; a human retarget is an
-                # explicit act that removes the PR from the loop). Enforce that same invariant
-                # HERE so the two admission points cannot drift, failing closed on a missing,
-                # unsafe, or retargeted base rather than probing/dispatching the wrong comparison.
-                base = pull.get("base") or {}
-                base_ref = str(base.get("ref", ""))
-                default_branch = str((base.get("repo") or {}).get("default_branch", ""))
-                if (not SAFE_ATOM.fullmatch(base_ref) or not default_branch
-                        or base_ref != default_branch):
-                    print(f"defer review {repo}#{number}: PR base {base_ref!r} is not the "
-                          "protected default branch (retargeted/unresolved) — refusing to "
-                          "review against the wrong base")
-                    continue
+                # The empty-diff / no-op-rebase probe compares against the PR's ACTUAL base
+                # ref, never the repo default branch (issue #164): a wrong-base probe reads
+                # either empty (a silent forever-defer) or non-empty vs a base the arm can never
+                # merge. The base admission ABOVE already validated base_ref as the protected
+                # default, so an empty result here really is a no-op rebase.
                 diff = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{head_sha}"])
                 if not diff.get("files"):
                     print(f"defer review {repo}#{number}: empty diff vs merge base (no-op rebase)")
@@ -4305,6 +4310,33 @@ def _self_test():
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
             assert alloc.chains == [], alloc.chains
+
+            # ordering regression (#454 review round 1): the retargeted-base exclusion runs
+            # BEFORE the round-budget processing. Each posture below took a MUTATING budget
+            # action when base == default (asserted above: record-model-pin for the first,
+            # the terminal needs-user for the second); retargeted, both must defer with NO
+            # helper call and NO claim — a human retarget removes the PR from the loop, so
+            # the loop must not label/pin it on the way out.
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"],
+                                       base_ref="release"))
+            # would-be extend-model-pin (the ACT posture above)
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=2 model=opus run=2.9 -->")]
+            write_verdict(3, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [], alloc.chains
+            # would-be terminal needs-user (the flip-goes-red posture above)
+            fake["comments"] = round_markers(4) + [
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+            write_verdict(4, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [], alloc.chains
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
 
             # latest_recorded_progress: the registry record is primary, the findings-comment
@@ -4571,7 +4603,7 @@ def _self_test():
                     "body": "", "mergeable": True, "auto_merge": None,
                     "head": {"ref": f"sparq-agent/issue-{issue_number}-1-1",
                              "sha": head_sha, "repo": {"full_name": repo}},
-                    "base": {"repo": {"default_branch": "main"}},
+                    "base": {"ref": "main", "repo": {"default_branch": "main"}},
                     "user": {"login": bot, "type": "Bot"},
                     "labels": [{"name": "review:changes"},
                                {"name": f"area:fanout-{offset}"}],
