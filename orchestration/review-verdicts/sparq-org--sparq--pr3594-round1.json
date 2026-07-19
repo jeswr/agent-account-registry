@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3594,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8b14de4bf3a676e219118c5f438816e443e3f988",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The page says every PARTIAL/GAP row that names future work links to its governing bead, and this file repeats that as an honesty contract. However, multiple rows describe future work without `beads`, including \"Query-time rewriting mode + multiple named schemas\" (PARTIAL), \"SWRL ingestion\" (GAP), and \"Ontology / shape editor\" (GAP). The latter two even say they are not beaded. Users therefore do not receive the promised build-in-public tracking links, so the page's central completeness claim is false.",
+    "file": "site/src/data/competitive-matrix.ts",
+    "fix_hint": "Either create/provide governing tracker beads for every PARTIAL/GAP row that names future work and populate `beads`, or narrow the comments and rendered copy to accurately state that only tracked work links to beads. Add a data-level test that enforces whichever invariant is chosen so future rows cannot silently contradict the copy.",
+    "severity": "major",
+    "title": "Future-work rows violate the advertised bead-link completeness invariant"
+   }
+  ],
+  "progress": null,
+  "summary": "The comparison page is structurally straightforward and its ZK/MPC language is appropriately caveated, but its central build-in-public completeness claim is contradicted by the matrix data. Several PARTIAL/GAP rows describe future work while providing no bead link, even though both the page and data-layer honesty contract promise that every such row links its governing tracker item. This makes a prominent user-facing claim false and should be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
