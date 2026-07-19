@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 439,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fa03e004a6aa296bc6396a4cc5c7c0a131f46e26",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow now checks out the trusted default-branch tree only after the actor/author trust gate, without persisting checkout credentials, then imports the existing authoritative PAT probe before any provider login begins. The probe stages authentication, environment-key read, repository-secret listing, and canary environment write; only `valid` or `expiring-soon` (both of which require the write to have succeeded) permit enrollment. Missing, malformed, denied, throttled, unavailable, crashed, or unrecognized outcomes all fail closed. The shell captures only the bounded verdict class, while diagnostic and lifecycle detail remain out of the public log. The README accurately reflects the behavior. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
