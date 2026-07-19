@@ -365,7 +365,7 @@ jobs:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           MODELS: ${{ needs.resolve.outputs.model_chain }}
           ACCOUNT_POOL: ${{ needs.resolve.outputs.account_pool }}
-          PACKAGE: ${{ needs.resolve.outputs.packages }}
+          PACKAGES: ${{ needs.resolve.outputs.packages }}
           ROLE: ${{ needs.resolve.outputs.role }}
           TIMEOUT_MINUTES: ${{ needs.resolve.outputs.worker_timeout_minutes }}
         run: |
@@ -373,7 +373,20 @@ jobs:
           [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]
           ttl=$((TIMEOUT_MINUTES * 60 + 900))
           holder="$TARGET_REPO#$ISSUE_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
-          lease_package=${PACKAGE:-__global__}
+          # Canonical lease partition (issue #133; mirrors dispatch-plan._plan_package /
+          # dispatch-claim.plan_package): EXACTLY one area reserves that area; ZERO OR MULTIPLE
+          # areas reserve the serializing __global__ partition, which the ledger excludes against
+          # every sibling. This self-claim MUST reduce identically to the dispatcher-claim adoption
+          # path below (and to the dispatcher that mints an adoptable claim), or the SAME issue
+          # reserves a different partition by entry path and a multi-area lease (e.g. "foo,bar")
+          # fails to conflict with a concurrent single-area sibling ("foo"). PACKAGES is the resolve
+          # job's sorted, de-duplicated area CSV whose values are comma-free, so a comma marks
+          # two-or-more areas. Fail-closed: over-serialize a multi-area issue, never free a busy crate.
+          if [[ -n "$PACKAGES" && "$PACKAGES" != *,* ]]; then
+            lease_package="$PACKAGES"
+          else
+            lease_package=__global__
+          fi
           set +e
           python3 registry/scripts/select-and-claim.py \
             --claim \
@@ -483,8 +496,14 @@ jobs:
           secret_ref = claim.get("secret_ref")
           pool = os.environ["ACCOUNT_POOL"].split(",")
           models = os.environ["MODELS"].split(",")
-          packages = os.environ["PACKAGES"].split(",") if os.environ["PACKAGES"] else []
-          expected_package = packages[0] if packages else "__global__"
+          # Canonical lease partition (issue #133; mirrors dispatch-plan._plan_package /
+          # dispatch-claim.plan_package): EXACTLY one area -> that area; ZERO OR MULTIPLE areas ->
+          # the serializing __global__ partition. This MUST match the self-claim reduction above AND
+          # the dispatcher that minted this claim (dispatch-claim.plan_package), or a legitimate
+          # multi-area dispatcher claim (package="__global__") is rejected here while a "foo,bar"
+          # issue reserves a partition that never conflicts with a concurrent "foo" sibling.
+          areas = [area for area in os.environ["PACKAGES"].split(",") if area]
+          expected_package = areas[0] if len(areas) == 1 else "__global__"
           if account != os.environ["EXPECTED_ACCOUNT"] or account not in pool:
               raise SystemExit("dispatcher claim account is outside resolved policy")
           if model not in models:
