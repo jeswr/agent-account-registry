@@ -1812,7 +1812,9 @@ TOML
     "$(sha256sum "$bwr/bundle/changes.patch" 2>/dev/null | awk '{print $1}')" "$bundle_digest"
   chk "bundle carries the verified issue snapshot for the clean runner" \
     "$( [[ -f "$bwr/bundle/verified-issue.json" ]] && echo ok )" "ok"
-  chk "bundle leaves the worker tree pristine for the gate (index reset)" \
+  chk "bundle resets the index so the gate sees no staged changes" \
+    "$(git -C "$bsrc" diff --cached --quiet 2>/dev/null && echo clean)" "clean"
+  chk "bundle keeps the working-tree edits intact for the gate" \
     "$(cat "$bsrc/mod.txt")" "new"
 
   # reconstruct onto a CLEAN checkout at the digest-bound base (a fresh clone stops at the committed
@@ -1860,6 +1862,23 @@ TOML
       bash "$SCRIPT_DIR/$(basename -- "$0")" reconstruct ) >/dev/null 2>&1 && mov_rc=0 || mov_rc=$?
   chk "reconstruct fails closed when HEAD is not the digest-bound base" \
     "$( [[ "$mov_rc" -ne 0 ]] && echo refused )" "refused"
+
+  # fail-closed: a DIRTY destination checkout must be refused even with a valid digest at the exact
+  # base — the token-bearing publisher only ever applies the patch onto a pristine tree.
+  local bdrt="$tmp/bundle-dirty"
+  git clone -q "$bsrc" "$bdrt" >/dev/null 2>&1
+  printf 'stray\n' > "$bdrt/stray.txt"
+  local drt_rc
+  ( cd "$bdrt" &&
+    TARGET_DIR="$bdrt" WORKER_BUNDLE_DIR="$bwr/bundle" WORKER_BUNDLE_SHA256="$bundle_digest" \
+      WORKER_BUNDLE_BASE_SHA="$bundle_base" WORKER_BRANCH=sparq-agent/issue-1 \
+      bash "$SCRIPT_DIR/$(basename -- "$0")" reconstruct ) >/dev/null 2>&1 && drt_rc=0 || drt_rc=$?
+  chk "reconstruct fails closed on a dirty target checkout" \
+    "$( [[ "$drt_rc" -ne 0 ]] && echo refused )" "refused"
+  chk "a refused dirty-tree reconstruct never applied the bundled addition" \
+    "$( [[ -e "$bdrt/add.txt" ]] && echo leaked || echo clean )" "clean"
+  chk "a refused dirty-tree reconstruct never applied the bundled modification" \
+    "$(cat "$bdrt/mod.txt" 2>/dev/null)" "old"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
