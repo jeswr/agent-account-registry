@@ -11,16 +11,6 @@
    "expires_at": 1784499738
   },
   {
-   "account": "acct01",
-   "claim_id": "11c86b908d984d51a1341175e40cf0f1",
-   "holder": "sparq-org/sparq#3067@29703060367.1",
-   "package": "bench",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784493859,
-   "expires_at": 1784500159
-  },
-  {
    "account": "acct03",
    "claim_id": "2bbd121e49794153b3ab5dd6ca25c424",
    "holder": "fix:sparq-org/sparq#3628@dispatch-29702802961.1",
