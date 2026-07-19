@@ -72,16 +72,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "e29d9d2348564ba5aa4b1cb602eec379",
-   "holder": "sparq-org/sparq#3228@dispatch-29669831149.1",
-   "package": "sparq-reason",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784427338,
-   "expires_at": 1784433638
-  },
-  {
-   "account": "acct01",
    "claim_id": "3f817ee7ecbd48688fe0008336284394",
    "holder": "sparq-org/sparq#3295@dispatch-29669831149.1",
    "package": "gui",
