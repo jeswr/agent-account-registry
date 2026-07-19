@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3618,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6a4998ba46b27f41864ae539331dfbde741ae462",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "SetupRequirement::BaseOtBootstrap is documented as \"Only base OTs (symmetric bootstrap)\". OT extension is predominantly symmetric-key, but the base OTs that seed it ordinarily use a separate public-key-style OT construction and are exactly the route-dependent component identified by PqStatus::Conditional. Calling the base OT itself symmetric blurs the distinction the new PQ descriptor is meant to preserve.",
+    "file": "research/mpc-dishonest-majority-spdz-backend-design.md",
+    "fix_hint": "Change the comment to describe base OT as a one-time cryptographic bootstrap with no trusted CRS or trusted party, and reserve the symmetric-key characterization for OT extension. Keep its PQ posture Conditional on the concrete base-OT instantiation.",
+    "severity": "minor",
+    "title": "Base OT is inaccurately described as a symmetric bootstrap"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior findings: the Beaver multiplication now uses c + epsilon*b + rho*a + epsilon*rho, with a correct symbolic expansion and concrete field example, and PqStatus now has a Conditional variant that preserves route-dependent preprocessing posture, including an honest default for the in-process dealer simulation. The design remains explicit that it is unimplemented, research-only, and unaudited. One minor terminology defect remains: base OT is not itself a symmetric bootstrap, although the surrounding text correctly treats its concrete cryptographic instantiation as unresolved. The diff also contains text explicitly addressed to a worker's follow-up channel and telling it to file work, so injection_detected is true under the supplied rule, irrespective of apparent intent.",
+  "verdict": "approve"
+ }
+}
