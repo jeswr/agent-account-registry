@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The workflow snapshots and uploads the patch before `Run policy-selected local gate`, then publishes that pre-gate patch whenever the later gate step reports success. The gate executes target-controlled code host-side and may mutate the target tree while running. There is no post-gate assertion that the evaluated working tree still corresponds exactly to `bundle_sha256`. Consequently the gate can pass after evaluating or manufacturing a different tree, while the clean publisher reconstructs and publishes the original, potentially failing patch. Protecting the registry script from the model fixes producer replacement, but it does not bind the gate's evaluated content to the published digest.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "After the gate, fail closed unless the complete target state still matches the exact pre-gate bundle (including index, tracked modifications, deletions, untracked files, and relevant metadata), or run the gate against a fresh reconstruction of the digest-bound bundle in an isolation boundary where gate code cannot alter what is subsequently authorized. Add an adversarial self-test whose gate mutates the tree and returns success, and prove that publication is refused unless the evaluated and published content are identical.",
+   "severity": "blocker",
+   "title": "Gate success is not bound to the patch that publish reconstructs"
+  },
+  {
+   "body": "The new `stage` job mints `app-token-stage` with `permission-issues: write` and then passes that token as `GH_TOKEN` while `worker-issue.py reverify` executes the target checkout's `scripts/trust-gate.py`. A hostile or compromised target default branch can therefore read/exfiltrate the token or directly perform arbitrary issue writes, including trust-relevant label and issue-state changes, from the same process environment. Calling the default-branch script reviewed policy does not create an isolation boundary; it remains target-controlled executable code co-located with a live write credential.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Separate trust-gate execution into a job/process that has no write-capable target credential. Ferry only a bounded, authenticated verdict/snapshot into a clean token-bearing job that performs the pre-run issue writes, or evaluate the policy using trusted registry-owned code/data without exposing the issues-write token. Add a non-vacuous posture test that rejects every job combining target-code execution with a target write-capable mint, not only the `worker` job.",
+   "severity": "blocker",
+   "title": "Target-controlled trust gate still runs beside a write-capable target token"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "Both round-2 trust-boundary blockers remain materially unresolved. The registry bundle producer is now protected from the model container, but publication is still authorized by a gate that may evaluate a different tree from the digest-bound patch. The write credential was narrowed and moved, but it is still co-located with execution of target-controlled trust-gate code. These are soundness and credential-isolation blockers, so progress is stagnant.",
+ "verdict": "request_changes"
+}
