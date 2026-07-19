@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 423,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e6a08f4c63dccb7efd4f76f07ae4f9699e9614f3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved. `_cmd_record` now fails closed on both invalid sides of the provider/class invariant: fleet records are limited to the folded zero-dispatch classes or success, and real providers cannot submit a folded zero-dispatch signal. Account sentinel selection now follows the validated fleet provider rather than the raw class. The self-test is non-vacuous: invalid pairings must return nonzero without incrementing the ledger writer, while fleet zero-dispatch, claim-abort, and success must each write exactly once. The workflow changes consistently move catalog/provider-derived strings from shell-source interpolation into environment variables and quote their expansions. No reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
