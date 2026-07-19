@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 376,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8b54b61feb35eaafcd2eef0ec1bea959f7e20402",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. `gh secret set` now has combined stdout/stderr captured and never relayed; a failure emits only a fixed identifier-free diagnostic, returns non-zero, and occurs before `rotated=true` is written. The added failure-path fake deliberately prints both reversible identifiers and exits non-zero, so the log-redaction and fail-closed checks would fail if output capture or control flow regressed. The success-path fake likewise makes its no-identifier assertion non-vacuous. The workflow diagnostics and verdict/comment sink redaction consistently remove raw account handles and email addresses without weakening SHA binding or machine verdict fields. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
