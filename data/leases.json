@@ -13,12 +13,12 @@
   {
    "account": "acct2css",
    "claim_id": "ec40b24312fb437cbcae461a179cca8a",
-   "holder": "jeswr/agent-account-registry#195@dispatch-29686401785.1",
+   "holder": "jeswr/agent-account-registry#195@29686596704.1",
    "package": "set-up-account",
    "role": "impl",
    "model": "opus",
-   "issued_at": 1784463225,
-   "expires_at": 1784465925
+   "issued_at": 1784463249,
+   "expires_at": 1784465949
   },
   {
    "account": "acct01",
