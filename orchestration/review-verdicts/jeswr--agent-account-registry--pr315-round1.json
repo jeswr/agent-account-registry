@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly makes every public-registry fallback redact account handles while preserving per-account detail only for the configured ALERT_REPO+ALERT_TOKEN route. The routing flag is propagated through main() into render(), the aggregate rendering does not expose row handles, and both helper-level and end-to-end self-tests specifically fail if the fully unconfigured case reverts to the prior permissive behavior. The workflow documentation matches the implementation. No trust check is weakened, no new token/log exposure is introduced, and the added tests are non-vacuous.",
+ "verdict": "approve"
+}
