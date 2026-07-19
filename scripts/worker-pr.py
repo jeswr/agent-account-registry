@@ -368,6 +368,14 @@ def decide_budget(rounds_used, per_round_models, latest_progress, provider,
         raise WorkerPrError("rounds_used must be a non-negative integer")
     if not isinstance(base_rounds, int) or isinstance(base_rounds, bool) or base_rounds < 1:
         raise WorkerPrError("base_rounds must be a positive integer")
+    if not isinstance(hard_cap, int) or isinstance(hard_cap, bool) or hard_cap < 1:
+        raise WorkerPrError("hard_cap must be a positive integer")
+    if base_rounds > hard_cap:
+        # The hard cap is ABSOLUTE (issue #163). A base budget above it (an unbounded policy
+        # max_review_rounds) would otherwise let the base-budget continuation below override the
+        # declared cap — the existing bug continued at round 6 with base_rounds=8. Reject the
+        # misconfiguration fail-closed rather than silently honouring a base the cap forbids.
+        raise WorkerPrError("base_rounds must not exceed the absolute hard cap")
     models = sorted(set(per_round_models))
     for model in models:
         if model not in ladder:
@@ -380,10 +388,14 @@ def decide_budget(rounds_used, per_round_models, latest_progress, provider,
         raise WorkerPrError("pin_floor must be a ladder member for its provider")
     if latest_progress is not None and latest_progress not in PROGRESS_VALUES:
         raise WorkerPrError("latest_progress must be improving, stagnant, regressing, or None")
-    if rounds_used < base_rounds:
-        return {"action": "continue", "pin": None}
+    # The absolute hard cap is evaluated BEFORE the base-budget continuation (issue #163): were
+    # the order reversed, a base budget at/above the cap would continue past the declared cap.
+    # base_rounds > hard_cap is already rejected above, so for valid inputs this ordering is
+    # belt-and-suspenders — but it keeps the cap authoritative regardless of the base budget.
     if rounds_used >= hard_cap:
         return {"action": "needs-user", "pin": None}
+    if rounds_used < base_rounds:
+        return {"action": "continue", "pin": None}
     # Re-review authorization — "may we GRADE a fix round already granted and executed" is a
     # different question from "may we SPEND another fix round" (see extend-pending-review in the
     # docstring). The hard-cap check above keeps rounds_used < hard_cap here, so the authorized
@@ -3181,10 +3193,14 @@ def _self_test():
           {"action": "needs-user", "pin": None})
     check("openai improving extends", budget(3, ["sol"], "improving", provider="openai"),
           {"action": "extend-progress", "pin": None})
-    # an explicit policy base above the hard cap is respected up to the base, never extended
-    check("base above cap continues below base", budget(6, ["fable"], "improving", base=8),
+    # The hard cap is ABSOLUTE (issue #163): a base AT the cap is honoured up to the cap, and the
+    # cap check precedes the base-budget continuation. (A base ABOVE the cap is rejected outright —
+    # see "base above the hard cap" in the rejection loop below; the old buggy behavior continued
+    # at round 6 with base_rounds=8.)
+    check("base at the cap continues below it", budget(5, ["fable"], "improving", base=6),
           {"action": "continue", "pin": None})
-    check("base above cap stops at base", budget(8, ["fable"], "improving", base=8),
+    check("hard cap dominates at the base==cap boundary",
+          budget(6, ["fable"], "improving", base=6),
           {"action": "needs-user", "pin": None})
     for bad, name in (
             (lambda: budget(3, ["gpt-omega"], None), "unknown fix model"),
@@ -3196,6 +3212,7 @@ def _self_test():
             (lambda: budget(3, [], "better"), "unknown progress value"),
             (lambda: budget(True, [], None), "boolean rounds"),
             (lambda: decide_budget(3, [], None, "anthropic", base_rounds=0), "zero base"),
+            (lambda: budget(6, ["fable"], "improving", base=8), "base above the hard cap"),
             (lambda: budget(3, ["opus"], None, pending=["gpt-omega"]), "unknown pending model"),
             (lambda: budget(3, ["opus"], None, pending=["sol"]),
              "cross-provider pending model"),
