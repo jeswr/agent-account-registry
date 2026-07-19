@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Moving the mint before `worker-live.sh gate` protects the App private key from a process started by the gate, but not the minted credential. After the target-controlled gate runs, `steps.app-token-post.outputs.token` is injected as `GH_TOKEN` into publish and follow-up processes on that same runner. A detached gate process can survive the step and inspect or interfere with those later processes, capturing the contents/issues/pull-requests/workflows-write token. A 40-minute timeout limits duration but does not restore runner integrity or prevent persistence, so the round-1 credential-exfiltration boundary is still open.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Move privileged publish/final-state work to a fresh job/runner that never executes target code. Pass only bounded, integrity-checked data bound to the expected repository and SHA, then mint and use the target-scoped token exclusively in that clean job. Keep a clean-runner failure-state path for deferred status updates.",
+   "severity": "blocker",
+   "title": "Privileged token remains usable after hostile gate on the same runner"
+  },
+  {
+   "body": "The 10 + 40 minute caps do not guarantee that publish, follow-ups, or final-state use a valid token. `Write back a rotated full account credential` runs after the mint with no step timeout, and publish plus follow-up processing also run before final-state with no bounded aggregate duration. Therefore final-state can still start after the installation token expires, contradicting the stated fail-closed recovery guarantee and potentially leaving an issue stranded in `status:in-progress`.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Enforce an aggregate deadline with adequate margin across every step between mint and the last required write, or mint/use separate tokens in clean publisher/finalizer jobs immediately before their bounded operations. Add a test or structural check that fails if an unbounded intervening step is introduced.",
+   "severity": "major",
+   "title": "The claimed 60-minute TTL bound omits intervening steps"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "The round-1 credential-boundary blocker remains. Minting before the target-controlled gate avoids invoking the private-key action after compromise, but it does not isolate the resulting privileged token: the same runner later places that token in GH_TOKEN for publish and follow-up operations. Gate code can persist past its step and observe those later processes, so bounding the gate duration does not remove the exfiltration path. The proposed TTL bound is also incomplete because unbounded writeback and post-gate steps consume the same 60-minute window. Progress is stagnant because the prior blocker is materially unresolved at the same severity.",
+ "verdict": "request_changes"
+}
