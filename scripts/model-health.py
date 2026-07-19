@@ -909,6 +909,43 @@ def _alert_target():
     return registry_repo, ambient
 
 
+def _registry_fallback():
+    """The always-available public route: (registry_repo, ambient_token). Used at RUN TIME when
+    the primary (private) route's token is present but UNUSABLE (issue #175) — a nonempty
+    ALERT_TOKEN selects the private route without proving access, so an expired/wrong token would
+    otherwise drop every alert while the run stays green. Identifiers are salted (decision 22a), so
+    retrying the alert on the public registry leaks nothing."""
+    return (os.environ["REGISTRY_REPO"],
+            os.environ.get("REGISTRY_ALERT_TOKEN") or os.environ.get("GH_TOKEN") or "")
+
+
+def _deliver_alerts(actions, maintainer):
+    """Upsert every action on the primary route; on a failed FIRING action retry the salted alert
+    on the public registry with the ambient token (issue #175). Failed recoveries do NOT fall
+    back cross-repo — see the inline comment. Returns the actions still undelivered (empty == all
+    delivered) so the caller can exit nonzero — an unusable alert token must fail the run, never
+    silently drop the alert."""
+    repo, token = _alert_target()
+    fb_repo, fb_token = _registry_fallback()
+    undelivered = []
+    for action in actions:
+        if _upsert_alert(action, repo, token, maintainer):
+            continue
+        # Primary failed. If FIRING on the private route (a distinct repo/token) and a usable
+        # ambient token exists, retry on the registry. Recovery (fire=false) never falls back:
+        # it targets the open marker on the PRIMARY route, and "no open issue" on a different
+        # repository is a no-op that cannot confirm that close — treating it as delivered would
+        # leave the primary alert open while the run stays green (review round 2). Never re-run
+        # the identical route (no value).
+        if action["fire"] and (repo, token) != (fb_repo, fb_token) and fb_token:
+            print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
+                  "delivery failed on the private route — retrying on the registry")
+            if _upsert_alert(action, fb_repo, fb_token, maintainer):
+                continue
+        undelivered.append(action)
+    return undelivered
+
+
 def _gh(args, token, capture=False):
     env = dict(os.environ)
     if token:
@@ -917,16 +954,23 @@ def _gh(args, token, capture=False):
 
 
 def _find_marker_issue(repo, token, marker, state):
-    """The issue number carrying the hidden marker in `state`, or None. A failed/garbled gh list is
-    None (callers treat 'not found' conservatively — never create over an unreadable tracker)."""
+    """The issue number carrying the hidden marker in `state`, or None if the read succeeded and
+    nothing matched. RAISES HealthError on a failed/garbled gh list (issue #175): a failed read
+    must NEVER be mistaken for 'not found' — that let an unreadable tracker be treated as empty and
+    a duplicate alert created over it. The caller turns a raise into a delivery FAILURE (retry the
+    fallback route, then fail nonzero), never a blind create."""
     proc = _gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", state,
                 "--json", "number,body", "--limit", "50"], token, capture=True)
     if proc.returncode != 0:
-        return None
+        raise HealthError(f"gh issue list ({state}) failed")
     try:
         found = json.loads(proc.stdout or "[]")
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise HealthError("gh issue list returned malformed JSON") from exc
+    if not isinstance(found, list):
+        # Valid-but-wrong JSON ({} / null / a scalar) is just as unreadable as garbled JSON:
+        # treating it as an empty tracker would re-enable the blind create this guard exists for.
+        raise HealthError("gh issue list returned non-list JSON")
     return next((i["number"] for i in found if isinstance(i, dict)
                  and marker in (i.get("body") or "")), None)
 
@@ -935,7 +979,12 @@ def _upsert_alert(action, repo, token, maintainer):
     """Idempotent one-issue-per-(condition,provider) upsert keyed by the hidden body marker.
     OPERATIONAL idempotency (review defect #7): every gh return code is checked; a flap REOPENS the
     closed marker issue instead of creating a duplicate; and the recovery comment is posted only
-    AFTER a CONFIRMED close, so a failed close retries next tick without comment spam."""
+    AFTER a CONFIRMED close, so a failed close retries next tick without comment spam.
+
+    Returns True iff the desired state is CONFIRMED — the mutation succeeded, or nothing was needed
+    (steady no-alert with no open issue). Returns False on ANY failed gh mutation or an unreadable
+    tracker (issue #175): the caller retries the fallback route and, if that also fails, exits
+    NONZERO so an unusable ALERT_TOKEN can never drop an alert while the run stays green."""
     title = _alert_title(action["condition"], action["provider"])
     marker = _marker(action["condition"], action["provider"])
     body = render_body(action, maintainer)
@@ -943,34 +992,50 @@ def _upsert_alert(action, repo, token, maintainer):
     _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", "d73a4a",
          "--description", "Autonomous model-access health alert (maintainer action)"],
         token, capture=True)
-    num = _find_marker_issue(repo, token, marker, "open")
+    try:
+        num = _find_marker_issue(repo, token, marker, "open")
+    except HealthError as exc:
+        # An unreadable tracker is NOT 'not found' — do not create over it (would duplicate).
+        print(f"::warning::model-health: cannot read the {action['condition']} alert tracker "
+              f"({exc}) — treating as undelivered (no blind create)")
+        return False
     if action["fire"]:
         if num is not None:
             if _gh(["issue", "edit", str(num), "-R", repo, "--body", body], token).returncode == 0:
                 print(f"::warning::model-health: refreshed {action['condition']} alert "
                       "(detail in the issue)")
-            else:
-                print(f"::warning::model-health: refresh of {action['condition']} alert FAILED "
-                      "(will retry next tick)")
-            return
+                return True
+            print(f"::warning::model-health: refresh of {action['condition']} alert FAILED "
+                  "(will retry next tick)")
+            return False
         # Flap: reuse (REOPEN) the closed marker issue rather than minting a new one.
-        closed = _find_marker_issue(repo, token, marker, "closed")
+        try:
+            closed = _find_marker_issue(repo, token, marker, "closed")
+        except HealthError as exc:
+            print(f"::warning::model-health: cannot read the {action['condition']} closed tracker "
+                  f"({exc}) — treating as undelivered (no blind create)")
+            return False
         if closed is not None:
-            if _gh(["issue", "reopen", str(closed), "-R", repo], token).returncode == 0:
-                _gh(["issue", "edit", str(closed), "-R", repo, "--body", body], token)
+            # True only when BOTH the reopen and the body refresh land: a reopened issue with a
+            # stale body is not the desired state. A reopen that lands with a failed edit is safe
+            # to retry — next tick finds the issue open and takes the refresh path.
+            if (_gh(["issue", "reopen", str(closed), "-R", repo], token).returncode == 0
+                    and _gh(["issue", "edit", str(closed), "-R", repo,
+                             "--body", body], token).returncode == 0):
                 print(f"::warning::model-health: reopened {action['condition']} alert "
                       "(detail in the issue)")
-            else:
-                print(f"::warning::model-health: reopen of {action['condition']} alert FAILED "
-                      "(will retry next tick)")
-            return
+                return True
+            print(f"::warning::model-health: reopen of {action['condition']} alert FAILED "
+                  "(will retry next tick)")
+            return False
         if _gh(["issue", "create", "-R", repo, "--title", title,
                 "--label", ALERT_LABEL, "--body", body], token).returncode == 0:
             print(f"::warning::model-health: raised {action['condition']} alert "
                   "(detail in the issue)")
-        else:
-            print(f"::warning::model-health: raising {action['condition']} alert FAILED "
-                  "(will retry next tick)")
+            return True
+        print(f"::warning::model-health: raising {action['condition']} alert FAILED "
+              "(will retry next tick)")
+        return False
     elif num is not None:
         # Close FIRST; comment only on a CONFIRMED state change so a failed close cannot
         # re-comment every tick.
@@ -978,9 +1043,12 @@ def _upsert_alert(action, repo, token, maintainer):
             _gh(["issue", "comment", str(num), "-R", repo, "--body",
                  "✅ Recovered — successful model access is back. Auto-closed."], token)
             print(f"model-health: recovered {action['condition']} — alert closed")
-        else:
-            print(f"::warning::model-health: close of {action['condition']} alert FAILED "
-                  "(will retry next tick without commenting)")
+            return True
+        print(f"::warning::model-health: close of {action['condition']} alert FAILED "
+              "(will retry next tick without commenting)")
+        return False
+    # Steady no-alert with no open issue: nothing to deliver.
+    return True
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1088,14 +1156,19 @@ def _cmd_decide(args):
     # Issue #70: annotate firing outage/transient actions with the provider's public status —
     # AFTER classification, so a probe result can reframe an alert but never decide one.
     annotate_provider_status(actions)
-    repo, token = _alert_target()
-    for action in actions:
-        # Only touch the tracker when there is something to do (fire) or an OPEN alert to recover;
-        # a steady no-alert condition stays silent (no issue churn).
-        _upsert_alert(action, repo, token, maintainer)
+    # Deliver on the primary route, falling back to the salted public registry when a private
+    # ALERT_TOKEN is present but unusable (issue #175). A steady no-alert condition with no open
+    # issue is a confirmed no-op (never touched), so it never churns nor counts as undelivered.
+    undelivered = _deliver_alerts(actions, maintainer)
     fired = [a["condition"] for a in actions if a["fire"]]
     print(f"model-health decide: {len(actions)} conditions checked, "
           f"{len(fired)} firing ({','.join(sorted(set(fired))) or 'none'})")
+    if undelivered:
+        conds = sorted({f"{a['condition']}/{a['provider']}" for a in undelivered})
+        print(f"::error::model-health decide: {len(undelivered)} alert(s) undeliverable on any "
+              f"route ({', '.join(conds)}) — an unusable ALERT_TOKEN must fail the run, not drop "
+              "the alert silently")
+        return 1
     return 0
 
 
@@ -1531,6 +1604,9 @@ def _self_test():
     # ---- #39 routing fallback ---------------------------------------------------------------
     ok = _test_routing(chk) and ok
 
+    # ---- #175: unusable private token retries the registry, else fails nonzero ---------------
+    ok = _test_delivery(chk) and ok
+
     # ---- provider fleet resolution (account catalog -> salted provider map) ------------------
     chk("provider parsed from YAML body",
         _provider_of("harness: claude\nprovider: anthropic\nmodels: [fable]"), "anthropic")
@@ -1639,10 +1715,12 @@ def _test_upsert(chk):
     global _gh
     real_gh, calls = _gh, []
 
-    def fake_gh(open_issues, closed_issues, fail_verbs):
+    def fake_gh(open_issues, closed_issues, fail_verbs, list_fails=False):
         def run(args, token, capture=False):
             calls.append(list(args))
             if args[:2] == ["issue", "list"]:
+                if list_fails:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
                 state = args[args.index("--state") + 1]
                 issues = open_issues if state == "open" else closed_issues
                 return types.SimpleNamespace(returncode=0, stdout=json.dumps(issues), stderr="")
@@ -1659,21 +1737,50 @@ def _test_upsert(chk):
     try:
         # flap: no open issue, a CLOSED marker issue exists -> REOPEN, never create
         _gh, calls[:] = fake_gh([], [{"number": 7, "body": marker}], set()), []
-        _upsert_alert(action, "o/r", "t", "m")
+        chk("upsert returns True on a confirmed reopen", _upsert_alert(action, "o/r", "t", "m"), True)
         chk("upsert reopens the closed marker issue on flap", "reopen" in issue_verbs(), True)
         chk("upsert does not create a duplicate on flap", "create" in issue_verbs(), False)
         # fresh alert (no open, no closed) -> create
         _gh, calls[:] = fake_gh([], [], set()), []
-        _upsert_alert(action, "o/r", "t", "m")
+        chk("upsert returns True on a confirmed create", _upsert_alert(action, "o/r", "t", "m"), True)
         chk("fresh alert creates the issue", "create" in issue_verbs(), True)
-        # FAILED close -> NO recovery comment (retries next tick)
+        # FAILED create -> returns False (issue #175: caller must see the failure, not exit 0)
+        _gh, calls[:] = fake_gh([], [], {"create"}), []
+        chk("upsert returns False on a FAILED create", _upsert_alert(action, "o/r", "t", "m"), False)
+        # FAILED close -> returns False, and NO recovery comment (retries next tick)
         _gh, calls[:] = fake_gh([{"number": 8, "body": marker}], [], {"close"}), []
-        _upsert_alert({**action, "fire": False}, "o/r", "t", "m")
+        chk("upsert returns False on a FAILED close",
+            _upsert_alert({**action, "fire": False}, "o/r", "t", "m"), False)
         chk("failed close posts no recovery comment", "comment" in issue_verbs(), False)
-        # confirmed close -> recovery comment
+        # confirmed close -> returns True + recovery comment
         _gh, calls[:] = fake_gh([{"number": 8, "body": marker}], [], set()), []
-        _upsert_alert({**action, "fire": False}, "o/r", "t", "m")
+        chk("upsert returns True on a confirmed close",
+            _upsert_alert({**action, "fire": False}, "o/r", "t", "m"), True)
         chk("confirmed close posts the recovery comment", "comment" in issue_verbs(), True)
+        # steady no-alert with no open issue -> confirmed no-op (True), no mutation
+        _gh, calls[:] = fake_gh([], [], set()), []
+        chk("steady no-alert is a confirmed no-op (True)",
+            _upsert_alert({**action, "fire": False}, "o/r", "t", "m"), True)
+        chk("steady no-alert touches nothing", issue_verbs(), ["list"])
+        # UNREADABLE tracker (list read fails) -> False and NEVER a blind create (issue #175)
+        _gh, calls[:] = fake_gh([], [], set(), list_fails=True), []
+        chk("unreadable tracker returns False (undelivered)",
+            _upsert_alert(action, "o/r", "t", "m"), False)
+        chk("unreadable tracker does NOT create over itself", "create" in issue_verbs(), False)
+        # valid-but-NON-LIST list JSON ({} / null) is unreadable too, never an empty tracker
+        _gh, calls[:] = fake_gh({}, [], set()), []
+        chk("non-list tracker JSON ({}) returns False (undelivered)",
+            _upsert_alert(action, "o/r", "t", "m"), False)
+        chk("non-list tracker JSON ({}) does NOT create over itself",
+            "create" in issue_verbs(), False)
+        _gh, calls[:] = fake_gh(None, [], set()), []
+        chk("null tracker JSON returns False (undelivered)",
+            _upsert_alert(action, "o/r", "t", "m"), False)
+        chk("null tracker JSON does NOT create over itself", "create" in issue_verbs(), False)
+        # reopen lands but the body refresh FAILS -> False (stale body is not the desired state)
+        _gh, calls[:] = fake_gh([], [{"number": 7, "body": marker}], {"edit"}), []
+        chk("upsert returns False when reopen succeeds but the edit fails",
+            _upsert_alert(action, "o/r", "t", "m"), False)
     finally:
         _gh = real_gh
     return True
@@ -1758,6 +1865,121 @@ def _test_routing(chk):
         chk("route registry when no ALERT_REPO",
             _alert_target(), ("jeswr/agent-account-registry", "amb"))
     finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_delivery(chk):
+    """Issue #175: a nonempty-but-unusable ALERT_TOKEN must NOT silently drop alerts. The private
+    route failing retries the salted alert on the public registry with the ambient token; only when
+    NEITHER route delivers is the action reported undelivered (caller then exits nonzero). A
+    fake gh keyed on (token, repo) proves the retry hits the REGISTRY with the AMBIENT token."""
+    import types
+    global _gh
+    real_gh, calls = _gh, []
+
+    def fake_gh(bad_tokens):
+        def run(args, token, capture=False):
+            repo = args[args.index("-R") + 1] if "-R" in args else None
+            calls.append((args[0], args[1] if args[0] == "issue" else None, token, repo))
+            if args[:2] == ["issue", "list"]:
+                # list reads always succeed and return empty (fresh -> create path)
+                return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+            rc = 1 if token in bad_tokens else 0
+            return types.SimpleNamespace(returncode=rc, stdout="", stderr="")
+        return run
+
+    def creates():
+        return [(t, r) for (v, sub, t, r) in calls if sub == "create"]
+
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN", "GH_TOKEN")}
+    fire = {"condition": "provider-outage", "provider": "anthropic", "fire": True, "reason": "r"}
+    try:
+        os.environ["REGISTRY_REPO"] = "jeswr/agent-account-registry"
+        os.environ["REGISTRY_ALERT_TOKEN"] = "amb"
+        os.environ.pop("GH_TOKEN", None)
+        os.environ["ALERT_REPO"] = "jeswr/agent-account-data"
+        os.environ["ALERT_TOKEN"] = "priv"
+
+        # (a) private token UNUSABLE, ambient usable -> retried on the registry, delivered
+        _gh, calls[:] = fake_gh({"priv"}), []
+        undelivered = _deliver_alerts([fire], "m")
+        chk("unusable private token: alert delivered via the registry fallback", undelivered, [])
+        chk("fallback create targets the REGISTRY with the AMBIENT token",
+            ("amb", "jeswr/agent-account-registry") in creates(), True)
+        chk("private route was attempted first (priv token create tried)",
+            ("priv", "jeswr/agent-account-data") in creates(), True)
+
+        # (b) BOTH routes unusable -> reported undelivered (caller exits nonzero)
+        _gh, calls[:] = fake_gh({"priv", "amb"}), []
+        undelivered = _deliver_alerts([fire], "m")
+        chk("both routes unusable -> action reported undelivered", len(undelivered), 1)
+
+        # (c) end-to-end: _cmd_decide returns NONZERO when the alert cannot be delivered.
+        #     Stub the ledger + fleet + probe so a firing outage reaches delivery deterministically.
+        import argparse as _ap
+        global GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
+        real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger)
+        try:
+            GitHubAPI = lambda token: object()
+            read_ledger = lambda api, repo: ([], None)
+            prune = lambda records, now: []
+            _enabled_provider_accounts = lambda api, repo, policy, salt: {}
+            annotate_provider_status = lambda actions, **kw: None  # no-op (probe-free)
+            # force a single firing action regardless of records
+            global classify_records
+            real_classify = classify_records
+            classify_records = lambda records, fleet, now: [dict(fire)]
+            _gh, calls[:] = fake_gh({"priv", "amb"}), []
+            chk("decide exits NONZERO when no route can deliver the alert (#175)",
+                _cmd_decide(_ap.Namespace(policy_file="policy/repos.toml")), 1)
+            classify_records = real_classify
+        finally:
+            (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
+             prune, read_ledger) = real
+
+        # (d) no private ALERT_TOKEN at all -> primary IS the registry; no pointless retry, and a
+        #     failing ambient token is reported undelivered (fail-closed, never a silent green).
+        os.environ["ALERT_TOKEN"] = ""
+        _gh, calls[:] = fake_gh({"amb"}), []
+        undelivered = _deliver_alerts([fire], "m")
+        chk("registry-only route with a bad ambient token is undelivered", len(undelivered), 1)
+        chk("registry-only route is not retried against itself",
+            sum(1 for c in creates()), 1)
+
+        # (e) review round 2: a FAILED private recovery (fire=false, open marker on the private
+        #     route, close fails) must stay undelivered. Pre-fix, the registry fallback found no
+        #     open marker, returned True as a steady no-op, and the failed close vanished green.
+        os.environ["ALERT_TOKEN"] = "priv"  # restore the private route cleared by (d)
+        recover = {**fire, "fire": False}
+        marker = _marker(recover["condition"], recover["provider"])
+
+        def recovery_gh(args, token, capture=False):
+            repo = args[args.index("-R") + 1] if "-R" in args else None
+            calls.append((args[0], args[1] if args[0] == "issue" else None, token, repo))
+            if args[:2] == ["issue", "list"]:
+                if repo == "jeswr/agent-account-data":
+                    return types.SimpleNamespace(
+                        returncode=0, stdout=json.dumps([{"number": 7, "body": marker}]),
+                        stderr="")
+                return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+            if args[:2] == ["issue", "close"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        _gh, calls[:] = recovery_gh, []
+        undelivered = _deliver_alerts([recover], "m")
+        chk("failed private recovery stays undelivered (fallback no-op cannot confirm it)",
+            len(undelivered), 1)
+        chk("recovery never retries cross-repo (no registry calls on fire=false)",
+            any(r == "jeswr/agent-account-registry" for (_, _, _, r) in calls), False)
+    finally:
+        _gh = real_gh
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -2068,7 +2290,8 @@ def _test_decide_annotation(chk):
         stub = _StubAPI(seed=burst)
         GitHubAPI = lambda token: stub
         probe_provider_status = lambda provider, fetch=None: (STATUS_OPERATIONAL, "none")
-        _upsert_alert = lambda action, repo, token, maintainer: seen.append(action)
+        # returns True: the new delivery contract (issue #175) treats a confirmed upsert as True.
+        _upsert_alert = lambda action, repo, token, maintainer: seen.append(action) or True
         rc = _cmd_decide(_ap.Namespace(policy_file="/nonexistent/repos.toml"))
         fired = [a for a in seen
                  if a["condition"] == "persistent-transient" and a["fire"]]
