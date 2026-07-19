@@ -1,0 +1,29 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The disposition table marks 'DISTINCT, REDUCED, LIMIT, OFFSET, projection' as IN (today) (line 399). But the added grammar puts `Project(W, P)` on the SECOND line (line 529), which the following prose (lines 532-534) defines as 'the candidate-normative extension ... admitted only as its corresponding phase becomes implemented' \u2014 i.e. NOT available today. Separately, the pre-existing editor's note point (2) (lines 577-579), which this PR does not touch, still states 'Projection (SELECT variable lists) is not transcribed; the correctness property above is defined on full solution mappings' \u2014 yet the PR just transcribed projection by adding `eval(Project(W, P)) = restricts each mapping in eval(P) to W` (line 556). So projection is simultaneously (a) implemented today, (b) a not-yet-implemented future-phase extension, and (c) not transcribed. In a spec whose explicit goal (lines 405-410) is that 'candidate-normative design text does not enlarge the reference implementation's claim surface ahead of implementation', a self-contradiction about whether projection is implemented-today is exactly the honesty/claim-surface defect the section is meant to prevent.",
+   "file": "site/specs/zksparql.typ",
+   "fix_hint": "Pick one status for projection and make the three sites agree. If SELECT projection is genuinely IN (today), either move `Project(W, P)` onto the first (currently-implemented) grammar line or add a note that only the algebra transcription \u2014 not the capability \u2014 is new, and update editor's note point (2) since projection is now transcribed. If projection is a future phase, change the table row to 'IN (phase N)'. In all cases, revise editor's note point (2) so it no longer asserts projection 'is not transcribed' now that eval(Project(W,P)) is defined.",
+   "severity": "major",
+   "title": "Projection has three contradictory dispositions across the disposition table, the grammar, and the (stale) editor's note"
+  },
+  {
+   "body": "The expression table (line 488) lists `BOUND` as 'IN (phase 3, static)' with reason 'With OPTIONAL out, the query text determines boundness.' But the newly added eval(Extend(v, E, P)) (lines 554-555) 'retains \u03bc without a v binding when E raises an expression error'. Several admitted expression forms can error (arithmetic division, SUBSTR byte-position, date/time functions, etc.), so a BIND/Extend-introduced variable can be dynamically UNBOUND even with OPTIONAL out. Boundness of such a variable is therefore not statically determined by the query text, contradicting the 'static' justification.",
+   "file": "site/specs/zksparql.typ",
+   "fix_hint": "Qualify the BOUND row: boundness is static for BGP-derived variables, but a variable introduced by Extend(v, E, P) may be unbound when E errors, so BOUND over BIND-introduced variables is dynamic. Either narrow the 'static' claim to non-Extend variables or add the Extend-error caveat.",
+   "severity": "minor",
+   "title": "BOUND marked 'static' conflicts with the Extend error semantics added in the same diff"
+  },
+  {
+   "body": "In the one-directional-equivalence requirement (line 455) the expression `$eval_k(P) subset.eq eval(P)$` places the multi-letter identifier `eval` in Typst math mode, where it renders as the product of italic letters e\u00b7v\u00b7a\u00b7l rather than an upright operator name. Cosmetic only; the surrounding prose uses `eval(P)` in text mode elsewhere (e.g. line 542).",
+   "file": "site/specs/zksparql.typ",
+   "fix_hint": "Wrap the operator name, e.g. `$op(\"eval\")_k(P) subset.eq op(\"eval\")(P)$` or use `\"eval\"` in math mode, so it typesets as an upright multi-letter operator consistent with the text-mode `eval(P)` usage.",
+   "severity": "nit",
+   "title": "`eval` inside math mode renders as separate italic letters"
+  }
+ ],
+ "progress": null,
+ "summary": "Candidate-normative expansion of the ZK-SPARQL fragment tables and formal-semantics grammar in site/specs/zksparql.typ. On the honesty/ZK-soundness surface the change is good: designed extensions are consistently caveated ('not yet implemented', 'not a present cryptographic guarantee', 'subject to the external-audit caveat of section 17.1'), so the privacy-claims gate is not tripped and there is no over-claim about unaudited circuits. The property-path bounded semantics correctly state only the sound direction (eval_k \u2286 eval, existence-only, public bound k, no completeness/reachable-set claim), and section cross-references resolve. Blocking issue: the PR adds projection to the algebra (grammar Project(W,P) + eval(Project(W,P))) and marks 'projection' IN (today) in the disposition table, yet (a) the grammar comment places Project on the 'candidate-normative extension ... admitted only as its corresponding phase becomes implemented' second line, and (b) the pre-existing, unmodified editor's note point (2) still asserts 'Projection (SELECT variable lists) is not transcribed'. So the spec now says projection is simultaneously implemented-today, a not-yet-implemented future extension, and not transcribed \u2014 a three-way contradiction in normative text whose stated purpose (lines 405-410) is precise claim-surface delineation. A smaller BOUND 'static' claim conflicts with the Extend error semantics added in the same diff. Everything else is sound; reconciling the projection status and the BOUND note would clear this.",
+ "verdict": "request_changes"
+}
