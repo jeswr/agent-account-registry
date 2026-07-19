@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 442,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "35e2da5fe91f0c1c73324ae94620bd5615c5753a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "holds_live_claim binds ownership only to record-attempt markers. In the workflow, a new run first sets status:in-progress and posts claim-receipt, then runs the potentially lengthy prepare step, and only afterward posts record-attempt. If an older run reaches pre-publish verification in that interval, the label still satisfies its check and the newest recognized attempt receipt is still the older run's own. The old run is therefore authorized to publish despite the newer run's already-visible claim. The label and recognized receipt do not form a compare-and-swap or fail-closed handoff.",
+    "file": "scripts/worker-issue.py",
+    "fix_hint": "Make supersession visible to the verifier before or atomically with the shared in-progress transition. For example, post a run-key-bound ownership receipt before changing the issue to in-progress, and have pre-publish verification reject whenever the newest ownership receipt is not its own; then apply the label. Ensure failure ordering cannot leave an older run authorized. Add a concurrency/order test covering old receipt -> newer ownership receipt/claim -> old pre-publish reverify refuses, including the interval before the newer run records its model attempt.",
+    "severity": "blocker",
+    "title": "Claim verification ignores the newer claim until its later attempt receipt"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 always-reject regression is genuinely fixed: pre-publish mode accepts the workflow's own in-progress lifecycle, remains gated on the pinned verifier, and the added wired tests are non-vacuous. However, the new claim binding is not fail-closed during supersession. A worker changes the shared label to status:in-progress and posts a visible claim receipt before it posts the attempt receipt that holds_live_claim actually recognizes. During that interval, an older worker still sees status:in-progress and its own attempt receipt as newest, so it can pass pre-publish verification and publish after the newer worker has claimed the issue. Because this is a new trust-plane finding relative to round 2, progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
