@@ -63,6 +63,28 @@
 # invisible and permanently burn the claimed slot. set-up-account.yml ships in the guard job's
 # sparse checkout so the assertion also runs live every tick.
 #
+# BINDING-MAP CONTRACT (sol round 17 on the #275 PR): the empty-repo-scope check above proves an
+# UNBOUND job sees nothing — which also means every job that CONSUMES a secret only works while
+# it carries the job-level `environment: dispatch-secrets` binding, and a job whose binding is
+# dropped both breaks (reads empty secrets) and becomes an any-ref exfiltration surface the
+# moment the secrets ever regress to repo scope. That map was previously maintained by hand per
+# workflow; this guard now DERIVES it: every job across .github/workflows/ whose body holds a
+# secrets-context read — a dotted `${{ secrets.<NAME> }}` reference (the 14 migrated names and
+# every other real secret: post-#101 the repo scope is provably empty, so any non-ephemeral name
+# resolves ONLY inside the environment), a dynamic `${{ secrets[...] }}` read (worker/review-fix
+# resolve secrets[secret_ref]), or a whole-context `${{ toJSON(secrets) }}` read — must carry
+# the binding. The ONLY hardcoded entries are the deliberate exceptions (BINDING_EXCEPTIONS):
+# dispatch.yml's secrets-guard job (its UNBOUND toJSON(secrets) read IS check 1 above) and the
+# one-shot migration's quiesce/migrate jobs (env-UNBOUND by design — documented in that file's
+# header); an exception whose job stops consuming, disappears, or gains the binding goes red as
+# STALE so the allowlist can never silently cover a future job. Two env-scoped WRITES are pinned
+# the same way: the broker's final store (set-up-account.yml `gh secret set "$SECRET_NAME" ...
+# --env dispatch-secrets`) and the rotation write-back (worker-live.sh `... secret set
+# "$secret_ref" ... --env dispatch-secrets`) — a repo-scope write would re-trip the guard AND
+# strand the env-bound consumers on the pre-rotation credential. The workflows directory and
+# scripts/worker-live.sh ship in the guard job's sparse checkout so both contracts also run live
+# every tick.
+#
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
 import json
@@ -314,6 +336,197 @@ def setup_account_union_verdict(step_lines):
     return True, "ok"
 
 
+# BINDING-MAP CONTRACT (sol round 17 on the #275 PR) — secrets-context reads that make a job a
+# secret CONSUMER. All three require the `${{` expression opener on the same line: a jq
+# `.secrets[].name` filter over an API listing, or prose quoting a reference, is not a context
+# read (comment lines/tails are stripped besides). The dotted form accepts ANY uppercase name
+# except the ephemeral GITHUB_TOKEN — post-#101 the repo scope is provably empty (check 1), so
+# every real secret, the 14 migrated names included, resolves ONLY inside the environment and
+# any dotted reference demands the binding. Same-line scope is asserted by the self-test's
+# accept directions over the LIVE workflow texts, not assumed.
+BINDING_SECRET_REF_RE = re.compile(r"\$\{\{[^}]*\bsecrets\.([A-Z][A-Z0-9_]*)")
+BINDING_DYNAMIC_READ_RE = re.compile(r"\$\{\{[^}]*\bsecrets\s*\[")
+BINDING_CONTEXT_READ_RE = re.compile(r"\$\{\{[^}]*toJSON\(\s*secrets\s*\)")
+BINDING_JOB_HEADER_RE = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*):\s*(?:#.*)?$")
+
+# The ONLY jobs allowed to consume secrets UNBOUND — each deliberate, each documented at the
+# job. Any other consumer without the binding is a refusal; an entry here whose job no longer
+# exists, no longer consumes, or now carries the binding is a STALE-exception refusal (an
+# allowlist entry nobody needs is a future bypass wearing that job's name).
+BINDING_EXCEPTIONS = {
+    ("dispatch.yml", "secrets-guard"):
+        "the guard's UNBOUND toJSON(secrets) read IS the empty-repo-scope assertion (check 1)",
+    ("migrate-secrets-to-env.yml", "quiesce"):
+        "one-shot migration writer-disable phase: mints from the repo-scope bootstrap App "
+        "credentials BEFORE any cutover (env-UNBOUND by design, see that file's header)",
+    ("migrate-secrets-to-env.yml", "migrate"):
+        "one-shot migration main phase: MUST read the repo-scope originals to copy them into "
+        "the environment — bound, it would read back the env copies and the originals could "
+        "never be verified or drained (env-UNBOUND by design, see that file's header)",
+}
+
+# The env-scoped secret WRITE sites the map depends on: `gh secret set <ARG> ...` invocations
+# (the `gh` token may arrive via an expansion like "${WORKER_GH_BIN:-/usr/bin/gh}", hence the
+# `[}"]*` tail). Group 1 = the first argument (the secret-name word), used to select the pinned
+# invocation; a quoted self-test fixture string carries no leading `gh` and never matches.
+SECRET_WRITE_RE = re.compile(r'gh[}"]*\s+secret\s+set\s+("?\$?[A-Za-z_][A-Za-z0-9_]*"?)')
+
+
+def workflow_jobs(workflow_text):
+    """Pure: {job name: [body lines]} for the top-level `jobs:` block, or None when the block
+    cannot be located or holds no jobs (callers treat None as a failure — fail closed). Same
+    deliberately NARROW, dependency-free line-parser discipline as workflow_guard_permissions
+    above: a column-0 `jobs:` line, two-space job keys, body = every following line until the
+    next job key; a column-0 non-comment line ends the block. Reshaping a workflow out of this
+    shape goes red in the self-test rather than silently passing."""
+    lines = workflow_text.splitlines()
+    try:
+        start = lines.index("jobs:")
+    except ValueError:
+        return None
+    jobs = {}
+    current = None
+    for line in lines[start + 1:]:
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            break  # dedented out of the jobs block
+        header = BINDING_JOB_HEADER_RE.match(line)
+        if header:
+            current = header.group(1)
+            jobs[current] = []
+        elif current is not None:
+            jobs[current].append(line)
+    return jobs or None
+
+
+def job_environment(body_lines):
+    """Pure: the job-level `environment:` name — the inline scalar form (`environment: x`) or
+    the mapping form's `name:` key — or None when the job carries no binding."""
+    for index, line in enumerate(body_lines):
+        code = line.split("#", 1)[0].rstrip()
+        if code == "    environment:":
+            for follow in body_lines[index + 1:]:
+                if not follow.startswith("      "):
+                    break
+                follow_code = follow.split("#", 1)[0].strip()
+                if follow_code.startswith("name:"):
+                    return follow_code.partition(":")[2].strip()
+            return None
+        if code.startswith("    environment:"):
+            return code.partition(":")[2].strip()
+    return None
+
+
+def job_secret_reads(body_lines):
+    """Pure: sorted secret-consuming expressions in one job's body lines (see the BINDING_*
+    regexes above). Full-line comments and ` #` comment tails are stripped first, so prose
+    ABOUT a secret never demands a binding."""
+    reads = set()
+    for line in body_lines:
+        if line.lstrip().startswith("#"):
+            continue
+        code = line.split(" #", 1)[0]
+        for name in BINDING_SECRET_REF_RE.findall(code):
+            if name != "GITHUB_TOKEN":
+                reads.add(f"secrets.{name}")
+        if BINDING_DYNAMIC_READ_RE.search(code):
+            reads.add("secrets[...]")
+        if BINDING_CONTEXT_READ_RE.search(code):
+            reads.add("toJSON(secrets)")
+    return sorted(reads)
+
+
+def secret_consuming_jobs(workflow_docs):
+    """Pure: {(filename, job): (reads, environment)} over {filename: workflow text} — the
+    DERIVED binding map binding_map_verdict checks. None when any document's jobs block cannot
+    be parsed (fail closed). Exposed separately so the self-test can anchor the LIVE derivation
+    to known consumers: a scan that stops seeing worker.yml's secrets[secret_ref] job is parser
+    rot, not safety."""
+    consuming = {}
+    for filename in sorted(workflow_docs):
+        jobs = workflow_jobs(workflow_docs[filename])
+        if jobs is None:
+            return None
+        for job_name, body in jobs.items():
+            reads = job_secret_reads(body)
+            if reads:
+                consuming[(filename, job_name)] = (reads, job_environment(body))
+    return consuming
+
+
+def binding_map_verdict(workflow_docs):
+    """Pure: (ok, reason). EVERY secret-consuming job across the given workflow documents must
+    carry the job-level `environment: dispatch-secrets` binding, except the documented
+    BINDING_EXCEPTIONS. Fail closed on: no documents, an unparseable jobs block, a scan that
+    derives ZERO consumers (it proves nothing — parser or repo shape drifted), and stale
+    exceptions (scoped to filenames present in the documents so synthetic fixtures compose;
+    the live self-test separately anchors every exception file's presence)."""
+    if not workflow_docs:
+        return False, "no workflow documents to scan (fail closed)"
+    consuming = secret_consuming_jobs(workflow_docs)
+    if consuming is None:
+        broken = sorted(name for name in workflow_docs
+                        if workflow_jobs(workflow_docs[name]) is None)
+        return False, ("cannot locate a `jobs:` block in: " + ", ".join(broken)
+                       + " (fail closed)")
+    if not consuming:
+        return False, ("derived ZERO secret-consuming jobs — the scan proves nothing "
+                       "(fail closed: the parser or the repository shape has drifted)")
+    stale = sorted(f"{filename}::{job}" for (filename, job) in BINDING_EXCEPTIONS
+                   if filename in workflow_docs and (filename, job) not in consuming)
+    if stale:
+        return False, ("STALE binding exception(s): " + ", ".join(stale) + " — the job no "
+                       "longer exists or no longer consumes secrets; remove the exception so "
+                       "the allowlist cannot silently cover a future job of the same name")
+    for (filename, job_name), (reads, environment) in sorted(consuming.items()):
+        if (filename, job_name) in BINDING_EXCEPTIONS:
+            if environment == ENVIRONMENT:
+                return False, (f"STALE binding exception: {filename}::{job_name} is on the "
+                               f"deliberately-UNBOUND list but now carries `environment: "
+                               f"{ENVIRONMENT}` — remove the exception")
+            continue
+        if environment != ENVIRONMENT:
+            bound = f" (bound to {environment!r} instead)" if environment else ""
+            return False, (
+                f"{filename}::{job_name} reads {', '.join(reads)} but has no job-level "
+                f"`environment: {ENVIRONMENT}` binding{bound} — post-#101 every real secret "
+                "lives ONLY in that environment, so this job either reads EMPTY secrets "
+                "(broken) or, should the secrets ever regress to repo scope, becomes an "
+                "any-ref exfiltration surface")
+    return True, "ok"
+
+
+def secret_env_write_verdict(text, secret_arg, where):
+    """Pure: (ok, reason). Locates every `gh secret set <secret_arg> ...` invocation in `where`
+    (comment lines ignored, backslash continuations joined) and requires each to carry
+    `--env dispatch-secrets`: a repo-scope write would re-trip the empty-repo-scope check on
+    the next tick AND strand the env-bound consumers on the pre-rotation credential (they
+    resolve secrets from the environment, never repo scope). A write site that cannot be
+    located is a refusal — reshaping it out of recognition must surface here (fail closed)."""
+    lines = text.splitlines()
+    found = False
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            continue
+        joined = line.rstrip()
+        follow = index
+        while joined.endswith("\\") and follow + 1 < len(lines):
+            follow += 1
+            joined = joined.rstrip("\\").rstrip() + " " + lines[follow].strip()
+        for match in SECRET_WRITE_RE.finditer(joined):
+            if match.group(1) != secret_arg:
+                continue
+            found = True
+            if f"--env {ENVIRONMENT}" not in joined:
+                return False, (f"{where}: `gh secret set {secret_arg}` does not carry "
+                               f"`--env {ENVIRONMENT}` — a repo-scope write re-trips the "
+                               "empty-repo-scope guard AND leaves the environment copy stale "
+                               "while every env-bound consumer keeps resolving it")
+    if not found:
+        return False, (f"{where}: the `gh secret set {secret_arg}` write site was not found "
+                       "(fail closed — reshaping the write must not silently pass)")
+    return True, "ok"
+
+
 def _api(path):
     """Read-only `gh api` GET. Returns the parsed JSON document, or None on any failure —
     sanitized: neither stderr nor the payload is ever echoed (GH_DEBUG=api can echo request
@@ -540,6 +753,145 @@ def _self_test():
         "all paginated, all BEFORE the claim, all flowing into taken, taken determining the "
         "claimed ref (taken -> n -> cand -> claim)",
         live_union_verdict, (True, "ok"))
+
+    # BINDING-MAP CONTRACT (sol round 17 on the #275 PR): synthetic accept + every reject
+    # direction, then the LIVE derivation over the real .github/workflows/ tree. The map is
+    # DERIVED (any job whose body holds a secrets-context read must be dispatch-secrets-bound),
+    # never hand-listed — only BINDING_EXCEPTIONS is hardcoded, and staleness there is itself
+    # a refusal.
+    bound_doc = "\n".join([
+        "on: workflow_dispatch",
+        "jobs:",
+        "  worker:",
+        "    runs-on: ubuntu-latest",
+        "    environment: dispatch-secrets",
+        "    steps:",
+        "      - run: true",
+        "        env:",
+        "          CRED: ${{ secrets[steps.pick.outputs.secret_ref] }}",
+        "          SALT: ${{ secrets.PROVENANCE_SALT }}",
+        "  deploy:",
+        "    environment:",
+        "      name: dispatch-secrets",
+        "    steps:",
+        "      - run: echo ${{ secrets.ACCT01_TOKEN != '' }}",
+        "  lint:",  # consumes nothing: comment mentions + jq API listings demand no binding
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      # a comment quoting ${{ secrets.ACCT01_TOKEN }} demands nothing",
+        "      - run: gh api repos/o/r/actions/secrets --jq '.secrets[].name'",
+    ])
+    chk("binding map: bound consumers (inline + mapping-form env) + non-consuming job -> ok",
+        binding_map_verdict({"worker.yml": bound_doc}), (True, "ok"))
+    unbound = binding_map_verdict(
+        {"worker.yml": bound_doc.replace("    environment: dispatch-secrets\n", "")})
+    chk("binding map: environment stripped from the worker job -> refuse, file::job NAMED",
+        (unbound[0], "worker.yml::worker" in unbound[1],
+         "no job-level `environment: dispatch-secrets`" in unbound[1]),
+        (False, True, True))
+    rebound = binding_map_verdict(
+        {"worker.yml": bound_doc.replace(
+            "    environment: dispatch-secrets", "    environment: github-pages")})
+    chk("binding map: consumer bound to the WRONG environment -> refuse, binding named",
+        (rebound[0], "'github-pages'" in rebound[1]), (False, True))
+    guard_doc = "\n".join([
+        "jobs:",
+        "  secrets-guard:",
+        "    steps:",
+        "      - run: true",
+        "        env:",
+        "          ALL_SECRETS: ${{ toJSON(secrets) }}",
+    ])
+    chk("binding map: dispatch.yml secrets-guard consumes toJSON(secrets) UNBOUND -> exception "
+        "honored (its unbound read IS the empty-scope check)",
+        binding_map_verdict({"dispatch.yml": guard_doc, "worker.yml": bound_doc}),
+        (True, "ok"))
+    ghost = binding_map_verdict(
+        {"other.yml": guard_doc, "worker.yml": bound_doc})
+    chk("binding map: same UNBOUND toJSON(secrets) job in a NON-excepted file -> refuse",
+        (ghost[0], "other.yml::secrets-guard" in ghost[1]), (False, True))
+    bound_guard = binding_map_verdict(
+        {"dispatch.yml": guard_doc.replace(
+            "    steps:", "    environment: dispatch-secrets\n    steps:"),
+         "worker.yml": bound_doc})
+    chk("binding map: exception job now BOUND -> refuse as STALE (remove the dead allowlist entry)",
+        (bound_guard[0], "STALE" in bound_guard[1]), (False, True))
+    stale_exc = binding_map_verdict(
+        {"dispatch.yml": "jobs:\n  plan:\n    steps:\n      - run: true",
+         "worker.yml": bound_doc})
+    chk("binding map: exception file present but its job consumes nothing -> refuse as STALE",
+        (stale_exc[0], "STALE" in stale_exc[1],
+         "dispatch.yml::secrets-guard" in stale_exc[1]), (False, True, True))
+    chk("binding map: no documents -> refuse (fail closed)",
+        binding_map_verdict({})[0], False)
+    chk("binding map: zero derived consumers -> refuse (a scan that proves nothing fails closed)",
+        binding_map_verdict(
+            {"a.yml": "jobs:\n  lint:\n    steps:\n      - run: true"})[0], False)
+    chk("binding map: unparseable jobs block -> refuse, file named",
+        (binding_map_verdict({"a.yml": "name: no jobs key here"})[0],
+         "a.yml" in binding_map_verdict({"a.yml": "name: no jobs key here"})[1]),
+        (False, True))
+    workflows_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 os.pardir, ".github", "workflows")
+    try:
+        live_docs = {}
+        for name in sorted(os.listdir(workflows_dir)):
+            if name.endswith((".yml", ".yaml")):
+                with open(os.path.join(workflows_dir, name), encoding="utf-8") as handle:
+                    live_docs[name] = handle.read()
+    except OSError:
+        live_docs = {}
+    chk("workflow: EVERY secret-consuming job repo-wide carries `environment: dispatch-secrets` "
+        "(exceptions: dispatch's guard job + the two unbound one-shot migration phases)",
+        binding_map_verdict(live_docs), (True, "ok"))
+    live_consumers = secret_consuming_jobs(live_docs) or {}
+    chk("workflow: the LIVE derivation still sees the known consumers + every exception "
+        "(parser-rot anchor: a scan that finds fewer jobs is rot, not safety)",
+        (("worker.yml", "worker") in live_consumers,
+         ("review-fix.yml", "run") in live_consumers,
+         ("dispatch.yml", "claim") in live_consumers,
+         all(key in live_consumers for key in BINDING_EXCEPTIONS)),
+        (True, True, True, True))
+
+    # Env-scoped WRITE pins (round 17): the broker's final store + the rotation write-back must
+    # keep `--env dispatch-secrets` — synthetic accept/reject, then the LIVE files.
+    write_sample = ('# comment: gh secret set "$SECRET_NAME" (prose, ignored)\n'
+                    'GH_TOKEN="$PAT" gh secret set "$SECRET_NAME" -R "o/r" '
+                    '--env dispatch-secrets < "$DIR/token"\n')
+    chk("env write: store invocation carries --env dispatch-secrets -> ok",
+        secret_env_write_verdict(write_sample, '"$SECRET_NAME"', "sample"), (True, "ok"))
+    stripped_write = secret_env_write_verdict(
+        write_sample.replace(" --env dispatch-secrets", ""), '"$SECRET_NAME"', "sample")
+    chk("env write: --env dispatch-secrets stripped -> refuse, repo-scope risk named",
+        (stripped_write[0], "--env dispatch-secrets" in stripped_write[1]), (False, True))
+    continued = ('gh secret set "$SECRET_NAME" -R "o/r" \\\n'
+                 '  --env dispatch-secrets < "$DIR/token"\n')
+    chk("env write: backslash-continued invocation -> joined and accepted",
+        secret_env_write_verdict(continued, '"$SECRET_NAME"', "sample"), (True, "ok"))
+    chk("env write: write site missing entirely -> refuse (fail closed)",
+        secret_env_write_verdict("echo no writes here", '"$SECRET_NAME"', "sample")[0],
+        False)
+    chk("env write: a quoted fixture string without a leading `gh` is NOT an invocation",
+        secret_env_write_verdict(
+            '"secret set ACCT05_TOKEN --repo o/r"', "ACCT05_TOKEN", "sample")[0], False)
+    try:
+        with open(setup_path, encoding="utf-8") as handle:
+            live_broker_write = secret_env_write_verdict(
+                handle.read(), '"$SECRET_NAME"', "set-up-account.yml")
+    except OSError:
+        live_broker_write = (False, "set-up-account.yml unreadable (fail closed)")
+    chk("workflow: the broker's final store writes into the dispatch-secrets ENVIRONMENT",
+        live_broker_write, (True, "ok"))
+    worker_live_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "worker-live.sh")
+    try:
+        with open(worker_live_path, encoding="utf-8") as handle:
+            live_rotation_write = secret_env_write_verdict(
+                handle.read(), '"$secret_ref"', "worker-live.sh")
+    except OSError:
+        live_rotation_write = (False, "worker-live.sh unreadable (fail closed)")
+    chk("script: the rotation write-back writes into the dispatch-secrets ENVIRONMENT",
+        live_rotation_write, (True, "ok"))
 
     # Pure scope verdict — accept AND reject directions.
     chk("scope: only github_token -> ok",

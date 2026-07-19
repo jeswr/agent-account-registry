@@ -30,8 +30,10 @@ secret_ref: ACCT_<HANDLE>_TOKEN   # the NAME of the GitHub secret holding this a
 notes: "..."
 ```
 
-The **token value** for each account is stored ONLY as a repository/organization **secret** named by
-`secret_ref` — never in the issue body, never in a comment, never in a public repo.
+The **token value** for each account is stored ONLY as a secret in this repo's
+**`dispatch-secrets` environment**, named by `secret_ref` — never at repository/organization
+scope (issue #101: the dispatch secrets-guard fails closed while ANY repo-scope secret exists),
+never in the issue body, never in a comment, never in a public repo.
 
 ## Lease-based claim / release (the cross-codebase mutex)
 
@@ -152,8 +154,12 @@ title (GitHub does not enforce unique titles).
 ### Step 1 — save the token as a secret (via stdin, never as a visible arg)
 
 Secrets live in the **`dispatch-secrets` environment**, NOT at repo scope (issue #101): the
-dispatch secrets-guard fails every tick closed while ANY repo-scope secret exists, so a
-repo-scope write here re-breaks dispatch until the migration is re-run.
+dispatch secrets-guard fails every tick closed while ANY repo-scope secret exists. If you
+accidentally write one at repo scope, recover by **deleting the stray directly**
+(`gh secret delete <NAME> -R jeswr/agent-account-registry`) and re-running the env-scoped
+command below — **never** by re-running the migration workflow: post-cleanup it cannot mint
+(the bootstrap repo copies are gone by design) and there is nothing left to migrate (see the
+header of `.github/workflows/migrate-secrets-to-env.yml`).
 
 ```bash
 tr -d '[:space:]' < ~/.claude-acct5-token | gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry --env dispatch-secrets
@@ -310,9 +316,9 @@ You don't paste tokens manually. Instead:
 2. The `set-up-account` workflow (trust-gated to the maintainer) runs the provider's device/OAuth
    login and **comments a sign-in URL + one-time code** on the issue.
 3. Sign in with the account you want to register. The broker captures the resulting token, stores it
-   as the account **secret** (`ACCTNN_TOKEN`) on the token-target repo, registers the account issue,
-   and closes the request. **The token is never printed** — only written to a mode-600 file and set
-   as a secret.
+   as the account **secret** (`ACCTNN_TOKEN`) in this registry's `dispatch-secrets` environment,
+   registers the account issue, and closes the request. **The token is never printed** — only
+   written to a mode-600 file and set as a secret.
 
 Providers: **OpenAI** via `codex login --device-auth` (native device flow); **Anthropic** via
 `claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_SECRETS_PAT` (a
