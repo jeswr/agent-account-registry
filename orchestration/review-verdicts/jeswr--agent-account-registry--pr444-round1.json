@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 444,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ca8ef29dca6cfa6c2036f0e0b239225dab3260ac",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_is_safe_field only checks type, length, and str.isprintable(). Consequently values such as model_alias=\"[redacted-account]\", run_id=\"[redacted-account]\", or reset_hint=\"[redacted-account] **@maintainer** <!-- marker -->\" are accepted and written to the public ledger. This contradicts the new _validate_record contract's claim that no field can carry a raw identifier or injected marker. It is particularly unsafe for reset_hint because that value is later interpolated into Markdown alert text. The added self-tests only put a raw handle in account and only test a newline in run_id, so they do not exercise these bypasses.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Define and enforce field-specific allowlists/grammars rather than treating all printable Unicode as a safe token. At minimum reject account-handle patterns in every public free-form field and constrain or escape reset_hint for its Markdown sink. Add negative construction and ledger-read tests for a raw handle in model_alias, run_id, and reset_hint, plus printable Markdown/HTML payloads; ensure the tests fail when those checks are removed.",
+    "severity": "major",
+    "title": "Printable-field validation still permits raw identifiers and markup injection"
+   }
+  ],
+  "progress": null,
+  "summary": "The new shared validator is fail-closed for shape, provider, class, size, and control characters, and the pre-PUT guard has a meaningful non-vacuous test. However, it does not enforce the stronger privacy/injection invariant that the change itself claims: printable text can still contain raw account handles and arbitrary Markdown/HTML. This is especially material for reset_hint, which is later rendered into maintainer-facing Markdown. The tests cover a raw handle only in the dedicated account field, leaving the bypasses in the other public free-form fields untested. Because this is a public trust-plane ledger and the stated poisoning defense remains incomplete, changes are required.",
+  "verdict": "request_changes"
+ }
+}
