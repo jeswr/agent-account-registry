@@ -1095,12 +1095,21 @@ jobs:
   # gate) BEFORE publish: a registry-write token co-located there could be hijacked (poisoned
   # registry checkout / $GITHUB_ENV / a lingering process) to forge provenance for arbitrary PRs
   # — precisely what this record must make impossible. This job executes NO target code, takes
-  # the implementer identity from the pre-hostile claim outputs, verifies the (post-hostile)
-  # pr_number against the live API bound to THIS run's issue, and stores only the SALTED account
-  # hash (privacy: the registry is public — locked decision 22a).
+  # the implementer identity from the pre-hostile claim outputs, verifies the (post-hostile) PR
+  # against the live API bound to THIS run's issue, and stores only the SALTED account hash
+  # (privacy: the registry is public — locked decision 22a).
+  #
+  # RECONCILE, don't trust the publisher's output (issue #128): `gh pr create` mutates GitHub
+  # BEFORE pr_number reaches $GITHUB_OUTPUT, so a lost response / cancellation / local failure
+  # after server-side creation would leave an open worker PR with an EMPTY pr_number — the record
+  # was skipped, the review sweep never enumerated the PR, and the open PR blocked re-attempt.
+  # This job therefore runs for EVERY acquired live attempt (not gated on pr_number) and recovers
+  # the PR from the DETERMINISTIC head branch — built from trusted run identity (issue + run
+  # id/attempt), never from the hostile worker output. A genuinely un-published attempt finds no
+  # PR and records nothing.
   provenance:
-    name: Record implementer provenance (no target code runs here)
-    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.worker.outputs.pr_number != '' }}
+    name: Reconcile + record implementer provenance (no target code runs here)
+    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
     needs: [resolve, claim, worker]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1117,26 +1126,52 @@ jobs:
           path: registry
           persist-credentials: false
 
-      - name: Record implementer provenance in the registry (salted account hash only)
+      # Independent bot identity (issue #128): the bot-authored check keys on the target App bot
+      # login, which the worker resolves as `<app-slug>[bot]` (the `target` step). Deriving it here
+      # from a FRESHLY minted token's app-slug — instead of reading needs.worker.outputs.bot_login —
+      # keeps reconciliation working even when a mid-publish CANCELLATION leaves the worker job's
+      # outputs empty. Minimal scope (contents:read): this step only needs the app-slug; the PR read
+      # is a public-repo read via github.token and the registry write is github.token contents:write.
+      - name: Mint target-scoped App token (bot identity only)
+        id: app-token-recon
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: read
+
+      - name: Reconcile the PR from the head branch and record provenance (salted account hash only)
+        id: provenance
         env:
           GH_TOKEN: ${{ github.token }}
           # Raw handle + salt arrive via env only (argv is echoed into public logs) and only the
           # 16-hex hash is stored; this job runs no target code, so the salt cannot leak to it.
           WORKER_IMPL_ACCOUNT: ${{ needs.claim.outputs.account }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          # DETERMINISTIC head branch — MUST match worker-live.sh's `branch=` construction. Built
+          # from trusted run identity (github.run_id/run_attempt are shared across every job in this
+          # run), never from the hostile worker job's pr_number output (issue #128).
+          HEAD_BRANCH: sparq-agent/issue-${{ inputs.issue_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # `<app-slug>[bot]` == the login the worker's `target` step verifies via /users/<slug>[bot].
+          VERIFY_BOT_LOGIN: ${{ steps.app-token-recon.outputs.app-slug }}[bot]
         run: |
-          python3 registry/scripts/worker-pr.py provenance-record \
+          python3 registry/scripts/worker-pr.py reconcile-provenance \
             --registry-repo "$GITHUB_REPOSITORY" \
             --target-repo "${{ inputs.target_repo }}" \
-            --pr "${{ needs.worker.outputs.pr_number }}" \
+            --head-branch "$HEAD_BRANCH" \
             --impl-provider "${{ needs.claim.outputs.provider }}" \
             --impl-alias "${{ needs.claim.outputs.model }}" \
             --issue "${{ inputs.issue_number }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
-            --verify-bot-login "${{ needs.worker.outputs.bot_login }}"
+            --verify-bot-login "$VERIFY_BOT_LOGIN"
 
+      # Guarded on the RECONCILED pr_number (issue #128): a genuinely un-published attempt records
+      # no provenance and has no PR to stamp, so these steps skip instead of failing on an empty PR.
       - name: Mint App token for the review-state stamp
         id: app-token-stamp
+        if: ${{ steps.provenance.outputs.pr_number != '' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
@@ -1147,12 +1182,13 @@ jobs:
           permission-pull-requests: write
 
       - name: Stamp the initial review state on the draft PR
+        if: ${{ steps.provenance.outputs.pr_number != '' }}
         env:
           GH_TOKEN: ${{ steps.app-token-stamp.outputs.token }}
         run: |
           python3 registry/scripts/worker-pr.py review-state set \
             --repo "${{ inputs.target_repo }}" \
-            --pr "${{ needs.worker.outputs.pr_number }}" \
+            --pr "${{ steps.provenance.outputs.pr_number }}" \
             --state needs
 
   # Model-access health record (registry #32): consumes the worker's exit CLASS (success OR any
