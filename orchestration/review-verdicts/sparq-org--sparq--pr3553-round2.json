@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves the prior major finding. The implementation preserves owl:topObjectProperty's role identity through extraction, applies the normative top-superproperty exemption before self-constraint and cycle analysis, and retains the pre-binarization told-chain representation needed by the regularity check. The focused helper test pins the previously failing ternary top self-chain, while top_superproperty_chain_is_regular exercises both classify_graph and Classifier::classify through the real Turtle extraction path. The public Report documentation and inference skill were updated consistently. No correctness, soundness, security, or test-validity issue remains in the diff-scoped evidence.",
+ "verdict": "approve"
+}
