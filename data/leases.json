@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct01",
-   "claim_id": "77cae8aaffd74128a95c33c48e05ae3e",
-   "holder": "sparq-org/sparq#3067@29705483559.1",
-   "package": "bench",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784498663,
-   "expires_at": 1784504963
-  },
-  {
-   "account": "acct01",
    "claim_id": "5e13ad1d7b0d4d32a9c9c45dc4444e77",
    "holder": "jeswr/agent-account-registry#414@dispatch-29705145212.1",
    "package": "workflows",
