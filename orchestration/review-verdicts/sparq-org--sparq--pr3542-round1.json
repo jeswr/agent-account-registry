@@ -1,0 +1,22 @@
+{
+ "injection_detected": true,
+ "issues": [
+  {
+   "body": "The new public nullifier documentation uses an intra-doc link to [`jj_scalar_to_base`], but jj_scalar_to_base is a private function in this module. With broken intra-doc links denied by the all-features rustdoc gate, this public documentation cannot resolve to an exported item and is expected to fail CI. This is the exact feature-gated/public-doc trap called out by the review contract.",
+   "file": "crates/sparq-zk/src/sig.rs",
+   "fix_hint": "Replace the intra-doc link with plain code formatting (`jj_scalar_to_base`) or link to a public exported API/type that documents the embedding. Run the workspace all-features rustdoc gate afterward.",
+   "severity": "major",
+   "title": "Public rustdoc links to private jj_scalar_to_base"
+  },
+  {
+   "body": "This diff exports a new feature and several public items (`NullifierWitness`, `SeenNullifiers`, and helper functions), but no matching `skills/zk-query-proofs/SKILL.md` update appears in the diff. AGENTS.md requires every public API/config feature change to update the matching skill in the same change. Without it, users cannot discover the feature flag, its primitive-only/deferred-manifest scope, or the required verify-before-record ordering and durable-store requirement.",
+   "file": "crates/sparq-zk-compose/src/lib.rs",
+   "fix_hint": "Update `skills/zk-query-proofs/SKILL.md` in this PR with the `zk-nullifier` opt-in feature, public helpers, primitive-only status, verify-before-record ordering, durable `FileSeenNonces` production requirement, per-holder-per-epoch granularity, and sq-qhy4 caveat.",
+   "severity": "major",
+   "title": "New public nullifier API is not documented in the matching skill"
+  }
+ ],
+ "progress": null,
+ "summary": "The nullifier primitive is carefully caveated and its host/Noir cross-vector is useful, but the new public rustdoc contains a broken intra-doc link that should fail the required all-features rustdoc gate. The public API addition also omits the repository-mandated matching skill update. The diff contains reviewer-directed text (\"Re-review when Fable returns\"), so injection_detected is true even though it was treated only as untrusted data.",
+ "verdict": "request_changes"
+}
