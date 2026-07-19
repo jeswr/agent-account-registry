@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3581,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "13ec298aba3c058d7f6b5f44911e3dd12a99c76c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `rustfmt (check)` gate runs `cargo fmt --all --check`, which formats only the members of the root workspace. bench/dict (and, per the clippy-lane comments, bench/parse and bench/serve) each carry their own `[workspace]` table, so `--all` never reaches them \u2014 the same isolation the neighboring `bench/dict standalone selftest` step exists to work around for clippy. Their formatting therefore remains unchecked, a small blind spot given the PR's intent to gate 'the workspace formatting'. Not a regression (it was never gated) and not blocking.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Optional: add a `cargo fmt --manifest-path bench/dict/Cargo.toml --check` (and bench/parse, bench/serve) alongside the existing standalone clippy step, or file a follow-up bead noting these workspaces are intentionally out of the fmt gate.",
+    "severity": "nit",
+    "title": "`cargo fmt --all` does not cover the standalone bench/ workspaces"
+   }
+  ],
+  "progress": null,
+  "summary": "PR flips rustfmt from informational to a hard gate and applies the one-time `cargo fmt --all` reformat across the workspace. The one functional change is in .github/workflows/ci.yml: the `rustfmt` step drops `continue-on-error: true` and runs `cargo fmt --all --check`, and the lint job is renamed `clippy (gate) + fmt (non-blocking)` -> `fmt + clippy (gate)`. The rename is correct: neither 'informational' nor 'advisory' appears, so the ci-summary gate still treats the job as gating (the documented sq-wjth/sq-0lk hazard). The CI runner installs rustfmt via `rustup component add rustfmt clippy`, so the gate is runnable there. The rest of the diff is a mechanical rustfmt pass (multiline struct literals, use-list reordering, method-chain/match-arm rewrapping). I spot-checked ~15 chunks across sparq-acbench, sparq-conformance (incl. entail.rs match arms with `if v < 0` guards and the solve/inconsistency boolean-chain rewrites), sparq-cli, sparq-canon, sparq-bench \u2014 all pure formatting with no logic change. I could not run `cargo fmt --all --check` locally (read-only FS; rustfmt component uninstallable), but completeness is self-enforced: any missed file fails the newly-added gate and blocks merge. No correctness, soundness, or security issues. Minor: the standalone workspaces bench/dict, bench/parse, bench/serve are not reached by `cargo fmt --all`, so their formatting stays ungated \u2014 a blind spot in the 'workspace formatting' claim, not a regression.",
+  "verdict": "approve"
+ }
+}
