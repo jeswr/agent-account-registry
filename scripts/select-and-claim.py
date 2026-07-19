@@ -122,12 +122,18 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
             if now < until:
                 return False                          # rate-limited earlier — backed off until it expires
         return True                                   # non-metered provider (e.g. codex) — not probe-gated
-    if str(u.get("status", "")).lower() not in ("allowed", ""):
-        return False                                  # throttled/rejected -> skip until it resets
+    if str(u.get("status", "")).strip().lower() != "allowed":
+        # [ISSUE #196] require status EXACTLY `allowed`: an empty status was previously accepted
+        # (the `("allowed", "")` set) and failed open as eligible capacity.
+        return False                                  # empty/throttled/rejected -> not eligible
     for prefix in ("5h", "7d"):
         util, _ = _usage_window(u, prefix)
-        if util is None or (1.0 - util) < margin:
-            return False                              # unknown, or too little headroom to finish
+        # [ISSUE #196] Validate the SHAPE before trusting the headroom comparison: a base window of
+        # `nan` (every comparison is false, so `(1 - util) < margin` never fires) or a NEGATIVE
+        # utilization (looks like excess headroom) otherwise slips through and admits the account.
+        # Require a finite fraction in [0,1]; anything else is fail-closed ineligible.
+        if util is None or not (0.0 <= util <= 1.0) or (1.0 - util) < margin:
+            return False                              # unknown, malformed, or too little headroom
     if model in PREMIUM_MODELS and not _fable_eligible(u, margin):
         return False                                  # [FABLE-5] whole-account fine, but Fable bucket isn't
     return True
@@ -1126,6 +1132,21 @@ def _self_test():
     check("ineligible: 7d full", usage_eligible({**fresh, "7d_util": 0.95}), False)
     check("ineligible: unknown window", usage_eligible({"status": "allowed", "5h_util": 0.1}), False)
     check("eligible: exempt provider (codex)", usage_eligible({"exempt": True}), True)
+    # [ISSUE #196] malformed base SHAPE must fail CLOSED, not fail open as eligible capacity. Each
+    # of these admitted the account before the fix: a NaN window (all comparisons false, so the
+    # `(1 - util) < margin` headroom test never fired), a NEGATIVE utilization (looks like excess
+    # headroom), an out-of-range fraction, and an EMPTY/MISSING status (once read as `allowed`).
+    check("ineligible: NaN 5h util (fails open pre-fix)",
+          usage_eligible({**fresh, "5h_util": float("nan")}), False)
+    check("ineligible: string NaN 5h util", usage_eligible({**fresh, "5h_util": "nan"}), False)
+    check("ineligible: negative 7d util (fake headroom pre-fix)",
+          usage_eligible({**fresh, "7d_util": -1}), False)
+    check("ineligible: string negative util", usage_eligible({**fresh, "5h_util": "-1"}), False)
+    check("ineligible: out-of-range (>1) utilization", usage_eligible({**fresh, "5h_util": 1.5}), False)
+    check("ineligible: empty status (once accepted as allowed)",
+          usage_eligible({**fresh, "status": ""}), False)
+    check("ineligible: missing status",
+          usage_eligible({"5h_util": 0.1, "5h_reset": 5000, "7d_util": 0.1, "7d_reset": 9000}), False)
 
     # ---- probe-exempt (openai) + reactive backoff (decision 2026-07-17, registry issue #29) ----
     # (i) openai/codex accounts are eligible WITHOUT usage data — deleting the exempt arm turns

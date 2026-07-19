@@ -108,11 +108,17 @@ def _assemble_usage(hdr):
 
 
 def _probe_anthropic(token):
-    """Whole-account 5h/7d usage via a cheap, ungated haiku probe. None -> fail-closed omit."""
+    """Whole-account 5h/7d usage via a cheap, ungated haiku probe. None -> fail-closed omit.
+    A well-SHAPED entry is required: a base window that drifts to `nan`/`-1`/'' (or an empty
+    status) is OMITTED here (issue #196) instead of being emitted to fail open as eligible
+    capacity downstream — see _valid_base_usage."""
     hdr = _probe_headers(token, "claude-haiku-4-5")
     if hdr is None or hdr.get("status") is None:
         return None  # transport error or no rate-limit headers (e.g. 401/blocked) -> fail-closed omit
-    return _assemble_usage(hdr)
+    entry = _assemble_usage(hdr)
+    if not _valid_base_usage(entry):
+        return None  # malformed status / base-utilization shape (issue #196) -> fail-closed omit
+    return entry
 
 
 def _valid_utilization(val):
@@ -127,6 +133,25 @@ def _valid_utilization(val):
     except (TypeError, ValueError):
         return False
     return 0.0 <= num <= 1.0
+
+
+def _valid_base_usage(entry):
+    """True iff the whole-account base entry is well-SHAPED enough to gate dispatch (issue #196).
+    The strict [0,1] utilization validator above was used ONLY for the Fable sub-quota, so a
+    provider shape drift that left a BASE 5h/7d window as `nan`, `-1`, `1.5`, `''` — or an empty
+    status — was emitted UNCHANGED and failed open downstream: a NaN compares false in every
+    direction (so the `(1 - util) < margin` headroom test never fires) and a negative utilization
+    looks like excess headroom, so choose_account admitted the account as eligible capacity.
+    Require a NON-EMPTY status and BOTH base windows to be finite fractions in [0,1]; a caller
+    OMITS the account (fail-closed) on any mismatch. A well-formed NON-`allowed` status (e.g.
+    `throttled`) is a valid provider state, NOT a shape mismatch — it is kept so usage-alert can
+    report it precisely, and the eligibility gate (select-and-claim.usage_eligible) is what
+    requires status exactly `allowed`. Pure — unit-tested by --self-test."""
+    if not isinstance(entry, dict):
+        return False
+    if not str(entry.get("status") or "").strip():
+        return False  # empty/missing status is a shape mismatch (an empty status once read as allowed)
+    return _valid_utilization(entry.get("5h_util")) and _valid_utilization(entry.get("7d_util"))
 
 
 def _assemble_fable(hdr):
@@ -518,6 +543,24 @@ def _self_test():
         "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n"))
     chk("fable good sans limit: fable_ok", (fable_nolimit or {}).get("fable_ok"), True)
     chk("fable good sans limit: no limit key", "fable_7d_oi_limit" in (fable_nolimit or {}), False)
+    # [ISSUE #196] the SAME strict validator now guards the BASE 5h/7d windows (previously only the
+    # Fable sub-quota): a malformed base window / empty status OMITS the account (fail-closed) rather
+    # than being emitted to fail open as eligible capacity downstream. `good_base` is the parsed
+    # allowed/0.42/0.1 header from above.
+    good_base = _assemble_usage(hdr)
+    chk("base usage: well-formed allowed entry is usable", _valid_base_usage(good_base), True)
+    chk("base usage: well-formed throttled entry kept (valid state, not a shape mismatch)",
+        _valid_base_usage({**good_base, "status": "throttled"}), True)
+    chk("base usage: empty status -> omit", _valid_base_usage({**good_base, "status": ""}), False)
+    chk("base usage: missing status -> omit",
+        _valid_base_usage({"5h_util": "0.4", "7d_util": "0.1"}), False)
+    chk("base usage: NaN 5h util -> omit", _valid_base_usage({**good_base, "5h_util": "nan"}), False)
+    chk("base usage: negative 7d util -> omit", _valid_base_usage({**good_base, "7d_util": "-1"}), False)
+    chk("base usage: >1 util -> omit", _valid_base_usage({**good_base, "5h_util": "1.5"}), False)
+    chk("base usage: non-numeric util -> omit",
+        _valid_base_usage({**good_base, "7d_util": "unknown"}), False)
+    chk("base usage: missing window -> omit", _valid_base_usage({**good_base, "5h_util": None}), False)
+    chk("base usage: non-dict -> omit", _valid_base_usage(None), False)
     # ---- probe-exempt backoff overlay (decision 2026-07-17, registry issue #29) ----
     import tempfile
     script_dir = os.path.dirname(os.path.abspath(__file__))
