@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 434,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ee79090848d28a3c38a8e17e3243e10df6a1e598",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_porcelain_changed_paths` parses NUL records correctly but emits each raw path followed by `\\n`, after which command substitution, `printf`, `mapfile`, and `_registry_selftest_targets` all treat newlines as record boundaries. Git permits newline bytes in filenames. For example, a changed path named `.github/workflows/evil\\n.yml` is split into `.github/workflows/evil` and `.yml`; neither matches `.github/workflows/*.yml`, so it receives no direct workflow validation and the gate may still pass because zero targets is explicitly allowed for docs/data-only changes. The same construction can hide `scripts/*.py` or `scripts/*.sh`. The new self-test only exercises spaces, not the control-character case claimed by the implementation, so it does not catch this bypass.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Preserve unambiguous record framing through classification (for example, perform the path matching in the NUL-aware Python stage and emit typed targets, or use a reversible encoding that cannot contain newlines). Add a fixture containing an actual newline in a workflow/script filename and assert that the corresponding direct target is produced; also cover rename endpoints with such a filename.",
+    "severity": "blocker",
+    "title": "Newline-containing control paths still bypass registry classification"
+   }
+  ],
+  "progress": null,
+  "summary": "The NUL-aware Git parser fixes spaces and rename endpoint handling, and its listed assertions are non-vacuous. However, it immediately converts arbitrary Git path bytes to newline-delimited text. Because newline is valid in a Git filename, this reintroduces a classification bypass in the registry self-test gate and contradicts the stated control-character safety. The change is therefore not complete or fail-closed.",
+  "verdict": "request_changes"
+ }
+}
