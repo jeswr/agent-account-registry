@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-1 exact-binding defect is resolved. `_current_links` now derives exactly one source issue from the authenticated worker branch match and ignores all body closing references, while retaining fail-closed checks for bot identity, same-repository heads, the worker marker, and worker-shaped branches. The new direct and end-to-end cross-reference tests are non-vacuous: restoring body-derived linkage would change the asserted maps/action sets and fail them. The outsider, fork, non-bot, missing-marker, and empty-bot cases also meaningfully exercise the identity gate. Both planning and mutation-boundary rechecks use the strengthened linkage consistently. No blocker, major, or other actionable issue is supported by the diff.",
+ "verdict": "approve"
+}
