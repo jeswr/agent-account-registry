@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-2 major finding is resolved. Target routing keywords are now derived through the shared policy resolver, which validates the repository policy row and full routing document and raises on missing, unreadable, malformed, or structurally invalid inputs; resolution therefore cannot continue with a reduced permissive keyword set. The keyword union is safely encoded through the workflow output and supplied to the arm-side live classifier, which rechecks both PR and source-issue labels and fails closed on malformed payloads. The new tests are non-vacuous: they verify successful keyword extraction, each relevant failure mode, positive and negative routing-keyword controls, label-only audit behavior on benign paths, and refusal on unreadable live state. No reviewer-directed instruction was detected in the diff.",
+ "verdict": "approve"
+}
