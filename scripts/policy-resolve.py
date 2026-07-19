@@ -285,6 +285,25 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
     }
 
 
+def routing_security_keywords(target_repo, policy_file=POLICY_PATH, target_root="."):
+    """FAIL-CLOSED union of every `[[route]].match_labels` keyword in TARGET_REPO's routing.
+
+    [#153 / #325 round 2] This is the keyword source for the arm-side live security-label
+    classifier (review-fix.yml resolve -> worker-pr.live_security_flagged). Any inability to
+    load the policy row, resolve the routing pointer, parse the routing file, or validate its
+    structure RAISES PolicyError — it must never return a reduced set: a silently dropped
+    target keyword (e.g. the registry's own worker/dispatch) would let a security label added
+    during review classify as benign and auto-arm without the trust-surface audit.
+    """
+    policy = _policy_row(target_repo, _load_toml(policy_file, "policy file"))
+    routing_file = Path(target_root).joinpath(*PurePosixPath(policy["routing"]).parts)
+    _, security_routes, _ = _validated_routing(_load_toml(routing_file, "routing file"))
+    keywords = set()
+    for match_keywords, _value in security_routes:
+        keywords.update(match_keywords)
+    return sorted(keywords)
+
+
 def _self_test():
     policy = tomllib.loads('''
 [repos."sparq-org/sparq"]
@@ -464,6 +483,43 @@ agent = "docs-agent"
     rejects("security override rejects a docs-only alias", "docs-only",
             lambda: resolve("sparq-org/sparq", ["role:impl", "area:sparq-zk"], policy,
                             bad_security_docs))
+    # [#153 / #325 round 2] routing_security_keywords feeds the ARM-time live label audit; it
+    # must fail CLOSED — a missing/unknown policy row or a missing/malformed/invalid routing
+    # RAISES instead of degrading to a reduced (permissive) keyword set that would let a
+    # security label added mid-review classify as benign and reach the arm step unaudited.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path(tmp)
+        tmp_policy = tmp_root / "repos.toml"
+        tmp_policy.write_text(
+            '[repos."o/r"]\nenabled=true\nrouting="orchestration/routing.toml"\n'
+            'account_pool=["acct01"]\nmax_concurrent=1\nworker_timeout_minutes=30\n'
+            'gate_profile="lint-only"\narm_auto_merge=false\nmax_attempts=1\n'
+            'trust="collaborators"\n', encoding="utf-8")
+        tmp_target = tmp_root / "target"
+        (tmp_target / "orchestration").mkdir(parents=True)
+        tmp_routing = tmp_target / "orchestration" / "routing.toml"
+        tmp_routing.write_text(
+            '[models.fable]\nprovider = "anthropic"\n\n[defaults]\n'
+            'model_chain = ["fable"]\nagent = "default-agent"\n\n[[route]]\n'
+            'match_labels = ["worker", "dispatch"]\nmodel_chain = ["fable"]\n'
+            'agent = "security-agent"\n', encoding="utf-8")
+        check("routing security keywords surfaced for the arm-side classifier",
+              routing_security_keywords("o/r", tmp_policy, tmp_target),
+              ["dispatch", "worker"])
+        rejects("unknown repo yields NO keyword set (fail closed)", "unknown target repo",
+                lambda: routing_security_keywords("other/repo", tmp_policy, tmp_target))
+        rejects("missing routing file yields NO keyword set (fail closed)",
+                "cannot load routing file",
+                lambda: routing_security_keywords("o/r", tmp_policy, tmp_root / "empty"))
+        tmp_routing.write_text("not = valid = toml", encoding="utf-8")
+        rejects("malformed routing TOML yields NO keyword set (fail closed)",
+                "cannot load routing file",
+                lambda: routing_security_keywords("o/r", tmp_policy, tmp_target))
+        tmp_routing.write_text('[models.fable]\nprovider = "anthropic"\n', encoding="utf-8")
+        rejects("structurally invalid routing yields NO keyword set (fail closed)",
+                "routing defaults table is required",
+                lambda: routing_security_keywords("o/r", tmp_policy, tmp_target))
     check("pure core leaves fixtures unchanged",
           policy == policy_before and routing == routing_before, True)
     print("policy-resolve self-test", "PASSED" if ok else "FAILED")
