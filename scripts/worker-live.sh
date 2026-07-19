@@ -650,8 +650,15 @@ _registry_selftest_targets() {
     case "$path" in
       scripts/*.py)
         base=${path#scripts/}
-        # only scripts that are part of the known self-testing suite are run (a data/helper py
-        # with no --self-test would otherwise fail closed spuriously)
+        # [issue #140] EVERY touched python file gets a direct py_compile syntax check. A non-suite
+        # helper/data py was previously classified into NOTHING and slipped through unvalidated while
+        # the always-run suite incremented the counter — so the gate could pass having validated only
+        # unrelated files. Emit a py: compile target for the actual change regardless of suite
+        # membership.
+        printf 'py:%s\n' "$path"
+        # A suite script is ADDITIONALLY run via --self-test (validates the change's behaviour, not
+        # just its syntax). A data/helper py with no --self-test stays compile-only — a spurious
+        # --self-test on it would fail closed for the wrong reason.
         case " $suite " in *" $base "*) printf 'self:%s\n' "$base" ;; esac
         ;;
       scripts/*.sh)
@@ -759,8 +766,10 @@ registry_selftest_gate() {
   local -a targets=()
   mapfile -t targets < <(printf '%s\n' "$changed" | _registry_selftest_targets "$FULL_SELFTEST_SUITE")
 
-  local ran=0 t kind name
-  # 1) EVERY touched self-testing script, run directly (validates the change itself).
+  # `direct` counts validations of the ACTUAL touched files (targets); `ran` counts the always-run
+  # regression suite. Non-vacuity is measured against `direct`, never the suite — see the final gate.
+  local ran=0 direct=0 t kind name
+  # 1) EVERY touched self-testing script, run directly (validates the change's behaviour).
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == self ]]; then
@@ -770,12 +779,27 @@ registry_selftest_gate() {
       else
         python3 "scripts/$name" --self-test || die "self-test failed: $name"
       fi
-      ran=$((ran + 1))
+      direct=$((direct + 1))
+    fi
+  done
+
+  # 1b) [issue #140] py_compile EVERY touched python file (suite or not). The previous gate only ran
+  #     a touched suite script's --self-test and left a non-suite helper/data py with NO direct check
+  #     — the always-run suite still incremented the counter, so the gate passed having validated only
+  #     unrelated files. A direct compile of the actual change closes that hole.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == py ]]; then
+      printf 'worker-live: py_compile %s\n' "$name"
+      python3 -m py_compile "$name" || die "py_compile failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
   # 2) The FULL recent-wave suite (regression backstop): every suite script present in the tree,
   #    run once. A touched script already ran above; running it twice is harmless + idempotent.
+  #    Suite runs count toward `ran` (coverage exists) but NOT toward `direct`: the suite validates
+  #    unrelated files, so it must never be what makes the gate non-vacuous.
   local script
   for script in $FULL_SELFTEST_SUITE; do
     [[ -f "scripts/$script" ]] || continue
@@ -794,21 +818,25 @@ registry_selftest_gate() {
     if [[ "$kind" == bash ]]; then
       printf 'worker-live: bash -n %s\n' "$name"
       bash -n "$name" || die "bash -n failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
-  # 4) actionlint + a yaml parse on every touched workflow.
+  # 4) yaml parse + actionlint on every touched workflow. [issue #140] actionlint is the SEMANTIC
+  #    linter; a yaml parse only proves the file is well-formed. Silently degrading to yaml-only when
+  #    actionlint is absent (the worker gate lane never installs it) let a semantically-broken
+  #    trust-plane workflow pass the gate, so a touched workflow now FAILS CLOSED when actionlint is
+  #    unavailable rather than under-validating it.
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == wf ]]; then
       printf 'worker-live: lint workflow %s\n' "$name"
       python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$name" \
         || die "yaml parse failed: $name"
-      if command -v actionlint >/dev/null 2>&1; then
-        actionlint "$name" || die "actionlint failed: $name"
-      else
-        printf 'worker-live: actionlint not on PATH; yaml parse only for %s\n' "$name"
-      fi
+      command -v actionlint >/dev/null 2>&1 \
+        || die "actionlint unavailable but a workflow changed: $name (fail closed — install a pinned actionlint)"
+      actionlint "$name" || die "actionlint failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
@@ -819,12 +847,20 @@ registry_selftest_gate() {
     if [[ "$kind" == dockerfile ]]; then
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
-      ran=$((ran + 1))
+      direct=$((direct + 1))
     fi
   done
 
+  # [issue #140] Non-vacuity is measured against the ACTUAL change: every touched control file
+  # (`targets`) must have been directly validated above. `ran` only proves the regression backstop
+  # ran; `direct == #targets` proves nothing touched slipped through unchecked (and flips closed if a
+  # future classification emits a target kind that no loop validates). A docs/data-only diff
+  # legitimately has no targets — the suite backstop (ran>0) still covers it.
   [[ "$ran" -gt 0 ]] || die 'registry-selftest gate ran no suite (fail closed — nothing validated)'
-  printf 'worker-live: registry-selftest gate passed (%s suite run(s))\n' "$ran"
+  [[ "$direct" -eq "${#targets[@]}" ]] \
+    || die "registry-selftest gate: a touched control file was not directly validated (fail closed): $direct/${#targets[@]}"
+  printf 'worker-live: registry-selftest gate passed (%s direct validation(s), %s suite run(s))\n' \
+    "$direct" "$ran"
 }
 
 # Model naming (maintainer directive 2026-07-18): sol is the codex-side FRONTIER model
@@ -1728,6 +1764,7 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "scripts/backfill-provenance.py" \
     "scripts/dashboard-gen.py" \
     "scripts/pat-validity.py" \
+    "scripts/newhelper.py" \
     "containers/worker-model.Dockerfile" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
@@ -1740,6 +1777,16 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(grep -c 'wf:.github/workflows/dispatch.yml' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate ignores a non-suite data path" \
     "$(grep -c 'leases.json' <<< "${sel//,/$'\n'}" || true)" "0"
+  # [issue #140] every touched python file is compile-checked. A suite py emits BOTH a py: compile
+  # target and its self: run; a NON-suite helper py (previously classified into NOTHING, so it
+  # slipped through the gate unvalidated) now emits a py: compile target — but NO spurious self:,
+  # since it has no --self-test. These flip red if the compile classification regresses.
+  chk "registry gate compiles a touched suite py" \
+    "$(grep -c 'py:scripts/worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate compiles a touched NON-suite py (was unvalidated before #140)" \
+    "$(grep -c 'py:scripts/newhelper.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate does NOT self-test a non-suite py (compile-only, no --self-test)" \
+    "$(grep -c 'self:newhelper.py' <<< "${sel//,/$'\n'}" || true)" "0"
   chk "registry gate runs a touched non-.sh suite py" \
     "$(grep -c 'self:backfill-provenance.py' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate runs the dashboard privacy self-test" \
