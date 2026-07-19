@@ -1005,6 +1005,24 @@ def _ledger_leases(ledger_root):
     return leases if isinstance(leases, list) else None
 
 
+def review_item_crate_superseded(repo, number, issue_number, package, leases, now):
+    """[issue #114] CLAIM-side cross-lane crate re-check for ONE review/fix item, re-derived
+    against the LIVE ledger IMMEDIATELY before its claim. The review/fix lane re-validates the
+    PR live (open/draft/head/provenance/CI) but otherwise TRUSTS the PLAN artifact's
+    enumerate_review_items superseded-until-sibling-resolves decision — which read a PLAN-time
+    ledger snapshot. Meanwhile allocator.claim's partition_available serializes only SAME-prefix
+    leases (impl `<repo>#<issue>` vs `review:`/`fix:`), so a sibling lease (any lane) that landed
+    on this PR's crate in the PLAN->CLAIM window is invisible to the claim below and the two lanes
+    would progress on one crate at once. True when a FOREIGN live lease holds this PR's crate,
+    re-derived against the same live ledger the worker loop's revalidate_items_against_live_pulls
+    reads; the PR's OWN review:/fix: leases and its source issue's impl lease are excepted (the
+    identical own-key set the enumerator uses). Ambiguity (None/malformed ledger, unknown crate)
+    fails toward True (defer), fail-closed like the worker loop."""
+    own_keys = {f"review:{repo}#{number}", f"fix:{repo}#{number}", f"{repo}#{issue_number}"}
+    packages = {package} if isinstance(package, str) and package else set()
+    return sibling_lease_conflict(repo, own_keys, packages, leases, now)
+
+
 def provenance_admission_error(record, pr_number):
     """Return why a PARSED provenance record for target PR ``pr_number`` is NOT admissible by
     the review loop, or None when it passes EVERY record-shape requirement of EVERY consumer.
@@ -1589,6 +1607,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     launched = 0
     script_dir = Path(__file__).resolve().parent
     max_rounds = int(policy.get("max_review_rounds", 3))
+    # [issue #114] ONE live cross-lane ledger view for this tick's review/fix claims, read from
+    # the same data-plane checkout the worker loop reads (a static snapshot: allocator claims land
+    # on the REMOTE ledger via CAS, not this file, so a per-item re-read yields nothing new). None
+    # -> the per-item check fails closed to exclusion, exactly like the worker loop.
+    live_leases = _ledger_leases(ledger_root)
     for item in review_items:
         number = item["pr_number"]
         lane = _review_item_lane(item["state"])
@@ -1879,6 +1902,17 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             print(f"defer review {repo}#{number}: revalidation failed ({exc}); skipped")
             continue
         now = int(time.time())
+        # [issue #114] Re-derive the cross-lane crate check against the LIVE ledger IMMEDIATELY
+        # before the claim. allocator.claim's partition_available only serializes SAME-prefix
+        # leases, so a sibling lease (any lane) that landed on this PR's crate in the PLAN->CLAIM
+        # window is invisible to it; defer (fail closed) and re-enter next tick when the sibling
+        # releases/expires — the review/fix analogue of the worker loop's live busy revalidation.
+        if review_item_crate_superseded(repo, number, issue_number, item["package"],
+                                        live_leases, now):
+            defer_reasons["live-busy-crate"] += 1
+            print(f"defer review {repo}#{number}: a live sibling lease (any lane) holds its "
+                  "crate on the live ledger (PLAN->CLAIM window); retried next tick")
+            continue
         holder = f"{holder_prefix}{repo}#{number}@dispatch-" \
                  f"{os.environ.get('GITHUB_RUN_ID', 'local')}." \
                  f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
@@ -2976,6 +3010,25 @@ def _self_test():
                                   [sibling_impl], now) is False
     assert sibling_lease_conflict(repo, set(), {"crate-a"}, [], now) is False
 
+    # [issue #114] review_item_crate_superseded: the CLAIM-side per-item cross-lane re-check that
+    # re-derives the enumerator's superseded-until-sibling-resolves decision against the LIVE
+    # ledger immediately before the claim — allocator.claim's partition_available serializes only
+    # SAME-prefix leases, so a sibling lease that landed in the PLAN->CLAIM window is invisible to
+    # the claim. A FOREIGN live lease on the item's crate (any lane) supersedes it...
+    assert review_item_crate_superseded(
+        repo, 41, 7, "crate-a",
+        [{"holder": f"{repo}#88@d.1", "package": "crate-a", "expires_at": now + 600}], now) is True
+    # ...but the item's OWN leases — its review:/fix: lease and its source issue's impl lease —
+    # never self-exclude (the IDENTICAL own-key set enumerate_review_items excepts)
+    for own in (f"review:{repo}#41", f"fix:{repo}#41", f"{repo}#7"):
+        assert review_item_crate_superseded(
+            repo, 41, 7, "crate-a",
+            [{"holder": f"{own}@d.1", "package": "crate-a", "expires_at": now + 600}], now) is False
+    # a free crate admits; a None ledger (no wired/readable checkout) FAILS CLOSED to defer,
+    # exactly like the worker loop's revalidation
+    assert review_item_crate_superseded(repo, 41, 7, "crate-a", [], now) is False
+    assert review_item_crate_superseded(repo, 41, 7, "crate-a", None, now) is True
+
     # ---- [round-6 P1] REPOSITORY SCOPE: the ledger is fleet-wide but package/__global__
     # partitions are PER-REPO — a live lease in ANOTHER target must never block this
     # target (unscoped, the sibling check itself recreates cross-repo frontier collapse).
@@ -3448,6 +3501,17 @@ def _self_test():
         record_file = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, 41)
         record_file.parent.mkdir(parents=True)
         record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
+        # [issue #114] the CLAIM-side review/fix lane re-reads the live data-plane ledger before
+        # each claim; an empty ledger leaves every crate free (a MISSING file would fail closed to
+        # defer-all — the same fail-closed posture the worker loop takes on an unreadable ledger).
+        ledger_data_dir = Path(wiring_ledger_root) / "data"
+        ledger_data_dir.mkdir(parents=True)
+
+        def write_leases(rows):
+            (ledger_data_dir / "leases.json").write_text(
+                json.dumps({"leases": rows}), encoding="utf-8")
+
+        write_leases([])
         try:
             globals()["_gh_json"] = fake_gh_json
             globals()["_run_target_helper"] = fake_helper
@@ -3556,6 +3620,26 @@ def _self_test():
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
             assert alloc.chains == [["fable", "opus"]], alloc.chains
+
+            # [issue #114 WIRING] a FOREIGN sibling lease that appeared on the item's crate in the
+            # PLAN->CLAIM window DEFERS the claim (live-busy-crate) BEFORE the allocator is reached
+            # — the allocator's same-prefix partition_available would never have seen it, so the
+            # separate worker/review lease prefixes could otherwise co-run one crate. NON-VACUOUS:
+            # the same fix_item reached the claim (alloc.chains non-empty) with a free ledger just
+            # above, and reaches it again below once the lease is keyed as the item's OWN.
+            write_leases([{"holder": f"{repo}#88@d.1", "package": "crate-a",
+                           "expires_at": 9999999999}])
+            alloc = FakeAllocator()
+            _, reasons_114 = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert reasons_114["live-busy-crate"] == 1, reasons_114
+            # the item's OWN source-issue impl lease on the same crate never self-excludes it
+            write_leases([{"holder": f"{repo}#7@d.1", "package": "crate-a",
+                           "expires_at": 9999999999}])
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            write_leases([])   # restore the free ledger for the remaining wiring cases
 
             # a recorded bot pin governs the chain even under budget (the floor never lowers) —
             # a fable floor offers ONLY fable (tiers below the floor are never offered) ...
