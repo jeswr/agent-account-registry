@@ -1280,7 +1280,17 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 "context": context[:CI_CONTEXT_MAX],
             })
 
-        # GAP-B: conflict repair FIRST and alone — CI on a conflicted base is noise.
+        # GAP-B: conflict repair FIRST and alone — CI on a conflicted base is noise. This is
+        # REVIEW-STATE-AGNOSTIC by design (issue #351, the #256 limbo): a review:pass PR is
+        # armable (decision 7 REVISED) but the arm can NEVER merge a conflicting base, so a
+        # pass verdict on a conflicting base is NOT a terminal arm-and-wait — it emits
+        # needs-rebase exactly like any other non-terminal state. The pass does NOT survive
+        # the rebase: the pushed merge advances the head and the fix outcome flips the PR to
+        # review:needs (see the repair dispatch below — "every pushed repair flips to
+        # review:needs"), so a verdict bound to the now-STALE base is re-verified against the
+        # merged-in code rather than auto-armed on content it never reviewed. (A no-op rebase
+        # that pushes nothing is guarded elsewhere and legitimately leaves the pass intact —
+        # nothing merged in, nothing to re-verify.)
         if status.get("conflicting") is True:
             if lease_free:
                 emit("needs-rebase")
@@ -3782,6 +3792,21 @@ def _self_test():
                   body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
     assert [item["state"] for item in enumerate_review_items(
         repo, [passed], provenance, [], issue_labels, now, pr_status=red)] == ["needs-ci-fix"]
+    # Issue #351 (the #256 limbo): a non-draft review:pass PR (decision-7 armable) on a
+    # CONFLICTING base is NOT a terminal arm-and-wait — the arm can never merge a conflicting
+    # base, so the conflict-first block emits needs-rebase REGARDLESS of the pass verdict
+    # (review-state-agnostic). GAP-B still beats GAP-A here: a red gate on the conflicted base
+    # is noise, so the pass PR emits needs-rebase, NOT needs-ci-fix. (Gating the conflict block
+    # on review state would flip this to needs-ci-fix and re-strand #256 — the mutation check.)
+    passed_conflicting = {41: status_of(sha_a, gate="failure", conflicting=True, legs=["js"])}
+    assert [(item["state"], item["context"]) for item in enumerate_review_items(
+        repo, [passed], provenance, [], issue_labels, now,
+        pr_status=passed_conflicting)] == [("needs-rebase", "")]
+    # ... and a live review/fix lease suppresses it exactly like any other repair state
+    for holder in (f"review:{repo}#41@run.1", f"fix:{repo}#41@run.1"):
+        assert enumerate_review_items(
+            repo, [passed], provenance, [{"holder": holder, "expires_at": now + 100}],
+            issue_labels, now, pr_status=passed_conflicting) == []
     # review:needs-user stays terminal for the repair states too (escalation must halt the loop)
     stopped = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs-user"])
     assert enumerate_review_items(repo, [stopped], provenance, [], issue_labels, now,
