@@ -1171,8 +1171,9 @@ class FleetResolution:
     `accounts` is {provider: set-of-salted-hashes}. `ok` is True when resolution SUCCEEDED — even
     with a genuinely empty fleet (no enabled repos/pool, or a catalog with no matching accounts, is
     a valid configuration, not a failure). `ok` is False only when the fleet could NOT be observed
-    at all: an unreadable/malformed policy, a failing account-catalog API, or a missing salt. Those
-    three must NEVER be mistaken for an empty fleet, because an empty fleet silently deletes the
+    COMPLETELY: an unreadable/malformed policy, a failing account-catalog API, a missing salt, or a
+    catalog that fails to map every enabled handle to exactly one provider. Those failures must
+    NEVER be mistaken for an empty (or smaller) fleet, because an empty fleet silently deletes the
     provider-capped arm and shifts the provider-outage threshold to the observed-record fallback
     while `decide` still reports success — the exact silent-disable this type exists to prevent.
     `reason` is a concise, credential-free description of the failure (None when ok)."""
@@ -1187,8 +1188,9 @@ def _enabled_provider_accounts(api, registry_repo, policy_path, salt):
     """Resolve the enabled fleet into a FleetResolution (issue #206). {provider: set-of-salted-
     hashes} is needed by provider-capped ("EVERY enabled account"): the union of the enabled policy
     rows' account_pool, mapped to provider via the account catalog, then salted. A FAILURE to
-    resolve (unreadable policy, catalog API failure, missing salt) returns ok=False so the caller
-    can fall back to the last known-good snapshot and raise a durable configuration alert instead of
+    resolve (unreadable policy, catalog API failure, missing salt, or an INCOMPLETE catalog that
+    leaves any enabled handle without exactly one provider) returns ok=False so the caller can fall
+    back to the last known-good snapshot and raise a durable configuration alert instead of
     silently disabling the arm. A genuinely empty fleet returns ok=True. Never emits a raw handle."""
     import tomllib
     try:
@@ -1209,11 +1211,11 @@ def _enabled_provider_accounts(api, registry_repo, policy_path, salt):
         # a real misconfiguration (the capped decision cannot be computed), never an empty fleet.
         return FleetResolution({}, ok=False, reason="PROVENANCE_SALT is missing")
     # account catalog: handle -> provider (open account issues, title=handle, YAML body).
-    result = {}
     try:
         issues = api.paginate(f"/repos/{registry_repo}/issues?state=open")
     except HealthError:
         return FleetResolution({}, ok=False, reason="account catalog API is unreadable")
+    mapped = {}  # handle -> set of DISTINCT providers the catalog claims for it
     for it in issues:
         if not isinstance(it, dict) or "pull_request" in it:
             continue
@@ -1222,7 +1224,21 @@ def _enabled_provider_accounts(api, registry_repo, policy_path, salt):
             continue
         provider = _provider_of(it.get("body") or "")
         if provider:
-            result.setdefault(provider, set()).add(account_hash(handle, salt))
+            mapped.setdefault(handle, set()).add(provider)
+    # EVERY enabled handle must resolve to exactly one provider. A handle with no catalog issue,
+    # an issue whose body has no parseable provider, or conflicting duplicate issues would
+    # otherwise be silently omitted — a PARTIAL fleet returned as ok=True gets persisted over the
+    # known-good snapshot and can delete a provider-capped arm with no alert, the exact
+    # silent-disable this type exists to prevent. Counts only in the reason: never a raw handle.
+    missing = sum(1 for h in pool if not mapped.get(h))
+    conflicted = sum(1 for h in pool if len(mapped.get(h, ())) > 1)
+    if missing or conflicted:
+        return FleetResolution({}, ok=False, reason=(
+            f"account catalog is incomplete: {missing} enabled account(s) have no provider "
+            f"mapping and {conflicted} map to conflicting providers"))
+    result = {}
+    for handle, providers in mapped.items():
+        result.setdefault(next(iter(providers)), set()).add(account_hash(handle, salt))
     return FleetResolution(result, ok=True)
 
 
@@ -2534,6 +2550,36 @@ def _test_fleet(chk):
     unreadable = _enabled_provider_accounts(_CatalogAPI(), "o/r", policy + ".gone", salt)
     chk("fleet failure (unreadable policy) is typed not-ok", unreadable.ok, False)
 
+    # an INCOMPLETE catalog is a resolution FAILURE, never a smaller ok fleet (review #348): a
+    # pooled handle with no account issue, or one whose body has no parseable provider, would
+    # otherwise be silently dropped and the partial fleet persisted over the known-good snapshot.
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh3:
+        fh3.write('[repos."o/a"]\nenabled = true\naccount_pool = ["acct01", "acct02", "acct03"]\n')
+        wide_policy = fh3.name
+
+    class _NoProviderCatalogAPI:  # acct02's body has no parseable provider line
+        def paginate(self, path):
+            return [{"title": "acct01", "body": "provider: anthropic"},
+                    {"title": "acct02", "body": "models: [terra]"}]
+
+    class _ConflictCatalogAPI:  # duplicate acct01 issues claim two different providers
+        def paginate(self, path):
+            return [{"title": "acct01", "body": "provider: anthropic"},
+                    {"title": "acct01", "body": "provider: openai"},
+                    {"title": "acct02", "body": "provider: openai"}]
+
+    absent = _enabled_provider_accounts(_CatalogAPI(), "o/r", wide_policy, salt)
+    chk("fleet failure (pooled account absent from catalog) is typed not-ok, empty",
+        (absent.ok, absent.accounts), (False, {}))
+    chk("fleet incomplete-catalog reason carries no raw handle",
+        "acct" not in (absent.reason or ""), True)
+    no_provider = _enabled_provider_accounts(_NoProviderCatalogAPI(), "o/r", policy, salt)
+    chk("fleet failure (catalog issue without a provider) is typed not-ok, empty",
+        (no_provider.ok, no_provider.accounts), (False, {}))
+    conflict = _enabled_provider_accounts(_ConflictCatalogAPI(), "o/r", policy, salt)
+    chk("fleet failure (conflicting provider mappings) is typed not-ok, empty",
+        (conflict.ok, conflict.accounts), (False, {}))
+
     # a policy with NO enabled account pool is a legitimate EMPTY fleet (ok=True) — nothing to cap,
     # so it must NOT raise a false config alert.
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh2:
@@ -2542,6 +2588,7 @@ def _test_fleet(chk):
     legit_empty = _enabled_provider_accounts(_CatalogAPI(), "o/r", empty_policy, salt)
     os.unlink(policy)
     os.unlink(empty_policy)
+    os.unlink(wide_policy)
     chk("fleet empty enabled-pool is a legitimate ok resolution",
         (legit_empty.ok, legit_empty.accounts), (True, {}))
     return True
@@ -2647,7 +2694,8 @@ def _test_fleet_resolution_decide(chk):
         os.environ.update(REGISTRY_REPO="o/r", GH_TOKEN="tok")
         os.environ.pop("ALERT_REPO", None)
         os.environ.pop("ALERT_TOKEN", None)
-        GitHubAPI = lambda token: _SnapStore(blob=blob, sha="s0")
+        store = _SnapStore(blob=blob, sha="s0")
+        GitHubAPI = lambda token: store
         read_ledger = lambda api, repo: (list(capped), None)
         prune = lambda records, now_: list(records)
         _enabled_provider_accounts = (lambda api, repo, policy, s:
@@ -2663,6 +2711,9 @@ def _test_fleet_resolution_decide(chk):
         chk("failed resolution keeps provider-capped alive via the snapshot", capped_fired, True)
         chk("failed resolution raises the durable configuration alert", config_fired, True)
         chk("degraded decide still exits 0 when its alerts deliver", rc, 0)
+        # Review #348: a failed resolution must LEAVE the known-good snapshot in place — writing
+        # the (empty/partial) failed fleet here would poison the very fallback the next tick needs.
+        chk("failed resolution never overwrites the known-good snapshot", store.puts, [])
     finally:
         (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger,
          _upsert_alert, _open_alert_markers) = real
