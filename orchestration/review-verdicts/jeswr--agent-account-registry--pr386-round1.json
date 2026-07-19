@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 386,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f45934fbeaf9223997f7f8edecae72fcbb883ec4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly consults the lease-release result in both unsafe-claim paths and fails loud when release cannot be confirmed: it records a lane error, emits a dedicated coarse defer reason, and does not falsely report recovery. Successful releases retain the prior defer behavior. The added regression test is non-vacuous because it exercises both boolean outcomes and asserts the release attempt, launch count, dedicated reason, and lane-error flip; the failure-side assertions would fail against the old implementation. No trust check is weakened, no permissive fallback is introduced, and the new logging remains free of account handles and tokens.",
+  "verdict": "approve"
+ }
+}
