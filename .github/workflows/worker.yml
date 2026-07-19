@@ -570,6 +570,8 @@ jobs:
           owner: ${{ needs.resolve.outputs.target_owner }}
           repositories: ${{ needs.resolve.outputs.target_name }}
           permission-contents: read
+          # No post-phase revoker in the worker job — see the live mint's rationale below.
+          skip-token-revoke: true
 
       - name: Mint live target-scoped App token
         id: app-token-live
@@ -586,6 +588,16 @@ jobs:
           # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
           # branches touching .github/workflows/* (role:ci issues were structurally blocked).
           permission-workflows: write
+          # POST-PHASE CREDENTIAL BAN (PR #310 round 3 blocker): by default this action
+          # registers a post-job phase that REVOKES the installation token — authenticating
+          # WITH that token — and action post phases run after ALL normal steps, i.e. AFTER
+          # the gate has executed target-controlled code on this runner. That revoker is
+          # exactly the later credential-bearing process a detached hostile gate process could
+          # observe. Every mint in this job therefore disables revocation and relies on the
+          # 60-minute installation TTL (plus narrow scoping) instead; the clean-runner jobs
+          # below keep the default revoker because no target code ever runs there.
+          # worker-live.sh's boundary self-test enforces this on every worker-job mint.
+          skip-token-revoke: true
 
       - name: Verify target App identity and default branch
         id: target
@@ -885,11 +897,14 @@ jobs:
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back
 
-      # CREDENTIAL BOUNDARY (PR #310 review rounds 1+2, blocker): the gate below executes
+      # CREDENTIAL BOUNDARY (PR #310 review rounds 1+2+3, blocker): the gate below executes
       # target-CONTROLLED cargo build scripts/tests HOST-side. Code run there can outlive its
       # step (a detached process) and inspect ANY later process on this runner, so from the gate
       # onward NO step in this job may hold, mint, or receive a GitHub credential of any kind —
-      # not the App private key (round 1) and not a minted installation token (round 2).
+      # not the App private key (round 1), not a minted installation token (round 2), and not
+      # an action POST phase either (round 3): every worker-job token mint sets
+      # skip-token-revoke, so the action's default token-revocation post step (which runs
+      # after the gate, authenticating WITH the token) never executes on this runner.
       # Everything privileged that used to follow the gate (DRAFT-PR publish, follow-up issues,
       # final issue state) now lives in the separate `publish` job on a FRESH runner that
       # executes no target code. This mint exists ONLY for the IMMEDIATELY-following push step,
@@ -905,8 +920,9 @@ jobs:
       # job mints its own fresh token immediately before its bounded writes, so the deferral
       # path always holds a valid credential even after a worker run that consumes the whole
       # job window. worker-live.sh's self-test structurally enforces all of this (mint→push
-      # adjacency, no credential at/after the gate, bounded clean publish job), so a drive-by
-      # step insertion turns the registry gate red. continue-on-error + the `|| app-token-live`
+      # adjacency, no credential at/after the gate, no revocation post phase on any worker-job
+      # mint, bounded clean publish job), so a drive-by step insertion turns the registry gate
+      # red. continue-on-error + the `|| app-token-live`
       # fallback keep a transient mint hiccup from being worse than the old single-mint
       # behaviour — a stale fallback fails the push CLOSED (git rejects an expired token), and
       # the clean publish job still writes status:deferred with its own fresh token.
@@ -924,6 +940,10 @@ jobs:
           # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
           # branches touching .github/workflows/* (role:ci issues were structurally blocked).
           permission-workflows: write
+          # No post-phase revoker in the worker job (PR #310 round 3 blocker) — the default
+          # revocation post step would run WITH this token AFTER the hostile gate. See the
+          # live mint's rationale above; TTL + narrow scope bound this token instead.
+          skip-token-revoke: true
 
       - name: Commit and push the candidate branch (pre-gate; sole token consumer)
         id: push

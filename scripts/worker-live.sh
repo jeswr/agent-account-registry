@@ -1410,7 +1410,7 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to %s\n' "$secret_ref"
 }
 
-# PURE structural guard for the worker workflow's credential boundary (PR #310 rounds 1+2).
+# PURE structural guard for the worker workflow's credential boundary (PR #310 rounds 1+2+3).
 # Parses a worker.yml and enforces, fail-closed:
 #   (1) the post-model mint (id app-token-post) is IMMEDIATELY followed by its sole consumer
 #       (id push), which runs before the gate — no intervening step may re-open the mint→use
@@ -1419,7 +1419,12 @@ PY
 #       gate) references a credential in any form — once the gate has run target-controlled
 #       code the runner may hold a surviving hostile process (round 2 blocker);
 #   (3) privileged publish/final-state work lives in the separate, bounded `publish` job, which
-#       never checks out or executes target code.
+#       never checks out or executes target code;
+#   (4) EVERY worker-job token mint sets skip-token-revoke: true — create-github-app-token
+#       otherwise registers a post-job phase that revokes the token USING the token, and action
+#       post phases run AFTER all normal steps, i.e. after the hostile gate; that revoker would
+#       be exactly the later credential-bearing process rule (2) exists to ban, invisible to a
+#       step-order scan (round 3 blocker).
 # The self-test runs this against the LIVE workflow AND against mutated fixtures (each rule
 # violated in turn), so the guard itself cannot rot vacuous.
 _worker_yml_boundary_check() {
@@ -1450,6 +1455,14 @@ for step in steps[push + 1:]:
             raise SystemExit("worker.yml boundary: step "
                              f"{step.get('name') or step.get('id')!r} runs in or after the "
                              f"hostile gate window but references {marker}")
+for step in steps:
+    if "create-github-app-token" not in str(step.get("uses") or ""):
+        continue
+    if (step.get("with") or {}).get("skip-token-revoke") is not True:
+        raise SystemExit("worker.yml boundary: worker-job token mint "
+                         f"{step.get('id') or step.get('name')!r} must set "
+                         "skip-token-revoke: true — the action's default revocation post "
+                         "phase runs AFTER the hostile gate, holding the token")
 publish = jobs.get("publish") or {}
 dump = yaml.safe_dump(publish)
 if "worker-live.sh publish" not in dump or "worker-issue.py status" not in dump:
@@ -1872,6 +1885,8 @@ jobs:
         run: bash model
       - id: app-token-post
         uses: actions/create-github-app-token@sha
+        with:
+          skip-token-revoke: true
       - id: push
         env:
           GH_TOKEN: t
@@ -1899,6 +1914,16 @@ YML
       "$tmp/wf-good.yml" > "$tmp/wf-m3.yml"
     chk "(m3) target execution inside the publish job is refused" \
       "$( (_worker_yml_boundary_check "$tmp/wf-m3.yml" >/dev/null 2>&1 && echo ok) || echo refused)" "refused"
+    # (m4)+(m5) round 3: a worker-job mint whose default revocation post phase stays enabled —
+    # explicitly (false) or silently (input absent) — would run a credential-bearing process
+    # AFTER the hostile gate; both directions must be refused.
+    sed 's/^          skip-token-revoke: true$/          skip-token-revoke: false/' \
+      "$tmp/wf-good.yml" > "$tmp/wf-m4.yml"
+    chk "(m4) a worker mint with skip-token-revoke: false is refused" \
+      "$( (_worker_yml_boundary_check "$tmp/wf-m4.yml" >/dev/null 2>&1 && echo ok) || echo refused)" "refused"
+    sed '/^          skip-token-revoke: true$/d' "$tmp/wf-good.yml" > "$tmp/wf-m5.yml"
+    chk "(m5) a worker mint silent about token revocation is refused" \
+      "$( (_worker_yml_boundary_check "$tmp/wf-m5.yml" >/dev/null 2>&1 && echo ok) || echo refused)" "refused"
   else
     printf '  FAIL worker.yml boundary checks need PyYAML (install pyyaml)\n'
     failures=$((failures + 1))
