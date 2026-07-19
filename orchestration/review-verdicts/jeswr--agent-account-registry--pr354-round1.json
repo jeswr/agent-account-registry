@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 354,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "32715e2ef85ff0a62b22d15e4806973d3c758e12",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly moves the advisory trust and linked-open-PR exclusions ahead of frontier selection, allowing compute_ready to backfill a filtered candidate's package while preserving deterministic conflict selection. It deliberately retains both busy status classes so compute_ready still seeds their packages as taken, including for linked or untrusted busy rows; this avoids opening a double-dispatch path. The resulting ready rows remain subject to the existing authoritative CLAIM revalidation. No trust check, audit binding, gate, permission, or untrusted-text execution surface is weakened by this diff, and no reviewer-directed prompt injection appears in it.",
+  "verdict": "approve"
+ }
+}
