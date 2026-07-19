@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Both provider paths can rewrite or rotate the refresh credential in the isolated HOME: the Anthropic path explicitly stores resp.refresh_token, and Codex may rewrite auth.json. But broker() returns only the access-token capability and then recursively deletes that HOME. It never updates the credential source read from --cred-file or returns the rotated credential to a durable registry store. If a refresh exchange invalidates the prior refresh token, the next broker invocation starts from that stale token and cannot mint another capability, forcing reauthentication despite the module's stated invariant. The self-test only asserts persistence inside the temporary HOME and therefore misses the loss at the broker boundary.",
+   "file": "scripts/broker-refresh.py",
+   "fix_hint": "Add a secure, atomic durable credential-update path owned by the private registry, and persist the complete rotated provider credential before returning the worker capability and deleting the isolated HOME. Keep the worker output access-token-only. Add an end-to-end broker-level test that simulates refresh-token rotation, completes cleanup, then performs a second mint from the durable credential and proves the rotated refresh token was retained without leaking it in output.",
+   "severity": "major",
+   "title": "Rotated refresh credentials are deleted instead of persisted durably"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The two round-2 lifetime findings are addressed with independent expiry checks and non-vacuous negative tests. However, the refreshed credential is only written inside the temporary isolated HOME and is deleted when broker() returns. Any provider-issued refresh-token rotation is therefore discarded, while the durable credential supplied by --cred-file remains unchanged. This can strand the broker on its next invocation and violates the stated no-reauthentication contract. Because this is a new major finding despite resolution of the prior findings, progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
