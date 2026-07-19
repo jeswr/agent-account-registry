@@ -12,16 +12,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "4dadd1fdecc5419c83c8e9267b6f06d0",
-   "holder": "jeswr/agent-account-registry#414@29704836190.1",
-   "package": "workflows",
-   "role": "ci",
-   "model": "sol",
-   "issued_at": 1784497344,
-   "expires_at": 1784500044
-  },
-  {
-   "account": "acct01",
    "claim_id": "01207b16ac934ca9aa720ca376af1783",
    "holder": "review:jeswr/agent-account-registry#458@dispatch-29704493488.1",
    "package": "review-loop",
