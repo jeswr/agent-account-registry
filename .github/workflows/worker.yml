@@ -581,18 +581,22 @@ jobs:
       exhausted: ${{ steps.budget.outputs.exhausted }}
       trust_outcome: ${{ steps.trust.outcome }}
       attempt_number: ${{ steps.attempt.outputs.number }}
-      # Model-access health (registry #136, round 2): a genuine-provider-attempt marker keyed on the
-      # COMPLETED `model-prep` step, which builds the model-isolation image immediately before the
-      # launch step invokes the provider CLI. record-attempt is deliberately NOT used: it completes
-      # much earlier (before the prompt and the slow, cold-cache-minute-scale image build), so a
-      # cancellation or job timeout after it but before the CLI launched would falsely mark a
-      # non-attempt as started and pollute the health ledger with a fabricated `unknown` (round-2
-      # finding). `model-prep` sits at the pre-launch boundary, and a completed step's outcome is
-      # retained even when the LATER model step is killed by the job timeout (see the #127 note above)
-      # — so a started attempt whose exit class went uncaptured is still retained (defaulted to
-      # `unknown` in model_health), while a pre-launch abort — budget exhaustion, trust failure, prep/
-      # build failure, or a cancel DURING the build — records nothing.
-      model_started: ${{ steps.model-prep.outcome == 'success' }}
+      # Model-access health (registry #136, round 2): the genuine-provider-attempt marker. Written
+      # by worker-live.sh (_mark_model_launched) at the ACTUAL CLI-invocation boundary — the last
+      # statement inside the model step before the provider process is executed — never inferred
+      # from an earlier step's OUTCOME. Keying on record-attempt (round 1) or on the completed
+      # model-prep build (round 2, first cut) both leave a window: a cancellation or job timeout
+      # can land after that step completes but before the model step execs the CLI, falsely marking
+      # a non-attempt as started and polluting the health ledger with a fabricated `unknown`. A
+      # step output written before the exec is durable against the step itself being cancelled or
+      # killed by the job timeout (the runner processes GITHUB_OUTPUT file commands when a killed
+      # step finalizes, and this outputs map is still evaluated — the same mechanism the #127
+      # outputs above rely on), so a launched attempt whose exit class went uncaptured is retained
+      # (defaulted to `unknown` in model_health), while ANY abort before the provider process
+      # starts — budget exhaustion, trust failure, prep/build failure, or a cancel at any point up
+      # to the exec — leaves this empty and records nothing. (A hard runner death loses the marker
+      # and DROPS a genuine attempt: fail-toward-silence, never fabrication.)
+      model_started: ${{ steps.model.outputs.launched }}
     concurrency:
       group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
       cancel-in-progress: false
@@ -869,12 +873,13 @@ jobs:
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
 
       # registry #136 (round 2): build the model-isolation image in ITS OWN step so the (cold-cache
-      # minute-scale) build sits BEHIND a completed step boundary. `model_started` keys on THIS step's
-      # completion, not on record-attempt's — so a cancellation or job timeout during the build (before
-      # any provider CLI is invoked) leaves model_started false and records NO health entry, closing
-      # the pre-launch pollution path. The launch step below fails closed if the image is absent, so
-      # build-and-launch never collapse back into one step.
-      - name: Build the model-isolation image (pre-launch marker for model_started)
+      # minute-scale) build completes BEFORE the launch step starts — a cancellation or job timeout
+      # during the build aborts with no provider attempt. `model_started` does NOT key on this
+      # step's outcome: completed prep still proves nothing about a launch (a cancel can land
+      # between this step and the CLI exec) — it maps the in-step `launched` output worker-live.sh
+      # writes at the invocation boundary itself. The launch step below fails closed if the image
+      # is absent, so build-and-launch never collapse back into one step.
+      - name: Build the model-isolation image (pre-launch build boundary)
         id: model-prep
         if: ${{ !inputs.dry_run && steps.attempt.outcome == 'success' }}
         working-directory: target
@@ -907,9 +912,9 @@ jobs:
       # model step means `success`. A SKIPPED model step is a pre-launch abort (budget exhaustion,
       # trust failure, or prep failure) where NO provider call occurred — it must record NOTHING, not
       # a fabricated class=unknown (#136: those non-attempts polluted the health ledger). The started-
-      # vs-non-attempt distinction is carried by the `model_started` job output (set from the completed
-      # model-prep step — the pre-launch build boundary — which survives a hard model-step timeout that
-      # kills THIS always() step);
+      # vs-non-attempt distinction is carried by the `model_started` job output (the `launched`
+      # marker worker-live.sh writes at the CLI-invocation boundary inside the model step — a step
+      # output that survives a hard model-step kill that stops THIS always() step from running);
       # a started attempt whose class is empty because this capture step never ran is defaulted to
       # `unknown` in the model_health job, so a genuine timeout is RETAINED rather than dropped.
       - name: Capture model exit class
@@ -1292,10 +1297,12 @@ jobs:
 
   # Model-access health record (registry #32): consumes the worker's exit CLASS (success OR any
   # failure) into the registry model-health ledger so `decide` (in the groom sweep) can alert when
-  # a whole provider stops having working model access. Gated on the `model_started` marker (#136),
-  # so ONLY genuine provider attempts are recorded: a pre-launch abort (budget/trust/prep) that made
-  # no provider call records nothing, while a started attempt whose exit class went uncaptured (a
-  # hard model-step timeout that killed the capture step) is retained as `unknown`, not dropped.
+  # a whole provider stops having working model access. Gated on the `model_started` marker (#136:
+  # written at the CLI-invocation boundary inside the model step), so ONLY genuine provider
+  # attempts are recorded: an abort at any point before the provider process starts (budget/trust/
+  # prep failure, or a cancel between prep and the exec) records nothing, while a started attempt
+  # whose exit class went uncaptured (a hard kill of the model step) is retained as `unknown`, not
+  # dropped.
   # A SEPARATE job — like `provenance` — because
   # the worker job executes hostile target code host-side (the cargo gate): a registry-write token
   # co-located there could forge health records. This job runs NO target code, takes the raw handle

@@ -175,6 +175,25 @@ _credential_mount_args() {
   printf '%s\n' --mount "type=bind,src=$credential_path,dst=/home/worker/$rel,readonly"
 }
 
+# registry #136 (round 2): the genuine-provider-attempt marker, written at the ACTUAL provider-
+# invocation boundary — the last statement before the CLI process is executed. The workflow maps
+# `steps.model.outputs.launched` into the `model_started` job output that gates model_health, so
+# ONLY a run that reached this line can ever produce a health record. Durability: the runner
+# processes GITHUB_OUTPUT file commands when a step finalizes EVEN if the step was cancelled or
+# killed by the job timeout, and the job `outputs:` map is still evaluated on a cancelled job (the
+# same mechanism the #127 final_state outputs rely on) — so a launched CLI whose step dies before
+# any exit class is captured still surfaces launched=true and is retained as `unknown`. Any abort
+# BEFORE this line — a cancel between the model-prep and model steps, a cancel during the image
+# build, a pre-flight die inside this step — leaves the output unset and records NOTHING: completed
+# image preparation is prep, never proof of a launch. (A hard runner death loses the marker and
+# DROPS a genuine attempt — fail-toward-silence, never fabrication.) Fail-stop on the write: if the
+# marker cannot be recorded, the CLI must not run, or a real attempt would be invisible to the
+# outage detector.
+_mark_model_launched() {
+  [[ -n ${GITHUB_OUTPUT:-} ]] || return 0
+  printf 'launched=true\n' >> "$GITHUB_OUTPUT"
+}
+
 # mutation_mode:
 #   allow — today's implementation tooling (claude Bash/Edit/Write; codex unchanged).
 #   deny  — reviewer posture: claude is restricted to Read/Glob/Grep. codex KEEPS
@@ -235,10 +254,11 @@ _run_headless_harness() {
   mkdir -p "$worker_root/home/.cargo"
   chmod 700 "$worker_root/home/.cargo"
   # registry #136 (round 2): the model-isolation image is built by the SEPARATE `model-prep` step so
-  # its slow, cold-cache-minute-scale build sits BEHIND a completed step boundary that the
-  # `model_started` marker keys on. Fail closed here — NEVER build-and-launch inside this one step,
-  # which would reopen the pre-launch cancellation/timeout window that split exists to close (a
-  # cancel during an in-step build would otherwise mark a non-attempt as started).
+  # its slow, cold-cache-minute-scale build completes BEFORE this launch step starts. The genuine-
+  # attempt marker does NOT key on that build (completed prep proves nothing about a launch — see
+  # _mark_model_launched, written at the CLI exec boundary below). Fail closed here — NEVER
+  # build-and-launch inside this one step, which would put the long build between step start and
+  # the CLI exec and stretch the pre-launch cancellation window the prep split exists to shrink.
   docker image inspect "$image" >/dev/null 2>&1 \
     || die 'model-isolation image absent; the model-prep step must build it before the CLI launch'
   # shellcheck disable=SC2054  # comma-separated Docker mount/tmpfs options are single elements
@@ -302,6 +322,7 @@ _run_headless_harness() {
         local -a credential_env=()
         [[ -n ${CLAUDE_CODE_OAUTH_TOKEN:-} ]] && credential_env+=(--env CLAUDE_CODE_OAUTH_TOKEN)
         [[ -n ${ANTHROPIC_API_KEY:-} ]] && credential_env+=(--env ANTHROPIC_API_KEY)
+        _mark_model_launched
         "${container[@]}" "${credential_env[@]}" "$image" \
           /opt/model-cli/node_modules/.bin/claude -p \
           --model "$provider_model" \
@@ -326,6 +347,7 @@ _run_headless_harness() {
         # (the configuration the proven drain runs).
         local -a model_args=()
         mapfile -t model_args < <(_provider_model_args "$harness" "$provider_model")
+        _mark_model_launched
         "${container[@]}" "$image" /opt/model-cli/node_modules/.bin/codex exec \
           "${model_args[@]}" \
           --dangerously-bypass-approvals-and-sandbox \
@@ -432,11 +454,13 @@ PY
 }
 
 # registry #136 (round 2): build the model-isolation container image in its OWN step (the workflow
-# `model-prep` step) so the slow build sits BEHIND a completed step boundary. `model_started` keys on
-# this step's completion, so a cancel or job timeout DURING the build — before any provider CLI is
-# invoked — records NO health entry, instead of the record-attempt-based marker's fabricated `unknown`
-# for a run that never reached the provider. The launch step (`run_model`/_run_headless_harness) then
-# fails closed if this image is absent, so build-and-launch never recombine into a single step.
+# `model-prep` step) so the slow build completes before the launch step starts. The genuine-attempt
+# marker `model_started` does NOT key on this step's outcome — a completed build proves preparation,
+# not a launch (a cancel/job timeout can still land between this step and the CLI exec) — it maps
+# the `launched` output _mark_model_launched writes at the provider-invocation boundary itself, so a
+# cancel at ANY point before the CLI process starts records NO health entry. The launch step
+# (`run_model`/_run_headless_harness) fails closed if this image is absent, so build-and-launch
+# never recombine into a single step.
 prep_model() {
   local worker_root=${WORKER_ROOT:-}
   [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
@@ -1833,23 +1857,101 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   chk "the publish/PR step is guarded by gate success" \
     "$(_workflow_step_if "$wf" pr | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
 
-  # --- [registry #136 round 2] the model_started marker keys on the COMPLETED model-prep step (which
-  # builds the isolation image immediately before the CLI launches), NOT on the earlier record-attempt
-  # step. record-attempt completes long before the slow build, so a cancel/timeout after it but before
-  # the CLI launched used to falsely mark a non-attempt as started and pollute model_health with a
-  # fabricated `unknown`. Non-vacuous: reverting model_started (or the launch step's `if`) back to
-  # `steps.attempt.outcome` flips these red; the record-attempt negatives are the fail-closed control,
-  # and model-prep gating on `steps.attempt.outcome` proves the pre-launch ORDERING is preserved. ---
-  chk "model_started keys on the completed pre-launch model-prep step" \
-    "$(grep -aEc "^[[:space:]]+model_started:.*steps\.model-prep\.outcome == 'success'" "$wf" || true)" "1"
+  # --- [registry #136 round 2] the model_started marker maps the `launched` step output that
+  # _mark_model_launched writes at the provider-invocation boundary INSIDE the model step — never
+  # any earlier step's OUTCOME. A completed record-attempt (round 1) or a completed model-prep
+  # image build (round 2, first cut) still proves nothing about a launch: a cancel/job-timeout can
+  # land after either step completes but before the CLI process starts, and keying on them
+  # fabricated `unknown` health records for non-attempts. Non-vacuous: rewiring model_started back
+  # to ANY step outcome flips these red; the ordering checks prove prep still precedes launch
+  # fail-closed, and the model_health checks prove the ledger consumes only marker-proven launches
+  # while retaining a started-but-classless attempt as `unknown`. ---
+  chk "model_started maps the in-step CLI-launch marker (steps.model.outputs.launched)" \
+    "$(grep -aEc "^[[:space:]]+model_started:.*steps\.model\.outputs\.launched" "$wf" || true)" "1"
+  chk "model_started no longer keys on the model-prep build outcome (prep is not a launch)" \
+    "$(grep -aEc "^[[:space:]]+model_started:.*steps\.model-prep\.outcome" "$wf" || true)" "0"
   chk "model_started no longer keys on the earlier record-attempt step (non-vacuous)" \
     "$(grep -aEc "^[[:space:]]+model_started:.*steps\.attempt\.outcome" "$wf" || true)" "0"
-  chk "the model launch step gates on the completed model-prep marker" \
+  chk "the model launch step still gates on the completed model-prep image build (fail-closed)" \
     "$(_workflow_step_if "$wf" model | grep -Fc "steps.model-prep.outcome == 'success'" || true)" "1"
-  chk "the model launch step no longer gates directly on record-attempt (non-vacuous)" \
+  chk "the model launch step does not gate directly on record-attempt (non-vacuous)" \
     "$(_workflow_step_if "$wf" model | grep -Fc "steps.attempt.outcome" || true)" "0"
   chk "the model-prep step gates on a recorded attempt (pre-launch ordering preserved, fail-closed)" \
     "$(_workflow_step_if "$wf" model-prep | grep -Fc "steps.attempt.outcome == 'success'" || true)" "1"
+  chk "model_health records only marker-proven launches" \
+    "$(grep -aFc "needs.worker.outputs.model_started == 'true'" "$wf" || true)" "1"
+  chk "model_health retains a started-but-classless attempt as unknown (not dropped)" \
+    "$(grep -aFc "needs.worker.outputs.exit_class || 'unknown'" "$wf" || true)" "1"
+
+  # --- [registry #136 round 2] BEHAVIORAL: the `launched` marker is written at the provider-
+  # invocation boundary itself, in both directions, against a stubbed docker CLI:
+  #   (a) cancellation AFTER image preparation is verified but BEFORE the CLI is invoked — the
+  #       round-2 window — delivered as a real SIGTERM to the launch process from inside
+  #       `docker image inspect`: NO marker is written and NO provider process runs, so
+  #       model_health records nothing (a fabricated `unknown` here flips this red);
+  #   (b) the CLI IS invoked and the whole launch process is killed mid-run before any exit class
+  #       is captured: the marker is already durable in $GITHUB_OUTPUT — and the stub proves it was
+  #       present BEFORE the exec (moving the mark after the launch flips the ordering check red) —
+  #       while WORKER_EXIT_CLASS was never written: the started-but-classless shape model_health
+  #       retains as `unknown`. ---
+  local mh="$tmp/mh"
+  mkdir -p "$mh/fixture/.claude/agents" "$mh/root/home/.codex" "$mh/bin"
+  printf 'stub agent\n' > "$mh/fixture/.claude/agents/testagent.md"
+  printf 'stub task\n' > "$mh/prompt.txt"
+  printf 'stub-credential\n' > "$mh/root/home/.codex/auth.json"
+  cat > "$mh/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+# Self-test stub: STUB_KILL_PID is the launch process (the "step"); killing it simulates the
+# runner cancelling the step at that exact point. File writes happen BEFORE the kill so the
+# caller's assertions never race; the trailing sleep keeps this stub from exiting (and thereby
+# resuming its caller) before the TERM lands.
+case "${1:-}" in
+  image)
+    touch "$STUB_DIR/inspect-ran"
+    if [[ "${STUB_MODE:-}" == cancel-pre-cli ]]; then kill -TERM "$STUB_KILL_PID"; sleep 2; fi
+    exit 0 ;;
+  run)
+    touch "$STUB_DIR/run-invoked"
+    grep -q '^launched=true$' "$GITHUB_OUTPUT" && touch "$STUB_DIR/marker-preceded-exec"
+    kill -TERM "$STUB_KILL_PID"; sleep 2
+    exit 137 ;;
+esac
+exit 0
+STUB
+  chmod +x "$mh/bin/docker"
+  _launch_marker_case() {
+    local mode=$1 stub_dir=$2
+    mkdir -p "$stub_dir"
+    : > "$stub_dir/gh-output"
+    : > "$stub_dir/gh-env"
+    (
+      export PATH="$mh/bin:$PATH" STUB_MODE="$mode" STUB_DIR="$stub_dir" STUB_KILL_PID=$BASHPID
+      export GITHUB_OUTPUT="$stub_dir/gh-output" GITHUB_ENV="$stub_dir/gh-env"
+      export WORKER_ROOT="$mh/root" TARGET_DIR="$mh/fixture" WORKER_HARNESS=codex
+      export WORKER_PROVIDER_MODEL='' WORKER_AGENT=testagent
+      export WORKER_CREDENTIAL_FORMAT=codex-auth-json
+      export WORKER_CREDENTIAL_PATH="$mh/root/home/.codex/auth.json"
+      cd "$mh/fixture"
+      _run_headless_harness "$mh/prompt.txt" allow
+    ) >/dev/null 2>&1 &
+    wait "$!" 2>/dev/null || true
+  }
+  _launch_marker_case cancel-pre-cli "$mh/pre"
+  chk "cancel after image prep, before CLI exec: prep WAS verified (window is post-prep)" \
+    "$([[ -e "$mh/pre/inspect-ran" ]] && echo yes || echo no)" "yes"
+  chk "cancel after image prep, before CLI exec: the provider CLI was never invoked" \
+    "$([[ -e "$mh/pre/run-invoked" ]] && echo invoked || echo no-launch)" "no-launch"
+  chk "cancel after image prep, before CLI exec: NO launched marker (no health record)" \
+    "$(grep -c '^launched=true$' "$mh/pre/gh-output" || true)" "0"
+  _launch_marker_case kill-mid-cli "$mh/kill"
+  chk "launch process killed mid-CLI: the provider CLI was invoked" \
+    "$([[ -e "$mh/kill/run-invoked" ]] && echo invoked || echo no-launch)" "invoked"
+  chk "launch process killed mid-CLI: the launched marker survives the kill" \
+    "$(grep -c '^launched=true$' "$mh/kill/gh-output" || true)" "1"
+  chk "the marker is durable BEFORE the exec, at the invocation boundary (non-vacuous ordering)" \
+    "$([[ -e "$mh/kill/marker-preceded-exec" ]] && echo before || echo after)" "before"
+  chk "launch process killed mid-CLI: no exit class captured (model_health defaults to unknown)" \
+    "$(grep -c '^WORKER_EXIT_CLASS=' "$mh/kill/gh-env" || true)" "0"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
