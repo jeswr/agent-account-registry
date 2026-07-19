@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 359,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5f94aadb275c625e2094e1973031b8f142c15e9f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "needs_user states that the source issue's needs-user transition is one of three mutations that must be confirmed before parking, but `if issue:` simply skips the step when `issue` is absent and records no failure. The `needs-user` parser still makes `--issue` optional, as do direct call paths through the function signature. Thus a missing issue identifier can produce the terminal review:needs-user label after only the comment and alert, contrary to the fail-closed transaction contract and leaving the orchestration source issue unrouted. The self-test never exercises `issue=None`, so it cannot catch this permissive path.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Require a valid source issue for terminal escalation, or append a reconciliation failure when it is absent so parking cannot occur. Add a self-test calling needs_user with `issue=None` that asserts WorkerPrError is raised and no `park` call is recorded. If issue-less escalation is genuinely supported, define and test a separate explicit mode rather than inferring opt-out from a missing trust-plane input.",
+    "severity": "major",
+    "title": "Missing source issue silently bypasses a required reconciliation step"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior round's blocker is fixed: absent or partial alert configuration now leaves the PR enumerable and raises, and the added assertions make that behavior non-vacuous. However, the reconciled transaction still silently treats a missing source issue as success even though issue routing is one of its required pre-park mutations. Because the CLI keeps --issue optional, needs_user can park after only the comment and alert, with no confirmed source-issue transition. That is a new fail-open completeness finding, so progress is regressing under the required rubric despite the earlier blocker being resolved.",
+  "verdict": "request_changes"
+ }
+}
