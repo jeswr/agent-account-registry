@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3595,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bd9061d8760026af224381e6849d8f94f1dabd39",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SourceSegment.holder is used only in error messages; encode() serializes no holder identifier. Consequently swapping two holders that have byte-identical segments leaves federated_public_inputs and out_of_circuit_message unchanged, and the same segment bytes can be reassigned to a different holder without changing the signed message. The holder_order_is_bound test misses this because Alice and Bob also have different commitments. This contradicts the claims that canonical holder order is bound and that the layout spans holder-attributed sources, and is security-relevant for a multi-source attestation.",
+    "file": "crates/sparq-mpc/src/federated.rs",
+    "fix_hint": "Define a canonical, domain-separated holder-identity encoding and bind it (with an unambiguous length framing) into each federated segment/transcript, or explicitly move holder-to-segment binding into the signed attestation structure and test it here. Add a negative test where two segments have identical public-input bytes but different holder IDs/order; changing or swapping holder assignment must change the signed transcript or fail validation. Also reject duplicate holder IDs if the protocol requires one segment per holder.",
+    "severity": "major",
+    "title": "Federated transcript does not bind SourceSegment holder identities"
+   },
+   {
+    "body": "scan_segment_matches_single_source_layout builds an expected vector from the same locally documented order and the same local uint_word helper. It neither calls sparq-zk-compose::verifier::reconstruct_public_inputs nor pins the existing real-bb scan vector used by that crate. If the authoritative verifier changes field order, padding, integer encoding, or adds/removes a field, this test remains green, contrary to the module's explicit claim that it is a tripwire keeping the mirrored implementations in lockstep. For a security-critical duplicated serialization boundary, the asserted byte-identity is therefore not established by the test.",
+    "file": "crates/sparq-mpc/src/federated.rs",
+    "fix_hint": "Add a dependency-light shared layout implementation consumed by both crates, or add a cross-crate integration/conformance test that feeds the same scan fixture through both implementations and compares exact bytes. If dependency constraints preclude that, pin the authoritative real-bb public-input fixture here and add a repository gate/test that compares both reconstructions; do not describe a self-derived fixture as a drift tripwire.",
+    "severity": "major",
+    "title": "The advertised cross-crate layout tripwire cannot detect verifier drift"
+   }
+  ],
+  "progress": null,
+  "summary": "The byte layout mostly mirrors the current scan reconstruction, but the new federated binding does not bind holder identities and its claimed cross-crate drift test is not actually coupled to the authoritative implementation or its empirical vector. Those gaps make the holder-order/security claims and the completeness of the layout verification unsound as scoped.",
+  "verdict": "request_changes"
+ }
+}
