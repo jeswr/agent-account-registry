@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 1's exact-branch binding defect is resolved at both security-sensitive stages: candidate selection now requires the live response's head.ref to equal the trusted deterministic head branch, and provenance_record independently re-reads the PR and enforces the same equality before writing. The added self-tests are non-vacuous and cover the same-issue/sibling-run case in both selection and final verification, alongside author, state, same-repository, malformed-input, empty-binding, and ambiguity failures. The workflow derives the branch from trusted run identity, preserves least-privilege and pinned actions, and gates downstream stamping on a successfully reconciled PR number. No blocker or major issue remains in the diff.",
+ "verdict": "approve"
+}
