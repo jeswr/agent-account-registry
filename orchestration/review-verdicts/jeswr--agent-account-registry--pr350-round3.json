@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-2 major finding is resolved. Fixer staging now receives the dispatch repo, PR, round, and expected live SHA; validates their values and exact types against the host envelope; and refuses stale, legacy-unbound, malformed, or identity-mismatched records without creating the staged verdict. The workflow gates verdict fixes on staged=true, and the added self-tests include the previously missing matching-SHA/wrong-repo, wrong-PR, and wrong-round negative cases with explicit no-output assertions. The broader SHA binding is consistently propagated into recorded verdicts and review/fix outcomes, whose fresh live-head checks defer without mutations when state, author, draft status, or head no longer matches. The pushed-fix SHA is emitted and carried to fix-outcome, while stale review outcomes are excluded from the terminal reviewed-SHA bind. No prompt-injection instruction directed at the reviewer appears in the diff.",
+ "verdict": "approve"
+}
