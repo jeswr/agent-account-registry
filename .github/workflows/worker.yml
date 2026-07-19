@@ -950,12 +950,41 @@ jobs:
           # crash signal. The failure-class annotation below reads only host-derived step outcomes.
         run: bash ../registry/scripts/worker-live.sh gate
 
+      # TTL guard, PRE-PUBLISH (issue #40): app-token-post is minted right after the model step but
+      # BEFORE the `Run policy-selected local gate` step above, which runs target-controlled cargo and
+      # can exceed the 60-minute App-installation-token lifetime on a large crate / cold cargo cache.
+      # A gate that runs long therefore reaches publish/followups with an EXPIRED app-token-post —
+      # the exact strand app-token-post was added to prevent, just displaced past the gate: a
+      # completed, gate-green diff is lost and the issue is left stale in-progress. This fresh mint,
+      # placed immediately AFTER the gate, keeps publish + followups inside a new 60-minute window.
+      # `always()` is LOAD-BEARING and mirrors followups (model succeeded, NOT gate-gated): without a
+      # status function GitHub Actions implicitly wraps the `if` in success(), so a FAILED gate would
+      # silently skip this mint — leaving a followups-only run to fall back on a possibly-expired
+      # app-token-post, the exact stale-token failure this guard exists to prevent. continue-on-error +
+      # the `|| app-token-post || app-token-live` fallbacks below keep a mint hiccup no worse than before.
+      - name: Mint pre-publish target-scoped App token (post-gate TTL guard)
+        id: app-token-publish
+        if: ${{ always() && !inputs.dry_run && steps.model.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
+          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
+          permission-workflows: write
+
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
         if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
         working-directory: target
         env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
           TARGET_DIR: ${{ github.workspace }}/target
           TARGET_REPO: ${{ inputs.target_repo }}
           TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
@@ -972,14 +1001,17 @@ jobs:
         run: bash ../registry/scripts/worker-live.sh publish
 
       - name: Create declared follow-up issues (discovered out-of-scope work)
+        id: followups
         # The procedure for the orchestrator to capture work it discovers but must NOT do in this PR:
         # the model appends {title, body, labels} lines to WORKER_ROOT/followups.jsonl (worker-live.sh
         # moves them out of the target tree BEFORE the commit so they are never committed), and this
         # step creates de-duplicated, labelled, back-linked issues. Best-effort; never fails the worker.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        # `always()` is load-bearing: without a status function the `if` is implicitly success()-gated,
+        # so a FAILED gate would skip the very followups-only run the post-gate token mint refreshes for.
+        if: ${{ always() && !inputs.dry_run && steps.model.outcome == 'success' }}
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
         run: |
           set -uo pipefail
