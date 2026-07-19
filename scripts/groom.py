@@ -24,6 +24,7 @@ import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -374,6 +375,97 @@ def _provenance_record(
     if not _review_loop_module().is_enumerable_provenance(record, number):
         return None
     return record
+
+
+def _live_provenance_record(
+    registry_api: "GitHubAPI", registry_repo: str, repo: str, number: int
+) -> tuple[str, dict[str, Any] | None]:
+    """Read target PR ``repo#number``'s registry provenance record from the LIVE authoritative
+    ``ledger`` ref, returning ``(state, record)`` where ``state`` is one of:
+
+    - ``"admits"``       — a schema-admissible record (dispatch-claim.is_enumerable_provenance,
+                           the review loop's OWN predicate) exists on the live ref RIGHT NOW;
+                           ``record`` is the parsed object. A terminal ``needs:user`` park must be
+                           CANCELLED — the PR is review-loop-owned.
+    - ``"denies"``       — the live ref conclusively holds NO admissible record: a clean 404, or a
+                           cleanly-read record the predicate rejects (``record`` is None). The park
+                           may proceed — the same fail-closed orphan hand-off the on-disk path makes.
+    - ``"indeterminate"``— the read was UNAVAILABLE (registry API/network failure) or CONFLICTING
+                           (a non-file shape, undecodable content, or malformed JSON): admissibility
+                           cannot be determined, so the caller must SKIP the terminal mutation and
+                           raise an operational alert (never park on an unusable read).
+
+    Both planning and the on-disk mutation-boundary re-check read the IMMUTABLE workflow checkout
+    (``registry_root`` / ``--ledger-root``), so a delayed provenance job or backfill that lands
+    DURING the sweep is invisible and groom would terminally park an already-valid PR (issue #174).
+    This live read is the FINAL gate immediately before the write — it can only CANCEL a park, never
+    cause one. Records live in the REGISTRY repo, so it reads via the registry client
+    (``REGISTRY_GH_TOKEN``) pinned to ``LEDGER_REF``, exactly as _read_ledger reads the ledger tip."""
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        raise GroomError("target repository name is malformed")
+    record_name = f"{owner}--{name}--pr{number}.json"
+    path = (
+        f"/repos/{registry_repo}/contents/{PROVENANCE_DIR}/"
+        f"{quote(record_name, safe='')}?ref={LEDGER_REF}"
+    )
+    try:
+        result = registry_api.request("GET", path, allow_404=True)
+    except GroomError:
+        return "indeterminate", None  # unavailable live read — cannot confirm, fail closed
+    if result is None:
+        return "denies", None  # clean 404 on the live ledger ref — genuinely no record
+    if (
+        not isinstance(result, dict)
+        or result.get("type") != "file"
+        or not isinstance(result.get("content"), str)
+    ):
+        return "indeterminate", None  # non-file / malformed metadata — a conflicting read
+    try:
+        record = json.loads(
+            base64.b64decode("".join(result["content"].split()), validate=True).decode()
+        )
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return "indeterminate", None  # present-but-undecodable — conflicting, never strand
+    if _review_loop_module().is_enumerable_provenance(record, number):
+        return "admits", record
+    return "denies", None  # cleanly read but not admissible — the orphan-park hand-off stands
+
+
+def _live_issue_admission(
+    registry_api: "GitHubAPI", registry_repo: str, repo: str, number: int,
+    pulls: dict[int, dict[str, Any]], bot_login: str,
+) -> str:
+    """Live-ref admission for a SINGLE source issue at the terminal mutation boundary (issue #174).
+
+    Among ``pulls`` (freshly re-read open PRs), is a worker PR BOUND TO ``number`` (worker identity
+    AND branch-encoded issue == ``number``) admitted by a schema-valid record on the LIVE ``ledger``
+    ref? Returns ``"admitted"`` (a valid record for its worker PR now exists live → cancel the
+    exhaustion park), ``"indeterminate"`` (a candidate worker PR's live read was unavailable or
+    conflicting → skip the park and raise an operational alert), or ``"denied"`` (the live ref
+    conclusively admits none → the park may proceed).
+
+    Mirrors _admitted_worker_prs' identity + issue-binding (via _worker_pr_identity and the record's
+    ``issue`` field) so the on-disk and live admissions cannot drift; only the record SOURCE differs
+    (the live ref instead of the immutable checkout). An indeterminate read is scoped to THIS issue's
+    candidate PRs, so an unusable read on an unrelated PR never blocks this park."""
+    bot = bot_login.casefold()
+    if not bot:
+        return "denied"  # no bot identity — nothing proven, fail closed (park may proceed)
+    indeterminate = False
+    for pr_number, pull in pulls.items():
+        branch = _worker_pr_identity(repo, pull, bot)
+        if branch is None or int(branch.group("issue")) != number:
+            continue  # only a worker PR bound to THIS issue can suppress its park
+        state, record = _live_provenance_record(
+            registry_api, registry_repo, repo, pr_number
+        )
+        if state == "indeterminate":
+            indeterminate = True
+            continue
+        if record is not None and record["issue"] == number:
+            return "admitted"  # record and branch agree on the source issue — review-loop-owned
+    return "indeterminate" if indeterminate else "denied"
 
 
 def _worker_pr_identity(
@@ -1392,11 +1484,36 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             # GitHub's own read-to-write gap, and since `needs:user` is terminal for the review
             # loop (no automated repair), skipping — the fail-closed side, retried next sweep —
             # wins any tie.
+            boundary_pulls = _pulls(api, action.repo)
             if action.number in _admitted_worker_prs(
-                action.repo, _pulls(api, action.repo), bot_login, ledger_root=ledger_root
+                action.repo, boundary_pulls, bot_login, ledger_root=ledger_root
             ):
                 print(
                     f"SKIP issue {action.repo}#{action.number}: an admitted worker PR is open"
+                )
+                continue
+            # Issue #174: the checkout the on-disk admission reads is IMMUTABLE for the whole
+            # sweep, so a provenance record a delayed job or backfill lands DURING the sweep is
+            # invisible above. Re-read this issue's worker-PR provenance from the LIVE `ledger`
+            # ref immediately before the terminal park: a raced-in valid record still suppresses
+            # it (review-loop-owned), and an unavailable or conflicting live read skips the park
+            # with an operational alert rather than terminally parking on an unusable read
+            # (`needs:user` is terminal for the review loop — a wrong park strands the issue).
+            live = _live_issue_admission(
+                registry_api, registry_repo, action.repo, action.number,
+                boundary_pulls, bot_login,
+            )
+            if live == "admitted":
+                print(
+                    f"SKIP issue {action.repo}#{action.number}: a valid provenance record for "
+                    "its worker PR now exists on the live ledger ref"
+                )
+                continue
+            if live == "indeterminate":
+                print(
+                    f"ALERT issue {action.repo}#{action.number}: live provenance revalidation "
+                    "was unavailable or conflicting — deferring the terminal needs:user park to "
+                    "the next sweep"
                 )
                 continue
         changed = _apply_labels(api, action.repo, action.number, labels, mode)
@@ -1425,6 +1542,32 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         if reason is None:
             print(f"SKIP PR {action.repo}#{action.number}: no longer stale/failing")
             continue
+        # Issue #174: the ORPHAN-draft reason was derived from provenance ABSENCE on the IMMUTABLE
+        # checkout (worker_pr_provenance_enumerable, at planning and just above). A delayed
+        # provenance job or backfill that lands DURING the sweep is invisible there, so re-read the
+        # record from the LIVE `ledger` ref immediately before the terminal park. A raced-in valid
+        # record means the draft is review-loop-owned (cancel the park); an unavailable or
+        # conflicting live read skips the park with an operational alert rather than terminally
+        # parking on an unusable read. Only the provenance-derived orphan reason is revalidated — a
+        # NON-draft PR wedged in a bad merge state is parked regardless of provenance, so its
+        # (unrelated) escalation is left untouched.
+        if reason == ORPHAN_DRAFT_REASON:
+            state, _record = _live_provenance_record(
+                registry_api, registry_repo, action.repo, action.number
+            )
+            if state == "admits":
+                print(
+                    f"SKIP PR {action.repo}#{action.number}: a valid provenance record now "
+                    "exists on the live ledger ref (review-loop-owned)"
+                )
+                continue
+            if state == "indeterminate":
+                print(
+                    f"ALERT PR {action.repo}#{action.number}: live provenance revalidation was "
+                    "unavailable or conflicting — deferring the terminal needs:user park to the "
+                    "next sweep"
+                )
+                continue
         labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
         label_changed = False
         if "needs:user" not in labels:
@@ -2206,6 +2349,133 @@ def _self_test() -> int:
             set(),
         )
 
+    # ---- live-ref provenance revalidation at the terminal mutation boundary (issue #174) ----
+    # Both planning and the on-disk mutation-boundary re-check read the IMMUTABLE workflow checkout,
+    # so a provenance record a delayed job/backfill lands DURING the sweep is invisible and groom
+    # would terminally park an already-valid PR. _live_provenance_record re-reads the record from the
+    # live `ledger` ref: it can only CANCEL a park (admits), let it proceed on a conclusive read
+    # (denies), or force skip+alert on an unusable read (indeterminate) — never park on a bad read.
+    def _contents(obj: Any) -> dict[str, str]:
+        return {"type": "file",
+                "content": base64.b64encode(json.dumps(obj).encode()).decode()}
+
+    live_valid = {
+        "pr_number": 91, "head_sha_at_open": "1" * 40, "impl_provider": "anthropic",
+        "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 9,
+    }
+    live_path = (
+        "/repos/owner/registry/contents/orchestration/provenance/"
+        "owner--repo--pr91.json?ref=ledger"
+    )
+
+    class _RaisingAPI:
+        def request(self, method, path, **_kwargs):
+            raise GroomError("registry contents read failed")
+
+    check(
+        "live provenance: a schema-valid record on the live ref ADMITS (cancel the park)",
+        _live_provenance_record(
+            _StubAPI({live_path: _contents(live_valid)}), "owner/registry", "owner/repo", 91),
+        ("admits", live_valid),
+    )
+    check(
+        "live provenance: a clean 404 on the live ref DENIES (park may proceed)",
+        _live_provenance_record(_StubAPI({}), "owner/registry", "owner/repo", 91),
+        ("denies", None),
+    )
+    # A cleanly-read but schema-invalid record is a conclusive 'not admissible' — the same
+    # fail-closed orphan-park the on-disk path makes, NOT an indeterminate alert.
+    check(
+        "live provenance: a cleanly-read schema-invalid record DENIES (orphan park stands)",
+        _live_provenance_record(
+            _StubAPI({live_path: _contents({**live_valid, "pr_number": 90})}),
+            "owner/registry", "owner/repo", 91)[0],
+        "denies",
+    )
+    # Unusable reads must NEVER let the park proceed: a non-file shape, undecodable content, and
+    # malformed JSON are all indeterminate (skip + operational alert). Reverting any of these to a
+    # park (denies) or a suppress (admits) reds a check here.
+    check(
+        "live provenance: a non-file contents shape is INDETERMINATE",
+        _live_provenance_record(
+            _StubAPI({live_path: {"type": "dir"}}), "owner/registry", "owner/repo", 91)[0],
+        "indeterminate",
+    )
+    check(
+        "live provenance: undecodable base64 content is INDETERMINATE",
+        _live_provenance_record(
+            _StubAPI({live_path: {"type": "file", "content": "not base64!"}}),
+            "owner/registry", "owner/repo", 91)[0],
+        "indeterminate",
+    )
+    check(
+        "live provenance: valid base64 wrapping malformed JSON is INDETERMINATE",
+        _live_provenance_record(
+            _StubAPI({live_path: {
+                "type": "file",
+                "content": base64.b64encode(b"{not json").decode()}}),
+            "owner/registry", "owner/repo", 91)[0],
+        "indeterminate",
+    )
+    check(
+        "live provenance: an unavailable (raising) registry read is INDETERMINATE (fail closed)",
+        _live_provenance_record(_RaisingAPI(), "owner/registry", "owner/repo", 91)[0],
+        "indeterminate",
+    )
+    live_repo_failed = False
+    try:
+        _live_provenance_record(_StubAPI({}), "owner/registry", "no-slash", 91)
+    except GroomError:
+        live_repo_failed = True
+    check("live provenance: a malformed target repo fails closed", live_repo_failed, True)
+
+    # _live_issue_admission: the single-issue admission the defer boundary asks — mirrors
+    # _admitted_worker_prs' identity + issue-binding, only the record SOURCE differs (live ref).
+    live_worker_pull = {
+        "head": {"ref": "sparq-agent/issue-9-91-1", "repo": {"full_name": "owner/repo"}},
+        "user": {"login": "app[bot]"},
+        "body": WORKER_PR_MARKER + "\n\nFixes #9",
+    }
+    check(
+        "live admission: a raced-in valid record for the issue's worker PR ADMITS it",
+        _live_issue_admission(
+            _StubAPI({live_path: _contents(live_valid)}), "owner/registry",
+            "owner/repo", 9, {91: live_worker_pull}, "app[bot]"),
+        "admitted",
+    )
+    # NEGATIVE: the live record's issue field disagrees with the branch-encoded issue — admit
+    # neither (exactly _admitted_worker_prs' cross-check, applied to the live record).
+    check(
+        "live admission: a record whose issue disagrees with the branch is DENIED",
+        _live_issue_admission(
+            _StubAPI({live_path: _contents({**live_valid, "issue": 8})}), "owner/registry",
+            "owner/repo", 9, {91: live_worker_pull}, "app[bot]"),
+        "denied",
+    )
+    check(
+        "live admission: an unavailable read on this issue's worker PR is INDETERMINATE",
+        _live_issue_admission(
+            _RaisingAPI(), "owner/registry", "owner/repo", 9,
+            {91: live_worker_pull}, "app[bot]"),
+        "indeterminate",
+    )
+    # A non-worker PR (fails the identity gate) is never read and never suppresses.
+    check(
+        "live admission: a non-worker PR is skipped without a live read (DENIED)",
+        _live_issue_admission(
+            _RaisingAPI(), "owner/registry", "owner/repo", 9,
+            {92: {"head": {"ref": "feature/x", "repo": {"full_name": "owner/repo"}},
+                  "user": {"login": "mallory"}, "body": "Fixes #9"}}, "app[bot]"),
+        "denied",
+    )
+    check(
+        "live admission: an unresolved (empty) bot login admits nothing (fail closed)",
+        _live_issue_admission(
+            _StubAPI({live_path: _contents(live_valid)}), "owner/registry",
+            "owner/repo", 9, {91: live_worker_pull}, ""),
+        "denied",
+    )
+
     # Orphan repair: closed-unmerged worker PRs strip every status label ('complete' adds nothing),
     # and a dead review loop leaves status:in-progress-review. Both are recoverable ONLY when the
     # issue carries worker-attempt evidence, is stale, is not needs:user, and has no open PR.
@@ -2575,6 +2845,10 @@ def _self_test() -> int:
 
         def request(self, method, path, body=None, allow_404=False, **_kwargs):
             if method == "GET":
+                # Issue #174: simulate an UNAVAILABLE live provenance read (registry contents GET
+                # raising) so the mutation-boundary live gate must fail closed (skip + alert).
+                if sweep_env.get("provenance_error") and "/contents/" in path:
+                    raise GroomError("registry contents read failed")
                 return sweep_env["gets"].get(path)
             sweep_env["writes"].append((method, path))
             return {}
@@ -2675,6 +2949,50 @@ def _self_test() -> int:
                  in sweep_env["writes"]),
                 (1, True, True),
             )
+            # ---- issue #174: live-ref revalidation at the terminal defer boundary ----
+            # Remove the ON-DISK provenance record so the on-disk mutation-boundary admission no
+            # longer suppresses (modelling a record that landed on the live `ledger` ref AFTER the
+            # immutable checkout was taken). The live `ledger` ref is served the valid record.
+            (sweep_record_dir / "owner--repo--pr91.json").unlink()
+            live_prov_path = (
+                "/repos/owner/registry/contents/orchestration/provenance/"
+                "owner--repo--pr91.json?ref=ledger"
+            )
+            sweep_env["gets"][live_prov_path] = {
+                "type": "file",
+                "content": base64.b64encode(json.dumps({
+                    "pr_number": 91, "head_sha_at_open": "3" * 40,
+                    "impl_provider": "anthropic", "impl_alias": "fable",
+                    "impl_account_h": "ef" * 8, "issue": 8,
+                }).encode()).decode(),
+            }
+            # (C) The worker PR is visible at the boundary but ABSENT on the immutable checkout;
+            # the LIVE ref admits it → the terminal defer park is CANCELLED (no write). Reverting
+            # the live gate reds this: the on-disk admission alone would park the already-valid
+            # issue (the exact stale-checkout bug).
+            summary_c = _sweep_scenario(pr_visible_from=3)
+            check(
+                "issue #174: a record on the LIVE ref (missing on the checkout) cancels the park",
+                (summary_c, sweep_env["writes"]),
+                ((0, 0, 0, 0), []),
+            )
+            # (D) The live read is UNAVAILABLE (registry contents GET raises): the park must be
+            # SKIPPED and an operational ALERT raised — never park on an unusable read. Capturing
+            # stdout proves the alert is emitted alongside the skipped mutation.
+            sweep_env["provenance_error"] = True
+            alert_buf = io.StringIO()
+            saved_stdout = sys.stdout
+            sys.stdout = alert_buf
+            try:
+                summary_d = _sweep_scenario(pr_visible_from=3)
+            finally:
+                sys.stdout = saved_stdout
+            check(
+                "issue #174: an unavailable live read skips the park AND raises an ALERT",
+                (summary_d[2], sweep_env["writes"], "ALERT" in alert_buf.getvalue()),
+                (0, [], True),
+            )
+            sweep_env["provenance_error"] = False
     finally:
         os.chdir(sweep_prior_cwd)
         globals().update(sweep_saved)
