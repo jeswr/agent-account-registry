@@ -20,6 +20,15 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
 
+class AmbiguousRoleError(ValueError):
+    """A malformed issue carries more than one role:* label — reject, never guess (fail-closed).
+
+    Mirrors policy-resolve.resolve (the CLAIM-side resolver), which raises PolicyError on multiple
+    roles. resolve() distinguishes this from a ROLELESS issue (which legitimately routes to
+    security/defaults) so ambiguous input can never fall through to a permissive default (#122).
+    """
+
+
 def resolve(labels, doc):
     """Return (model_chain, agent, escalate). `labels`: iterable of the issue's labels.
 
@@ -27,17 +36,25 @@ def resolve(labels, doc):
     CLAIM never diverge on a reordered routing.toml (#121): ALL security-label rules are evaluated
     before ANY role rule; within each phase the first match wins. The old single-pass first-match
     let a role block that preceded a matching security block win, planning a chain CLAIM rejects.
+
+    RAISES AmbiguousRoleError when the issue carries more than one distinct role:* label — the
+    ambiguity guard precedes route matching (as in policy-resolve.resolve), so a malformed issue
+    can never resolve to a security/defaults route regardless of a caller's own precheck.
     """
     labels = set(labels)
 
     def role_of(lbs):
-        # The SINGLE declared role, else None — for zero role:* OR an AMBIGUOUS set (>1). Never
-        # picks one of several roles. Consistent with policy-resolve.resolve, which REJECTS
-        # multiple roles, and the planner (dispatch-plan.plan_dispatch), which rejects an ambiguous
-        # issue before plan construction (#122): a multi-role set here skips the Phase-2 role route
-        # and falls to security/defaults, never a silently-chosen (nondeterministic) role chain.
+        # The SINGLE declared role, or None when ROLELESS. RAISES on an AMBIGUOUS set (>1 distinct
+        # role:*) rather than silently returning None: returning None collapsed ambiguity into the
+        # roleless case and let a multi-role issue fall to a security/defaults route (default-allow)
+        # for any caller that skips the planner precheck. This matches policy-resolve.resolve, which
+        # REJECTS multiple roles, and complements the planner (dispatch-plan.plan_dispatch), which
+        # skips an ambiguous issue before it reaches here (#122). Never picks one of several roles.
         roles = {lb[5:] for lb in lbs if lb.startswith("role:")}
-        return next(iter(roles)) if len(roles) == 1 else None
+        if len(roles) > 1:
+            raise AmbiguousRoleError(
+                f"ambiguous role labels: {', '.join(sorted(roles))} — exactly one role:* required")
+        return next(iter(roles)) if roles else None
 
     role = role_of(labels)
     routes = doc.get("route", [])
@@ -66,6 +83,17 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
 
+    def raises_ambiguous(n, fn):
+        nonlocal ok
+        try:
+            fn()
+        except AmbiguousRoleError:
+            good, detail = True, "raised AmbiguousRoleError"
+        else:
+            good, detail = False, "did NOT raise (routed instead)"
+        ok = ok and good
+        print(f"  {'ok  ' if good else 'FAIL'} {n}: {detail}")
+
     # impl + a trust surface (area:worker) -> security rule wins over role -> Opus, escalate.
     mc, ag, esc = resolve(["role:impl", "area:worker"], doc)
     chk("impl+worker -> opus/escalate", (mc, ag, esc), (["opus"], "registry-reviewer", True))
@@ -85,12 +113,17 @@ def _self_test():
     chk("ci chain has no sub-frontier tier", sorted(set(mc) & {"sonnet", "haiku"}), [])
     # no role -> defaults (sol-led, 2026-07-18).
     chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "sol")
-    # [#122] an AMBIGUOUS multi-role set is NOT resolved to an arbitrarily-picked role route:
-    # role_of returns None, so a non-security multi-role set falls to DEFAULTS (sol-led), not the
-    # docs (haiku) route the pre-fix alphabetically-first pick would have chosen. Mirrors
-    # policy-resolve.resolve, which REJECTS multiple roles. Non-vacuous: flips red on pre-fix code.
-    chk("ambiguous roles -> defaults, not an arbitrary role route",
-        resolve(["role:impl", "role:docs", "area:usage"], doc)[0][0], "sol")
+    # [#122] an AMBIGUOUS multi-role set is REJECTED, never silently routed. The pre-fix role_of
+    # returned None for >1 role, collapsing ambiguity into the roleless case so the set fell to a
+    # security/defaults route (a default-allow path for any caller that skips the planner precheck).
+    # resolve now RAISES AmbiguousRoleError, mirroring policy-resolve.resolve (CLAIM), which raises
+    # PolicyError on multiple roles. Non-vacuous: the pre-fix code returned ("sol", ...) here.
+    raises_ambiguous("ambiguous roles rejected, not routed to a default",
+                     lambda: resolve(["role:impl", "role:docs", "area:usage"], doc))
+    # the guard precedes route matching (as in policy-resolve), so a security label present on the
+    # malformed issue does NOT let it slip past the ambiguity check into a security route.
+    raises_ambiguous("ambiguous roles rejected even with a security label present",
+                     lambda: resolve(["role:impl", "role:docs", "area:worker"], doc))
     # review role -> opus + escalate.
     chk("review -> opus/escalate", resolve(["role:review"], doc)[1:], ("registry-reviewer", True))
 
