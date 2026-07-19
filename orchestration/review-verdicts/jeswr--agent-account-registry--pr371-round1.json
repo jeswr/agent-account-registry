@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 371,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f87408f0c7a317e60921523d7f1feff432197981",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly extends the existing require_usage fail-closed behavior to review/fix dispatches before any lease claim, while limiting the exception to non-empty chains whose every resolved alias explicitly maps to the allowlisted openai provider. Missing catalogs, aliases, provider fields, unknown providers, mixed chains, and empty chains remain gated. The tests are non-vacuous: they verify claim suppression and the defer counter for the gated outage, dispatch when the policy is disabled or usage is live, dispatch for the fully exempt chain, and fail-closed handling of unknown providers; the focused classifier tests also cover mixed, missing, typo, empty, and absent-catalog cases. No trust check is weakened and no injection-directed text appears in the diff.",
+  "verdict": "approve"
+ }
+}
