@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 420,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5f29f5621575c4db6252960a427e170b4d3d1635",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change closes both producer- and consumer-side fail-open paths. account-usage now omits Anthropic entries unless status is non-empty and both base utilization windows are finite numeric strings within [0,1]; select-and-claim independently requires allowed status and numeric utilization within [0,1], which also rejects NaN and infinities through the chained comparison. The added self-tests are non-vacuous and cover valid entries plus empty/missing status, missing/non-numeric windows, NaN, negative, and above-range values. No trust checks are weakened and no security-sensitive workflow or token handling is expanded.",
+  "verdict": "approve"
+ }
+}
