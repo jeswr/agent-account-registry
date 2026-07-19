@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Both jobs first run `python3 scripts/retriage.py --self-test`. When a regression makes that self-test fail, the retriage job becomes `failure`, but the alert job then fails on the identical self-test and never reaches the `--alert` step. Thus a scheduled retriage outage caused by a self-test failure produces no rolling issue even though the alert job is documented as catching job-level failures. The live-workflow assertion only proves that the alert step is unmasked; it does not prove the step is reachable when the upstream result is failure.",
+   "file": ".github/workflows/retriage.yml",
+   "fix_hint": "Gate the alert path with tests that are independent of the sweep failure it is reporting (for example, a focused alert-only self-test), or otherwise ensure `--alert` still runs when the shared/full self-test fails while retaining fail-loud behavior for alert implementation failures. Add a non-vacuous workflow/self-test assertion covering an upstream self-test failure and proving the alert invocation remains reachable.",
+   "severity": "major",
+   "title": "The alert job is blocked by the same self-test failure it must report"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The round-2 malformed-lookup finding is correctly fixed: malformed and non-array JSON now return nonzero, avoid mutation and payload echoing, and the self-test asserts that behavior. However, the new alert job cannot report an important class of retriage failures: it reruns the exact same full retriage self-test that gates the retriage job before invoking --alert. If that self-test is what failed, the alert job fails at the same step and never creates or updates the rolling alert. This contradicts the stated job-level fail-loud guarantee. Because this is a new major finding, progress is regressing under the required rubric.",
+ "verdict": "request_changes"
+}
