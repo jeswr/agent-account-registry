@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 428,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "40759465cc70c27de9b9f7c286b99abdbfcf9c74",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's major cache-boundary finding is fixed. `_ensure_actionlint` now re-verifies every cached executable against the hard-coded extracted-binary digest, evicts mismatched cache entries, and falls back only to checksum-verified provisioning. Provisioning extracts into a fresh sibling temporary directory, verifies both the pinned tarball and extracted binary before rename, and removes stale destination binaries on failure. The self-tests are non-vacuous: they separately prove acceptance of a matching cache entry and rejection plus eviction of tampered, binary-digest-mismatched, tarball-mismatched, stale, and unavailable artifacts. The touched-file gate also counts direct validations against emitted targets and fails closed on any unhandled target kind. No reviewer-directed instruction or other prompt-injection text appears in the diff.",
+  "verdict": "approve"
+ }
+}
