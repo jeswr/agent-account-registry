@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 413,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "407d9d0d7a47d0240c385480c559f756b6ef338f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved. Capability bytes are now staged in a fresh mode-0600 inode in the destination directory and atomically installed with os.replace, so an existing permissive inode never receives the token and a destination symlink is replaced rather than followed. The added self-tests are non-vacuous: they pin and inspect the old permissive inode, verify the symlink victim remains unchanged, verify final modes and contents, and retain the missing-output fail-closed assertion. The live path no longer prints the capability. No new blocker, major, or minor issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
