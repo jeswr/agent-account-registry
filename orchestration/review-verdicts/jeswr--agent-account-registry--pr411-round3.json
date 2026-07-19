@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 411,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "12868a1911eb635ea8fa4ec14caf073de1d6cb13",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-2 major finding is resolved. review_outcome now records a void only for the exact `head-moved` freshness result; closed, wrong-author, undrafted, malformed-head, and unbound outcomes defer without a void, so their pre-model charge remains and bounded accounting still converges to escalation. The workflow supplies the resolved 40-hex head to round-record, the write path rejects missing or malformed SHA bindings, voids are bot-authored and keyed to the same round/run attempt, and counting preserves unvoided retries and crashes. The self-tests are non-vacuous: they assert the head-moved-only mutation, explicitly assert no void for representative tamper/identity failures, exercise invalid and valid SHA marker writes, exact void matching, bot filtering, retry charging, and reserved-marker neutralization. I found no remaining blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
