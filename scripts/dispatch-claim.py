@@ -2205,13 +2205,34 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     # PR was silently stranded. A missed dispatch we cannot durably count is a
                     # COUNTED lane error + rolling-alert defer reason, NOT a healthy defer: surface
                     # it and do not fall through to the normal "no lease free" line, whose green
-                    # defer is exactly the signal that hid this. The item still defers (auto-retry),
-                    # but the tick now reports the budget as unconfirmed.
+                    # defer is exactly the signal that hid this.
                     lanes[lane]["error"] += 1
                     defer_reasons["missed-marker-write-failed"] += 1
                     fix_dispatch["defer:missed-marker-write-failed"] += 1
                     print(f"defer review {repo}#{number}: missed-fix marker write FAILED ({exc}); "
-                          "missed-fix budget unconfirmed, escalation cannot bound this PR")
+                          "missed-fix budget unconfirmed")
+                    # Issue #165: the durable `missed` marker is the ONLY input to the
+                    # MISSED_FIX_LIMIT terminal budget, so if it can NEVER be written the budget can
+                    # never bound this PR and the counted-error/rolling-alert above is only a
+                    # PER-TICK signal — a persistent comment/API failure would defer forever without
+                    # the promised human escalation. An accounting failure we cannot durably count
+                    # is itself a terminal, hand-to-human state, so escalate DIRECTLY instead of
+                    # waiting on a budget that can no longer accrue. This is retryable, not
+                    # premature: needs-user rides the SAME target API as the failed marker, so a
+                    # broad transient outage fails this POST too and we simply defer to the next
+                    # tick — the escalation only STICKS on a record-marker-specific failure that
+                    # will not self-heal. The item is bounded the moment EITHER the marker or this
+                    # escalation is durably confirmed; until then it stays a retryable defer.
+                    try:
+                        _pr_needs_user(script_dir, repo, number, issue_number,
+                                       f"the durable missed-fix marker could not be recorded "
+                                       f"({exc}); the MISSED_FIX_LIMIT budget can no longer bound "
+                                       "this PR, so a human must unstick it")
+                    except DispatchError as esc_exc:
+                        defer_reasons["missed-escalation-failed"] += 1
+                        print(f"defer review {repo}#{number}: missed-fix human escalation ALSO "
+                              f"FAILED ({esc_exc}); retrying until the marker or escalation is "
+                              "confirmed")
                     continue
                 fix_dispatch[f"defer:{claim_reason or 'no-account-slots'}"] += 1
             print(f"defer review {repo}#{number}: no eligible {mode} lease is free this tick")
@@ -4556,12 +4577,47 @@ def _self_test():
             assert reasons["missed-marker-write-failed"] == 1, reasons
             assert _lane_summary(run_items.lanes)["fix"] == {
                 "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+            # Issue #165: because the durable marker (the SOLE budget input) could not be written,
+            # the MISSED_FIX_LIMIT terminal can never fire — so the failure escalates DIRECTLY to a
+            # human. needs-user succeeds here (failing_marker_helper only rejects record-marker), so
+            # the PR is now bounded and the escalation is NOT re-counted as an escalation failure.
+            assert ("worker-pr.py", "needs-user") in [
+                (script, args[0]) for script, args in helper_calls], helper_calls
+            assert reasons["missed-escalation-failed"] == 0, reasons
+
+            # Issue #165: a PERSISTENT target-API outage fails the escalation POST too (same API as
+            # the failed marker). Both the marker AND the human escalation fail, so neither terminal
+            # is confirmed: the tick counts the escalation failure and the item stays a RETRYABLE
+            # defer (auto-retry until the marker or the escalation finally lands) — never silently
+            # lost, never a green "no lease free" defer that hides the unbounded PR.
+            def failing_all_helper(script_dir, target_repo, script, args):
+                helper_calls.append((script, args))
+                raise DispatchError(f"{script} {args[0]}: target helper failed")
+
+            globals()["_run_target_helper"] = failing_all_helper
+            try:
+                alloc = FakeAllocator()
+                launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            finally:
+                globals()["_run_target_helper"] = fake_helper
+            assert launched == 0, launched
+            assert reasons["missed-marker-write-failed"] == 1, reasons
+            assert reasons["missed-escalation-failed"] == 1, reasons
+            assert _lane_summary(run_items.lanes)["fix"]["error"] == 1, run_items.lanes
+            # the human escalation WAS attempted after the marker write failed (it did not silently
+            # give up once the marker was unrecordable)
+            assert ("worker-pr.py", "needs-user") in [
+                (script, args[0]) for script, args in helper_calls], helper_calls
+
             # regression guard: a SUCCESSFUL missed marker (default helper) stays a clean defer —
-            # no spurious error/alert when the durable marker is confirmed
+            # no spurious error/alert/escalation when the durable marker is confirmed
             alloc = FakeAllocator()
             _, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert reasons["missed-marker-write-failed"] == 0, reasons
+            assert reasons["missed-escalation-failed"] == 0, reasons
             assert _lane_summary(run_items.lanes)["fix"]["error"] == 0, run_items.lanes
+            assert ("worker-pr.py", "needs-user") not in [
+                (script, args[0]) for script, args in helper_calls], helper_calls
 
             # ---- issue #115: require_usage HOLDS a review/fix claim during a WHOLESALE usage-
             # probe outage (usage=None), matching the worker loop's fail-closed hold, with an
