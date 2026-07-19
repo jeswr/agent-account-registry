@@ -152,6 +152,29 @@ _extract_reset_hint() {
     "$signals_file" 2>/dev/null | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80
 }
 
+# PURE (issue #134): emit the nested READ-ONLY bind mount that pins the selected account credential
+# immutable inside the model's container HOME. The credential HOME is mounted read-write so the CLI
+# can persist its own session/cache, but the credential FILE itself must never be writable by the
+# model: the container gives the model Bash/Write, and a prompt-injected model could otherwise
+# overwrite ~/.codex/auth.json (or ~/.claude/.credentials.json / ~/.claude/worker-token) with
+# attacker-chosen or invalid data, which the rotation write_back would then push to the central
+# ACCTNN_TOKEN secret — poisoning every later worker on that account. A read-only bind mount over
+# just that file (the same parent-rw + child-ro pattern as the read-only .git mount in
+# _run_headless_harness) makes the overwrite impossible at the source: the file becomes an active
+# mountpoint that cannot be written, unlinked, or renamed over from inside the container, so the
+# post-run credential write_back reads is always exactly what worker-prep materialized. Fail closed:
+# every supported credential format materializes UNDER $worker_root/home; a credential anywhere else
+# is an unexpected layout we refuse to run with rather than leave writable.
+_credential_mount_args() {
+  local worker_root=$1 credential_path=$2
+  local home_prefix="$worker_root/home/"
+  [[ "$credential_path" == "$home_prefix"* ]] ||
+    die 'credential is not under the mounted worker HOME; refusing to leave it model-writable'
+  local rel=${credential_path#"$home_prefix"}
+  [[ -n "$rel" && "$rel" != *..* ]] || die 'unsafe credential relative path'
+  printf '%s\n' --mount "type=bind,src=$credential_path,dst=/home/worker/$rel,readonly"
+}
+
 # mutation_mode:
 #   allow — today's implementation tooling (claude Bash/Edit/Write; codex unchanged).
 #   deny  — reviewer posture: claude is restricted to Read/Glob/Grep. codex KEEPS
@@ -242,6 +265,18 @@ _run_headless_harness() {
     [[ "$argv_item" != GH_TOKEN* && "$argv_item" != GITHUB_* ]] ||
       die 'refusing to forward a GitHub token env into the model container'
   done
+
+  # issue #134: pin the account credential READ-ONLY inside the container (nested under the
+  # read-write HOME mount, exactly like the read-only .git mount above) so the untrusted model
+  # cannot overwrite it and poison the central secret through the rotation write_back. Fail closed:
+  # a malformed/absent mount (the helper rejected an out-of-HOME credential) stops the run rather
+  # than leaving the credential writable — the helper's own die() cannot halt the parent from inside
+  # a process substitution, so the element-count check below is the load-bearing guard.
+  local -a credential_mount=()
+  mapfile -t credential_mount < <(_credential_mount_args "$worker_root" "$credential_path")
+  [[ ${#credential_mount[@]} -eq 2 ]] ||
+    die 'credential read-only mount could not be built; refusing to run with a writable credential'
+  container+=("${credential_mount[@]}")
 
   local claude_tools='Bash,Edit,Read,Write,Glob,Grep'
   [[ "$mutation_mode" == deny ]] && claude_tools='Read,Glob,Grep'
@@ -1373,6 +1408,26 @@ self_test() {
   mapfile -t model_args < <(_provider_model_args codex gpt-5.6-codex)
   chk "codex concrete provider model pins --model" \
     "${model_args[*]-}" "--model gpt-5.6-codex"
+
+  # --- credential immutability (issue #134): the selected account credential is bind-mounted
+  # READ-ONLY inside the model's container HOME, so a prompt-injected model with Bash/Write cannot
+  # overwrite it and poison the central ACCTNN_TOKEN secret via the rotation write_back. A
+  # regression that drops `readonly`, mounts it read-write, or maps the wrong container path turns
+  # these red; a credential outside the mounted HOME must fail closed, never run writable. ---
+  local -a cred_mount=()
+  mapfile -t cred_mount < <(_credential_mount_args /w/root /w/root/home/.codex/auth.json)
+  chk "credential mount pins the file read-only" \
+    "$(printf '%s\n' "${cred_mount[@]}" | grep -c ',readonly$')" "1"
+  chk "credential mount maps the HOME-relative path to the container HOME" \
+    "${cred_mount[*]}" \
+    "--mount type=bind,src=/w/root/home/.codex/auth.json,dst=/home/worker/.codex/auth.json,readonly"
+  mapfile -t cred_mount < <(_credential_mount_args /w/root /w/root/home/.claude/worker-token)
+  chk "opaque-token credential is pinned read-only at its container path too" \
+    "${cred_mount[*]}" \
+    "--mount type=bind,src=/w/root/home/.claude/worker-token,dst=/home/worker/.claude/worker-token,readonly"
+  chk "a credential outside the mounted HOME fails closed (never left writable)" \
+    "$( (_credential_mount_args /w/root /w/root/elsewhere/auth.json >/dev/null 2>&1 && echo ok) || echo refused)" \
+    "refused"
 
   # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
   cat > "$tmp/claude.log" <<'LOG'
