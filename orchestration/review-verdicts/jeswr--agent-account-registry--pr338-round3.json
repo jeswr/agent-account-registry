@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The two round-2 major findings are resolved. PLAN now deliberately preserves unlisted `[bot]` authors as advisory over-proposals even with a nonempty policy allowlist, while CLAIM remains the authoritative fail-closed gate using exact membership in the policy allowlist unioned with the runtime App login. Both PLAN and CLAIM type-check the issue and nested `user` shape, so malformed snapshot/API data denies the item rather than aborting the sweep. The new tests exercise the real workflow helper, pin the nonempty-allowlist/own-App case, malformed nested users, exact allowlist admission, and rejection of arbitrary suffix-matching bots; these assertions are non-vacuous. Policy validation rejects malformed and duplicate entries, and no token, permission, action-pinning, head/base binding, audit-trail, or trust-surface regression is introduced.",
+ "verdict": "approve"
+}
