@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2's major durability finding is resolved. scan_records now treats every checksum mismatch on a structurally complete frame, including the final frame at EOF, as CorruptJournal; only partial headers or payloads extending beyond EOF are truncated as torn tails. The revised checksum_mismatch_fails_closed_for_final_and_midfile_records test exercises both a corrupted final acknowledged record and a corrupted earlier record through Journal::open, while torn_tail_is_truncated_on_recovery retains coverage for genuinely incomplete append prefixes. No new correctness, soundness, test-validity, or security issue is evident in the changed surface.",
+ "verdict": "approve"
+}
