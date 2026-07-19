@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 402,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d44d8336e818a1c2505cf1992bad817a26dd342e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior round's major finding is resolved soundly. External FROM references now reject variable expansion and require a literal sha256 digest of exactly 64 hexadecimal characters, while prior-stage aliases remain allowed. The added negative self-tests cover variable-expanded, short, non-hex, and empty digests and would fail under the previous substring-only implementation. The directory-prefix trust-surface expansion remains fail-closed and is backed by non-vacuous classification tests. No blocker or major issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
