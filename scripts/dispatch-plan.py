@@ -43,11 +43,11 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
 
-def _role_of(labels):
-    for lb in sorted(labels):
-        if lb.startswith("role:"):
-            return lb[5:]
-    return None
+def _roles_of(labels):
+    """All DISTINCT declared roles, sorted for determinism (empty when roleless). The planner
+    requires EXACTLY ONE (registry issue #122): CLAIM (policy-resolve.resolve) rejects a multi-role
+    issue, so the old `sorted(labels)` first-role pick built a plan row CLAIM would reject."""
+    return sorted({lb[5:] for lb in labels if lb.startswith("role:")})
 
 
 def _plan_package(labels):
@@ -63,14 +63,39 @@ def _plan_package(labels):
 
 
 def plan_dispatch(ready_issues, routing_doc):
-    """Compose the ready frontier + routing into a dispatch plan. PURE — no I/O, no side effects.
-    A roleless issue is flagged unresolved (role=None, agent=None) — never guessed (fail-closed)."""
+    """Compose the ready frontier + routing into a dispatch plan. PURE apart from a stderr
+    diagnostic when it REJECTS an ambiguous-role issue (below). A roleless issue is flagged
+    unresolved (role=None, agent=None) — never guessed (fail-closed)."""
     plan = []
     for it in ready_issues:
         labels = labels_of(it)
-        role = _role_of(labels)
+        roles = _roles_of(labels)
+        if len(roles) > 1:
+            # registry issue #122: CLAIM (policy-resolve.resolve) REJECTS an issue carrying more
+            # than one role:* label. The planner must therefore NOT pick one arbitrarily (the old
+            # `sorted(labels)` first-role) and build a plan row CLAIM will reject — that resolved
+            # the role nondeterministically and then stranded the malformed issue every tick.
+            # Reject it DETERMINISTICALLY here, BEFORE its plan row is constructed, with a
+            # diagnostic; the tick stays healthy (the other ready issues still plan). NOT emitted
+            # as a role=None row: dispatch.yml treats an unresolved planner row as a fatal
+            # invariant breach (SystemExit) — that would abort the whole tick, not just this issue.
+            print(f"skip #{it.get('number', 0)}: ambiguous role labels "
+                  f"{', '.join(roles)} — exactly one role:* required (registry issue #122)",
+                  file=sys.stderr)
+            continue
+        role = roles[0] if roles else None
         package = _plan_package(labels)
-        model_chain, agent, escalate = resolve(labels, routing_doc)
+        try:
+            model_chain, agent, escalate = resolve(labels, routing_doc)
+        except _route.RoleResolutionError as exc:
+            # registry issue #122 (round 2): a bare `role:` (empty value) or an UNCONFIGURED
+            # `role:<name>` is likewise rejected by CLAIM (policy-resolve.resolve raises on an empty
+            # role value and on a role absent from role_routes). resolve() now fails closed on both
+            # BEFORE routing, so — as with the ambiguous case above — reject the issue here rather
+            # than let the raise abort the tick OR (pre-fix) build a default-routed row CLAIM would
+            # strand. Per-issue skip + diagnostic; the other ready issues still plan.
+            print(f"skip #{it.get('number', 0)}: {exc} (registry issue #122)", file=sys.stderr)
+            continue
         if role is None:
             row = {
                 "number": it.get("number", 0),
@@ -155,6 +180,45 @@ def _self_test():
     p_norole = plan_dispatch([iss(7, ["priority:P1", "area:usage"])], doc)
     row = p_norole[0]
     chk("no-role -> flagged", (row["role"], row["agent"], row["model_chain"]), (None, None, []))
+
+    # issue #122: an AMBIGUOUS multi-role ready issue is REJECTED deterministically and produces
+    # NO plan row — CLAIM (policy-resolve) rejects multiple roles, so a row with an arbitrarily
+    # picked role (the pre-fix `sorted(labels)` first-role -> "docs" here) would strand the issue
+    # every tick. The check flips red on the pre-fix code (which returned a one-row docs plan).
+    p_ambig = plan_dispatch(
+        compute_ready([iss(10, R + ["priority:P1", "role:docs", "role:impl", "area:usage"])]), doc)
+    chk("ambiguous roles -> no row (rejected)", p_ambig, [])
+    # per-issue rejection: a valid single-role issue alongside an ambiguous one still plans — only
+    # the malformed one is dropped, so one mislabeled issue never aborts the whole tick.
+    p_mix = plan_dispatch(compute_ready([
+        iss(11, R + ["priority:P0", "role:impl", "area:usage"]),
+        iss(12, R + ["priority:P1", "role:impl", "role:docs", "area:worker"]),
+    ]), doc)
+    chk("ambiguous dropped, valid kept", [r["number"] for r in p_mix], [11])
+
+    # issue #122 (round 2): a bare `role:` (EMPTY value) and an UNCONFIGURED `role:<name>` are
+    # ALSO rejected — CLAIM (policy-resolve) rejects an empty role value and a role absent from
+    # role_routes, so a default-routed plan row would strand the issue every tick. resolve() raises
+    # a RoleResolutionError and plan_dispatch drops the issue (no row), rather than crashing the
+    # tick or emitting a permissive default row. An UNCONFIGURED role (`role:bogus`) reaches the
+    # planner through readiness (has_role matches any `role:.+`) and is rejected here — non-vacuous:
+    # the pre-fix planner built a one-row default-agent plan for it.
+    chk("unknown role -> no row (rejected)", plan_dispatch(
+        compute_ready([iss(14, R + ["priority:P1", "role:bogus", "area:usage"])]), doc), [])
+    # A bare `role:` (empty value) is normally filtered EARLIER by readiness (has_role requires
+    # `role:.+`), so feed plan_dispatch directly to exercise its own fail-closed guard (defense in
+    # depth): even handed a malformed empty-role issue it drops it rather than emit a default row.
+    # Non-vacuous: pre-fix resolve returned defaults and plan_dispatch built a role="" default row.
+    chk("empty role -> no row (planner guard, defense in depth)",
+        plan_dispatch([iss(13, R + ["priority:P1", "role:", "area:usage"])], doc), [])
+    # per-issue rejection holds: a valid issue alongside a malformed-role one still plans. DIFFERENT
+    # areas (usage vs docs) so both survive readiness — the drop is the role rejection, NOT a
+    # package conflict filtering the second issue out before plan_dispatch sees it.
+    p_mix2 = plan_dispatch(compute_ready([
+        iss(15, R + ["priority:P0", "role:impl", "area:usage"]),
+        iss(16, R + ["priority:P1", "role:bogus", "area:docs"]),
+    ]), doc)
+    chk("malformed single-role dropped, valid kept", [r["number"] for r in p_mix2], [15])
 
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
     # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
