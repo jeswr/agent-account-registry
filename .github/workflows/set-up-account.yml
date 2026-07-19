@@ -83,8 +83,12 @@ jobs:
     # branch, which the environment's custom deployment-branch policy admits.
     environment: dispatch-secrets
     timeout-minutes: 20
-    env:
-      GH_TOKEN: ${{ github.token }}
+    # #188: NO job-level GH_TOKEN. A job-wide token is inherited by every step — including the npm
+    # install and the third-party provider login CLIs, which have no business holding an issues:write
+    # + contents:write registry token. The token is instead granted per-step, ONLY on the steps that
+    # call the GitHub API with the default identity; the install/login steps get none (and explicitly
+    # clear any GitHub credential variable). Checkout runs with persist-credentials:false so the
+    # checkout credential is not left in .git/config for that same untrusted code to read.
     steps:
       # The `runner` context is not valid in job-level env (it invalidated the whole workflow —
       # GitHub refused to parse the file, so the broker never fired). Derive LOGIN_DIR in a step.
@@ -92,6 +96,8 @@ jobs:
         run: echo "LOGIN_DIR=$RUNNER_TEMP/login" >> "$GITHUB_ENV"
 
       - name: Trust gate — actor AND author must be admin/maintain
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           for u in "${{ github.actor }}" "${{ github.event.issue.user.login }}"; do
             perm=$(gh api "repos/${{ github.repository }}/collaborators/$u/permission" --jq .permission 2>/dev/null || echo none)
@@ -122,6 +128,7 @@ jobs:
       # access — a read probe would bless a read-only PAT). Fail closed pre-login on either.
       - name: Preflight — REGISTRY_SECRETS_PAT present AND store-capable, before any login
         env:
+          GH_TOKEN: ${{ github.token }}   # for the fail() issue comment; the PAT probes override it inline
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: |
           set -euo pipefail
@@ -150,6 +157,8 @@ jobs:
 
       - name: Determine provider (structured — no silent default)
         id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           prov=""
           for lb in ${{ join(github.event.issue.labels.*.name, ' ') }}; do
@@ -182,10 +191,20 @@ jobs:
 
       - name: Checkout (pinned)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # #188: do not persist the checkout credential into .git/config — npm lifecycle code and the
+          # third-party provider CLIs run against this checkout and must never be able to read a
+          # repository-write git credential (the repo-wide convention; every other checkout does this).
+          persist-credentials: false
 
       - name: Install provider CLI (version-pinned, fail on error)
         run: |
           set -e
+          # #188: no GitHub token reaches npm or any package lifecycle script. The job sets no
+          # job-level GH_TOKEN and this step is granted none, but clear every GitHub credential
+          # variable explicitly here too (defence in depth) so untrusted install-time code can never
+          # observe a repository-write token.
+          unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
           if [ "${{ steps.meta.outputs.provider }}" = "openai" ]; then
             npm i -g @openai/codex@0.144.1
           else
@@ -203,6 +222,7 @@ jobs:
       # secrets preflight) — a login whose challenge we cannot deliver confidentially must never run.
       - name: Preflight — requester has a confidential-delivery key, before any login
         env:
+          GH_TOKEN: ${{ github.token }}
           REQUESTER: ${{ github.event.issue.user.login }}
           ISSUE: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
@@ -244,11 +264,17 @@ jobs:
       - name: Device login + deliver encrypted sign-in, capture token
         id: login
         env:
+          GH_TOKEN: ${{ github.token }}   # used ONLY by the gh issue comment below, never by the CLI
           REQUESTER: ${{ github.event.issue.user.login }}
         run: |
           set -euo pipefail
           export GNUPGHOME="$LOGIN_DIR/gnupg"   # the keyring the preflight imported the recipient into
-          bash scripts/account-login.sh "${{ steps.meta.outputs.provider }}" "$LOGIN_DIR" 780 &
+          # #188: the provider login CLI (and any child it spawns) must NOT inherit the repository-write
+          # GitHub token — only the `gh issue comment` in this step needs it. Launch account-login.sh
+          # with every GitHub credential variable stripped from its environment; GH_TOKEN stays set for
+          # the gh command that posts the encrypted challenge.
+          env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            bash scripts/account-login.sh "${{ steps.meta.outputs.provider }}" "$LOGIN_DIR" 780 &
           BR=$!
           for _ in $(seq 1 40); do [ -s "$LOGIN_DIR/signin.txt" ] && break; sleep 2; done
           if [ -s "$LOGIN_DIR/signin.txt" ]; then
@@ -284,6 +310,7 @@ jobs:
       - name: Reject a credential format incompatible with the routing aliases (fail closed, pre-store)
         if: steps.login.outputs.status == 'ok'
         env:
+          GH_TOKEN: ${{ github.token }}
           MODELS: ${{ steps.meta.outputs.models }}
           ISSUE: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
@@ -318,6 +345,7 @@ jobs:
         id: store
         if: steps.login.outputs.status == 'ok'
         env:
+          GH_TOKEN: ${{ github.token }}   # default-identity refs/issues API; PAT probes override inline
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
           RESERVED_HANDLE: ${{ steps.meta.outputs.handle }}
         run: |
@@ -432,6 +460,7 @@ jobs:
         id: register
         if: steps.login.outputs.status == 'ok'
         env:
+          GH_TOKEN: ${{ github.token }}
           PROVIDER: ${{ steps.meta.outputs.provider }}
           MODELS: ${{ steps.meta.outputs.models }}
           HANDLE: ${{ steps.store.outputs.handle }}
@@ -454,6 +483,7 @@ jobs:
         id: validate
         if: steps.login.outputs.status == 'ok'
         env:
+          GH_TOKEN: ${{ github.token }}   # read_accounts shells out to `gh issue list`
           NEW_HANDLE: ${{ steps.store.outputs.handle }}
         run: |
           set -euo pipefail
@@ -612,6 +642,7 @@ jobs:
         id: activate_inline
         if: steps.login.outputs.status == 'ok'
         env:
+          GH_TOKEN: ${{ github.token }}
           HANDLE: ${{ steps.store.outputs.handle }}
           SECRET: ${{ steps.store.outputs.secret }}
           MODELS: ${{ steps.meta.outputs.models }}
@@ -660,6 +691,8 @@ jobs:
 
       - name: Report failure
         if: steps.login.outputs.status != 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
             --body "⚠️ Sign-in did not complete in time (device code expires ~15 min). Re-apply \`set-up-account\` to retry." || true
@@ -672,6 +705,7 @@ jobs:
       - name: Alarm on partial enrollment state (always) (#185)
         if: always() && steps.login.outputs.status == 'ok'
         env:
+          GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
           HANDLE: ${{ steps.store.outputs.handle }}
           SECRET: ${{ steps.store.outputs.secret }}
@@ -733,6 +767,9 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
+          # #188: this job runs no installer or third-party CLI, but there is no reason to persist the
+          # checkout credential (gh uses GH_TOKEN, not .git/config) — match the repo-wide convention.
+          persist-credentials: false
 
       - name: Activate the pending account now that account_pool merged (fail closed)
         run: |
