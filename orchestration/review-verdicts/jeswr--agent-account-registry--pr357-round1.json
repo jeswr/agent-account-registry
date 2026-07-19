@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 357,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cf5bf6db4c1314c0d4081b9cfcdc23b9ca7765b6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_is_registry_cas_conflict` returns false for every 5xx response, and `_registry_put_file` consequently stops after the first PUT. The accompanying comment claims a server failure can never clear by waiting, but 5xx responses are inherently capable of being transient. This regresses the old bounded retry behavior and can permanently omit a provenance/verdict record during a short GitHub outage. Paging a human does not preserve or automatically replay the lost record, so this conflicts with the change's stated goal of preventing stranded writers.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Separate retryable transient failures from CAS conflicts. Keep deadline-bounded, jittered retries for genuine CAS conflicts and use an appropriate bounded retry policy (honoring retry hints where available) for transient 5xx/rate-limit failures, while retaining immediate failure for permanent auth/validation/not-found errors. Add a self-test proving a 5xx can recover on a later attempt and that a persistent 5xx still terminates and alerts within its bound.",
+    "severity": "major",
+    "title": "Transient 5xx failures are incorrectly made fail-fast"
+   }
+  ],
+  "progress": null,
+  "summary": "The CAS deadline and conflict-specific tests are non-vacuous, but the new fail-fast classification incorrectly treats all server-side 5xx responses as permanent. That weakens delivery reliability for provenance and verdict records: a transient GitHub outage now strands the record after one PUT, even though the previous implementation retried it. Because these records are part of the orchestration trust plane and the terminal alert does not replay the write, this is a major correctness issue.",
+  "verdict": "request_changes"
+ }
+}
