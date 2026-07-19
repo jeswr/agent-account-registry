@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 366,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4f6c04bf27297fece57a6df6c2eb9f0f57a1ea44",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly adds a nested read-only bind mount for the selected credential after the writable HOME mount, validates that the credential is beneath the mounted worker HOME, and fails closed when the helper cannot produce the expected two mount arguments. The destination preserves the HOME-relative credential path for both structured and opaque-token formats. The self-tests are non-vacuous: they check the readonly flag, exact source/destination mapping for both supported layouts, and rejection of an out-of-HOME credential. No trust check is weakened, no token value is exposed, and no hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
