@@ -17,8 +17,11 @@
 #         still-live) access token must then pass the non-inference `/api/oauth/profile` check
 #         before it is attested;
 #     and REQUIRES the op to succeed before the credential is accepted, so a stale/unproven credential
-#     can never be reported as a fresh one; then (c) extracts ONLY {access_token, expires_at} — openai
-#     expiry derived from the access token's own `exp` claim, NOT `last_refresh` — and returns that.
+#     can never be reported as a fresh one; then (c) INDEPENDENTLY of the provider op, requires the
+#     re-read expiry to outlive a worker job by WORKER_TOKEN_MIN_LIFETIME_S (so a status op that
+#     "succeeds" over an expired, un-rotated token is still refused) and extracts ONLY
+#     {access_token, expires_at} — openai expiry derived from the access token's own `exp` claim,
+#     NOT `last_refresh` — and returns that.
 #     The refresh token stays inside the registry. The maintainer never re-authenticates: the refresh
 #     token is valid until explicitly revoked and is what mints each short-lived access token.
 #
@@ -34,6 +37,7 @@ token (or any key whose name implies a refresh/long-lived secret)."""
 import argparse
 import base64
 import json
+import math
 import os
 import stat
 import subprocess
@@ -128,8 +132,12 @@ ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 # Claude Code's PUBLIC OAuth client identifier (baked into the CLI's PKCE flow; not a secret).
 ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# A worker capability must outlive a worker job by this margin; refresh_ok enforces it for BOTH
+# providers on the re-read credential, so a "successful" refresh op that leaves an expired (or
+# near-expiry) token on disk can never be attested as a fresh capability.
+WORKER_TOKEN_MIN_LIFETIME_S = 3600
 # Mint a new access token unless the stored one outlives a worker job by this margin.
-ANTHROPIC_REFRESH_SKEW_S = 3600
+ANTHROPIC_REFRESH_SKEW_S = WORKER_TOKEN_MIN_LIFETIME_S
 
 
 def _http_post_json(url, payload, timeout=30):
@@ -194,8 +202,11 @@ def _prove_anthropic(home, http_post=None, http_get=None, now=None):
             "grant_type": "refresh_token", "refresh_token": o["refreshToken"],
             "client_id": ANTHROPIC_OAUTH_CLIENT_ID})
         minted, expires_in = (resp or {}).get("access_token"), (resp or {}).get("expires_in")
-        if not minted or not isinstance(expires_in, (int, float)):
-            return False, cred  # exchange failed or expiry unattestable; fail closed
+        if (not minted or not isinstance(expires_in, (int, float)) or not math.isfinite(expires_in)
+                or expires_in <= ANTHROPIC_REFRESH_SKEW_S):
+            # Exchange failed, expiry unattestable, or the minted lifetime cannot cover a worker job
+            # (zero/negative/below-margin) — the same lifetime invariant that forced the mint.
+            return False, cred  # fail closed; never persist an unusable minted token
         cred = dict(cred, claudeAiOauth=dict(
             o, accessToken=minted, expiresAt=int((now + expires_in) * 1000),
             refreshToken=resp.get("refresh_token") or o["refreshToken"]))
@@ -216,16 +227,24 @@ def refresh_via_cli(provider, home, **kwargs):
     return prove(home, **kwargs)
 
 
-def refresh_ok(provider, ok, refreshed):
+def refresh_ok(provider, ok, refreshed, now=None):
     """Fail-closed gate over a refresh attempt: the op must have succeeded (ok) AND the re-read
-    credential must yield a usable capability — an access token (extract raises otherwise) and, for
-    openai, a real derived expiry. Returns the validated capability; raises on any failure so a stale
-    or unproven credential is NEVER re-read and reported as success."""
+    credential must yield a usable capability — an access token (extract raises otherwise) with an
+    attestable expiry that outlives a worker job by WORKER_TOKEN_MIN_LIFETIME_S. This is checked here
+    for BOTH providers, independently of the provider proof, so an op that "succeeds" while leaving
+    an expired or near-expiry token on disk (e.g. `codex login status` exiting 0 without rotating)
+    is NEVER reported as a fresh capability. `now` is injectable for --self-test."""
+    now = time.time() if now is None else now
     if not ok:
         raise RuntimeError(f"{provider} refresh op did not succeed; credential not proven refreshed")
     cap = extract_access_token(provider, refreshed)
-    if provider == "openai" and cap["expires_at"] is None:
-        raise ValueError("openai access token carries no readable `exp` claim; expiry unattestable")
+    exp = cap["expires_at"]  # anthropic stores milliseconds; tolerate seconds
+    exp_s = exp / 1000.0 if isinstance(exp, (int, float)) and exp > 1e12 else exp
+    # Condition stated positively so NaN (all comparisons False) also fails closed.
+    if not (isinstance(exp_s, (int, float)) and math.isfinite(exp_s)
+            and exp_s > now + WORKER_TOKEN_MIN_LIFETIME_S):
+        raise ValueError(f"{provider} access token expiry is unattestable or does not outlive a "
+                         "worker job; refusing to attest it as a fresh capability")
     return cap
 
 
@@ -287,14 +306,34 @@ def _self_test():
         raises(ValueError, lambda: extract_access_token("openai", {"tokens": {}})))
     chk("anthropic rejects missing access token",
         raises(ValueError, lambda: extract_access_token("anthropic", {"claudeAiOauth": {}})))
-    # refresh gate: a failed op or an openai token with no derivable expiry is NEVER reported success
-    chk("refresh_ok passes a proven openai refresh", refresh_ok("openai", True, codex) == co)
-    chk("refresh_ok passes a proven anthropic refresh", refresh_ok("anthropic", True, claude) == cl)
+    # refresh gate: a failed op, a token with no derivable expiry, or a token whose expiry cannot
+    # outlive a worker job is NEVER reported success — for EITHER provider.
+    now = 1752000000  # fixed clock (seconds) so expiry math is deterministic; exp above is later
+    chk("refresh_ok passes a proven openai refresh", refresh_ok("openai", True, codex, now=now) == co)
+    chk("refresh_ok passes a proven anthropic refresh",
+        refresh_ok("anthropic", True, claude, now=now) == cl)
     chk("refresh_ok rejects a failed op (non-vacuous)",
-        raises(RuntimeError, lambda: refresh_ok("openai", False, codex)))
+        raises(RuntimeError, lambda: refresh_ok("openai", False, codex, now=now)))
     chk("refresh_ok rejects openai token with no exp (non-vacuous)",
         raises(ValueError, lambda: refresh_ok(
-            "openai", True, {"tokens": {"access_token": "opaque-not-a-jwt"}})))
+            "openai", True, {"tokens": {"access_token": "opaque-not-a-jwt"}}, now=now)))
+    chk("refresh_ok rejects an EXPIRED openai token even when the op reported ok (non-vacuous)",
+        raises(ValueError, lambda: refresh_ok(
+            "openai", True, {"tokens": {"access_token": mk_jwt(now - 60)}}, now=now)))
+    chk("refresh_ok rejects an openai token expiring within the worker margin",
+        raises(ValueError, lambda: refresh_ok(
+            "openai", True, {"tokens": {"access_token": mk_jwt(now + 600)}}, now=now)))
+    chk("refresh_ok rejects an EXPIRED anthropic token even when the op reported ok (non-vacuous)",
+        raises(ValueError, lambda: refresh_ok(
+            "anthropic", True,
+            {"claudeAiOauth": {"accessToken": "A", "expiresAt": (now - 60) * 1000}}, now=now)))
+    chk("refresh_ok rejects an anthropic token with a non-numeric expiry",
+        raises(ValueError, lambda: refresh_ok(
+            "anthropic", True, {"claudeAiOauth": {"accessToken": "A", "expiresAt": None}}, now=now)))
+    chk("refresh_ok rejects a NaN expiry (fail closed on incomparable values)",
+        raises(ValueError, lambda: refresh_ok(
+            "anthropic", True,
+            {"claudeAiOauth": {"accessToken": "A", "expiresAt": float("nan")}}, now=now)))
     # the security invariant: NO refresh token in either capability
     chk("openai capability has NO refresh key", assert_no_refresh_leak(co))
     chk("anthropic capability has NO refresh key", assert_no_refresh_leak(cl))
@@ -307,7 +346,6 @@ def _self_test():
     chk("cred_relpath anthropic", cred_relpath("anthropic") == ".claude/.credentials.json")
 
     # ---- live proof paths, mocked I/O over real credential files in a throwaway HOME ------------
-    now = 1752000000  # fixed clock (seconds) so expiry math is deterministic
     expired = {"claudeAiOauth": {"accessToken": "OLD_ACCESS", "refreshToken": "REFRESH_long",
                                  "expiresAt": (now - 60) * 1000}}  # ms, already past
 
@@ -322,7 +360,7 @@ def _self_test():
                     "expires_in": 28800}
         ok_live, refreshed = refresh_via_cli("anthropic", home, http_post=post_mint,
                                              http_get=lambda u, h: 200, now=now)
-        cap_live = refresh_ok("anthropic", ok_live, refreshed)
+        cap_live = refresh_ok("anthropic", ok_live, refreshed, now=now)
         chk("anthropic expired token triggers exactly one refresh exchange",
             len(posts) == 1 and posts[0][0] == ANTHROPIC_TOKEN_URL)
         chk("anthropic exchange is a refresh_token grant with the stored refresh token",
@@ -348,10 +386,21 @@ def _self_test():
         chk("failed exchange fails closed even though the profile op would return 200 (non-vacuous)",
             ok_neg is False and cred_neg["claudeAiOauth"]["accessToken"] == "OLD_ACCESS")
         chk("refresh_ok refuses the failed anthropic mint",
-            raises(RuntimeError, lambda: refresh_ok("anthropic", ok_neg, cred_neg)))
+            raises(RuntimeError, lambda: refresh_ok("anthropic", ok_neg, cred_neg, now=now)))
         ok_m401, _ = _prove_anthropic(home, http_post=post_mint,
                                       http_get=lambda u, h: 401, now=now)
         chk("a minted token that fails profile validation is rejected", ok_m401 is False)
+        # A "successful" mint whose lifetime cannot cover a worker job is rejected BEFORE it is
+        # persisted or profile-checked — zero, negative, below-margin, and non-finite expires_in.
+        for label, bad_in in (("zero", 0), ("negative", -300),
+                              ("below-margin", ANTHROPIC_REFRESH_SKEW_S - 1), ("inf", float("inf"))):
+            _write_isolated("anthropic", expired, home)  # the ok_m401 mint above rotated the file
+            ok_bad_in, cred_bad_in = _prove_anthropic(
+                home, http_post=lambda u, p, e=bad_in: {"access_token": "SHORT", "expires_in": e},
+                http_get=lambda u, h: 200, now=now)
+            chk(f"minted token with {label} expires_in is rejected and never persisted (non-vacuous)",
+                ok_bad_in is False
+                and cred_bad_in["claudeAiOauth"]["accessToken"] == "OLD_ACCESS")
 
     # anthropic: a still-fresh token validates WITHOUT a needless refresh-token rotation, a 401
     # fails closed, and a credential with no refresh token cannot mint at all.
@@ -390,7 +439,7 @@ def _self_test():
                                       "refresh_token": "REFRESH_rotated"}}, f)
             return subprocess.CompletedProcess(cmd, 0)
         ok_cli, cred_cli = refresh_via_cli("openai", home, run=codex_refreshes)
-        cap_cli = refresh_ok("openai", ok_cli, cred_cli)
+        cap_cli = refresh_ok("openai", ok_cli, cred_cli, now=now)
         chk("openai proof re-reads the CLI-rewritten credential (token actually rotated)",
             ok_cli is True and cap_cli["access_token"] == new_jwt
             and cap_cli["expires_at"] == 2200000000)
@@ -399,7 +448,19 @@ def _self_test():
         ok_bad, cred_bad = _prove_openai(
             home, run=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1))
         chk("openai failed status op is never accepted (non-vacuous)",
-            ok_bad is False and raises(RuntimeError, lambda: refresh_ok("openai", ok_bad, cred_bad)))
+            ok_bad is False
+            and raises(RuntimeError, lambda: refresh_ok("openai", ok_bad, cred_bad, now=now)))
+        # THE critical negative: `codex login status` exits 0 but does NOT rotate the expired token
+        # on disk. The status op is then "successful", yet the re-read credential is still expired —
+        # refresh_ok must refuse to attest it as a fresh worker capability.
+        _write_isolated("openai", {"tokens": {"access_token": old_jwt,
+                                              "refresh_token": "REFRESH_long"}}, home)
+        ok_noop, cred_noop = _prove_openai(
+            home, run=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0))  # exit 0, no rewrite
+        chk("openai status 0 leaving an EXPIRED token unchanged is rejected (non-vacuous)",
+            ok_noop is True  # the op itself reported success — the expiry gate must catch it
+            and cred_noop["tokens"]["access_token"] == old_jwt
+            and raises(ValueError, lambda: refresh_ok("openai", ok_noop, cred_noop, now=now)))
 
     print("broker-refresh self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
