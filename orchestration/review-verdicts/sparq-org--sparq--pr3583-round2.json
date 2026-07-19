@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3583,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aafe9d4ac9bd2aa71a77e3218fba80153baa5afa",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major completeness defect is resolved. The regression guard now checks both stale origins across site/src, and the remaining generated-data reference was migrated to github.com/sparq-org/sparq. A checkout-wide scan of site/src finds neither stale pattern. The exclusions are narrow, documented sibling-owned paths; neither currently contains a stale origin at the PR head. The test exercises the real filesystem tree and reports file, line, and matched origin, so it is non-vacuous and appropriately guards the claimed scope.",
+  "verdict": "approve"
+ }
+}
