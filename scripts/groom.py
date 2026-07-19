@@ -387,34 +387,53 @@ def _live_provenance_record(
                            the review loop's OWN predicate) exists on the live ref RIGHT NOW;
                            ``record`` is the parsed object. A terminal ``needs:user`` park must be
                            CANCELLED — the PR is review-loop-owned.
-    - ``"denies"``       — the live ref conclusively holds NO admissible record: a clean 404, or a
-                           cleanly-read record the predicate rejects (``record`` is None). The park
-                           may proceed — the same fail-closed orphan hand-off the on-disk path makes.
-    - ``"indeterminate"``— the read was UNAVAILABLE (registry API/network failure) or CONFLICTING
-                           (a non-file shape, undecodable content, or malformed JSON): admissibility
-                           cannot be determined, so the caller must SKIP the terminal mutation and
-                           raise an operational alert (never park on an unusable read).
+    - ``"denies"``       — the live ref conclusively holds NO admissible record: a clean 404 pinned
+                           to the VERIFIED ledger tip, or a cleanly-read record the predicate
+                           rejects (``record`` is None). The park may proceed — the same fail-closed
+                           orphan hand-off the on-disk path makes.
+    - ``"indeterminate"``— the read was UNAVAILABLE (registry API/network failure, or a
+                           missing/unresolvable ``LEDGER_REF``) or CONFLICTING (a non-file shape,
+                           undecodable content, or malformed JSON): admissibility cannot be
+                           determined, so the caller must SKIP the terminal mutation and raise an
+                           operational alert (never park on an unusable read).
 
     Both planning and the on-disk mutation-boundary re-check read the IMMUTABLE workflow checkout
     (``registry_root`` / ``--ledger-root``), so a delayed provenance job or backfill that lands
     DURING the sweep is invisible and groom would terminally park an already-valid PR (issue #174).
     This live read is the FINAL gate immediately before the write — it can only CANCEL a park, never
     cause one. Records live in the REGISTRY repo, so it reads via the registry client
-    (``REGISTRY_GH_TOKEN``) pinned to ``LEDGER_REF``, exactly as _read_ledger reads the ledger tip."""
+    (``REGISTRY_GH_TOKEN``) pinned to the commit sha ``LEDGER_REF`` resolves to at read time —
+    the ref is verified to exist before any 404 is trusted, as _read_ledger's branch probe does."""
     owner, _, name = repo.partition("/")
     if not owner or not name:
         raise GroomError("target repository name is malformed")
     record_name = f"{owner}--{name}--pr{number}.json"
+    # A Contents 404 does NOT prove the ledger REF exists (review round 1): the API answers 404
+    # both for a missing file and for a missing/inaccessible ref or repository, so a deleted or
+    # misconfigured LEDGER_REF would read as "no record" and green-light every terminal park.
+    # Resolve the ref to its commit sha FIRST (the same file-vs-branch probe _read_ledger makes)
+    # and pin the record read to that sha: a 404 below then conclusively means "absent on the
+    # verified live tip", while an unresolvable ref is indeterminate — never a park.
+    try:
+        ref = registry_api.request(
+            "GET", f"/repos/{registry_repo}/git/ref/heads/{LEDGER_REF}", allow_404=True
+        )
+    except GroomError:
+        return "indeterminate", None  # unavailable ref resolution — cannot confirm, fail closed
+    tip = ref.get("object") if isinstance(ref, dict) else None
+    sha = tip.get("sha") if isinstance(tip, dict) else None
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        return "indeterminate", None  # missing/malformed ledger ref — the live source is unreadable
     path = (
         f"/repos/{registry_repo}/contents/{PROVENANCE_DIR}/"
-        f"{quote(record_name, safe='')}?ref={LEDGER_REF}"
+        f"{quote(record_name, safe='')}?ref={sha}"
     )
     try:
         result = registry_api.request("GET", path, allow_404=True)
     except GroomError:
         return "indeterminate", None  # unavailable live read — cannot confirm, fail closed
     if result is None:
-        return "denies", None  # clean 404 on the live ledger ref — genuinely no record
+        return "denies", None  # clean 404 pinned to the verified tip — genuinely no record
     if (
         not isinstance(result, dict)
         or result.get("type") != "file"
@@ -2363,9 +2382,14 @@ def _self_test() -> int:
         "pr_number": 91, "head_sha_at_open": "1" * 40, "impl_provider": "anthropic",
         "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 9,
     }
+    # A Contents 404 only proves file absence once the ledger REF is verified (review round 1),
+    # so every conclusive read first resolves the ref and pins the record read to its tip sha.
+    # Literal "ledger" here for the same reason as the ledger-branch-targeting checks below.
+    live_tip = "a" * 40
+    live_ref = {"/repos/owner/registry/git/ref/heads/ledger": {"object": {"sha": live_tip}}}
     live_path = (
         "/repos/owner/registry/contents/orchestration/provenance/"
-        "owner--repo--pr91.json?ref=ledger"
+        f"owner--repo--pr91.json?ref={live_tip}"
     )
 
     class _RaisingAPI:
@@ -2375,43 +2399,61 @@ def _self_test() -> int:
     check(
         "live provenance: a schema-valid record on the live ref ADMITS (cancel the park)",
         _live_provenance_record(
-            _StubAPI({live_path: _contents(live_valid)}), "owner/registry", "owner/repo", 91),
+            _StubAPI({**live_ref, live_path: _contents(live_valid)}),
+            "owner/registry", "owner/repo", 91),
         ("admits", live_valid),
     )
     check(
-        "live provenance: a clean 404 on the live ref DENIES (park may proceed)",
-        _live_provenance_record(_StubAPI({}), "owner/registry", "owner/repo", 91),
+        "live provenance: a clean 404 on the VERIFIED live ref DENIES (park may proceed)",
+        _live_provenance_record(_StubAPI(dict(live_ref)), "owner/registry", "owner/repo", 91),
         ("denies", None),
+    )
+    # The 404 is only conclusive against a PROVEN ref: with the ledger ref itself missing (deleted
+    # branch, misconfigured LEDGER_REF, lost registry visibility) the record 404 proves nothing.
+    # Reverting the ref verification (trusting a bare Contents 404) turns these red as "denies".
+    check(
+        "live provenance: a 404 with the ledger REF missing is INDETERMINATE (never park)",
+        _live_provenance_record(_StubAPI({}), "owner/registry", "owner/repo", 91),
+        ("indeterminate", None),
+    )
+    check(
+        "live provenance: a malformed ref object (no tip sha) is INDETERMINATE",
+        _live_provenance_record(
+            _StubAPI({"/repos/owner/registry/git/ref/heads/ledger": {"object": {}}}),
+            "owner/registry", "owner/repo", 91)[0],
+        "indeterminate",
     )
     # A cleanly-read but schema-invalid record is a conclusive 'not admissible' — the same
     # fail-closed orphan-park the on-disk path makes, NOT an indeterminate alert.
     check(
         "live provenance: a cleanly-read schema-invalid record DENIES (orphan park stands)",
         _live_provenance_record(
-            _StubAPI({live_path: _contents({**live_valid, "pr_number": 90})}),
+            _StubAPI({**live_ref, live_path: _contents({**live_valid, "pr_number": 90})}),
             "owner/registry", "owner/repo", 91)[0],
         "denies",
     )
     # Unusable reads must NEVER let the park proceed: a non-file shape, undecodable content, and
     # malformed JSON are all indeterminate (skip + operational alert). Reverting any of these to a
-    # park (denies) or a suppress (admits) reds a check here.
+    # park (denies) or a suppress (admits) reds a check here. Each stub carries the ref entry so
+    # the indeterminate verdict is attributable to the CONTENT defect, not a missing ref.
     check(
         "live provenance: a non-file contents shape is INDETERMINATE",
         _live_provenance_record(
-            _StubAPI({live_path: {"type": "dir"}}), "owner/registry", "owner/repo", 91)[0],
+            _StubAPI({**live_ref, live_path: {"type": "dir"}}),
+            "owner/registry", "owner/repo", 91)[0],
         "indeterminate",
     )
     check(
         "live provenance: undecodable base64 content is INDETERMINATE",
         _live_provenance_record(
-            _StubAPI({live_path: {"type": "file", "content": "not base64!"}}),
+            _StubAPI({**live_ref, live_path: {"type": "file", "content": "not base64!"}}),
             "owner/registry", "owner/repo", 91)[0],
         "indeterminate",
     )
     check(
         "live provenance: valid base64 wrapping malformed JSON is INDETERMINATE",
         _live_provenance_record(
-            _StubAPI({live_path: {
+            _StubAPI({**live_ref, live_path: {
                 "type": "file",
                 "content": base64.b64encode(b"{not json").decode()}}),
             "owner/registry", "owner/repo", 91)[0],
@@ -2439,7 +2481,7 @@ def _self_test() -> int:
     check(
         "live admission: a raced-in valid record for the issue's worker PR ADMITS it",
         _live_issue_admission(
-            _StubAPI({live_path: _contents(live_valid)}), "owner/registry",
+            _StubAPI({**live_ref, live_path: _contents(live_valid)}), "owner/registry",
             "owner/repo", 9, {91: live_worker_pull}, "app[bot]"),
         "admitted",
     )
@@ -2448,9 +2490,18 @@ def _self_test() -> int:
     check(
         "live admission: a record whose issue disagrees with the branch is DENIED",
         _live_issue_admission(
-            _StubAPI({live_path: _contents({**live_valid, "issue": 8})}), "owner/registry",
-            "owner/repo", 9, {91: live_worker_pull}, "app[bot]"),
+            _StubAPI({**live_ref, live_path: _contents({**live_valid, "issue": 8})}),
+            "owner/registry", "owner/repo", 9, {91: live_worker_pull}, "app[bot]"),
         "denied",
+    )
+    # The finding's mutation-relevant direction: a missing ledger ref must surface as
+    # INDETERMINATE through the single-issue admission too, so the caller skips the park.
+    check(
+        "live admission: a missing ledger REF is INDETERMINATE (skip the park)",
+        _live_issue_admission(
+            _StubAPI({}), "owner/registry", "owner/repo", 9,
+            {91: live_worker_pull}, "app[bot]"),
+        "indeterminate",
     )
     check(
         "live admission: an unavailable read on this issue's worker PR is INDETERMINATE",
@@ -2954,9 +3005,14 @@ def _self_test() -> int:
             # longer suppresses (modelling a record that landed on the live `ledger` ref AFTER the
             # immutable checkout was taken). The live `ledger` ref is served the valid record.
             (sweep_record_dir / "owner--repo--pr91.json").unlink()
+            # The live gate first verifies the ledger ref exists and pins the record read to its
+            # tip sha (review round 1) — serve the ref, and the record AT that pinned sha.
+            sweep_ref_path = "/repos/owner/registry/git/ref/heads/ledger"
+            sweep_tip = "b" * 40
+            sweep_env["gets"][sweep_ref_path] = {"object": {"sha": sweep_tip}}
             live_prov_path = (
                 "/repos/owner/registry/contents/orchestration/provenance/"
-                "owner--repo--pr91.json?ref=ledger"
+                f"owner--repo--pr91.json?ref={sweep_tip}"
             )
             sweep_env["gets"][live_prov_path] = {
                 "type": "file",
@@ -2993,6 +3049,23 @@ def _self_test() -> int:
                 (0, [], True),
             )
             sweep_env["provenance_error"] = False
+            # (E) The ledger REF itself is unresolvable at the boundary (deleted branch or
+            # misconfigured LEDGER_REF — review round 1): the record 404 proves nothing, so the
+            # terminal park must be SKIPPED with an ALERT, never written. Reverting the ref
+            # verification (trusting a bare Contents 404 as "denies") reds this: the record is
+            # stubbed only at the verified-sha path, so the un-pinned read would deny and park.
+            sweep_env["gets"].pop(sweep_ref_path)
+            alert_buf = io.StringIO()
+            sys.stdout = alert_buf
+            try:
+                summary_e = _sweep_scenario(pr_visible_from=3)
+            finally:
+                sys.stdout = saved_stdout
+            check(
+                "issue #174: a missing ledger REF skips the terminal park AND raises an ALERT",
+                (summary_e[2], sweep_env["writes"], "ALERT" in alert_buf.getvalue()),
+                (0, [], True),
+            )
     finally:
         os.chdir(sweep_prior_cwd)
         globals().update(sweep_saved)
