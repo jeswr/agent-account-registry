@@ -994,7 +994,19 @@ def live_human_holds(repo, pr_number, issue=None, live=None):
     payload (a non-list, or any non-dict entry / non-string name), or an unreadable
     source-issue probe RAISES WorkerPrError — the caller mutates nothing and the sweep simply
     retries. The old shape-tolerant read collapsed malformed label data to "no hold" and
-    ready_and_arm still issued `pr ready` + `merge --auto` (fail OPEN on the dangerous act)."""
+    ready_and_arm still issued `pr ready` + `merge --auto` (fail OPEN on the dangerous act).
+
+    DEFENSE-IN-DEPTH ONLY — RESIDUAL TOCTOU WINDOW (descoped from PR #286, tracked in
+    issue #294): this probe is an unbound PREFLIGHT read; a hold that lands in the
+    probe-to-mutation gap is still overwritten, because set_review_state deletes the
+    mutually-exclusive review:* labels unconditionally and the arm path has the same gap
+    before `pr ready`/`merge --auto`. The concrete worst case is a transiently-removed hold
+    label (or, via the freed crate, a duplicate same-crate worker PR) — humanly recoverable
+    churn, never credential exposure or data corruption. Closing the window needs a
+    monotonic hold/disarm handshake: label transitions that can never delete a
+    concurrently-added terminal hold (ETag/If-Match or a label compare-and-swap, or a
+    tombstone marker automated paths cannot remove) — see issue #294 for the design
+    constraints."""
     if live is None:
         live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
     if not isinstance(live, dict):

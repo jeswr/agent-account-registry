@@ -379,25 +379,63 @@ def _live_holder_keys(leases, now):
     return live
 
 
-def sibling_lease_conflict(own_keys, packages, leases, now):
-    """[round-5 P1] The ONE cross-lane crate-ownership view over the lease ledger. True when
-    ANY live lease whose holder key is NOT in `own_keys` holds one of `packages` — regardless
-    of lane prefix: impl leases key `<repo>#<issue>`, review/fix leases key
-    `review:<repo>#<pr>` / `fix:<repo>#<pr>`, and the allocator's partition_available checks
-    only SAME-prefix leases by design, so without this view the lanes cannot see each other.
-    That is the park -> sibling-launch -> UNPARK hole: parking a provably-inert draft frees
-    its crate, an impl sibling claims an impl lease there (invisible to the review lane), and
-    the moment a human unparks the PR both same-crate lanes progress at once.
+def _lease_holder_repo(key):
+    """[round-6 P1] The target repository a lease holder key belongs to. Holder grammar
+    (select-and-claim.py): impl keys are `<owner>/<name>#<issue>`, review/fix-lane keys are
+    `review:<owner>/<name>#<pr>` / `fix:<owner>/<name>#<pr>` (the run suffix is already
+    stripped by the caller). Returns "" when the key does not parse to that shape — callers
+    fail toward exclusion, never toward guessing a repository."""
+    for prefix in ("review:", "fix:"):
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+            break
+    repository, sep, rest = key.partition("#")
+    if not sep or not rest.isdigit() or not SAFE_REPO.fullmatch(repository):
+        return ""
+    return repository
+
+
+def sibling_lease_conflict(repo, own_keys, packages, leases, now):
+    """[round-5 P1] The cross-lane crate-ownership view over the lease ledger, SCOPED to the
+    candidate's target `repo` [round-6 P1]. True when ANY live SAME-REPOSITORY lease whose
+    holder key is NOT in `own_keys` holds one of `packages` — regardless of lane prefix:
+    impl leases key `<repo>#<issue>`, review/fix leases key `review:<repo>#<pr>` /
+    `fix:<repo>#<pr>`, and the allocator's partition_available checks only SAME-prefix
+    leases by design, so without this view the lanes cannot see each other. That is the
+    park -> sibling-launch -> UNPARK hole: parking a provably-inert draft frees its crate,
+    an impl sibling claims an impl lease there (invisible to the review lane), and the
+    moment a human unparks the PR both same-crate lanes progress at once.
+
+    REPOSITORY SCOPE [round-6 P1, sol round-5 item 3]: the ledger is fleet-wide (one lease
+    file across every dispatch target), while package names and `__global__` are PER-REPO
+    partitions — the allocator's partition_available is explicitly repository-scoped via the
+    holder prefix. A lease whose holder parses to a DIFFERENT target repository never
+    conflicts here (a same-named crate — or a global lease — in one target must not freeze
+    another target's frontier; unscoped, this check would itself recreate the fleet-wide
+    frontier collapse it exists to prevent). A holder that does not parse to any repository
+    is ambiguity and excludes, as below.
 
     Package semantics mirror partition_available / the busy union: `__global__` serializes in
-    both directions (a global lease conflicts with everything; a global-packaged candidate
-    conflicts with any live sibling lease). An empty `packages` set means the candidate's
-    crate is unknown and collapses to `__global__` (fail closed).
+    both directions WITHIN the repo (a global lease conflicts with everything; a
+    global-packaged candidate conflicts with any live same-repo sibling lease). An empty
+    `packages` set means the candidate's crate is unknown and collapses to `__global__`
+    (fail closed).
 
     FAIL TOWARD EXCLUSION ON AMBIGUITY: a non-list ledger, a malformed row, an unparseable
-    expiry, or a missing/invalid holder or package all read as a live colliding sibling — the
-    caller defers/excludes and retries next tick rather than launching into a crate whose
-    ownership cannot be proven."""
+    expiry, or a missing/invalid/unparseable holder or package all read as a live colliding
+    sibling — the caller defers/excludes and retries next tick rather than launching into a
+    crate whose ownership cannot be proven.
+
+    DEFENSE-IN-DEPTH ONLY — RESIDUAL TOCTOU WINDOW (descoped from PR #286, tracked in
+    issue #294): this view reads a CHECKOUT SNAPSHOT of the ledger, and the allocator's own
+    CAS predicate still filters same-prefix leases only — a sibling lease claimed AFTER the
+    snapshot (or through a self-claim path) is invisible until the next tick. The concrete
+    worst case is a duplicate same-crate worker PR (humanly recoverable churn — never
+    credential exposure or data corruption). Closing the window means enforcing cross-lane
+    repository/package exclusion INSIDE select-and-claim's CAS transaction for every claim
+    path; see issue #294 for the design constraints."""
+    if not isinstance(repo, str) or not repo:
+        return True                       # unscoped candidate — cannot prove any lease foreign
     mine = {package for package in packages if isinstance(package, str) and package} \
         or {GLOBAL_PACKAGE}
     if not isinstance(leases, list):
@@ -416,6 +454,13 @@ def sibling_lease_conflict(own_keys, packages, leases, now):
             return True                   # cannot prove the lease is one of OUR own
         if key in own_keys:
             continue                      # the candidate's own lease never supersedes it
+        holder_repo = _lease_holder_repo(key)
+        if not holder_repo:
+            return True                   # unparseable holder — cannot prove which target owns it
+        if holder_repo != repo:
+            continue                      # [round-6 P1] another TARGET's lease: package and
+                                          # __global__ partitions are per-repository — a foreign
+                                          # lease never blocks this repo's frontier
         package = lease.get("package")
         if not isinstance(package, str) or not package:
             return True                   # unknown crate — cannot prove disjointness
@@ -477,7 +522,6 @@ def pr_ci_status(record):
         return {}
     mergeable = record.get("mergeable")
     draft = record.get("draft")
-    auto_merge = record.get("auto_merge")
     status = {
         "head_sha": head_sha,
         # REST tri-state: False = conflicting, True = clean, null = still computing (unknown).
@@ -488,8 +532,15 @@ def pr_ci_status(record):
         # fail OPEN: the busy-partition carve-out would free a crate whose latch state was
         # unprovable. Unknown never frees (_pull_provably_inactive requires armed exactly
         # False) and never proves the stranded posture.
-        "armed": (True if isinstance(auto_merge, dict)
-                  else False if auto_merge is None else None),
+        # [round-6 P2] ABSENCE != NULL: the bit is derived ONLY from a PRESENT auto_merge
+        # field (plan-snapshot preserves field presence). A record that never carried the
+        # field — a projected/degraded/pre-round-6 shape — proves NOTHING about the latch:
+        # the old record.get() read collapsed absence to explicit-null = unarmed, so a
+        # detail with a matching head and draft:true but NO auto_merge field "proved" the
+        # PR inactive and freed its crate (fail OPEN). Absent reads UNKNOWN (busy).
+        "armed": ((True if isinstance(record["auto_merge"], dict)
+                   else False if record["auto_merge"] is None else None)
+                  if "auto_merge" in record else None),
         # [round-4 P1] the detail read's OWN draft bit (the pulls/N REST response carries
         # `draft`): the busy-partition carve-out frees a parked draft ONLY when this NEWER
         # read confirms the listing's stale draft flag on the same head. Strict bool;
@@ -762,7 +813,7 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
         if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
             continue
         if sibling_lease_conflict(
-                {f"{repo}#{item.get('number')}"},
+                repo, {f"{repo}#{item.get('number')}"},
                 {package} if isinstance(package, str) else set(),
                 leases, now):
             print(f"exclude {repo}#{item.get('number')}: superseded-until-sibling-resolves — "
@@ -1053,6 +1104,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         issue_areas = {label[5:] for label in source_labels
                        if isinstance(label, str) and label.startswith("area:")}
         if sibling_lease_conflict(
+                repo,
                 {f"review:{repo}#{number}", f"fix:{repo}#{number}", f"{repo}#{issue_number}"},
                 pr_areas | issue_areas, leases, now):
             print(f"exclude {repo}#{number}: superseded-until-sibling-resolves — a live "
@@ -2607,6 +2659,15 @@ def _self_test():
         [{"holder": f"{repo}#12@dispatch-9.1", "package": GLOBAL_PACKAGE,
           "expires_at": now + 600}],
         issue_labels, now) == []
+    # [round-6 P1] a live lease held in ANOTHER target repository never supersedes this
+    # repo's PR — same-named crate AND __global__ are per-repository partitions
+    assert [item["pr_number"] for item in enumerate_review_items(
+        repo, [unparked], provenance,
+        [{"holder": "other-org/other-target#12@d.1", "package": "crate-a",
+          "expires_at": now + 600},
+         {"holder": "fix:other-org/other-target#9@r.1", "package": GLOBAL_PACKAGE,
+          "expires_at": now + 600}],
+        issue_labels, now)] == [41]
     # ambiguity fails toward exclusion: malformed row / holder / package / expiry
     for bad_lease in ("junk",
                       {"holder": None, "package": "crate-a", "expires_at": now + 600},
@@ -2617,13 +2678,68 @@ def _self_test():
                                       issue_labels, now) == [], bad_lease
     # sibling_lease_conflict unit facets: a non-list ledger is ambiguity; empty packages
     # collapse to the serializing global partition; a bool expiry is unparseable
-    assert sibling_lease_conflict(set(), {"crate-a"}, None, now) is True
-    assert sibling_lease_conflict(set(), set(), [sibling_impl], now) is True
+    assert sibling_lease_conflict(repo, set(), {"crate-a"}, None, now) is True
+    assert sibling_lease_conflict(repo, set(), set(), [sibling_impl], now) is True
     assert sibling_lease_conflict(
-        set(), {"crate-z"},
+        repo, set(), {"crate-z"},
         [{"holder": "x#1@r.1", "package": "crate-a", "expires_at": True}], now) is True
-    assert sibling_lease_conflict({f"{repo}#12"}, {"crate-a"}, [sibling_impl], now) is False
-    assert sibling_lease_conflict(set(), {"crate-a"}, [], now) is False
+    assert sibling_lease_conflict(repo, {f"{repo}#12"}, {"crate-a"},
+                                  [sibling_impl], now) is False
+    assert sibling_lease_conflict(repo, set(), {"crate-a"}, [], now) is False
+
+    # ---- [round-6 P1] REPOSITORY SCOPE: the ledger is fleet-wide but package/__global__
+    # partitions are PER-REPO — a live lease in ANOTHER target must never block this
+    # target (unscoped, the sibling check itself recreates cross-repo frontier collapse).
+    # Mixed-repository battery, BOTH directions + __global__ scoped per-repo. ----
+    other_repo = "other-org/other-target"
+
+    def foreign(package, lane=""):
+        return {"holder": f"{lane}{other_repo}#12@d.1", "package": package,
+                "expires_at": now + 600}
+
+    # direction 1: a foreign-target lease (same-named crate) never conflicts here...
+    assert sibling_lease_conflict(repo, set(), {"crate-a"}, [foreign("crate-a")], now) is False
+    assert sibling_lease_conflict(
+        repo, set(), {"crate-a"}, [foreign("crate-a", "review:")], now) is False
+    assert sibling_lease_conflict(
+        repo, set(), {"crate-a"}, [foreign("crate-a", "fix:")], now) is False
+    # ... even a foreign __global__ lease: global serializes WITHIN its repo only
+    assert sibling_lease_conflict(
+        repo, set(), {"crate-a"}, [foreign(GLOBAL_PACKAGE)], now) is False
+    assert sibling_lease_conflict(
+        repo, set(), {GLOBAL_PACKAGE}, [foreign("crate-a")], now) is False
+    # direction 2 (the mirror): this repo's lease never blocks the OTHER target either
+    assert sibling_lease_conflict(other_repo, set(), {"crate-a"}, [sibling_impl], now) is False
+    assert sibling_lease_conflict(
+        other_repo, set(), {GLOBAL_PACKAGE},
+        [{"holder": f"review:{repo}#41@run.1", "package": GLOBAL_PACKAGE,
+          "expires_at": now + 600}], now) is False
+    # same-repo conflicts are UNCHANGED by the scoping (regression guard on the round-5 fix)
+    assert sibling_lease_conflict(repo, set(), {"crate-a"}, [sibling_impl], now) is True
+    assert sibling_lease_conflict(other_repo, set(), {"crate-a"},
+                                  [foreign("crate-a")], now) is True
+    # an UNPARSEABLE holder cannot be proven foreign — ambiguity still excludes (fail
+    # closed): no slash in the repo part, no #number suffix, or an unscoped candidate
+    assert sibling_lease_conflict(
+        repo, set(), {"crate-a"},
+        [{"holder": "no-slash#1@r.1", "package": "crate-a", "expires_at": now + 600}],
+        now) is True
+    assert sibling_lease_conflict(
+        repo, set(), {"crate-a"},
+        [{"holder": "owner/name@r.1", "package": "crate-a", "expires_at": now + 600}],
+        now) is True
+    assert sibling_lease_conflict(
+        repo, set(), {"crate-a"},
+        [{"holder": "owner/name#notanumber@r.1", "package": "crate-a",
+          "expires_at": now + 600}], now) is True
+    assert sibling_lease_conflict("", set(), {"crate-a"}, [], now) is True
+    # _lease_holder_repo grammar facets (the ONE holder->repo parse the scope rests on)
+    assert _lease_holder_repo(f"{repo}#12") == repo
+    assert _lease_holder_repo(f"review:{repo}#41") == repo
+    assert _lease_holder_repo(f"fix:{repo}#41") == repo
+    assert _lease_holder_repo("no-slash#1") == ""
+    assert _lease_holder_repo("owner/name") == ""
+    assert _lease_holder_repo("owner/name#1x") == ""
 
     # non-draft (armed/ready) PRs leave the loop
     assert enumerate_review_items(repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a,
@@ -2736,6 +2852,13 @@ def _self_test():
     assert pr_ci_status({**record, "auto_merge": "garbage"})["armed"] is None
     assert pr_ci_status({**record, "auto_merge": []})["armed"] is None
     assert pr_ci_status({**record, "auto_merge": True})["armed"] is None
+    # [round-6 P2] ABSENCE != NULL: a record with NO auto_merge field at all (a projected /
+    # degraded / pre-round-6 detail shape) is UNKNOWN (None), never "unarmed" — the old
+    # record.get() read collapsed absence to the explicit-null unarmed and freed a parked
+    # crate whose latch state was never observed (fail OPEN).
+    assert pr_ci_status(
+        {key: value for key, value in record.items() if key != "auto_merge"}
+    )["armed"] is None
     assert pr_ci_status({**record, "head_sha": "zz"}) == {}
     assert pr_ci_status("junk") == {}
     # [round-4 P1] the detail draft bit is STRICT-bool tri-state: absent (the pre-round-4
@@ -3371,6 +3494,15 @@ def _self_test():
         plan_items, repo, [], issue_labels, busy_prov,
         leases=[{"holder": f"{repo}#7@run.1", "package": "crate-a",
                  "expires_at": now + 600}], now=now) == plan_items
+    # [round-6 P1] a live lease held in ANOTHER target repository never defers this repo's
+    # impl items — same-named crate and __global__ alike (per-repo partitions; the ledger
+    # is fleet-wide and PLAN iterates every target over the ONE lease list)
+    assert filter_busy_area_items(
+        plan_items, repo, [], issue_labels, busy_prov,
+        leases=[{"holder": "review:other-org/other-target#41@run.1", "package": "crate-a",
+                 "expires_at": now + 600},
+                {"holder": "other-org/other-target#12@d.1", "package": GLOBAL_PACKAGE,
+                 "expires_at": now + 600}], now=now) == plan_items
     # an ABSENT/unreadable ledger view is ambiguity: everything defers (fail closed)
     assert filter_busy_area_items(plan_items, repo, [], issue_labels, busy_prov,
                                   leases=None, now=now) == []
@@ -3542,6 +3674,20 @@ def _self_test():
         repo, [parked_draft()], collapse_labels, busy_prov,
         {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": "garbage",
                            "draft": True, "check_runs": []})}) == {"crate-b"}
+    # [round-6 P2] ABSENCE != NULL end-to-end: a detail with a matching head and a
+    # confirming draft:true but NO auto_merge field AT ALL must NOT prove the PR inactive —
+    # armed reads UNKNOWN through pr_ci_status and the parked draft stays BUSY (the old
+    # detail.get() plumbing collapsed absence to explicit-null=unarmed and freed the crate)
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "draft": True,
+                           "check_runs": []})}) == {"crate-b"}
+    # ... while the EXPLICIT-null + draft-coherent detail still frees (the carve-out's
+    # one legitimate free path is unchanged by the presence-preservation)
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
+                           "draft": True, "check_runs": []})}) == set()
     # parked DRAFT with a synthetic auto_merge dict (raw-REST defense in depth, NOT a
     # snapshot field): same crashed-disarm artifact — busy
     assert busy_packages_of_pulls(repo, [parked_draft(auto_merge=latched)],

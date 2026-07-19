@@ -189,7 +189,6 @@ def _pr_status_record(fetch, claim, repo, number):
     record = {
         "head_sha": sha,
         "mergeable": detail.get("mergeable"),
-        "auto_merge": detail.get("auto_merge"),
         # [round-4 P1] the detail read's own draft bit (present on the pulls/N REST
         # response): the busy-partition carve-out (_pull_provably_inactive) frees a
         # human-parked draft's crate ONLY when this NEWER, head-matched read CONFIRMS
@@ -198,6 +197,14 @@ def _pr_status_record(fetch, claim, repo, number):
         "draft": detail.get("draft"),
         "check_runs": [],
     }
+    # [round-6 P2] ABSENCE != NULL: carry `auto_merge` ONLY when the detail actually has
+    # the field. `detail.get("auto_merge")` collapsed an ABSENT field to None — the exact
+    # JSON value REST uses for "explicitly unarmed" — so a detail that never carried the
+    # field read as PROOF of inactivity downstream and freed a parked crate (fail OPEN).
+    # An omitted key survives the JSON round-trip and reads UNKNOWN in pr_ci_status
+    # (armed=None: never frees a crate, never proves the stranded posture — fail closed).
+    if "auto_merge" in detail:
+        record["auto_merge"] = detail["auto_merge"]
     if SAFE_SHA.fullmatch(sha):
         try:
             check_runs = _fetch_check_runs(fetch, repo, sha, check_name=claim.CI_GATE_CHECK)
@@ -289,6 +296,7 @@ def _self_test():
         worker_pull(11, sha_red),        # concluded gate failure: legs fetched + interpretable
         worker_pull(13, sha_ok),         # detail read hard-fails -> per-item skip
         worker_pull(15, sha_legs_over),  # gate failure but the unfiltered legs walk overflows
+        worker_pull(17, sha_ok),         # detail WITHOUT an auto_merge field (round-6 P2)
         {"number": 90, "state": "open",  # non-worker head: excluded from the census entirely
          "head": {"ref": "topic", "sha": sha_ok, "repo": {"full_name": repo}}},
     ]
@@ -300,6 +308,10 @@ def _self_test():
             return pulls if "page=1" in url else []
         if "/pulls/13" in url:
             raise FetchError("boom")
+        if url.split("?")[0].endswith("/pulls/17"):
+            # [round-6 P2] a detail read that never carried the auto_merge field (degraded/
+            # projected upstream response): the record must PRESERVE the absence.
+            return {"head": {"sha": sha_ok}, "mergeable": True, "draft": True}
         for number, sha in ((7, sha_over), (9, sha_ok), (11, sha_red), (15, sha_legs_over)):
             if url.split("?")[0].endswith(f"/pulls/{number}"):
                 # PR 7 is ARMED (auto_merge latched) — the round-1 disarm-under-overflow case.
@@ -342,11 +354,21 @@ def _self_test():
     # (iii) POST-detail degradation (PR #60 round-1 fix): a check-run overflow KEEPS the
     # detail record — check_runs EMPTY + an explicit marker — while the pre-detail
     # failure (13) stays a full skip with no record at all.
-    assert sorted(doc["items"]) == ["11", "15", "7", "9"], sorted(doc["items"])
+    assert sorted(doc["items"]) == ["11", "15", "17", "7", "9"], sorted(doc["items"])
     assert doc["items"]["7"] == {"head_sha": sha_over, "mergeable": True, "draft": False,
                                  "auto_merge": {"merge_method": "squash"},
                                  "check_runs": [],
                                  "check_runs_degraded": "check-runs-overflow"}
+    # [round-6 P2] ABSENCE != NULL survives the snapshot + JSON round-trip: the detail read
+    # for 17 carried NO auto_merge field, so its record must OMIT the key (never emit the
+    # explicit-null "unarmed" sentinel), and the claim-side interpreter must read the arm
+    # bit as UNKNOWN — an absent field can never prove a parked PR inactive (busy,
+    # fail closed). Contrast 9: an EXPLICIT null (a field REST actually served) still
+    # reads unarmed.
+    assert "auto_merge" not in doc["items"]["17"], doc["items"]["17"]
+    assert claim.pr_ci_status(doc["items"]["17"])["armed"] is None
+    assert "auto_merge" in doc["items"]["9"]
+    assert claim.pr_ci_status(doc["items"]["9"])["armed"] is False
     degraded = claim.pr_ci_status(doc["items"]["7"])
     assert degraded["gate"] == "missing" and degraded["armed"] is True
     assert degraded["check_runs_degraded"] is True
