@@ -1104,9 +1104,43 @@ def _resolvable_chain(chain, routing):
     return usable
 
 
-def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
-                           registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
-                           defer_reasons, ledger_root=""):
+def _effective_fix_floor(route_model_chain, impl_provider, pin_floor, worker_pr):
+    """The fix-model FLOOR that governs BOTH the claim chain and the worker's own chain
+    resolution (issue #103). Fixes were selected from the provider-wide FIX_CHAIN alone, so an
+    opus-only trust-surface PR could be fixed by fable/sonnet and a frontier-only CI PR could fall
+    back to sonnet. The PR's ORIGINAL route (re-derived LIVE from the source issue) implies a
+    minimum fix TIER: the lowest escalation-ladder position among the route's SAME-PROVIDER
+    models. It is applied ONLY when it outranks the default FIX_CHAIN's own floor, so a
+    trust-surface route pins the fix at opus and a frontier-only CI route pins an anthropic fix at
+    fable (never sonnet), while an ordinary impl route leaves the default chain untouched. The
+    result is the HIGHER (by ladder rank) of that route floor and the round-budget escalation pin
+    — both are floors — and is threaded UNCHANGED into review-fix.yml's `model_pin` input so the
+    worker floors ITS chain identically (the dispatch claim and the worker adopt validate against
+    the same models). Returns a ladder tier alias, or None for no floor (default FIX_CHAIN). Fails
+    closed (DispatchError) when the route names no same-provider ladder member — no in-provider
+    fix can honour the route, so the caller defers rather than falling through to a weaker
+    default."""
+    ladder = worker_pr.ESCALATION_LADDERS.get(impl_provider, [])
+    route_members = [alias for alias in route_model_chain if alias in ladder]
+    if not route_members:
+        raise DispatchError(
+            f"original route names no {impl_provider} fix model (cannot fix in-provider)")
+    default_floor_rank = min((ladder.index(alias) for alias in FIX_CHAIN.get(impl_provider, [])
+                              if alias in ladder), default=0)
+    floors = []
+    route_floor = min(route_members, key=ladder.index)
+    if ladder.index(route_floor) > default_floor_rank:
+        floors.append(route_floor)     # the route is stricter than the default fix chain
+    if pin_floor:
+        floors.append(pin_floor)       # the round-budget escalation pin (already ladder-checked)
+    if not floors:
+        return None
+    return max(floors, key=ladder.index)
+
+
+def _dispatch_review_items(review_items, repo, policy, routing, policy_doc, policy_module,
+                           allocator, worker_pr, registry_repo, registry_root, workflow_ref,
+                           bot_login, usage, margin, defer_reasons, ledger_root=""):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
     that item (per-item resilience, like the issue loop). `defer_reasons` is the tick's SHARED
     histogram: allocator lease errors here must fold into the same `lease-error` counter the
@@ -1178,7 +1212,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # maintainer ping) — the repair loop must never disarm/redraft/push (nor review
             # past) a PR whose work item a human explicitly owns. Live read, fail closed.
             source_issue = _gh_json(["api", f"repos/{repo}/issues/{issue_number}"])
-            if any(label.startswith("needs:") for label in _labels(source_issue)):
+            source_labels = _labels(source_issue)
+            if any(label.startswith("needs:") for label in source_labels):
                 print(f"defer review {repo}#{number}: source issue #{issue_number} is "
                       "human-owned (needs:*)")
                 continue
@@ -1324,8 +1359,26 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # simply DEFERS to the next tick — falling back down the chain would silently spend
             # the extension re-running the model that already failed. (The missed-fix marker
             # budget still bounds how long it can defer before a loud needs-user.)
-            fix_aliases = (worker_pr.pinned_fix_chain(impl_provider, pin_floor)
-                           if pin_floor else FIX_CHAIN[impl_provider])
+            # Issue #103: the same-provider fix chain must honour the PR's ORIGINAL trust-tier
+            # route, not just the provider-wide FIX_CHAIN — else an opus-only trust-surface PR
+            # could be fixed by fable/sonnet and a frontier-only CI PR could fall back to sonnet.
+            # Re-derive that route LIVE from the source-issue labels in registry-owned code (the
+            # SAME resolve() the issue path asserts against in _route_matches; the plan is hostile,
+            # so nothing persisted in it is trusted here). A malformed/unresolvable route fails
+            # closed — defer, never a permissive default.
+            try:
+                route_model_chain = policy_module.resolve(
+                    repo, source_labels, policy_doc, routing)["model_chain"]
+                # The route floor and the escalation pin are BOTH fix-model floors — fold them
+                # into one effective floor that governs the claim chain AND (below) the worker's
+                # model_pin, so trust surfaces stay opus-only and CI fixes stay frontier-only.
+                fix_floor = _effective_fix_floor(
+                    route_model_chain, impl_provider, pin_floor, worker_pr)
+            except (ValueError, KeyError, DispatchError) as exc:
+                print(f"defer review {repo}#{number}: original route re-derivation failed ({exc})")
+                continue
+            fix_aliases = (worker_pr.pinned_fix_chain(impl_provider, fix_floor)
+                           if fix_floor else FIX_CHAIN[impl_provider])
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # raw-handle/missing hash already deferred above (provenance_admission_error).
             impl_account_h = record["impl_account_h"]
@@ -1466,9 +1519,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             "-f", f"mode={mode}",
             "-f", f"fix_kind={fix_kind}",
             "-f", f"fix_context={fix_context}",
-            # The pinned fix-model floor rides along so the workflow's own chain resolution
-            # honours it (review mode never carries a pin; the input is ladder-validated there).
-            "-f", f"model_pin={(pin_floor or '') if mode == 'fix' else ''}",
+            # The EFFECTIVE fix-model floor (route floor unioned with the escalation pin, issue
+            # #103) rides along so the workflow's own chain resolution floors ITS chain identically
+            # — else a trust-surface opus claim would fail the worker's adopt against an
+            # unconstrained fable/sonnet chain. Review mode never carries a pin; the input is
+            # ladder-validated there.
+            "-f", f"model_pin={(fix_floor or '') if mode == 'fix' else ''}",
             "-f", f"review_round={round_number}",
             "-f", f"account={account}",
             "-f", f"claim_id={claim_id}",
@@ -1821,9 +1877,9 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         ]
         if repo_review_items:
             dispatched += _dispatch_review_items(
-                repo_review_items, repo, policy, routing, allocator, worker_pr,
-                registry_repo, registry_root, workflow_ref, bot_login, usage,
-                float(policy.get("usage_safety_margin", 0.10)),
+                repo_review_items, repo, policy, routing, policy_doc, policy_module,
+                allocator, worker_pr, registry_repo, registry_root, workflow_ref, bot_login,
+                usage, float(policy.get("usage_safety_margin", 0.10)),
                 defer_reasons, ledger_root=ledger_root)
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
 
@@ -2579,8 +2635,8 @@ def _self_test():
         reasons = Counter()
         launched = _dispatch_review_items(
             items, repo, {"max_review_rounds": 3, "account_pool": []},
-            routing or {}, allocator, wiring_worker_pr, "reg/repo",
-            wiring_root, "main", bot, None, 0.10, reasons,
+            routing or {}, wiring_policy_doc, wiring_policy, allocator, wiring_worker_pr,
+            "reg/repo", wiring_root, "main", bot, None, 0.10, reasons,
             ledger_root=wiring_ledger_root)
         return launched, reasons
 
@@ -2595,6 +2651,16 @@ def _self_test():
         wiring_ledger_root = str(Path(tmp) / "ledger")
         wiring_worker_pr = _load_module(
             "registry_worker_pr_wiring", Path(__file__).resolve().parent / "worker-pr.py")
+        # Issue #103: the fix path re-derives the PR's original route via the shared resolver,
+        # so the wiring needs the real policy-resolve module + a valid policy row for `repo`.
+        wiring_policy = _load_module(
+            "registry_policy_resolve_wiring",
+            Path(__file__).resolve().parent / "policy-resolve.py")
+        wiring_policy_doc = {"repos": {repo: {
+            "enabled": True, "routing": "orchestration/routing.toml",
+            "account_pool": ["acct01"], "max_concurrent": 3,
+            "worker_timeout_minutes": 30, "gate_profile": "registry-selftest",
+            "arm_auto_merge": True, "max_attempts": 3, "trust": "collaborators"}}}
         record_file = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, 41)
         record_file.parent.mkdir(parents=True)
         record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
@@ -2671,12 +2737,25 @@ def _self_test():
             fix_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-fix",
                         "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
                         "security": False, "context": ""}
-            routing_ok = {"models": {
-                "sonnet": {"provider_model": "claude-sonnet-4-6", "harness": "claude"},
-                "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
-                "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
-                "terra": {"provider_model": "TBD", "harness": "codex"},
-            }}
+            routing_ok = {
+                "models": {
+                    "sonnet": {"provider_model": "claude-sonnet-4-6", "harness": "claude"},
+                    "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
+                    "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
+                    "terra": {"provider_model": "TBD", "harness": "codex"},
+                },
+                "defaults": {"model_chain": ["fable", "sonnet", "terra"],
+                             "agent": "registry-impl"},
+                "route": [
+                    # A trust-surface security override (opus-only) + a frontier-only CI role so
+                    # the live route re-derivation below can floor the fix chain (issue #103).
+                    {"match_labels": ["dispatch", "worker", "groom", "zk", "auth"],
+                     "model_chain": ["opus"], "agent": "registry-reviewer", "escalate": True},
+                    {"role": "impl", "model_chain": ["fable", "sonnet", "terra"],
+                     "agent": "registry-impl"},
+                    {"role": "ci", "model_chain": ["fable", "terra"], "agent": "registry-ci"},
+                ],
+            }
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
                         check_runs=gate_green, issue_labels=["area:crate-a"])
             fix_model = wiring_worker_pr.FIX_MODEL_MARKER
@@ -2705,6 +2784,46 @@ def _self_test():
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
             assert alloc.chains == [["fable", "sonnet"]], alloc.chains
+
+            # ---- issue #103: the same-provider fix chain is FLOORED to the PR's ORIGINAL
+            # trust-tier route (re-derived LIVE from the source-issue labels), never the
+            # provider-wide FIX_CHAIN alone. ----
+            # _effective_fix_floor (pure): an ordinary impl route imposes NO floor; a trust route
+            # pins opus; a frontier CI route pins fable; the escalation pin and the route floor
+            # fold to the HIGHER tier; a route with no same-provider ladder member fails closed.
+            wp = wiring_worker_pr
+            assert _effective_fix_floor(["fable", "sonnet", "terra"], "anthropic", None, wp) is None
+            assert _effective_fix_floor(["opus"], "anthropic", None, wp) == "opus"
+            assert _effective_fix_floor(["fable", "terra"], "anthropic", None, wp) == "fable"
+            assert _effective_fix_floor(["fable", "terra"], "openai", None, wp) is None
+            assert _effective_fix_floor(["opus"], "anthropic", "fable", wp) == "opus"   # route wins
+            assert _effective_fix_floor(["fable", "terra"], "anthropic", "opus", wp) == "opus"  # pin wins
+            try:
+                _effective_fix_floor(["terra"], "anthropic", None, wp)
+                raise AssertionError("expected fail-closed on no same-provider fix model")
+            except DispatchError:
+                pass
+            # End-to-end via the claim chain (same under-budget posture as DO-NOTHING above, so the
+            # ONLY variable is the route). Non-vacuous: without the floor both would read
+            # FIX_CHAIN [fable, sonnet]. The same floor is threaded to review-fix.yml's model_pin,
+            # so the worker adopt validates the claim against the SAME chain.
+            fake["issue_labels"] = ["area:dispatch"]      # trust surface -> opus-only route
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["opus"]], alloc.chains  # NOT fable/sonnet
+            fake["issue_labels"] = ["role:ci"]            # frontier-only CI -> no sonnet fallback
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["fable", "opus"]], alloc.chains  # sonnet floored out
+            # a recorded opus pin on a frontier CI route still resolves to opus (the higher of the
+            # route floor and the escalation pin wins)
+            fake["comments"] = round_markers(2) + [
+                bot_comment(f"z {pin_marker} round=1 tier=opus run=1.5 -->")]
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [["opus"]], alloc.chains
+            fake["comments"] = round_markers(2)           # restore under-budget comments
+            fake["issue_labels"] = ["area:crate-a"]       # restore the default route
 
             # a recorded bot pin governs the chain even under budget (the floor never lowers) ...
             fake["comments"] = round_markers(2) + [
