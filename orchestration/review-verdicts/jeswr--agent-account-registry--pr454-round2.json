@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 454,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3c6338338839e5f550d43a3ab6a5bf47fe180675",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 ordering defect is resolved. Live base admission now occurs before comment retrieval and all round-budget processing, so both terminal needs-user and durable model-pin actions are unreachable for a retargeted or unresolved-base PR. The admitted base ref is validated as a safe atom and exact-matched to the repository's protected default branch, and the later compare probe uses that validated actual base rather than a permissive fallback. The new regression cases are non-vacuous: they reuse postures already shown to invoke each mutation-capable budget path on the default base, then change only base.ref and assert both zero helper calls and zero allocator claims. Keeping the check after a live-confirmed repair defuse is consistent with the explicit safety exception and does not weaken the admission gate.",
+  "verdict": "approve"
+ }
+}
