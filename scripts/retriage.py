@@ -24,7 +24,9 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
         return {"action": "skip", "reason": "gated:" + ",".join(gates)}
     if HOLD_MARKER in (issue.get("body") or ""):
         return {"action": "skip", "reason": "explicit-hold"}
-    if not labels.intersection({"status:untriaged", "status:deferred"}):
+    # status:deferred is owned exclusively by the dispatcher's bounded retry path. Retriage must
+    # not consume it or it would reset that path's retry/escalation state.
+    if "status:untriaged" not in labels or "status:deferred" in labels:
         return {"action": "skip", "reason": "not-retriageable"}
     try:
         result = classify(labels, "task", trusted=True)
@@ -33,7 +35,7 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
     if not result["ready"]:
         return {"action": "skip", "reason": "classifier-incomplete"}
     remove = set(result["remove"])
-    remove.update(labels.intersection({"status:untriaged", "status:deferred"}))
+    remove.update(labels.intersection({"status:untriaged"}))
     return {"action": "promote", "add": sorted(result["add"]), "remove": sorted(remove)}
 
 
@@ -49,16 +51,22 @@ def _self_test():
         return value
 
     checks = []
-    for status in ("status:untriaged", "status:deferred"):
-        got = plan(issue(status), "owner", "app[bot]", "none")
-        checks.append((f"{status} promotion",
-                       got["action"] == "promote" and "status:ready" in got["add"]
-                       and status in got["remove"]))
+    got = plan(issue("status:untriaged"), "owner", "app[bot]", "none")
+    checks.append(("status:untriaged promotion",
+                   got["action"] == "promote" and "status:ready" in got["add"]
+                   and "status:untriaged" in got["remove"]))
+    checks.append(("dispatcher-owned deferred rejected",
+                   plan(issue("status:deferred"), "owner", "app[bot]", "none")
+                   == {"action": "skip", "reason": "not-retriageable"}))
+    checks.append(("mixed untriaged and deferred rejected",
+                   plan(issue("status:untriaged", "status:deferred"),
+                        "owner", "app[bot]", "none")
+                   == {"action": "skip", "reason": "not-retriageable"}))
     checks.append(("needs gate rejected",
                    plan(issue("status:untriaged", "needs:design"), "owner", "app[bot]", "none")
                    == {"action": "skip", "reason": "gated:needs:design"}))
     checks.append(("hold marker rejected",
-                   plan(issue("status:deferred", body=HOLD_MARKER), "owner", "app[bot]", "none")
+                   plan(issue("status:untriaged", body=HOLD_MARKER), "owner", "app[bot]", "none")
                    == {"action": "skip", "reason": "explicit-hold"}))
 
     def broken(*_args, **_kwargs):
