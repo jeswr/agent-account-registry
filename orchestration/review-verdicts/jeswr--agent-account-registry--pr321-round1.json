@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "In `_dispatch_review_items`, a nonzero `workflow run` result increments `defer_reasons[\"dispatch-launch-failed\"]` and continues, but never increments `lanes[lane][\"error\"]`. If all review (or fix) workflow launches fail while another lane launches successfully, that lane is serialized as planned > 0, launched = 0, error = 0, with the failures incorrectly derived as `deferred`. The workflow's `_lane_stalled` predicate therefore remains false and records the overall tick as healthy, preserving the exact cross-lane masking this change claims to eliminate. This is a hard dispatch error, not capacity contention.",
+   "file": "scripts/dispatch-claim.py",
+   "fix_hint": "Increment the selected review/fix lane's `error` count when the workflow-dispatch command fails (and audit the other hard-failure exits for the same classification). Add a self-test that forces `_run_gh(... workflow run ...)` to return nonzero and asserts planned=1, launched=0, error=1, deferred=0 for the appropriate lane.",
+   "severity": "major",
+   "title": "Review/fix workflow launch failures are not recorded as lane errors"
+  }
+ ],
+ "progress": null,
+ "summary": "The new lane summary does not reliably detect the class of masked review/fix failures it is intended to surface. Review/fix workflow-launch failures are left as derived deferrals rather than hard lane errors, so a productive worker launch can still make a tick healthy while every review or fix launch fails. The added tests cover allocator and revalidation exceptions but not this launch-failure path.",
+ "verdict": "request_changes"
+}
