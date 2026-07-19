@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3585,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e4cd071dff78647269c16664b062fe2d7c63f08b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`oblivious_sort_by_secret_key` documents that values must be `< 2^60` and that `n >= 2t+1`, but it performs neither validation itself. Both checks occur only inside `secure_greater_than_shared`, which is called per compare-exchange. For an empty or singleton column, `SortingNetwork` has no compare-exchanges, so the function returns `Ok` without checking party count or proving the sole value is in range. In particular, a singleton sharing of `Fp::new(COMPARE_MAX_EXCLUSIVE)` succeeds although the public API says the range condition is fail-closed. This makes behavior depend on column length and violates the security/correctness contract.",
+    "file": "crates/sparq-mpc/src/sort_merge_join.rs",
+    "fix_hint": "At function entry, call the party-count validation used by the comparison layer. Also range-verify every shared input independently of whether it participates in a comparator (using the existing in-MPC Rabbit decomposition plus range proof, preferably factored as a shared helper), or explicitly reject/handle singleton inputs through an equivalent fail-closed validation. Add tests showing a singleton out-of-range sharing and an under-provisioned singleton backend return `MpcError::Protocol`, while a valid singleton succeeds.",
+    "severity": "major",
+    "title": "Singleton secret sort bypasses its fail-closed contracts"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fully addresses the prior major finding: `production_fast_path_mutations_diverge_from_oracle` now injects each named fault through `sort_merge_semi_anti_faulted`, which is the same secret-shared implementation used by the public wrapper, and verifies an unmutated control against the plaintext oracle. However, review found a new public-contract correctness gap in `oblivious_sort_by_secret_key`: its documented fail-closed range and party-count requirements are enforced only incidentally by comparisons. A zero- or one-element input performs no comparator call, so invalid values and an under-provisioned backend are returned successfully. Because this is a newly identified correctness finding relative to round 2, progress is regressing under the required scale despite the prior issue being fixed.",
+  "verdict": "request_changes"
+ }
+}
