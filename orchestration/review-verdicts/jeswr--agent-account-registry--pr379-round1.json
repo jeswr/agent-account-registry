@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 379,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "00c7f0eb9d1b423a4177107fc4cc38fe7d3ca9b7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`set_reviewed_sha` reads the body and then sends an unconditional whole-body PATCH. If a maintainer changes the body after that GET but before the PATCH, this PATCH replaces the maintainer's edit with `target`; the verification GET then equals `target`, so the function prints success and never detects the loss. Re-reading after a verification mismatch only handles writes that land after/around this function's PATCH; it cannot detect the acknowledged pre-PATCH TOCTOU. Thus this is not optimistic concurrency and does not meet the claimed 'never silently clobber' property. The self-test is incomplete because its only concurrent edit is injected after PATCH; it needs a case that injects an edit between the initial GET and PATCH and proves that edit cannot be lost. Under the current API operation, that test would fail.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Use storage or an API operation with a real conditional/CAS primitive (for example immutable commit-specific metadata as noted in the code), or otherwise redesign so updating the reviewed-SHA does not replace the mutable PR body. Add a non-vacuous test that mutates the body after the read and before the write and asserts both that the concurrent edit survives and that the function cannot report success after overwriting it. Do not describe the operation as safe optimistic concurrency while this race remains.",
+    "severity": "blocker",
+    "title": "Read-to-PATCH race still silently clobbers concurrent body edits"
+   }
+  ],
+  "progress": null,
+  "summary": "The change does not provide optimistic concurrency for the PR body. It detects writes that occur after its PATCH, but GitHub's whole-body PATCH has no compare-and-swap precondition, so a maintainer edit between the initial GET and PATCH is still silently overwritten and the subsequent equality check reports success. The new tests omit precisely that race. Because the stated safety property remains false and the reviewed-SHA binding is trust-plane state, this is blocking.",
+  "verdict": "request_changes"
+ }
+}
