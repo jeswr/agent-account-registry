@@ -127,9 +127,11 @@ PERSISTENCE_CLASSES = frozenset({CLASS_TRANSIENT, CLASS_UNKNOWN})
 # at construction AND at read (issue #202).
 DECISION_CLASSES = frozenset(_EXIT_CLASS_MAP.values())
 # Bounds on the free-form string fields of a record (model_alias/run_id, and the provider-supplied
-# reset_hint). The registry is PUBLIC: every such field is strictly a bounded, PRINTABLE token, so a
-# hostile catalog/provider value can never smuggle a newline, a hidden HTML marker, or an unbounded
-# blob into the ledger (issue #202). The account handle carries its own stricter check (_is_hash).
+# reset_hint). The registry is PUBLIC: every such field is bounded AND must match its
+# FIELD-SPECIFIC allowlist grammar (_is_safe_field — review round 1 of PR #444: "printable" alone
+# still admitted a raw acctNN handle or Markdown/HTML markup), so a hostile catalog/provider value
+# can never smuggle a newline, a raw identifier, a hidden HTML marker, or an unbounded blob into
+# the ledger (issue #202). The account handle carries its own stricter check (_is_hash).
 RECORD_FIELD_MAX_LEN = 64
 RESET_HINT_MAX_LEN = 256
 
@@ -239,7 +241,8 @@ def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset
 
     The FULLY-ASSEMBLED record is fail-closed validated before it is returned (issue #202): the
     account must be a salted hash (never a raw acctNN handle), the provider must be catalog-known,
-    the class a known fold target, and every other string field a bounded printable token. A record
+    the class a known fold target, and every other string field bounded and inside its
+    field-specific allowlist grammar (never a raw handle or Markdown markup). A record
     that a reader would later reject as malformed (poisoning the whole ledger) can therefore never
     be constructed in the first place — construction fails loud instead."""
     rec = {
@@ -336,16 +339,38 @@ def _is_hash(value):
             and all(c in "0123456789abcdef" for c in value))
 
 
-def _is_safe_field(value, max_len, allow_empty):
-    """A stored record string field is a PRINTABLE, bounded token: no control chars / newlines (so a
-    forged value can never inject a hidden marker or break the ledger JSON) and length-capped (so it
-    can never carry an unbounded blob) — issue #202. Empty is accepted only where the field is
+# Field-specific allowlist grammars (review round 1 of PR #444): printable-Unicode alone still
+# admitted a raw acctNN handle or Markdown/HTML markup into the PUBLIC ledger. model_alias is a
+# routing.toml alias token and run_id is "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" — both strictly
+# token-shaped. reset_hint is provider-supplied text that is LATER INTERPOLATED INTO A MARKDOWN
+# ALERT BODY (_alert_body's "Earliest known reset: **...**"), so its charset is EXACTLY the
+# closed set worker-live.sh's _extract_reset_hint emits (tr -cd 'A-Za-z0-9 :,/+.()-'): it keeps
+# every machine-parseable form parse_reset_hint reads ("in 5 minutes", "retry-after: 120",
+# "2026-07-20 14:00 UTC") while excluding every Markdown/HTML metacharacter (* _ ` [ ] < > @ #
+# | \ ~ ...) — a forged hint can neither @-mention, style, nor smuggle a hidden marker into the
+# alert.
+_TOKEN_FIELD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_RESET_HINT_RE = re.compile(r"[A-Za-z0-9 :,/+.()-]+")
+# Raw worker-account handles follow the acct<digit>... convention (policy/repos.toml
+# account_pool). No public free-form field may embed one, even where the field's grammar would
+# otherwise admit it (model_alias="acct01" is a valid token SHAPE but a privacy leak).
+_HANDLE_PATTERN_RE = re.compile(r"acct[0-9]", re.IGNORECASE)
+
+
+def _is_safe_field(value, max_len, allow_empty, grammar):
+    """A stored record string field is bounded and matches its FIELD-SPECIFIC allowlist grammar —
+    not merely "printable" (review round 1 of PR #444: printability admitted raw handles and
+    Markdown markup). Each grammar is a strict ASCII allowlist, so a forged value can never carry
+    a control char, markup, or an unbounded blob; on top of the grammar, a value embedding the raw
+    acctNN account-handle pattern is refused outright. Empty is accepted only where the field is
     optional (model_alias/run_id may legitimately be absent-as-empty)."""
     if not isinstance(value, str):
         return False
     if not value:
         return allow_empty
-    return len(value) <= max_len and value.isprintable()
+    if len(value) > max_len or not grammar.fullmatch(value):
+        return False
+    return not _HANDLE_PATTERN_RE.search(value)
 
 
 def _validate_record(r):
@@ -354,9 +379,10 @@ def _validate_record(r):
     Raises ValueError on any malformed field. Enforced identically at write and read so a poisoned
     record can neither be constructed nor survive a reader (issue #202): the account is a salted
     hash and never a raw acctNN handle, the provider is catalog-bounded, the class is a known fold
-    target, every other string field is a bounded printable token, and no unexpected field may ride
-    along — nothing can carry a raw identifier, an injected marker, or an unbounded blob into the
-    PUBLIC ledger."""
+    target, every other string field is bounded AND matches its field-specific allowlist grammar
+    (with the raw-handle pattern refused everywhere), and no unexpected field may ride along —
+    nothing can carry a raw identifier, Markdown/HTML markup, an injected marker, or an unbounded
+    blob into the PUBLIC ledger."""
     if not isinstance(r, dict):
         raise ValueError("model-health ledger contains a non-object entry")
     extra = set(r) - {"ts", "provider", "account", "model_alias", "exit_class", "run_id",
@@ -373,12 +399,15 @@ def _validate_record(r):
         raise ValueError("model-health record account is not a salted hash")
     if r.get("exit_class") not in DECISION_CLASSES:
         raise ValueError("model-health record exit_class is not a known decision class")
-    if not _is_safe_field(r.get("model_alias"), RECORD_FIELD_MAX_LEN, allow_empty=True):
+    if not _is_safe_field(r.get("model_alias"), RECORD_FIELD_MAX_LEN, allow_empty=True,
+                          grammar=_TOKEN_FIELD_RE):
         raise ValueError("model-health record model_alias is malformed")
-    if not _is_safe_field(r.get("run_id"), RECORD_FIELD_MAX_LEN, allow_empty=True):
+    if not _is_safe_field(r.get("run_id"), RECORD_FIELD_MAX_LEN, allow_empty=True,
+                          grammar=_TOKEN_FIELD_RE):
         raise ValueError("model-health record run_id is malformed")
     if "reset_hint" in r and not _is_safe_field(
-            r.get("reset_hint"), RESET_HINT_MAX_LEN, allow_empty=False):
+            r.get("reset_hint"), RESET_HINT_MAX_LEN, allow_empty=False,
+            grammar=_RESET_HINT_RE):
         raise ValueError("model-health record reset_hint is malformed")
 
 
@@ -1566,6 +1595,28 @@ def _self_test():
     chk("make_record rejects an over-long field", _raises(lambda: make_record(
         "anthropic", account_hash("a", salt), "x" * (RECORD_FIELD_MAX_LEN + 1), "auth", "1", now)),
         True)
+    # Review round 1 of PR #444: printability alone admitted raw handles and Markdown markup into
+    # PUBLIC fields. Every free-form field must refuse a raw acctNN handle — even where it is a
+    # valid token SHAPE (model_alias/run_id) or grammar-clean free text (reset_hint) — and
+    # reset_hint (interpolated into a Markdown alert body) must refuse printable markup. Both
+    # directions: each rejection here goes green only while its specific check exists, and the
+    # legitimate producer forms below must keep constructing.
+    hash_a = account_hash("a", salt)
+    chk("make_record rejects a raw handle in model_alias", _raises(lambda: make_record(
+        "anthropic", hash_a, "acct01", "auth", "1", now)), True)
+    chk("make_record rejects a raw handle in run_id", _raises(lambda: make_record(
+        "anthropic", hash_a, "fable", "auth", "acct2css", now)), True)
+    chk("make_record rejects a raw handle in reset_hint", _raises(lambda: make_record(
+        "openai", hash_a, "codex", "rate-limit", "1", now,
+        reset_hint="acct01 capped until 14:00")), True)
+    chk("make_record rejects printable Markdown in reset_hint", _raises(lambda: make_record(
+        "openai", hash_a, "codex", "rate-limit", "1", now,
+        reset_hint="**@maintainer** <!-- marker -->")), True)
+    chk("make_record rejects markup in model_alias", _raises(lambda: make_record(
+        "anthropic", hash_a, "[evil](https://x)", "auth", "1", now)), True)
+    chk("make_record accepts legitimate producer forms",
+        make_record("openai", hash_a, "codex", "rate-limit", "16463.2", now,
+                    reset_hint="retry-after: 120")["reset_hint"], "retry-after: 120")
     chk("account_hash needs salt", _raises(lambda: account_hash("acct02", "")), True)
     # exit-class folding
     chk("session-limit -> limit", _decision_class("session-limit"), CLASS_LIMIT)
@@ -1994,6 +2045,22 @@ def _self_test():
         _raises(lambda: validate_ledger(_led(model_alias="a\nb"))), True)
     chk("ledger read rejects an unexpected extra field",
         _raises(lambda: validate_ledger(_led(handle="acct01"))), True)
+    # Review round 1 of PR #444: a hand-forged ledger entry carrying a raw handle or printable
+    # Markdown in ANY free-form field must die at READ too — the reader shares _validate_record
+    # with construction, so these go green only while the field grammars + handle-pattern check
+    # exist on the read path.
+    chk("ledger read rejects a raw handle in model_alias",
+        _raises(lambda: validate_ledger(_led(model_alias="acct01"))), True)
+    chk("ledger read rejects a raw handle in run_id",
+        _raises(lambda: validate_ledger(_led(run_id="acct2css"))), True)
+    chk("ledger read rejects a raw handle in reset_hint",
+        _raises(lambda: validate_ledger(_led(reset_hint="acct01 capped until 14:00"))), True)
+    chk("ledger read rejects Markdown/HTML in reset_hint (Markdown alert sink)",
+        _raises(lambda: validate_ledger(
+            _led(reset_hint="**@maintainer** <!-- marker -->"))), True)
+    chk("ledger read accepts a producer-shaped reset_hint",
+        validate_ledger(_led(exit_class="limit",
+                             reset_hint="2026-07-20 14:00 UTC")) is not None, True)
 
     # ---- CAS writer against a stub API (create + append + conflict retry) --------------------
     ok = _test_cas(chk) and ok
