@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "_deliver_alerts applies the same fallback rule to firing and recovery actions. If a fire=false action finds an open issue on the private primary route but `issue close` fails, `_upsert_alert` returns False and delivery retries the public registry. When that registry has no matching open issue, `_upsert_alert` returns True as a steady no-alert no-op, so `_deliver_alerts` removes the action from `undelivered` and `_cmd_decide` exits 0 even though the private alert remains incorrectly open. A no-op in a different repository cannot confirm the desired recovery state of the tracker where the alert exists. The delivery tests cover only fire=true, so this path is untested.",
+   "file": "scripts/model-health.py",
+   "fix_hint": "Do not let a fallback-repository no-op satisfy a failed primary recovery. Track whether recovery actually mutated the route containing the open marker (or restrict cross-repository fallback to firing actions), and keep the action undelivered when the primary close fails. Add a test with fire=false, an open private marker, a failed private close, and no public marker; assert the action remains undelivered and decide returns nonzero.",
+   "severity": "major",
+   "title": "Fallback can hide a failed recovery and leave the primary alert open"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The two round-1 defects are fixed with non-list JSON checks, explicit failure returns, and non-vacuous regression tests. However, the new cross-repository fallback is unsound for recovery actions: a failed close on the primary tracker can be treated as successfully delivered merely because the fallback repository has no corresponding open issue. That leaves the real alert stale while the decide run exits green, contrary to the fail-closed delivery contract. Because this is a new major finding, progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
