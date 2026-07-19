@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 377,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bcad28cba182d3592e3391c63b6f18f5d07654e3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "escalate_persist_decision discards old alerts only when it sees a later worker ATTEMPT_MARKER. A tick with effective_cap > 0 is itself evidence that the zero-headroom condition ended, but this path records no reset unless a worker subsequently starts. For example, after an alert, headroom can recover while allocator.claim returns None, the workflow launch fails, or another pre-dispatch condition prevents an attempt receipt; if headroom is zero again after 30 minutes, the stale alert makes the very first new starved snapshot escalate to needs:user. Thus the implementation measures time since an old alert across observed recovery, not continuous starvation as documented, and recreates the transient-terminal behavior it intends to remove. The self-test's recovery case only covers recovery that produced an attempt marker, so it misses this counterexample.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Persist a bot-authenticated recovery/reset receipt whenever a live usage observation changes effective_cap above zero for an issue with an active starvation receipt, and ignore alerts at or before the latest reset (as well as the latest attempt). Alternatively use another durable state transition that unambiguously records that observation. Add a test with old alert -> recovery/reset without worker attempt -> fresh alert and assert that the fresh episode does not escalate.",
+    "severity": "major",
+    "title": "Capacity recovery does not reset the starvation streak"
+   }
+  ],
+  "progress": null,
+  "summary": "The new grace period is fail-closed while capacity is zero and its unit assertions are meaningful, but the claimed continuous-starvation clock is not actually reset by a capacity-recovery observation. It resets only after a worker attempt receipt, so an old alert can later cause needs:user after a fresh zero-headroom snapshot even though headroom recovered in between. This violates the central bounded-persistence contract and requires changes.",
+  "verdict": "request_changes"
+ }
+}
