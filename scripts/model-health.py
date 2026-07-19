@@ -181,6 +181,14 @@ PROBED_CONDITIONS = frozenset({"provider-outage", "persistent-transient"})
 ALERT_LABEL = "ops-alert"
 MARKER_PREFIX = "model-health-alert"   # hidden HTML marker keying the idempotent upsert
 
+# Authoritative cap for the marker-issue lookup (#203). The old lookup read only 50 issues, but
+# CLOSED alert markers accumulate across every flap and are never deleted, so a small window could
+# push a reopen-eligible marker out of view — the caller then treated "not in the window" as "not
+# found" and minted a DUPLICATE alert over it. gh paginates the API internally to fill --limit, so
+# a generous cap turns the lookup authoritative; a result AT the cap is treated as possibly
+# truncated and raised (a distinct state the caller fails closed on, never a blind create).
+ALERT_LOOKUP_CAP = 1000
+
 
 # ---------------------------------------------------------------------------------------------
 # pure helpers (unit-tested)
@@ -954,13 +962,15 @@ def _gh(args, token, capture=False):
 
 
 def _find_marker_issue(repo, token, marker, state):
-    """The issue number carrying the hidden marker in `state`, or None if the read succeeded and
-    nothing matched. RAISES HealthError on a failed/garbled gh list (issue #175): a failed read
-    must NEVER be mistaken for 'not found' — that let an unreadable tracker be treated as empty and
-    a duplicate alert created over it. The caller turns a raise into a delivery FAILURE (retry the
-    fallback route, then fail nonzero), never a blind create."""
+    """The issue number carrying the hidden marker in `state`, or None if the read succeeded, was
+    complete, and nothing matched. RAISES HealthError on a failed/garbled/possibly-truncated gh
+    list (issues #175, #203): a failed OR truncated read must NEVER be mistaken for 'not found' —
+    that let an unreadable/oversized tracker be treated as empty and a duplicate alert created over
+    it. The lookup is authoritative — gh paginates the API to fill ALERT_LOOKUP_CAP, and a result
+    AT the cap is treated as possibly truncated and raised. The caller turns a raise into a
+    delivery FAILURE (retry the fallback route, then fail nonzero), never a blind create."""
     proc = _gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", state,
-                "--json", "number,body", "--limit", "50"], token, capture=True)
+                "--json", "number,body", "--limit", str(ALERT_LOOKUP_CAP)], token, capture=True)
     if proc.returncode != 0:
         raise HealthError(f"gh issue list ({state}) failed")
     try:
@@ -971,6 +981,11 @@ def _find_marker_issue(repo, token, marker, state):
         # Valid-but-wrong JSON ({} / null / a scalar) is just as unreadable as garbled JSON:
         # treating it as an empty tracker would re-enable the blind create this guard exists for.
         raise HealthError("gh issue list returned non-list JSON")
+    if len(found) >= ALERT_LOOKUP_CAP:
+        # The window is full: a matching marker could exist beyond it. Fail closed on a possibly
+        # truncated read rather than mistake it for 'not found' and risk a blind duplicate (#203).
+        raise HealthError(f"gh issue list ({state}) hit the {ALERT_LOOKUP_CAP}-issue lookup cap "
+                          "(possibly truncated)")
     return next((i["number"] for i in found if isinstance(i, dict)
                  and marker in (i.get("body") or "")), None)
 
@@ -1595,6 +1610,9 @@ def _self_test():
     # ---- alert upsert operational idempotency (defect #7) ------------------------------------
     ok = _test_upsert(chk) and ok
 
+    # ---- #203: marker lookup is authoritative + paginated (truncation != 'not found') --------
+    ok = _test_lookup_pagination(chk) and ok
+
     # ---- record exits NONZERO on CAS exhaustion (defect #8) ----------------------------------
     ok = _test_record_exit(chk) and ok
 
@@ -1781,6 +1799,48 @@ def _test_upsert(chk):
         _gh, calls[:] = fake_gh([], [{"number": 7, "body": marker}], {"edit"}), []
         chk("upsert returns False when reopen succeeds but the edit fails",
             _upsert_alert(action, "o/r", "t", "m"), False)
+    finally:
+        _gh = real_gh
+    return True
+
+
+def _test_lookup_pagination(chk):
+    """_find_marker_issue is an AUTHORITATIVE, paginated lookup (#203): it reads up to
+    ALERT_LOOKUP_CAP issues (gh paginates the API to fill --limit, far past the old 50-issue
+    window), and a result AT the cap is treated as possibly truncated and RAISED — a failed OR
+    truncated read must never be mistaken for 'not found' and let a duplicate be minted over an
+    unseen marker. The cap assertion + the full-window raise both go RED on the pre-fix
+    --limit-50, no-truncation-guard code."""
+    import types
+    global _gh
+    real_gh, calls = _gh, []
+
+    def fake_gh(issues):
+        def run(args, token, capture=False):
+            calls.append(list(args))
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(issues), stderr="")
+        return run
+
+    marker = _marker("provider-outage", "anthropic")
+    try:
+        # the lookup asks for the authoritative cap, not the old 50-issue window
+        _gh, calls[:] = fake_gh([]), []
+        _find_marker_issue("o/r", "t", marker, "open")
+        limit = calls[0][calls[0].index("--limit") + 1]
+        chk("lookup requests the authoritative cap, not 50", limit, str(ALERT_LOOKUP_CAP))
+
+        # a marker sitting BEYOND the old 50-issue window is still found (paginated)
+        window = [{"number": i, "body": f"decoy-{i}"} for i in range(120)]
+        window[110]["body"] = marker
+        _gh = fake_gh(window)
+        chk("marker beyond the old 50-window is found",
+            _find_marker_issue("o/r", "t", marker, "closed"), 110)
+
+        # a FULL window (cap items, no marker) is possibly truncated -> RAISE, never 'not found'
+        full = [{"number": i, "body": f"decoy-{i}"} for i in range(ALERT_LOOKUP_CAP)]
+        _gh = fake_gh(full)
+        chk("full window raises (a truncated read is not 'not found')",
+            _raises(lambda: _find_marker_issue("o/r", "t", marker, "closed")), True)
     finally:
         _gh = real_gh
     return True
