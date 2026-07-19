@@ -36,8 +36,8 @@ SEC_KEYWORDS = ("dispatch", "worker", "set-up-account", "review-loop", "groom",
 UI_SURFACE_LABELS = ("area:dashboard", "dashboard", "surface:frontend")
 # [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
 # 2026-07-17, same pattern as the UI rule above): infra-surface labels derive role:ci so CI
-# plumbing reaches the FRONTIER-ONLY ci chain in orchestration/routing.toml (fable/terra —
-# sonnet/haiku no longer author infra). EXACT labels, not substrings, and NOT routing match_labels
+# plumbing reaches the FRONTIER-ONLY sol-led ci chain in orchestration/routing.toml (sol/fable —
+# terra and sonnet are docs-only, 2026-07-18; sonnet/haiku no longer author infra). EXACT labels, not substrings, and NOT routing match_labels
 # (the arm-side security classifier unions those keywords). NOTE the trust-plane infra surfaces
 # (dispatch/worker/set-up-account/review-loop/groom — incl. scripts/dispatch*, scripts/worker*,
 # scripts/groom*, scripts/select-and-claim* issues, which carry those area labels) are ALREADY
@@ -67,7 +67,7 @@ def _role(labels, issue_type):
     # after kind (docs about the dashboard stay docs) and after an explicit role:* label.
     if any(lb in UI_SURFACE_LABELS for lb in labels):
         return "site"
-    # [FABLE-5] infra-surface labels derive role:ci (the frontier-only fable/terra chain) in the
+    # [FABLE-5] infra-surface labels derive role:ci (the frontier-only sol/fable chain) in the
     # same precedence slot: after security (soundness wins), explicit role:*, and kind.
     if any(lb in INFRA_SURFACE_LABELS for lb in labels):
         return "ci"
@@ -134,7 +134,7 @@ def _self_test():
     chk("dashboard docs stay docs",
         triage(["priority:P3", "kind:docs", "area:dashboard"], "task")["role"], "docs")
     # [FABLE-5] frontier-tier infra authorship: an infra-surface label derives role:ci (the
-    # frontier-only fable/terra chain); kind (docs) and trust-surface keywords still win.
+    # frontier-only sol/fable chain); kind (docs) and trust-surface keywords still win.
     chk("infra surface -> ci", triage(["priority:P2", "area:ci"], "feature")["role"], "ci")
     chk("workflows surface -> ci", triage(["priority:P2", "area:workflows"], "task")["role"], "ci")
     chk("infra docs stay docs",

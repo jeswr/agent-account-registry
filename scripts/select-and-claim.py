@@ -415,8 +415,41 @@ def _parse_account(body):
     return d
 
 
+# [FABLE-5] LEGACY-SHAPE NORMALIZATION (sol r3 f1), read-time only. The retired terra-era broker
+# minted every openai account record as exactly `models: [terra]`; the current broker
+# (set-up-account.yml) mints the FULL codex alias set. Membership gating in this file is LITERAL,
+# so a legacy record that survives (or reappears via an old broker run) could never serve a
+# sol/luna claim — starving every anthropic-authored PR review while the account sits available.
+# Fix: an openai record whose models list is EXACTLY the legacy fingerprint `[terra]` (nothing
+# else) expands, at read time, to the catalog's full codex alias set — the provider=openai aliases
+# of orchestration/routing.toml ([models.sol]/[models.luna]/[models.terra]). Any OTHER explicit
+# list (an operator-restricted `[terra, luna]` or `[sol]`) is preserved VERBATIM — operator
+# customization wins over the expansion. The stored account issue is never mutated: the expansion
+# applies to the in-memory catalog inside read_accounts — the single catalog read every membership
+# consumer shares (claim selection via claim()/choose_account, dynamic-concurrency accounting in
+# dispatch-claim.py, claim adoption via inspect_claim, usage probing via account-usage.py) — and
+# each expansion is logged to stderr so it stays visible in dispatch/worker logs.
+LEGACY_OPENAI_SHAPE = ["terra"]              # the retired broker's exact fingerprint
+CODEX_ALIAS_SET = ["sol", "luna", "terra"]   # catalog-derived: routing.toml provider=openai aliases
+
+
+def normalize_legacy_models(account):
+    """Legacy-shape normalization, READ-TIME only: expand an openai record whose models list is
+    EXACTLY the legacy `[terra]` broker fingerprint to the full codex alias set. Every other list
+    passes through verbatim (operator customization wins). Returns a new dict on expansion and
+    never mutates the input; each expansion is logged to stderr (visible, not silent)."""
+    if account.get("provider") == "openai" and account.get("models") == LEGACY_OPENAI_SHAPE:
+        print(f"legacy-shape normalization: openai account '{account.get('handle', '?')}' "
+              f"models {LEGACY_OPENAI_SHAPE} -> {CODEX_ALIAS_SET} (read-time only; the stored "
+              "record is unchanged)", file=sys.stderr)
+        return {**account, "models": list(CODEX_ALIAS_SET)}
+    return account
+
+
 def read_accounts(repo):
-    """The account catalog from the open account issues (title=handle, YAML body, status:available)."""
+    """The account catalog from the open account issues (title=handle, YAML body, status:available).
+    Applies the read-time legacy-shape normalization above, so every downstream membership
+    consumer sees a consistent catalog."""
     out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
                 "--json", "title,body,labels"]).stdout
     accounts = []
@@ -425,7 +458,7 @@ def read_accounts(repo):
         a["handle"] = it["title"].strip()
         a["available"] = any(lb["name"] == "status:available" for lb in it.get("labels", []))
         if a["handle"] and a["models"]:
-            accounts.append(a)
+            accounts.append(normalize_legacy_models(a))
     return accounts
 
 
@@ -561,13 +594,112 @@ def _self_test():
     check("route terra", choose_account(A, [], ["terra", "fable"], "pkg", "impl", now), "acct01")
     # Broker-minted openai records (set-up-account.yml) carry the FULL codex alias set
     # [sol, luna, terra]: exact alias membership is what choose_account gates on, so the full
-    # set satisfies a sol-led claim while a legacy terra-only record DEFERS it (sol r2 f1).
+    # set satisfies a sol-led claim while a terra-only LIST at this pure-gate level defers it
+    # (sol r2 f1). The gate stays LITERAL by design — it is read_accounts' legacy-shape
+    # normalization (sol r3 f1, tested below) that rescues the exact legacy broker fingerprint
+    # before it ever reaches this gate; a customized list is never expanded.
     BM = [{"handle": "acct09", "models": ["sol", "luna", "terra"], "max_concurrent_workers": 1,
            "available": True}]
     check("broker openai record [sol, luna, terra] serves a sol claim",
           choose_account(BM, [], ["sol", "luna"], "pkg", "impl", now), "acct09")
-    check("terra-only record defers a sol claim (exact alias membership)",
+    check("un-normalized terra-only list defers a sol claim (the membership gate stays literal)",
           choose_account(A, [], ["sol", "luna"], "pkg", "impl", now), None)
+
+    # ---- read-time legacy-shape normalization (sol r3 f1) ----
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    # Pure: ONLY the exact legacy openai `[terra]` fingerprint expands; the input record is
+    # never mutated (read-time only, no silent rewrite of the stored account issue).
+    legacy_rec = {"handle": "acctL", "provider": "openai", "models": ["terra"]}
+    with contextlib.redirect_stderr(io.StringIO()):
+        norm_rec = normalize_legacy_models(legacy_rec)
+    check("exact legacy [terra] expands to the full codex alias set",
+          norm_rec["models"], ["sol", "luna", "terra"])
+    check("normalization never mutates the input record", legacy_rec["models"], ["terra"])
+    check("customized [terra, luna] preserved verbatim (operator restriction wins)",
+          normalize_legacy_models({"handle": "c", "provider": "openai",
+                                   "models": ["terra", "luna"]})["models"], ["terra", "luna"])
+    check("restricted [sol] preserved verbatim",
+          normalize_legacy_models({"handle": "c", "provider": "openai",
+                                   "models": ["sol"]})["models"], ["sol"])
+    check("broker-minted [sol, luna, terra] passes through unchanged",
+          normalize_legacy_models({"handle": "c", "provider": "openai",
+                                   "models": ["sol", "luna", "terra"]})["models"],
+          ["sol", "luna", "terra"])
+    check("non-openai record never expands (provider-scoped fingerprint)",
+          normalize_legacy_models({"handle": "c", "provider": "anthropic",
+                                   "models": ["terra"]})["models"], ["terra"])
+
+    # End-to-end through the REAL read_accounts (gh issue list stubbed): the expansion is applied
+    # at the single catalog read EVERY membership consumer shares, and it is LOGGED (visible).
+    issue_rows = json.dumps([
+        {"title": "acctL", "body": "provider: openai\nmodels: [terra]\nsecret_ref: L_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        {"title": "acctC", "body": "provider: openai\nmodels: [terra, luna]\nsecret_ref: C_TOKEN",
+         "labels": [{"name": "status:available"}]},
+    ])
+    real_run_fn = globals()["_run"]
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    log_buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(log_buf):
+            norm_cat = read_accounts("o/r")
+    finally:
+        globals()["_run"] = real_run_fn
+    check("read_accounts expands ONLY the exact legacy shape",
+          {a["handle"]: a["models"] for a in norm_cat},
+          {"acctL": ["sol", "luna", "terra"], "acctC": ["terra", "luna"]})
+    check("normalization is logged, naming the account (no silent expansion)",
+          "legacy-shape normalization" in log_buf.getvalue() and "acctL" in log_buf.getvalue(),
+          True)
+    check("the customized record's pass-through is NOT logged as normalized",
+          "acctC" in log_buf.getvalue(), False)
+
+    # CLAIM SELECTION: a legacy [terra] record now serves a sol-led claim end-to-end (claim()
+    # reads the catalog through read_accounts), while a customized [terra, luna] record still
+    # does NOT serve a sol-only chain.
+    saved_rl, saved_wl = globals()["_read_ledger"], globals()["_write_ledger"]
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    globals()["_read_ledger"] = lambda repo: ([], "sha0")
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            legacy_claim = claim("o/r", "p", "review", ["sol", "luna"],
+                                 "review:o/r#1@run", now)
+            customized_claim = claim("o/r", "p", "review", ["sol"], "review:o/r#2@run", now,
+                                     account_pool=["acctC"])
+    finally:
+        globals()["_run"] = real_run_fn
+        globals()["_read_ledger"], globals()["_write_ledger"] = saved_rl, saved_wl
+    check("legacy [terra] record serves a sol claim (read-time expansion)",
+          (legacy_claim and legacy_claim["account"], legacy_claim and legacy_claim["model"]),
+          ("acctL", "sol"))
+    check("customized [terra, luna] does NOT serve a sol-only claim", customized_claim, None)
+
+    # DYNAMIC-CONCURRENCY ACCOUNTING: dispatch-claim.py feeds read_accounts output straight into
+    # dynamic_concurrency, so the normalized legacy record counts capacity for a sol chain
+    # (openai accounts are probe-exempt) while the customized record does not.
+    exempt_usage = {"acctL": {"exempt": True}, "acctC": {"exempt": True}}
+    check("dynamic concurrency counts the normalized legacy record for a sol chain",
+          dynamic_concurrency(norm_cat, exempt_usage, ["sol"], now=now), 4)
+
+    # CLAIM ADOPTION: a sol lease held on the legacy account is adoptable — inspect_claim's
+    # model-membership check reads the SAME normalized catalog.
+    sol_lease = {**make_lease("acctL", "o/r#1@run", "p", "impl", "sol", now, 100),
+                 "claim_id": "CIDL"}
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    globals()["_read_ledger"] = lambda repo: ([sol_lease], "sha0")
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            adopted = inspect_claim("o/r", "CIDL", now)
+    finally:
+        globals()["_run"] = real_run_fn
+        globals()["_read_ledger"] = saved_rl
+    check("sol lease on a legacy [terra] record is adoptable (adoption path normalized)",
+          adopted and adopted.get("secret_ref"), "L_TOKEN")
+
     full1 = [make_lease("acct01", "h", "p", "r", "terra", now, 100)]
     check("cap fallthrough", choose_account(A, full1, ["terra", "fable"], "p", "r", now), "acct02")
     exp = [make_lease("acct01", "h", "p", "r", "terra", 0, 10)]  # expires_at=10 < now → reclaimed

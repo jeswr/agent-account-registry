@@ -61,8 +61,8 @@ cross_provider_fallback = false  # honest default: stay queued + alert, never si
 # [OPUS-4.8] The registry as a SECOND self-managed target — its OWN pipeline drains its own
 # ~19 open from:agent issues (triage -> ready -> worker -> draft PR -> cross-provider review ->
 # arm) exactly like sparq. This repo IS the orchestration trust plane, so it runs conservatively:
-# a SMALL max_concurrent, the SHARED account_pool, sparq-style routing (impl -> fable chain, docs
-# -> haiku, review cross-provider), and a python/actions gate profile (the crate-scoped cargo gate
+# a SMALL max_concurrent, the SHARED account_pool, sparq-style routing (impl -> sol-led chain,
+# docs -> haiku, review cross-provider), and a python/actions gate profile (the crate-scoped cargo gate
 # does not fit a python repo). Its routing.toml (orchestration/routing.toml, in THIS repo) marks
 # every orchestration area (dispatch/worker/set-up-account/review-loop/groom) as a soundness
 # surface (escalate=true) so those routes run on Opus and, on chain-exhaustion, escalate to a
