@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "stage_verdict_for_fix receives only record_file, out_file, and expected_sha, then gates staging exclusively on envelope_reviewed_sha(record) == expected_sha. It never validates host_envelope.repo, host_envelope.pr, or host_envelope.round against the dispatch context. A record for another PR or review round can therefore be accepted whenever it names the same commit, despite those identity fields being present in the host envelope. The new tests remain non-probing for this defect: no assertion constructs a matching-SHA envelope with a wrong repo, PR, or round and proves staged=false with no output file.",
+   "file": "scripts/worker-pr.py",
+   "fix_hint": "Pass the expected target repo, PR number, and review round into stage-verdict from the workflow. Strictly validate all host_envelope fields, including exact types and values, together with reviewed_sha; reject malformed, missing, or mismatched fields without writing the staged file. Add separate negative self-tests for matching-SHA envelopes with wrong repo, wrong PR, and wrong round.",
+   "severity": "major",
+   "title": "Fixer staging still authenticates only the SHA, not repo, PR, and round"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "The round-1 identity-binding defect remains materially unchanged. The new stage-verdict workflow passes only the expected SHA, and stage_verdict_for_fix still accepts an envelope solely when host_envelope.reviewed_sha matches it. The envelope's repo, pr, and round fields are neither supplied as expected context nor validated. Because distinct PRs and review rounds can reference the same commit, a misplaced or substituted record can still seed the fixer with a verdict issued for a different review context. The added self-tests cover matching/moved SHA and legacy records but omit the required matching-SHA, wrong-repo/PR/round negatives. This exact-match trust-plane check must fail closed before approval.",
+ "verdict": "request_changes"
+}
