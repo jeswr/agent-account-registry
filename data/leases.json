@@ -21,16 +21,6 @@
    "expires_at": 1784445324
   },
   {
-   "account": "acct03",
-   "claim_id": "88e6a03915a746aaa522baf134f20b52",
-   "holder": "review:sparq-org/sparq#3567@dispatch-29674830526.1",
-   "package": "bench-wasm-compare",
-   "role": "review",
-   "model": "opus",
-   "issued_at": 1784439032,
-   "expires_at": 1784440232
-  },
-  {
    "account": "acct2css",
    "claim_id": "56166048fe484018b32623c00b3354c3",
    "holder": "fix:sparq-org/sparq#3573@dispatch-29674830526.1",
