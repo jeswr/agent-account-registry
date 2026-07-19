@@ -121,7 +121,15 @@
 #         (BY DESIGN — the cleanup phase drains them); any OTHER name is a distinct hard fail.
 #
 #   --phase cleanup-bootstrap (`environment: dispatch-secrets`-BOUND job that minted FROM the
-#     environment copies; needs Secrets RW + Environments R + Actions R):
+#     environment copies; needs Secrets RW + Environments R + Actions R). TWO dispatch paths
+#     (round 13 — mid-cleanup cancellation recovery): behind `needs: migrate` in a `phase:
+#     migrate` run (job `cleanup-bootstrap`), AND standalone via the workflow's `phase:
+#     cleanup-bootstrap` input (job `cleanup-standalone`, NO needs). The standalone path exists
+#     because C3 deletes APP_ID before APP_KEY: a cancellation between the two leaves the repo
+#     scope KEY-only, from which a fresh `phase: migrate` cannot mint (the env-UNBOUND main job
+#     reads the missing repo-scope APP_ID) while re-running the cancelled cleanup is banned by
+#     the attempt gate — only an env-bound FRESH dispatch converges, and it works whatever
+#     bootstrap subset remains (2/1/0). Same script phase, same gates, either way:
 #     C0. the same M0a quiesce gate + M0b coherent drain check + M0c ordering attestation (a
 #         cleanup-only rerun after an accidental resume must fail closed the same way —
 #         re-dispatch phase: quiesce, then phase: migrate, which converges through main as a
@@ -241,7 +249,17 @@
 # `github.actor == 'jeswr'` AND `github.triggering_actor == 'jeswr'` on every phase job's `if:`
 # (github.actor stays the ORIGINAL initiator on a re-run while triggering_actor is the
 # re-runner, so actor-only lets a write-access user re-run a jeswr run under the secret-admin
-# mint); dropping the triggering_actor clause goes red.
+# mint); dropping the triggering_actor clause goes red. Round 13 (sol — workflow REACHABILITY
+# was untested: the "one remaining" scenario invokes the script directly, so nothing proved the
+# WORKFLOW could ever dispatch the cleanup phase into that state): the standalone recovery path
+# is pinned by check_workflow_reachability_contract — the `cleanup-bootstrap` phase input
+# choice must exist, the `cleanup-standalone` job must carry NO `needs:` (needs-freedom is the
+# recovery property), must route on `inputs.phase == 'cleanup-bootstrap'`, must be
+# `environment: dispatch-secrets`-bound, and BOTH cleanup jobs must invoke `--phase
+# cleanup-bootstrap`; removing the phase choice, the env binding, re-coupling the standalone
+# job to migrate via `needs:`, or retargeting the script invocation each goes red — and the
+# standalone job's mint + actor pins are enrolled in the two contracts above (mint set
+# identical to cleanup-bootstrap's).
 # Wired into pr-gate.yml and worker-live's FULL_SELFTEST_SUITE so it gates. When the migration
 # workflow is deleted after its successful run, delete this script too and unenrol it from BOTH
 # suite lists.
@@ -746,14 +764,16 @@ phase_resume() {
 # tied the WORKFLOW's declared mint grants to it — deleting both `permission-actions: read`
 # lines from migrate-secrets-to-env.yml still passed every scenario. This static assertion
 # (anchored awk over the stable two-space job indentation — the repo toolchain carries no
-# PyYAML) pins ALL FOUR create-github-app-token steps' EXACT phase-specific grant sets
+# PyYAML) pins ALL FIVE create-github-app-token steps' EXACT phase-specific grant sets
 # (round 8 moved the disable into the secret-free `quiesce` job — Actions write ONLY — and
 # WEAKENED the migrate mint's Actions grant write -> READ: migrate now only reads workflow
-# state + run listings for its gate; the cleanup mint stays at Actions read):
+# state + run listings for its gate; the cleanup mint stays at Actions read; round 13 added
+# `cleanup-standalone` — the standalone dispatch path of the same cleanup phase, same grants):
 #   job `quiesce`:                 actions: write ONLY (secret-free phase: it can disable
 #                                  workflows but cannot read or touch any secret)
 #   main job `migrate`:            secrets: write + environments: write + actions: read
 #   job `cleanup-bootstrap`:       secrets: write + environments: read  + actions: read
+#   job `cleanup-standalone`:      secrets: write + environments: read  + actions: read
 #   job `reenable-writers`:        actions: write ONLY (no secrets/environments power at all)
 # The comparison is against the FULL sorted set, so REMOVING, WEAKENING (write -> read), or
 # silently WIDENING any `permission-*` declaration goes red in --self-test (wired into
@@ -791,6 +811,11 @@ check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
     printf '::error::migrate-secrets: workflow contract violated — the CLEANUP mint (job cleanup-bootstrap) must declare EXACTLY {permission-secrets: write, permission-environments: read, permission-actions: read}; found:\n%s\n' "${got:-<none>}" >&2
     rc=1
   fi
+  got=$(_mint_grants "$wf" cleanup-standalone)
+  if [[ "$got" != "$want" ]]; then
+    printf '::error::migrate-secrets: workflow contract violated — the STANDALONE CLEANUP mint (job cleanup-standalone, round 13) must declare EXACTLY the same set as cleanup-bootstrap {permission-secrets: write, permission-environments: read, permission-actions: read}; found:\n%s\n' "${got:-<none>}" >&2
+    rc=1
+  fi
   want=$(printf 'permission-actions: write')
   got=$(_mint_grants "$wf" reenable-writers)
   if [[ "$got" != "$want" ]]; then
@@ -804,9 +829,9 @@ check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
 # `github.actor == 'jeswr'`, but github.actor stays the ORIGINAL initiator when a run is
 # RE-RUN — `github.triggering_actor` is the re-runner. Actor-only therefore lets ANY
 # write-access user re-run a jeswr-initiated run while it holds the secret-admin mint. The
-# workflow requires BOTH fields on all four phase jobs' `if:`; this pin (same anchored-awk
-# job-block extraction as the mint contract) goes red in --self-test if either clause is
-# dropped from any job.
+# workflow requires BOTH fields on all five phase jobs' `if:` (round 13 enrolled
+# cleanup-standalone); this pin (same anchored-awk job-block extraction as the mint contract)
+# goes red in --self-test if either clause is dropped from any job.
 _job_block() {  # _job_block WORKFLOW_FILE JOB_KEY -> that job's lines (same anchor as _mint_grants)
   awk -v job="$2" '
     /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
@@ -820,11 +845,76 @@ check_workflow_actor_contract() {  # check_workflow_actor_contract WORKFLOW_FILE
     printf '::error::migrate-secrets: workflow contract: %s not found (delete this script together with the workflow)\n' "$wf" >&2
     return 1
   fi
-  for job in quiesce migrate cleanup-bootstrap reenable-writers; do
+  for job in quiesce migrate cleanup-bootstrap cleanup-standalone reenable-writers; do
     block=$(_job_block "$wf" "$job")
     if ! grep -qF "github.actor == 'jeswr'" <<<"$block" \
        || ! grep -qF "github.triggering_actor == 'jeswr'" <<<"$block"; then
       printf "::error::migrate-secrets: workflow contract violated — job %s must gate on BOTH github.actor == 'jeswr' AND github.triggering_actor == 'jeswr' (round-9 finding 2: github.actor stays the ORIGINAL initiator on a re-run while triggering_actor is the RE-RUNNER, so actor-only lets any write-access user re-run a jeswr run under the secret-admin mint)\n" "$job" >&2
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+# REACHABILITY CONTRACT (sol round 13 of #275 — mid-cleanup cancellation was unrecoverable
+# THROUGH THE WORKFLOW, and nothing tested workflow reachability: the "one remaining" scenario
+# invokes this script directly, so the suite proved the SCRIPT converges from a KEY-only repo
+# scope while the WORKFLOW had no dispatchable path into that state — cleanup ran only behind
+# `needs: migrate`, whose env-UNBOUND mint needs the repo-scope APP_ID the cancelled cleanup
+# already deleted, and the round-11 attempt gate bans re-running the cancelled run). This pin
+# asserts the recovery path stays dispatchable end-to-end:
+#   1. the `phase` workflow_dispatch input offers EXACTLY {quiesce, migrate, cleanup-bootstrap,
+#      resume} — the exact-set comparison catches a dropped recovery choice AND a stray one;
+#   2. job `cleanup-standalone` carries NO `needs:` (needs-freedom IS the recovery property —
+#      re-coupling it to migrate resurrects the brick), routes on `inputs.phase ==
+#      'cleanup-bootstrap'`, and is `environment: dispatch-secrets`-bound (an unbound copy
+#      would re-open the round-3 mint hole this path exists to escape);
+#   3. BOTH cleanup jobs invoke `bash scripts/migrate-secrets.sh --phase cleanup-bootstrap`
+#      (a retargeted invocation would dispatch the wrong state machine under cleanup grants).
+# The standalone job's mint grants + actor pins are enrolled in the two contracts above.
+
+_phase_options() {  # _phase_options WORKFLOW_FILE -> the phase input's sorted choice list
+  awk '
+    /^        options:/ { inopt = 1; next }
+    inopt && /^          - / { sub(/^          - /, ""); sub(/[ \t]+$/, ""); print; next }
+    inopt { exit }
+  ' "$1" | sort
+}
+
+check_workflow_reachability_contract() {  # check_workflow_reachability_contract WORKFLOW_FILE
+  local wf=$1 want got block job rc=0
+  if [[ ! -f "$wf" ]]; then
+    printf '::error::migrate-secrets: workflow contract: %s not found (delete this script together with the workflow)\n' "$wf" >&2
+    return 1
+  fi
+  want=$(printf 'cleanup-bootstrap\nmigrate\nquiesce\nresume')
+  got=$(_phase_options "$wf")
+  if [[ "$got" != "$want" ]]; then
+    printf '::error::migrate-secrets: workflow contract violated — the phase workflow_dispatch input must offer EXACTLY {quiesce, migrate, cleanup-bootstrap, resume} (round 13: cleanup-bootstrap is the ONLY recovery from a mid-cleanup cancellation — without the choice that state is unrecoverable through the workflow); found:\n%s\n' "${got:-<none>}" >&2
+    rc=1
+  fi
+  block=$(_job_block "$wf" cleanup-standalone)
+  if [[ -z "$block" ]]; then
+    printf '::error::migrate-secrets: workflow contract violated — job cleanup-standalone is MISSING (round 13: the phase: cleanup-bootstrap dispatch must reach a needs-free env-bound cleanup job)\n' >&2
+    rc=1
+  else
+    if grep -qE '^    needs:' <<<"$block"; then
+      printf '::error::migrate-secrets: workflow contract violated — job cleanup-standalone must carry NO needs: (needs-freedom is the round-13 recovery property: coupled to migrate it can never run once the repo-scope APP_ID is gone, resurrecting the brick)\n' >&2
+      rc=1
+    fi
+    if ! grep -qF "inputs.phase == 'cleanup-bootstrap'" <<<"$block"; then
+      printf "::error::migrate-secrets: workflow contract violated — job cleanup-standalone must route on inputs.phase == 'cleanup-bootstrap' (round 13: otherwise the recovery choice dispatches nothing)\n" >&2
+      rc=1
+    fi
+    if ! grep -qF 'environment: dispatch-secrets' <<<"$block"; then
+      printf '::error::migrate-secrets: workflow contract violated — job cleanup-standalone must be environment: dispatch-secrets-bound (round 13: its mint MUST resolve the environment copies — the repo-scope bootstrap originals may already be partly deleted)\n' >&2
+      rc=1
+    fi
+  fi
+  for job in cleanup-bootstrap cleanup-standalone; do
+    block=$(_job_block "$wf" "$job")
+    if ! grep -qF 'run: bash scripts/migrate-secrets.sh --phase cleanup-bootstrap' <<<"$block"; then
+      printf '::error::migrate-secrets: workflow contract violated — job %s must invoke exactly "bash scripts/migrate-secrets.sh --phase cleanup-bootstrap" (round 13: the reachability pin covers the script invocation, not just the job shape)\n' "$job" >&2
       rc=1
     fi
   done
@@ -1350,7 +1440,14 @@ FAKE
   # --- scenario 6: CLEANUP FROM 1-REMAINING — the state a mid-cleanup cancellation leaves
   # (APP_ID already deleted, APP_KEY not yet). The rerun converges; in the OLD single-phase
   # design this exact state was the BRICK (unbound rerun could not mint) — here the env-bound
-  # cleanup mints from the env copies and finishes the drain.
+  # cleanup mints from the env copies and finishes the drain. ROUND 13: this KEY-only state is
+  # now REACHABLE through the workflow too — the standalone `phase: cleanup-bootstrap` dispatch
+  # (job cleanup-standalone) runs exactly this script phase; from here a fresh `phase: migrate`
+  # CANNOT mint (the env-unbound main job reads the deleted repo-scope APP_ID) and the
+  # cancelled run cannot be re-run (attempt gate), so this convergence plus the reachability
+  # contract (scenario 18k) IS the recovery path. The exact argv pin proves the recovery is
+  # delete-only: the full C0 gate, the two listings-of-record, the ONE delete, the final
+  # assert — zero non-delete mutations (no secret set, no workflow disable/enable).
   local s6="$tmp/s6"
   mkdir -p "$s6"
   seed_quiesced "$s6"
@@ -1361,6 +1458,20 @@ FAKE
   chk "cleanup from 1-remaining deletes exactly the one leftover" \
     "$(grep -cE '^secret delete ' "$s6/calls.log")" 1
   chk "cleanup from 1-remaining: repo scope empty after" "$(cat "$s6/repo_secrets")" ""
+  chk "cleanup from 1-remaining: reports MIGRATION COMPLETE (the standalone recovery finishes the repair)" \
+    "$(grep -c 'MIGRATION COMPLETE (both phases)' "$tmp/s6.out")" 1
+  chk "cleanup from 1-remaining: zero NON-delete mutations (no set, no disable/enable — delete-only recovery)" \
+    "$(grep -cE '^(secret set |workflow (disable|enable) )' "$s6/calls.log" || true)" 0
+  local expected_c1="$tmp/expected-cleanup-1rem.log"
+  {
+    cat "$expected_gate"
+    printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n'
+    printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
+    printf 'secret delete REGISTRY_ADMIN_APP_KEY --repo o/r\n'
+    printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
+  } > "$expected_c1"
+  chk "cleanup from 1-remaining: EXACT gh argv sequence (state x4 -> snapshot x4 -> ordering x2 -> env assert -> repo list -> delete KEY x1 -> assert)" \
+    "$(diff -q "$expected_c1" "$s6/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
 
   # --- scenario 7: CLEANUP FROM 0-REMAINING — a rerun after full success: success no-op.
   local s7="$tmp/s7"
@@ -1654,7 +1765,7 @@ FAKE
   chk "no environments:write grant: NO deletions, repo scope untouched" \
     "$(grep -cE '^secret delete ' "$s17/calls.log" || true)-$(wc -l < "$s17/repo_secrets")" 0-14
 
-  # --- scenario 18: WORKFLOW MINT CONTRACT (round-4 finding 3) — the REAL workflow's FOUR mint
+  # --- scenario 18: WORKFLOW MINT CONTRACT (round-4 finding 3) — the REAL workflow's FIVE mint
   # steps must declare exactly the phase-specific grant sets the permission scenarios above
   # model; the fake-gh grants files prove the SCRIPT fails closed under-granted, this proves the
   # WORKFLOW actually requests the grants. Then the check's own non-vacuity: a mutated copy with
@@ -1663,11 +1774,11 @@ FAKE
   wf_real="$(dirname -- "$me")/../.github/workflows/migrate-secrets-to-env.yml"
   rc=0; check_workflow_mint_contract "$wf_real" > "$tmp/s18.out" 2>&1 || rc=$?
   chk "workflow mint contract holds on the real migrate-secrets-to-env.yml" "$rc" 0
-  grep -v 'permission-actions: read' "$wf_real" > "$wf_mut"   # strips the migrate AND cleanup mints' actions:read
+  grep -v 'permission-actions: read' "$wf_real" > "$wf_mut"   # strips the migrate AND both cleanup mints' actions:read
   rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18b.out" 2>&1 || rc=$?
   chk "contract goes RED when the permission-actions: read declarations are removed (the exact round-4 vacuity gap)" "$rc" 1
-  chk "contract names BOTH under-granted mints when actions:read is stripped (migrate + cleanup)" \
-    "$(grep -c 'workflow contract violated' "$tmp/s18b.out")" 2
+  chk "contract names ALL THREE under-granted mints when actions:read is stripped (migrate + cleanup-bootstrap + cleanup-standalone)" \
+    "$(grep -c 'workflow contract violated' "$tmp/s18b.out")" 3
   grep -v 'permission-actions: write' "$wf_real" > "$wf_mut"  # strips the quiesce AND reenable actions:write mints
   rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18e.out" 2>&1 || rc=$?
   chk "contract goes RED when the permission-actions: write declarations (round-8 quiesce / re-enable) are removed" "$rc" 1
@@ -1691,18 +1802,49 @@ FAKE
   # stays the ORIGINAL initiator when a run is re-run, while github.triggering_actor is the
   # re-runner — so an actor-only `if:` lets any write-access user re-run a jeswr-initiated run
   # while it holds the secret-admin mint. Every phase job must pin BOTH fields; dropping the
-  # triggering_actor clause from any job (the sed strips it from ALL FOUR) goes red, one
+  # triggering_actor clause from any job (the sed strips it from ALL FIVE) goes red, one
   # violation per job.
   rc=0; check_workflow_actor_contract "$wf_real" > "$tmp/s18h.out" 2>&1 || rc=$?
-  chk "actor contract holds on the real workflow (github.actor AND github.triggering_actor pinned on all 4 phase jobs)" "$rc" 0
+  chk "actor contract holds on the real workflow (github.actor AND github.triggering_actor pinned on all 5 phase jobs)" "$rc" 0
   sed "s/ && github.triggering_actor == 'jeswr'//" "$wf_real" > "$wf_mut"
   rc=0; check_workflow_actor_contract "$wf_mut" > "$tmp/s18i.out" 2>&1 || rc=$?
   chk "actor contract goes RED when the triggering_actor clause is dropped (the re-run bypass reopens)" "$rc" 1
-  chk "actor contract names ALL FOUR under-gated jobs when the clause is dropped" \
-    "$(grep -c 'workflow contract violated' "$tmp/s18i.out")" 4
+  chk "actor contract names ALL FIVE under-gated jobs when the clause is dropped" \
+    "$(grep -c 'workflow contract violated' "$tmp/s18i.out")" 5
   sed "s/github\.actor == 'jeswr' && //" "$wf_real" > "$wf_mut"
   rc=0; check_workflow_actor_contract "$wf_mut" > "$tmp/s18j.out" 2>&1 || rc=$?
   chk "actor contract goes RED when the github.actor clause is dropped (both fields are load-bearing)" "$rc" 1
+
+  # --- scenario 18k: REACHABILITY CONTRACT (sol round 13 — the mid-cleanup-cancellation
+  # recovery must stay DISPATCHABLE through the workflow, not just convergent in the script):
+  # the real workflow must offer the cleanup-bootstrap phase choice and carry the needs-free,
+  # env-bound, phase-routed cleanup-standalone job invoking this script's cleanup phase.
+  # Non-vacuity, one mutation per pinned property: (a) the phase CHOICE removed — the recovery
+  # becomes undispatchable, the exact round-13 gap; (b) the ENV BINDING stripped — the
+  # standalone mint falls back to the (possibly already-drained) repo scope, the round-3 hole;
+  # (c) the script INVOCATION retargeted to another phase; (d) a `needs: migrate` re-coupled
+  # onto the standalone job — behind migrate's unmintable env-UNBOUND job the recovery can
+  # never run, resurrecting the brick. Each must go red.
+  rc=0; check_workflow_reachability_contract "$wf_real" > "$tmp/s18k.out" 2>&1 || rc=$?
+  chk "reachability contract holds on the real workflow (phase choice + needs-free env-bound standalone cleanup + script invocations)" "$rc" 0
+  grep -v '^          - cleanup-bootstrap$' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_reachability_contract "$wf_mut" > "$tmp/s18l.out" 2>&1 || rc=$?
+  chk "reachability contract goes RED when the cleanup-bootstrap phase CHOICE is removed (the exact round-13 unrecoverability gap)" "$rc" 1
+  chk "reachability contract names the missing phase choice" \
+    "$(grep -c 'must offer EXACTLY {quiesce, migrate, cleanup-bootstrap, resume}' "$tmp/s18l.out")" 1
+  grep -v 'environment: dispatch-secrets' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_reachability_contract "$wf_mut" > "$tmp/s18m.out" 2>&1 || rc=$?
+  chk "reachability contract goes RED when the standalone job's ENV BINDING is stripped (its mint must resolve the environment copies)" "$rc" 1
+  sed 's|run: bash scripts/migrate-secrets.sh --phase cleanup-bootstrap|run: bash scripts/migrate-secrets.sh --phase resume-writers|' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_reachability_contract "$wf_mut" > "$tmp/s18n.out" 2>&1 || rc=$?
+  chk "reachability contract goes RED when the cleanup script invocation is RETARGETED to another phase" "$rc" 1
+  chk "reachability contract names BOTH retargeted cleanup jobs" \
+    "$(grep -c 'must invoke exactly' "$tmp/s18n.out")" 2
+  sed '/^  cleanup-standalone:$/a\    needs: migrate' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_reachability_contract "$wf_mut" > "$tmp/s18o.out" 2>&1 || rc=$?
+  chk "reachability contract goes RED when a needs: is re-coupled onto the standalone job (needs-freedom is the recovery property)" "$rc" 1
+  chk "reachability contract names the needs re-coupling" \
+    "$(grep -c 'must carry NO needs:' "$tmp/s18o.out")" 1
 
   # --- scenario 19: RESUME-WRITERS happy path (the self-resume after a COMPLETED migrate, or
   # the standalone phase: resume) — exactly the 4 enables, in the canonical writer order, and
