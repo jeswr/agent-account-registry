@@ -1102,6 +1102,30 @@ def _run_key_identity(value):
     return value[:value.rfind(".")]
 
 
+def _json_type_exact(left, right):
+    """Structural equality that ALSO requires identical JSON types, closing Python's cross-type
+    coercion — `True == 1`, `False == 0`, and `7.0 == 7` all hold under plain `==`. Used for the
+    identifying-field comparison in _registry_record_equivalent (#412 r2): a type-confused stored
+    provenance value (`pr_number: true`, `issue: 7.0`) must NOT compare equal to a candidate
+    (`pr_number: 1`, `issue: 7`) and be reported idempotent — that would let a malformed
+    root-of-trust record masquerade as identical, contradicting the exact-match/fail-closed
+    contract. Recurses through objects and lists; `bool` (an `int` subclass) matches only `bool`,
+    and `int` never matches `float`."""
+    # bool is a subclass of int, so guard it first: only bool-equals-bool is a match.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return (left.keys() == right.keys()
+                and all(_json_type_exact(left[k], right[k]) for k in left))
+    if isinstance(left, list) and isinstance(right, list):
+        return (len(left) == len(right)
+                and all(_json_type_exact(a, b) for a, b in zip(left, right)))
+    # Distinct JSON scalar types never match (int vs float, str vs number, ...).
+    if type(left) is not type(right):
+        return False
+    return left == right
+
+
 def _registry_record_equivalent(existing_text, document, volatile_fields):
     """True when an already-stored registry record is the SAME logical record as `document`,
     differing only in the per-attempt component of `volatile_fields` — retry metadata that
@@ -1129,9 +1153,12 @@ def _registry_record_equivalent(existing_text, document, volatile_fields):
         return False
     if not isinstance(stored, dict):
         return False
-    # Every identifying (non-volatile) field must match byte-for-byte.
-    if ({k: v for k, v in stored.items() if k not in volatile_fields}
-            != {k: v for k, v in document.items() if k not in volatile_fields}):
+    # Every identifying (non-volatile) field must match with JSON-TYPE-EXACT equality — NOT Python
+    # `==`, which coerces `True`/`1`, `False`/`0`, and `7.0`/`7` (#412 r2): a type-confused stored
+    # value must never masquerade as an identical record.
+    if not _json_type_exact(
+            {k: v for k, v in stored.items() if k not in volatile_fields},
+            {k: v for k, v in document.items() if k not in volatile_fields}):
         return False
     # Each volatile field is a `recorded_at_run` provenance stamp: ignore ONLY the attempt, never
     # the run identity. BOTH sides must carry a valid stamp sharing the same run — a missing,
@@ -3391,6 +3418,31 @@ def _self_test():
             except WorkerPrError as exc:
                 check(f"a malformed stored stamp {bad_stamp!r} fails closed",
                       "different content" in str(exc), True)
+        # #412 r2: identifying fields are compared JSON-TYPE-EXACT, not with Python `==`, so a
+        # type-confused stored value (`pr_number: true`, `issue: 7.0`) can never masquerade as an
+        # identical record via `True == 1` / `7.0 == 7` and be reported idempotent. A VALID same-run
+        # stamp is supplied on both sides so ONLY the type confusion drives the rejection (without
+        # the fix these would be reported idempotent success, not raise).
+        prov_bool = dict(prov_v1, pr_number=True, recorded_at_run="100.1")
+        prov_int = dict(prov_v1, pr_number=1, recorded_at_run="100.2")
+        put_state["files"] = {ledger_loc: record_meta(prov_bool)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_int, "m", volatile_fields=volatile)
+            check("stored pr_number:true vs candidate pr_number:1 fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("stored pr_number:true vs candidate pr_number:1 fails closed",
+                  "different content" in str(exc), True)
+        prov_float = dict(prov_v1, issue=7.0, recorded_at_run="100.1")
+        prov_seven = dict(prov_v1, issue=7, recorded_at_run="100.2")
+        put_state["files"] = {ledger_loc: record_meta(prov_float)}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                               prov_seven, "m", volatile_fields=volatile)
+            check("stored issue:7.0 vs candidate issue:7 fails closed", "no", "error")
+        except WorkerPrError as exc:
+            check("stored issue:7.0 vs candidate issue:7 fails closed",
+                  "different content" in str(exc), True)
 
         # issue #130: a sustained burst of GENUINE CAS conflicts (HTTP 409) retries under
         # full-jitter backoff until the wall-clock DEADLINE — NOT a fixed six-attempt budget a
