@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "acct03",
-   "claim_id": "bc8ef78f75ef4081b14f81873dd517c0",
-   "holder": "fix:sparq-org/sparq#3624@dispatch-29700372669.1",
-   "package": "sparq-zk-compose",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784489497,
-   "expires_at": 1784495797
-  }
- ]
+ "leases": []
 }
