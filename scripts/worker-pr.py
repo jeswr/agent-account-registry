@@ -1235,9 +1235,10 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     The pre-#157 order applied the parking label FIRST, then commented / updated the issue /
     alerted — and the alert used check=False with no return-code check. A failure after the label,
     or a silently-failed alert, stranded the PR excluded-from-enumeration FOREVER with no human
-    ever paged. An UNCONFIGURED alert route (no ALERT_REPO/REGISTRY_REPO) is the operator opting
-    out of paging — it is not treated as a delivery failure, so it never blocks the park; the
-    comment + issue record still land. The PR stays DRAFT throughout."""
+    ever paged. FAIL CLOSED: an UNCONFIGURED or partially-configured alert route (missing/incomplete
+    ALERT_REPO/REGISTRY_REPO or its token) yields no CONFIRMED page, so it is treated exactly like an
+    unverified delivery — it blocks the park and leaves the PR enumerable, never parking it unpaged
+    on a guessed opt-out. The PR stays DRAFT throughout."""
     handle = maintainer or os.environ.get("MAINTAINER_HANDLE", "jeswr")
     marker = f"{NEEDS_USER_MARKER} pr={pr_number} -->"
     failures = []
@@ -1262,15 +1263,15 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             _load_worker_issue().set_status(repo, issue, "needs-user")
         except Exception as exc:  # noqa: BLE001 — continue to the alert, then reconcile on retry
             failures.append(f"source issue #{issue} needs-user routing ({exc})")
-    # 3) Delivery-VERIFIED ops alert (the human page): one deduped rolling registry issue. A
-    #    configured route that does NOT confirm delivery keeps the escalation enumerable; an
-    #    unconfigured route is an opt-out, not a failure.
-    alert_configured = bool(alert_repo and alert_token)
+    # 3) Delivery-VERIFIED ops alert (the human page): one deduped rolling registry issue. FAIL
+    #    CLOSED — _ops_alert returns False on a missing/partial route AND on an unverified delivery;
+    #    either way the human page is UNCONFIRMED, so it blocks the park and keeps the PR enumerable.
+    #    A missing/partial route is a misconfiguration, never a silent opt-out that parks unpaged.
     alerted = _ops_alert(alert_repo, alert_token,
                          f"⚠️ Review loop needs a human — {repo}#{pr_number}",
                          f"> 🤖 SPARQ agent — {reason}\n\nhttps://github.com/{repo}/pull/{pr_number} "
                          f"needs @{handle}.")
-    if alert_configured and not alerted:
+    if not alerted:
         failures.append("ops alert delivery unconfirmed")
     # PARK last — only once every notification + issue-state mutation is confirmed. The label is
     # the durable completion marker; an unparked PR stays enumerable for the sweep to reconcile.
@@ -2796,8 +2797,11 @@ def _self_test():
         nu_globals["_load_worker_issue"] = lambda: _FakeIssueMod
         nu_globals["set_review_state"] = (
             lambda repo, pr, state: nu_calls.append(("park", state)))
+        # Faithful to the real _ops_alert: it is always CALLED, but returns False on a
+        # missing/partial route (ar/at absent) regardless of the simulated delivery outcome.
         nu_globals["_ops_alert"] = (
-            lambda ar, at, title, body: nu_calls.append(("alert", title)) or nu_state["alert"])
+            lambda ar, at, title, body: nu_calls.append(("alert", title))
+            or (nu_state["alert"] if (ar and at) else False))
         nu_globals["_paginated_comments"] = lambda repo, pr: nu_state["comments"]
 
         def run_needs_user(**over):
@@ -2830,11 +2834,18 @@ def _self_test():
         check("an unconfirmed escalation still attempted comment, issue AND alert",
               [c[0] for c in nu_calls], ["comment", "issue", "alert"])
 
-        # An UNCONFIGURED alert route is the operator opting out of paging — not a delivery
-        # failure — so it never blocks the park; the comment + issue record still land.
-        run_needs_user(alert=False, alert_repo=None, alert_token=None)
-        check("an unconfigured alert route never blocks the park (operator opt-out)",
-              nu_calls[-1], ("park", "needs-user"))
+        # FAIL CLOSED (trust plane): a missing OR partially-configured alert route is an
+        # UNCONFIRMED human page, never an opt-out — it blocks the park and raises so the sweep
+        # keeps the PR enumerable rather than stranding it excluded-from-enumeration unpaged.
+        # nu_state["alert"] stays True here, so it is the ABSENT route (not a delivery failure)
+        # that forces the raise — a permissive opt-out would regress these to a park.
+        for miss in ({"alert_repo": None, "alert_token": None},
+                     {"alert_repo": None}, {"alert_token": None}):
+            label = "+".join(sorted(k for k in miss))
+            raised = run_needs_user(**miss)
+            check(f"a missing/partial alert route raises ({label})", bool(raised), True)
+            check(f"a missing/partial alert route never parks ({label})",
+                  any(c[0] == "park" for c in nu_calls), False)
 
         # A failed explanatory comment still routes the issue and alerts, then raises without
         # parking — the sweep re-derives needs-user and the marker-dedup replays only the gaps.
