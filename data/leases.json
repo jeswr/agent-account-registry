@@ -12,16 +12,6 @@
   },
   {
    "account": "acct03",
-   "claim_id": "e7307a887fa6400b88e4f2b3b5fc14f6",
-   "holder": "sparq-org/sparq#2762@dispatch-29674138070.1",
-   "package": "sparq-engine",
-   "role": "research",
-   "model": "opus",
-   "issued_at": 1784437400,
-   "expires_at": 1784443700
-  },
-  {
-   "account": "acct03",
    "claim_id": "4221832e38c14fe2a0e20fac574d722e",
    "holder": "jeswr/agent-account-registry#109@dispatch-29674138070.1",
    "package": "dispatch",
