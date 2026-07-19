@@ -548,60 +548,114 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     return items
 
 
-def busy_packages_of_pulls(repo, pulls, issue_labels):
-    """PURE busy-area union for the PLAN conflict partition (registry issue #27): every open
-    same-repo `sparq-agent/*` PR the review loop still OWNS — draft or not, any NON-TERMINAL
-    review state — reserves the `area:*` packages of its PR labels plus its head-ref-linked
-    source issue. A known issue with NO area labels reserves the serializing global partition
-    (mirrors the target ready-engine); an unknown/closed issue with no PR areas reserves
-    nothing (never freeze the pipeline on a stray branch).
+def _pull_provably_inactive(pull, status):
+    """True iff a HUMAN-PARKED worker PR provably cannot reach main on its own — the round-2
+    P1 carve-out guard (HELD != INACTIVE): groom's stale paths park NON-draft PRs WITHOUT
+    disarming, so a parked PR with GitHub auto-merge still latched can merge mid-air into a
+    crate the busy partition just freed for a sibling. Provably inactive means:
+    - DRAFT with no latched arm visible anywhere (draft is the loop's own defused state —
+      the disarm path converts to draft, and GitHub cancels/refuses auto-merge on drafts;
+      a draft that still SHOWS a latched arm is a crashed-disarm artifact and reads ACTIVE,
+      fail closed), or
+    - NON-draft with an EXPLICIT `auto_merge: null` in the listing row and no disagreeing
+      detail record. The REST auto-merge request is also the vehicle by which a PR enters a
+      merge queue (merge-when-ready), so a null listing read covers the queue state the
+      snapshot carries no independent field for.
+    `status` is the PLAN detail-read record (pr_ci_status) when one exists — fresher than
+    the listing, so `armed: True` there overrides a stale listing null. A missing draft
+    field, a missing `auto_merge` field, a non-null/garbage `auto_merge`, or a detail
+    record whose armed bit reads True all return False: UNKNOWN is ACTIVE (busy)."""
+    if isinstance(pull.get("auto_merge"), dict):
+        return False                      # latched arm in the listing row — it may merge
+    if isinstance(status, dict) and status.get("armed") is True:
+        return False                      # fresher detail read says latched — fail closed
+    if pull.get("draft") is True:
+        return True                       # defused state: nothing latched, nothing queued
+    if pull.get("draft") is not False:
+        return False                      # unknown draft state — fail closed
+    return "auto_merge" in pull and pull["auto_merge"] is None
 
-    HUMAN-PARKED PRs reserve NOTHING (the 2026-07-18 P1 frontier collapse): a PR that is
-    terminal for enumerate_review_items — `review:needs-user`/`needs:user` on the PR, or a
-    `needs:*` label on its source issue — will never be advanced autonomously, so letting it
-    hold its crate deadlocks dispatch for as long as the human takes. Measured collapse: 26 of
-    27 open sparq worker PRs sat source-parked, every planned crate read busy, and the PLAN
-    emitted ~1 item/tick against a 13-row ready frontier (dispatch runs 29664401328/
-    29665207000). The exclusions here mirror the enumerator's terminal set EXACTLY so
-    "review-loop-owned" means the same thing in both places; the parked SOURCE issue itself is
-    still `needs:*`-gated out of the target ready engine, so freeing the crate can never
-    re-dispatch the parked issue — only siblings in the same crate."""
+
+def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None):
+    """PURE busy-area union for the PLAN conflict partition (registry issue #27): every open
+    same-repo `sparq-agent/*` PR that can still LAND in a crate — because the review loop
+    still owns it, or because a latched/unknown arm means it may merge regardless — reserves
+    the `area:*` packages of its provenance-linked source issue plus its own PR labels. A
+    linked issue with NO area labels reserves the serializing global partition (mirrors the
+    target ready-engine).
+
+    LINKAGE PARITY (round-2 P2): the source issue comes from the SAME validated provenance
+    record enumerate_review_items admits (is_enumerable_provenance) — NEVER the branch name.
+    Divergent linkage let the two sides disagree in both directions: branch-parked/
+    provenance-live freed a crate the enumerator still emits into (mid-air collision), and
+    branch-live/provenance-parked kept reserving a crate the enumerator had already handed
+    to a human (frontier collapse preserved). A PR with MISSING/invalid provenance is
+    invisible to the enumerator but can still carry a latched arm, and its true crate is
+    unknowable — it reserves the GLOBAL partition (fail closed; the old "stray branch
+    reserves nothing" rule freed exactly the crate an armed stray could merge into). A valid
+    record whose source issue is absent from the open-issue map mirrors the enumerator,
+    which still emits that PR as `__global__`.
+
+    HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse): a human-parked PR —
+    `review:needs-user`/`needs:user` on the PR, or `needs:*` on the provenance-linked source
+    issue — frees its packages ONLY when it is provably inactive (_pull_provably_inactive:
+    draft, or non-draft with an explicitly un-latched auto-merge and no disagreeing detail
+    record). groom parks stale NON-draft PRs WITHOUT disarming, so a parked PR with
+    auto-merge still latched can merge mid-air into a crate this partition just freed for a
+    sibling — armed/unknown-arm parked PRs stay BUSY. The measured collapse (26 of 27 open
+    sparq worker PRs source-parked, ~1 plan item/tick against a 13-row frontier, dispatch
+    runs 29664401328/29665207000) is still fixed: groom's parks are drafts or unarmed in the
+    common case, and those free. The parked SOURCE issue itself stays `needs:*`-gated out of
+    the target ready engine, so freeing an inert PR's crate can never re-dispatch the parked
+    issue — only siblings in the same crate."""
     busy = set()
     for pull in pulls:
         if not isinstance(pull, dict) or pull.get("state") != "open":
             continue
         head = pull.get("head") or {}
-        match = HEAD_REF_RE.match(str(head.get("ref", "")))
-        if not match or (head.get("repo") or {}).get("full_name") != repo:
+        if not HEAD_REF_RE.match(str(head.get("ref", ""))):
             continue
+        if (head.get("repo") or {}).get("full_name") != repo:
+            continue                      # fork head — cannot land in a target crate
+        number = pull.get("number")
         pr_labels = {
             label.get("name") if isinstance(label, dict) else label
             for label in (pull.get("labels") or [])
         }
-        if pr_labels & HUMAN_HOLD_PR_LABELS:
-            continue                      # terminal human-owned PR — not review-loop-owned
         areas = {label[5:] for label in pr_labels
                  if isinstance(label, str) and label.startswith("area:")}
-        source = issue_labels.get(int(match.group(1))) if isinstance(issue_labels, dict) else None
-        if isinstance(source, list):
-            if any(isinstance(label, str) and label.startswith("needs:")
-                   for label in source):
-                continue                  # source issue human-parked — same terminal posture
-            issue_areas = {label[5:] for label in source
-                           if isinstance(label, str) and label.startswith("area:")}
-            areas |= issue_areas or {GLOBAL_PACKAGE}
-        elif not areas:
-            continue
+        parked = bool(pr_labels & HUMAN_HOLD_PR_LABELS)
+        record = provenance.get(number) if isinstance(provenance, dict) else None
+        if is_enumerable_provenance(record, number):
+            source = (issue_labels.get(record["issue"])
+                      if isinstance(issue_labels, dict) else None)
+            if isinstance(source, list):
+                if any(isinstance(label, str) and label.startswith("needs:")
+                       for label in source):
+                    parked = True         # source issue human-parked — same terminal posture
+                issue_areas = {label[5:] for label in source
+                               if isinstance(label, str) and label.startswith("area:")}
+                areas |= issue_areas or {GLOBAL_PACKAGE}
+            else:
+                areas |= {GLOBAL_PACKAGE}  # closed/unlisted source: the enumerator still
+                                           # emits this PR as `__global__` — mirror it
+        else:
+            areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage — fail closed
+        status = pr_status.get(number) if isinstance(pr_status, dict) else None
+        if parked and _pull_provably_inactive(pull, status):
+            continue                      # provably inert human-parked PR — frees its crates
         busy |= areas
     return busy
 
 
-def filter_busy_area_items(items, repo, pulls, issue_labels):
+def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_status=None):
     """Drop plan items whose package has an in-flight worker PR (registry issue #27: the review
     loop's PRs were invisible to the busy-area partition, double-dispatching onto a busy crate).
     Global semantics mirror the target ready-engine: a global reservation blocks everything, and
-    a global item cannot co-run with ANY reserved package."""
-    busy = busy_packages_of_pulls(repo, pulls, issue_labels)
+    a global item cannot co-run with ANY reserved package. `provenance`/`pr_status` are the same
+    maps handed to enumerate_review_items — the busy partition and the enumerator must read the
+    same linkage and the same arm state (round-2 P1/P2)."""
+    busy = busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status)
     if not busy:
         return items
     kept = []
@@ -2888,35 +2942,64 @@ def _self_test():
              globals()["_target_token"]) = real_io
 
     # ---- GAP-D (issue #27): busy-area union over ALL open worker PRs ----
+    # Linkage parity (round-2 P2): the busy partition reads each PR's source issue from the
+    # SAME validated provenance record the enumerator admits, so these fixtures carry
+    # provenance — the branch name is only the worker-pattern gate.
+    def busy_record(number, issue):
+        return {"pr_number": number, "head_sha_at_open": sha_a,
+                "impl_provider": "anthropic", "impl_alias": "fable",
+                "impl_account_h": "ab" * 8, "issue": issue, "recorded_at_run": "1.1"}
+
+    busy_prov = {**provenance,
+                 60: busy_record(60, 8), 61: busy_record(61, 999),
+                 75: busy_record(75, 80), 76: busy_record(76, 81),
+                 77: busy_record(77, 82), 78: busy_record(78, 81),
+                 79: busy_record(79, 84), 85: busy_record(85, 82),
+                 86: busy_record(86, 80)}
     plan_items = [{"number": 7, "package": "crate-a", "deferred": False},
                   {"number": 9, "package": "crate-b", "deferred": False}]
     in_review = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"])
-    kept = filter_busy_area_items(plan_items, repo, [in_review], issue_labels)
+    kept = filter_busy_area_items(plan_items, repo, [in_review], issue_labels, busy_prov)
     assert [item["number"] for item in kept] == [9], kept  # crate-a busy via issue 7's area
-    assert filter_busy_area_items(plan_items, repo, [], issue_labels) == plan_items
+    assert filter_busy_area_items(plan_items, repo, [], issue_labels, busy_prov) == plan_items
     # draft-agnostic, review-state-agnostic: a non-draft review:pass PR still reserves its area
     ready_pr = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False, labels=["review:pass"])
     assert [item["number"] for item in filter_busy_area_items(
-        plan_items, repo, [ready_pr], issue_labels)] == [9]
+        plan_items, repo, [ready_pr], issue_labels, busy_prov)] == [9]
     # area:* labels on the PR itself union in as well
     labelled = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["area:crate-b"])
-    assert filter_busy_area_items(plan_items, repo, [labelled], issue_labels) == []
+    assert filter_busy_area_items(plan_items, repo, [labelled], issue_labels, busy_prov) == []
     # a known source issue with NO areas reserves the serializing global partition
     assert filter_busy_area_items(plan_items, repo,
                                   [pull(60, "sparq-agent/issue-8-1-1", sha_a)],
-                                  {8: ["role:impl"]}) == []
-    # an unknown/closed source issue with no PR areas reserves nothing (no pipeline freeze)
-    assert filter_busy_area_items(plan_items, repo,
-                                  [pull(61, "sparq-agent/issue-999-1-1", sha_a)],
-                                  issue_labels) == plan_items
+                                  {8: ["role:impl"]}, busy_prov) == []
+    # [round-2 P2] a VALID provenance record whose source issue is closed/unlisted mirrors
+    # the enumerator — which still emits that PR as `__global__` — with a global reservation
+    # (the old "reserves nothing" rule freed a crate the loop was still driving into)
+    stray_closed = pull(61, "sparq-agent/issue-999-1-1", sha_a)
+    assert busy_packages_of_pulls(repo, [stray_closed], issue_labels,
+                                  busy_prov) == {GLOBAL_PACKAGE}
+    stray_items = enumerate_review_items(repo, [stray_closed], busy_prov, [],
+                                         issue_labels, now)
+    assert [item["package"] for item in stray_items] == [GLOBAL_PACKAGE], stray_items
+    # [round-2 P2] MISSING/invalid provenance: invisible to the enumerator but still able to
+    # carry a latched arm, and its true crate is unknowable — global reservation (fail
+    # closed), even when the PR wears area labels of its own
+    assert busy_packages_of_pulls(repo, [stray_closed], issue_labels, {}) == {GLOBAL_PACKAGE}
+    assert GLOBAL_PACKAGE in busy_packages_of_pulls(
+        repo, [pull(61, "sparq-agent/issue-999-1-1", sha_a, labels=["area:crate-a"])],
+        issue_labels, {})
+    assert busy_packages_of_pulls(
+        repo, [stray_closed], issue_labels,
+        {61: {**busy_record(61, 999), "issue": True}}) == {GLOBAL_PACKAGE}
     # a global plan item never co-runs with ANY in-flight worker PR
     assert filter_busy_area_items([{"number": 3, "package": "__global__", "deferred": False}],
-                                  repo, [in_review], issue_labels) == []
-    # fork-headed imposters do not reserve
+                                  repo, [in_review], issue_labels, busy_prov) == []
+    # fork-headed imposters do not reserve (filtered BEFORE the fail-closed linkage read)
     assert filter_busy_area_items(plan_items, repo,
                                   [pull(62, "sparq-agent/issue-7-1-1", sha_a,
                                         head_repo="mallory/fork")],
-                                  issue_labels) == plan_items
+                                  issue_labels, busy_prov) == plan_items
 
     # ---- P1 frontier-collapse regression (2026-07-18): HUMAN-PARKED worker PRs must NOT
     # reserve their crates. Reproduction shape (dispatch runs 29664401328/29665207000): a
@@ -2939,27 +3022,105 @@ def _self_test():
         pull(76, "sparq-agent/issue-81-1-1", sha_a, labels=["review:needs-user"]),
         pull(77, "sparq-agent/issue-82-1-1", sha_a, labels=["review:needs"]),
     ]
-    assert busy_packages_of_pulls(repo, collapse_pulls, collapse_labels) == {"crate-c"}
-    kept = filter_busy_area_items(frontier, repo, collapse_pulls, collapse_labels)
+    assert busy_packages_of_pulls(repo, collapse_pulls, collapse_labels,
+                                  busy_prov) == {"crate-c"}
+    kept = filter_busy_area_items(frontier, repo, collapse_pulls, collapse_labels, busy_prov)
     assert [item["number"] for item in kept] == [70, 71, 73], kept
     # a needs:user PR label parks just as terminally as review:needs-user
     assert filter_busy_area_items(
         frontier, repo, [pull(78, "sparq-agent/issue-81-1-1", sha_a, labels=["needs:user"])],
-        collapse_labels) == frontier
+        collapse_labels, busy_prov) == frontier
     # the GLOBAL-freeze slice of the same bug: a PARKED PR whose known source issue has no
     # area labels must not reserve the serializing global partition (pre-fix it froze the
     # ENTIRE repo frontier); the unparked twin still does.
     assert filter_busy_area_items(
         frontier, repo, [pull(79, "sparq-agent/issue-84-1-1", sha_a)],
-        {84: ["needs:user", "role:impl"]}) == frontier
+        {84: ["needs:user", "role:impl"]}, busy_prov) == frontier
     assert filter_busy_area_items(
         frontier, repo, [pull(79, "sparq-agent/issue-84-1-1", sha_a)],
-        {84: ["role:impl"]}) == []
+        {84: ["role:impl"]}, busy_prov) == []
     # a parked PR's own area:* labels are discarded with it (the whole PR is terminal)
     assert filter_busy_area_items(
         frontier, repo, [pull(78, "sparq-agent/issue-81-1-1", sha_a,
                               labels=["needs:user", "area:crate-d"])],
-        collapse_labels) == frontier
+        collapse_labels, busy_prov) == frontier
+
+    # ---- [round-2 P1] HELD != INACTIVE: groom parks stale NON-draft PRs WITHOUT disarming,
+    # and a parked PR with auto-merge still latched can merge mid-air into a crate the
+    # partition just freed for a sibling. A parked PR frees its crates ONLY when provably
+    # inactive; a latched or UNKNOWN arm state stays busy (fail closed). ----
+    def parked_ready(**extra):
+        base = pull(76, "sparq-agent/issue-81-1-1", sha_a, draft=False,
+                    labels=["review:needs-user"])
+        base.update(extra)
+        return base
+
+    latched = {"enabled_by": {"login": bot}, "merge_method": "squash"}
+    # armed-non-draft-parked: the latch survives the park — its crate stays busy
+    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=latched)],
+                                  collapse_labels, busy_prov) == {"crate-b"}
+    # unarmed-non-draft-parked (explicit `auto_merge: null` in the listing row): provably
+    # inert — frees the crate (the round-1 draft carve-out, extended beyond drafts)
+    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)],
+                                  collapse_labels, busy_prov) == set()
+    # unknown arm state (no auto_merge field in the row at all): fail closed — busy
+    assert busy_packages_of_pulls(repo, [parked_ready()],
+                                  collapse_labels, busy_prov) == {"crate-b"}
+    # garbage arm state is unknown too
+    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge="yes")],
+                                  collapse_labels, busy_prov) == {"crate-b"}
+    # unknown DRAFT state: fail closed — busy
+    no_draft = parked_ready(auto_merge=None)
+    del no_draft["draft"]
+    assert busy_packages_of_pulls(repo, [no_draft],
+                                  collapse_labels, busy_prov) == {"crate-b"}
+    # a fresher detail record (pr_status) with the arm latched overrides a stale listing null
+    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)], collapse_labels,
+                                  busy_prov,
+                                  {76: {"head_sha": sha_a, "armed": True}}) == {"crate-b"}
+    # ... while an agreeing unarmed detail record keeps the inert park free
+    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)], collapse_labels,
+                                  busy_prov,
+                                  {76: {"head_sha": sha_a, "armed": False}}) == set()
+    # a DRAFT that still SHOWS a latched arm is a crashed-disarm artifact — busy, not inert
+    armed_draft = pull(76, "sparq-agent/issue-81-1-1", sha_a, labels=["review:needs-user"])
+    armed_draft["auto_merge"] = latched
+    assert busy_packages_of_pulls(repo, [armed_draft],
+                                  collapse_labels, busy_prov) == {"crate-b"}
+    # source-issue parks obey the same inactivity rule: issue 80 is needs:user-parked, but
+    # an ARMED non-draft worker PR on it still reserves crate-a
+    assert busy_packages_of_pulls(
+        repo, [dict(pull(75, "sparq-agent/issue-80-1-1", sha_a, draft=False,
+                         labels=["review:needs"]), auto_merge=latched)],
+        collapse_labels, busy_prov) == {"crate-a"}
+
+    # ---- [round-2 P2] LINKAGE PARITY: when the branch-derived and provenance-derived
+    # source issues differ, the busy result must mirror the enumerator's classification in
+    # BOTH directions (provenance is the linkage; the branch name is only the pattern gate).
+    # Direction 1 — branch says PARKED issue 80, provenance says LIVE issue 82: the
+    # enumerator still emits this PR into crate-c, so crate-c stays busy (pre-fix the
+    # branch-derived park freed it -> mid-air collision) and branch-issue 80's crate-a is
+    # NOT reserved. ----
+    cross_live = pull(85, "sparq-agent/issue-80-1-1", sha_a, labels=["review:needs"])
+    assert busy_packages_of_pulls(repo, [cross_live], collapse_labels,
+                                  busy_prov) == {"crate-c"}
+    cross_items = enumerate_review_items(repo, [cross_live], busy_prov, [],
+                                         collapse_labels, now)
+    assert [(item["pr_number"], item["package"]) for item in cross_items] \
+        == [(85, "crate-c")], cross_items
+    # Direction 2 — branch says LIVE issue 82, provenance says PARKED issue 80: the
+    # enumerator skips it (human-owned), and the provably-inert draft frees its crates the
+    # same way (pre-fix the branch-derived linkage kept crate-c reserved -> frontier
+    # collapse preserved).
+    cross_parked = pull(86, "sparq-agent/issue-82-1-1", sha_a, labels=["review:needs"])
+    assert busy_packages_of_pulls(repo, [cross_parked], collapse_labels,
+                                  busy_prov) == set()
+    assert enumerate_review_items(repo, [cross_parked], busy_prov, [],
+                                  collapse_labels, now) == []
+    # ... and the SAME divergent-linkage PR with the arm latched stays busy on the
+    # provenance-linked crate (P1's HELD != INACTIVE composes with P2's parity)
+    assert busy_packages_of_pulls(repo, [dict(cross_parked, auto_merge=latched)],
+                                  collapse_labels, busy_prov) == {"crate-a"}
 
     # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
     deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]

@@ -482,10 +482,13 @@ jobs:
                   repo, pulls, pr_status, provenance))
               # Deferred-retry items with a still-live lease are dropped registry-side, then the
               # busy-area union over ALL open worker PRs (issue #27) keeps impl items out of any
-              # crate with an in-flight review-loop PR.
+              # crate with an in-flight review-loop PR. The busy partition reads the SAME
+              # provenance linkage and the SAME per-PR arm state as the enumerator above
+              # (round-2 P1/P2): a human-parked PR frees its crate only when provably inactive,
+              # and a PR with missing/divergent linkage reserves fail-closed.
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
-                  repo, pulls, issue_labels)
+                  repo, pulls, issue_labels, provenance, pr_status)
 
           snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
           document = {
