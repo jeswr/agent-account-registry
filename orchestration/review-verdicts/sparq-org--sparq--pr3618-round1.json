@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3618,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e2a3d33689c3ea5f9946787e3eb73b6e6513d6b7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 1.2 defines epsilon=x-a and rho=y-b, but then gives [[z]]=[[c]]+epsilon[[y]]+rho[[x]]+epsilon*rho. Expanding that expression does not yield xy; it double-counts cross terms. This is the central online multiplication construction, so an implementation following the design would produce incorrect results. The same erroneous form may have been inherited from the cited prior audit record, but repeating it here still makes this design unsound.",
+    "file": "research/mpc-dishonest-majority-spdz-backend-design.md",
+    "fix_hint": "Use one standard equivalent form and verify it algebraically, e.g. [[z]]=[[c]]+epsilon[[b]]+rho[[a]]+epsilon*rho, or [[c]]+epsilon[[y]]+rho[[x]]-epsilon*rho. Add a small symbolic or concrete field example in the record that expands to xy, and reconcile the cited prior design record separately if it contains the same error.",
+    "severity": "blocker",
+    "title": "Beaver multiplication formula computes the wrong product"
+   },
+   {
+    "body": "Section 3.2 says preprocessing is 'PQ-plausible-but-route-dependent', while PqStatus offers only PostQuantum, ClassicalOnly, and NotApplicable. The comments then map MASCOT and Overdrive preprocessing to PostQuantum despite explicitly depending on the concrete base-OT construction and proof components. That turns an unresolved/conditional posture into an unconditional machine-readable claim and defeats the stated no-overclaim objective.",
+    "file": "research/mpc-dishonest-majority-spdz-backend-design.md",
+    "fix_hint": "Add an explicit Conditional/DependsOnInstantiation (or Unknown/Unaudited) state carrying the relevant dependency, and reserve PostQuantum for a backend whose complete concrete preprocessing stack has that established posture. Specify truthful defaults for the in-process simulation, which implements no wire cryptography.",
+    "severity": "major",
+    "title": "PqStatus cannot represent the claimed conditional preprocessing posture"
+   }
+  ],
+  "progress": null,
+  "summary": "The doc is appropriately cautious about its research-only status and the cited fail-closed registry test exercises the real selection path. However, the load-bearing SPDZ multiplication equation is algebraically wrong, so this cannot serve as the design of record as written. The proposed PQ descriptor also collapses a conditional, route-dependent claim into an unconditional enum value, contradicting the document's honesty goal.",
+  "verdict": "request_changes"
+ }
+}
