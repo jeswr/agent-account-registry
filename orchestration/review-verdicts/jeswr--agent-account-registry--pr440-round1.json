@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 440,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "731cb24345ba6e12009cb5fcae9aa51b9ad04ebd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly closes the resolve/worker routing TOCTOU window. The resolve job exports the exact 40-hex commit checked out for routing evaluation, and the worker consumes that job output as the target checkout ref, so policy resolution, routing re-read, model execution, and local gating share one target revision. The new output is produced on every successful resolve path, the worker already depends on resolve, and checkout failure for an unavailable SHA is fail-closed. The target remains scoped to the validated repository and App token, action pins and permissions are unchanged, and no untrusted text is introduced into expression or shell control flow. No blocker, major, or minor issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
