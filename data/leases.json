@@ -11,16 +11,6 @@
    "expires_at": 1784476674
   },
   {
-   "account": "acct2css",
-   "claim_id": "a4a95e8599454b4a947fa880ee6f0773",
-   "holder": "jeswr/agent-account-registry#204@29690535486.1",
-   "package": "set-up-account",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784470651,
-   "expires_at": 1784473351
-  },
-  {
    "account": "acct01",
    "claim_id": "0d882931dea446f5a528562e756528b9",
    "holder": "review:jeswr/agent-account-registry#428@dispatch-29690287972.1",
