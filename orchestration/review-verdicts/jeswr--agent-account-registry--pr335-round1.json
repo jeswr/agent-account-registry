@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change consistently narrows all review-budget marker consumers to bot-authored, whole-body dedicated comments and updates every corresponding producer to emit that canonical form. Reviewer-controlled findings remain reserved-prefix-neutralized, while the progress record is moved into a separate dedicated comment, preventing App-identity laundering without weakening bot-login filtering or fail-closed handling of corrupt pins. The added self-tests are non-vacuous and cover embedded, prefixed, suffixed, multiline, non-bot, corrupt-tier, and end-to-end post_findings cases, including confirmation that legitimate dedicated markers still parse. No blocker or major correctness, security, or completeness issue is evident in the diff.",
+ "verdict": "approve"
+}
