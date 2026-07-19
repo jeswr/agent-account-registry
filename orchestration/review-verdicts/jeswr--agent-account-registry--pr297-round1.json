@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The PLAN step calls `enumerate_provenance_orphans(repo, pulls, provenance)` without `bot_login`, so its default accepts every author ending in `[bot]`. The workflow later derives a concrete `BOT_LOGIN` from the successfully minted App token for CLAIM, and the new helper explicitly supports and tests this pin, but that identity is never provided during PLAN. A different GitHub App with write access can therefore open a same-repo `sparq-agent/...` PR and be counted as an inadmissible fleet provenance orphan, inflating `planned`, emitting warnings, and potentially driving zero-dispatch health alerts even though the PR was not created by this worker fleet.",
+   "file": ".github/workflows/dispatch.yml",
+   "fix_hint": "Expose the minted App slug/login to the PLAN step and pass it as `bot_login` to `enumerate_provenance_orphans`; fail closed if the worker bot identity cannot be established. Add an integration-level assertion covering the actual PLAN invocation so a different `[bot]` author is excluded in production wiring, not only when the helper is called manually with `bot_login`.",
+   "severity": "major",
+   "title": "Production orphan enumeration is not pinned to the worker App bot"
+  }
+ ],
+ "progress": null,
+ "summary": "The orphan accounting is structurally validated and its tests are non-vacuous, but the production PLAN call does not supply the known App bot identity. Consequently the new alerting path classifies any same-repository, worker-ref-shaped PR authored by any GitHub App as this fleet's provenance failure. That makes the outstanding-work count and rolling health signal unsound and permits unrelated automation with repository write access to create persistent false provenance-orphan alerts. The helper and its self-test already support the required identity pin, so the production wiring must use it.",
+ "verdict": "request_changes"
+}
