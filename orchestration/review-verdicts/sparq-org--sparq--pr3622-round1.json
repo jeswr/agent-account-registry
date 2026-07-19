@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3622,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "09337b0ff149bda5aa460da71bc8c58b7285dc09",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The test documentation says the captured manifest and AGE_OPERAND_ENC must stay consistent, but `if let Some(map_hex)` makes the check optional. If AGE_OPERAND_ENC[CAPTURED_AGE] is deleted or its key is changed, this test remains green even though the captured and live-proving configurations no longer share the asserted anchor entry. That is a vacuous pass on one of the test's stated load-bearing invariants.",
+    "file": "crates/sparq-zk-compose/tests/site_age_enc_drift.rs",
+    "fix_hint": "Require the captured-age entry with `.find(...).unwrap_or_else(|| panic!(...))` (or an equivalent assertion), then compare it to OPERAND_ENC unconditionally. Add or structure the test so deleting the CAPTURED_AGE entry demonstrably fails.",
+    "severity": "major",
+    "title": "Captured-age map consistency check silently passes when the entry is missing"
+   }
+  ],
+  "progress": null,
+  "summary": "The native-encoding comparisons are useful and exercise the committed site files, but the claimed cross-file invariant is not actually enforced: removing the captured age from AGE_OPERAND_ENC makes the consistency test silently skip its assertion. The guard should fail when that entry is absent.",
+  "verdict": "request_changes"
+ }
+}
