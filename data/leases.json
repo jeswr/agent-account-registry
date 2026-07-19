@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct2css",
-   "claim_id": "891b73335cd741c8a9fde4534816762f",
-   "holder": "sparq-org/sparq#3321@29693045373.1",
-   "package": "sparq-mpc",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784475156,
-   "expires_at": 1784481456
-  },
-  {
    "account": "acct03",
    "claim_id": "34ba110b8052457ba5c5d9a8bcc13f4a",
    "holder": "fix:jeswr/agent-account-registry#437@dispatch-29692858939.1",
