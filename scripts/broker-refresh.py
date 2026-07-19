@@ -8,11 +8,14 @@
 #       - openai/codex  : ~/.codex/auth.json         -> tokens.{access_token,refresh_token,id_token}
 #       - anthropic     : ~/.claude/.credentials.json -> claudeAiOauth.{accessToken,refreshToken,expiresAt}
 #   * On a worker request the broker (a) materializes the credential into an ISOLATED $HOME (never the
-#     maintainer's live ~/.codex / ~/.claude), (b) triggers a refresh via the provider CLI — the CLI
-#     already knows the OAuth endpoints, so we reverse-engineer nothing and stay robust to provider
-#     changes — then (c) extracts ONLY {access_token, expires_at} and returns that. The refresh token
-#     stays inside the registry. The maintainer never re-authenticates: the refresh token is valid
-#     until explicitly revoked, and the CLI auto-refreshes the short-lived access token on demand.
+#     maintainer's live ~/.codex / ~/.claude), (b) runs the provider's documented, authenticated,
+#     NON-INFERENCE op — codex `login status` (refreshes the token from the refresh token) / the
+#     Anthropic OAuth `/api/oauth/profile` check — and REQUIRES it to succeed before re-reading the
+#     credential, so a stale/unproven credential can never be reported as a fresh one; then (c)
+#     extracts ONLY {access_token, expires_at} — openai expiry derived from the access token's own
+#     `exp` claim, NOT `last_refresh` — and returns that. The refresh token stays inside the registry.
+#     The maintainer never re-authenticates: the refresh token is valid until explicitly revoked, and
+#     the CLI auto-refreshes the short-lived access token on demand.
 #
 # This module ships the PURE, security-critical parts (isolation + access-token-only extraction) with
 # unit tests over the real credential layouts. The live CLI refresh (refresh_via_cli) is the mechanism
@@ -23,12 +26,15 @@
 The security invariant, asserted by --self-test: the returned capability NEVER contains the refresh
 token (or any key whose name implies a refresh/long-lived secret)."""
 import argparse
+import base64
 import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 
 PROVIDERS = ("openai", "anthropic")
 
@@ -43,16 +49,40 @@ def cred_relpath(provider):
     raise ValueError(f"unknown provider {provider!r}")
 
 
+def _jwt_exp(access_token):
+    """The Unix-seconds `exp` claim decoded from a JWT access token, or None if it cannot be read.
+    OpenAI/codex access tokens are JWTs whose `exp` IS the true token expiry (unlike `last_refresh`,
+    which is merely when the CLI last rewrote the file). Pure/offline: decodes, never verifies a
+    signature — the signature is the provider's concern, we only read the expiry we are attesting."""
+    if not isinstance(access_token, str):
+        return None
+    parts = access_token.split(".")
+    if len(parts) != 3:
+        return None  # not a JWT
+    payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)  # restore base64url padding
+    try:
+        exp = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii"))).get("exp")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return int(exp) if isinstance(exp, (int, float)) else None
+
+
 def extract_access_token(provider, cred):
     """Return the SHORT-LIVED capability {access_token, expires_at} from a (refreshed) credential.
-    NEVER returns the refresh token. `cred` is the parsed credential JSON."""
+    NEVER returns the refresh token. `cred` is the parsed credential JSON. Fail closed: a credential
+    with no access token is not a usable capability, so reject it rather than emit access_token=None."""
     if provider == "openai":
-        tok = cred.get("tokens", {})
-        return {"access_token": tok.get("access_token"),
-                "expires_at": cred.get("last_refresh")}  # codex stamps last_refresh; access_token is short-lived
+        access_token = cred.get("tokens", {}).get("access_token")
+        if not access_token:
+            raise ValueError("openai credential has no tokens.access_token")
+        # Real expiry comes from the access token's own `exp` claim, NOT `last_refresh`.
+        return {"access_token": access_token, "expires_at": _jwt_exp(access_token)}
     if provider == "anthropic":
         o = cred.get("claudeAiOauth", {})
-        return {"access_token": o.get("accessToken"), "expires_at": o.get("expiresAt")}
+        access_token = o.get("accessToken")
+        if not access_token:
+            raise ValueError("anthropic credential has no claudeAiOauth.accessToken")
+        return {"access_token": access_token, "expires_at": o.get("expiresAt")}
     raise ValueError(f"unknown provider {provider!r}")
 
 
@@ -87,25 +117,68 @@ def _write_isolated(provider, cred, home):
     return path
 
 
-def refresh_via_cli(provider, home):
-    """Trigger the provider CLI (with HOME=`home`) to refresh the access token from the refresh token,
-    then re-read the updated credential. The CLI owns the OAuth endpoints. Registry-Actions only."""
+ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+
+
+def _prove_openai(home):
+    """Run codex's documented, authenticated, NON-INFERENCE status op so the CLI validates/refreshes
+    the access token from its refresh token, then re-read the (possibly rewritten) credential.
+    Returns (ok, cred): ok is a clean exit 0 (`codex whoami` was never a subcommand and could stall on
+    an interactive prompt; `codex login status` is the real status command)."""
     env = dict(os.environ, HOME=home)
-    # A minimal no-op that forces the CLI to validate/refresh its token. Kept provider-specific + quiet.
-    cmd = {"openai": ["codex", "whoami"], "anthropic": ["claude", "--version"]}[provider]
-    subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
-    with open(os.path.join(home, cred_relpath(provider))) as f:
-        return json.load(f)
+    proc = subprocess.run(["codex", "login", "status"], env=env,
+                          capture_output=True, text=True, timeout=60)
+    with open(os.path.join(home, cred_relpath("openai"))) as f:
+        return proc.returncode == 0, json.load(f)
+
+
+def _prove_anthropic(home):
+    """Prove the anthropic access token is live via the documented, non-inference OAuth profile endpoint
+    (the same op account-whoami trusts; a subscription OAuth token reads it, `claude --version` proves
+    nothing). Returns (ok, cred): ok is HTTP 200. The credential already carries a real `expiresAt`, so
+    it is returned unchanged. The token travels only in the Authorization header — never logged."""
+    with open(os.path.join(home, cred_relpath("anthropic"))) as f:
+        cred = json.load(f)
+    token = cred.get("claudeAiOauth", {}).get("accessToken")
+    if not token:
+        return False, cred
+    req = urllib.request.Request(ANTHROPIC_PROFILE_URL, method="GET", headers={
+        "Authorization": f"Bearer {token}", "anthropic-version": "2023-06-01"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 (hard-coded https host)
+            return resp.status == 200, cred
+    except urllib.error.URLError:
+        return False, cred
+
+
+def refresh_via_cli(provider, home):
+    """Trigger the provider's documented refresh/validation op (with HOME=`home`), then re-read the
+    credential. Returns (ok, cred). The provider owns the OAuth endpoints. Registry-Actions only."""
+    prove = {"openai": _prove_openai, "anthropic": _prove_anthropic}[provider]
+    return prove(home)
+
+
+def refresh_ok(provider, ok, refreshed):
+    """Fail-closed gate over a refresh attempt: the op must have succeeded (ok) AND the re-read
+    credential must yield a usable capability — an access token (extract raises otherwise) and, for
+    openai, a real derived expiry. Returns the validated capability; raises on any failure so a stale
+    or unproven credential is NEVER re-read and reported as success."""
+    if not ok:
+        raise RuntimeError(f"{provider} refresh op did not succeed; credential not proven refreshed")
+    cap = extract_access_token(provider, refreshed)
+    if provider == "openai" and cap["expires_at"] is None:
+        raise ValueError("openai access token carries no readable `exp` claim; expiry unattestable")
+    return cap
 
 
 def broker(provider, cred):
-    """Full path (registry Actions): isolate -> refresh -> extract access-token-only capability."""
+    """Full path (registry Actions): isolate -> prove refresh -> extract access-token-only capability."""
     home = tempfile.mkdtemp(prefix="broker-")
     try:
         os.chmod(home, 0o700)
         _write_isolated(provider, cred, home)
-        refreshed = refresh_via_cli(provider, home)
-        cap = extract_access_token(provider, refreshed)
+        ok, refreshed = refresh_via_cli(provider, home)
+        cap = refresh_ok(provider, ok, refreshed)
         assert_no_refresh_leak(cap)
         return cap
     finally:
@@ -121,30 +194,57 @@ def _self_test():
         ok = ok and cond
         print(f"  {'ok  ' if cond else 'FAIL'} {n}")
 
-    # real key layouts (values are fake)
+    def raises(exc, fn):  # True iff fn() raises `exc` — makes the fail-closed guards non-vacuous
+        try:
+            fn()
+        except exc:
+            return True
+        return False
+
+    def mk_jwt(exp):  # a real-shape JWT (fake signature) whose payload carries `exp`
+        seg = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+        return f"{seg({'alg': 'RS256', 'typ': 'JWT'})}.{seg({'exp': exp, 'sub': 'u'})}.sig"
+
+    # real key layouts (values are fake). The codex access token is a JWT — its `exp` is the true
+    # expiry; `last_refresh` is deliberately a DIFFERENT value to prove we never report last_refresh.
+    access_jwt = mk_jwt(1799999999)
     codex = {"auth_mode": "oauth",
-             "tokens": {"id_token": "ID", "access_token": "ACCESS_short", "refresh_token": "REFRESH_long",
+             "tokens": {"id_token": "ID", "access_token": access_jwt, "refresh_token": "REFRESH_long",
                         "account_id": "acct"}, "last_refresh": "2026-07-15T00:00:00Z"}
     claude = {"claudeAiOauth": {"accessToken": "ACCESS_short", "refreshToken": "REFRESH_long",
                                 "expiresAt": 1799999999, "scopes": ["x"], "subscriptionType": "max"}}
     co = extract_access_token("openai", codex)
     cl = extract_access_token("anthropic", claude)
-    chk("openai extracts access token", co["access_token"] == "ACCESS_short")
-    chk("openai carries expiry", co["expires_at"] == "2026-07-15T00:00:00Z")
+    chk("openai extracts access token", co["access_token"] == access_jwt)
+    chk("openai expiry is the JWT exp claim", co["expires_at"] == 1799999999)
+    chk("openai expiry is NOT last_refresh (non-vacuous)", co["expires_at"] != codex["last_refresh"])
     chk("anthropic extracts access token", cl["access_token"] == "ACCESS_short")
     chk("anthropic carries expiry", cl["expires_at"] == 1799999999)
+    # exp decoding: reads a real JWT, None for non-JWT / missing exp (non-vacuous both ways)
+    chk("jwt exp decodes", _jwt_exp(access_jwt) == 1799999999)
+    chk("jwt exp None for non-jwt", _jwt_exp("ACCESS_short") is None)
+    chk("jwt exp None when exp absent", _jwt_exp(mk_jwt(None)) is None)
+    # reject missing access tokens (fail closed) — both providers
+    chk("openai rejects missing access token",
+        raises(ValueError, lambda: extract_access_token("openai", {"tokens": {}})))
+    chk("anthropic rejects missing access token",
+        raises(ValueError, lambda: extract_access_token("anthropic", {"claudeAiOauth": {}})))
+    # refresh gate: a failed op or an openai token with no derivable expiry is NEVER reported success
+    chk("refresh_ok passes a proven openai refresh", refresh_ok("openai", True, codex) == co)
+    chk("refresh_ok passes a proven anthropic refresh", refresh_ok("anthropic", True, claude) == cl)
+    chk("refresh_ok rejects a failed op (non-vacuous)",
+        raises(RuntimeError, lambda: refresh_ok("openai", False, codex)))
+    chk("refresh_ok rejects openai token with no exp (non-vacuous)",
+        raises(ValueError, lambda: refresh_ok(
+            "openai", True, {"tokens": {"access_token": "opaque-not-a-jwt"}})))
     # the security invariant: NO refresh token in either capability
     chk("openai capability has NO refresh key", assert_no_refresh_leak(co))
     chk("anthropic capability has NO refresh key", assert_no_refresh_leak(cl))
     chk("no refresh value present in openai cap", "REFRESH_long" not in json.dumps(co))
     chk("no refresh value present in anthropic cap", "REFRESH_long" not in json.dumps(cl))
     # leak detector actually fires (non-vacuous)
-    leaked = False
-    try:
-        assert_no_refresh_leak({"access_token": "a", "refresh_token": "R"})
-    except AssertionError:
-        leaked = True
-    chk("leak detector fires on a refresh_token key (non-vacuous)", leaked)
+    chk("leak detector fires on a refresh_token key (non-vacuous)",
+        raises(AssertionError, lambda: assert_no_refresh_leak({"access_token": "a", "refresh_token": "R"})))
     chk("cred_relpath openai", cred_relpath("openai") == ".codex/auth.json")
     chk("cred_relpath anthropic", cred_relpath("anthropic") == ".claude/.credentials.json")
     print("broker-refresh self-test", "PASSED" if ok else "FAILED")
