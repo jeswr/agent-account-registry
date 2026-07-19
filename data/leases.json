@@ -22,16 +22,6 @@
   },
   {
    "account": "acct3css",
-   "claim_id": "1d6b79bfbe494c83ab407d5fea377758",
-   "holder": "sparq-org/sparq#2752@dispatch-29670110786.1",
-   "package": "bench-wasm-compare",
-   "role": "impl",
-   "model": "fable",
-   "issued_at": 1784428104,
-   "expires_at": 1784434404
-  },
-  {
-   "account": "acct3css",
    "claim_id": "c841f49d9f75458e9cccac387f7e36de",
    "holder": "sparq-org/sparq#3230@dispatch-29670211883.1",
    "package": "sparq-reason",
