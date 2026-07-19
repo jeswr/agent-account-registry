@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "run_alert() returns 0 when `gh issue list` exits successfully but produces malformed JSON. In that state the code cannot deduplicate an existing alert or prove recovery, yet the alert job becomes green. This is the same silent-alerting failure class the round-1 change was meant to close. The self-test makes the problem durable by explicitly asserting `rc_f == 0`, so neither the script test nor the new workflow masking assertion will fail when this fail-open behavior occurs.",
+   "file": "scripts/retriage.py",
+   "fix_hint": "Return nonzero on malformed or structurally invalid list output, and change the self-test to require that nonzero result while retaining assertions that no mutation occurs and the remote payload is not echoed. The workflow can then surface the alerting outage as a failed job without leaking untrusted output.",
+   "severity": "major",
+   "title": "Malformed alert lookup data is still masked as success"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The two round-1 findings were addressed: the hard-coded model marker is gone, and the workflow no longer masks a nonzero alert exit. However, the alert implementation still has a fail-open path: malformed output from the alert lookup is explicitly converted into exit 0. That makes an alerting/data-integrity failure appear green and defeats the new workflow-level fail-loud protection. Because this is a newly recorded major finding, progress is regressing under the required rubric.",
+ "verdict": "request_changes"
+}
