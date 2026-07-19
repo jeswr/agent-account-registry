@@ -13,12 +13,12 @@
   {
    "account": "acct03",
    "claim_id": "945352ac3cc34321a5d3d9fea96d302a",
-   "holder": "sparq-org/sparq#2962@dispatch-29680721304.1",
+   "holder": "sparq-org/sparq#2962@29680875303.1",
    "package": "sparq-zk",
    "role": "impl",
    "model": "opus",
-   "issued_at": 1784451746,
-   "expires_at": 1784458046
+   "issued_at": 1784451772,
+   "expires_at": 1784458072
   },
   {
    "account": "acct01",
