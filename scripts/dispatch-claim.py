@@ -1987,7 +1987,18 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         elif mode == "fix" and claim_provider and claim_provider != impl_provider:
             violation = "fixer provider would differ from implementer provider"
         if violation:
-            _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+            # Issue #118: never report the lease "released" without confirming it. A CAS
+            # conflict (or a garbage claim_id that was itself the violation) can leave the
+            # lease ACTIVE — consuming its account/package until expiry — so a failed release
+            # is a COUNTED lane error + hard `::error::`, not a green unsafe-claim defer that
+            # falsely logs recovery.
+            released = _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+            if not released:
+                lanes[lane]["error"] += 1
+                defer_reasons["unsafe-claim-release-failed"] += 1
+                print(f"::error::review {repo}#{number}: {violation}; lease release FAILED "
+                      "(claim still active until expiry)")
+                continue
             print(f"defer review {repo}#{number}: {violation}; released + skipped")
             continue
         result = _run_gh([
@@ -2522,7 +2533,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     or model not in resolved["model_chain"]
                     or not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f]{32}", claim_id)
                     or secret_ref != f"{account.upper()}_TOKEN"):
-                _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+                # Issue #118: confirm the release before logging it. A failed release leaves
+                # the lease active until expiry, so it is a COUNTED worker-lane error + hard
+                # `::error::` rather than a green "released + skipped" that falsely claims
+                # recovery and hides the leaked account/package.
+                released = _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+                if not released:
+                    lanes["worker"]["error"] += 1
+                    defer_reasons["unsafe-claim-release-failed"] += 1
+                    print(f"::error::worker {repo}#{number}: allocator returned an unsafe/"
+                          "out-of-policy claim; lease release FAILED (claim still active "
+                          "until expiry)")
+                    continue
                 defer_reasons["unsafe-claim"] += 1
                 print(f"defer {repo}#{number}: allocator returned an unsafe/out-of-policy claim; released + skipped")
                 continue
@@ -4098,6 +4120,45 @@ def _self_test():
                     "planned": 1, "launched": 1, "deferred": 0, "error": 0}, run_items.lanes
             finally:
                 globals()["_run_gh"] = real_run_gh
+
+            # ---- issue #118: an unsafe/out-of-policy claim whose lease release FAILS (a CAS
+            # conflict, or the garbage claim_id that was itself the violation) is a COUNTED
+            # fix-lane error, NEVER a green "released + skipped" defer. The buggy path ignored
+            # `_release_failed_dispatch`'s boolean and logged recovery while the lease stayed
+            # active until expiry, consuming its account + package. This test is non-vacuous:
+            # under the old code BOTH branches printed "released" and left the error tally at 0,
+            # so the release_ok=False assertions below would flip red. ----
+            class UnsafeClaimAllocator:
+                def __init__(self, release_ok):
+                    self.release_ok = release_ok
+                    self.released = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    # account fails the acct-regex assertion -> unsafe/out-of-policy violation,
+                    # reached BEFORE any provider/salt leg, so it is mode- and env-independent.
+                    return {"account": "BADACCT", "claim_id": "cd" * 16,
+                            "model": chain[0], "provider": "anthropic"}
+
+                def release(self, _repo, claim_id, _now):
+                    self.released.append(claim_id)
+                    return self.release_ok
+
+            # release FAILS: hard `::error::` reason + counted lane error, NO launch, and NOT
+            # the plain unsafe-claim green defer.
+            alloc = UnsafeClaimAllocator(release_ok=False)
+            launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert launched == 0, launched
+            assert alloc.released == ["cd" * 16], alloc.released  # release WAS attempted
+            assert reasons["unsafe-claim-release-failed"] == 1, reasons
+            assert _lane_summary(run_items.lanes)["fix"]["error"] == 1, run_items.lanes
+            # release SUCCEEDS: the SAME unsafe claim is a clean released+skipped defer with NO
+            # lane error and NO hard-error reason — proving the boolean is actually consulted.
+            alloc = UnsafeClaimAllocator(release_ok=True)
+            launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert launched == 0, launched
+            assert alloc.released == ["cd" * 16], alloc.released
+            assert reasons["unsafe-claim-release-failed"] == 0, reasons
+            assert _lane_summary(run_items.lanes)["fix"]["error"] == 0, run_items.lanes
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io
