@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "verdict_envelope records repo, pr, round, and reviewed_sha as the host-authored binding, but stage_verdict_for_fix reads only envelope_reviewed_sha(record). It never compares host_envelope.repo/pr/round with the fix dispatch context. Thus an envelope from another PR or round (including a substituted/misplaced ledger record) is accepted if its reviewed_sha matches expected_sha, and its nested verdict is supplied to the fixer. A SHA alone is not a unique review-context binding: multiple PRs/rounds can point at the same commit, and the unused identity fields provide no protection. The self-test is also missing a negative assertion for a matching SHA with mismatched repo/PR/round.",
+   "file": "scripts/worker-pr.py",
+   "fix_hint": "Pass expected target repo, PR number, and review round to stage-verdict, validate all four host_envelope fields with exact type/value checks, and return staged=false for any malformed or mismatched field. Add self-tests proving that matching-SHA envelopes with the wrong repo, PR, or round are each refused and do not create the output file. Consider centralizing strict envelope validation so other readers do not unwrap malformed envelopes permissively.",
+   "severity": "major",
+   "title": "Fixer staging validates only the SHA, not the envelope's PR identity and round"
+  }
+ ],
+ "progress": null,
+ "summary": "The SHA freshness gates are directionally sound and the new tests exercise moved-head deferral, but the fixer does not authenticate the full host envelope it relies on. Although the envelope records repo, PR, and round, stage-verdict checks only reviewed_sha. Consequently a misplaced, substituted, or tampered record for another review context can be accepted whenever it names the same commit, seeding the fixer with findings that were not issued for this PR/round. This violates the required exact-match target binding and must fail closed.",
+ "verdict": "request_changes"
+}
