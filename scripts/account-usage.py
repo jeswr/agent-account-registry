@@ -56,6 +56,25 @@ def _parse_rate_headers(header_text):
     return hdr
 
 
+def _probe_curl_command(token, model, claude_code=False):
+    """Build the (argv, stdin) pair for one probe. The bearer token is fed through curl's STDIN
+    header stream (`-H @-`), NEVER placed in argv (issue #195) — so the credential cannot leak via
+    process inspection (`ps`/`/proc/<pid>/cmdline`) or diagnostic command capture. Only non-secret
+    headers appear on the command line. Pure — unit-tested by --self-test."""
+    body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+    args = ["curl", "-s", "-D", "-", "-o", "/dev/null", "--max-time", "20", "-X", "POST",
+            "https://api.anthropic.com/v1/messages",
+            "-H", "@-",  # read the (secret-bearing) Authorization header from stdin, not argv
+            "-H", "anthropic-version: 2023-06-01",
+            "-H", "content-type: application/json",
+            "-H", "anthropic-beta: oauth-2025-04-20"]
+    if claude_code:
+        body["system"] = [{"type": "text", "text": _CLAUDE_CODE_SYSTEM}]
+        args += ["-H", "user-agent: " + _CLAUDE_CODE_UA]
+    args += ["-d", json.dumps(body)]
+    return args, "Authorization: Bearer " + token + "\n"
+
+
 def _probe_headers(token, model, claude_code=False):
     """POST a max_tokens:1 message and return the parsed anthropic-ratelimit-unified-* header map
     (lowercased keys, 'anthropic-ratelimit-unified-' prefix stripped), or None on any transport error.
@@ -66,19 +85,10 @@ def _probe_headers(token, model, claude_code=False):
     token = (token or "").strip()
     if not token:
         return None
-    body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
-    args = ["curl", "-s", "-D", "-", "-o", "/dev/null", "--max-time", "20", "-X", "POST",
-            "https://api.anthropic.com/v1/messages",
-            "-H", "Authorization: Bearer " + token,
-            "-H", "anthropic-version: 2023-06-01",
-            "-H", "content-type: application/json",
-            "-H", "anthropic-beta: oauth-2025-04-20"]
-    if claude_code:
-        body["system"] = [{"type": "text", "text": _CLAUDE_CODE_SYSTEM}]
-        args += ["-H", "user-agent: " + _CLAUDE_CODE_UA]
-    args += ["-d", json.dumps(body)]
+    args, stdin = _probe_curl_command(token, model, claude_code)
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=30, check=False)
+        proc = subprocess.run(args, input=stdin, capture_output=True, text=True,
+                              timeout=30, check=False)
     except (subprocess.SubprocessError, OSError):
         return None
     return _parse_rate_headers(proc.stdout)
@@ -444,6 +454,21 @@ def _self_test():
     chk("header parse status", hdr.get("status"), "allowed")
     chk("header parse limit trimmed", hdr.get("5h-limit"), "1000000")
     chk("header parse ignores others", "x-other" in hdr, False)
+    # credential never lands in argv (issue #195): the bearer token is fed through curl's stdin
+    # (-H @-), so process inspection / diagnostic command capture see only non-secret headers.
+    args, stdin = _probe_curl_command("sk-secret-tok", "claude-haiku-4-5")
+    chk("probe: token absent from argv", any("sk-secret-tok" in a for a in args), False)
+    chk("probe: token carried on stdin only", stdin, "Authorization: Bearer sk-secret-tok\n")
+    chk("probe: argv reads the auth header from stdin", "@-" in args, True)
+    chk("probe: no literal Authorization header in argv",
+        any(a.lower().startswith("authorization:") for a in args), False)
+    chk("probe: body still carries the model", any('"claude-haiku-4-5"' in a for a in args), True)
+    #   the fable variant adds the Claude-Code UA but STILL keeps the token off argv
+    fargs, fstdin = _probe_curl_command("sk-secret-tok", "claude-fable-5", claude_code=True)
+    chk("fable probe: token still absent from argv",
+        any("sk-secret-tok" in a for a in fargs), False)
+    chk("fable probe: token on stdin", fstdin, "Authorization: Bearer sk-secret-tok\n")
+    chk("fable probe: Claude-Code UA present in argv", any(_CLAUDE_CODE_UA in a for a in fargs), True)
     # usage assembly includes limits ONLY when the provider exposes them
     entry = _assemble_usage(hdr)
     chk("assemble includes exposed limit", entry.get("5h_limit"), "1000000")
