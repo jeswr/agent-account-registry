@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 401,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1345fb8caecfcb489d864c8c563586dfa57d9f7e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes literal success the only green completed gate conclusion, routes every documented GitHub non-success conclusion through the existing ci-fix failure path, and fails closed to unknown for malformed or unrecognized values (including unhashable hostile input). The added self-tests are non-vacuous and cover all newly classified conclusions plus malformed/unrecognized cases that previously became success or could crash. No trust check, audit binding, permission boundary, or untrusted-text execution surface is weakened.",
+  "verdict": "approve"
+ }
+}
