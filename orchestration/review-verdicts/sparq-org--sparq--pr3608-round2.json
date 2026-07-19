@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3608,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "db0864a7ebbd1dcd9d819a3333b87660eaeb91a9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves all three prior major findings. The new proposal consistently characterizes the mechanism as issuer self-attestation that scopes and attributes, but does not discharge, the honest-issuer assumption; it expressly denies verifier-checkable same-byte derivation and adversarial-issuer soundness. Historical credentials are excluded by an epoch/marker rule and require re-signing for the signature-covered lane. Value/term identity and leaf collapse are now limited fail-closed to an explicitly enumerated, audited per-datatype injectivity allow-list, with many-to-one datatypes retaining their identity handle. The companion field-native design is updated consistently. This documentation-only, explicitly unaudited proposal makes no uncaveated ZK soundness/privacy claim and introduces no executable security path or vacuous test concern.",
+  "verdict": "approve"
+ }
+}
