@@ -165,7 +165,9 @@ function renderAccounts(accounts) {
 // exist — live per-window utilization probes where the provider exposes them (anthropic), and
 // only the availability counts + reactive backoff where it does not (probe-exempt openai).
 // Accounts the fail-closed probe OMITTED surface as `accounts_unknown` ("unreported") and are
-// never rendered free — dispatch treats that omission as unavailable (sol finding 2, PR #281).
+// never rendered free — dispatch treats that omission as unavailable (sol finding 2, PR #281);
+// so do PARTIAL probe entries (status-only / one window without the other), which dispatch and
+// usage-alert equally reject (sol finding 1, PR #281 fix round 3).
 // The honest aggregate unit is "account-windows free" (Σ remaining window fraction over the
 // accounts that reported), with a PARTIAL limit-weighted sum only where limit headers are known;
 // each card states its signal source, and the section header carries the snapshot freshness.

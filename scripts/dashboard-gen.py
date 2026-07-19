@@ -287,10 +287,16 @@ def _quota_state(account, entry, now):
     fail-closed OMITS an account whose token is missing or whose probe failed — is "unknown":
     dispatch (select-and-claim.usage_eligible) and usage-alert treat that omission as
     UNAVAILABLE, so counting it free here would advertise quota the allocator will never use
-    (sol finding 2, PR #281 fix round); and (b) a probe-exempt account under an ACTIVE reactive
+    (sol finding 2, PR #281 fix round); (b) a probe-exempt account under an ACTIVE reactive
     backoff (its only quota signal — issue #29) counts as capped until the backoff expires,
-    with the stamp parsed by the allocator's shared `_backoff_epoch` semantics. Returns
-    (state, backoff_epoch_or_None). Pure — unit-tested by --self-test."""
+    with the stamp parsed by the allocator's shared `_backoff_epoch` semantics; and (c) a
+    non-exempt account counts "available" only with BOTH mandatory windows (5h AND 7d) validly
+    reported — account-usage.py can emit a PARTIAL entry (status-only, or one window without
+    the other), and dispatch (usage_eligible: `util is None` → ineligible) plus usage-alert
+    (classify: `u5 is None or u7 is None` → UNAVAILABLE) both fail closed on that shape, so
+    rendering it free would again advertise quota the allocator will never use (sol finding 1,
+    PR #281 fix round 3); partial ⇒ "unknown". Returns (state, backoff_epoch_or_None).
+    Pure — unit-tested by --self-test."""
     availability = _availability(account, entry)
     if availability != "available":
         return availability, None
@@ -300,6 +306,9 @@ def _quota_state(account, entry, now):
         until = _backoff_epoch(entry.get("backoff_until"))
         if until is not None and until > now:
             return "capped", until
+        return "available", None
+    if any(_percent(entry.get(f"{prefix}_util")) is None for prefix in ("5h", "7d")):
+        return "unknown", None
     return "available", None
 
 
@@ -365,11 +374,22 @@ def _provider_quota(accounts, usage, now):
                     limit = account["limits"].get(f"{prefix}_limit")
                 try:
                     limit_number = float(limit)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError (sol finding 2, PR #281 fix round 3): a huge-int limit
+                    # (10**400) is valid JSON but float() of it RAISES rather than returning
+                    # inf — same trap select-and-claim._usage_num already guards.
                     limit_number = None
                 if limit_number is not None and math.isfinite(limit_number) and limit_number >= 0:
-                    window["limits_known"] += 1
-                    window["limit_remaining"] += limit_number * remaining
+                    # Individually-finite limits can still overflow the WEIGHTED SUM (two
+                    # "1e308" limits are each finite but their sum is inf), and round(inf) at
+                    # render would crash the whole dashboard build on one malformed account
+                    # record (sol finding 2, PR #281 fix round 3). Validate the product AND
+                    # the running sum; on overflow, reject THIS account's limit contribution
+                    # (its limit stays unknown — not in limits_known) and keep the build alive.
+                    product = limit_number * remaining
+                    if math.isfinite(product) and math.isfinite(window["limit_remaining"] + product):
+                        window["limits_known"] += 1
+                        window["limit_remaining"] += product
                 # _utc_iso emits a fixed-width "...Z" format, so lexicographic min/max below is
                 # chronological.
                 reset_iso = _utc_iso(entry.get(f"{prefix}_reset"))
@@ -1237,6 +1257,53 @@ def _self_test():
               quota_accounts[3:], {"solo-openai": {"exempt": True, "backoff_until": now - 1}},
               now)],
           [(1, 0)])
+    # PARTIAL probe entries are never free (sol finding 1, PR #281 fix round 3):
+    # account-usage.py can emit an entry whose mandatory utilization windows are missing
+    # (status-only, or 5h without 7d) — dispatch (usage_eligible) and usage-alert (classify)
+    # both fail closed on that shape, so the dashboard must file it under accounts_unknown
+    # ("unreported — treated unavailable by dispatch"), not "1 free". Each shape is also
+    # parity-checked against the allocator's own admission predicate.
+    partial_account = {"handle": "partial", "provider": "anthropic",
+                       "catalog_available": True, "limits": {}}
+    for shape_name, partial_entry in (
+            ("status-only", {"status": "allowed"}),
+            ("5h-only", {"status": "allowed", "5h_util": "0.2", "5h_reset": now + 600})):
+        state, _until = _quota_state(partial_account, partial_entry, now)
+        check(f"partial probe entry ({shape_name}) is unknown, never free",
+              (state, allocator.usage_eligible(dict(partial_entry), now=now)),
+              ("unknown", False))
+        check(f"partial probe entry ({shape_name}) aggregates as unreported, not available",
+              [(row["accounts_available"], row["accounts_unknown"]) for row in _provider_quota(
+                  [partial_account], {"partial": dict(partial_entry)}, now)],
+              [(0, 1)])
+    check("both-windows entry still counts available (not over-rejected)",
+          _quota_state(partial_account,
+                       {"status": "allowed", "5h_util": "0.2", "7d_util": "0.3"}, now),
+          ("available", None))
+    # Malformed/extreme limit headers must never crash the build (sol finding 2, PR #281 fix
+    # round 3): float() of a huge JSON int RAISES OverflowError, and two individually-FINITE
+    # "1e308" limits overflow the weighted SUM to inf — round(inf) at render then raised and
+    # one malformed account record killed the whole dashboard. The offending contribution is
+    # rejected (limit stays unknown — outside limits_known) and the build stays alive.
+    def _limit_window(limits_map):
+        rows_ = _provider_quota(
+            [{"handle": f"lim-{i}", "provider": "anthropic", "catalog_available": True,
+              "limits": {}} for i in range(len(limits_map))],
+            {f"lim-{i}": {"status": "allowed", "5h_util": "0.0", "5h_limit": limit_value,
+                          "7d_util": "0.0"}
+             for i, limit_value in enumerate(limits_map)}, now)
+        window = rows_[0]["windows"][0]
+        return (window["limits_known"], window["limit_remaining"],
+                window["limit_remaining"] is None
+                or isinstance(window["limit_remaining"], int))
+    check("single 1e308 limit: finite, counted, round() survives",
+          _limit_window(["1e308"]), (1, round(1e308), True))
+    check("two 1e308 limits: finite each, infinite sum -> second rejected, build alive",
+          _limit_window(["1e308", "1e308"]), (1, round(1e308), True))
+    check("huge-int limit (10**400): float() OverflowError caught, limit unknown",
+          _limit_window([10 ** 400]), (0, None, True))
+    check("'inf'/'nan'/negative limit strings rejected, never summed",
+          _limit_window(["inf", "nan", "-5"]), (0, None, True))
     check("cumulative quota rows carry no raw account identifier (decision 22)",
           all(h not in json.dumps(quota_rows) for h in quota_handles), True)
     check("ordered fixture publishes one cumulative row per provider, single-account marked",
