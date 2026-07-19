@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3601,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "84ef94256d56cdc3c250322acad083905cd12e41",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 remains clean. The capped eligibility predicate and deriveGraph still share the same injective term identity, scan order, node limit, adjacency behavior, self-loop exclusion, and admitted-resource requirement. The cap-boundary regressions exercise both the excluded-endpoint decline and admitted-endpoint success paths, so the toggle cannot offer a graph that derivation cannot draw. The graph implementation remains invocation-path lazy, term data is rendered through React escaping, and no correctness, soundness, security, or test-validity defect is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
