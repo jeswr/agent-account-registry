@@ -738,6 +738,11 @@ _git_commit_and_push() {
   fi
   git config user.name "$bot_login"
   git config user.email "$bot_id+$bot_login@users.noreply.github.com"
+  # Defence-in-depth (issue #125): NEVER run repository hooks while a target-scoped App token is in
+  # the environment. The publisher runs on a clean checkout, but a hostile target could still ship a
+  # tracked `.git`-adjacent hook via core.hooksPath; pin it to a non-existent path so commit/push run
+  # no target-authored code with GH_TOKEN inherited.
+  git config core.hooksPath /dev/null
   git add -A -- .
   git diff --cached --check
   [[ -n "$(git diff --cached --name-only)" ]] || die 'no staged changes to publish'
@@ -883,6 +888,93 @@ PY
   write_output pr_number "$pr_number"
   write_output head_sha "$head_sha"
   printf 'worker-live: opened DRAFT target pull request %s (cross-provider review pending)\n' "$pr_url"
+}
+
+# ---- issue #125: split the token-bearing publisher off the hostile-gate runner -------------------
+# The worker job executes model- and gate-authored target code HOST-side (the cargo gate), so it can
+# mutate registry/scripts, plant .git hooks, poison $GITHUB_ENV/$GITHUB_PATH, or leave a background
+# process. Publishing (commit/push/PR) with a contents/issues/PR-capable App token used to run in
+# that SAME job, right after the gate — so gated code could capture the token or publish arbitrary
+# post-gate changes. The fix moves publish to a FRESH runner that runs no target code and transfers
+# only a digest-bound, NON-executable patch reconstructed onto a CLEAN target checkout with hooks
+# disabled. `bundle` (below) is produced on the worker runner BEFORE the gate runs, so its digest —
+# carried out-of-band as a host-derived job output — pins the model's pre-hostile output; anything
+# the gate later does to the tree, the artifact, or the scripts cannot change what gets published.
+worker_bundle() {
+  require_target
+  local worker_root=${WORKER_ROOT:-}
+  local branch=${WORKER_BRANCH:-}
+  local issue_file=${WORKER_ISSUE_FILE:-}
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe worker branch'
+  local base_sha
+  base_sha=$(git rev-parse HEAD)
+  [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe base sha'
+  [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'refusing to bundle .beads changes'
+
+  local bundle_dir="$worker_root/bundle"
+  rm -rf -- "$bundle_dir"
+  mkdir -p "$bundle_dir"
+  # Stage everything (add runs NO hooks) so new/modified/deleted files land in ONE binary-safe patch,
+  # then reset the index so the worker tree stays pristine for the gate that runs after this step.
+  git add -A -- .
+  git diff --cached --check
+  [[ -n "$(git diff --cached --name-only)" ]] || die 'no changes to bundle'
+  git diff --cached --binary --full-index > "$bundle_dir/changes.patch"
+  git reset -q -- . >/dev/null 2>&1 || git reset -q >/dev/null 2>&1
+  chmod 0600 "$bundle_dir/changes.patch"
+  # The verified (pre-model, host-trusted) issue snapshot drives the PR title/body on the clean
+  # runner; carry it alongside the patch so publish never re-reads a post-hostile RUNNER_TEMP.
+  if [[ -n "$issue_file" && -f "$issue_file" && ! -L "$issue_file" ]]; then
+    cp -- "$issue_file" "$bundle_dir/verified-issue.json"
+    chmod 0600 "$bundle_dir/verified-issue.json"
+  fi
+  # Model-declared follow-ups were already lifted OUT of the tree by run_model; ferry them to the
+  # clean runner that files them (they are never committed).
+  if [[ -f "$worker_root/followups.jsonl" ]]; then
+    cp -- "$worker_root/followups.jsonl" "$bundle_dir/followups.jsonl"
+    chmod 0600 "$bundle_dir/followups.jsonl"
+  fi
+
+  local digest
+  digest=$(sha256sum "$bundle_dir/changes.patch" | awk '{print $1}')
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die 'could not compute bundle digest'
+  write_output bundle_sha256 "$digest"
+  write_output base_sha "$base_sha"
+  write_output branch "$branch"
+  printf 'worker-live: wrote digest-bound bundle for %s (sha256=%s)\n' "$branch" "$digest"
+}
+
+# Reconstruct the digest-bound bundle on the CLEAN publish runner. The checkout MUST already be the
+# exact digest-bound base commit (the workflow checks it out at that sha); we verify the patch
+# against the host-derived digest job output, disable hooks, and apply the patch as DATA. A digest
+# mismatch, a moved base, a dirty tree, or a .beads-touching patch all FAIL CLOSED — the token-
+# bearing publish step never runs on unverified content.
+reconstruct_bundle() {
+  require_target
+  local bundle_dir=${WORKER_BUNDLE_DIR:-}
+  local expected=${WORKER_BUNDLE_SHA256:-}
+  local expected_base=${WORKER_BUNDLE_BASE_SHA:-}
+  local branch=${WORKER_BRANCH:-}
+  [[ -n "$bundle_dir" && -d "$bundle_dir" ]] || die 'bundle dir is missing'
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die 'expected bundle digest is unsafe or missing'
+  [[ "$expected_base" =~ ^[0-9a-f]{40}$ ]] || die 'expected base sha is unsafe or missing'
+  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe worker branch'
+  local patch="$bundle_dir/changes.patch"
+  [[ -f "$patch" && ! -L "$patch" ]] || die 'bundle patch is missing or unsafe'
+  local actual
+  actual=$(sha256sum "$patch" | awk '{print $1}')
+  [[ "$actual" == "$expected" ]] || die 'bundle digest mismatch — refusing to reconstruct'
+
+  # Never run target-authored hooks on the publish runner, even before the token-bearing commit.
+  git config core.hooksPath /dev/null
+  [[ "$(git rev-parse HEAD)" == "$expected_base" ]] || die 'clean checkout HEAD is not the digest-bound base'
+  [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || die 'reconstruct requires a clean target checkout'
+  git switch -c "$branch"
+  git apply --whitespace=nowarn -- "$patch"
+  [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]] || die 'reconstructed tree is empty'
+  [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'reconstructed tree touches .beads'
+  printf 'worker-live: reconstructed digest-bound bundle onto %s (hooks disabled)\n' "$branch"
 }
 
 # ---- cross-provider review / same-provider fix (review-fix.yml) ----------------------------------
@@ -1687,6 +1779,88 @@ TOML
     printf '  skip (d) live cargo crash-reproduction (cargo not on PATH)\n'
   fi
 
+  # --- digest-bound publish bundle round-trip (issue #125): the token-bearing publisher must run on
+  # a CLEAN checkout and apply ONLY a digest-verified, non-executable patch with hooks disabled. Prove
+  # the real bundle→reconstruct path is faithful (add/modify/delete all survive), that it leaves the
+  # worker tree pristine for the gate, that the digest is bound out-of-band, and that a MISMATCH,
+  # a MOVED base, or a DIRTY tree all fail closed (never letting unverified content reach publish). ---
+  local bsrc="$tmp/bundle-src"
+  git init -q -b main "$bsrc"
+  _bgit() { git -C "$bsrc" -c user.name=t -c user.email=t@example.invalid "$@"; }
+  printf 'keep\n' > "$bsrc/keep.txt"
+  printf 'old\n' > "$bsrc/mod.txt"
+  printf 'gone\n' > "$bsrc/del.txt"
+  _bgit add . && _bgit commit -qm base
+  local bundle_base
+  bundle_base=$(git -C "$bsrc" rev-parse HEAD)
+  # worker-authored working-tree edits: modify, add, delete
+  printf 'new\n' > "$bsrc/mod.txt"
+  printf 'added\n' > "$bsrc/add.txt"
+  rm "$bsrc/del.txt"
+  local bwr="$tmp/bundle-wr"
+  mkdir -p "$bwr"
+  printf '{"number":1,"title":"t","body":"b"}\n' > "$bwr/issue.json"
+  ( cd "$bsrc" &&
+    TARGET_DIR="$bsrc" WORKER_ROOT="$bwr" WORKER_BRANCH=sparq-agent/issue-1 \
+      WORKER_ISSUE_FILE="$bwr/issue.json" GITHUB_OUTPUT="$tmp/bundle.out" \
+      bash "$SCRIPT_DIR/$(basename -- "$0")" bundle ) >/dev/null 2>&1 || true
+  local bundle_digest
+  bundle_digest=$(sed -n 's/^bundle_sha256=//p' "$tmp/bundle.out" 2>/dev/null | tail -n1)
+  chk "bundle emits a 64-hex digest job output" \
+    "$( [[ "$bundle_digest" =~ ^[0-9a-f]{64}$ ]] && echo ok )" "ok"
+  chk "bundle digest matches the patch on disk" \
+    "$(sha256sum "$bwr/bundle/changes.patch" 2>/dev/null | awk '{print $1}')" "$bundle_digest"
+  chk "bundle carries the verified issue snapshot for the clean runner" \
+    "$( [[ -f "$bwr/bundle/verified-issue.json" ]] && echo ok )" "ok"
+  chk "bundle leaves the worker tree pristine for the gate (index reset)" \
+    "$(cat "$bsrc/mod.txt")" "new"
+
+  # reconstruct onto a CLEAN checkout at the digest-bound base (a fresh clone stops at the committed
+  # base HEAD, since the worker edits were never committed).
+  local bdst="$tmp/bundle-dst"
+  git clone -q "$bsrc" "$bdst" >/dev/null 2>&1
+  ( cd "$bdst" &&
+    TARGET_DIR="$bdst" WORKER_BUNDLE_DIR="$bwr/bundle" WORKER_BUNDLE_SHA256="$bundle_digest" \
+      WORKER_BUNDLE_BASE_SHA="$bundle_base" WORKER_BRANCH=sparq-agent/issue-1 \
+      bash "$SCRIPT_DIR/$(basename -- "$0")" reconstruct ) >/dev/null 2>&1 || true
+  chk "reconstruct lands on the worker branch" \
+    "$(git -C "$bdst" rev-parse --abbrev-ref HEAD 2>/dev/null)" "sparq-agent/issue-1"
+  chk "reconstruct disables git hooks before the token-bearing publish" \
+    "$(git -C "$bdst" config core.hooksPath 2>/dev/null)" "/dev/null"
+  chk "reconstruct applies a modification" "$(cat "$bdst/mod.txt" 2>/dev/null)" "new"
+  chk "reconstruct applies an addition" "$(cat "$bdst/add.txt" 2>/dev/null)" "added"
+  chk "reconstruct applies a deletion" \
+    "$( [[ -e "$bdst/del.txt" ]] && echo present || echo gone )" "gone"
+
+  # fail-closed: a TAMPERED patch (digest mismatch) must be refused on a fresh clean checkout.
+  local btam="$tmp/bundle-tam"
+  git clone -q "$bsrc" "$btam" >/dev/null 2>&1
+  cp -r "$bwr/bundle" "$tmp/bundle-tampered"
+  printf 'diff --git a/evil b/evil\nnew file mode 100644\n--- /dev/null\n+++ b/evil\n@@ -0,0 +1 @@\n+pwn\n' \
+    >> "$tmp/bundle-tampered/changes.patch"
+  local tam_rc
+  ( cd "$btam" &&
+    TARGET_DIR="$btam" WORKER_BUNDLE_DIR="$tmp/bundle-tampered" WORKER_BUNDLE_SHA256="$bundle_digest" \
+      WORKER_BUNDLE_BASE_SHA="$bundle_base" WORKER_BRANCH=sparq-agent/issue-1 \
+      bash "$SCRIPT_DIR/$(basename -- "$0")" reconstruct ) >/dev/null 2>&1 && tam_rc=0 || tam_rc=$?
+  chk "reconstruct fails closed on a digest mismatch (tampered patch)" \
+    "$( [[ "$tam_rc" -ne 0 ]] && echo refused )" "refused"
+  chk "a refused reconstruct never applied the tampered content" \
+    "$( [[ -e "$btam/evil" ]] && echo leaked || echo clean )" "clean"
+
+  # fail-closed: a MOVED base (checkout is not the digest-bound base) must be refused even with a
+  # matching digest — the publisher must never reconstruct onto an unexpected tree.
+  local bmov="$tmp/bundle-moved"
+  git clone -q "$bsrc" "$bmov" >/dev/null 2>&1
+  git -C "$bmov" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m drift
+  local mov_rc
+  ( cd "$bmov" &&
+    TARGET_DIR="$bmov" WORKER_BUNDLE_DIR="$bwr/bundle" WORKER_BUNDLE_SHA256="$bundle_digest" \
+      WORKER_BUNDLE_BASE_SHA="$bundle_base" WORKER_BRANCH=sparq-agent/issue-1 \
+      bash "$SCRIPT_DIR/$(basename -- "$0")" reconstruct ) >/dev/null 2>&1 && mov_rc=0 || mov_rc=$?
+  chk "reconstruct fails closed when HEAD is not the digest-bound base" \
+    "$( [[ "$mov_rc" -ne 0 ]] && echo refused )" "refused"
+
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
   else
@@ -1698,11 +1872,13 @@ TOML
 case "${1:-}" in
   model) run_model ;;
   gate) run_gate ;;
+  bundle) worker_bundle ;;
+  reconstruct) reconstruct_bundle ;;
   publish) publish_pr ;;
   review) run_review ;;
   fix) run_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|reconstruct|publish|review|fix|push-fix|write-back|self-test>' ;;
 esac

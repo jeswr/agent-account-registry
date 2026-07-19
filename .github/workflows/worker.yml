@@ -520,8 +520,26 @@ jobs:
       # `provenance` job below, which executes no target code.
       contents: read
     outputs:
-      pr_number: ${{ steps.pr.outputs.pr_number }}
       bot_login: ${{ steps.target.outputs.bot_login }}
+      bot_id: ${{ steps.target.outputs.bot_id }}
+      default_branch: ${{ steps.target.outputs.default_branch }}
+      # Digest-bound publish handoff (issue #125): the token-bearing commit/push/PR runs in the
+      # separate `publish` job on a CLEAN runner. These host-derived, pre-gate values pin exactly
+      # what that job may publish — the gate (which runs target code AFTER this) cannot alter them.
+      bundle_sha256: ${{ steps.bundle.outputs.bundle_sha256 }}
+      base_sha: ${{ steps.bundle.outputs.base_sha }}
+      branch: ${{ steps.bundle.outputs.branch }}
+      # Concrete routing resolved BEFORE any target code ran (steps.selected / needs.claim), carried
+      # so the clean publish runner builds the PR title/body without re-reading post-hostile state.
+      model_alias: ${{ steps.selected.outputs.model }}
+      provider_model: ${{ steps.selected.outputs.provider_model }}
+      impl_provider: ${{ steps.selected.outputs.provider }}
+      # Host-observed step outcomes the publish/finalize job keys off (never target-controlled).
+      gate_outcome: ${{ steps.gate.outcome }}
+      model_outcome: ${{ steps.model.outcome }}
+      trust_outcome: ${{ steps.trust.outcome }}
+      exhausted: ${{ steps.budget.outputs.exhausted }}
+      attempt_number: ${{ steps.attempt.outputs.number }}
       # Model-access health (registry #32): the sanitized exit CLASS of the model launch, surfaced
       # so the separate no-target-code `model_health` job records it (success or failure). The
       # provider/account/model come from the pre-hostile `claim` job outputs (not this job, which
@@ -850,30 +868,32 @@ jobs:
           echo "class=$cls" >> "$GITHUB_OUTPUT"
           echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
 
-      # TTL guard (audit-2026-07-17): App installation tokens live 60 minutes and app-token-live is
-      # minted BEFORE the heavy checkout + toolchain + model run, so with worker_timeout_minutes=90
-      # every long run used to reach publish/followups/final-state with an EXPIRED token — the
-      # model's completed work was discarded AND the deferral write failed, stranding the issue
-      # status:in-progress. This fresh mint immediately after the model step keeps all post-model
-      # writes inside a new 60-minute window. `always()` is load-bearing: final-state also runs on
-      # the failure path. continue-on-error + the `|| app-token-live` fallbacks below keep a mint
-      # hiccup from being worse than the old single-mint behavior.
-      - name: Mint post-model target-scoped App token (publish/final-state TTL guard)
-        id: app-token-post
-        if: ${{ always() && !inputs.dry_run }}
-        continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      # Digest-bound publish handoff (issue #125). NO write-capable App token is minted in THIS job
+      # anymore: the token-bearing commit/push/PR moved to the separate `publish` job on a clean
+      # runner (which mints its own token, inside a fresh 60-minute window — also the old TTL guard's
+      # purpose). Here we only capture the model's PRE-GATE output as a non-executable patch + a
+      # host-derived sha256 job output. Running this BEFORE the toolchain/gate steps is load-bearing:
+      # once the gate executes target code it can mutate the tree, so a post-gate snapshot could carry
+      # arbitrary injected changes. The digest pins the pre-hostile content the publish job may apply.
+      - name: Snapshot model output into a digest-bound bundle
+        id: bundle
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_BRANCH: ${{ steps.model.outputs.branch }}
+          WORKER_ISSUE_FILE: ${{ runner.temp }}/verified-issue.json
+        run: bash ../registry/scripts/worker-live.sh bundle
+
+      - name: Upload the digest-bound publish bundle (non-executable data)
+        if: ${{ !inputs.dry_run && steps.bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
-          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
-          owner: ${{ needs.resolve.outputs.target_owner }}
-          repositories: ${{ needs.resolve.outputs.target_name }}
-          permission-contents: write
-          permission-issues: write
-          permission-pull-requests: write
-          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
-          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
-          permission-workflows: write
+          name: worker-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/registry-worker/bundle
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Write back a rotated full account credential
         id: writeback
@@ -918,78 +938,11 @@ jobs:
           # crash signal. The failure-class annotation below reads only host-derived step outcomes.
         run: bash ../registry/scripts/worker-live.sh gate
 
-      - name: Commit, push, and open DRAFT target pull request (review pending)
-        id: pr
-        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
-        working-directory: target
-        env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
-          TARGET_DIR: ${{ github.workspace }}/target
-          TARGET_REPO: ${{ inputs.target_repo }}
-          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
-          TARGET_BOT_LOGIN: ${{ steps.target.outputs.bot_login }}
-          TARGET_BOT_ID: ${{ steps.target.outputs.bot_id }}
-          ISSUE_NUMBER: ${{ inputs.issue_number }}
-          WORKER_ROOT: ${{ runner.temp }}/registry-worker
-          WORKER_ISSUE_FILE: ${{ runner.temp }}/verified-issue.json
-          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
-          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
-          WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
-          GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
-          ARM_AUTO_MERGE_REQUESTED: ${{ needs.resolve.outputs.arm_auto_merge }}
-        run: bash ../registry/scripts/worker-live.sh publish
-
-      - name: Create declared follow-up issues (discovered out-of-scope work)
-        # The procedure for the orchestrator to capture work it discovers but must NOT do in this PR:
-        # the model appends {title, body, labels} lines to WORKER_ROOT/followups.jsonl (worker-live.sh
-        # moves them out of the target tree BEFORE the commit so they are never committed), and this
-        # step creates de-duplicated, labelled, back-linked issues. Best-effort; never fails the worker.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
-          WORKER_ROOT: ${{ runner.temp }}/registry-worker
-        run: |
-          set -uo pipefail
-          for l in from:agent self-improvement; do
-            gh label create "$l" -R "${{ inputs.target_repo }}" --color ededed \
-              --description "worker-discovered follow-up" 2>/dev/null || true
-          done
-          python3 registry/scripts/worker-issue.py followup \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --spec-file "$WORKER_ROOT/followups.jsonl" || true
-
-      - name: Set final target issue state
-        if: ${{ always() && !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
-          ACQUIRED: ${{ needs.claim.outputs.acquired }}
-          EXHAUSTED: ${{ steps.budget.outputs.exhausted }}
-          TRUST_OUTCOME: ${{ steps.trust.outcome }}
-          ATTEMPT_NUMBER: ${{ steps.attempt.outputs.number }}
-          MAX_ATTEMPTS: ${{ needs.resolve.outputs.max_attempts }}
-          PR_URL: ${{ steps.pr.outputs.pr_url }}
-        run: |
-          set -euo pipefail
-          status=deferred
-          if [[ "$ACQUIRED" == true && "$EXHAUSTED" == true ]]; then
-            status=needs-user
-          elif [[ "$ACQUIRED" == true && -n "$PR_URL" ]]; then
-            # Completion is DEFERRED to the review-fix ARM path (the issue closes only when its
-            # PR is approved cross-provider and armed); the review loop owns it from here.
-            status=in-progress-review
-          elif [[ "$ACQUIRED" == true && "$TRUST_OUTCOME" == success \
-                  && "$ATTEMPT_NUMBER" =~ ^[1-9][0-9]*$ \
-                  && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ \
-                  && "$ATTEMPT_NUMBER" -ge "$MAX_ATTEMPTS" ]]; then
-            status=needs-user
-          fi
-          python3 registry/scripts/worker-issue.py status \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --status "$status" ||
-            printf '%s\n' "::warning::Could not set final target issue state to $status"
+      # Commit/push/PR, follow-up issue creation, and the final issue-state write ALL moved to the
+      # separate `publish` job below (issue #125): each carried a contents/issues/PR-capable App token
+      # and executed the registry checkout AFTER the gate ran target code host-side, so gated code
+      # could capture the token or publish arbitrary changes. This job now holds NO write-capable
+      # target token past the gate — there is nothing for hostile gate code to hijack.
 
       # [OPUS-4.8] The diagnostics ARTIFACT was DROPPED for credential-safety (security review,
       # finding #1). Rationale: the `gate` step above runs target-CONTROLLED cargo (build scripts /
@@ -1017,20 +970,170 @@ jobs:
       # class of failure (which step outcome) and the resolved WORKER_PACKAGES atom(s). It deliberately
       # echoes NO target-controlled content (no raw gate stderr, no CLI stderr, no transcript, no
       # account handle / credential paths), so there is no path for hostile cargo output to reach it.
+      # The gate is the last worker-job step that can fail productive work: publish (commit/push/PR)
+      # now runs in the separate `publish` job (issue #125), so this keys off the gate/bundle outcome.
       - name: Preserve live-attempt failure signal (annotation only)
-        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' && steps.trust.outcome == 'success' && steps.pr.outcome != 'success' }}
+        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' && steps.trust.outcome == 'success' && steps.gate.outcome != 'success' }}
         continue-on-error: true
         env:
           GATE_OUTCOME: ${{ steps.gate.outcome }}
           MODEL_OUTCOME: ${{ steps.model.outcome }}
-          PR_OUTCOME: ${{ steps.pr.outcome }}
+          BUNDLE_OUTCOME: ${{ steps.bundle.outcome }}
           RESOLVED_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: |
           set -uo pipefail
-          echo '::warning::Live worker attempt did not open its target pull request (model outcome='"${MODEL_OUTCOME:-?}"', gate outcome='"${GATE_OUTCOME:-?}"', pr outcome='"${PR_OUTCOME:-?}"').'
+          echo '::warning::Live worker attempt did not hand off a publishable bundle (model outcome='"${MODEL_OUTCOME:-?}"', gate outcome='"${GATE_OUTCOME:-?}"', bundle outcome='"${BUNDLE_OUTCOME:-?}"'); the publish job is skipped.'
           if [[ "${MODEL_OUTCOME:-}" == "success" && "${GATE_OUTCOME:-}" != "success" ]]; then
             echo '::warning::The model produced work but the local gate did not pass for package atom(s) ['"${RESOLVED_PACKAGES:-?}"'] — the gate error is in this run job log above (the Run policy-selected local gate step output); no artifact is produced by design (credential-safety).'
           fi
+
+  # Token-bearing publisher on a CLEAN runner (issue #125). The worker job executes model- and
+  # gate-authored target code HOST-side, so a contents/issues/PR-capable App token must NEVER be
+  # co-located with it after that code runs: gated code could poison registry/scripts, plant .git
+  # hooks, or shim $GITHUB_PATH to capture the token or publish arbitrary changes. This job runs NO
+  # target code — it mints its own token (a fresh 60-minute TTL window), checks out a CLEAN registry
+  # and a CLEAN target at the digest-bound base, verifies the pre-gate patch against the host-derived
+  # digest, applies it as DATA with hooks disabled, and only then commits/pushes/opens the DRAFT PR.
+  # Follow-up filing and the final issue-state write live here too — they carried the same token.
+  publish:
+    name: Publish DRAFT target PR from a clean runner (no target code runs here)
+    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
+    needs: [resolve, claim, worker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Writes go to the TARGET via a scoped App token minted below — never github.token.
+      contents: read
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Mint target-scoped App token (fresh 60-minute window)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
+          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
+          permission-workflows: write
+
+      - name: Download the digest-bound publish bundle (non-executable data)
+        if: ${{ needs.worker.outputs.bundle_sha256 != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: worker-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle
+
+      - name: Checkout target at the digest-bound base (CLEAN, pinned, no persisted token)
+        if: ${{ needs.worker.outputs.gate_outcome == 'success' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ needs.worker.outputs.base_sha }}
+          path: target
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Reconstruct the digest-verified bundle (hooks disabled)
+        id: reconstruct
+        if: ${{ needs.worker.outputs.gate_outcome == 'success' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          WORKER_BUNDLE_DIR: ${{ runner.temp }}/bundle
+          WORKER_BUNDLE_SHA256: ${{ needs.worker.outputs.bundle_sha256 }}
+          WORKER_BUNDLE_BASE_SHA: ${{ needs.worker.outputs.base_sha }}
+          WORKER_BRANCH: ${{ needs.worker.outputs.branch }}
+        run: bash ../registry/scripts/worker-live.sh reconstruct
+
+      - name: Commit, push, and open DRAFT target pull request (review pending)
+        id: pr
+        if: ${{ needs.worker.outputs.gate_outcome == 'success' && steps.reconstruct.outcome == 'success' }}
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ needs.worker.outputs.default_branch }}
+          TARGET_BOT_LOGIN: ${{ needs.worker.outputs.bot_login }}
+          TARGET_BOT_ID: ${{ needs.worker.outputs.bot_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          WORKER_ROOT: ${{ runner.temp }}/publish-root
+          WORKER_BRANCH: ${{ needs.worker.outputs.branch }}
+          WORKER_ISSUE_FILE: ${{ runner.temp }}/bundle/verified-issue.json
+          WORKER_MODEL_ALIAS: ${{ needs.worker.outputs.model_alias }}
+          WORKER_PROVIDER_MODEL: ${{ needs.worker.outputs.provider_model }}
+          WORKER_PROVIDER: ${{ needs.worker.outputs.impl_provider }}
+          WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
+          GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
+          ARM_AUTO_MERGE_REQUESTED: ${{ needs.resolve.outputs.arm_auto_merge }}
+        run: |
+          mkdir -p "$WORKER_ROOT"
+          bash ../registry/scripts/worker-live.sh publish
+
+      - name: Create declared follow-up issues (discovered out-of-scope work)
+        # The model appended {title, body, labels} lines to followups.jsonl (lifted OUT of the tree by
+        # run_model, ferried here in the bundle so they are never committed); this creates de-duplicated,
+        # labelled, back-linked issues. Best-effort; never fails the pipeline.
+        if: ${{ needs.worker.outputs.model_outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          FOLLOWUPS_FILE: ${{ runner.temp }}/bundle/followups.jsonl
+        run: |
+          set -uo pipefail
+          [[ -f "$FOLLOWUPS_FILE" ]] || { echo 'no model-declared follow-ups'; exit 0; }
+          for l in from:agent self-improvement; do
+            gh label create "$l" -R "${{ inputs.target_repo }}" --color ededed \
+              --description "worker-discovered follow-up" 2>/dev/null || true
+          done
+          python3 registry/scripts/worker-issue.py followup \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --spec-file "$FOLLOWUPS_FILE" || true
+
+      - name: Set final target issue state
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ACQUIRED: ${{ needs.claim.outputs.acquired }}
+          EXHAUSTED: ${{ needs.worker.outputs.exhausted }}
+          TRUST_OUTCOME: ${{ needs.worker.outputs.trust_outcome }}
+          ATTEMPT_NUMBER: ${{ needs.worker.outputs.attempt_number }}
+          MAX_ATTEMPTS: ${{ needs.resolve.outputs.max_attempts }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          status=deferred
+          if [[ "$ACQUIRED" == true && "$EXHAUSTED" == true ]]; then
+            status=needs-user
+          elif [[ "$ACQUIRED" == true && -n "$PR_URL" ]]; then
+            # Completion is DEFERRED to the review-fix ARM path (the issue closes only when its
+            # PR is approved cross-provider and armed); the review loop owns it from here.
+            status=in-progress-review
+          elif [[ "$ACQUIRED" == true && "$TRUST_OUTCOME" == success \
+                  && "$ATTEMPT_NUMBER" =~ ^[1-9][0-9]*$ \
+                  && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ \
+                  && "$ATTEMPT_NUMBER" -ge "$MAX_ATTEMPTS" ]]; then
+            status=needs-user
+          fi
+          python3 registry/scripts/worker-issue.py status \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --status "$status" ||
+            printf '%s\n' "::warning::Could not set final target issue state to $status"
 
   # Provenance is REGISTRY-recorded and is the review loop's root of trust: the review sweep
   # fails closed on a missing record (the PR is never enumerated), so this job must FAIL LOUD —
@@ -1044,8 +1147,8 @@ jobs:
   # hash (privacy: the registry is public — locked decision 22a).
   provenance:
     name: Record implementer provenance (no target code runs here)
-    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.worker.outputs.pr_number != '' }}
-    needs: [resolve, claim, worker]
+    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.publish.outputs.pr_number != '' }}
+    needs: [resolve, claim, worker, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1068,7 +1171,7 @@ jobs:
           python3 registry/scripts/worker-pr.py provenance-record \
             --registry-repo "$GITHUB_REPOSITORY" \
             --target-repo "${{ inputs.target_repo }}" \
-            --pr "${{ needs.worker.outputs.pr_number }}" \
+            --pr "${{ needs.publish.outputs.pr_number }}" \
             --impl-provider "${{ needs.claim.outputs.provider }}" \
             --impl-alias "${{ needs.claim.outputs.model }}" \
             --issue "${{ inputs.issue_number }}" \
@@ -1092,7 +1195,7 @@ jobs:
         run: |
           python3 registry/scripts/worker-pr.py review-state set \
             --repo "${{ inputs.target_repo }}" \
-            --pr "${{ needs.worker.outputs.pr_number }}" \
+            --pr "${{ needs.publish.outputs.pr_number }}" \
             --state needs
 
   # Model-access health record (registry #32): consumes the worker's exit CLASS (success OR any
