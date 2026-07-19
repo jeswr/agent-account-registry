@@ -52,12 +52,19 @@ FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
 MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
 PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-# Provider escalation ladders in ASCENDING capability order. anthropic: sonnet < fable < opus
-# (opus is the terminal fix tier for hard cases); openai is single-tier (terra) — no ladder, so
-# only the progress extension applies there. A pin or recorded model outside its provider ladder
-# is REJECTED (hostile-input surface: a forged marker must never select an arbitrary
-# provider_model — concrete ids are still resolved from protected target routing by alias).
-ESCALATION_LADDERS = {"anthropic": ["sonnet", "fable", "opus"], "openai": ["terra"]}
+# Provider escalation ladders in ESCALATION order — weakest tier FIRST, STRONGEST (terminal)
+# tier LAST: ladder index is capability rank, exhaustion escalates UPWARD by pinning the tier
+# ABOVE the highest that already ran. Maintainer capability order (2026-07-18):
+# opus < luna < fable < sol. anthropic: opus then fable (fable terminal); openai: luna then sol
+# (sol, the codex-side frontier model, terminal). Sol r2 finding 2 fixed the previous INVERTED
+# declarations (["fable","opus"] / ["sol","luna"]) under which exhaustion on the strong tier
+# "escalated" the fix floor DOWN to the weaker one. terra and sonnet are DOCS-ONLY models
+# (maintainer directive 2026-07-18) and are structurally excluded from every ladder — a
+# recorded terra/sonnet fix round or pin now fails closed. A pin or recorded model outside its
+# provider ladder is REJECTED (hostile-input surface: a forged marker must never select an
+# arbitrary provider_model — concrete ids are still resolved from protected target routing by
+# alias).
+ESCALATION_LADDERS = {"anthropic": ["opus", "fable"], "openai": ["luna", "sol"]}
 PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -1627,89 +1634,96 @@ def _self_test():
         return decide_budget(rounds, models, progress, provider, base_rounds=base,
                              pending_fix_models=pending, pin_floor=pin)
 
-    check("budget below base continues", budget(2, ["sonnet"], "regressing"),
+    check("budget below base continues", budget(2, ["fable"], "regressing"),
           {"action": "continue", "pin": None})
     check("budget zero rounds continues", budget(0, [], None),
           {"action": "continue", "pin": None})
-    # Mechanism 1 — model escalation, precedence over progress (it resets the quality question)
-    check("exhaustion on sonnet pins fable", budget(3, ["sonnet"], "stagnant"),
+    # Mechanism 1 — model escalation, precedence over progress (it resets the quality question).
+    # Direction (sol r2 f2): the ladder escalates UPWARD per opus < luna < fable < sol —
+    # exhaustion on the WEAK tier pins the STRONG tier, never the reverse.
+    check("exhaustion on opus pins fable (escalates UP)", budget(3, ["opus"], "stagnant"),
           {"action": "extend-model-pin", "pin": "fable"})
-    check("model pin outranks improving progress", budget(3, ["sonnet"], "improving"),
+    check("model pin outranks improving progress", budget(3, ["opus"], "improving"),
           {"action": "extend-model-pin", "pin": "fable"})
-    check("exhaustion on fable pins opus", budget(3, ["fable"], None),
-          {"action": "extend-model-pin", "pin": "opus"})
-    check("mixed sonnet+fable pins opus", budget(4, ["sonnet", "fable"], "regressing"),
-          {"action": "extend-model-pin", "pin": "opus"})
+    check("exhaustion on luna pins sol (escalates UP)",
+          budget(3, ["luna"], None, provider="openai"),
+          {"action": "extend-model-pin", "pin": "sol"})
     # Mechanism 2 — progress extension once the top tier has run (or nothing is recorded)
-    check("opus + improving extends on progress", budget(3, ["opus"], "improving"),
+    check("fable + improving extends on progress (terminal tier)",
+          budget(3, ["fable"], "improving"),
           {"action": "extend-progress", "pin": None})
-    check("sonnet+opus + improving is progress-only", budget(4, ["sonnet", "opus"], "improving"),
+    check("opus+fable + improving is progress-only", budget(4, ["opus", "fable"], "improving"),
           {"action": "extend-progress", "pin": None})
     check("no fix record + improving extends", budget(3, [], "improving"),
           {"action": "extend-progress", "pin": None})
     # Re-review authorization: a PUSHED-but-unreviewed fix at/above the pinned floor gets its
-    # re-review even at exhaustion (the terminal-grant orphan defect: the executed opus fix
+    # re-review even at exhaustion (the terminal-grant orphan defect: the executed fable fix
     # falsifies the top-tier predicate while the stagnant grade predates that fix)
     check("pending pinned-floor fix authorizes its re-review",
-          budget(3, ["fable", "opus"], "stagnant", pending=["opus"], pin="opus"),
+          budget(3, ["opus", "fable"], "stagnant", pending=["fable"], pin="fable"),
           {"action": "extend-pending-review", "pin": None})
     check("no pending fix in the same posture stops (flip side)",
-          budget(3, ["fable", "opus"], "stagnant"),
+          budget(3, ["opus", "fable"], "stagnant"),
           {"action": "needs-user", "pin": None})
     check("pending fix BELOW the pinned floor never extends",
-          budget(3, ["fable", "opus"], "stagnant", pending=["fable"], pin="opus"),
+          budget(3, ["opus", "fable"], "stagnant", pending=["opus"], pin="fable"),
           {"action": "needs-user", "pin": None})
     check("unpinned pending fix authorizes (floor is the ladder bottom)",
-          budget(3, ["sonnet"], None, pending=["sonnet"]),
+          budget(3, ["opus"], None, pending=["opus"]),
           {"action": "extend-pending-review", "pin": None})
     check("pending re-review precedes the progress extension",
-          budget(3, ["opus"], "improving", pending=["opus"], pin="opus"),
+          budget(3, ["fable"], "improving", pending=["fable"], pin="fable"),
           {"action": "extend-pending-review", "pin": None})
     check("openai pending fix authorizes its re-review",
-          budget(3, ["terra"], None, provider="openai", pending=["terra"]),
+          budget(3, ["sol"], None, provider="openai", pending=["sol"]),
           {"action": "extend-pending-review", "pin": None})
     check("hard cap still dominates a pending fix",
-          budget(6, ["fable", "opus"], "stagnant", pending=["opus"], pin="opus"),
+          budget(6, ["opus", "fable"], "stagnant", pending=["fable"], pin="fable"),
           {"action": "needs-user", "pin": None})
     check("pending fix below base just continues",
-          budget(2, ["sonnet"], None, pending=["sonnet"]),
+          budget(2, ["opus"], None, pending=["opus"]),
           {"action": "continue", "pin": None})
-    # needs-user sides (flip-goes-red on every ACT above)
-    check("opus + stagnant stops", budget(3, ["opus"], "stagnant"),
+    # needs-user sides (flip-goes-red on every ACT above). fable/sol are the TERMINAL tiers:
+    # exhaustion there never pins DOWN the ladder — it stops (or extends only on progress).
+    check("fable + stagnant stops (never pins DOWN to opus)", budget(3, ["fable"], "stagnant"),
           {"action": "needs-user", "pin": None})
-    check("opus + regressing stops", budget(4, ["opus"], "regressing"),
+    check("fable + regressing stops", budget(4, ["fable"], "regressing"),
           {"action": "needs-user", "pin": None})
-    check("opus + ungraded stops", budget(3, ["opus"], None),
+    check("fable + ungraded stops", budget(3, ["fable"], None),
           {"action": "needs-user", "pin": None})
     check("no fix record + stagnant stops", budget(3, [], "stagnant"),
           {"action": "needs-user", "pin": None})
-    check("hard cap stops even below-top + improving", budget(6, ["sonnet"], "improving"),
+    check("hard cap stops even below-top + improving", budget(6, ["opus"], "improving"),
           {"action": "needs-user", "pin": None})
-    check("hard cap stops past 6", budget(7, ["sonnet"], "improving"),
+    check("hard cap stops past 6", budget(7, ["fable"], "improving"),
           {"action": "needs-user", "pin": None})
-    check("round 5 still extends under the cap", budget(5, ["sonnet"], None)["action"],
+    check("round 5 still extends under the cap", budget(5, ["opus"], None)["action"],
           "extend-model-pin")
-    # openai: single tier — no ladder, mechanism 2 only
-    check("openai never model-pins", budget(3, ["terra"], "stagnant", provider="openai"),
+    # openai two-tier ladder: SOL is terminal — mechanism 2 only once sol has run
+    check("openai sol + stagnant stops (never pins DOWN to luna)",
+          budget(3, ["sol"], "stagnant", provider="openai"),
           {"action": "needs-user", "pin": None})
-    check("openai improving extends", budget(3, ["terra"], "improving", provider="openai"),
+    check("openai improving extends", budget(3, ["sol"], "improving", provider="openai"),
           {"action": "extend-progress", "pin": None})
     # an explicit policy base above the hard cap is respected up to the base, never extended
-    check("base above cap continues below base", budget(6, ["sonnet"], "improving", base=8),
+    check("base above cap continues below base", budget(6, ["fable"], "improving", base=8),
           {"action": "continue", "pin": None})
-    check("base above cap stops at base", budget(8, ["sonnet"], "improving", base=8),
+    check("base above cap stops at base", budget(8, ["fable"], "improving", base=8),
           {"action": "needs-user", "pin": None})
     for bad, name in (
             (lambda: budget(3, ["gpt-omega"], None), "unknown fix model"),
-            (lambda: budget(3, ["terra"], None), "cross-provider fix model"),
+            (lambda: budget(3, ["sol"], None), "cross-provider fix model"),
+            (lambda: budget(3, ["sonnet"], None), "docs-only fix model (sonnet)"),
+            (lambda: budget(3, ["terra"], None, provider="openai"),
+             "docs-only fix model (terra)"),
             (lambda: decide_budget(3, [], None, "mystery"), "unknown provider"),
             (lambda: budget(3, [], "better"), "unknown progress value"),
             (lambda: budget(True, [], None), "boolean rounds"),
             (lambda: decide_budget(3, [], None, "anthropic", base_rounds=0), "zero base"),
             (lambda: budget(3, ["opus"], None, pending=["gpt-omega"]), "unknown pending model"),
-            (lambda: budget(3, ["opus"], None, pending=["terra"]),
+            (lambda: budget(3, ["opus"], None, pending=["sol"]),
              "cross-provider pending model"),
-            (lambda: budget(3, ["opus"], None, pending=["opus"], pin="terra"),
+            (lambda: budget(3, ["opus"], None, pending=["opus"], pin="sol"),
              "cross-provider pin floor"),
             (lambda: budget(3, ["opus"], None, pin="gpt-omega"), "unknown pin floor"),
     ):
@@ -1722,9 +1736,9 @@ def _self_test():
 
     # ---- durable escalation markers: fix-model, progress, and the pinned floor ----
     esc_comments = [
-        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=1 model=sonnet run=1.1 -->"},
-        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=1 model=sonnet run=1.2 -->"},
-        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=2 model=fable run=2.1 -->"},
+        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=1 model=fable run=1.1 -->"},
+        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=1 model=fable run=1.2 -->"},
+        {"user": {"login": bot}, "body": f"x {FIX_MODEL_MARKER} round=2 model=opus run=2.1 -->"},
         {"user": {"login": "mallory"},
          "body": f"x {FIX_MODEL_MARKER} round=3 model=opus run=6.6 -->"},
         {"user": {"login": bot},
@@ -1733,23 +1747,23 @@ def _self_test():
          "body": f"y {PROGRESS_MARKER} round=3 progress=improving -->"},
     ]
     check("fix models per round (bot-only, deduped)", fix_round_models(esc_comments, bot),
-          {1: ["sonnet"], 2: ["fable"]})
+          {1: ["fable"], 2: ["opus"]})
     check("progress per round (bot-only)", round_progress(esc_comments, bot),
           {2: "improving"})
     check("no pin markers yields no floor", pinned_fix_floor(esc_comments, bot, "anthropic"),
           None)
     pin_comments = esc_comments + [
-        {"user": {"login": bot}, "body": f"z {MODEL_PIN_MARKER} round=3 tier=fable run=3.1 -->"},
+        {"user": {"login": bot}, "body": f"z {MODEL_PIN_MARKER} round=3 tier=opus run=3.1 -->"},
         {"user": {"login": "mallory"},
-         "body": f"z {MODEL_PIN_MARKER} round=3 tier=opus run=6.6 -->"},
+         "body": f"z {MODEL_PIN_MARKER} round=3 tier=fable run=6.6 -->"},
     ]
     check("pinned floor reads the bot marker (forged higher pin ignored)",
-          pinned_fix_floor(pin_comments, bot, "anthropic"), "fable")
+          pinned_fix_floor(pin_comments, bot, "anthropic"), "opus")
     check("highest recorded floor wins",
           pinned_fix_floor(pin_comments + [
               {"user": {"login": bot},
-               "body": f"z {MODEL_PIN_MARKER} round=4 tier=opus run=4.1 -->"}], bot,
-              "anthropic"), "opus")
+               "body": f"z {MODEL_PIN_MARKER} round=4 tier=fable run=4.1 -->"}], bot,
+              "anthropic"), "fable")
     try:
         pinned_fix_floor([{"user": {"login": bot},
                            "body": f"z {MODEL_PIN_MARKER} round=1 tier=gpt-omega run=1.1 -->"}],
@@ -1759,18 +1773,31 @@ def _self_test():
     else:
         check("corrupt pin tier fails closed", "accepted", "rejected")
     check("pinned chain keeps floor-and-above ascending",
-          pinned_fix_chain("anthropic", "fable"), ["fable", "opus"])
-    check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "opus"), ["opus"])
+          pinned_fix_chain("openai", "luna"), ["luna", "sol"])
+    check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "fable"),
+          ["fable"])
     check("pinned chain at the bottom is the whole ladder",
-          pinned_fix_chain("anthropic", "sonnet"), ["sonnet", "fable", "opus"])
-    check("openai pinned chain is its single tier", pinned_fix_chain("openai", "terra"),
-          ["terra"])
+          pinned_fix_chain("anthropic", "opus"), ["opus", "fable"])
+    check("openai pinned chain at its terminal tier", pinned_fix_chain("openai", "sol"),
+          ["sol"])
     try:
-        pinned_fix_chain("anthropic", "terra")
+        pinned_fix_chain("anthropic", "sol")
     except WorkerPrError:
         check("cross-provider pin fails closed", "rejected", "rejected")
     else:
         check("cross-provider pin fails closed", "accepted", "rejected")
+    try:
+        pinned_fix_chain("anthropic", "sonnet")
+    except WorkerPrError:
+        check("docs-only pin fails closed", "rejected", "rejected")
+    else:
+        check("docs-only pin fails closed", "accepted", "rejected")
+    # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are DOCS-ONLY —
+    # never a ladder member for any provider. review-fix.yml asserts the same over its
+    # review/fix chain tables; dispatch-claim.py over REVIEW_CHAIN/FIX_CHAIN.
+    check("docs-only models are excluded from every escalation ladder",
+          sorted({"terra", "sonnet"} & {alias for ladder in ESCALATION_LADDERS.values()
+                                        for alias in ladder}), [])
 
     # decide_disarm (issue #42): the sweep invariant acts on mismatch when the PR is armed OR
     # ready-but-unarmed (interrupted-disarm crash-window re-entry); matching SHAs are NEVER
@@ -1885,16 +1912,18 @@ def _self_test():
                     run_key="9.1"))
                 return list(wiring_calls)
 
-            sonnet_fix = [{"user": {"login": bot},
-                           "body": f"x {FIX_MODEL_MARKER} round=1 model=sonnet run=1.1 -->"}]
+            # Ladder direction (sol r2 f2): an exhausted OPUS fix pins UP to fable; a fable
+            # (terminal-tier) fix can only progress-extend or stop.
             opus_fix = [{"user": {"login": bot},
                          "body": f"x {FIX_MODEL_MARKER} round=1 model=opus run=1.1 -->"}]
+            fable_fix = [{"user": {"login": bot},
+                          "body": f"x {FIX_MODEL_MARKER} round=1 model=fable run=1.1 -->"}]
             check("outcome model extension pins + stays changes",
-                  outcome("stagnant", sonnet_fix),
+                  outcome("stagnant", opus_fix),
                   [("findings", 3), ("pin", "fable"), ("state", "changes")])
             check("outcome progress extension stays changes without a pin",
-                  outcome("improving", opus_fix), [("findings", 3), ("state", "changes")])
-            terminal = outcome("stagnant", opus_fix)
+                  outcome("improving", fable_fix), [("findings", 3), ("state", "changes")])
+            terminal = outcome("stagnant", fable_fix)
             check("outcome terminal escalates once",
                   [entry[0] for entry in terminal], ["findings", "needs-user"])
             check("terminal reason names the exhausted budget",

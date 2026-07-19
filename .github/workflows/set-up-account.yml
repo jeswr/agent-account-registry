@@ -88,7 +88,11 @@ jobs:
           fi
           # The models line the allocator requires (read_accounts drops model-less accounts),
           # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
-          if [ "$prov" = openai ]; then models='[terra]'; else models='[fable, opus, sonnet, haiku]'; fi
+          # openai mints the FULL codex alias set [sol, luna, terra]: select-and-claim's
+          # choose_account requires exact alias membership, so a terra-only record would defer
+          # every sol/luna claim forever (sol r2 finding 1). anthropic stays
+          # [fable, opus, sonnet, haiku] — unchanged.
+          if [ "$prov" = openai ]; then models='[sol, luna, terra]'; else models='[fable, opus, sonnet, haiku]'; fi
           # handle/secret here are only a PRE-LOGIN RESERVATION HINT: the login below can take ~13 min,
           # during which another (non-serialized) writer may claim this number, so the store step
           # derives the real slot from complete live state and atomically claims it (an acct-claims

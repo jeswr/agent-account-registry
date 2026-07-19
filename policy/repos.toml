@@ -1,19 +1,25 @@
 # [GPT-5.6] REG-1 per-repository worker policy.
 # PRIVATE. This file contains account names and spend posture, but NEVER tokens or secret values.
 #
+# MODEL NAMING + POLICY (maintainer directive 2026-07-18): sol is the codex-side FRONTIER model
+# (GPT-5.6 sol/codex). terra is a DIFFERENT, sonnet-class GPT model — earlier comments here
+# misnamed it "GPT-5.6 sol/codex". terra and sonnet are DOCS-ONLY: they never implement, review,
+# or fix (review-fix.yml / dispatch-claim.py / worker-pr.py assert this structurally). sol
+# reviews anthropic-authored content; opus stays lead reviewer of openai-authored content.
+#
 # [FABLE-5] STANDING RULE for every onboarded target (maintainer decision 2026-07-17): UI/front-end
-# surfaces route to the openai/codex model chain (original-builder ownership: GPT-5.6 built the
-# registry dashboard, e4098b9). Each target's routing table (the `routing` pointer below) must
-# carry a terra-led `role = "site"` route — see README "Standing routing rules" + this repo's own
+# surfaces route to the openai/codex model chain (original-builder ownership: GPT-5.6 sol/codex
+# built the registry dashboard, e4098b9). Each target's routing table (the `routing` pointer below)
+# must carry a sol-led `role = "site"` route — see README "Standing routing rules" + this repo's own
 # orchestration/routing.toml for the canonical form.
 #
 # [FABLE-5] STANDING RULE for every onboarded target (maintainer decision 2026-07-17): frontier-
-# tier agents (fable = Claude Fable, terra = GPT-5.6 sol/codex) author ALL CI/infrastructure work,
+# tier agents (fable = Claude Fable, sol = GPT-5.6 sol/codex) author ALL CI/infrastructure work,
 # incl. the self-draining pipeline itself (.github/workflows, dispatch/worker/gate scripts).
-# Each target's routing table must carry a FRONTIER-ONLY `role = "ci"` chain (["fable", "terra"] —
-# no sonnet/haiku): chain exhaustion then DEFERS at the claim step (defer-not-fallback, retried
-# next tick) instead of degrading tier. Security match_labels overrides still win where they
-# overlap. See README "Standing routing rules"; sparq-org/sparq carries it (sparq PR #3422).
+# Each target's routing table must carry a FRONTIER-ONLY `role = "ci"` chain (["sol", "fable"] —
+# no terra/sonnet/haiku): chain exhaustion then DEFERS at the claim step (defer-not-fallback,
+# retried next tick) instead of degrading tier. Security match_labels overrides still win where
+# they overlap. See README "Standing routing rules"; sparq-org/sparq carries it (sparq PR #3422).
 #
 # Schema for every [repos."owner/name"] row (all fields are required):
 #   enabled                = bool
@@ -55,8 +61,8 @@ cross_provider_fallback = false  # honest default: stay queued + alert, never si
 # [OPUS-4.8] The registry as a SECOND self-managed target — its OWN pipeline drains its own
 # ~19 open from:agent issues (triage -> ready -> worker -> draft PR -> cross-provider review ->
 # arm) exactly like sparq. This repo IS the orchestration trust plane, so it runs conservatively:
-# a SMALL max_concurrent, the SHARED account_pool, sparq-style routing (impl -> fable chain, docs
-# -> haiku, review cross-provider), and a python/actions gate profile (the crate-scoped cargo gate
+# a SMALL max_concurrent, the SHARED account_pool, sparq-style routing (impl -> sol-led chain,
+# docs -> haiku, review cross-provider), and a python/actions gate profile (the crate-scoped cargo gate
 # does not fit a python repo). Its routing.toml (orchestration/routing.toml, in THIS repo) marks
 # every orchestration area (dispatch/worker/set-up-account/review-loop/groom) as a soundness
 # surface (escalate=true) so those routes run on Opus and, on chain-exhaustion, escalate to a

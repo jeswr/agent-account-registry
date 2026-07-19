@@ -15,8 +15,11 @@
 # Trust posture (locked decisions):
 # - The implementer identity comes ONLY from the registry provenance record written at publish
 #   time (orchestration/provenance/...); commit trailers and PR body markers are audit-only.
-# - mode=review claims the OPPOSITE provider (anthropic impl -> terra, openai impl -> opus),
-#   asserted fail-closed at claim AND script layer; the reviewer model is read-only (mutation=deny,
+# - mode=review claims the OPPOSITE provider vs the CONTENT author (anthropic impl -> sol review,
+#   openai impl -> opus review), asserted fail-closed at claim AND script layer. terra and sonnet
+#   are DOCS-ONLY models (maintainer directive 2026-07-18) and never appear in any review/fix/
+#   escalation chain here (review-fix has no docs lane — asserted structurally in the resolve
+#   step). The reviewer model is read-only (mutation=deny,
 #   no GitHub token in the container) and its verdict is VOID unless the tree is byte-identical.
 # - Arming (gh pr ready + gh pr merge --auto) happens ONLY here, host-side, one-shot, gated on a
 #   schema-valid approve verdict + reviewer!=implementer (provider AND account) + the armed head
@@ -155,8 +158,10 @@ jobs:
           # escalation-ladder tier may pass — a forged pin can therefore never select an
           # arbitrary provider_model (the concrete id is still resolved from the protected
           # target routing BY ALIAS, and the provider-ladder membership is re-checked against
-          # the provenance-bound implementer provider in the resolve step below).
-          if model_pin and model_pin not in {"sonnet", "fable", "opus", "terra"}:
+          # the provenance-bound implementer provider in the resolve step below). terra and
+          # sonnet are DOCS-ONLY models (maintainer directive 2026-07-18) and this lane is
+          # never docs, so a terra/sonnet pin is rejected outright.
+          if model_pin and model_pin not in {"fable", "opus", "sol", "luna"}:
               raise SystemExit("model_pin must be empty or an escalation-ladder tier")
           if mode == "review" and model_pin:
               raise SystemExit("review mode takes no model pin")
@@ -417,23 +422,40 @@ jobs:
           with open(routing_path, "rb") as handle:
               routing = tomllib.load(handle)
 
-          # The review chain is the INVERSE of the implementer's provider and is computed HERE,
-          # never via resolve() (whose role=review row is always [opus]); resolve() supplies
-          # account_pool / gate / arm / caps only. Fix uses the implementer's own chain.
+          # The review chain is the INVERSE of the CONTENT author's provider and is computed
+          # HERE, never via resolve() (whose role=review row is always [opus]); resolve()
+          # supplies account_pool / gate / arm / caps only. Fix uses the implementer's own
+          # chain. Model policy (maintainer directive 2026-07-18): sol — the codex-side
+          # frontier model — is THE reviewer of anthropic-authored content (luna is its
+          # fallback); opus stays lead reviewer of openai-authored content (proven verdict
+          # quality + the security-surface doctrine). terra and sonnet are DOCS-ONLY and never
+          # appear in any chain below (terra is a sonnet-class GPT model, NOT "GPT-5.6 sol" as
+          # older comments misnamed it).
           # A CODEX alias with a missing/TBD provider_model is RESOLVABLE (locked decision 14):
           # the proven codex drain passes no --model flag (CLI default), and worker-live.sh omits
-          # --model in that case — so an unpinned terra never stalls the common
+          # --model in that case — so an unpinned sol/luna never stalls the common
           # anthropic-implemented direction. A claude alias still needs a concrete id.
-          review_chain = {"anthropic": ["terra"], "openai": ["opus"]}
-          fix_chain = {"anthropic": ["fable", "sonnet"], "openai": ["terra"]}
-          # Escalation ladders in ascending order — mirrors worker-pr.py ESCALATION_LADDERS
-          # (maintainer directive 2026-07-17). A pinned fix-model FLOOR replaces the default
-          # fix chain with the ladder tiers at/above the pin, cheapest first: tiers below the
-          # floor are DELIBERATELY absent (defer-not-fallback — with no at/above-floor account
-          # free, the claim defers to a later tick instead of burning the extended round budget
-          # on the model that already failed; see dispatch-claim.py). A pin outside the
-          # implementer provider's ladder fails closed.
-          ladders = {"anthropic": ["sonnet", "fable", "opus"], "openai": ["terra"]}
+          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
+          fix_chain = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
+          # Escalation ladders in escalation order — weakest tier FIRST, STRONGEST (terminal)
+          # tier LAST per the maintainer capability order opus < luna < fable < sol — mirrors
+          # worker-pr.py ESCALATION_LADDERS (directives 2026-07-17/18; sol r2 f2 fixed the
+          # previously INVERTED order under which exhaustion pinned the weaker tier). A pinned
+          # fix-model FLOOR replaces the default fix chain with the ladder tiers at/above the
+          # pin, cheapest first: tiers below the floor are DELIBERATELY absent
+          # (defer-not-fallback — with no at/above-floor account free, the claim defers to a
+          # later tick instead of burning the extended round budget on the model that already
+          # failed; see dispatch-claim.py). A pin outside the implementer provider's ladder
+          # fails closed.
+          ladders = {"anthropic": ["opus", "fable"], "openai": ["luna", "sol"]}
+          # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are
+          # DOCS-ONLY — review-fix has no docs lane, so their appearance in ANY chain here is a
+          # policy defect. Fail closed before any claim can run on the wrong model.
+          docs_only = {"terra", "sonnet"}
+          chained = {alias for table in (review_chain, fix_chain, ladders)
+                     for tiers in table.values() for alias in tiers}
+          if docs_only & chained:
+              raise SystemExit("docs-only model (terra/sonnet) in a review/fix/escalation chain")
           model_pin = os.environ.get("MODEL_PIN", "")
           if mode == "fix" and model_pin:
               ladder = ladders[impl_provider]

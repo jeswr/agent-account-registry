@@ -28,6 +28,14 @@ POLICY_PATH = "policy/repos.toml"
 # bash -n / actionlint on touched shell + workflow files. Fail-closed.
 GATE_PROFILES = {"none", "lint-only", "crate-scoped", "workspace", "registry-selftest"}
 TRUST_MODES = {"collaborators"}
+# DOCS-ONLY model aliases (maintainer directive 2026-07-18): terra + sonnet may appear ONLY in a
+# docs-role route. Any OTHER resolved route (defaults, a security override, or a non-docs role)
+# carrying one is a routing-document defect and fails CLOSED at validation time — structural
+# enforcement for ROUTING (sol r2 f3), mirroring the review-loop exclusion in worker-pr.py
+# ESCALATION_LADDERS / dispatch-claim.py REVIEW_CHAIN+FIX_CHAIN / review-fix.yml.
+DOCS_ONLY_MODELS = frozenset({"terra", "sonnet"})
+# Roles whose routes may legitimately carry the docs-only aliases.
+DOCS_ROLES = frozenset({"docs"})
 POLICY_FIELDS = {
     "enabled",
     "routing",
@@ -172,6 +180,15 @@ def _route_value(route, where, model_catalog):
     return list(chain), agent, escalate
 
 
+def _reject_docs_only(chain, where):
+    """Fail closed when a NON-docs route resolves to a docs-only alias (sol r2 f3)."""
+    banned = sorted(set(chain) & DOCS_ONLY_MODELS)
+    if banned:
+        raise PolicyError(
+            f"{where} routes a non-docs surface to docs-only model(s): {', '.join(banned)} — "
+            "terra/sonnet are docs-only (maintainer directive 2026-07-18)")
+
+
 def _validated_routing(routing_doc):
     if not isinstance(routing_doc, dict):
         raise PolicyError("routing document must be a table")
@@ -183,6 +200,7 @@ def _validated_routing(routing_doc):
     if not isinstance(defaults, dict):
         raise PolicyError("routing defaults table is required")
     default_value = _route_value(defaults, "routing defaults", models)
+    _reject_docs_only(default_value[0], "routing defaults")
 
     routes = routing_doc.get("route", [])
     if not isinstance(routes, list):
@@ -203,6 +221,7 @@ def _validated_routing(routing_doc):
             if (not isinstance(keywords, list) or not keywords
                     or any(not isinstance(keyword, str) or not keyword for keyword in keywords)):
                 raise PolicyError(f"{where} match_labels must be a non-empty string list")
+            _reject_docs_only(value[0], where)
             security_routes.append((tuple(keywords), value))
         else:
             role = route["role"]
@@ -210,6 +229,8 @@ def _validated_routing(routing_doc):
                 raise PolicyError(f"{where} role must be a non-empty string")
             if role in role_routes:
                 raise PolicyError(f"routing has duplicate role {role!r}")
+            if role not in DOCS_ROLES:
+                _reject_docs_only(value[0], f"{where} (role {role!r})")
             role_routes[role] = value
     return default_value, security_routes, role_routes
 
@@ -421,6 +442,28 @@ agent = "docs-agent"
     bad_routing["route"][0]["model_chain"] = ["unlisted"]
     rejects("unknown model fails closed", "unknown models",
             lambda: resolve("sparq-org/sparq", "impl", policy, bad_routing))
+    # DOCS-ONLY structural rule (sol r2 f3): terra/sonnet in any NON-docs resolved route is a
+    # hard validation error; a docs route may carry them.
+    docs_ok = copy.deepcopy(routing)
+    docs_ok["models"]["terra"] = {"provider": "openai"}
+    docs_ok["models"]["sonnet"] = {"provider": "anthropic"}
+    docs_ok["route"][2]["model_chain"] = ["haiku", "terra", "sonnet"]  # the docs role route
+    check("docs route may use docs-only aliases",
+          resolve("sparq-org/sparq", "docs", policy, docs_ok)["model_chain"],
+          ["haiku", "terra", "sonnet"])
+    bad_impl_docs = copy.deepcopy(docs_ok)
+    bad_impl_docs["route"][0]["model_chain"] = ["fable", "terra"]  # the impl role route
+    rejects("non-docs role route rejects a docs-only alias", "docs-only",
+            lambda: resolve("sparq-org/sparq", "impl", policy, bad_impl_docs))
+    bad_defaults_docs = copy.deepcopy(docs_ok)
+    bad_defaults_docs["defaults"]["model_chain"] = ["sonnet", "fable"]
+    rejects("routing defaults reject a docs-only alias", "docs-only",
+            lambda: resolve("sparq-org/sparq", ["area:misc"], policy, bad_defaults_docs))
+    bad_security_docs = copy.deepcopy(docs_ok)
+    bad_security_docs["route"][1]["model_chain"] = ["opus", "terra"]  # the security override
+    rejects("security override rejects a docs-only alias", "docs-only",
+            lambda: resolve("sparq-org/sparq", ["role:impl", "area:sparq-zk"], policy,
+                            bad_security_docs))
     check("pure core leaves fixtures unchanged",
           policy == policy_before and routing == routing_before, True)
     print("policy-resolve self-test", "PASSED" if ok else "FAILED")
