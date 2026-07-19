@@ -1312,6 +1312,55 @@ def enumerate_provenance_orphans(repo, pulls, provenance, bot_login=""):
     return orphans
 
 
+def check_plan_bot_pin(minted_bot_login, plan_bot_login):
+    """Fail LOUD when PLAN's worker-bot pin diverges from the MINTED App identity (#297 r1).
+
+    PLAN is the secret-free dispatcher half and runs BEFORE the CLAIM-side App-token mint, so
+    it pins enumerate_provenance_orphans to the maintainer-set REGISTRY_APP_BOT_LOGIN
+    repository variable instead of the minted slug. CLAIM is the first place both identities
+    coexist: a stale variable mis-pins the enumerator in the SILENT-HEALTHY direction (the
+    fleet's own PRs excluded from the orphan rows — the exact #104 invisible-orphan defect
+    back again), so divergence — or a missing pin while the minted identity is known — must
+    die here, before the orphan rows are counted as outstanding work. An EMPTY minted login
+    (every mint failed) skips the check: there is no authoritative identity to compare, and
+    those owners' mutation paths already defer."""
+    if not minted_bot_login:
+        return
+    if not plan_bot_login:
+        raise DispatchError(
+            "PLAN carried no worker-bot identity pin while the minted App identity is known "
+            "— the dispatch.yml plan/claim PLAN_BOT_LOGIN wiring has regressed")
+    if plan_bot_login != minted_bot_login:
+        raise DispatchError(
+            f"PLAN worker-bot pin {plan_bot_login!r} diverges from the minted App identity "
+            f"{minted_bot_login!r} — fix the REGISTRY_APP_BOT_LOGIN repository variable; "
+            "refusing to trust this plan's provenance-orphan rows")
+
+
+def plan_orphan_pin_wiring_gaps(workflow_text):
+    """Pure: name the MISSING facets of dispatch.yml's PLAN-side orphan bot pin (#297 r1).
+
+    Empty list == fully wired. The self-test asserts this over the LIVE workflow file so the
+    PRODUCTION PLAN invocation — not only a manual helper call — is proven pinned: (a) every
+    enumerate_provenance_orphans call site passes an explicit bot_login=, (b) PLAN_BOT_LOGIN
+    is wired from vars.REGISTRY_APP_BOT_LOGIN with the IDENTICAL expression in at least two
+    places (the PLAN pin and the CLAIM cross-check must read the same source, or the
+    check_plan_bot_pin comparison is vacuous), and (c) CLAIM forwards --plan-bot-login so the
+    cross-check actually runs. Absence of any facet — including no call site at all — is a
+    gap (fail closed)."""
+    gaps = []
+    calls = re.findall(r"enumerate_provenance_orphans\(([^)]*)\)", workflow_text)
+    if not calls or any("bot_login=" not in call for call in calls):
+        gaps.append("orphan-call-bot-login")
+    pins = re.findall(r"^\s*PLAN_BOT_LOGIN:\s*(\S.*?)\s*$", workflow_text, flags=re.M)
+    if (len(pins) < 2 or len(set(pins)) != 1
+            or "vars.REGISTRY_APP_BOT_LOGIN" not in pins[0]):
+        gaps.append("plan-bot-login-env")
+    if "--plan-bot-login" not in workflow_text:
+        gaps.append("claim-plan-bot-login-flag")
+    return gaps
+
+
 def filter_deferred_items(items, repo, leases, now):
     """Drop deferred-retry items that still have a LIVE lease (a worker is already on them)."""
     live_keys = _live_holder_keys(leases, now)
@@ -2096,7 +2145,7 @@ def _load_usage():
 
 
 def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
-             registry_root=".", bot_login="", ledger_root=""):
+             registry_root=".", bot_login="", ledger_root="", plan_bot_login=""):
     policy_module = _load_module("registry_policy_resolve", script_dir / "policy-resolve.py")
     allocator = _load_module("registry_select_and_claim", script_dir / "select-and-claim.py")
     worker_pr = _load_module("registry_worker_pr", script_dir / "worker-pr.py")
@@ -2117,6 +2166,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         raise DispatchError("PLAN target manifest does not exactly match enabled registry policy")
     if not workflow_ref or "\n" in workflow_ref or "\r" in workflow_ref:
         raise DispatchError("worker workflow ref is missing or unsafe")
+    # PLAN bot-pin cross-check (#297 r1): dies BEFORE the orphan rows below are counted as
+    # outstanding work — a drifted REGISTRY_APP_BOT_LOGIN variable must never silently
+    # mis-pin the orphan enumeration (see check_plan_bot_pin).
+    check_plan_bot_pin(bot_login, plan_bot_login)
 
     dispatched = 0
     # Zero-dispatch visibility (registry #28/#32): count the ready items the PLAN carried and, per
@@ -2811,6 +2864,11 @@ def _self_test():
     assert [o["pr_number"] for o in bad_orphans] == [96], bad_orphans
     # bot_login pin: with the App bot login known, a DIFFERENT [bot] is not ours -> not an orphan
     assert enumerate_provenance_orphans(repo, [bad_pull], bad_prov, bot_login=bot) == []
+    # ... while the fleet's OWN no-provenance PR stays an orphan under the same pin (the pin
+    # narrows the author gate, it must never blind the enumerator — #297 r1)
+    own_orphan = pull(99, "sparq-agent/issue-8-9-1", sha_b)
+    assert [o["pr_number"] for o in enumerate_provenance_orphans(
+        repo, [bad_pull, own_orphan], bad_prov, bot_login=bot)] == [99]
     # a CLOSED worker PR never reserves a crate -> never an orphan
     closed = pull(97, "sparq-agent/issue-7-9-1", sha_b, login="other[bot]", state="closed")
     assert enumerate_provenance_orphans(repo, [closed], provenance) == []
@@ -2829,6 +2887,50 @@ def _self_test():
     review_pr_numbers = {i["pr_number"] for i in enumerate_review_items(
         repo, orphan_pulls, provenance, [], issue_labels, now)}
     assert 91 not in review_pr_numbers and 91 in {o["pr_number"] for o in orphans}
+
+    # ---- PLAN bot-pin cross-check (#297 r1): CLAIM verifies PLAN's variable-sourced pin
+    # against the MINTED App identity — agreement passes, drift or a missing pin dies. ----
+    check_plan_bot_pin("", "")             # no minted identity -> nothing authoritative to verify
+    check_plan_bot_pin("", "a[bot]")
+    check_plan_bot_pin("a[bot]", "a[bot]")
+    for bad_pin in ("", "b[bot]"):
+        try:
+            check_plan_bot_pin("a[bot]", bad_pin)
+            raise AssertionError("divergent/missing PLAN bot pin must raise")
+        except DispatchError:
+            pass
+
+    # ---- PRODUCTION wiring of the orphan bot pin (#297 r1): pure verdict in both
+    # directions on synthetic text, then asserted over the LIVE dispatch.yml so the actual
+    # PLAN invocation — not only a manual helper call — is proven pinned. ----
+    wired = (
+        "          PLAN_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'x[bot]' }}\n"
+        "              orphans.extend(claim_mod.enumerate_provenance_orphans(\n"
+        "                  repo, pulls, provenance, bot_login=bot_login))\n"
+        "          PLAN_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'x[bot]' }}\n"
+        "            --plan-bot-login \"$PLAN_BOT_LOGIN\" \\\n"
+    )
+    assert plan_orphan_pin_wiring_gaps(wired) == []
+    assert plan_orphan_pin_wiring_gaps(wired.replace(", bot_login=bot_login", "")) \
+        == ["orphan-call-bot-login"]
+    assert plan_orphan_pin_wiring_gaps("no call site at all") \
+        == ["orphan-call-bot-login", "plan-bot-login-env", "claim-plan-bot-login-flag"]
+    assert plan_orphan_pin_wiring_gaps(wired.replace(
+        "PLAN_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'x[bot]' }}\n"
+        "            --plan-bot-login", "--plan-bot-login", 1)) == ["plan-bot-login-env"]
+    assert plan_orphan_pin_wiring_gaps(wired.replace(
+        "|| 'x[bot]' }}\n            --plan-bot-login",
+        "|| 'y[bot]' }}\n            --plan-bot-login")) == ["plan-bot-login-env"]
+    assert plan_orphan_pin_wiring_gaps(wired.replace("--plan-bot-login", "")) \
+        == ["claim-plan-bot-login-flag"]
+    dispatch_workflow = (Path(__file__).resolve().parent.parent
+                        / ".github" / "workflows" / "dispatch.yml")
+    try:
+        live_gaps = plan_orphan_pin_wiring_gaps(
+            dispatch_workflow.read_text(encoding="utf-8"))
+    except OSError:
+        live_gaps = ["workflow-unreadable"]   # fail closed — the wiring proof needs the file
+    assert live_gaps == [], f"dispatch.yml orphan bot-pin wiring gaps: {live_gaps}"
 
     # security flag from the SOURCE issue labels (zk) — needs a provenance-linked issue
     sec = enumerate_review_items(
@@ -4198,6 +4300,10 @@ def main():
                              "legacy registry root only")
     parser.add_argument("--bot-login", default="",
                         help="target App bot login (<slug>[bot]); required for review/deferred")
+    parser.add_argument("--plan-bot-login", default="",
+                        help="the worker-bot identity PLAN pinned its provenance-orphan "
+                             "enumeration to (vars.REGISTRY_APP_BOT_LOGIN); cross-checked "
+                             "against the minted --bot-login, divergence fails the claim")
     parser.add_argument("--workflow-ref", default="")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -4216,6 +4322,7 @@ def main():
             registry_root=args.registry_root,
             bot_login=args.bot_login,
             ledger_root=args.ledger_root,
+            plan_bot_login=args.plan_bot_login,
         )
     except DispatchError as exc:
         print(f"dispatch-claim: {exc}", file=sys.stderr)

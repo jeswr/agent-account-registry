@@ -364,11 +364,23 @@ jobs:
           test ! -e registry-ledger/scripts
 
       - name: Assemble and validate the v2 plan (registry code only, no tokens, local data)
+        env:
+          # Worker-fleet bot identity for the PLAN-side provenance-orphan pin (#297 review
+          # round 1): PLAN is the secret-free half and runs BEFORE the CLAIM-side App-token
+          # mint, so the minted slug cannot reach it. The maintainer-set repository VARIABLE
+          # (the same source triage-issue.yml trusts; not a secret) supplies the identity
+          # instead, and the claim step below forwards this EXACT value as --plan-bot-login so
+          # dispatch-claim.py cross-checks it against the MINTED slug every tick
+          # (check_plan_bot_pin) — variable drift dies loud instead of silently mis-pinning
+          # the orphan enumeration. Keep both env entries textually IDENTICAL: the
+          # dispatch-claim self-test statically asserts they match (plan_orphan_pin_wiring_gaps).
+          PLAN_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'agent-account-registry[bot]' }}
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP" "$RUNNER_TEMP/plan.json" <<'PY'
           import importlib.util
           import json
+          import os
           from pathlib import Path
           import re
           import sys
@@ -387,6 +399,18 @@ jobs:
               return module
 
           claim_mod = load("registry_dispatch_claim", registry / "scripts" / "dispatch-claim.py")
+
+          # Worker-fleet bot identity (#297 review round 1): the orphan enumeration below must
+          # pin to OUR App bot — a different App with write access can open a same-repo
+          # sparq-agent/* PR, and the loose any-[bot] default would count it as a fleet
+          # provenance orphan (inflating `planned` and the zero-dispatch health signal). Fail
+          # CLOSED when the identity cannot be established: die loud, never enumerate loose.
+          plan_bot_login = os.environ.get("PLAN_BOT_LOGIN", "")
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*\[bot\]", plan_bot_login):
+              raise SystemExit(
+                  "PLAN_BOT_LOGIN is unset or malformed — cannot pin the provenance-orphan "
+                  "enumeration to the worker App bot (set the REGISTRY_APP_BOT_LOGIN "
+                  "repository variable to <app-slug>[bot])")
 
           intermediate = json.loads(Path(out_dir, "issue-plan.json").read_text(encoding="utf-8"))
           # Lease state comes from the data-plane `ledger` branch checkout (issue #28) — the
@@ -486,8 +510,9 @@ jobs:
               # logic. Emit them as EXPLICIT outstanding-work rows so a fleet of provenance-write
               # failures can no longer read as an empty, apparently-healthy tick (CLAIM counts
               # them + raises the rolling alert; reconciliation is backfill-provenance.py).
+              # Pinned to OUR App bot (#297 r1) — a foreign App's [bot] PR is never counted.
               provenance_orphans.extend(claim_mod.enumerate_provenance_orphans(
-                  repo, pulls, provenance))
+                  repo, pulls, provenance, bot_login=plan_bot_login))
               # Deferred-retry items with a still-live lease are dropped registry-side, then the
               # busy-area union over ALL open worker PRs (issue #27) keeps impl items out of any
               # crate with an in-flight review-loop PR. The busy partition reads the SAME
@@ -857,6 +882,12 @@ jobs:
           # whichever mint succeeded.
           TARGET_GH_TOKENS: ${{ steps.token-map.outputs.tokens }}
           BOT_LOGIN: ${{ (steps.app-token-sparq.outputs.app-slug || steps.app-token-jeswr.outputs.app-slug) && format('{0}[bot]', steps.app-token-sparq.outputs.app-slug || steps.app-token-jeswr.outputs.app-slug) || '' }}
+          # The identity PLAN pinned its provenance-orphan enumeration to (#297 review round
+          # 1) — the SAME variable expression as the plan job's env (statically asserted by
+          # the dispatch-claim self-test). dispatch-claim cross-checks it against the minted
+          # BOT_LOGIN above and dies loud on drift, so a stale variable can never silently
+          # blind the orphan rows to the fleet's own PRs.
+          PLAN_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'agent-account-registry[bot]' }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
           # Privacy routing (locked decision 22c): a maintainer-set ALERT_REPO (+ ALERT_TOKEN
@@ -891,6 +922,7 @@ jobs:
             --registry-root registry \
             --ledger-root ledger \
             --bot-login "$BOT_LOGIN" \
+            --plan-bot-login "$PLAN_BOT_LOGIN" \
             --workflow-ref "$WORKFLOW_REF"
 
       # Zero-dispatch visibility (registry #28) + model-access health (#32): every tick that
