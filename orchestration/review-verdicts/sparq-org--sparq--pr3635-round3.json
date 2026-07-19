@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3635,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f4b195cd17f38e488071847f191640f12bd88d56",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "PrivacyBudget::would_exceed applies BUDGET_EPS_TOL = 1e-12 to both epsilon and delta. Consequently a zero delta budget can authorize a nonzero release whenever params.delta <= 1e-12 (for example, parameters with sufficiently large epsilon can pass DpParams validation), despite PrivacyBudget::new documenting that a zero budget refuses every non-trivial query. More generally, the ledger can spend up to 1e-12 beyond delta_total, which is enormous relative to commonly requested cryptographic failure probabilities. This breaks the claimed fail-closed basic-composition invariant. The existing delta-axis test uses 1e-6 and cannot detect the defect.",
+    "file": "crates/sparq-mpc/src/dp_output.rs",
+    "fix_hint": "Do not use a fixed absolute tolerance for delta privacy accounting. Prefer an exact conservative comparison/representation, or at minimum a one-sided floating-point treatment that can never authorize spend above the configured total. Add a regression test with delta_total = 0 and a valid DpParams whose delta is below 1e-12, plus a near-boundary small-delta composition test, asserting refusal without mutation. Consider separating epsilon rounding handling from delta rather than sharing BUDGET_EPS_TOL.",
+    "severity": "major",
+    "title": "Absolute epsilon tolerance allows overspending small delta budgets"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 corrects the prior blocker: shift() now accounts for the full neighboring-support gap for sensitivity greater than one, and the deterministic regression tests exercise that corrected bound. However, the budget accountant still permits privacy spend beyond the configured delta total because it applies a fixed 1e-12 absolute tolerance to delta. This contradicts the documented fail-closed accounting and can entirely erase small delta budgets, so the change is not yet sound as scoped.",
+  "verdict": "request_changes"
+ }
+}
