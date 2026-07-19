@@ -419,8 +419,8 @@ def _admitted_worker_prs(
     the ONLY linkage strong enough to suppress the exhausted-attempt defer (issue #170, review
     round 1).
 
-    `_current_links` linkage (a worker-looking branch OR a `Fixes #N` body reference) is
-    deliberately NOT trusted for suppression: anyone can open a PR whose body says `Fixes #N`,
+    Linkage weaker than these admissions (a worker-looking branch or a `Fixes #N` body
+    reference) is deliberately NOT trusted for suppression: anyone can open a PR whose body says `Fixes #N`,
     and a fork can spoof a worker-shaped head ref — under loose linkage either would hold an
     exhausted issue out of `needs:user` indefinitely. Suppression instead requires the SAME
     identity and provenance admissions the review loop applies before it will drive a PR
@@ -985,6 +985,12 @@ def _current_links(
     the mutation-boundary re-check), so trusting outsider linkage would let anyone hold a stale
     issue out of recovery indefinitely.
 
+    The sole linked issue is the one the head branch encodes — a worker attempt is bound to
+    exactly one source issue. Body closing references (`Fixes #N`) are ignored even on an
+    authenticated worker PR (review round 1): the branch is not bound to those issues, so
+    linking them would suppress stale/orphan recovery for unrelated issues the App is not
+    actually working.
+
     This is the identity gate WITHOUT the registry-provenance record `_admitted_worker_prs`
     additionally requires: recovery suppression asks 'is the App itself actively working this issue
     right now', for which the authoring identity is authoritative — provenance-record visibility
@@ -995,10 +1001,10 @@ def _current_links(
     if not bot:
         return links  # no bot identity resolved — trust no linkage, fail closed
     for number, pull in pulls.items():
-        if _worker_pr_identity(repo, pull, bot) is None:
+        branch = _worker_pr_identity(repo, pull, bot)
+        if branch is None:
             continue
-        for issue in linked_issue_numbers(pull):
-            links.setdefault(issue, set()).add(number)
+        links.setdefault(int(branch.group("issue")), set()).add(number)
     return links
 
 
@@ -1964,6 +1970,15 @@ def _self_test() -> int:
             9 in _current_links("owner/repo", {92: arbitrary_pull}, "app[bot]"),
             False,
         )
+        # Round 1: even a FULLY authenticated worker PR links ONLY its branch-encoded issue —
+        # a `Fixes #25` body reference on the issue-9 branch must not enter #25 in the map, or
+        # the App's own PR would suppress stale/orphan recovery for an unrelated issue.
+        cross_ref_pull = {**proven_pull, "body": WORKER_PR_MARKER + "\n\nFixes #25"}
+        check(
+            "round 1: an authenticated worker PR links only the branch-encoded issue",
+            _current_links("owner/repo", {91: cross_ref_pull}, "app[bot]"),
+            {9: {91}},
+        )
         check(
             "NEGATIVE: a fork PR with a spoofed worker-shaped head does not link",
             _current_links(
@@ -2141,6 +2156,36 @@ def _self_test() -> int:
         "issue #172: an untrusted linking PR does NOT suppress orphan recovery of issue #25",
         sorted((a.number, a.mode) for a in untrusted_actions),
         [(21, "ready"), (22, "ready"), (25, "ready")],
+    )
+    # Round 1, end-to-end: a fully AUTHENTICATED worker PR bound to issue #22 by its branch, whose
+    # body also says `Fixes #25`, suppresses recovery for #22 ONLY — #25 is readied. Linking body
+    # closing references back into `_current_links` reds this: the App's own PR would then hold an
+    # unrelated stale issue out of recovery.
+    cross_linked_pull = {
+        "updated_at": stale_at,
+        "head": {
+            "ref": "sparq-agent/issue-22-99-1",
+            "repo": {"full_name": "owner/repo"},
+        },
+        "user": {"login": "app[bot]"},
+        "body": WORKER_PR_MARKER + "\n\nFixes #25",
+    }
+    cross_actions, _prs4, _dead4 = _plan_actions(
+        {"owner/repo": limits},
+        orphan_issues,
+        {"owner/repo": {99: cross_linked_pull}},
+        {"owner/repo": set()},
+        orphan_attempts,
+        {},
+        [],
+        {},
+        now,
+        "app[bot]",
+    )
+    check(
+        "round 1: a worker PR's body reference does NOT suppress recovery of unrelated issue #25",
+        sorted((a.number, a.mode) for a in cross_actions),
+        [(21, "ready"), (25, "ready")],
     )
 
     malformed_failed = False
