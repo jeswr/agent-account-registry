@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 411,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1d3431b1251e9a1b9f6813f7bca36ae0402dc0d4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`round-record --head-sha` defaults to an empty string, and `record_round` maps every missing or malformed SHA to `none`. Thus the newly claimed invariant\u2014each charged round is bound to the concrete head it reviewed\u2014is not enforced. A workflow wiring regression or alternate caller can successfully create an unbound accounting record, and the self-test explicitly blesses that behavior. For a trust-plane identity field, missing or malformed input must stop the mutation rather than produce a weaker durable marker.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Make `--head-sha` required, validate it as exactly 40 lowercase hexadecimal characters before calling `_comment`, and raise `WorkerPrError` on invalid input. Remove support for `sha=none` from newly written markers and replace the `sha=none marker parses` test with assertions that missing and malformed values are rejected without posting a marker; legacy parsing can remain separate if backward compatibility is actually needed.",
+    "severity": "major",
+    "title": "Head-SHA binding silently degrades to an unbound marker"
+   }
+  ],
+  "progress": null,
+  "summary": "The stale-attempt subtraction and exact (round, run) matching are otherwise coherent and the added tests exercise the principal counting cases. However, the new control is described as binding every charged review round to concrete content, while its public command interface makes the head SHA optional and record_round deliberately converts any absent or malformed value to `sha=none`. That is a fail-open degradation in trust-plane accounting and leaves a durable round marker without the content identity this change relies on. The workflow currently supplies a validated-looking resolve output, but the script-level invariant must fail closed rather than silently mint an unbound marker if wiring regresses or another caller omits the argument.",
+  "verdict": "request_changes"
+ }
+}
