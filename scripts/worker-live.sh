@@ -549,11 +549,22 @@ _resolve_gate_package() {
 # and NEVER quoted; a rename/copy record is `XY <dst>\0<src>\0` (two NUL fields, order reversed vs
 # the arrow form), so BOTH endpoints are emitted and validated (a move into OR out of a gated
 # prefix is caught). Reads stdin so the self-test can feed a NUL fixture with no git.
+# NEWLINE REFUSAL (#434 review r1): git also permits NEWLINE bytes in filenames, and EVERYTHING
+# downstream of this parser (command substitution, printf, mapfile, the classifiers) is
+# newline-framed — a path like `.github/workflows/evil\n.yml` would split into two fragments,
+# neither matching `.github/workflows/*.yml`, so a touched workflow/script would get NO direct
+# validation while the gate still passed (zero targets is legitimate for docs-only diffs). Such a
+# path cannot be represented in this framing, so the parser REFUSES it outright: every path
+# (rename endpoints included) is validated BEFORE anything is emitted, a violation exits non-zero
+# with NOTHING on stdout (even a status-blind caller classifies nothing), and both gate callers
+# `|| die` on the failure. A newline-named file has no legitimate use in this repo — refuse and
+# surface beats guess and proceed.
 _porcelain_changed_paths() {
   python3 -c '
 import sys
 
 fields = sys.stdin.buffer.read().split(b"\0")
+paths = []
 i = 0
 n = len(fields)
 while i < n:
@@ -568,9 +579,19 @@ while i < n:
     # consume and emit it too so a rename of a gated file is not missed.
     if b"R" in xy or b"C" in xy:
         if i < n and fields[i]:
-            sys.stdout.buffer.write(fields[i] + b"\n")
+            paths.append(fields[i])
         i += 1
-    sys.stdout.buffer.write(path + b"\n")
+    paths.append(path)
+# validate EVERY path before emitting ANY: a newline byte would break the record framing of
+# every downstream consumer, so it is unrepresentable here — refuse the whole parse.
+for p in paths:
+    if b"\n" in p:
+        sys.stderr.write(
+            "worker-live: changed path contains a newline byte, which the newline-framed "
+            "gate pipeline cannot represent (refusing, fail closed): %r\n" % (p,))
+        sys.exit(1)
+for p in paths:
+    sys.stdout.buffer.write(p + b"\n")
 '
 }
 
@@ -597,7 +618,8 @@ run_gate() {
         # docs-quality gate is the real backstop. But it is a REAL error if the diff actually
         # touches crate source with no crate label, so fail closed in that case.
         local changed_paths
-        changed_paths="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)"
+        changed_paths="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
+          || die 'crate-scoped gate: changed-path listing refused (fail closed)'
         if printf '%s\n' "$changed_paths" | grep -qE '^crates/|^Cargo\.toml$|^Cargo\.lock$'; then
           die 'crate-scoped gate requires an area:<crate> label (diff touches crate source)'
         fi
@@ -892,7 +914,8 @@ _ensure_actionlint() {
 
 registry_selftest_gate() {
   local changed
-  changed="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)"
+  changed="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
+    || die 'registry-selftest gate: changed-path listing refused (fail closed)'
   [[ -n "$changed" ]] || die 'registry-selftest gate: no changed files to validate (fail closed)'
   local -a targets=()
   mapfile -t targets < <(printf '%s\n' "$changed" | _registry_selftest_targets "$FULL_SELFTEST_SUITE")
@@ -1953,6 +1976,23 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(printf '%s\n' "$pp" | grep -c '^src/lib\.rs$')" "1"
   chk "porcelain: untracked space path parsed whole" \
     "$(printf '%s\n' "$pp" | grep -c '^notes doc\.md$')" "1"
+
+  # --- [#434 review r1] git permits NEWLINE bytes in filenames, and every consumer downstream of
+  # this parser is newline-framed: `.github/workflows/evil\n.yml` would split into two fragments,
+  # NEITHER matching `.github/workflows/*.yml`, so the touched workflow got no direct target and
+  # the gate could still pass (zero targets is legitimate for docs-only diffs); the same trick
+  # hides scripts/*.py|sh. A newline path is unrepresentable in this framing, so the parser must
+  # REFUSE it (non-zero exit, NOTHING on stdout) in a plain record AND in a rename endpoint. Each
+  # chk flips RED if the parser regresses to splitting/emitting such a path. ---
+  chk "porcelain: newline-containing path is refused, not split (the #434 wf-gate bypass)" \
+    "$( (printf 'A  .github/workflows/evil\n.yml\0' | _porcelain_changed_paths >/dev/null 2>&1 \
+      && echo parsed) || echo refused)" "refused"
+  chk "porcelain: refused parse emits NO paths (a status-blind caller classifies nothing)" \
+    "$(printf 'A  .github/workflows/evil\n.yml\0 M scripts/x.py\0' \
+      | _porcelain_changed_paths 2>/dev/null || true)" ""
+  chk "porcelain: newline in a rename SOURCE endpoint is refused too" \
+    "$( (printf 'R  clean.yml\0scripts/evil\n.py\0' | _porcelain_changed_paths >/dev/null 2>&1 \
+      && echo parsed) || echo refused)" "refused"
 
   # --- [issue #140 review r1, #428 review r2] pinned actionlint provisioning. The gate fails
   # closed when a workflow changed and actionlint is missing, so the worker lane must provision a
