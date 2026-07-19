@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_prove_anthropic` reads `accessToken`, sends that bearer token to `/api/oauth/profile`, and returns the original credential unchanged. It never reads or exchanges `refreshToken`. A profile GET can prove an access token that is live now, but it cannot mint a new one; when the stored access token expires the request fails and the long-lived refresh credential is never used. This contradicts the module's purpose of minting a short-lived worker token without maintainer reauthentication and turns normal token expiry into a permanent broker failure.",
+   "file": "scripts/broker-refresh.py",
+   "fix_hint": "Implement the provider-supported refresh-token exchange (or invoke a provider operation that demonstrably performs it), persist/re-read the rotated credential in the isolated HOME, and only return the resulting access token after successful validation. Do not describe a profile check as refresh unless it actually rotates an expired/expiring token.",
+   "severity": "blocker",
+   "title": "Anthropic path validates an access token but never refreshes it"
+  },
+  {
+   "body": "All added tests call `_jwt_exp`, extraction, and `refresh_ok` with a caller-supplied boolean. None invokes `_prove_openai`, `_prove_anthropic`, or `refresh_via_cli` with mocked subprocess/network behavior and a credential file. Thus the test passes even when the live operation never refreshes or re-reads a changed token, as is currently true for Anthropic. The security-critical claim that a successful proof yields a refreshed credential is untested.",
+   "file": "scripts/broker-refresh.py",
+   "fix_hint": "Add non-vacuous mocked tests where an expired/old credential is materialized, the provider operation is simulated, and the assertion requires a different refreshed access token/expiry to be re-read. Include negative cases proving that status/profile success without credential refresh cannot be accepted as minting a fresh capability.",
+   "severity": "major",
+   "title": "Self-test never proves that provider operations refresh credentials"
+  }
+ ],
+ "progress": null,
+ "summary": "The change improves fail-closed extraction and derives OpenAI expiry from the JWT, but it does not implement the core Anthropic refresh contract. The new Anthropic operation only checks the currently stored access token and returns the credential unchanged; it never exchanges the stored refresh token. Consequently the broker cannot mint a replacement after access-token expiry and will fail permanently until credentials are manually replaced. The self-test does not exercise either provider proof function, so it cannot catch this central mismatch between validation and refresh.",
+ "verdict": "request_changes"
+}
