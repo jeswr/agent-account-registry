@@ -214,6 +214,17 @@ SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # CONCLUDED failure of THIS check on the CURRENT head enumerates a ci-fix; in-progress = no churn.
 CI_GATE_CHECK = "gate"
 FAILED_CONCLUSIONS = {"failure", "timed_out"}
+# A gate check-run that COMPLETED with any of these did not pass and did not cleanly fail: the
+# run was cancelled, never started, went stale, or needs a human (issue #160). None of these is
+# green and none is silently deferrable — required checks in these states will NOT merge, so each
+# must take the SAME ci-fix rerun/escalation path as a hard failure rather than collapse to
+# success. Previously only FAILED_CONCLUSIONS mapped to gate=failure and EVERY other completed
+# conclusion (cancelled/action_required/startup_failure/stale/neutral/skipped) fell through to
+# success — suppressing repair while looking merge-ready. These are the GitHub check-run
+# conclusions outside {success} ∪ FAILED_CONCLUSIONS; an UNRECOGNISED conclusion (None / hostile
+# garbage on a "completed" run) is deliberately NOT here — it degrades to gate=unknown (no ACT).
+BROKEN_CONCLUSIONS = {"cancelled", "action_required", "startup_failure", "stale",
+                      "neutral", "skipped"}
 GLOBAL_PACKAGE = "__global__"   # mirrors the target ready-engine's serializing partition
 CI_CONTEXT_MAX = 1000           # advisory failing-leg context cap (plan field + workflow input)
 MAX_FAILING_LEGS = 20
@@ -581,10 +592,23 @@ def interpret_check_runs(check_runs):
         gate = "missing"
     elif gate_entry[1].get("status") != "completed":
         gate = "pending"
-    elif gate_entry[1].get("conclusion") in FAILED_CONCLUSIONS:
-        gate = "failure"
     else:
-        gate = "success"
+        # ONLY the literal `success` conclusion is green (issue #160). A hard/transient failure
+        # OR a broken/incomplete run (cancelled, action_required, startup_failure, stale,
+        # neutral, skipped) is a concluded non-pass that takes the ci-fix rerun/escalation path.
+        # Anything unrecognised (None or hostile garbage on a "completed" run) degrades to
+        # unknown so a poisoned snapshot can only DEFER, never spuriously repair or go green.
+        # isinstance BEFORE each set membership: an unhashable JSON value ([] / {}) as the
+        # conclusion would TypeError the `in` lookup — a hostile snapshot must degrade to
+        # unknown, never crash (mirrors the plan-validation guard above).
+        conclusion = gate_entry[1].get("conclusion")
+        if conclusion == "success":
+            gate = "success"
+        elif isinstance(conclusion, str) and (conclusion in FAILED_CONCLUSIONS
+                                              or conclusion in BROKEN_CONCLUSIONS):
+            gate = "failure"
+        else:
+            gate = "unknown"
     failing = sorted({
         _sanitize_leg(name) for name, (_started, run) in latest.items()
         if name != CI_GATE_CHECK and run.get("status") == "completed"
@@ -3572,6 +3596,20 @@ def _self_test():
     rerun = runs + [{"name": "gate", "status": "completed", "conclusion": "success",
                      "started_at": "T3"}]
     assert interpret_check_runs(rerun)["gate"] == "success"
+    # [issue #160] ONLY literal `success` is green. A COMPLETED gate whose conclusion is a
+    # broken/incomplete run (cancelled, never-started, stale, needs-a-human) is NOT green — it
+    # takes the same ci-fix rerun/escalation path as a hard failure. Pre-fix EVERY one of these
+    # fell through to gate="success", suppressing repair on a PR that required checks won't merge.
+    for broken in ("cancelled", "action_required", "startup_failure", "stale",
+                   "neutral", "skipped"):
+        assert interpret_check_runs([{"name": "gate", "status": "completed",
+                                      "conclusion": broken}])["gate"] == "failure", broken
+    # ... but an UNRECOGNISED conclusion on a "completed" run (None / hostile garbage) is NOT a
+    # known non-pass: it degrades to unknown (never ACT on a poisoned snapshot), not to failure
+    # (no spurious repair) and never to success (pre-fix bug: both collapsed to green).
+    for junk in (None, "wat", 42, [], {"x": 1}):
+        assert interpret_check_runs([{"name": "gate", "status": "completed",
+                                      "conclusion": junk}])["gate"] == "unknown", junk
     assert interpret_check_runs([{"name": "gate", "status": "in_progress",
                                   "conclusion": None}])["gate"] == "pending"
     assert interpret_check_runs([])["gate"] == "missing"
