@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The lookup expansion is sound and fail-closed: it requests a substantially larger paginated result set, distinguishes a cap-sized (possibly truncated) response from an authoritative miss, and existing callers convert that condition into an undelivered failure rather than creating blindly. The new self-test is non-vacuous: it verifies the requested limit, proves discovery beyond the former 50-item window, and asserts that a full window raises. No trust checks, permissions, token handling, or workflow surfaces are weakened, and no reviewer-directed prompt injection appears in the diff.",
+ "verdict": "approve"
+}
