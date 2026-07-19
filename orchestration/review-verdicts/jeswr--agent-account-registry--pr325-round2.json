@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The new keyword derivation catches OSError, KeyError, and TOMLDecodeError and then continues with only the builtin keyword set. This is not fail-closed: target-specific match_labels such as worker/dispatch can disappear from security_keywords, so a matching PR/source-issue label added during review is not recognized by live_security_flagged. A benign-path PR can consequently auto-arm without the trust-surface label/comment even though its live label posture is a configured trust surface. The path classifier is not an equivalent backstop for a label-only posture.",
+   "file": ".github/workflows/review-fix.yml",
+   "fix_hint": "Treat any inability to load repos[repo].routing or parse the referenced routing file as a fatal resolve error, and add a self-test proving a missing/malformed routing cannot reach the arm step. Do not emit a reduced keyword set as a permissive fallback.",
+   "severity": "major",
+   "title": "Unreadable target routing silently weakens the live security-label audit"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The live-label recheck and its tests are otherwise substantive, but the keyword handoff is not fail-closed at its source. The resolve step explicitly suppresses missing or unreadable protected routing and continues with only builtin keywords. That can omit target-specific label keywords from both the initial classification and the arm-time recomputation, allowing an approved PR with a label-only target trust posture to arm without the required trust-surface audit. Because the prior round recorded no findings, this newly identified major finding makes progress regressing.",
+ "verdict": "request_changes"
+}
