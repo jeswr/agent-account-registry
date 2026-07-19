@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "reconcile_provenance queries with the exact head_branch, but select_reconcilable_pr only validates `^sparq-agent/issue-{issue}-...$`, and provenance_record repeats only that issue-prefix check. Thus the returned live PR object is never asserted to have `head.ref == head_branch`. The query parameter is not a substitute for validating the security-sensitive response: if filtering is ignored, altered, or behaves unexpectedly, a different run's bot-authored PR for the same issue can be recorded with this run's implementer identity and run_key. This violates the exact-match, fail-closed binding described by the change itself.",
+   "file": "scripts/worker-pr.py",
+   "fix_hint": "Pass the trusted head_branch through selection/final verification and require exact equality with `head.ref` (while retaining bot, open-state, and same-repo checks). Add a non-vacuous self-test containing a bot-authored, same-repo, open PR for the same issue but a different run branch and assert that it returns None; also test the final reconciliation/verification binding where practical.",
+   "severity": "major",
+   "title": "Reconciled PR is not verified against the exact run-specific head branch"
+  }
+ ],
+ "progress": null,
+ "summary": "The recovery path is well-motivated and most filters are fail-closed, but it does not actually enforce the key exact-match binding to the deterministic head branch. Both selection and the final live verification accept any syntactically valid branch for the same issue; the API query is being relied upon as the only exact filter. A provenance trust root should validate the returned object against the trusted run-specific branch value before writing. The self-tests also omit the same-issue/different-run case that exposes this gap.",
+ "verdict": "request_changes"
+}
