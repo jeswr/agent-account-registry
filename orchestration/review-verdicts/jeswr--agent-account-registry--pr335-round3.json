@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-3 diff completes the dedicated-marker migration in dispatch-claim's integration self-tests and remains consistent with worker-pr's whole-comment trust grammar. Every affected parser requires both the configured bot login and a full-body canonical marker shape; embedded, prefixed, trailing-text, multiline, and non-bot forgeries remain inert, while corrupt dedicated pin tiers still fail closed. Producers now emit the same canonical form, reviewer-controlled fields are reserved-prefix-neutralized, and progress is emitted separately as a host-shaped dedicated comment. The added assertions cover successful parsing, rejection paths, corrupt-pin failure, and the end-to-end post_findings laundering scenario; no vacuous or materially incomplete trust check is evident. No actionable diff-scoped issue is found.",
+ "verdict": "approve"
+}
