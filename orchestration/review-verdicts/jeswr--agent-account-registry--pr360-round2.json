@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 360,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b555a3a8a94c5a6f1ffade906db41867d99ec451",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`live_leases` is still loaded once before iterating and is not the remote ledger state used by `allocator.claim`. The added comments now acknowledge that a sibling lease committed after this snapshot\u2014including an earlier claim in the same loop\u2014is invisible, while the allocator still checks only same-prefix leases. Thus review/fix and implementation claims for one repository/package can still both succeed. The wiring test changes the checkout between separate `run_items` calls, so it proves only the preflight behavior and cannot fail when the claim-time race remains open.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Enforce repository/package cross-lane exclusion inside select-and-claim's SHA-bound CAS transaction using the live remote ledger for every claim path. Add a non-vacuous contention test in which mixed-lane contenders share one crate and the second claim observes and rejects the first claim committed after the initial plan/checkout snapshot.",
+    "severity": "major",
+    "title": "Cross-lane exclusion still uses a stale snapshot instead of claim-time CAS state"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-1 soundness issue remains unchanged. This revision accurately relabels the checkout-ledger check as defense in depth and explicitly documents the residual TOCTOU, but documentation does not enforce the required cross-lane exclusion. The ledger is still read once before the loop, while allocator claims commit against remote state and serialize only same-prefix leases. A foreign-lane claim made after that snapshot, including an earlier mixed-lane claim in the same dispatch loop, can therefore coexist on the same crate. The new tests validate only leases already present in the local checkout and expressly do not test or close the claim-time race. Because the intended trust-plane invariant is still not enforced atomically, the change remains incomplete and unsound.",
+  "verdict": "request_changes"
+ }
+}
