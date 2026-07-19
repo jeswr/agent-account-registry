@@ -13,12 +13,12 @@
   {
    "account": "acct2css",
    "claim_id": "6ded46149af945a098e1a4da752f9186",
-   "holder": "sparq-org/sparq#3204@dispatch-29684708795.1",
+   "holder": "sparq-org/sparq#3204@29684898066.1",
    "package": "site",
    "role": "research",
    "model": "opus",
-   "issued_at": 1784459921,
-   "expires_at": 1784466221
+   "issued_at": 1784459941,
+   "expires_at": 1784466241
   },
   {
    "account": "acct01",
