@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 407,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c99a7d20137ed8c2615bdfc978ac6a681b92522d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`role_of` returns `None` for both zero roles and multiple roles, so `resolve([\"role:impl\", \"role:docs\", ...])` produces a real default/security route instead of rejecting the malformed input. This contradicts the file's stated exact-match contract with `policy-resolve.resolve`, which raises `PolicyError` for multiple roles, and creates a default-allow path for any caller that invokes `resolve` without the planner's new precheck. The added self-test entrenches that unsafe divergence by expecting `sol`.",
+    "file": "scripts/route-resolve.py",
+    "fix_hint": "Distinguish roleless input from ambiguous input in `resolve` and reject ambiguity (for example with a dedicated exception), matching claim-side policy behavior. Update the self-test to assert that multiple distinct `role:*` labels raise/reject; retain planner tests proving one malformed issue cannot cause an arbitrary role selection, adapting planner handling to the resolver's rejection as needed.",
+    "severity": "major",
+    "title": "Ambiguous roles fall through to a permissive default route"
+   }
+  ],
+  "progress": null,
+  "summary": "The planner-side rejection is deterministic and its new tests are non-vacuous, but the shared route resolver now treats an ambiguous multi-role label set as roleless and sends it through security/default routing. That is not fail-closed and explicitly diverges from the claim-side policy resolver, which rejects the same input. Because route-resolve.py is independently executable/reusable and its contract says PLAN and CLAIM resolution must match, ambiguity must be rejected rather than converted into a valid default route.",
+  "verdict": "request_changes"
+ }
+}
