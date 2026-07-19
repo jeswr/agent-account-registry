@@ -96,21 +96,21 @@ SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # subtree, a bare path is an exact-or-descendant match. review-fix.yml passes the resolved list
 # from the target policy row; this constant is the built-in fail-closed default when no list is
 # supplied (so the guard is never silently absent).
+#
+# [issue #145 — sol-audit worker] The manifest is DIRECTORY PREFIXES, not an enumerated file list.
+# The prior per-script enumeration was a standing blind spot: it omitted credential materialization
+# (scripts/worker-prep.sh), the model-isolation container (containers/), and the model-health CAS
+# (scripts/model-health.py), so a benign-labelled PR could weaken any of them without tripping the
+# arm gate — and EVERY newly added trust-plane script would silently inherit the same hole. A
+# whole-directory prefix is fail-closed by construction: every script under scripts/, every
+# container definition under containers/, and every workflow/policy/routing/agent file is a trust
+# surface, and a NEW file in any of those trees is covered the moment it lands. Keep this in sync
+# with policy/repos.toml `security_paths` (the per-target override that REPLACES this default in
+# production) and the worker-live.sh registry-selftest gate — they are the one canonical manifest
+# consumed by routing, the arm check, and the gate respectively.
 DEFAULT_TRUST_SURFACE_PATHS = (
-    "scripts/trust-gate.py",
-    "scripts/dispatch-claim.py",
-    "scripts/worker-live.sh",
-    "scripts/worker-pr.py",
-    "scripts/worker-issue.py",
-    "scripts/select-and-claim.py",
-    "scripts/groom.py",
-    "scripts/policy-resolve.py",
-    "scripts/route-resolve.py",
-    "scripts/ready-issues.py",
-    "scripts/dispatch-plan.py",
-    "scripts/triage.py",
-    "scripts/broker-refresh.py",
-    "scripts/account-usage.py",
+    "scripts/",          # every orchestration/credential/health/provenance control script
+    "containers/",       # the model-isolation sandbox (worker-model.Dockerfile)
     ".github/workflows/",
     "policy/",
     "orchestration/",
@@ -2482,6 +2482,19 @@ def _self_test():
     check("trust-surface flags a renamed-from surface path",
           trust_surface_paths_touched(["docs/moved.md", "scripts/groom.py"]),
           ["scripts/groom.py"])
+    # [issue #145] the manifest is fail-closed DIRECTORY PREFIXES so a NEW credential / container /
+    # health / orchestration path cannot silently escape the arm gate by omission. The audit's three
+    # named blind spots — worker credential prep, the model-sandbox container, and the model-health
+    # CAS — now flag under the default. (These FAILED against the prior enumerated list.)
+    check("trust-surface flags worker credential prep (issue #145)",
+          trust_surface_paths_touched(["scripts/worker-prep.sh"]),
+          ["scripts/worker-prep.sh"])
+    check("trust-surface flags the model-sandbox container (issue #145)",
+          trust_surface_paths_touched(["containers/worker-model.Dockerfile"]),
+          ["containers/worker-model.Dockerfile"])
+    check("trust-surface flags the model-health CAS (issue #145)",
+          trust_surface_paths_touched(["scripts/model-health.py"]),
+          ["scripts/model-health.py"])
     # a caller-supplied (policy security_paths) list REPLACES the default set.
     check("trust-surface honours a supplied path list",
           trust_surface_paths_touched(["scripts/worker-pr.py", "custom/thing.py"],

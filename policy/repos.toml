@@ -98,21 +98,18 @@ cross_provider_fallback = false
 # outcome + ready-and-arm steps pass this list to worker-pr.trust_surface_paths_touched, and
 # ready-and-arm re-derives the live PR diff (renamed paths included) before ever undrafting/arming.
 # The automated cross-provider review still runs — only the final arm click is a human's here.
+#
+# [issue #145 — sol-audit worker] DIRECTORY PREFIXES, not an enumerated file list. The prior
+# per-script enumeration omitted credential materialization (scripts/worker-prep.sh), the model-
+# isolation container (containers/), and the model-health CAS (scripts/model-health.py) — a benign
+# PR could weaken any of them without the arm gate firing, and every newly added trust-plane script
+# inherited the same hole. Whole-directory prefixes are fail-closed: a NEW file under any of these
+# trees is a trust surface the moment it lands. This is the canonical manifest — keep it in sync
+# with worker-pr.py DEFAULT_TRUST_SURFACE_PATHS (the built-in default this REPLACES when supplied)
+# and the worker-live.sh registry-selftest gate.
 security_paths = [
-  "scripts/trust-gate.py",
-  "scripts/dispatch-claim.py",
-  "scripts/worker-live.sh",
-  "scripts/worker-pr.py",
-  "scripts/worker-issue.py",
-  "scripts/select-and-claim.py",
-  "scripts/groom.py",
-  "scripts/broker-refresh.py",
-  "scripts/account-usage.py",
-  "scripts/policy-resolve.py",
-  "scripts/route-resolve.py",
-  "scripts/ready-issues.py",
-  "scripts/dispatch-plan.py",
-  "scripts/triage.py",
+  "scripts/",           # every orchestration/credential/health/provenance control script
+  "containers/",        # the model-isolation sandbox (worker-model.Dockerfile)
   "policy/",
   "orchestration/",
   ".github/workflows/",

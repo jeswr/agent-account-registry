@@ -662,8 +662,61 @@ _registry_selftest_targets() {
       .github/workflows/*.yml|.github/workflows/*.yaml)
         printf 'wf:%s\n' "$path"
         ;;
+      # [issue #145] the model-isolation sandbox. A touched container definition was previously
+      # classified into NOTHING — the gate never looked at it — so a benign PR could swap the
+      # pinned base image for a mutable tag unchecked. Emit a dockerfile: target so the gate
+      # asserts its base images stay digest-pinned.
+      containers/*Dockerfile|containers/*.Dockerfile|containers/*.dockerfile)
+        printf 'dockerfile:%s\n' "$path"
+        ;;
     esac
   done
+}
+
+# PURE (self-tested): every `FROM` in a container definition must pin its base image by @sha256:
+# digest — a mutable tag is a supply-chain / model-isolation weakening (a benign-labelled PR could
+# repoint the worker sandbox at an attacker-controlled image). Returns non-zero and names the first
+# offending FROM. Multi-stage builds are honoured: a `FROM <alias>` that references a prior
+# `... AS <alias>` stage is allowed unpinned; leading `--platform=`/`--flag` tokens are skipped.
+_assert_dockerfile_pinned() {
+  local file="$1"
+  [[ -f "$file" ]] || { printf 'worker-live: container definition missing: %s\n' "$file" >&2; return 1; }
+  local line lower img as_seen i j
+  local -A stage_alias=()
+  local -a toks
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lower=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+    [[ "$lower" =~ ^[[:space:]]*from[[:space:]] ]] || continue
+    read -r -a toks <<< "$line"
+    # first non-flag token after FROM is the base image ref
+    img=""; i=1
+    while [[ $i -lt ${#toks[@]} ]]; do
+      case "${toks[$i]}" in
+        --*) i=$((i + 1)) ;;
+        *) img="${toks[$i]}"; break ;;
+      esac
+    done
+    [[ -n "$img" ]] || { printf 'worker-live: FROM with no image in %s: %s\n' "$file" "$line" >&2; return 1; }
+    # capture an `AS <alias>` stage name (case-insensitive) for later multi-stage FROM refs
+    as_seen=""; j=$((i + 1))
+    while [[ $j -lt ${#toks[@]} ]]; do
+      if [[ "$(printf '%s' "${toks[$j]}" | tr '[:upper:]' '[:lower:]')" == as ]]; then
+        as_seen="${toks[$((j + 1))]:-}"; break
+      fi
+      j=$((j + 1))
+    done
+    if [[ -n "${stage_alias[$img]:-}" ]]; then
+      # a reference to a prior build stage — not an external base image, allowed unpinned
+      [[ -n "$as_seen" ]] && stage_alias[$as_seen]=1
+      continue
+    fi
+    if [[ "$img" != *@sha256:* ]]; then
+      printf 'worker-live: base image not digest-pinned in %s: %s\n' "$file" "$img" >&2
+      return 1
+    fi
+    [[ -n "$as_seen" ]] && stage_alias[$as_seen]=1
+  done < "$file"
+  return 0
 }
 
 registry_selftest_gate() {
@@ -723,6 +776,17 @@ registry_selftest_gate() {
       else
         printf 'worker-live: actionlint not on PATH; yaml parse only for %s\n' "$name"
       fi
+    fi
+  done
+
+  # 5) [issue #145] every touched container definition must keep its base images digest-pinned so a
+  #    benign-labelled PR cannot silently weaken the model-isolation sandbox.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == dockerfile ]]; then
+      printf 'worker-live: base-image pin check %s\n' "$name"
+      _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+      ran=$((ran + 1))
     fi
   done
 
@@ -1631,6 +1695,7 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "scripts/backfill-provenance.py" \
     "scripts/dashboard-gen.py" \
     "scripts/pat-validity.py" \
+    "containers/worker-model.Dockerfile" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
     "$(grep -c 'self:worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
@@ -1648,6 +1713,31 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(grep -c 'self:dashboard-gen.py' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate suite includes pat-validity (review r2 #3 — not just when touched)" \
     "$(grep -c 'self:pat-validity.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  # [issue #145] a touched container definition is now classified (was NOTHING before) so the gate
+  # can validate its base-image pinning.
+  chk "registry gate classifies a touched container definition" \
+    "$(grep -c 'dockerfile:containers/worker-model.Dockerfile' <<< "${sel//,/$'\n'}" || true)" "1"
+
+  # --- [issue #145] container base-image pin check (non-vacuous: a mutable-tag base FAILS). Proves
+  # the real worker sandbox is digest-pinned, that an unpinned base is rejected, and that a
+  # multi-stage FROM referencing a prior build stage is allowed unpinned. ---
+  chk "the live worker-model sandbox is digest-pinned" \
+    "$( _assert_dockerfile_pinned "$SCRIPT_DIR/../containers/worker-model.Dockerfile" >/dev/null 2>&1 \
+        && echo pinned || echo unpinned)" "pinned"
+  printf 'FROM node:20-slim@sha256:%s AS node\nFROM rust:1.88@sha256:%s\nCOPY --from=node /x /x\n' \
+    "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" > "$tmp/ok.Dockerfile"
+  chk "digest-pinned multi-stage Dockerfile passes" \
+    "$( _assert_dockerfile_pinned "$tmp/ok.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
+  printf 'FROM node:20-slim\n' > "$tmp/bad.Dockerfile"
+  chk "mutable-tag base image is REJECTED (non-vacuous)" \
+    "$( _assert_dockerfile_pinned "$tmp/bad.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'FROM rust:1.88@sha256:%s AS build\nFROM build\n' "$(printf 'c%.0s' {1..64})" \
+    > "$tmp/stage.Dockerfile"
+  chk "multi-stage FROM referencing a prior stage alias is allowed unpinned" \
+    "$( _assert_dockerfile_pinned "$tmp/stage.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
