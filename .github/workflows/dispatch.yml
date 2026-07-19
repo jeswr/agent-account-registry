@@ -896,6 +896,9 @@ jobs:
       # BEFORE claim-side work so a mid-claim abort still surfaces as planned>0/launched-0.
       # A truly empty frontier (planned == 0 AND an empty defer histogram) stays recordless by
       # design; a snapshot-skip-only tick (issue #109) is degraded and records zero-dispatch.
+      # NOTE (issue #205): an open zero-dispatch alert is recovered on the decide side even when
+      # the fleet has aged out of the window (model-health.py classify_records + open-alert
+      # markers), so the recordless empty tick no longer leaves the alert open forever.
       # always() so a claim FAILURE (exactly when nothing launches) is still surfaced. No issue
       # numbers or account handles are emitted.
       - name: Surface + record the dispatch-tick health state
