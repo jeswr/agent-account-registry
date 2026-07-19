@@ -123,7 +123,12 @@ def _new_lane_counts():
 
 
 def _fix_dispatch_line(counts):
-    """One privacy-safe, per-tick fix fan-out telemetry line (issue #448)."""
+    """One privacy-safe, per-tick fix fan-out telemetry line (issues #448/#460).
+
+    ``eligible`` means PLAN enumerated a fix-lane item.  CLAIM may still exclude it during
+    authoritative live revalidation; those items remain visible as deferred instead of making
+    the line incorrectly report zero eligible after PLAN already surfaced work.
+    """
     counts = counts or Counter()
     eligible = int(counts.get("eligible", 0) or 0)
     launched = int(counts.get("launched", 0) or 0)
@@ -1208,36 +1213,58 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         sha = str(head.get("sha", ""))
         head_repo = (head.get("repo") or {}).get("full_name")
         login = str((pull.get("user") or {}).get("login", ""))
+        # Issue #460 exclusion telemetry: identify the explicit fix signal BEFORE any trust/
+        # shape gate, then make every rejection of such a PR visible with its exact reason.
+        # The snapshot projection emits label-name strings while direct REST fixtures carry
+        # objects, so accept exactly those two production shapes and ignore malformed entries.
+        labels = sorted({
+            name for label in (pull.get("labels") or [])
+            for name in [label.get("name") if isinstance(label, dict) else label]
+            if isinstance(name, str) and name
+        })
+        changes_signalled = "review:changes" in labels
+
+        def exclude_changes(reason):
+            if changes_signalled:
+                identity = number if isinstance(number, int) and not isinstance(number, bool) \
+                    and number > 0 else "unknown"
+                print(f"fix-enumeration: exclude {repo}#{identity}: {reason}")
+
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            exclude_changes("invalid PR number in snapshot")
             continue
         if pull.get("state") != "open":
+            exclude_changes(f"snapshot state is {pull.get('state')!r}, not open")
             continue
         if not HEAD_REF_RE.match(ref):
+            exclude_changes("head ref is not a worker branch")
             continue
         if head_repo != repo:
+            exclude_changes("head repo is not the target repo")
             continue                      # fork head — attacker-controlled, never reviewed
         if not login.endswith("[bot]") or (bot_login and login != bot_login):
+            exclude_changes("author is not the trusted App bot")
             continue
         record = provenance.get(number)
-        if not is_enumerable_provenance(record, number):
+        record_error = provenance_admission_error(record, number)
+        if record_error:
+            exclude_changes(record_error)
             continue                      # missing/invalid registry provenance record — fail
                                           # closed by the ONE shared predicate (CLAIM,
                                           # review-fix.yml resolve, and groom's draft carve-out
                                           # apply the same one, so "enumerated here" and
                                           # "admitted there" cannot drift)
         impl_provider = record["impl_provider"]
-        labels = sorted({
-            label.get("name") if isinstance(label, dict) else label
-            for label in (pull.get("labels") or [])
-            if isinstance(label, (dict, str))
-        } - {None})
         if HUMAN_HOLD_PR_LABELS & set(labels):
+            exclude_changes("PR carries a human-owned hold label")
             continue                      # terminal — human-owned, nothing autonomous re-enters
         if not SAFE_SHA.fullmatch(sha):
+            exclude_changes("head SHA is missing or malformed")
             continue
         issue_number = record["issue"]    # a positive int — guaranteed by the predicate above
         source_labels = issue_labels.get(issue_number, [])
         if any(isinstance(label, str) and label.startswith("needs:") for label in source_labels):
+            exclude_changes(f"source issue #{issue_number} carries a needs:* human hold")
             continue                      # the SOURCE issue is human-parked (groom/escalation) —
                                           # the whole PR surface is human-owned too
         # [round-5 P1] CROSS-LANE SUPERSESSION: an (un)parked PR that reaches this point may
@@ -1260,6 +1287,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             print(f"exclude {repo}#{number}: superseded-until-sibling-resolves — a live "
                   "sibling lease (any lane) still holds this PR's package(s); it re-enters "
                   "when that lease releases or expires")
+            exclude_changes("superseded until a live sibling package lease resolves")
             continue
         draft = pull.get("draft") is True
         status = pr_status.get(number) if isinstance(pr_status, dict) else None
@@ -1310,6 +1338,8 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         if status.get("conflicting") is True:
             if lease_free:
                 emit("needs-rebase")
+            else:
+                exclude_changes("a live per-PR review/fix lease holds the conflict repair")
             continue
         # Explicit review labels are authoritative re-entry signals, independent of GitHub's
         # draft bit.  An orchestrator/human adjudication can relabel a formerly human-owned READY
@@ -1318,6 +1348,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         # redrafts a ready item while preserving this state before any model is launched.
         if "review:changes" in labels:
             if f"fix:{repo}#{number}" in live_keys:
+                exclude_changes("a live per-PR fix lease already owns this PR")
                 continue                  # per-PR single-flight; re-emit after release/expiry
             emit("needs-fix")
             continue
@@ -1785,6 +1816,14 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         if (not pending_telemetry["launched"]
                 and sum(defer_reasons.values()) == pending_telemetry["reason_total"]):
             defer_reasons[f"{pending_telemetry['lane']}:preclaim-defer"] += 1
+        if (pending_telemetry["lane"] == "fix" and not pending_telemetry["launched"]
+                and sum(value for key, value in fix_dispatch.items()
+                        if key.startswith("defer:"))
+                == pending_telemetry["fix_reason_total"]):
+            # The exact per-PR cause was printed at the rejection site. Keep the aggregate
+            # privacy-safe while ensuring an enumerated fix item can never vanish from the
+            # fleet line merely because it stopped before allocator.claim().
+            fix_dispatch["defer:preclaim-defer"] += 1
         pending_telemetry = None
 
     for item in review_items:
@@ -1792,10 +1831,17 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         number = item["pr_number"]
         lane = _review_item_lane(item["state"])
         lanes[lane]["planned"] += 1
+        if lane == "fix":
+            # Issue #460: count at the actual PLAN->CLAIM enumeration boundary, not just
+            # immediately before allocator.claim(). The old placement turned every valid
+            # live-revalidation/budget exclusion into the false `0 eligible` signal.
+            fix_dispatch["eligible"] += 1
         pending_telemetry = {
             "lane": lane,
             "launched": False,
             "reason_total": sum(defer_reasons.values()),
+            "fix_reason_total": sum(
+                value for key, value in fix_dispatch.items() if key.startswith("defer:")),
         }
         try:
             if not bot_login:
@@ -2154,8 +2200,6 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         holder = f"{holder_prefix}{number}@dispatch-" \
                  f"{os.environ.get('GITHUB_RUN_ID', 'local')}." \
                  f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
-        if mode == "fix":
-            fix_dispatch["eligible"] += 1
         try:
             claim_result = allocator.claim(
                 registry_repo,
@@ -3546,6 +3590,67 @@ def _self_test():
              "recorded_at_run": "2.1"},
     }
     issue_labels = {7: ["area:crate-a", "role:impl"], 9: ["area:sparq-zk", "role:impl"]}
+
+    # ---- issue #460 SNAPSHOT -> WORKFLOW ROW -> ENUMERATOR end-to-end regression ----
+    # Start at plan-snapshot.py's raw document shape (a complete wrapper around the verbatim
+    # pulls-list REST row), then execute the ACTUAL field-selection block embedded in
+    # dispatch.yml. This is deliberately not a hand-built enumerate_review_items row: changing
+    # or dropping a production projection field makes this test fail at the same boundary as
+    # PLAN. PR #442 supplies the concrete live shape and its ledger provenance field set.
+    snapshot_repo = "jeswr/agent-account-registry"
+    snapshot_sha = "3" * 40
+    snapshot_doc = {"complete": True, "items": [{
+        "number": 442,
+        "state": "open",
+        "draft": False,
+        "body": "Fixes #144",
+        "labels": [{"id": 1, "name": "review:changes"}],
+        "head": {
+            "ref": "sparq-agent/issue-144-29694084610-1",
+            "sha": snapshot_sha,
+            "repo": {"full_name": snapshot_repo},
+        },
+        "user": {"login": "sparq-orchestrator[bot]", "type": "Bot"},
+    }]}
+    workflow_source = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                       / "dispatch.yml").read_text(encoding="utf-8")
+    projection_start = workflow_source.index("              pr_snapshot = []\n")
+    projection_end = workflow_source.index(
+        '              Path(out_dir, f"pulls-{index}.json")', projection_start)
+    projection_namespace = {"pulls": snapshot_doc["items"]}
+    exec(textwrap.dedent(workflow_source[projection_start:projection_end]),
+         projection_namespace)  # noqa: S102 — repository-owned workflow source
+    snapshot_rows = projection_namespace["pr_snapshot"]
+    snapshot_provenance = {442: {
+        "pr_number": 442,
+        "head_sha_at_open": "6eb5c28aa2e9441ecd19fb8aa460bc70e2912e80",
+        "impl_provider": "anthropic",
+        "impl_alias": "opus",
+        "impl_account_h": "9e13ea21abf27e68",
+        "issue": 144,
+        "recorded_at_run": "29694084610.1",
+    }}
+    snapshot_items = enumerate_review_items(
+        snapshot_repo, snapshot_rows, snapshot_provenance, [],
+        {144: ["area:dispatch", "role:impl", "status:in-progress-review"]}, now)
+    assert [(item["pr_number"], item["state"], item["package"])
+            for item in snapshot_items] == [(442, "needs-fix", "dispatch")], snapshot_items
+
+    # Every snapshot-visible changes PR excluded before emit names its exact reason. Missing
+    # provenance is representative of an early trust-gate rejection; the valid twin above must
+    # remain quiet. Restoring the pre-#456 `if draft:` wrapper makes the READY twin produce zero,
+    # which is the mutation check run explicitly by issue #460's gate command.
+    import contextlib
+    import io
+    excluded_log = io.StringIO()
+    with contextlib.redirect_stdout(excluded_log):
+        assert enumerate_review_items(
+            snapshot_repo, snapshot_rows, {}, [],
+            {144: ["area:dispatch", "role:impl"]}, now) == []
+    assert excluded_log.getvalue().strip() == (
+        "fix-enumeration: exclude jeswr/agent-account-registry#442: "
+        "provenance record is not a JSON object"), excluded_log.getvalue()
+
     pulls = [
         pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"]),
         # spoofed FORK head with a worker-shaped ref: must NOT be enumerated
@@ -4193,6 +4298,12 @@ def _self_test():
             # Issue #450 no-silent-defer: even a pre-claim live-trigger drift gets a coarse
             # non-empty shared telemetry reason (the exact detail remains in the per-PR log).
             assert launched == 0 and reasons["fix:preclaim-defer"] == 1, reasons
+            # Issue #460: this item was already ENUMERATED into the fix lane. Live trigger drift
+            # may defer it, but must not rewrite that fact as `0 eligible`; the aggregate reason
+            # stays privacy-safe while the per-PR line above carries the exact cause.
+            assert _fix_dispatch_line(run_items.fix_dispatch) == (
+                "fix-dispatch: 1 eligible, 0 launched, 1 deferred "
+                "(reasons: preclaim-defer=1)"), run_items.fix_dispatch
             # trigger still live: the ready PR IS defused (disarm --when always), exactly once
             fake["check_runs"] = gate_red
             run_items([ci_item])
