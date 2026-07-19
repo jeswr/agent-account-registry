@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3621,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "53f117f944b3f34e462b5986d0fcee332cfa869e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The instance watchdog defaults to 14,400 seconds, but the launcher polls only 120 times at 30 seconds (about one hour) and then its EXIT trap terminates the instance. The documented matrix includes a deliberate 10^8-open ceiling cell and describes a four-hour hard cap, so a healthy sweep that needs more than one hour is killed before it can write DONE. The self-test only inspects marker strings and does not validate this lifetime relationship.",
+    "file": "scripts/mpc-ec2-ceiling.sh",
+    "fix_hint": "Derive the polling deadline from WATCHDOG_SECS (plus bounded startup/grace time), or expose and validate a separate launcher timeout that is guaranteed not to be shorter than the in-box deadline. Add a hermetic check proving the launcher wait budget covers the configured instance watchdog.",
+    "severity": "major",
+    "title": "Launcher terminates valid runs after one hour despite a four-hour watchdog"
+   },
+   {
+    "body": "When MPC_CEILING_FAILED appears, no sentinel appears, the instance terminates, polling expires, or the tar pipeline fails, the script only logs the problem and reaches the final `log \"done\"` with exit status zero. In the DONE branch, `... && log ... || log \"tar pull failed\"` also converts extraction failure into success. Automation can therefore treat a failed or missing benchmark artifact as a successful ceiling run, so fail-closed behavior is incomplete at the launcher boundary.",
+    "file": "scripts/mpc-ec2-ceiling.sh",
+    "fix_hint": "Track a final outcome and exit nonzero unless DONE was observed and the result archive was transferred and extracted successfully. Preserve diagnostic log pulling as a best-effort operation, then call die or return the recorded nonzero status. Extend the hermetic test with stubbed polling/SSH/tar outcomes and assert the launcher exit code.",
+    "severity": "major",
+    "title": "Remote failure and result-transfer failure still return success"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the prior root user-data injection and makes the on-instance setup/build path fail closed, with meaningful negative self-tests. Two launcher-level completion defects remain: the orchestrator can terminate a valid long-running matrix well before its declared watchdog, and it still exits successfully when the remote run fails, times out, or result transfer fails. Thus callers cannot reliably distinguish a completed, retrieved ceiling run from failure.",
+  "verdict": "request_changes"
+ }
+}
