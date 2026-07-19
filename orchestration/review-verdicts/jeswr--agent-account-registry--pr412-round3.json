@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 412,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dfde67255ec634b5923963d5c112bccdf89d8928",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-2 type-confusion finding is correctly resolved. `_json_type_exact` enforces recursive, type-sensitive equality for non-volatile JSON content, including explicit rejection of bool/int and int/float equivalence, while preserving exact object keys and list structure. The added negative self-tests use valid same-run volatile stamps and independently demonstrate that `pr_number: true` versus `pr_number: 1` and `issue: 7.0` versus `issue: 7` raise the fail-closed divergence error; these tests would fail under the prior implementation and are non-vacuous. Volatile-field handling remains opt-in and continues to require valid, matching immutable run identities. No remaining correctness, soundness, test-validity, or security issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
