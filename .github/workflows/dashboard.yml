@@ -73,12 +73,23 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          # The salt is the probe's ONLY route to the openai quota signal (issue #29): the
+          # model-health ledger keys rate-limit backoff records by SALTED account hash, so a
+          # salt-less probe emits bare `{"exempt": true}` entries and the reactive backoff never
+          # reaches the dashboard's openai card (sol finding 1, PR #281 fix round).
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          # Read the backoff ledger from THIS job's ledger-branch checkout — the same loudly
+          # guarded source dashboard-gen renders from — instead of a second API read.
+          MODEL_HEALTH_FILE: ledger/data/model-health.json
           REGISTRY_REPO: ${{ github.repository }}
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
         run: |
           set -uo pipefail
           python3 scripts/account-usage.py --self-test
-          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2>/dev/null || printf '{}' > "$RUNNER_TEMP/usage.json"
+          # stderr flows to the step log: the probe's fail-open ::warning:: lines are sanitized
+          # (no handles/salt/counts — asserted by its self-test), and the old 2>/dev/null is
+          # exactly what hid this step's missing-salt gap in production.
+          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" || printf '{}' > "$RUNNER_TEMP/usage.json"
           echo 'usage-probe: snapshot written'
 
       - name: Generate privacy-safe dashboard

@@ -163,7 +163,9 @@ function renderAccounts(accounts) {
 // --- Provider quota (cumulative): per-provider AGGREGATE headroom across that provider's
 // accounts, computed server-side by dashboard-gen._provider_quota from the signals that actually
 // exist — live per-window utilization probes where the provider exposes them (anthropic), and
-// only the availability trichotomy + reactive backoff where it does not (probe-exempt openai).
+// only the availability counts + reactive backoff where it does not (probe-exempt openai).
+// Accounts the fail-closed probe OMITTED surface as `accounts_unknown` ("unreported") and are
+// never rendered free — dispatch treats that omission as unavailable (sol finding 2, PR #281).
 // The honest aggregate unit is "account-windows free" (Σ remaining window fraction over the
 // accounts that reported), with a PARTIAL limit-weighted sum only where limit headers are known;
 // each card states its signal source, and the section header carries the snapshot freshness.
@@ -219,6 +221,11 @@ function providerQuotaCard(row) {
   if (Number.isInteger(row.accounts_capped) && row.accounts_capped > 0) {
     badges.append(node("span", "badge capped", `${row.accounts_capped} capped`));
   }
+  if (Number.isInteger(row.accounts_unknown) && row.accounts_unknown > 0) {
+    // Distinct neutral badge: an unreported (fail-closed-omitted) account is NOT free — the
+    // muted default badge style separates "no signal" from green/amber/red real states.
+    badges.append(node("span", "badge", `${row.accounts_unknown} unreported`));
+  }
   top.append(badges);
   const total = Number.isInteger(row.accounts_total) ? row.accounts_total : 0;
   let countsText = `${total} account${total === 1 ? "" : "s"}`
@@ -226,6 +233,9 @@ function providerQuotaCard(row) {
     + ` · ${Number.isInteger(row.accounts_capped) ? row.accounts_capped : 0} capped`;
   if (Number.isInteger(row.accounts_unavailable) && row.accounts_unavailable > 0) {
     countsText += ` · ${row.accounts_unavailable} unavailable`;
+  }
+  if (Number.isInteger(row.accounts_unknown) && row.accounts_unknown > 0) {
+    countsText += ` · ${row.accounts_unknown} unreported — treated unavailable by dispatch`;
   }
   const windows = node("div", "window-list");
   const windowRows = Array.isArray(row.windows) ? row.windows : [];
