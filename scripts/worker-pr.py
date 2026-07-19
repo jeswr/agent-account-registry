@@ -799,11 +799,51 @@ def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_logi
 
 
 def set_reviewed_sha(repo, pr_number, sha):
-    pull = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
-    body = replace_reviewed_sha(pull.get("body") or "", sha)
-    _gh_json(["api", "-X", "PATCH", f"repos/{repo}/pulls/{pr_number}", "--input", "-"],
-             input_doc={"body": body})
-    print(f"reviewed-sha bound: {sha}")
+    """Bind the canonical reviewed-sha marker into the PR body under optimistic concurrency, so a
+    maintainer/automation body edit racing this write is never silently clobbered (issue #158).
+
+    The body stays the store — every reader resolves the binding via reviewed_sha_of on the LIVE
+    body — so the write must touch ONLY the marker: read the live body, splice in only the marker,
+    PATCH, then re-read and VERIFY the result is exactly what we sent. A verify miss means another
+    write raced ours, so we do NOT trust it: re-read the now-live body and re-splice only the
+    marker onto THAT (preserving the concurrent edit), retrying under the shared bounded CAS
+    deadline. An already-canonical marker is a no-op — NO PATCH is issued at all — which removes
+    the clobber window entirely for the idempotent rebind / re-run path (the common case). Fails
+    CLOSED (raises) rather than reporting a bind it could not confirm within the deadline.
+
+    Residual: a body edit landing inside the single read->PATCH gap is still overwritten — the
+    unavoidable REST-body TOCTOU shared by every body/label write here (tracked in issue #294); the
+    durable close is to move the binding off the mutable body onto immutable commit-specific
+    metadata (issue #158 option 1), out of scope for this minimal fix."""
+    deadline = _registry_now() + _REGISTRY_CAS_DEADLINE_S
+    attempts = 0
+    while True:
+        if attempts:
+            # Full-jitter backoff BETWEEN attempts (never before the first read) so racing
+            # rebinders stop re-colliding in lock-step, mirroring the ledger CAS loop.
+            _registry_sleep_backoff(attempts)
+        base = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"]).get("body") or ""
+        target = replace_reviewed_sha(base, sha)
+        if target == base:
+            # Marker already canonical on the live body — nothing to write, nothing to clobber.
+            print(f"reviewed-sha already bound: {sha}")
+            return
+        _gh_json(["api", "-X", "PATCH", f"repos/{repo}/pulls/{pr_number}", "--input", "-"],
+                 input_doc={"body": target})
+        live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"]).get("body") or ""
+        if live == target:
+            print(f"reviewed-sha bound: {sha}")
+            return
+        # A write landed around ours (the verify body is not what we sent). Do NOT trust the
+        # PATCH: loop to re-read and re-splice ONLY the marker onto the now-live body, so the
+        # concurrent edit is carried forward rather than overwritten.
+        attempts += 1
+        if _registry_now() >= deadline:
+            raise WorkerPrError(
+                f"reviewed-sha bind for {repo}#{pr_number} could not be confirmed within the "
+                f"{_REGISTRY_CAS_DEADLINE_S:.0f}s deadline under concurrent PR-body edits; "
+                f"refusing to report a bind that may have overwritten another change "
+                f"(fail closed)")
 
 
 def get_reviewed_sha(repo, pr_number):
@@ -3014,6 +3054,92 @@ def _self_test():
         wiring_globals["_gh_json"] = real_alert_json
         wiring_globals["_alert_route"] = real_alert_route
         wiring_globals["_registry_now"] = real_registry_now
+
+    # ---- set_reviewed_sha optimistic-concurrency wiring (issue #158): the reviewed-sha bind must
+    # never silently clobber a concurrent PR-body edit. Drive the read-merge-VERIFY-retry loop with
+    # a fake body-store + stubbed clock/backoff so contention is exercised without a real clock ----
+    sr_srv = {"body": ""}
+    sr_patches = []          # bodies THIS function PATCHed (concurrent edits are injected directly)
+    sr_after_patch = []      # one-shot concurrent edits: applied to the store right after a PATCH
+    sr_steal = {"fn": None}  # a persistent rival writer: re-applied after EVERY PATCH
+    sr_backoffs = []
+    real_sr_json = wiring_globals["_gh_json"]
+    real_sr_now = wiring_globals["_registry_now"]
+    real_sr_backoff = wiring_globals["_registry_sleep_backoff"]
+    sha_a = "a" * 40
+
+    def fake_sr_gh_json(gh_args, **kwargs):
+        path = gh_args[1] if len(gh_args) > 1 else ""
+        if "-X" in gh_args:  # PATCH the PR body
+            sr_srv["body"] = kwargs["input_doc"]["body"]
+            sr_patches.append(sr_srv["body"])
+            if sr_after_patch:                       # a maintainer edit lands right after our PATCH
+                sr_srv["body"] = sr_after_patch.pop(0)(sr_srv["body"])
+            elif sr_steal["fn"] is not None:         # a rival keeps overwriting our marker
+                sr_srv["body"] = sr_steal["fn"](sr_srv["body"])
+            return {}
+        if path.startswith("repos/o/r/pulls/"):
+            return {"body": sr_srv["body"]}
+        raise WorkerPrError(f"unexpected API path {path}")
+
+    try:
+        wiring_globals["_gh_json"] = fake_sr_gh_json
+        wiring_globals["_registry_sleep_backoff"] = lambda n: sr_backoffs.append(n)
+        wiring_globals["_registry_now"] = lambda: 0.0
+
+        # 1) already-canonical marker: NO PATCH at all — the clobber window is gone for the
+        # idempotent rebind / re-run path.
+        sr_srv["body"] = f"desc\n\n<!-- sparq-reviewed-sha:{sha_a} -->\n"
+        sr_patches.clear()
+        set_reviewed_sha("o/r", 5, sha_a)
+        check("an already-canonical reviewed-sha performs NO PATCH", sr_patches, [])
+
+        # 2) clean bind: exactly ONE PATCH, changing ONLY the marker (the description survives).
+        sr_srv["body"] = "desc-A\n\n<!-- sparq-reviewed-sha:none -->\n"
+        sr_patches.clear()
+        set_reviewed_sha("o/r", 5, sha_a)
+        check("a clean reviewed-sha bind PATCHes exactly once", len(sr_patches), 1)
+        check("the bind changes ONLY the marker (description preserved)",
+              (reviewed_sha_of(sr_patches[0]), sr_patches[0].startswith("desc-A")), (sha_a, True))
+        check("the live body ends bound to the reviewed sha",
+              reviewed_sha_of(sr_srv["body"]), sha_a)
+
+        # 3) a maintainer body edit landing right AFTER our PATCH is PRESERVED, never clobbered:
+        # the verify miss re-reads, finds the marker already canonical on the NEW body, and returns
+        # WITHOUT a second stale-body PATCH.
+        sr_srv["body"] = "desc-A\n\n<!-- sparq-reviewed-sha:none -->\n"
+        sr_patches.clear()
+        sr_after_patch[:] = [lambda b: b.replace("desc-A", "desc-EDITED-BY-MAINTAINER")]
+        set_reviewed_sha("o/r", 5, sha_a)
+        check("a concurrent post-PATCH body edit is preserved (not clobbered)",
+              "desc-EDITED-BY-MAINTAINER" in sr_srv["body"], True)
+        check("the preserved concurrent edit still carries our reviewed-sha",
+              reviewed_sha_of(sr_srv["body"]), sha_a)
+        check("the raced bind issues NO second clobbering PATCH of the stale body",
+              len(sr_patches), 1)
+
+        # 4) a persistent rival that keeps rebinding a DIFFERENT sha never yields a false success:
+        # the loop fails CLOSED once the CAS deadline elapses (advancing clock, no real sleep).
+        sr_srv["body"] = "desc\n\n<!-- sparq-reviewed-sha:none -->\n"
+        sr_patches.clear()
+        sr_backoffs.clear()
+        sr_after_patch[:] = []
+        sr_steal["fn"] = lambda b: replace_reviewed_sha(b, "d" * 40)
+        sr_now_seq = iter([0.0] + [10.0] * 3 + [999.0])
+        wiring_globals["_registry_now"] = lambda: next(sr_now_seq)
+        try:
+            set_reviewed_sha("o/r", 5, sha_a)
+            check("a persistent rebind conflict fails closed", "no error", "error")
+        except WorkerPrError as exc:
+            check("a persistent rebind conflict fails closed (never a false bind)",
+                  "fail closed" in str(exc) and "deadline" in str(exc), True)
+        check("the conflicting bind retried under backoff before giving up",
+              sr_backoffs, [1, 2, 3])
+        sr_steal["fn"] = None
+    finally:
+        wiring_globals["_gh_json"] = real_sr_json
+        wiring_globals["_registry_now"] = real_sr_now
+        wiring_globals["_registry_sleep_backoff"] = real_sr_backoff
 
     # #148: the backoff ceiling is a bounded, non-decreasing full-jitter envelope — exponential
     # growth from the base, clamped so a long contention run never sleeps unboundedly.
