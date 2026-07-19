@@ -1949,8 +1949,20 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                         f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
                         "--bot-login", bot_login])
-                except DispatchError:
-                    pass
+                except DispatchError as exc:
+                    # Issue #117 fail-closed missed-fix budget: swallowing this write left the
+                    # durable `missed` marker unrecorded, so the missed-fix budget could stay at
+                    # zero forever — the MISSED_FIX_LIMIT escalation to a human never fired and the
+                    # PR was silently stranded. A missed dispatch we cannot durably count is a
+                    # COUNTED lane error + rolling-alert defer reason, NOT a healthy defer: surface
+                    # it and do not fall through to the normal "no lease free" line, whose green
+                    # defer is exactly the signal that hid this. The item still defers (auto-retry),
+                    # but the tick now reports the budget as unconfirmed.
+                    lanes[lane]["error"] += 1
+                    defer_reasons["missed-marker-write-failed"] += 1
+                    print(f"defer review {repo}#{number}: missed-fix marker write FAILED ({exc}); "
+                          "missed-fix budget unconfirmed, escalation cannot bound this PR")
+                    continue
             print(f"defer review {repo}#{number}: no eligible {mode} lease is free this tick")
             continue
         account = claim.get("account")
@@ -3911,6 +3923,37 @@ def _self_test():
             # health recorder does NOT read it as a hard stall while accounts are simply busy.
             assert _lane_summary(run_items.lanes)["fix"] == {
                 "planned": 1, "launched": 0, "deferred": 1, "error": 0}, run_items.lanes
+
+            # Issue #117: a FAILED durable missed-fix marker write on the None-claim path is NOT a
+            # healthy defer. Swallowing it (except DispatchError: pass) left the missed-fix budget
+            # stuck at zero forever, so the MISSED_FIX_LIMIT human escalation never fired and the PR
+            # was silently stranded. The failure must surface as a COUNTED fix-lane error + a
+            # rolling-alert defer reason, and must NOT report the normal "no lease free" defer.
+            def failing_marker_helper(script_dir, target_repo, script, args):
+                helper_calls.append((script, args))
+                if script == "worker-pr.py" and "record-marker" in args and "missed" in args:
+                    raise DispatchError("record-marker missed: target helper failed")
+
+            globals()["_run_target_helper"] = failing_marker_helper
+            try:
+                alloc = FakeAllocator()   # claim() returns None: the missed marker is attempted
+                launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            finally:
+                globals()["_run_target_helper"] = fake_helper
+            assert launched == 0, launched
+            # the write WAS attempted (the missed record-marker call is present) ...
+            assert ("worker-pr.py", "record-marker") in [
+                (script, args[0]) for script, args in helper_calls], helper_calls
+            # ... and its failure is a counted error + rolling alert, not a silent green defer
+            assert reasons["missed-marker-write-failed"] == 1, reasons
+            assert _lane_summary(run_items.lanes)["fix"] == {
+                "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+            # regression guard: a SUCCESSFUL missed marker (default helper) stays a clean defer —
+            # no spurious error/alert when the durable marker is confirmed
+            alloc = FakeAllocator()
+            _, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert reasons["missed-marker-write-failed"] == 0, reasons
+            assert _lane_summary(run_items.lanes)["fix"]["error"] == 0, run_items.lanes
 
             # ---- issue #115: require_usage HOLDS a review/fix claim during a WHOLESALE usage-
             # probe outage (usage=None), matching the worker loop's fail-closed hold, with an
