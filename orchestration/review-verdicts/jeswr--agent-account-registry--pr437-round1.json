@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 437,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "47c3ef9bc7bffa90deca466aec8d9a5c89d96d46",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "All three security-relevant changes are embedded workflow Python, but no test extracts and executes the changed self-claim, adopt, or live selected-model paths. The existing select-and-claim self-test extracts only the `Validate dry-run account against resolved policy` heredoc; it does not reach these branches. Consequently, restoring `if claimed_provider and ...` (and its harness/format equivalents), or removing either new missing-metadata loop, would not make a relevant assertion fail. For a trust-plane routing check, syntax validation alone is insufficient and leaves the fix unprotected against exactly the permissive regression it addresses.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Add hermetic, non-vacuous tests against the real embedded workflow scripts. At minimum, run the live selected-model heredoc with valid protected routing and each of LIVE_PROVIDER, LIVE_HARNESS, and LIVE_CREDENTIAL_FORMAT empty in turn and assert a nonzero exit; include matching-value success and mismatched-value failure controls. Also exercise both claim-output heredocs with each routing metadata field missing/empty and assert rejection, plus a fully populated success fixture. Ensure extraction failure itself fails the test so the checks cannot silently skip when workflow text moves.",
+    "severity": "major",
+    "title": "Fail-closed routing changes have no regression test"
+   }
+  ],
+  "progress": null,
+  "summary": "The new checks are directionally sound and fail closed: both claim paths reject absent metadata, and the final live-routing gate now requires exact equality. However, this trust-plane regression fix is not complete because the diff adds no non-vacuous test for any of those controls. Existing self-tests exercise the worker dry-run heredoc and unrelated workflow guards, not the self-claim/adopt parsing or the live selected-model branch changed here. A future reintroduction of the permissive truthiness guards could therefore pass the current suite.",
+  "verdict": "request_changes"
+ }
+}
