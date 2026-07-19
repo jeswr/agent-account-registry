@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 432,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bb786e577248481a64be16ff2e539cad6e2abef9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_repo_confirmed_private() proves only that ALERT_TOKEN can read GET /repos/{repo}; it does not prove issue read/write access. main() then parses a failed issue-list command as [] without checking its return code, and _gh(check=True) merely prints a warning for a failed create/edit instead of raising or returning failure to main(). Consequently, a fine-grained token with metadata access but no Issues write permission selects the detailed private route, drops the alert, prints `maintainer alerted`, and returns 0. There is also no separately rendered generic retry on REGISTRY_REPO. This contradicts the changed route contract that the token can write and is fail-open for the operational signal.",
+    "file": "scripts/usage-alert.py",
+    "fix_hint": "Make lookup and mutation failures observable to main, and on a degraded private-route failure retry a freshly rendered redacted body on REGISTRY_REPO with the ambient token; return nonzero if both routes fail. Add end-to-end tests for private issue-list failure, private create/edit failure, successful public fallback, and both routes failing. Do not reuse the detailed body on fallback.",
+    "severity": "major",
+    "title": "Verified visibility does not prevent a green run with no usage alert"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 materially fixes all five prior findings: PAT stdout is coarse and tested per verdict, PAT/model-health/usage-alert now require a positive private-visibility response before rendering details, same-repo routes are rejected, and PAT private-route lookup/write failures retry a separately rendered public body. However, usage-alert still equates read-time visibility verification with a usable alert route. A token that can GET repository metadata but cannot list or write issues causes warnings at most; main then prints that the maintainer was alerted and returns 0, with no redacted registry retry. That is a new fail-open delivery gap in the newly hardened route, so progress is regressing under the required scale despite the substantial fixes.",
+  "verdict": "request_changes"
+ }
+}
