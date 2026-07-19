@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct3css",
-   "claim_id": "a16b15b164984f74bd392fe80448da5a",
-   "holder": "fix:sparq-org/sparq#3530@dispatch-29672633098.1",
-   "package": "sparq-mpc",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784433819,
-   "expires_at": 1784437419
-  },
-  {
-   "account": "acct3css",
    "claim_id": "0c62850664264b5fa2fd4ee0a08a5386",
    "holder": "fix:jeswr/agent-account-registry#310@dispatch-29673345663.1",
    "package": "worker",
@@ -79,6 +69,16 @@
    "model": "sol",
    "issued_at": 1784437415,
    "expires_at": 1784438615
+  },
+  {
+   "account": "acct03",
+   "claim_id": "4221832e38c14fe2a0e20fac574d722e",
+   "holder": "jeswr/agent-account-registry#109@dispatch-29674138070.1",
+   "package": "dispatch",
+   "role": "impl",
+   "model": "opus",
+   "issued_at": 1784437421,
+   "expires_at": 1784440121
   }
  ]
 }
