@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3601,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2461866a406b96e5d35e5f2a89db8f88e4cac140",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 4 resolves the prior major finding. The eligibility predicate now replays the same capped, injective term admission order used by derivation, and deriveGraph uses that predicate as its precondition. The added cap-boundary regression directly covers the previously failing case (24 edge-less admitted terms followed by the only edge between excluded terms), while the admitted-endpoint companion test verifies that a drawable post-cap edge remains available. The predicate and derivation also agree on adjacency, self-loop exclusion, and the admitted-resource requirement. The renderer remains behind an invocation-path dynamic import, and no correctness, security, or test-validity defects are evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
