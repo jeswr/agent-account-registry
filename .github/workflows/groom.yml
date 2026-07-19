@@ -207,3 +207,63 @@ jobs:
           set -euo pipefail
           python3 scripts/model-health.py --self-test
           python3 scripts/model-health.py decide --policy-file policy/repos.toml
+
+  # FAIL-LOUD alert for a HARD GROOM failure (issue #176). The model-access health decision is the
+  # LAST step of the `groom` job under the default success() guard, and every other repair happens
+  # inside that same job — so when an EARLIER step fails or is cancelled (ledger data-only invariant
+  # sweep, a target-token mint, the main sweep's dead-lease CAS / target-repo errors, or the
+  # 15-minute timeout), the health evaluator is SKIPPED and nothing raises an alarm: a persistent
+  # groom failure means crash-recovery has stopped AND health alerts are no longer evaluated, yet it
+  # presents only as skipped steps on a cron nobody watches. This standalone job keys on
+  # `needs.groom.result` and, on failure/cancelled, upserts a rolling `ops-alert` issue @-mentioning
+  # the maintainer via the SAME ALERT_REPO/ALERT_TOKEN routing (locked decision 22c); it auto-closes
+  # on an explicit GROOM success. It downloads no sweep artifact and reads only the job RESULT, so no
+  # token or ledger data reaches it.
+  groom-alert:
+    name: ALERT (hard GROOM-job failure)
+    needs: [groom]
+    # Runs every tick regardless of the GROOM result so a healthy GROOM can auto-close a prior
+    # alert; scripts/groom-alert.py keys on needs.groom.result — close happens ONLY on an explicit
+    # success (a skipped GROOM is not a recovery), and a success tick with no open alert does only a
+    # bare `gh issue list`, so a green tick stays cheap and side-effect-free.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): this job reads ALERT_TOKEN/ALERT_REPO (the private-alert
+    # routing secrets), so — like the `groom` job — it is bound to the default-branch-only
+    # `dispatch-secrets` environment where those secrets live. It only ever runs from the default
+    # branch (schedule/workflow_dispatch), so the branch policy never starves it.
+    environment: dispatch-secrets
+    permissions:
+      contents: read  # minimum for the sparse checkout below — the job runs a script from the repo
+      issues: write   # upsert/close the rolling groom-failure ops-alert issue
+    steps:
+      # The alert logic lives in scripts/groom-alert.py, but only that one file is needed —
+      # sparse-checkout scopes the working copy to it, pinned and with no persisted token, so
+      # nothing else from the repo reaches this job.
+      - name: Check out ONLY scripts/groom-alert.py (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: scripts/groom-alert.py
+          sparse-checkout-cone-mode: false
+
+      - name: Alert maintainer that the scheduled GROOM job hard-failed
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          GROOM_RESULT: ${{ needs.groom.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c, issue #39): scripts/groom-alert.py routes to a
+          # maintainer-set PRIVATE ALERT_REPO only when ALERT_TOKEN can write there; otherwise the
+          # registry repo under the ambient token. The body carries NO account handles (it reports
+          # only the groom job RESULT + run link), so that fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/groom-alert.py --self-test
+          python3 registry/scripts/groom-alert.py
