@@ -1008,6 +1008,10 @@ jobs:
       # call still consumes budget: a deterministic crash re-claims at most max_review_rounds
       # times and then escalates to needs-user via the sweep — never an unbounded
       # re-claim/re-crash loop. Idempotent per run key (a re-run of this run records nothing new).
+      # Issue #162: the marker binds the head sha it reviews (--head-sha) so a review that DEFERS
+      # as stale (the live head moved off this commit) is voided by the outcome step and not
+      # charged — legitimate head churn no longer burns the global round budget. A crash (no
+      # outcome step) records no void and stays charged, so the crash bound is unchanged.
       - name: Record the review round before the model runs (bounded-crash accounting)
         id: round
         if: ${{ inputs.mode == 'review' && steps.prepare.outcome == 'success' }}
@@ -1019,6 +1023,7 @@ jobs:
             --pr "${{ inputs.pr_number }}" \
             --round "${{ inputs.review_round }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --head-sha "${{ needs.resolve.outputs.head_sha }}" \
             --bot-login "${{ steps.target.outputs.bot_login }}"
 
       # Prior-round context for the progress grade (maintainer directive 2026-07-17): the
