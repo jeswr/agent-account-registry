@@ -331,7 +331,13 @@ def _provider_quota(accounts, usage, now):
 
     Accounts fail-closed omitted from the usage snapshot count in `accounts_total` and in
     `accounts_unknown` ("unreported" — dispatch treats the omission as unavailable, so they are
-    NEVER counted free), and never in `accounts_reporting`. `soonest_reset`/`oldest_reset` span
+    NEVER counted free), and never in `accounts_reporting`. The same holds for PARTIAL probe
+    entries (quota state "unknown"): the whole account is excluded from the aggregation — its
+    parseable window contributes NOTHING to the window sums, `limit_remaining`/`limits_known`,
+    or the reset stamps (sol finding, PR #281 fix round 4: a 5h-only entry used to render
+    "accounts_unknown: 1" NEXT TO headroom summed from that very account). The exclusion is
+    keyed off the SAME `_quota_state` result as the counts — one source of truth, no
+    re-derivation. `soonest_reset`/`oldest_reset` span
     every known window-reset/backoff stamp for the provider: soonest = the first moment ANY
     quota refills, oldest = when the last known window has refilled. Pure — unit-tested by
     --self-test; rows carry provider names + counts only (decision 22: no account identifiers,
@@ -361,6 +367,13 @@ def _provider_quota(accounts, usage, now):
                 exempt = True
             elif entry:
                 probed = True
+            if state == "unknown":
+                # An "unknown" account (PARTIAL probe entry — e.g. 5h-only) contributes NOTHING
+                # to the aggregate (sol finding, PR #281 fix round 4): its parseable window used
+                # to leak into the sums, rendering "accounts_unknown: 1" next to account-window
+                # headroom from that same account. Keyed off the _quota_state result above —
+                # the single source of truth the counts already use, not a re-derivation.
+                continue
             for prefix, _name in WINDOWS:
                 used = _percent(entry.get(f"{prefix}_util"))
                 if used is None:
@@ -1267,19 +1280,60 @@ def _self_test():
                        "catalog_available": True, "limits": {}}
     for shape_name, partial_entry in (
             ("status-only", {"status": "allowed"}),
-            ("5h-only", {"status": "allowed", "5h_util": "0.2", "5h_reset": now + 600})):
+            ("5h-only", {"status": "allowed", "5h_util": "0.2", "5h_reset": now + 600,
+                         "5h_limit": "1000"})):
         state, _until = _quota_state(partial_account, partial_entry, now)
         check(f"partial probe entry ({shape_name}) is unknown, never free",
               (state, allocator.usage_eligible(dict(partial_entry), now=now)),
               ("unknown", False))
-        check(f"partial probe entry ({shape_name}) aggregates as unreported, not available",
-              [(row["accounts_available"], row["accounts_unknown"]) for row in _provider_quota(
-                  [partial_account], {"partial": dict(partial_entry)}, now)],
-              [(0, 1)])
+        # The COMPLETE row (sol finding, PR #281 fix round 4): an unknown account contributes
+        # NOTHING — even though the 5h-only shape carries a fully parseable window (util 0.2 +
+        # reset + limit), the row's windows stay EMPTY and no reset/limit is aggregated. Before
+        # this round it rendered "accounts_unknown: 1" NEXT TO "0.8 of 1 account-window free"
+        # summed from that very account.
+        check(f"partial probe entry ({shape_name}) contributes nothing to the provider row",
+              _provider_quota([partial_account], {"partial": dict(partial_entry)}, now),
+              [{"provider": "anthropic", "accounts_total": 1, "accounts_available": 0,
+                "accounts_capped": 0, "accounts_unavailable": 0, "accounts_unknown": 1,
+                "single_account": True,
+                "signal": "live rate-limit-header probe (per-window utilization)",
+                "windows": [], "soonest_reset": None, "oldest_reset": None}])
     check("both-windows entry still counts available (not over-rejected)",
           _quota_state(partial_account,
                        {"status": "allowed", "5h_util": "0.2", "7d_util": "0.3"}, now),
           ("available", None))
+    # Mixed complete+partial provider (sol finding, PR #281 fix round 4): the sums must reflect
+    # ONLY the complete account. The partial account's parseable 5h window is a trap on every
+    # aggregate axis — earlier reset (would flip soonest_reset), big known limit (would inflate
+    # limit_remaining + limits_known), 0.9 headroom (would inflate remaining + reporting) — so
+    # reverting the aggregation exclusion turns this red on the first leaked field.
+    mixed_accounts = [
+        {"handle": "mixed-full", "provider": "anthropic", "catalog_available": True,
+         "limits": {}},
+        {"handle": "mixed-partial", "provider": "anthropic", "catalog_available": True,
+         "limits": {}},
+    ]
+    mixed_usage = {
+        "mixed-full": {"status": "allowed", "5h_util": "0.25", "5h_reset": now + 600,
+                       "5h_limit": "1000", "7d_util": "0.5", "7d_reset": now + 4000},
+        "mixed-partial": {"status": "allowed", "5h_util": "0.1", "5h_reset": now + 60,
+                          "5h_limit": "9000"},
+    }
+    check("mixed complete+partial: sums reflect only the complete account",
+          _provider_quota(mixed_accounts, mixed_usage, now),
+          [{"provider": "anthropic", "accounts_total": 2, "accounts_available": 1,
+            "accounts_capped": 0, "accounts_unavailable": 0, "accounts_unknown": 1,
+            "single_account": False,
+            "signal": "live rate-limit-header probe (per-window utilization)",
+            "windows": [
+                {"name": "5 hour", "accounts_reporting": 1, "remaining_account_windows": 0.75,
+                 "limit_remaining": 750, "limits_known": 1,
+                 "soonest_reset": _utc_iso(now + 600), "oldest_reset": _utc_iso(now + 600)},
+                {"name": "7 day", "accounts_reporting": 1, "remaining_account_windows": 0.5,
+                 "limit_remaining": None, "limits_known": 0,
+                 "soonest_reset": _utc_iso(now + 4000), "oldest_reset": _utc_iso(now + 4000)},
+            ],
+            "soonest_reset": _utc_iso(now + 600), "oldest_reset": _utc_iso(now + 4000)}])
     # Malformed/extreme limit headers must never crash the build (sol finding 2, PR #281 fix
     # round 3): float() of a huge JSON int RAISES OverflowError, and two individually-FINITE
     # "1e308" limits overflow the weighted SUM to inf — round(inf) at render then raised and
