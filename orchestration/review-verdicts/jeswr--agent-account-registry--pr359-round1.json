@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 359,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4262117a312dcdf0070c45d91799e6f32ef3cc7b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`needs_user` sets `alert_configured = bool(alert_repo and alert_token)` and only records an alert failure when that value is true. Consequently, either a missing repository or missing token makes `_ops_alert` return false but is treated as an operator opt-out, after which `set_review_state(..., \"needs-user\")` removes the PR from sweep enumeration. This recreates the core stranded-escalation outcome the transaction is intended to prevent: the PR can be parked with no confirmed human page. The new self-test explicitly requires this permissive behavior. Trust-plane routing must fail closed when the route or credential is missing.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Treat an absent or partially configured alert route as an unconfirmed required mutation: add a failure and do not apply the terminal parking label. Update the self-test to assert that missing `alert_repo` and/or `alert_token` raises and never records a `park` call.",
+    "severity": "blocker",
+    "title": "Missing alert configuration parks the PR without paging a human"
+   }
+  ],
+  "progress": null,
+  "summary": "The reconciliation ordering and verified configured-alert path are materially stronger, and the new tests exercise those paths. However, terminal escalation still parks the PR when the alert route is absent. In this trust plane, a missing route or credential must fail closed; treating missing paging configuration as an opt-out can again exclude the PR from the sweep without paging a human. This is codified by a self-test, so the change is not safe to approve.",
+  "verdict": "request_changes"
+ }
+}
