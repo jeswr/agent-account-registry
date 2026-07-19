@@ -920,19 +920,24 @@ def _registry_fallback():
 
 
 def _deliver_alerts(actions, maintainer):
-    """Upsert every action on the primary route; on failure retry the salted alert on the public
-    registry with the ambient token (issue #175). Returns the actions still undelivered on EVERY
-    route (empty == all delivered) so the caller can exit nonzero — an unusable alert token must
-    fail the run, never silently drop the alert."""
+    """Upsert every action on the primary route; on a failed FIRING action retry the salted alert
+    on the public registry with the ambient token (issue #175). Failed recoveries do NOT fall
+    back cross-repo — see the inline comment. Returns the actions still undelivered (empty == all
+    delivered) so the caller can exit nonzero — an unusable alert token must fail the run, never
+    silently drop the alert."""
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
     undelivered = []
     for action in actions:
         if _upsert_alert(action, repo, token, maintainer):
             continue
-        # Primary failed. If it was the private route (a distinct repo/token) and a usable ambient
-        # token exists, retry on the registry. Never re-run the identical route (no value).
-        if (repo, token) != (fb_repo, fb_token) and fb_token:
+        # Primary failed. If FIRING on the private route (a distinct repo/token) and a usable
+        # ambient token exists, retry on the registry. Recovery (fire=false) never falls back:
+        # it targets the open marker on the PRIMARY route, and "no open issue" on a different
+        # repository is a no-op that cannot confirm that close — treating it as delivered would
+        # leave the primary alert open while the run stays green (review round 2). Never re-run
+        # the identical route (no value).
+        if action["fire"] and (repo, token) != (fb_repo, fb_token) and fb_token:
             print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
                   "delivery failed on the private route — retrying on the registry")
             if _upsert_alert(action, fb_repo, fb_token, maintainer):
@@ -1946,6 +1951,33 @@ def _test_delivery(chk):
         chk("registry-only route with a bad ambient token is undelivered", len(undelivered), 1)
         chk("registry-only route is not retried against itself",
             sum(1 for c in creates()), 1)
+
+        # (e) review round 2: a FAILED private recovery (fire=false, open marker on the private
+        #     route, close fails) must stay undelivered. Pre-fix, the registry fallback found no
+        #     open marker, returned True as a steady no-op, and the failed close vanished green.
+        os.environ["ALERT_TOKEN"] = "priv"  # restore the private route cleared by (d)
+        recover = {**fire, "fire": False}
+        marker = _marker(recover["condition"], recover["provider"])
+
+        def recovery_gh(args, token, capture=False):
+            repo = args[args.index("-R") + 1] if "-R" in args else None
+            calls.append((args[0], args[1] if args[0] == "issue" else None, token, repo))
+            if args[:2] == ["issue", "list"]:
+                if repo == "jeswr/agent-account-data":
+                    return types.SimpleNamespace(
+                        returncode=0, stdout=json.dumps([{"number": 7, "body": marker}]),
+                        stderr="")
+                return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+            if args[:2] == ["issue", "close"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        _gh, calls[:] = recovery_gh, []
+        undelivered = _deliver_alerts([recover], "m")
+        chk("failed private recovery stays undelivered (fallback no-op cannot confirm it)",
+            len(undelivered), 1)
+        chk("recovery never retries cross-repo (no registry calls on fire=false)",
+            any(r == "jeswr/agent-account-registry" for (_, _, _, r) in calls), False)
     finally:
         _gh = real_gh
         for k, v in saved.items():
