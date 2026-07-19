@@ -897,10 +897,19 @@ def _probe_registry_file(registry_repo, path, ref=None):
 #   (2) a genuine CAS conflict (the ref advanced under us — always transient on the UNPROTECTED
 #       ledger branch) retries until a wall-clock DEADLINE rather than a small FIXED count, so a
 #       burst can never exhaust the budget and STRAND a writer (issue #130). A NON-conflict PUT
-#       error is not contention and fails loud AT ONCE (it can never clear by waiting), so the
-#       deadline is never wasted on a permanent auth/validation/branch failure.
+#       error is split (pr #357 review r1): a TRANSIENT failure (5xx / rate limit) retries under
+#       a small FIXED budget — a brief GitHub blip must not permanently drop a provenance/verdict
+#       record — while a permanent auth/validation/not-found error fails loud AT ONCE, so the
+#       deadline is never wasted on a failure that can never clear by waiting.
 # All module-level so --self-test drives them without sleeping or a real clock.
 _REGISTRY_CAS_DEADLINE_S = 180.0
+
+# pr #357 review r1: a server-side 5xx or a rate-limit rejection can clear by waiting, so it gets
+# this small fixed retry budget under the same full-jitter backoff (gh's stderr carries no
+# structured Retry-After hint to honor), still capped by the CAS deadline. It is deliberately NOT
+# the open-ended conflict deadline: an outage is not ledger contention, and a persistent one must
+# terminate and page a human within a tight bound.
+_REGISTRY_TRANSIENT_MAX_ATTEMPTS = 6
 
 # GitHub's contents-PUT response when a sha-less (create-if-absent) write hits a file that appeared
 # concurrently: HTTP 422 with message 'Invalid request.\n\n"sha" wasn't supplied.' — the same
@@ -928,12 +937,26 @@ def _is_registry_cas_conflict(stderr, create):
     """True ONLY for a genuine compare-and-swap conflict on the ledger PUT: HTTP 409 is always a
     lost-head race, and HTTP 422 counts only for a create-if-absent PUT (`create=True`) carrying
     GitHub's create-race signature. Every other failure — authorization (403), missing branch/file
-    (404), non-race request validation (422), server (5xx) — is NOT contention and must fail loud
-    rather than be retried until the deadline (mirrors select-and-claim._is_cas_conflict, #179)."""
+    (404), non-race request validation (422), server (5xx) — is NOT contention and must never be
+    retried until the deadline (mirrors select-and-claim._is_cas_conflict, #179); of those, only
+    the transient class (_is_registry_transient_error) gets its own small bounded retry."""
     text = stderr or ""
     if "HTTP 409" in text:
         return True
     return create and "HTTP 422" in text and _REGISTRY_CREATE_RACE_SIGNATURE in text
+
+
+def _is_registry_transient_error(stderr):
+    """True for a non-conflict PUT failure that can clear by waiting (pr #357 review r1): any
+    HTTP 5xx server response, HTTP 429, or GitHub's rate-limit 403s ('API rate limit exceeded' /
+    'secondary rate limit'). Everything else — auth (non-rate-limit 403), missing branch/file
+    (404), request validation (422) — is permanent and must fail loud immediately."""
+    text = stderr or ""
+    if re.search(r"HTTP 5\d\d", text):
+        return True
+    if "HTTP 429" in text:
+        return True
+    return "HTTP 403" in text and "rate limit" in text.lower()
 
 
 def _registry_put_file(registry_repo, path, document, message):
@@ -945,7 +968,9 @@ def _registry_put_file(registry_repo, path, document, message):
     is success; an existing DIFFERENT file fails closed (provenance must never be silently
     rewritten, and a ledger write must never shadow a divergent legacy record). A genuine CAS
     conflict retries under full-jitter backoff until _REGISTRY_CAS_DEADLINE_S (issue #130 — a fixed
-    six-attempt budget let a burst exhaust every attempt and strand its PR); a non-conflict PUT
+    six-attempt budget let a burst exhaust every attempt and strand its PR); a transient 5xx /
+    rate-limit failure retries under the small fixed _REGISTRY_TRANSIENT_MAX_ATTEMPTS budget
+    (pr #357 review r1 — a brief outage must not permanently drop a record); a permanent PUT
     error fails loud immediately. On final failure the REAL last API error is raised, never a
     generic conflict message."""
     body = json.dumps(document, indent=1, sort_keys=True) + "\n"
@@ -962,7 +987,7 @@ def _registry_put_file(registry_repo, path, document, message):
     deadline = _registry_now() + _REGISTRY_CAS_DEADLINE_S
     last_error = ""
     attempts = 0
-    conflict = False
+    transient_attempts = 0
     while True:
         if attempts:
             # Full-jitter backoff BETWEEN attempts (never before the first read) so parallel
@@ -984,21 +1009,38 @@ def _registry_put_file(registry_repo, path, document, message):
         put = _run_gh(args, check=False)
         if put.returncode == 0:
             return True
-        last_error = (put.stderr or put.stdout or "").strip()
+        error_text = put.stderr or put.stdout or ""
+        last_error = error_text.strip()
         attempts += 1
         # `existing is None` here (else we already returned/raised above), so this is always a
         # create-if-absent PUT: classify create=True.
-        conflict = _is_registry_cas_conflict(put.stderr or put.stdout or "", create=True)
-        if not conflict:
-            break  # not contention — retrying can never clear it; fail loud now (#130/#179)
+        conflict = _is_registry_cas_conflict(error_text, create=True)
+        transient = not conflict and _is_registry_transient_error(error_text)
+        if not conflict and not transient:
+            # Permanent auth/validation/not-found — retrying can never clear it; fail loud
+            # now, never burning the conflict deadline on it (#130/#179).
+            reason = "a permanent, non-retryable PUT error"
+            break
+        if transient:
+            # pr #357 review r1: a 5xx/rate-limit failure is retried so a brief outage cannot
+            # permanently drop the record, but only within its own small fixed budget — an
+            # outage is not contention and must never absorb the whole CAS deadline.
+            transient_attempts += 1
+            if transient_attempts >= _REGISTRY_TRANSIENT_MAX_ATTEMPTS:
+                reason = (f"a transient API failure persisted through the "
+                          f"{_REGISTRY_TRANSIENT_MAX_ATTEMPTS}-attempt transient retry budget")
+                break
         if _registry_now() >= deadline:
-            break  # sustained burst outlasted the CAS deadline — page and fail loud
+            # Sustained burst (or outage) outlasted the wall-clock deadline — page and fail loud.
+            reason = (f"the CAS deadline ({_REGISTRY_CAS_DEADLINE_S:.0f}s) elapsed under "
+                      f"sustained contention" if conflict else
+                      f"the {_REGISTRY_CAS_DEADLINE_S:.0f}s retry deadline elapsed during "
+                      f"transient API failures")
+            break
     # Terminal: the record never landed. A silently-lost provenance record makes the PR
     # permanently invisible to enumeration; a lost verdict burns a round without applying the
     # outcome. Page a human with the REAL API error before failing (best-effort — the alert can
     # never mask the raise below).
-    reason = (f"the CAS deadline ({_REGISTRY_CAS_DEADLINE_S:.0f}s) elapsed under sustained "
-              f"contention" if conflict else "a non-conflict PUT error")
     _ops_alert(*_alert_route(),
                f"⚠️ Registry record write failing — {registry_repo}",
                f"> 🤖 SPARQ agent — `{path}` could not be written to the `{LEDGER_REF}` "
@@ -2759,6 +2801,9 @@ def _self_test():
     def fake_put_run_gh(args, **_kwargs):
         put_calls.append(list(args))
         if "-X" in args:  # the PUT
+            if put_state.get("put_seq"):  # per-attempt (rc, stderr) script, consumed in order
+                rc, err = put_state["put_seq"].pop(0)
+                return argparse.Namespace(returncode=rc, stdout="", stderr=err)
             return argparse.Namespace(returncode=put_state["put_rc"], stdout="",
                                       stderr=put_state["put_stderr"])
         meta = put_state["files"].get(args[1])
@@ -2884,7 +2929,7 @@ def _self_test():
               alert_calls and "o--r--pr7.json" in alert_calls[0][3]
               and "advanced under this write" in alert_calls[0][3], True)
 
-        # issue #130/#179: a NON-conflict PUT error (auth/validation/missing branch/5xx) can never
+        # issue #130/#179: a PERMANENT PUT error (auth/validation/missing branch) can never
         # clear by waiting, so it fails loud on the FIRST attempt — never burning the conflict
         # deadline. A constant clock is enough (the break happens before any deadline check).
         put_calls.clear()
@@ -2895,16 +2940,50 @@ def _self_test():
                          put_stderr="HTTP 403: Resource not accessible by integration.")
         try:
             _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
-            check("non-conflict PUT error raises", "no error", "error")
+            check("permanent PUT error raises", "no error", "error")
         except WorkerPrError as exc:
-            check("non-conflict PUT error surfaces the REAL API error text",
+            check("permanent PUT error surfaces the REAL API error text",
                   "Resource not accessible by integration" in str(exc), True)
-            check("non-conflict PUT error is labelled as such (not contention)",
-                  "non-conflict" in str(exc), True)
-        check("a non-conflict error fails loud on the FIRST attempt (no wasted retries)",
+            check("permanent PUT error is labelled non-retryable (not contention)",
+                  "non-retryable" in str(exc), True)
+        check("a permanent error fails loud on the FIRST attempt (no wasted retries)",
               sum(1 for call in put_calls if "-X" in call), 1)
-        check("a non-conflict error never backs off (nothing to wait out)", backoff_attempts, [])
-        check("a non-conflict error still pages a human once", len(alert_calls), 1)
+        check("a permanent error never backs off (nothing to wait out)", backoff_attempts, [])
+        check("a permanent error still pages a human once", len(alert_calls), 1)
+
+        # pr #357 review r1: a TRANSIENT failure (5xx / rate limit) is neither contention nor
+        # permanent — a brief outage must not permanently drop a provenance/verdict record. The
+        # first PUT hits a 502, the retry lands: the write SUCCEEDS after one backoff, no alert.
+        put_calls.clear()
+        backoff_attempts.clear()
+        alert_calls.clear()
+        put_state.update(files={}, put_rc=0, put_stderr="",
+                         put_seq=[(1, "HTTP 502: Bad gateway"), (0, "")])
+        check("a transient 5xx recovers on a later attempt (write still lands)",
+              _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                 doc, "m"), True)
+        check("the 5xx recovery took two PUTs with one backoff and no alert",
+              (sum(1 for call in put_calls if "-X" in call), backoff_attempts, alert_calls),
+              (2, [1], []))
+        # A PERSISTENT transient failure still terminates within its small fixed budget — it
+        # never absorbs the 180s CAS deadline — and pages a human with the real error.
+        put_calls.clear()
+        backoff_attempts.clear()
+        alert_calls.clear()
+        put_state.update(files={}, put_rc=1, put_stderr="HTTP 503: Service unavailable",
+                         put_seq=[])
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("a persistent 5xx terminates within its retry budget", "no error", "error")
+        except WorkerPrError as exc:
+            check("a persistent 5xx names the exhausted transient budget and the real error",
+                  "transient retry budget" in str(exc)
+                  and "Service unavailable" in str(exc), True)
+        check("a persistent 5xx stops at the fixed transient budget (never the CAS deadline)",
+              sum(1 for call in put_calls if "-X" in call), _REGISTRY_TRANSIENT_MAX_ATTEMPTS)
+        check("persistent-5xx retries back off between every attempt",
+              backoff_attempts, list(range(1, _REGISTRY_TRANSIENT_MAX_ATTEMPTS)))
+        check("a persistent 5xx still pages a human once", len(alert_calls), 1)
 
         # sol review r1 on #295: the terminal alert must be best-effort END TO END, so this
         # runs the REAL _ops_alert (not a stub) with its one raising path — the issue lookup
@@ -2963,10 +3042,33 @@ def _self_test():
           _is_registry_cas_conflict('HTTP 422: "sha" wasn\'t supplied', create=False), False)
     check("a 403 auth failure is NOT contention",
           _is_registry_cas_conflict("HTTP 403: Resource not accessible", create=True), False)
-    check("a 5xx server error is NOT contention",
+    check("a 5xx server error is NOT contention (it takes the transient budget instead)",
           _is_registry_cas_conflict("HTTP 502: Bad gateway", create=True), False)
     check("an empty/clean stderr is NOT contention",
           _is_registry_cas_conflict("", create=True), False)
+
+    # pr #357 review r1: the transient classifier gates which non-conflict failures get the small
+    # bounded retry — 5xx and rate limits can clear by waiting; auth/not-found/validation cannot.
+    check("a 502 is transient", _is_registry_transient_error("HTTP 502: Bad gateway"), True)
+    check("a 500 in gh's suffix form is transient",
+          _is_registry_transient_error("gh: Internal Server Error (HTTP 500)"), True)
+    check("a 429 is transient",
+          _is_registry_transient_error("HTTP 429: too many requests"), True)
+    check("a primary rate-limit 403 is transient",
+          _is_registry_transient_error("HTTP 403: API rate limit exceeded for installation"),
+          True)
+    check("a secondary rate-limit 403 is transient",
+          _is_registry_transient_error("HTTP 403: You have exceeded a secondary rate limit"),
+          True)
+    check("a plain auth 403 is NOT transient (permanent, fails loud)",
+          _is_registry_transient_error("HTTP 403: Resource not accessible by integration"),
+          False)
+    check("a 404 is NOT transient", _is_registry_transient_error("HTTP 404: Not Found"), False)
+    check("a validation 422 is NOT transient",
+          _is_registry_transient_error("HTTP 422: Invalid request"), False)
+    check("a 409 is NOT transient (routed to the CAS deadline path)",
+          _is_registry_transient_error("HTTP 409: head advanced"), False)
+    check("empty stderr is NOT transient", _is_registry_transient_error(""), False)
 
     # ---- disarm wiring (monkeypatched I/O), issue #69: a merge-only advance carries the
     # binding forward with the arm intact; a real content change still disarms; a QUEUED
