@@ -145,22 +145,28 @@ def _ops_alert(alert_repo, alert_token, title, body):
     """Post or refresh ONE deduped ops-alert registry issue (rolling posture, usage-alert.py):
     an open issue with the same title is commented on, otherwise a new one is opened. Best-effort
     and credential-scoped — a missing route or a failed alert call never masks the operational
-    error that triggered it, so every call is check=False."""
+    error that triggered it: every gh call is check=False AND the whole delivery is wrapped, so
+    even a raising path (the issue lookup goes through _gh_json → check=True + JSON parsing, and
+    an unexpected list shape can KeyError) only logs, never propagates into the caller's raise."""
     if not (alert_repo and alert_token):
         return
-    env = {"GH_TOKEN": alert_token}
-    _run_gh(["label", "create", "ops-alert", "-R", alert_repo, "--color", "d73a4a",
-             "--description", "Autonomous worker availability alert (maintainer action)"],
-            check=False, env=env)
-    found = _gh_json(["issue", "list", "-R", alert_repo, "--label", "ops-alert", "--state",
-                      "open", "--json", "number,title", "--limit", "50"], env=env) or []
-    number = next((i["number"] for i in found if i.get("title") == title), None)
-    if number:
-        _run_gh(["issue", "comment", str(number), "-R", alert_repo, "--body", body],
+    try:
+        env = {"GH_TOKEN": alert_token}
+        _run_gh(["label", "create", "ops-alert", "-R", alert_repo, "--color", "d73a4a",
+                 "--description", "Autonomous worker availability alert (maintainer action)"],
                 check=False, env=env)
-    else:
-        _run_gh(["issue", "create", "-R", alert_repo, "--title", title, "--label",
-                 "ops-alert", "--body", body], check=False, env=env)
+        found = _gh_json(["issue", "list", "-R", alert_repo, "--label", "ops-alert", "--state",
+                          "open", "--json", "number,title", "--limit", "50"], env=env) or []
+        number = next((i["number"] for i in found
+                       if isinstance(i, dict) and i.get("title") == title), None)
+        if number:
+            _run_gh(["issue", "comment", str(number), "-R", alert_repo, "--body", body],
+                    check=False, env=env)
+        else:
+            _run_gh(["issue", "create", "-R", alert_repo, "--title", title, "--label",
+                     "ops-alert", "--body", body], check=False, env=env)
+    except Exception as exc:  # noqa: BLE001 — alert delivery must never mask the caller's error
+        print(f"ops-alert delivery failed (non-fatal): {exc}", file=sys.stderr)
 
 
 def _bot_comments(comments, bot_login):
@@ -2124,6 +2130,8 @@ def _self_test():
     alert_calls = []
     real_backoff = wiring_globals["_registry_sleep_backoff"]
     real_ops_alert = wiring_globals["_ops_alert"]
+    real_alert_json = wiring_globals["_gh_json"]
+    real_alert_route = wiring_globals["_alert_route"]
 
     real_put_io = wiring_globals["_run_gh"]
     doc = {"pr_number": 7}
@@ -2214,10 +2222,33 @@ def _self_test():
         check("the ops-alert names the unwritten record and the real API error",
               alert_calls and "o--r--pr7.json" in alert_calls[0][3]
               and "gate" in alert_calls[0][3], True)
+
+        # sol review r1 on #295: the terminal alert must be best-effort END TO END, so this
+        # runs the REAL _ops_alert (not a stub) with its one raising path — the issue lookup
+        # via _gh_json (check=True + JSON parsing) — blowing up, and asserts the registry-write
+        # error still surfaces carrying the final PUT stderr, never the alert's own failure.
+        def raising_alert_gh_json(args, **_kwargs):
+            raise WorkerPrError("alert issue lookup failed")
+
+        put_state.update(files={}, put_rc=1,
+                         put_stderr="HTTP 409: Required status check \"gate\" is expected.")
+        wiring_globals["_ops_alert"] = real_ops_alert
+        wiring_globals["_alert_route"] = lambda: ("alerts/private", "alert-token")
+        wiring_globals["_gh_json"] = raising_alert_gh_json
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("a raising alert lookup never masks the terminal registry-write error",
+                  "no error", "error")
+        except WorkerPrError as exc:
+            check("a raising alert lookup never masks the terminal registry-write error",
+                  "Required status check \"gate\" is expected" in str(exc)
+                  and "alert issue lookup" not in str(exc), True)
     finally:
         wiring_globals["_run_gh"] = real_put_io
         wiring_globals["_registry_sleep_backoff"] = real_backoff
         wiring_globals["_ops_alert"] = real_ops_alert
+        wiring_globals["_gh_json"] = real_alert_json
+        wiring_globals["_alert_route"] = real_alert_route
 
     # #148: the backoff ceiling is a bounded, non-decreasing full-jitter envelope — exponential
     # growth from the base, clamped so a long contention run never sleeps unboundedly.
