@@ -971,30 +971,36 @@ def _registry_fallback():
             os.environ.get("REGISTRY_ALERT_TOKEN") or os.environ.get("GH_TOKEN") or "")
 
 
-def _deliver_alerts(actions, maintainer):
+def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     """Upsert every action on the primary route; on a failed FIRING action retry the salted alert
-    on the public registry with the ambient token (issue #175). Failed recoveries do NOT fall
-    back cross-repo — see the inline comment. Returns the actions still undelivered (empty == all
-    delivered) so the caller can exit nonzero — an unusable alert token must fail the run, never
-    silently drop the alert."""
+    on the public registry with the ambient token (issue #175). `fallback_open` is the set of
+    (condition, provider) markers currently OPEN on the fallback route: the firing retry can
+    CREATE an alert there, so a RECOVERY whose marker was seen on the fallback is delivered on
+    BOTH routes and counts as delivered only when each route it targets confirms (review #340).
+    Beyond that explicit binding, recoveries never fall back cross-repo — "no open issue" on a
+    repository whose marker was never seen is a no-op that cannot confirm a close (review round
+    2). Returns the actions still undelivered (empty == all delivered) so the caller can exit
+    nonzero — an unusable alert token must fail the run, never silently drop the alert."""
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
+    fb_distinct = (repo, token) != (fb_repo, fb_token) and bool(fb_token)
     undelivered = []
     for action in actions:
-        if _upsert_alert(action, repo, token, maintainer):
-            continue
-        # Primary failed. If FIRING on the private route (a distinct repo/token) and a usable
-        # ambient token exists, retry on the registry. Recovery (fire=false) never falls back:
-        # it targets the open marker on the PRIMARY route, and "no open issue" on a different
-        # repository is a no-op that cannot confirm that close — treating it as delivered would
-        # leave the primary alert open while the run stays green (review round 2). Never re-run
-        # the identical route (no value).
-        if action["fire"] and (repo, token) != (fb_repo, fb_token) and fb_token:
-            print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
-                  "delivery failed on the private route — retrying on the registry")
-            if _upsert_alert(action, fb_repo, fb_token, maintainer):
-                continue
-        undelivered.append(action)
+        delivered = _upsert_alert(action, repo, token, maintainer)
+        if action["fire"]:
+            # Primary failed while FIRING: retry on the registry with the ambient token. Never
+            # re-run the identical route (no value).
+            if not delivered and fb_distinct:
+                print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
+                      "delivery failed on the private route — retrying on the registry")
+                delivered = _upsert_alert(action, fb_repo, fb_token, maintainer)
+        elif fb_distinct and (action["condition"], action["provider"]) in fallback_open:
+            # The marker was SEEN open on the fallback repo (a prior firing retry created it):
+            # close it there too, and require BOTH routes to confirm — a steady no-op on the
+            # primary says nothing about the issue that lives on the fallback (review #340).
+            delivered = _upsert_alert(action, fb_repo, fb_token, maintainer) and delivered
+        if not delivered:
+            undelivered.append(action)
     return undelivered
 
 
@@ -1235,20 +1241,28 @@ def _cmd_decide(args):
         return 1
     provider_accounts = _enabled_provider_accounts(
         api, registry_repo, args.policy_file, salt)
-    # Currently-open alert markers on the delivery route (issue #205): feed them to classify_records
-    # so an alert whose provider has aged out of the rolling window still earns an explicit
-    # recovery and is closed, instead of lingering open forever. Read from the same route recovery
-    # is delivered on (_alert_target), and fail-open (empty) so a list failure never fabricates one.
+    # Currently-open alert markers on EVERY route this system may have delivered to (issues #205,
+    # review #340): the firing retry (issue #175) can create an alert on the FALLBACK route, so
+    # enumerating only the primary would leave that issue open forever once its provider ages out
+    # of the window. Feed the union to classify_records so such an alert still earns an explicit
+    # recovery, and pass the fallback's markers to _deliver_alerts so each recovery closes the
+    # marker on the repository it was found on (route binding — a no-op on the primary is never
+    # proof the fallback issue closed). Each enumeration stays fail-open-to-empty, so an
+    # unreadable/truncated list only defers a recovery to the next tick, never fabricates one.
     alert_repo, alert_token = _alert_target()
     open_alerts = _open_alert_markers(alert_repo, alert_token)
-    actions = classify_records(records, provider_accounts, now, open_alerts)
+    fb_repo, fb_token = _registry_fallback()
+    fallback_open = set()
+    if (fb_repo, fb_token) != (alert_repo, alert_token) and fb_token:
+        fallback_open = _open_alert_markers(fb_repo, fb_token)
+    actions = classify_records(records, provider_accounts, now, open_alerts | fallback_open)
     # Issue #70: annotate firing outage/transient actions with the provider's public status —
     # AFTER classification, so a probe result can reframe an alert but never decide one.
     annotate_provider_status(actions)
     # Deliver on the primary route, falling back to the salted public registry when a private
     # ALERT_TOKEN is present but unusable (issue #175). A steady no-alert condition with no open
     # issue is a confirmed no-op (never touched), so it never churns nor counts as undelivered.
-    undelivered = _deliver_alerts(actions, maintainer)
+    undelivered = _deliver_alerts(actions, maintainer, fallback_open)
     fired = [a["condition"] for a in actions if a["fire"]]
     print(f"model-health decide: {len(actions)} conditions checked, "
           f"{len(fired)} firing ({','.join(sorted(set(fired))) or 'none'})")
@@ -1749,6 +1763,9 @@ def _self_test():
     # ---- #175: unusable private token retries the registry, else fails nonzero ---------------
     ok = _test_delivery(chk) and ok
 
+    # ---- review #340: an alert created on the fallback route is still recovered --------------
+    ok = _test_fallback_orphan(chk) and ok
+
     # ---- provider fleet resolution (account catalog -> salted provider map) ------------------
     chk("provider parsed from YAML body",
         _provider_of("harness: claude\nprovider: anthropic\nmodels: [fable]"), "anthropic")
@@ -2202,6 +2219,99 @@ def _test_delivery(chk):
             any(r == "jeswr/agent-account-registry" for (_, _, _, r) in calls), False)
     finally:
         _gh = real_gh
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_fallback_orphan(chk):
+    """Review #340: an alert CREATED ON THE FALLBACK ROUTE (by the #175 firing retry) must still
+    be recovered. End-to-end against a stateful two-repo gh fake: primary firing delivery fails,
+    the fallback create succeeds, the records age out, and the next decide closes the fallback
+    issue — with the red direction proving a failed fallback close is NOT confirmed by the
+    primary's steady no-op (pre-fix, decide exited 0 and the issue stayed open forever)."""
+    import argparse as _ap
+    import types
+    global _gh, GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
+    real_gh = _gh
+    real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger)
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN", "GH_TOKEN")}
+    priv_repo, reg_repo = "jeswr/agent-account-data", "jeswr/agent-account-registry"
+    repos = {priv_repo: {}, reg_repo: {}}
+    seq = {"n": 100}
+    bad_tokens = {"priv"}          # phase 1: the private token is unusable
+    fail_close = {"on": False}
+
+    def state_gh(args, token, capture=False):
+        repo = args[args.index("-R") + 1] if "-R" in args else None
+        if args[0] == "label":
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if token in bad_tokens:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        verb, issues = args[1], repos[repo]
+        if verb == "list":
+            state = args[args.index("--state") + 1]
+            out = [{"number": n, "body": i["body"]}
+                   for n, i in sorted(issues.items()) if i["state"] == state]
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
+        if verb == "create":
+            seq["n"] += 1
+            issues[seq["n"]] = {"body": args[args.index("--body") + 1], "state": "open"}
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        num = int(args[2])
+        if verb == "close":
+            if fail_close["on"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            issues[num]["state"] = "closed"
+        elif verb == "edit":
+            issues[num]["body"] = args[args.index("--body") + 1]
+        elif verb == "reopen":
+            issues[num]["state"] = "open"
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def reg_states():
+        return [i["state"] for _, i in sorted(repos[reg_repo].items())]
+
+    fire = {"condition": "provider-outage", "provider": "anthropic", "fire": True, "reason": "r"}
+    try:
+        os.environ.update(REGISTRY_REPO=reg_repo, ALERT_REPO=priv_repo, ALERT_TOKEN="priv",
+                          REGISTRY_ALERT_TOKEN="amb")
+        os.environ.pop("GH_TOKEN", None)
+        _gh = state_gh
+
+        # phase 1: primary firing delivery fails -> the alert is CREATED on the fallback.
+        chk("fallback-orphan: firing delivered via the fallback create",
+            _deliver_alerts([fire], "m"), [])
+        chk("fallback-orphan: the issue lives on the registry, none on the private route",
+            (reg_states(), repos[priv_repo]), (["open"], {}))
+
+        # phase 2: the private token works again and the records have aged out. decide must
+        # enumerate the fallback marker, emit the orphan recovery, and close it THERE.
+        bad_tokens.clear()
+        GitHubAPI = lambda token: object()
+        read_ledger = lambda api, repo: ([], None)
+        prune = lambda records, now: []
+        _enabled_provider_accounts = lambda api, repo, policy, salt: {}
+        annotate_provider_status = lambda actions, **kw: None
+        ns = _ap.Namespace(policy_file="policy/repos.toml")
+
+        # red direction first: the fallback close FAILS -> the primary's steady no-op must not
+        # count as delivery (pre-fix, decide exited 0 here with the issue still open).
+        fail_close["on"] = True
+        chk("fallback-orphan: failed fallback close -> decide exits NONZERO, issue still open",
+            (_cmd_decide(ns), reg_states()), (1, ["open"]))
+
+        fail_close["on"] = False
+        chk("fallback-orphan: next decide closes the fallback issue and exits 0",
+            (_cmd_decide(ns), reg_states()), (0, ["closed"]))
+    finally:
+        _gh = real_gh
+        (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
+         prune, read_ledger) = real
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
