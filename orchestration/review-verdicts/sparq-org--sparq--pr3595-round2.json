@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3595,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fea4a7a35332931612dcefd18ef944e230d25ac4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "out_of_circuit_message accepts an arbitrary holders slice independently of the sources whose bytes were reconstructed. Nothing checks that holders[i] equals sources[i].holder, or even that the counts match. Thus changing a SourceSegment.holder and reconstructing the same holder-anonymous bytes while passing the old holders slice produces the identical digest. The new test does not exercise the real composition boundary: it manually changes both the holder list and digest input, so it only proves that hashing different bytes differs. This leaves the prior holder-attribution concern unresolved despite claims that relabelling or swapping a holder changes the signed digest.",
+    "file": "crates/sparq-mpc/src/federated.rs",
+    "fix_hint": "Make the binding operation consume the ordered SourceSegment list (or a validated reconstruction object carrying both bytes and holder identities) and derive holder_block internally, so identity/order cannot diverge from the reconstructed segments. Alternatively provide one public atomic function that reconstructs and hashes after validating exact count and positional identity, and keep unsafe pieces private. Add a negative test that changes only SourceSegment.holder while attempting to reuse the prior holder metadata/message; the public API must reject it or change the digest.",
+    "severity": "major",
+    "title": "Holder-to-segment binding is still caller-asserted rather than enforced"
+   },
+   {
+    "body": "The skill documents out_of_circuit_message(federated_public_inputs), but the public method now requires holders as its first argument. The recipe therefore does not compile and omits the security-critical holder-order input introduced to address round 1.",
+    "file": "skills/mpc/SKILL.md",
+    "fix_hint": "Document the exact current signature, including holders, and explain that its ordering must correspond positionally to the reconstructed sources; if the API is made atomic as recommended, document that safer signature instead.",
+    "severity": "minor",
+    "title": "Documented FreshnessBinding method signature is stale"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 honestly narrows the cross-crate test claim and adds holder IDs to the digest, so it addresses the prior drift-test overclaim and moves toward holder binding. However, the security boundary remains unenforced: the signed holder list is supplied independently from the SourceSegment holders used to construct the public inputs. A caller can relabel a SourceSegment while retaining the old holders argument and obtain the same signed message, so the API does not itself bind the holder-to-segment assignment it claims to bind. The updated public API documentation also shows the obsolete one-argument method signature. Because one prior major issue remains in a changed form and a new documentation/API issue appears, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
