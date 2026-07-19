@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The script currently extracts 5 GUI aliases and 4 CLI aliases, but only rejects counts below 2 for each class. If formatting or structure changes make the regex miss up to three GUI entries or two CLI entries, the check still succeeds and those site-referenced assets are never checked against the release list. That directly violates the stated fail-closed invariant and can publish a release with silent-404 buttons. The diff also adds no regression test demonstrating that partial extraction fails.",
+   "file": "scripts/check-release-aliases.sh",
+   "fix_hint": "Make extraction structurally robust or validate an independently derived complete expected set rather than weak count floors. At minimum, add a test fixture covering every current GUI/CLI reference and mutations where one or more references cease matching; each partial-extraction mutation must fail rather than approve a reduced contract. Avoid merely hard-coding today's counts without a mechanism that remains synchronized with intentional site changes.",
+   "severity": "major",
+   "title": "Extraction can silently lose aliases while the fail-closed guard still passes"
+  }
+ ],
+ "progress": null,
+ "summary": "The alias staging itself matches the current download component, but the purported fail-closed contract is not actually fail-closed. Its non-vacuity thresholds permit the extractor to lose multiple currently required aliases and still pass, so a source refactor can reintroduce silent 404 download buttons. No test is added to exercise this load-bearing failure mode.",
+ "verdict": "request_changes"
+}
