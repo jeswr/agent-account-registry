@@ -72,16 +72,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "3f817ee7ecbd48688fe0008336284394",
-   "holder": "sparq-org/sparq#3295@dispatch-29669831149.1",
-   "package": "gui",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784427344,
-   "expires_at": 1784433644
-  },
-  {
-   "account": "acct01",
    "claim_id": "d03866f9776d41e8ab92aaaa5a655503",
    "holder": "sparq-org/sparq#3381@dispatch-29669831149.1",
    "package": "sparq-vectors",
