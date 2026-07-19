@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change consistently maps zero- or multi-area work to the fail-closed global partition in both plan construction and claim-side verification/review-item enumeration. This prevents secondary-area conflicts from being discarded, preserves exact package/label anti-tamper agreement, and deliberately over-serializes rather than opening a permissive path. The added tests are non-vacuous: they distinguish the former alphabetically-first behavior for multi-area inputs and exercise lease exclusion against a busy secondary area while retaining a disjoint single-area control. No trust check, permission boundary, token handling, or workflow injection surface is weakened in the diff.",
+ "verdict": "approve"
+}
