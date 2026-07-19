@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3624,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f99e9dc5d3a7e9b26048dcd6a2803a423afde765",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defect in the design-only change. The proposed constraint derives the blank-node branch from a domain-constrained per-position type code and recomputes each active encoding, while inactive slots remain gated consistently with the existing fold. The public salt is specified as reconstructed from the issuer-attested value rather than prover-controlled bytes. The verification obligations cover the real circuit path, both subject/object blank nodes, wrong-salt and selector-forcing negative cases, regenerated VK/gate fixtures, and real-bb end-to-end verification. Claims remain explicitly design-only and deferred; the document does not claim implementation or external audit completion.",
+  "verdict": "approve"
+ }
+}
