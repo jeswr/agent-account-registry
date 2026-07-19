@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 373,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2f1bbe2f9a8082a4e6543b0a249300c6cdddbe72",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces the divergent 8-hex HMAC dashboard label with the repository's shared canonical 16-hex sha256(handle + ':' + salt) account_hash implementation. Missing salt now fails closed via DashboardError, collision detection remains intact, and the dashboard workflow supplies PROVENANCE_SALT. The self-test is non-vacuous: it explicitly verifies that an empty salt aborts dashboard construction and that a populated salt produces exactly the shared hasher's result; the updated fixture would also catch output-shape drift. Removing the public account-count log reduces disclosure without affecting generation. No correctness, soundness, security, or completeness issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
