@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3628,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "751159be46337c5f127d3b77aa180fb17a8e1074",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. EN8 is a non-vacuous inactive-padding rejection: the required second antecedent is present byte-for-byte only at index 1 while count is 1, the commitment is recomputed with that count, and rejection is pinned to the membership assertion. EN9 exercises K=2 split membership and exact [true, true] attribution; EN10 and EN11 independently exercise duplicate and descending commitment rejection after successful per-graph recomputation; EN12 covers cross-graph attribution overstatement. The coverage comment now accurately enumerates these cases. The circuit remains explicitly scoped to a single RDFS step over committed asserted-base members, and all outward claims retain the research-grade, not-externally-audited sq-qhy4 caveat. No correctness, soundness, vacuity, or security issue remains in the reviewed diff.",
+  "verdict": "approve"
+ }
+}
