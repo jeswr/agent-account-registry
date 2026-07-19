@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-2 change consistently enforces a whole-comment, bot-authored dedicated-marker grammar across every affected budget parser and updates the corresponding producers and dispatch tests to use that canonical form. Reviewer-controlled verdict fields remain reserved-prefix-neutralized, while the progress control marker is emitted separately, so model text republished under the trusted App identity cannot become a parsed control marker. The whole-body matching remains fail-closed, corrupt dedicated pin tiers still raise, non-bot and embedded markers remain inert, and the added tests exercise both rejection paths and successful canonical parsing, including the end-to-end findings path. No blocker, major, or other actionable diff-scoped issue is evident.",
+ "verdict": "approve"
+}
