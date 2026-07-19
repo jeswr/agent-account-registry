@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 434,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ce02a210a9379a382a9ad46ba56d23700cdecc6d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 blocker is resolved soundly. The parser now accumulates every porcelain path, including rename/copy source endpoints, validates the complete set before emitting anything, and refuses newline-containing names with a non-zero status and empty stdout. Both gate callers propagate that failure through an explicit fail-closed die path. The added assertions are non-vacuous: they independently check refusal status, atomic no-output behavior when another valid path is present, and newline handling in a rename source endpoint. No new correctness, security, or test-validity issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
