@@ -902,11 +902,20 @@ def _sleep_backoff(attempt):
 def _record_identity(record):
     """Idempotency key (issue #200): the fields that identify one underlying OUTCOME, so a REPLAY of
     the same outcome is recognised and never appended twice — a duplicate would double-count toward
-    the derived per-account backoff and the alert thresholds (a false escalation). Keyed on the
-    GITHUB_RUN_ID — the part of run_id BEFORE the `.RUN_ATTEMPT` suffix — plus provider, salted
-    account, folded class and model alias. Deliberately NOT the write-time ts NOR the run ATTEMPT:
-    re-running ONLY the failed recorder bumps GITHUB_RUN_ATTEMPT while replaying the identical
-    outcome (the exact duplication the issue describes), so an attempt-sensitive key would miss it.
+    the derived per-account backoff and the alert thresholds (a false escalation). Keyed on the FULL
+    run_id — `GITHUB_RUN_ID.<attempt of the job that PRODUCED the outcome>` — plus provider, salted
+    account, folded class and model alias. Deliberately NOT the write-time ts.
+
+    The attempt component must be the PRODUCING job's attempt, never the recorder's own (review
+    round 1 of #425 — stripping the attempt here collapsed BOTH cases into one): a re-run of ONLY
+    the failed recorder replays the producing job's PRESERVED outputs, so the same producing
+    attempt arrives again and the replay dedups, while a full workflow re-run under the same
+    GITHUB_RUN_ID re-executes the producing job, which stamps a fresh attempt — that genuinely new
+    outcome (e.g. a second real rate-limit) must keep counting toward backoff/alert thresholds.
+    The call sites uphold this: worker.yml/review-fix.yml surface the producing job's
+    GITHUB_RUN_ATTEMPT as an output beside exit_class, and dispatch.yml records inside the
+    producing job itself.
+
     Returns None when run_id is empty — an unkeyed record cannot be safely deduplicated (distinct
     outcomes could share the remaining fields), so it always appends (fail toward recording)."""
     if not isinstance(record, dict):
@@ -914,7 +923,7 @@ def _record_identity(record):
     run_id = record.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         return None
-    return (run_id.split(".", 1)[0], record.get("provider"), record.get("account"),
+    return (run_id, record.get("provider"), record.get("account"),
             record.get("exit_class"), record.get("model_alias"))
 
 
@@ -923,8 +932,10 @@ def append_record(api, registry_repo, record, now, retries=CAS_RETRIES):
     full-jitter exponential backoff BETWEEN attempts (issue #200) — a synchronized completion burst
     that retried in lockstep with no delay could exhaust the budget and DISCARD records. The write
     is IDEMPOTENT: if this exact outcome is already on the ledger (a re-run of the failed recorder
-    replaying it — GITHUB_RUN_ATTEMPT bumped, outcome unchanged), the append is a confirmed no-op,
-    so a duplicate can never falsely escalate the derived backoff or an alert. Returns the pruned
+    replaying the producing job's preserved outputs — same producing-job attempt in run_id, outcome
+    unchanged), the append is a confirmed no-op, so a duplicate can never falsely escalate the
+    derived backoff or an alert. A re-EXECUTED outcome (full re-run: same GITHUB_RUN_ID, fresh
+    producing-job attempt) is NOT a replay and still appends. Returns the pruned
     record count on success, or the unchanged window count on a dedup no-op."""
     identity = _record_identity(record)
     for attempt in range(retries):
@@ -1987,25 +1998,33 @@ def _test_cas_dedup_jitter(chk):
         api = _StubAPI(seed=[])
         r = make_record("openai", ah, "sol", "rate-limit", "9999.1", now)
         n1 = append_record(api, "o/r", r, now)
-        # a re-run of ONLY the failed recorder bumps GITHUB_RUN_ATTEMPT (.1 -> .2) but replays the
-        # identical outcome with a fresh write-time ts — keyed on GITHUB_RUN_ID it is a duplicate.
-        replay = make_record("openai", ah, "sol", "rate-limit", "9999.2", now + 30)
+        # a re-run of ONLY the failed recorder replays the producing job's PRESERVED outputs: the
+        # same producing-job attempt (.1 again) arrives with a fresh write-time ts — a duplicate.
+        replay = make_record("openai", ah, "sol", "rate-limit", "9999.1", now + 30)
         n2 = append_record(api, "o/r", replay, now + 30)
-        chk("replayed recorder (bumped RUN_ATTEMPT) is an idempotent no-op",
+        chk("replayed recorder (same producing attempt, fresh ts) is an idempotent no-op",
             (n1, n2, len(api.records())), (1, 1, 1))
         # ...so the derived backoff reflects ONE hit, never a falsely-escalated two
         chk("dedup keeps the derived backoff at a single consecutive hit",
             account_backoffs(api.records(), now + 60).get(ah, {}).get("consecutive"), 1)
-        # a DISTINCT run (different GITHUB_RUN_ID) is a genuine second outcome and DOES append
-        r2 = make_record("openai", ah, "sol", "rate-limit", "10000.1", now + 40)
-        n3 = append_record(api, "o/r", r2, now + 40)
+        # a FULL workflow re-run keeps GITHUB_RUN_ID but RE-EXECUTES the producing job, which
+        # stamps a fresh attempt (.1 -> .2): a genuinely new outcome — e.g. a second real
+        # rate-limit — that MUST stay countable (review round 1 of #425: collapsing every attempt
+        # into the run id silently dropped it, weakening backoff/outage thresholds).
+        rerun = make_record("openai", ah, "sol", "rate-limit", "9999.2", now + 40)
+        nre = append_record(api, "o/r", rerun, now + 40)
+        chk("re-executed outcome under the SAME GITHUB_RUN_ID (fresh producing attempt) appends",
+            (nre, len(api.records())), (2, 2))
+        # a DISTINCT run (different GITHUB_RUN_ID) is a genuine further outcome and DOES append
+        r2 = make_record("openai", ah, "sol", "rate-limit", "10000.1", now + 50)
+        n3 = append_record(api, "o/r", r2, now + 50)
         chk("a distinct GITHUB_RUN_ID is a genuine hit and appends",
-            (n3, len(api.records())), (2, 2))
-        chk("two distinct runs escalate the backoff to consecutive=2",
-            account_backoffs(api.records(), now + 60).get(ah, {}).get("consecutive"), 2)
+            (n3, len(api.records())), (3, 3))
+        chk("three genuine outcomes escalate the backoff to consecutive=3",
+            account_backoffs(api.records(), now + 70).get(ah, {}).get("consecutive"), 3)
         # a record with NO run_id cannot be keyed -> always appends (never falsely deduped)
-        unkeyed = make_record("openai", ah, "sol", "rate-limit", "", now + 50)
-        napp = append_record(_StubAPI(seed=[dict(unkeyed)]), "o/r", unkeyed, now + 50)
+        unkeyed = make_record("openai", ah, "sol", "rate-limit", "", now + 60)
+        napp = append_record(_StubAPI(seed=[dict(unkeyed)]), "o/r", unkeyed, now + 60)
         chk("an unkeyed (no run_id) record is never deduped", napp, 2)
     finally:
         globals()["_sleep_backoff"] = real_sleep
