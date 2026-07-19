@@ -1,14 +1,6 @@
 {
  "records": [
   {
-   "ts": 1784431202,
-   "provider": "anthropic",
-   "account": "33d4bc1f91e9f0a9",
-   "model_alias": "opus",
-   "exit_class": "success",
-   "run_id": "29671277601.1"
-  },
-  {
    "ts": 1784431213,
    "provider": "anthropic",
    "account": "33d4bc1f91e9f0a9",
@@ -1599,6 +1591,14 @@
    "model_alias": "",
    "exit_class": "success",
    "run_id": "29676193152.1"
+  },
+  {
+   "ts": 1784442226,
+   "provider": "anthropic",
+   "account": "33d4bc1f91e9f0a9",
+   "model_alias": "opus",
+   "exit_class": "success",
+   "run_id": "29676012463.1"
   }
  ]
 }
