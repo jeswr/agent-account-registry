@@ -124,8 +124,10 @@ jobs:
       # using REGISTRY code, BEFORE any target planner code runs (the clone/self-test step below is
       # the first to execute target code). The hostile planner step consumes only this pure-data
       # JSON — it never reads the policy itself. CLAIM re-derives the SAME allowlist authoritatively
-      # (exact App-bot login + policy trusted_bots) before any launch; this map only tightens PLAN's
-      # advisory author filter so it stops proposing arbitrary "<x>[bot]" issue authors.
+      # (exact App-bot login + policy trusted_bots) before any launch; PLAN's use of this map is
+      # purely ADVISORY — it can admit extra non-"[bot]" logins the policy names, while unlisted
+      # "[bot]" authors stay an over-proposal for CLAIM's exact check to settle (PLAN holds no
+      # token, so it can never resolve the pipeline's own App bot login itself).
       - name: Extract the policy trusted-bot allowlist (registry code, pre-target)
         run: |
           set -euo pipefail
@@ -227,24 +229,27 @@ jobs:
               return sorted(set(names))
 
           def trusted(issue, trusted_bots):
-              # Fail-closed author trust (registry issue #111). Collaborator associations
-              # (OWNER/MEMBER/COLLABORATOR) are trusted; a bot is trusted ONLY by EXACT membership
-              # in the policy-controlled `trusted_bots` allowlist — never by a bare "[bot]" suffix,
-              # which admits any unrelated or compromised GitHub App. When the allowlist is empty
-              # (none configured) PLAN keeps an ADVISORY suffix pass: PLAN is the unprivileged,
-              # hostile-data half (see file header) and cannot resolve the App bot login (no token),
-              # while CLAIM re-derives trust EXACTLY against the resolved App bot login + policy
-              # allowlist before any worker launches — so an empty list only over-proposes rows
-              # CLAIM then rejects, never fails OPEN here.
-              author = issue.get("user", {}).get("login")
-              association = str(issue.get("author_association", "")).upper()
+              # Advisory, fail-closed author filter (registry issue #111). Collaborator
+              # associations (OWNER/MEMBER/COLLABORATOR) and EXACT `trusted_bots` members pass;
+              # any other "[bot]"-suffixed login is kept as an ADVISORY over-proposal because
+              # PLAN is the unprivileged, hostile-data half (see file header) and cannot resolve
+              # the pipeline's own App bot login (no token) — dropping unlisted bots here would
+              # silently strand the App's own issues whenever the policy names ANY additional
+              # bot. CLAIM is the authority: it re-derives trust EXACTLY against the resolved
+              # App bot login + policy allowlist before any worker launches, so the suffix pass
+              # only over-proposes rows CLAIM then rejects — it never fails OPEN. Malformed
+              # shapes (non-dict issue or nested user in the untrusted snapshot) DENY the item
+              # instead of raising: an exception here aborts planning for EVERY repository.
+              if not isinstance(issue, dict):
+                  return False
+              user = issue.get("user")
+              author = user.get("login") if isinstance(user, dict) else None
               if not isinstance(author, str):
                   return False
+              association = str(issue.get("author_association", "")).upper()
               if association in trusted_associations:
                   return True
-              if trusted_bots:
-                  return author in trusted_bots
-              return author.endswith("[bot]")
+              return author in trusted_bots or author.endswith("[bot]")
 
           def linked_issue_numbers(pulls):
               linked = set()
@@ -336,7 +341,8 @@ jobs:
               for row, deferred in flagged_rows:
                   number = row.get("number")
                   issue, labels, body = details[number]
-                  author = issue.get("user", {}).get("login")
+                  user = issue.get("user")
+                  author = user.get("login") if isinstance(user, dict) else None
                   if row.get("role") is None or row.get("agent") is None or not row.get("model_chain"):
                       raise SystemExit(f"target planner left {repo}#{number} unresolved")
                   items.append({

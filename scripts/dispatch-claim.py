@@ -3923,6 +3923,37 @@ def _self_test():
     assert tick_state({"planned": 3, "dispatched": 1,
                        "defer_reasons": {"existing-pr": 2}}) == "ok"
 
+    # ---- [issue #111, round 2] PLAN's trusted() author filter, exec'd from dispatch.yml itself
+    # (not a re-implemented copy) so these pin the workflow's REAL advisory behavior. Two pinned
+    # regressions: (1) a NONEMPTY additional policy allowlist must NOT strand the pipeline's own
+    # App bot — PLAN cannot resolve the runtime bot_login (no token), so an unlisted "[bot]"
+    # author stays an advisory over-proposal for CLAIM's exact authoritative check to settle;
+    # (2) a truthy non-dict nested `user` in the untrusted snapshot DENIES that item instead of
+    # raising the AttributeError that would abort planning for every repository. ----
+    plan_trusted_src = re.search(
+        r"\n( *def trusted\(issue, trusted_bots\):.*?)\n\s*\n *def linked_issue_numbers",
+        workflow, re.DOTALL)
+    assert plan_trusted_src, "dispatch.yml lost the PLAN trusted() author filter"
+    plan_ns = {"trusted_associations": {"OWNER", "MEMBER", "COLLABORATOR"}}
+    exec(textwrap.dedent(plan_trusted_src.group(1)), plan_ns)  # noqa: S102 — trusted workflow source
+    plan_trusted = plan_ns["trusted"]
+    own_app = {"user": {"login": "our-app[bot]"}, "author_association": "NONE"}
+    # the round-2 defect: an ADDITIONAL policy bot must not exclude the unlisted own App bot
+    assert plan_trusted(own_app, {"other[bot]"}), \
+        "nonempty allowlist strands the pipeline's own App bot at PLAN"
+    assert plan_trusted(own_app, set())
+    # exact allowlist members pass even without a "[bot]" suffix; non-collaborator humans never do
+    assert plan_trusted({"user": {"login": "machine-user"}, "author_association": "NONE"},
+                        {"machine-user"})
+    assert not plan_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"},
+                            {"other[bot]"})
+    assert plan_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"}, set())
+    # malformed shapes DENY without raising (the whole-PLAN-abort defect)
+    assert not plan_trusted({"user": "malformed", "author_association": "MEMBER"}, set())
+    assert not plan_trusted({"user": ["x"], "author_association": "OWNER"}, {"other[bot]"})
+    assert not plan_trusted({"user": None, "author_association": "NONE"}, set())
+    assert not plan_trusted("nope", set())
+
     def snapshot_row(number, ref, *, draft, labels=()):
         # EXACTLY the dispatch.yml projection: top-level keys pinned to the workflow read
         # above; labels are plain STRINGS (not {"name": ...} dicts); head/user sub-shapes
