@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 413,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0a34981cc9ce431bfd137c7c3565b976ba2b1f49",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`os.open(path, O_WRONLY|O_CREAT|O_TRUNC, 0600)` only applies `0600` when creating a new file. If `path` already names a mode-0644 file, `json.dump` writes the access token while that inode remains readable, and only afterward does `os.chmod` narrow its mode. The open also follows symlinks, allowing a stale or manipulated output path to redirect truncation and secret output to another file. Thus the implementation does not actually guarantee that the capability goes only to a private file. The self-test covers only a newly created destination, so it cannot catch either failure mode.",
+    "file": "scripts/broker-refresh.py",
+    "fix_hint": "Create the output fail-closed without following symlinks (for example, use an atomic private temporary file in the destination directory and replace after fsync, with appropriate destination validation, or use `O_EXCL|O_NOFOLLOW` and reject an existing path). Add non-vacuous tests for an existing permissive destination and a symlink destination, asserting that no capability bytes become readable through or written to the unsafe target.",
+    "severity": "major",
+    "title": "Capability is written before an existing destination is made private"
+   }
+  ],
+  "progress": null,
+  "summary": "The live capability is no longer printed, and the new tests exercise the ordinary file-output and missing-destination paths. However, the file writer does not preserve the claimed private-file invariant when the caller-supplied destination already exists: it writes through the existing inode (and follows symlinks) before applying chmod. That can expose or overwrite the token-bearing capability through a permissive or redirected destination, so this trust-sensitive change is not yet fail-closed.",
+  "verdict": "request_changes"
+ }
+}
