@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3624,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ca4b9e949f3fef50ed0f4fcecaf796aa04e4537c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3.1 says is_bnode is constrained by an existing type discipline, but the current scan circuit receives each term only as an already-hashed Field encoding; TYPE_CODE_BLANK_NODE is hidden inside Poseidon and there is no independently bound type value from which the selector can be derived. Section 3.3 applies the new equality only when this private selector is true, while explicitly leaving non-bnode encodings under the existing witness treatment. A malicious prover can therefore set is_bnode=false for a blank-node encoding and bypass the new relation entirely. The proposed forge test would only be meaningful if it also attempts this selector-forcing bypass.",
+    "file": "research/zk-in-circuit-salt-binding.md",
+    "fix_hint": "Specify and enforce a non-bypassable term relation: witness a type code for every term position, constrain it to the allowed domain, recompute enc from that type and its corresponding digest/preimage data, and derive the bnode branch from equality with TYPE_CODE_BLANK_NODE (or use an equivalent fully constrained tagged encoding). Add a negative test that supplies a blank-node commitment with is_bnode=false and proves that witness generation/proving fails.",
+    "severity": "major",
+    "title": "Private is_bnode selector permits bypassing the salt constraint"
+   },
+   {
+    "body": "The current scan witness is enc[g][i][0..3], one encoding for each subject, predicate, and object position. The design instead declares one is_bnode[g][i] and one label_digest[g][i] per triple slot, then refers to an unspecified pos. A triple may contain blank nodes in both subject and object, so a single selector/digest cannot constrain all applicable enc[g][i][pos] values. This makes the design incomplete and not mechanical to implement.",
+    "file": "research/zk-in-circuit-salt-binding.md",
+    "fix_hint": "Define selectors and digest witnesses per term position, e.g. is_bnode[g][i][j] and label_digest[g][i][j] for j in 0..3, and state the constraint loop over every active graph, triple slot, and term position. Clarify padding/inactive-slot behavior and add a differential/forge case with blank nodes simultaneously in subject and object.",
+    "severity": "major",
+    "title": "Witness layout is underspecified for triple term positions"
+   }
+  ],
+  "progress": null,
+  "summary": "The design correctly describes the current off-circuit encoding and the outer SaltReused control, but its proposed circuit relation is not sufficient to enforce salt binding. The private is_bnode selector has no specified non-bypassable derivation from the committed encoding, and the witness shapes do not cover the three independently typed term positions in each triple. As written, a prover can select the non-bnode branch and retain the current unconstrained encoding. Because this document is intended to make implementation mechanical, that missing load-bearing constraint must be resolved before approval.",
+  "verdict": "request_changes"
+ }
+}
