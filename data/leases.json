@@ -41,16 +41,6 @@
    "expires_at": 1784432370
   },
   {
-   "account": "acct03",
-   "claim_id": "488163153d03478f96e0a092df4acb4a",
-   "holder": "review:sparq-org/sparq#3540@dispatch-29670534327.1",
-   "package": "sparq-rsp",
-   "role": "review",
-   "model": "opus",
-   "issued_at": 1784429005,
-   "expires_at": 1784430205
-  },
-  {
    "account": "acct01",
    "claim_id": "9abda500308a4aa5a64e45e97b4518c7",
    "holder": "sparq-org/sparq#3408@dispatch-29670631362.1",
