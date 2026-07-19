@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 392,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b0bb90bf274a8c829ea701acab7c0896ed15337",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 trust-boundary defect is fixed soundly. CLAIM now requires the default-branch API response to carry an explicit boolean `protected: true` before accepting its independently resolved 40-hex tip, and all missing, false, or malformed protection values fail closed with `DispatchError`. Routing content is then fetched by that immutable SHA rather than the plan-controlled target SHA. The added self-tests are non-vacuous: the unprotected and missing-protection cases would fail if the production protection check were removed, while the positive test proves the content request uses the protected tip. No blocker, major, or other diff-scoped issue remains.",
+  "verdict": "approve"
+ }
+}
