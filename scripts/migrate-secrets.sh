@@ -130,10 +130,18 @@
 #     reads the missing repo-scope APP_ID) while re-running the cancelled cleanup is banned by
 #     the attempt gate — only an env-bound FRESH dispatch converges, and it works whatever
 #     bootstrap subset remains (2/1/0). Same script phase, same gates, either way:
-#     C0. the same M0a quiesce gate + M0b coherent drain check + M0c ordering attestation (a
-#         cleanup-only rerun after an accidental resume must fail closed the same way —
-#         re-dispatch phase: quiesce, then phase: migrate, which converges through main as a
-#         no-op and re-runs this phase).
+#     C0. the same M0a quiesce gate + M0b coherent drain check — but, round 15 (sol), NOT the
+#         M0c ordering attestation. M0c protects a run's QUEUE-time S_* secrets snapshot, and
+#         this phase consumes no queue-time value (it mints from the ENVIRONMENT copies and
+#         deletes names from C2's LIVE listing), so the attestation protected nothing here —
+#         while applying it BRICKED the round-13 recovery: in the KEY-only mid-cleanup state
+#         a REFUSED phase: resume (R0 fail — enables nothing) still lands a resume-titled
+#         event that M0c rejects on title alone, demanding a fresh successful quiesce whose
+#         environment-UNBOUND mint cannot exist once the repo-scope APP_ID is gone — every
+#         later cleanup denied forever, forceable by any write collaborator via an
+#         actor-skipped resume dispatch. The live-state checks are KEPT: they cannot brick
+#         (a refused/actor-skipped resume enables nothing, so the writers stay disabled) and
+#         they close C2's listing->delete residual window.
 #     C1. list the environment; assert it holds all 14 — with a DISTINCT refusal if a BOOTSTRAP
 #         name is missing: deleting its repo-scope original then would destroy the last mint
 #         credential (re-run the main phase first).
@@ -244,7 +252,8 @@
 # decoy — neither may satisfy the attestation) and no-quiesce/resume-event-at-all. Round 10:
 # SUPERSEDED-QUIESCE total-order scenarios — sol's exact sequence (Q1 success -> resume -> Q2
 # FAILED drain, migrate queued during Q2, every repo value rotated to V2: must fail closed
-# with zero mutations and V2 untouched, for the main AND cleanup phases), newest-event-is-a-
+# with zero mutations and V2 untouched for the MAIN phase; round 15 — the same history must
+# NOT block the cleanup phase, which converges), newest-event-is-a-
 # RESUME -> fail closed, newest-event-is-an-IN-PROGRESS-quiesce (null conclusion) -> fail
 # closed; reverting the event filter to the old success-only-quiesce selection turns all of
 # them red (the harness shows the V2 values being destroyed). Round 11: RE-RUN PROHIBITED —
@@ -258,8 +267,9 @@
 # quiesce run whose job the actor/ref if-condition SKIPPED still reports run
 # conclusion=success) — sol's sequence (a legit jeswr quiesce FAILS its drain, then the
 # collaborator skipped-'success' quiesce supersedes it as the newest event; every repo value
-# rotated to V2) must fail closed with zero mutations and V2 untouched for the main AND
-# cleanup phases; plus one rejection scenario per attested field (triggering_actor mismatch /
+# rotated to V2) must fail closed with zero mutations and V2 untouched for the MAIN phase
+# (round 15: the cleanup phase never consults the history and converges on the same
+# state); plus one rejection scenario per attested field (triggering_actor mismatch /
 # off-master head_branch / run_attempt 2 on an otherwise-valid newest quiesce). Dropping the
 # actor pin (or any other field pin) from the winning-event check turns them red — the
 # harness shows the V2 values being destroyed. The suite also STATICALLY pins the WORKFLOW's
@@ -290,7 +300,20 @@
 # listing with zero enables; and the mint contract pins `permission-secrets: read` on the
 # reenable mint (removing it goes red). MUTATION CHECK: comment out the
 # assert_repo_scope_clear_for_resume call in phase_resume and the refusal scenario goes red
-# (rc 0, 4 enables issued from the dual-scope state).
+# (rc 0, 4 enables issued from the dual-scope state). Round 15 (sol — the composed
+# refused-resume denial): the CLEANUP phase drops the queue-time ordering attestation (it
+# consumes no queue-time S_* snapshot — see phase_cleanup's C0 comment); the composed
+# regression seeds the KEY-only mid-cleanup state with a REFUSED `phase: resume` event (R0
+# fail — enabled nothing, but the resume-titled run is in the history) and asserts the
+# standalone cleanup STILL converges (1 delete, repo scope empty, zero non-delete mutations,
+# the run history NEVER read, argv identical to the clean 1-remaining recovery), plus the
+# collaborator ACTOR-SKIPPED-resume variant (job skipped, run 'success' — the old title-only
+# block let any write collaborator force the permanent denial); the ordering-violation /
+# superseded-quiesce / skipped-quiesce histories are also asserted NOT to block cleanup
+# (updated coverage, not deleted), while the cleanup exact-argv diffs pin that the
+# attestation reads never creep back in. MUTATION CHECK: re-add
+# assert_quiesce_completed_before_queue to phase_cleanup and the composed scenarios go red
+# (rc 1 newest-is-a-RESUME refusal, zero deletions — the permanent denial).
 # Wired into pr-gate.yml and worker-live's FULL_SELFTEST_SUITE so it gates. When the migration
 # workflow is deleted after its successful run, delete this script too and unenrol it from BOTH
 # suite lists.
@@ -683,10 +706,29 @@ phase_cleanup() {
   echo '== attempt gate (round 11): this must be attempt 1 — re-runs are prohibited =='
   assert_first_attempt
   setup
-  echo '== phase C0: quiesce gate + coherent drain check + ordering attestation (same fail-closed gate as the main phase) =='
+  # C0 — round 15 (sol): the M0c queue-time total-order quiesce/resume attestation is
+  # DELIBERATELY NOT applied in this phase. That attestation exists to protect a run's
+  # QUEUE-time `secrets.*` snapshot (the S_* values the MAIN phase copies) from being staler
+  # than a writer rotation — and this phase consumes NO queue-time value: it mints from the
+  # ENVIRONMENT copies (env-bound job) and deletes repo-scope NAMES selected from the LIVE
+  # listing C2 takes at run time, so the attestation protected nothing here. Worse, it
+  # composed into a permanent brick of the round-13 recovery: in the KEY-only mid-cleanup
+  # state a REFUSED `phase: resume` (R0 fails, enables NOTHING) still lands a resume-titled
+  # event in the run history; the attestation rejects ANY newer resume event (title alone,
+  # fields ignored — the round-12 fail-closed direction) and demands a fresh SUCCESSFUL
+  # quiesce, but the quiesce mint is environment-UNBOUND and the repo-scope
+  # REGISTRY_ADMIN_APP_ID is already deleted — no quiesce can ever mint again, so every
+  # subsequent cleanup is denied forever (and a write collaborator could force the same
+  # permanent denial just by dispatching an actor-skipped resume). The WRITERS-DISABLED +
+  # DRAINED checks below are KEPT: they are LIVE-state reads, not queue-time attestations;
+  # they cannot brick this recovery (a refused or actor-skipped resume enables nothing, so
+  # the writers stay disabled and both checks pass); and they still close C2's
+  # listing->delete residual window (no writer can start or be mid-flight to re-create a
+  # migrated name between C2's listing and C3's deletes). The MAIN phase's M0c is UNCHANGED —
+  # it does consume queue-time S_* values.
+  echo '== phase C0: quiesce gate + coherent drain check (LIVE-state reads; round 15 — the queue-time ordering attestation is deliberately NOT applied here: this phase consumes no queue-time secrets snapshot) =='
   assert_writers_quiesced
   drain_check_no_live_writers
-  assert_quiesce_completed_before_queue
 
   echo '== phase C1: assert the environment holds all 14 (esp. both bootstrap mint credentials) =='
   local env_names
@@ -1067,8 +1109,9 @@ case "$*" in
     if [[ -f "$state/disabled_${wfname}" ]]; then echo disabled_manually; else echo active; fi
     exit 0 ;;
   "api repos/o/r/actions/runs/"*" --jq .created_at")
-    # Round-9 ordering attestation: the migrate/cleanup gate fetches ITS OWN run's created_at
-    # (the queue instant — the moment the secrets.* snapshot was fixed). Sits under Actions read.
+    # Round-9 ordering attestation: the MIGRATE gate fetches ITS OWN run's created_at (the
+    # queue instant — the moment the secrets.* snapshot was fixed). Sits under Actions read.
+    # Round 15: the cleanup phase no longer issues this read (it consumes no queue-time value).
     _grant actions:read \
       || { echo "HTTP 403: Resource not accessible by integration (run read needs Actions: read)" >&2; exit 1; }
     [[ -f "$state/run_created" ]] || { echo "HTTP 404: Not Found (no such run modeled)" >&2; exit 1; }
@@ -1262,23 +1305,27 @@ FAKE
   # The migrate/cleanup phases' shared fail-closed prefix (rounds 8+9): 4 workflow-state reads
   # (the quiesce gate), 4 single-snapshot drain listings — ONE unfiltered call per workflow;
   # the client-side NONTERMINAL_FILTER is part of the asserted argv, so a --status flag
-  # sneaking back in (or the filter disappearing) breaks the exact-sequence diffs — then the
-  # round-9/round-10/round-12 ordering attestation: this run's created_at read + ONE REST
-  # run listing of the migration workflow itself with QUIESCE_RESUME_EVENT_FILTER pinned in
-  # the argv (round 10: the filter must surface quiesce AND resume events of ANY conclusion —
-  # narrowing it back to successful quiesces breaks this exact-argv diff as well as the
-  # behavioral scenarios; round 12: the filter must CARRY the attested
-  # actor/triggering_actor/head_branch/run_attempt fields — dropping any of them from the
-  # emitted lines breaks this diff too).
-  local expected_gate="$tmp/expected-gate.log" wf st n
-  : > "$expected_gate"
+  # sneaking back in (or the filter disappearing) breaks the exact-sequence diffs. ROUND 15:
+  # this 8-call LIVE-state prefix ($expected_gate_cleanup) is the ENTIRE cleanup gate; only
+  # the MAIN phase ($expected_gate) appends the round-9/round-10/round-12 ordering
+  # attestation — this run's created_at read + ONE REST run listing of the migration workflow
+  # itself with QUIESCE_RESUME_EVENT_FILTER pinned in the argv (round 10: the filter must
+  # surface quiesce AND resume events of ANY conclusion — narrowing it back to successful
+  # quiesces breaks this exact-argv diff as well as the behavioral scenarios; round 12: the
+  # filter must CARRY the attested actor/triggering_actor/head_branch/run_attempt fields —
+  # dropping any of them from the emitted lines breaks this diff too). The cleanup exact-argv
+  # diffs (scenarios 2/6/29/29b) therefore go red if the attestation reads ever creep back
+  # into the cleanup phase.
+  local expected_gate="$tmp/expected-gate.log" expected_gate_cleanup="$tmp/expected-gate-cleanup.log" wf st n
+  : > "$expected_gate_cleanup"
   for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
-    printf 'api repos/o/r/actions/workflows/%s --jq .state\n' "$wf" >> "$expected_gate"
+    printf 'api repos/o/r/actions/workflows/%s --jq .state\n' "$wf" >> "$expected_gate_cleanup"
   done
   for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
     printf 'run list --all -R o/r --workflow %s --limit 1000 --json status,databaseId --jq %s\n' \
-      "$wf" "$NONTERMINAL_FILTER" >> "$expected_gate"
+      "$wf" "$NONTERMINAL_FILTER" >> "$expected_gate_cleanup"
   done
+  cp "$expected_gate_cleanup" "$expected_gate"
   printf 'api repos/o/r/actions/runs/7777 --jq .created_at\n' >> "$expected_gate"
   printf 'api repos/o/r/actions/workflows/migrate-secrets-to-env.yml/runs?per_page=100 --jq %s\n' \
     "$QUIESCE_RESUME_EVENT_FILTER" >> "$expected_gate"
@@ -1457,14 +1504,14 @@ FAKE
     "$(grep -c 'MIGRATION COMPLETE (both phases)' "$tmp/s2.out")" 1
   local expected_c="$tmp/expected-cleanup.log"
   {
-    cat "$expected_gate"
+    cat "$expected_gate_cleanup"
     printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n'
     printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
     printf 'secret delete REGISTRY_ADMIN_APP_ID --repo o/r\n'
     printf 'secret delete REGISTRY_ADMIN_APP_KEY --repo o/r\n'
     printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
   } > "$expected_c"
-  chk "cleanup: EXACT gh argv sequence (state x4 -> snapshot x4 -> env assert -> repo list -> delete x2 bootstrap -> assert)" \
+  chk "cleanup: EXACT gh argv sequence (state x4 -> snapshot x4 -> env assert -> repo list -> delete x2 bootstrap -> assert; round 15: NO ordering-attestation reads)" \
     "$(diff -q "$expected_c" "$s2/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
 
   # --- scenario 3: CONVERGED RERUNS of BOTH phases on the fully-migrated state, NO values
@@ -1523,8 +1570,9 @@ FAKE
   # CANNOT mint (the env-unbound main job reads the deleted repo-scope APP_ID) and the
   # cancelled run cannot be re-run (attempt gate), so this convergence plus the reachability
   # contract (scenario 18k) IS the recovery path. The exact argv pin proves the recovery is
-  # delete-only: the full C0 gate, the two listings-of-record, the ONE delete, the final
-  # assert — zero non-delete mutations (no secret set, no workflow disable/enable).
+  # delete-only: the live-state C0 gate (round 15: no ordering-attestation reads), the two
+  # listings-of-record, the ONE delete, the final assert — zero non-delete mutations (no
+  # secret set, no workflow disable/enable).
   local s6="$tmp/s6"
   mkdir -p "$s6"
   seed_quiesced "$s6"
@@ -1541,13 +1589,13 @@ FAKE
     "$(grep -cE '^(secret set |workflow (disable|enable) )' "$s6/calls.log" || true)" 0
   local expected_c1="$tmp/expected-cleanup-1rem.log"
   {
-    cat "$expected_gate"
+    cat "$expected_gate_cleanup"
     printf 'api repos/o/r/environments/dispatch-secrets/secrets --paginate --jq .secrets[].name\n'
     printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
     printf 'secret delete REGISTRY_ADMIN_APP_KEY --repo o/r\n'
     printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n'
   } > "$expected_c1"
-  chk "cleanup from 1-remaining: EXACT gh argv sequence (state x4 -> snapshot x4 -> ordering x2 -> env assert -> repo list -> delete KEY x1 -> assert)" \
+  chk "cleanup from 1-remaining: EXACT gh argv sequence (state x4 -> snapshot x4 -> env assert -> repo list -> delete KEY x1 -> assert; round 15: NO ordering-attestation reads)" \
     "$(diff -q "$expected_c1" "$s6/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
 
   # --- scenario 7: CLEANUP FROM 0-REMAINING — a rerun after full success: success no-op.
@@ -2076,7 +2124,12 @@ FAKE
     "$(grep -cE '^secret (set|delete) ' "$s24/calls.log" || true)" 0
   chk "queue-time ordering violation: the rotated V2 repo values survive untouched" \
     "$(grep -c '=v2-' "$s24/repo_values")" 14
-  # ... and the cleanup phase's C0 gate applies the same attestation.
+  # ... while the CLEANUP phase (round 15) deliberately does NOT apply the attestation: the
+  # same ordering-violation history must not block it — cleanup consumes no queue-time S_*
+  # snapshot (it mints from the env copies and deletes from C2's live listing), so it
+  # CONVERGES, and the attestation reads are never even issued. (The history stays UPDATED
+  # coverage, not deleted: pre-round-15 this scenario asserted fail-closed here, which is
+  # exactly the over-reach that composed into the permanent recovery denial — see scenario 29.)
   local s24c="$tmp/s24c"
   mkdir -p "$s24c"
   seed_quiesced "$s24c"
@@ -2085,8 +2138,10 @@ FAKE
   printf '%s\n' "${names[@]}" > "$s24c/env_secrets"
   printf '%s\n' "${bootstrap[@]}" > "$s24c/repo_secrets"
   rc=$(run_case "$s24c" "$tmp/s24c.out" cleanup-bootstrap none)
-  chk "queue-time ordering violation (cleanup): fail closed with zero deletions" \
-    "$rc-$(grep -cE '^secret delete ' "$s24c/calls.log" || true)" 1-0
+  chk "queue-time ordering violation history (cleanup, round 15): cleanup CONVERGES (consumes no queue-time snapshot) with exactly the 2 bootstrap deletes" \
+    "$rc-$(grep -cE '^secret delete ' "$s24c/calls.log" || true)" 0-2
+  chk "queue-time ordering violation history (cleanup): ZERO attestation reads (created_at / run-history never fetched)" \
+    "$(grep -cE '^api repos/o/r/actions/(runs/|workflows/migrate-secrets-to-env\.yml/runs)' "$s24c/calls.log" || true)" 0
 
   # --- scenario 24b: NO SUCCESSFUL QUIESCE RUN in the listing — the writers being disabled
   # (M0a green) is NOT an attestation that a quiesce RUN drained them (an admin may have
@@ -2161,7 +2216,11 @@ FAKE
     "$(grep -cE '^secret (set|delete) ' "$s25/calls.log" || true)" 0
   chk "superseded quiesce: the rotated V2 repo values survive untouched" \
     "$(grep -c '=v2-' "$s25/repo_values")" 14
-  # ... and the cleanup phase's C0 gate applies the same total order.
+  # ... while the CLEANUP phase (round 15) does NOT apply the total order: the superseded-
+  # quiesce history must not block it. Even if a writer DID run between the resume and Q2, it
+  # can only have touched non-bootstrap names — cleanup deletes only the 2 bootstrap names no
+  # writer ever writes, C1 verifies the env mint credentials LIVE, and C2's live exact-set
+  # check catches any writer-re-created repo name with zero deletions. Cleanup CONVERGES.
   local s25d="$tmp/s25d"
   mkdir -p "$s25d"
   seed_quiesced "$s25d"
@@ -2170,8 +2229,8 @@ FAKE
   printf '%s\n' "${names[@]}" > "$s25d/env_secrets"
   printf '%s\n' "${bootstrap[@]}" > "$s25d/repo_secrets"
   rc=$(run_case "$s25d" "$tmp/s25d.out" cleanup-bootstrap none)
-  chk "superseded quiesce (cleanup): fail closed with zero deletions" \
-    "$rc-$(grep -cE '^secret delete ' "$s25d/calls.log" || true)" 1-0
+  chk "superseded quiesce history (cleanup, round 15): cleanup CONVERGES with exactly the 2 bootstrap deletes (total order not consulted)" \
+    "$rc-$(grep -cE '^secret delete ' "$s25d/calls.log" || true)" 0-2
 
   # --- scenario 25b: NEWEST EVENT IS A RESUME — Q1 succeeded, then phase: resume re-enabled
   # the writers, then someone (or an out-of-band actions-admin) re-disabled them by hand so
@@ -2284,8 +2343,10 @@ FAKE
     "$(test -e "$s26c/calls.log" && echo exists || echo absent)" absent
   chk "sol re-run sequence: the rotated V2 repo values survive untouched" \
     "$(grep -c '=v2-' "$s26c/repo_values")" 14
-  # ... and an attempt-2 re-run of the CLEANUP phase fails closed identically (its C0 gate
-  # shares M0c, so it shares the attempt-unawareness — and the total kill).
+  # ... and an attempt-2 re-run of the CLEANUP phase fails closed identically: the attempt
+  # gate is phase-level and KEPT in round 15 — re-runs stay prohibited outright even though
+  # cleanup no longer runs M0c (recovery from a cancelled cleanup is a FRESH standalone
+  # dispatch, never a re-run).
   local s26d="$tmp/s26d"
   mkdir -p "$s26d"
   seed_quiesced "$s26d"
@@ -2330,7 +2391,10 @@ FAKE
     "$(grep -cE '^secret (set|delete) ' "$s27/calls.log" || true)" 0
   chk "collaborator skipped quiesce: the rotated V2 repo values survive untouched" \
     "$(grep -c '=v2-' "$s27/repo_values")" 14
-  # ... and the cleanup phase's C0 gate applies the same attested-fields rule.
+  # ... while the CLEANUP phase (round 15) does NOT consult the history at all, so the
+  # collaborator's skipped-'success' quiesce event cannot influence it either way: cleanup
+  # CONVERGES on live state (writers disabled + drained NOW, env verified LIVE by C1, repo
+  # exact-set verified LIVE by C2 — the deletions touch only bootstrap names no writer writes).
   local s27d="$tmp/s27d"
   mkdir -p "$s27d"
   seed_quiesced "$s27d"
@@ -2339,8 +2403,8 @@ FAKE
   printf '%s\n' "${names[@]}" > "$s27d/env_secrets"
   printf '%s\n' "${bootstrap[@]}" > "$s27d/repo_secrets"
   rc=$(run_case "$s27d" "$tmp/s27d.out" cleanup-bootstrap none)
-  chk "collaborator skipped quiesce (cleanup): fail closed with zero deletions" \
-    "$rc-$(grep -cE '^secret delete ' "$s27d/calls.log" || true)" 1-0
+  chk "collaborator skipped quiesce history (cleanup, round 15): cleanup CONVERGES with exactly the 2 bootstrap deletes (history not consulted)" \
+    "$rc-$(grep -cE '^secret delete ' "$s27d/calls.log" || true)" 0-2
 
   # --- scenario 27b: EVERY ATTESTED FIELD IS LOAD-BEARING — one rejection scenario per
   # remaining field on an otherwise fully-valid newest successful quiesce (completed 11:50 <
@@ -2409,6 +2473,72 @@ FAKE
     "$(cat "$s28/calls.log")" "api repos/o/r/actions/secrets --paginate --jq .secrets[].name"
   chk "resume refusal: the newer env V2 values survive untouched (resume mutates no secret in any state)" \
     "$(grep -c '=v2-' "$s28/env_values")" 14
+
+  # --- scenario 29: SOL'S COMPOSED ROUND-15 REGRESSION — REFUSED RESUME MUST NOT BRICK THE
+  # KEY-ONLY CLEANUP RECOVERY. Composition of rounds 13+14+the old C0: the mid-cleanup
+  # cancellation left the repo scope KEY-only (APP_ID deleted, APP_KEY not yet); an operator
+  # then dispatched phase: resume, which R0 correctly REFUSED (rc 1 — repo scope not empty,
+  # NOTHING enabled) — but the refused run still lands a 'migrate-secrets [resume]' event in
+  # the workflow history (created 11:55, after the good quiesce at 11:40 and before this
+  # cleanup's queue at 12:00). Pre-round-15, cleanup's C0 attestation rejected ANY newer
+  # resume event on title alone and demanded a fresh SUCCESSFUL quiesce — whose
+  # environment-UNBOUND mint needs the repo-scope APP_ID this very cancellation deleted:
+  # every subsequent cleanup denied FOREVER (R0 fails => enables nothing => the state never
+  # changes => the history never changes). Round 15: cleanup consumes no queue-time snapshot,
+  # so the refused-resume event is irrelevant to it — the standalone cleanup must STILL
+  # converge: delete the 1 remaining bootstrap name, assert the repo scope empty, zero
+  # non-delete mutations, and never read the run history at all. MUTATION CHECK: re-add
+  # assert_quiesce_completed_before_queue to phase_cleanup and this scenario (plus 29b) goes
+  # red — rc 1 on the newest-is-a-RESUME refusal with zero deletions, the permanent denial.
+  local s29="$tmp/s29"
+  mkdir -p "$s29"
+  seed_quiesced "$s29"
+  mk_history \
+    "$(mk_run 7000 'migrate-secrets [quiesce]' success 2026-07-18T11:40:00Z 2026-07-18T11:50:00Z)" \
+    "$(mk_run 7005 'migrate-secrets [resume]' failure 2026-07-18T11:55:00Z 2026-07-18T11:56:00Z)" \
+    > "$s29/wf_runs"
+  printf '%s\n' "${names[@]}" > "$s29/env_secrets"
+  printf 'REGISTRY_ADMIN_APP_KEY\n' > "$s29/repo_secrets"
+  rc=$(run_case "$s29" "$tmp/s29.out" cleanup-bootstrap none)
+  chk "composed round-15: KEY-only state + refused-resume event in history -> standalone cleanup STILL converges" "$rc" 0
+  chk "composed round-15: deletes exactly the 1 remaining bootstrap name" \
+    "$(grep -cE '^secret delete ' "$s29/calls.log")-$(grep -c '^secret delete REGISTRY_ADMIN_APP_KEY --repo o/r$' "$s29/calls.log")" 1-1
+  chk "composed round-15: repo scope empty after (the recovery finishes despite the resume event)" \
+    "$(cat "$s29/repo_secrets")" ""
+  chk "composed round-15: reports MIGRATION COMPLETE" \
+    "$(grep -c 'MIGRATION COMPLETE (both phases)' "$tmp/s29.out")" 1
+  chk "composed round-15: zero NON-delete mutations (no set, no disable/enable)" \
+    "$(grep -cE '^(secret set |workflow (disable|enable) )' "$s29/calls.log" || true)" 0
+  chk "composed round-15: the run history is NEVER read (cleanup consumes no queue-time attestation input)" \
+    "$(grep -cE '^api repos/o/r/actions/(runs/|workflows/migrate-secrets-to-env\.yml/runs)' "$s29/calls.log" || true)" 0
+  chk "composed round-15: EXACT gh argv sequence (identical to the clean 1-remaining recovery — the resume event changes nothing)" \
+    "$(diff -q "$expected_c1" "$s29/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
+
+  # --- scenario 29b: the COLLABORATOR ACTOR-SKIPPED-RESUME variant of the same denial — a
+  # WRITE COLLABORATOR dispatches phase: resume from the KEY-only state; the workflow's
+  # actor/triggering_actor `if:` gate SKIPS every job (nothing runs, nothing is enabled), yet
+  # the run still concludes 'success' and lands a resume-titled event. The old C0 blocked on
+  # resume TITLE ALONE regardless of fields (the round-12 fail-closed direction — correct for
+  # the MAIN phase, where the cost is one spurious re-quiesce), so any write collaborator
+  # could force the SAME permanent cleanup denial without ever touching a secret or a
+  # workflow. Round 15: the event is irrelevant to cleanup — same convergence, same argv.
+  local s29b="$tmp/s29b"
+  mkdir -p "$s29b"
+  seed_quiesced "$s29b"
+  mk_history \
+    "$(mk_run 7000 'migrate-secrets [quiesce]' success 2026-07-18T11:40:00Z 2026-07-18T11:50:00Z)" \
+    "$(mk_run 7006 'migrate-secrets [resume]' success 2026-07-18T11:57:00Z 2026-07-18T11:58:00Z collab-writeaccess collab-writeaccess)" \
+    > "$s29b/wf_runs"
+  printf '%s\n' "${names[@]}" > "$s29b/env_secrets"
+  printf 'REGISTRY_ADMIN_APP_KEY\n' > "$s29b/repo_secrets"
+  rc=$(run_case "$s29b" "$tmp/s29b.out" cleanup-bootstrap none)
+  chk "composed round-15 (collaborator variant): actor-skipped resume event cannot deny the cleanup recovery" "$rc" 0
+  chk "composed round-15 (collaborator variant): deletes exactly the 1 remaining + repo scope empty after" \
+    "$(grep -cE '^secret delete ' "$s29b/calls.log")-$(cat "$s29b/repo_secrets")" "1-"
+  chk "composed round-15 (collaborator variant): zero NON-delete mutations + history never read" \
+    "$(grep -cE '^(secret set |workflow (disable|enable) )' "$s29b/calls.log" || true)-$(grep -cE '^api repos/o/r/actions/(runs/|workflows/migrate-secrets-to-env\.yml/runs)' "$s29b/calls.log" || true)" 0-0
+  chk "composed round-15 (collaborator variant): EXACT gh argv sequence (identical to the clean 1-remaining recovery)" \
+    "$(diff -q "$expected_c1" "$s29b/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'migrate-secrets self-test PASSED\n'
