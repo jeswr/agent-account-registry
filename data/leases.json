@@ -33,12 +33,12 @@
   {
    "account": "acct03",
    "claim_id": "fb33221f1d5442698b76ae70cfda0b61",
-   "holder": "jeswr/agent-account-registry#159@dispatch-29682358154.1",
+   "holder": "jeswr/agent-account-registry#159@29682487270.1",
    "package": "review-loop",
    "role": "impl",
    "model": "opus",
-   "issued_at": 1784455051,
-   "expires_at": 1784457751
+   "issued_at": 1784455075,
+   "expires_at": 1784457775
   },
   {
    "account": "acct01",
