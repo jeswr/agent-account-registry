@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3585,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "06b3dd3f7d51f924e43593681827e5b65ce58a20",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module states that colluding parties' views are independent of every key and that the result is the only revealed information. Each comparison/equality invokes Rabbit decomposition, which opens c=(x+r) mod p; the existing comparator documentation characterizes this as near-uniform with a nonzero statistical leakage floor, not information-theoretic independence. Repeating these openings throughout O(n log^2 n) comparisons also requires accounting for composition. The sq-qhy4 caveat does not make the categorical claim honest.",
+    "file": "crates/sparq-mpc/src/sort_merge_join.rs",
+    "fix_hint": "Replace the independence/result-only language with a precise statistically-hiding claim, state the per-opening bound and its composition over the modeled number of decompositions, and retain the semi-honest/not-externally-audited caveat. Update matching public docs in the same change.",
+    "severity": "major",
+    "title": "Privacy claim contradicts the statistical Rabbit masking model"
+   },
+   {
+    "body": "randomised_differential_semi_and_anti does not generate randomized inputs: it runs six fixed, small layouts and reuses one seed per layout/party count. It therefore provides weak coverage of arbitrary network widths, group boundaries, duplicate patterns, and comparator-range edges. There is also no mutation test demonstrating that the oracle harness fails when the new sort/scan produces a deliberately wrong answer. For a new correctness-critical fast path, the supplied test evidence is insufficient.",
+    "file": "crates/sparq-mpc/src/sort_merge_join.rs",
+    "fix_hint": "Add a deterministic property-style differential over many generated lengths, seeds, key multisets, duplicates, empty sides, and values near the supported upper bound, exercising both Semi and Anti. Add a mutation check (or an equivalent test-only fault injection) that demonstrably turns the differential red when a selector, adjacency equality, scan direction, or swap decision is corrupted.",
+    "severity": "major",
+    "title": "Novel sort-merge path lacks a real randomized differential and mutation check"
+   }
+  ],
+  "progress": null,
+  "summary": "The implementation has plausible functional coverage for small examples, but this soundness-critical MPC change is not ready to approve. Its privacy documentation overstates information-theoretic independence despite the Rabbit masked openings being only statistically hiding, and the purported randomized differential test is a short fixed case table with no mutation check. Those gaps directly conflict with the repository's live MPC honesty gate and novel-algorithm verification requirements.",
+  "verdict": "request_changes"
+ }
+}
