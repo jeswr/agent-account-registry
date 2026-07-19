@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_enabled_provider_accounts` builds `pool`, but after a successful API call it never verifies that every enabled handle was resolved to a valid provider. A missing account issue, a title mismatch, or an issue whose body lacks a parseable provider is simply omitted and the function returns `FleetResolution(result, ok=True)`. `_cmd_decide` may then use this partial fleet and persist it over the prior snapshot. For a provider whose omitted account is capped, the all-enabled-accounts comparison can be wrong or the provider-capped arm can disappear entirely, with no `fleet-resolution` alert. This recreates a silent-disable path despite successful transport.",
+   "file": "scripts/model-health.py",
+   "fix_hint": "Track which pooled handles receive exactly one valid catalog mapping and return `ok=False` unless all enabled handles resolve unambiguously; on that failure, retain/use the prior snapshot and fire the degradation alert. Add a self-test where the policy pool contains an account absent from the catalog (and ideally one with a missing/invalid provider) asserting `ok=False`, plus a decide-level assertion that the prior snapshot is not overwritten and remains the detection input.",
+   "severity": "major",
+   "title": "Incomplete catalog mappings are treated as a successful fleet resolution"
+  }
+ ],
+ "progress": null,
+ "summary": "The new snapshot fallback and durable degradation alert are directionally sound and the end-to-end failure test is non-vacuous. However, live resolution still declares success when the catalog response is incomplete or contains an unusable provider entry for an enabled pooled handle. That can silently shrink provider membership, overwrite the last-known-good snapshot with the partial fleet, and suppress the exact provider-capped detection this change is intended to preserve. The change is therefore not fail-closed or complete.",
+ "verdict": "request_changes"
+}
