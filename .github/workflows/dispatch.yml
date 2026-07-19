@@ -313,12 +313,25 @@ jobs:
 
               pulls = snapshot("pulls", index)
               linked = linked_issue_numbers(pulls, repo)
-              ready = dispatch.compute_ready(readiness_input)
-              ready = [
-                  issue for issue in ready
-                  if issue["number"] not in linked
-                  and trusted(details[issue["number"]][0], repo_trusted_bots)
+              # Apply the trust + linked-PR exclusions BEFORE the frontier is selected (issue #113:
+              # post-frontier filters leave dispatchable holes). compute_ready commits to a
+              # conflict-free, priority-ordered frontier, so a candidate removed AFTER selection
+              # frees its package with NO backfill — one filtered high-priority or global row then
+              # suppresses an otherwise-dispatchable lower-priority sibling on that package for the
+              # whole tick. Filter the candidate set first, then run the frontier ONCE over the
+              # survivors — the same shape the deferred branch below already uses. In-progress rows
+              # are KEPT as inputs: compute_ready never selects them (they are busy), but they must
+              # still RESERVE their package in its taken-seeding, so dropping an in-progress row
+              # that is itself linked/untrusted would free a busy crate and fail OPEN into a
+              # double-dispatch. PLAN stays advisory — CLAIM re-derives trust + linkage exactly.
+              ready_input = [
+                  row for row in readiness_input
+                  if "status:in-progress" in row["labels"]
+                  or "status:in-progress-review" in row["labels"]
+                  or (row["number"] not in linked
+                      and trusted(details[row["number"]][0], repo_trusted_bots))
               ]
+              ready = dispatch.compute_ready(ready_input)
               # Deferred-retry candidates (registry decision: a status:deferred issue with no
               # live lease and no linked open PR is retryable). The ready-engine gate is reused
               # by SWAPPING deferred->ready only for readiness computation; the emitted item
