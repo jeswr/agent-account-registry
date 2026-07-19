@@ -1,0 +1,83 @@
+# [OPUS-4.8] Scheduled RE-TRIAGE sweep for jeswr/agent-account-registry (issue #178).
+# triage-issue.yml fires ONLY on issues.{opened,edited,reopened}; a bare LABEL change never re-runs
+# triage, so an issue that becomes complete via a label edit (missing priority/area/role supplied,
+# or the `needs:design` design-hold cleared) — or one that lost `status:ready` — stays outside the
+# dispatch frontier forever. This cron re-applies scripts/triage.py's deterministic verdict to every
+# open issue and promotes/re-parks the drift. It is the label-event gap that groom (crash-recovery)
+# does not cover.
+#
+# Minimal by design: reuses scripts/triage.py's own triage() (no private copy of the rules) and the
+# repo's alert pattern. Self-tests are the gate here — the sweep and its alert both self-test before
+# they are trusted. Least privilege (issues:write + contents:read only); actions SHA-pinned.
+name: retriage
+
+on:
+  schedule:
+    # Every 15 min at an explicit off-peak offset (11,26,41,56) — distinct from groom (7-59/15) and
+    # groom-leases (*/15) so scheduled ticks do not all pile onto the same throttled minute. A bare
+    # label edit is human-scale latency-tolerant, but 15 min keeps a cleared design-hold moving.
+    - cron: '11-59/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read   # checkout the sweep + alert script
+  issues: write    # add/remove triage labels; upsert/close the rolling failure alert
+
+concurrency:
+  group: retriage
+  cancel-in-progress: false
+
+jobs:
+  retriage:
+    name: Re-run static triage on label-changed issues
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Self-tests are the gate in this repo: never trust a sweep whose own fixtures fail.
+      - name: Self-test the sweep before trusting its verdict
+        run: python3 scripts/retriage.py --self-test
+
+      - name: Re-triage open issues (promote/re-park the label-event drift)
+        run: python3 scripts/retriage.py --repo "${{ github.repository }}"
+
+  # FAIL-LOUD alert (mirrors dispatch.yml's plan-alert, issue #38): a silently failing retriage cron
+  # re-strands every label-changed issue while presenting only as a red job on a cron nobody watches.
+  # A SEPARATE job keyed on the retriage RESULT catches a job-level failure/cancellation (which an
+  # in-job `if: failure()` step would miss if the runner died), and auto-closes on recovery. It
+  # mounts no ALERT_* secret (the failure body carries no account handles), so it needs neither the
+  # dispatch-secrets environment nor its exfil guard.
+  alert:
+    name: ALERT (scheduled retriage failure)
+    needs: retriage
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Self-test the alert before trusting it
+        run: python3 scripts/retriage.py --self-test
+
+      - name: Upsert/close the rolling retriage-failure alert
+        continue-on-error: true
+        env:
+          REGISTRY_REPO: ${{ github.repository }}
+          RETRIAGE_RESULT: ${{ needs.retriage.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+        run: python3 scripts/retriage.py --alert

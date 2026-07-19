@@ -101,6 +101,7 @@ security_paths = [
   "scripts/ready-issues.py",
   "scripts/dispatch-plan.py",
   "scripts/triage.py",
+  "scripts/retriage.py",
   "policy/",
   "orchestration/",
   ".github/workflows/",

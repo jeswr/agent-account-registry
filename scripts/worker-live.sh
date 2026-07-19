@@ -599,7 +599,7 @@ run_gate() {
 # onboarding push) — there is NO scripts/routing-validate.py; do not reference that name in suite
 # lists or briefs.
 FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
-plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
+plan-snapshot.py triage.py retriage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
 groom.py account-usage.py usage-alert.py plan-alert.py dispatch-secrets-guard.py model-health.py \
 pat-validity.py broker-refresh.py \
 backfill-provenance.py dashboard-gen.py trust-gate.py worker-live.sh"
