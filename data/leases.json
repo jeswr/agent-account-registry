@@ -12,16 +12,6 @@
   },
   {
    "account": "acct3css",
-   "claim_id": "4f517143f4684d76a01b4cc4ec9f7386",
-   "holder": "fix:sparq-org/sparq#3530@dispatch-29670735620.1",
-   "package": "sparq-mpc",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784429437,
-   "expires_at": 1784433037
-  },
-  {
-   "account": "acct3css",
    "claim_id": "84ff00b291be4f8a93687965221055e2",
    "holder": "fix:sparq-org/sparq#3554@dispatch-29671452391.1",
    "package": "sparq-engine",
@@ -39,16 +29,6 @@
    "model": "opus",
    "issued_at": 1784432716,
    "expires_at": 1784439016
-  },
-  {
-   "account": "acct03",
-   "claim_id": "7ad3d99e06374b56b75b67333122fce5",
-   "holder": "jeswr/agent-account-registry#197@dispatch-29672079205.1",
-   "package": "set-up-account",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784432729,
-   "expires_at": 1784435429
   },
   {
    "account": "acct03",
