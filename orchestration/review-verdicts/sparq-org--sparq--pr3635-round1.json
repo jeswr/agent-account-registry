@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3635,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "726ac238f5967c65d92b5f532d789f8ae150b087",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "DpParams::new accepts every finite epsilon > 0. For sufficiently small epsilon, exp(-epsilon/sensitivity) rounds to exactly 1.0 in f64. shift() then sees a zero log denominator and returns 1 via the non-finite fallback, while geometric_draw() divides by alpha.ln()==0 and returns 0 for both draws. The mechanism consequently releases B=m+1 deterministically, which is not (epsilon, delta)-DP for delta<1. More broadly, K_CAP truncates the geometric distribution, and its tail is not negligible across the accepted parameter space (especially when delta is large enough that shift() remains small). The documentation nevertheless makes an affirmative (epsilon, delta)-DP claim.",
+    "file": "crates/sparq-mpc/src/dp_output.rs",
+    "fix_hint": "Fail closed unless alpha is strictly representable in (0,1) and quantify/enforce a parameter bound making every numerical approximation and tail truncation fit within an explicitly accounted privacy delta. Prefer the exact discrete simulation sampler already identified in the module documentation. Add boundary tests using the smallest accepted epsilon and parameters near the cap; test the resulting distribution/privacy-loss bound rather than only variability and a coarse clamp rate. Until that is done, do not describe this implementation as providing (epsilon, delta)-DP.",
+    "severity": "blocker",
+    "title": "Accepted tiny epsilon values collapse the sampler and violate the claimed DP guarantee"
+   },
+   {
+    "body": "The public documentation says sensitivity=1 for a standard set-returning join and bases the privacy claim on one input row changing m by at most 1. For a join, adding one row can create as many output rows as there are matching rows on the other side; even SET output can therefore have unbounded or data-dependent row-level sensitivity absent a degree/contribution bound. Passing 1 under the documented guidance under-noises the release and invalidates its claimed epsilon.",
+    "file": "crates/sparq-mpc/src/dp_output.rs",
+    "fix_hint": "Define the neighboring-dataset model and enforce a contribution/degree bound that implies the supplied sensitivity, or compute a public conservative bound for the supported query shape. Remove every suggestion that an unrestricted standard join has sensitivity 1, and add a test/witness where one input row joins with multiple rows to pin the required sensitivity.",
+    "severity": "major",
+    "title": "The documented sensitivity of a standard join count is generally not one"
+   },
+   {
+    "body": "dp_release_result_rows charges the budget before validating row arity and before checked bound construction or the downstream oblivious transform. Thus a schema error, overflow, or transform error consumes budget even though no cardinality is released. This conflicts with the charge documentation's success semantics and creates an avoidable denial-of-service vector against a relying party's budget.",
+    "file": "crates/sparq-mpc/src/dp_output.rs",
+    "fix_hint": "Perform all deterministic validation before charging. For fallible work after charging, either make release failure impossible after validation, reserve then commit the charge only when the release succeeds, or explicitly document and test burn-on-failure semantics if that conservative policy is intentional.",
+    "severity": "minor",
+    "title": "Invalid requests consume privacy budget despite making no release"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed mechanism is not sound for the full parameter range its public constructor accepts, and its stated default join sensitivity is generally false. In particular, very small positive epsilon values can make alpha round to 1.0; shift() then returns 1 through its non-finite fallback and geometric_draw() deterministically returns zero, so the released bound becomes an essentially deterministic function of the true count while still being described as (epsilon, delta)-DP. The fixed K_CAP can also introduce non-negligible truncation bias for admissible small epsilon. Additionally, an ordinary join count does not generally have row-level sensitivity 1. These are privacy-claim defects on an externally unaudited MPC surface, so the PR should not be armed.",
+  "verdict": "request_changes"
+ }
+}
