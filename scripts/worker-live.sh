@@ -673,11 +673,13 @@ _registry_selftest_targets() {
   done
 }
 
-# PURE (self-tested): every `FROM` in a container definition must pin its base image by @sha256:
-# digest — a mutable tag is a supply-chain / model-isolation weakening (a benign-labelled PR could
-# repoint the worker sandbox at an attacker-controlled image). Returns non-zero and names the first
-# offending FROM. Multi-stage builds are honoured: a `FROM <alias>` that references a prior
-# `... AS <alias>` stage is allowed unpinned; leading `--platform=`/`--flag` tokens are skipped.
+# PURE (self-tested): every external `FROM` in a container definition must pin its base image by a
+# FULLY LITERAL `@sha256:` + 64-hex digest — a mutable tag, a variable-expanded ref, or a
+# short/empty/non-hex digest is a supply-chain / model-isolation weakening (a benign-labelled PR
+# could repoint the worker sandbox at an attacker-controlled image, or defer the choice to a build
+# arg). Returns non-zero and names the first offending FROM. Multi-stage builds are honoured: a
+# `FROM <alias>` that references a prior `... AS <alias>` stage is allowed unpinned; leading
+# `--platform=`/`--flag` tokens are skipped.
 _assert_dockerfile_pinned() {
   local file="$1"
   [[ -f "$file" ]] || { printf 'worker-live: container definition missing: %s\n' "$file" >&2; return 1; }
@@ -710,7 +712,15 @@ _assert_dockerfile_pinned() {
       [[ -n "$as_seen" ]] && stage_alias[$as_seen]=1
       continue
     fi
-    if [[ "$img" != *@sha256:* ]]; then
+    # An external base image must be a FULLY LITERAL digest-pinned reference: no variable
+    # expansion (a `${BASE}` / `@sha256:${DIGEST}` lets a build arg pick the real image AFTER
+    # review), and it must end in `@sha256:` + exactly 64 hex chars. A bare `@sha256:` substring
+    # is not enough — that would accept a short, empty, or non-hex digest.
+    if [[ "$img" == *'$'* ]]; then
+      printf 'worker-live: base image ref uses variable expansion in %s: %s\n' "$file" "$img" >&2
+      return 1
+    fi
+    if [[ ! "$img" =~ @sha256:[0-9a-f]{64}$ ]]; then
       printf 'worker-live: base image not digest-pinned in %s: %s\n' "$file" "$img" >&2
       return 1
     fi
@@ -1738,6 +1748,25 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   chk "multi-stage FROM referencing a prior stage alias is allowed unpinned" \
     "$( _assert_dockerfile_pinned "$tmp/stage.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
     "pinned"
+  # [review r1 #402] the pin check must be SOUND, not a bare `@sha256:` substring test: a
+  # variable-expanded ref, a short digest, a non-hex digest, and an empty digest must ALL be
+  # rejected — each flips this red if the assertion regresses to the syntactic form.
+  printf 'FROM ${IMAGE}@sha256:${DIGEST}\n' > "$tmp/var.Dockerfile"
+  chk "variable-expanded FROM ref is REJECTED (no build-arg image selection)" \
+    "$( _assert_dockerfile_pinned "$tmp/var.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'FROM node:20-slim@sha256:deadbeef\n' > "$tmp/short.Dockerfile"
+  chk "short (non-64) digest is REJECTED" \
+    "$( _assert_dockerfile_pinned "$tmp/short.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'FROM node:20-slim@sha256:%s\n' "$(printf 'g%.0s' {1..64})" > "$tmp/nonhex.Dockerfile"
+  chk "non-hex 64-char digest is REJECTED" \
+    "$( _assert_dockerfile_pinned "$tmp/nonhex.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'FROM node:20-slim@sha256:\n' > "$tmp/empty.Dockerfile"
+  chk "empty digest is REJECTED" \
+    "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
