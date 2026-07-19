@@ -120,6 +120,23 @@ def _new_lane_counts():
     in launched/error as each item resolves, and deferred is derived (planned-launched-error) at
     summary time so escalations and capacity holds are neither launches nor hard errors."""
     return {lane: Counter() for lane in DISPATCH_LANES}
+
+
+def _fix_dispatch_line(counts):
+    """One privacy-safe, per-tick fix fan-out telemetry line (issue #448)."""
+    counts = counts or Counter()
+    eligible = int(counts.get("eligible", 0) or 0)
+    launched = int(counts.get("launched", 0) or 0)
+    deferred = max(0, eligible - launched)
+    reasons = sorted(
+        (key[6:], int(value)) for key, value in counts.items()
+        if key.startswith("defer:") and value
+    )
+    detail = ", ".join(f"{reason}={count}" for reason, count in reasons) or "none"
+    return (f"fix-dispatch: {eligible} eligible, {launched} launched, {deferred} deferred "
+            f"(reasons: {detail})")
+
+
 # Human-owned PR labels: review:needs-user is the loop's own terminal escalation; needs:user is
 # groom's parked-PR marker ("Human attention required"). EITHER parks the whole autonomous
 # surface for the PR — enumeration, repair admission, and worker-pr.py disarm all stand down.
@@ -171,13 +188,11 @@ FIX_CHAIN = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
 # their EXPECTED steady state, not a failure. Kept as an explicit allowlist, never "any non-
 # anthropic": a missing/typo provider stays on the fail-closed hold path (never silently exempted).
 PROBE_EXEMPT_PROVIDERS = frozenset({"openai"})
-# Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
-# 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
-# earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
-# path does not usage-gate; codex accounts are usage-EXEMPT, so this shared `review:` prefix
-# cap IS the codex slot bound, and `fix:` bounds concurrent same-provider fix agents.
-REVIEW_MAX_CONCURRENT = 10
-FIX_MAX_CONCURRENT = 8
+# Issue #448: dispatch fan-out is bounded by the allocator's LIVE remaining account slots, not a
+# second, coarse `review:`/`fix:` lease-row constant.  The old fleet-wide 10/8 caps mixed repos and
+# providers: unrelated work could leave (for example) every sol slot idle while consuming the
+# shared prefix ceiling.  Each item still obtains its own CAS lease; per-account caps and the
+# repository/package/PR single-flight predicates remain the authoritative safety bounds.
 # Lease TTL must OUTLIVE the owning review-fix.yml workflow's worst-case wall-clock, or the
 # allocator reclaims a still-live account and two sessions race on one credential / write-back
 # (issue #159). A DISPATCHER-claimed lease (adopted by review-fix.yml's `claim` job) is created
@@ -1692,7 +1707,7 @@ def _chain_probe_exempt(chain, routing):
 
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
-                           defer_reasons, lanes=None, ledger_root=""):
+                           defer_reasons, lanes=None, ledger_root="", fix_dispatch=None):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
     that item (per-item resilience, like the issue loop). `defer_reasons` is the tick's SHARED
     histogram: allocator lease errors here must fold into the same `lease-error` counter the
@@ -1707,6 +1722,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     worker lane launched — the exact masking this loop's bare launched-count return used to allow."""
     if lanes is None:
         lanes = _new_lane_counts()
+    if fix_dispatch is None:
+        fix_dispatch = Counter()
     launched = 0
     script_dir = Path(__file__).resolve().parent
     max_rounds = int(policy.get("max_review_rounds", 3))
@@ -1956,7 +1973,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     continue
                 mode, role = "review", "review"
                 chain = _resolvable_chain(REVIEW_CHAIN[impl_provider], routing)
-                holder_prefix, cap, ttl = "review:", REVIEW_MAX_CONCURRENT, REVIEW_TTL
+                holder_namespace, ttl = "review:", REVIEW_TTL
                 round_number = rounds + 1
             elif repair_state:
                 # GAP-A/B autonomous repair (reuse mode=fix, same-provider chain). The live
@@ -1974,7 +1991,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    f"{round_number}; a human must unstick this PR")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
-                holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
+                holder_namespace, ttl = "fix:", FIX_TTL
             else:
                 if rounds < 1:
                     print(f"defer review {repo}#{number}: review:changes with no recorded round")
@@ -1998,7 +2015,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     continue
                 mode, role = "fix", "fix"
                 chain = _resolvable_chain(fix_aliases, routing)
-                holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
+                holder_namespace, ttl = "fix:", FIX_TTL
                 round_number = rounds
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
@@ -2023,11 +2040,19 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                   f"(probe failed) — holding the {mode} claim fail-closed")
             continue
         now = int(time.time())
-        holder = f"{holder_prefix}{repo}#{number}@dispatch-" \
+        # Repository-scoped prefix: package names (including __global__) are target-local.  The
+        # old bare `review:` / `fix:` prefix mixed unrelated repos into one package partition and
+        # one fixed lane cap, so a sparq lease could suppress registry work while its provider's
+        # account slots sat idle.  The holder grammar itself is unchanged, preserving adoption and
+        # per-PR duplicate keys; only the allocator's partition scope becomes the documented repo.
+        holder_prefix = f"{holder_namespace}{repo}#"
+        holder = f"{holder_prefix}{number}@dispatch-" \
                  f"{os.environ.get('GITHUB_RUN_ID', 'local')}." \
                  f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
+        if mode == "fix":
+            fix_dispatch["eligible"] += 1
         try:
-            claim = allocator.claim(
+            claim_result = allocator.claim(
                 registry_repo,
                 item["package"],
                 role,
@@ -2037,15 +2062,27 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 ttl=ttl,
                 account_pool=policy["account_pool"],
                 holder_prefix=holder_prefix,
-                max_holder_concurrent=cap,
                 usage=usage,
                 margin=margin,
+                # Issue #448: recompute the live remaining slots inside every CAS attempt.  N
+                # candidates therefore produce min(N, S) leases as earlier successes consume S;
+                # S=0 fails closed.  No static per-lane ceiling can strand an idle provider.
+                account_slot_bound=True,
+                return_reason=True,
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             defer_reasons["lease-error"] += 1
             lanes[lane]["error"] += 1
+            if mode == "fix":
+                fix_dispatch["defer:lease-error"] += 1
             print(f"defer review {repo}#{number}: lease allocation errored ({exc}); skipped")
             continue
+        # Compatibility with self-test allocators and out-of-tree allocator shims that implement
+        # the historical claim-or-None API; the real allocator returns (claim, reason) here.
+        if isinstance(claim_result, tuple) and len(claim_result) == 2:
+            claim, claim_reason = claim_result
+        else:
+            claim, claim_reason = claim_result, "no-account-slots"
         if claim is None:
             if mode == "fix":
                 try:
@@ -2066,9 +2103,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     # but the tick now reports the budget as unconfirmed.
                     lanes[lane]["error"] += 1
                     defer_reasons["missed-marker-write-failed"] += 1
+                    fix_dispatch["defer:missed-marker-write-failed"] += 1
                     print(f"defer review {repo}#{number}: missed-fix marker write FAILED ({exc}); "
                           "missed-fix budget unconfirmed, escalation cannot bound this PR")
                     continue
+                fix_dispatch[f"defer:{claim_reason or 'no-account-slots'}"] += 1
             print(f"defer review {repo}#{number}: no eligible {mode} lease is free this tick")
             continue
         account = claim.get("account")
@@ -2102,9 +2141,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             if not released:
                 lanes[lane]["error"] += 1
                 defer_reasons["unsafe-claim-release-failed"] += 1
+                if mode == "fix":
+                    fix_dispatch["defer:unsafe-claim-release-failed"] += 1
                 print(f"::error::review {repo}#{number}: {violation}; lease release FAILED "
                       "(claim still active until expiry)")
                 continue
+            if mode == "fix":
+                fix_dispatch["defer:unsafe-claim"] += 1
             print(f"defer review {repo}#{number}: {violation}; released + skipped")
             continue
         result = _run_gh([
@@ -2133,10 +2176,14 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # dodging the tick-health recorder while another lane launched.
             defer_reasons["dispatch-launch-failed"] += 1
             lanes[lane]["error"] += 1
+            if mode == "fix":
+                fix_dispatch["defer:dispatch-launch-failed"] += 1
             print(f"defer review {repo}#{number}: {mode} dispatch failed; skipped")
             continue
         launched += 1
         lanes[lane]["launched"] += 1
+        if mode == "fix":
+            fix_dispatch["launched"] += 1
         # Privacy (locked decision 22b): public workflow logs never carry account handles.
         kind_note = "" if fix_kind == "verdict" else f"/{fix_kind}"
         print(f"dispatched {mode}{kind_note} {repo}#{number}: round={round_number}, "
@@ -2388,6 +2435,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     # behind a worker launch). A worker launch can no longer mark the whole tick healthy while a
     # safety disarm or an entire review/fix lane failed.
     lanes = _new_lane_counts()
+    # Issue #448 fix-lane fan-out telemetry.  This is accumulated across every target repository
+    # and rendered once per tick, so the observable ceiling is fleet-wide rather than a sequence
+    # of ambiguous per-repo snippets.
+    fix_dispatch = Counter()
     # Per-item snapshot degradation (run 29617040167): PLAN skipped these PRs' CI/merge
     # snapshot (oversized check-run listing, failed detail read, census overflow) instead of
     # failing the sweep. Their snapshot-derived admissions already stood down at PLAN time
@@ -2706,8 +2757,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 repo_review_items, repo, policy, routing, allocator, worker_pr,
                 registry_repo, registry_root, workflow_ref, bot_login, usage,
                 float(policy.get("usage_safety_margin", 0.10)),
-                defer_reasons, lanes=lanes, ledger_root=ledger_root)
+                defer_reasons, lanes=lanes, ledger_root=ledger_root,
+                fix_dispatch=fix_dispatch)
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
+    print(_fix_dispatch_line(fix_dispatch))
     # Per-lane tick summary (issue #108) — coarse counts only (no issue numbers/handles). A stalled
     # review/fix lane or a failed safety disarm is visible here even when the worker lane launched.
     for name in DISPATCH_LANES:
@@ -3933,12 +3986,14 @@ def _self_test():
         # Issue #108: a fresh per-lane accumulator each call; run_items.lanes exposes it for the
         # review/fix stall assertions below without changing the (launched, reasons) return arity.
         lanes = _new_lane_counts()
+        fix_dispatch = Counter()
         launched = _dispatch_review_items(
             items, repo, policy or {"max_review_rounds": 3, "account_pool": []},
             routing or {}, allocator, wiring_worker_pr, "reg/repo",
             wiring_root, "main", bot, usage, 0.10, reasons, lanes=lanes,
-            ledger_root=wiring_ledger_root)
+            ledger_root=wiring_ledger_root, fix_dispatch=fix_dispatch)
         run_items.lanes = lanes
+        run_items.fix_dispatch = fix_dispatch
         return launched, reasons
 
     ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
@@ -4437,6 +4492,143 @@ def _self_test():
                 assert _lane_summary(run_items.lanes)["fix"] == {
                     "planned": 1, "launched": 1, "deferred": 0, "error": 0}, run_items.lanes
             finally:
+                globals()["_run_gh"] = real_run_gh
+
+            # ---- issue #448: one dispatch tick fans eligible fixes out to LIVE account slots ----
+            # Five distinct-package, trust-admitted fix rows over S=3 slots must launch exactly
+            # min(N,S)=3 distinct PR workflows.  This is deliberately an end-to-end test of the
+            # production _dispatch_review_items loop/lease call/gh argv, not a slice helper: a
+            # mutation that restores a one-item break or a static max_holder_concurrent=1 makes
+            # the launch-count assertion red.
+            fanout_numbers = list(range(51, 56))
+            fanout_items = []
+            fanout_pulls = {}
+            fanout_issues = {}
+            for offset, pr_number in enumerate(fanout_numbers):
+                issue_number = 700 + offset
+                head_sha = f"{pr_number:040x}"
+                fanout_pulls[pr_number] = {
+                    "number": pr_number, "state": "open", "draft": True,
+                    "body": "", "mergeable": True, "auto_merge": None,
+                    "head": {"ref": f"sparq-agent/issue-{issue_number}-1-1",
+                             "sha": head_sha, "repo": {"full_name": repo}},
+                    "base": {"repo": {"default_branch": "main"}},
+                    "user": {"login": bot, "type": "Bot"},
+                    "labels": [{"name": "review:changes"},
+                               {"name": f"area:fanout-{offset}"}],
+                }
+                fanout_issues[issue_number] = {
+                    "labels": [{"name": f"area:fanout-{offset}"}]}
+                fanout_items.append({
+                    "pr_number": pr_number, "head_sha": head_sha,
+                    "state": "needs-ci-fix", "impl_provider": "openai", "repo": repo,
+                    "package": f"fanout-{offset}", "security": False, "context": "gate",
+                })
+                path = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, pr_number)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "head_sha_at_open": head_sha, "impl_account_h": "ef" * 8,
+                    "impl_alias": "sol", "impl_provider": "openai",
+                    "issue": issue_number, "pr_number": pr_number,
+                    "recorded_at_run": "448.1",
+                }), encoding="utf-8")
+
+            def fanout_gh_json(args):
+                path = args[-1]
+                match = re.search(r"/pulls/([0-9]+)$", path)
+                if match:
+                    return fanout_pulls[int(match.group(1))]
+                if "/check-runs" in path:
+                    return {"check_runs": gate_red}
+                match = re.search(r"/issues/([0-9]+)/comments(?:\?.*)?$", path)
+                if match:
+                    return [[]]
+                match = re.search(r"/issues/([0-9]+)$", path)
+                if match:
+                    return fanout_issues[int(match.group(1))]
+                raise AssertionError(f"unexpected fan-out API read: {path}")
+
+            class SlotAllocator:
+                def __init__(self, slots, conflict_pr=None):
+                    self.slots = slots
+                    self.conflict_pr = conflict_pr
+                    self.claimed_prs = []
+                    self.calls = []
+
+                def claim(self, _registry_repo, package, role, chain, holder, *_args, **kwargs):
+                    match = re.search(r"#([0-9]+)@", holder)
+                    assert match, holder
+                    pr_number = int(match.group(1))
+                    self.calls.append((pr_number, package, role, list(chain), dict(kwargs)))
+                    # These are the load-bearing production arguments: repository-local package
+                    # partition plus the live account-slot bound, with NO coarse row cap.
+                    assert kwargs.get("holder_prefix") == f"fix:{repo}#", kwargs
+                    assert kwargs.get("account_slot_bound") is True, kwargs
+                    assert kwargs.get("max_holder_concurrent") is None, kwargs
+                    assert kwargs.get("return_reason") is True, kwargs
+                    if pr_number == self.conflict_pr:
+                        return None, "package-single-flight"
+                    if self.slots <= 0:
+                        return None, "no-account-slots"
+                    self.slots -= 1
+                    self.claimed_prs.append(pr_number)
+                    return ({"account": "acct09", "claim_id": f"{pr_number:032x}",
+                             "model": chain[0], "provider": "openai"}, "")
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            fanout_runs = []
+
+            def successful_fanout_run(args, *, check=True):
+                fanout_runs.append(list(args))
+                return subprocess.CompletedProcess(args, 0)
+
+            def launched_prs():
+                return [int(arg.split("=", 1)[1]) for args in fanout_runs for arg in args
+                        if arg.startswith("pr_number=")]
+
+            try:
+                globals()["_gh_json"] = fanout_gh_json
+                globals()["_run_gh"] = successful_fanout_run
+                fanout_routing = {"models": {
+                    "sol": {"provider": "openai", "provider_model": "TBD",
+                            "harness": "codex"},
+                    "luna": {"provider": "openai", "provider_model": "TBD",
+                             "harness": "codex"},
+                }}
+
+                alloc = SlotAllocator(3)
+                launched, _ = run_items(fanout_items, allocator=alloc, routing=fanout_routing)
+                assert launched == min(len(fanout_items), 3) == 3, launched
+                assert launched_prs() == fanout_numbers[:3], launched_prs()
+                assert len(launched_prs()) == len(set(launched_prs())), launched_prs()
+                assert _fix_dispatch_line(run_items.fix_dispatch) == (
+                    "fix-dispatch: 5 eligible, 3 launched, 2 deferred "
+                    "(reasons: no-account-slots=2)"), run_items.fix_dispatch
+
+                # S=0 is fail-closed: every eligible item defers and no workflow is launched.
+                fanout_runs.clear()
+                alloc = SlotAllocator(0)
+                launched, _ = run_items(fanout_items, allocator=alloc, routing=fanout_routing)
+                assert launched == 0 and launched_prs() == [], (launched, launched_prs())
+                assert _fix_dispatch_line(run_items.fix_dispatch) == (
+                    "fix-dispatch: 5 eligible, 0 launched, 5 deferred "
+                    "(reasons: no-account-slots=5)"), run_items.fix_dispatch
+
+                # A first-writer-wins package conflict defers only that PR; distinct PRs still
+                # fan out, and the conflicted PR can never appear in the workflow argv.
+                fanout_runs.clear()
+                conflicted_pr = fanout_numbers[1]
+                alloc = SlotAllocator(5, conflict_pr=conflicted_pr)
+                launched, _ = run_items(fanout_items, allocator=alloc, routing=fanout_routing)
+                assert launched == 4, launched
+                assert conflicted_pr not in launched_prs(), launched_prs()
+                assert len(launched_prs()) == len(set(launched_prs())), launched_prs()
+                assert run_items.fix_dispatch["defer:package-single-flight"] == 1, \
+                    run_items.fix_dispatch
+            finally:
+                globals()["_gh_json"] = fake_gh_json
                 globals()["_run_gh"] = real_run_gh
 
             # ---- issue #118: an unsafe/out-of-policy claim whose lease release FAILS (a CAS
