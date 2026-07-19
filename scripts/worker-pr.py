@@ -1008,6 +1008,65 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
     print(f"provenance {'recorded' if created else 'already recorded'} for {target_repo}#{pr_number}")
 
 
+def verdict_envelope(target_repo, pr_number, round_n, reviewed_sha, document):
+    """Issue #156: the HOST envelope that binds a model verdict to the exact commit it
+    reviewed. The registry record is keyed by PR + round only; without the reviewed sha a
+    fixer or an outcome mutation cannot tell whether the verdict still describes the live
+    head, so a head that advanced during review could be labelled/fixed against findings for
+    code that was never reviewed. The model's document is nested UNTOUCHED under `verdict`
+    (validate-verdict and the fixer see the identical bytes); the host-authored fields live
+    under `host_envelope`. Fails closed on a malformed reviewed sha — a record must never be
+    written unbound."""
+    if not re.fullmatch(r"[0-9a-f]{40}", reviewed_sha or ""):
+        raise WorkerPrError("verdict envelope requires a 40-hex reviewed sha")
+    return {
+        "host_envelope": {
+            "repo": target_repo,
+            "pr": pr_number,
+            "round": round_n,
+            "reviewed_sha": reviewed_sha,
+        },
+        "verdict": document,
+    }
+
+
+def envelope_verdict(record):
+    """The model verdict document from a registry record: the nested `verdict` of an issue
+    #156 envelope, or the whole record for a legacy pre-#156 bare-document record (readers
+    stay backward compatible with records written before the envelope existed)."""
+    if (isinstance(record, dict) and isinstance(record.get("host_envelope"), dict)
+            and "verdict" in record):
+        return record["verdict"]
+    return record
+
+
+def envelope_reviewed_sha(record):
+    """The reviewed sha an issue #156 envelope binds its verdict to, or None for a legacy
+    bare-document record (which the caller MUST treat as unbound — fail closed and re-review,
+    never consume it as if it matched the live head)."""
+    if isinstance(record, dict) and isinstance(record.get("host_envelope"), dict):
+        sha = record["host_envelope"].get("reviewed_sha")
+        if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
+            return sha
+    return None
+
+
+def envelope_identity_matches(record, expected_repo, expected_pr, expected_round):
+    """PURE: True ONLY when the record's host envelope names EXACTLY the dispatch context —
+    same repo (str), same PR and round (real ints; bool is rejected even though it compares
+    equal to an int). The reviewed sha alone does not identify a verdict: two PRs (or two
+    rounds of one PR) can share a commit, so a matching-sha record for the wrong repo/PR/round
+    must never seed the fixer. Any missing, malformed, or mismatched field is False."""
+    if not (isinstance(record, dict) and isinstance(record.get("host_envelope"), dict)):
+        return False
+    env = record["host_envelope"]
+    repo, pr, round_n = env.get("repo"), env.get("pr"), env.get("round")
+    return (isinstance(repo, str) and repo == expected_repo
+            and isinstance(pr, int) and not isinstance(pr, bool) and pr == expected_pr
+            and isinstance(round_n, int) and not isinstance(round_n, bool)
+            and round_n == expected_round)
+
+
 def select_reconcilable_pr(pulls, target_repo, bot_login, issue, head_branch):
     """PURE: from the target API's PR list for the DETERMINISTIC head branch, choose the single
     open, bot-authored, non-fork, issue-bound PR whose provenance must be reconciled (issue #128).
@@ -1073,14 +1132,63 @@ def reconcile_provenance(registry_repo, target_repo, head_branch, impl_provider,
     _write_outputs({"pr_number": pr_number})
 
 
-def verdict_record(registry_repo, target_repo, pr_number, round_n, verdict_file):
+def verdict_record(registry_repo, target_repo, pr_number, round_n, reviewed_sha, verdict_file):
     with open(verdict_file, encoding="utf-8") as handle:
         document = json.load(handle)
+    # Issue #156: wrap the model verdict in the host envelope so every downstream consumer can
+    # revalidate it against the live head before mutating or fixing.
+    envelope = verdict_envelope(target_repo, pr_number, round_n, reviewed_sha, document)
     created = _registry_put_file(
-        registry_repo, verdict_path(target_repo, pr_number, round_n), document,
-        f"review verdict {target_repo}#{pr_number} round {round_n}")
+        registry_repo, verdict_path(target_repo, pr_number, round_n), envelope,
+        f"review verdict {target_repo}#{pr_number} round {round_n} @ {reviewed_sha[:12]}")
     print(f"verdict {'recorded' if created else 'already recorded'} "
           f"for {target_repo}#{pr_number} round {round_n}")
+
+
+def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, expected_pr,
+                          expected_round):
+    """Issue #156, fixer-consumption guard: unwrap a registry verdict record for the same
+    provider fixer ONLY when its host envelope binds it to `expected_sha` — the exact commit
+    the fixer is about to check out and edit — AND names exactly this dispatch's repo, PR,
+    and round (a matching sha alone is not identity: a record for another PR or round that
+    happens to name the same commit must never seed this fixer). A legacy unbound record (no
+    envelope), a reviewed sha that no longer matches the live head, or an envelope whose
+    identity fields are missing/malformed/mismatched refuses to stage (staged=false) so the
+    fixer is never seeded against code that was never reviewed as this PR; the sweep
+    re-reviews the advanced head instead. Fails closed on malformed dispatch inputs or an
+    unreadable record. The staged file is written 0600 (the findings are untrusted data)."""
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha or ""):
+        raise WorkerPrError("stage-verdict requires a 40-hex --expected-sha")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+", expected_repo or ""):
+        raise WorkerPrError("stage-verdict requires an owner/name --target-repo")
+    if not (isinstance(expected_pr, int) and not isinstance(expected_pr, bool)
+            and expected_pr > 0):
+        raise WorkerPrError("stage-verdict requires a positive integer --pr")
+    if not (isinstance(expected_round, int) and not isinstance(expected_round, bool)
+            and expected_round > 0):
+        raise WorkerPrError("stage-verdict requires a positive integer --round")
+    with open(record_file, encoding="utf-8") as handle:
+        record = json.load(handle)
+    bound = envelope_reviewed_sha(record)
+    if bound != expected_sha:
+        _write_outputs({"staged": False,
+                        "stale_reason": "unbound" if bound is None else "head-moved"})
+        detail = ("unbound legacy record" if bound is None
+                  else f"reviewed {bound[:12]} != live head {expected_sha[:12]}")
+        print(f"verdict NOT staged for the fixer ({detail}); deferring to a fresh review")
+        return
+    if not envelope_identity_matches(record, expected_repo, expected_pr, expected_round):
+        _write_outputs({"staged": False, "stale_reason": "identity-mismatch"})
+        print("verdict NOT staged for the fixer (envelope repo/pr/round does not name "
+              f"{expected_repo}#{expected_pr} round {expected_round}); "
+              "deferring to a fresh review")
+        return
+    path = Path(out_file)
+    path.write_text(json.dumps(envelope_verdict(record), indent=1, sort_keys=True) + "\n",
+                    encoding="utf-8")
+    os.chmod(path, 0o600)
+    _write_outputs({"staged": True})
+    print(f"verdict staged for the fixer (bound to {expected_sha[:12]})")
 
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
@@ -1867,6 +1975,30 @@ def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha, bot_login=""
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
+def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login):
+    """Issue #156: gate EVERY review/fix outcome mutation on the live PR still being the exact
+    reviewed commit — an OPEN, bot-authored, DRAFT PR whose head equals the sha the model ran
+    against. Returns "ok", or a short stale reason ("closed"/"author"/"undrafted"/
+    "malformed-head"/"unbound"/"head-moved"); the caller DEFERS on anything but "ok" so stale
+    findings never label a new head and a stale escalation never terminally parks a
+    replacement head. Exact-head equality is STRICTER than the issue's ancestry requirement
+    and subsumes it: a descendant head still means unreviewed commits are live. Pure and
+    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok"."""
+    if state != "open":
+        return "closed"
+    if bot_login and login != bot_login:
+        return "author"
+    if draft is not True:
+        return "undrafted"
+    if not re.fullmatch(r"[0-9a-f]{40}", live_head or ""):
+        return "malformed-head"
+    if not re.fullmatch(r"[0-9a-f]{40}", reviewed_sha or ""):
+        return "unbound"
+    if live_head != reviewed_sha:
+        return "head-moved"
+    return "ok"
+
+
 def review_outcome(args):
     """Apply the review outcome. Deliberate ordering for crash-window liveness (the durable
     registry verdict record is written by the workflow BEFORE this step, the round marker was
@@ -1888,12 +2020,31 @@ def review_outcome(args):
     # (review-fix.yml keys the bind step off decision != 'hold'), arm_complete=false — so
     # the sweep re-derives this head after a human clears the park. Unreadable/malformed
     # hold surfaces raise (fail closed; the step fails and the sweep retries).
-    holds = live_human_holds(args.repo, args.pr, issue=args.issue)
+    live = _gh_json(["api", f"repos/{args.repo}/pulls/{args.pr}"])
+    holds = live_human_holds(args.repo, args.pr, issue=args.issue, live=live)
     if holds:
         _write_outputs({"decision": "hold", "human_hold": True, "arm_complete": False})
         print(f"review outcome DROPPED: human hold detected ({', '.join(holds)}) — the hold "
               "wins; no findings/label/state mutation was applied and reviewed-sha stays "
               "unbound")
+        return
+    # Issue #156: only the arm branch used to revalidate the reviewed sha, so a head that
+    # advanced during the review could still be labelled review:changes and seed a fixer
+    # against never-reviewed code (or be terminally parked by a stale escalation). Re-derive
+    # the live head/state/authorship/draft from the SAME fresh read the hold check used, and
+    # DEFER on any mismatch: mutate nothing, leave reviewed-sha unbound (the workflow keys the
+    # bind step off decision != 'stale'), and let the sweep re-review the new head — reviewed
+    # sha != live head guarantees it is re-enumerated.
+    freshness = revalidate_outcome_head(
+        live.get("state"), str((live.get("user") or {}).get("login", "")),
+        live.get("draft"), str((live.get("head") or {}).get("sha", "")),
+        args.reviewed_sha, args.bot_login)
+    if freshness != "ok":
+        _write_outputs({"decision": "stale", "stale_reason": freshness,
+                        "arm_complete": False})
+        print(f"review outcome DEFERRED: the live PR no longer matches the reviewed commit "
+              f"({freshness}) — no findings/label/state mutation was applied and reviewed-sha "
+              "stays unbound; the sweep re-reviews the current head")
         return
     post_findings(args.repo, args.pr, args.verdict_file, args.round)
     # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
@@ -1962,11 +2113,28 @@ def fix_outcome(args):
     # marker/label/state mutation; the sweep re-derives once a human clears the park.
     # Unreadable/malformed hold surfaces raise (fail closed; the step fails, the sweep
     # retries).
-    holds = live_human_holds(args.repo, args.pr, issue=args.issue)
+    live = _gh_json(["api", f"repos/{args.repo}/pulls/{args.pr}"])
+    holds = live_human_holds(args.repo, args.pr, issue=args.issue, live=live)
     if holds:
         _write_outputs({"decision": "hold", "human_hold": True})
         print(f"fix outcome DROPPED: human hold detected ({', '.join(holds)}) — the hold "
               "wins; no marker/label/state mutation was applied")
+        return
+    # Issue #156: revalidate the live head before any marker/label/state mutation. The fix's
+    # own push advances the head, so `--reviewed-sha` here is the head this fix PRODUCED (the
+    # pushed sha, or the unchanged head for a no-change/gate-failed/injection run). If the live
+    # head is something else, another push raced this fix — a stale `re-review` or `needs-user`
+    # would act on a head this run never touched (terminally parking a replacement head). DEFER:
+    # mutate nothing; the sweep re-derives the current head.
+    freshness = revalidate_outcome_head(
+        live.get("state"), str((live.get("user") or {}).get("login", "")),
+        live.get("draft"), str((live.get("head") or {}).get("sha", "")),
+        args.reviewed_sha, args.bot_login)
+    if freshness != "ok":
+        _write_outputs({"decision": "stale", "stale_reason": freshness})
+        print(f"fix outcome DEFERRED: the live PR no longer matches the fixed commit "
+              f"({freshness}) — no marker/label/state mutation was applied; the sweep "
+              "re-derives the current head")
         return
     if args.model:
         # Durable executed-model record for this fix round (maintainer directive 2026-07-17):
@@ -2476,7 +2644,8 @@ def _self_test():
         # block exercises the budget machinery, so its fake serves an UNHELD PR + source issue.
         wiring_globals["_gh_json"] = lambda args, **_kw: (
             {"labels": []} if "/issues/" in (args[1] if len(args) > 1 else "")
-            else {"state": "open", "labels": [],
+            else {"state": "open", "labels": [], "draft": True,
+                  "user": {"login": bot},
                   "head": {"ref": "sparq-agent/issue-7-1-1", "sha": "b" * 40}})
         wiring_globals["_paginated_comments"] = (
             lambda repo, pr: fake_state.get("comments", []))
@@ -2505,7 +2674,7 @@ def _self_test():
                     repo="o/r", pr=41, verdict_file=str(verdict_file),
                     files_file=str(files_file), round=3, max_rounds=3, security=False,
                     surface_path=[], issue=None, impl_provider="anthropic", bot_login=bot,
-                    run_key="9.1"))
+                    run_key="9.1", reviewed_sha="b" * 40))
                 return list(wiring_calls)
 
             # Ladder direction (sol r2 f2): an exhausted OPUS fix pins UP to fable; a fable
@@ -2978,6 +3147,136 @@ def _self_test():
           "orchestration/review-verdicts/sparq-org--sparq--pr12-round2.json")
     check("label colours cover review namespace", set(LABEL_COLOURS), set(REVIEW_LABELS))
 
+    # ---- issue #156: the host envelope binds the verdict to the reviewed sha, and readers
+    # unwrap it (legacy bare documents stay readable) ----
+    _env_doc = {"verdict": "approve", "injection_detected": False, "summary": "s",
+                "issues": [], "progress": "improving"}
+    _env = verdict_envelope("o/r", 41, 3, "a" * 40, _env_doc)
+    check("envelope binds repo/pr/round/reviewed-sha",
+          (_env["host_envelope"]["repo"], _env["host_envelope"]["pr"],
+           _env["host_envelope"]["round"], _env["host_envelope"]["reviewed_sha"]),
+          ("o/r", 41, 3, "a" * 40))
+    check("envelope nests the model document untouched", _env["verdict"], _env_doc)
+    check("envelope_verdict unwraps an enveloped record", envelope_verdict(_env), _env_doc)
+    check("envelope_verdict returns a legacy bare document unchanged",
+          envelope_verdict(_env_doc), _env_doc)
+    check("envelope_reviewed_sha reads the bound sha", envelope_reviewed_sha(_env), "a" * 40)
+    check("envelope_reviewed_sha is None for a legacy bare document",
+          envelope_reviewed_sha(_env_doc), None)
+    check("envelope_reviewed_sha is None for a malformed bound sha",
+          envelope_reviewed_sha({"host_envelope": {"reviewed_sha": "nope"}}), None)
+    # Review round 2: identity is repo AND pr AND round, exact values and exact types.
+    check("envelope identity matches the exact repo/pr/round",
+          envelope_identity_matches(_env, "o/r", 41, 3), True)
+    check("envelope identity rejects a wrong repo",
+          envelope_identity_matches(_env, "o/other", 41, 3), False)
+    check("envelope identity rejects a wrong pr",
+          envelope_identity_matches(_env, "o/r", 42, 3), False)
+    check("envelope identity rejects a wrong round",
+          envelope_identity_matches(_env, "o/r", 41, 4), False)
+    check("envelope identity rejects a legacy bare document",
+          envelope_identity_matches(_env_doc, "o/r", 41, 3), False)
+    check("envelope identity rejects a string pr even when it prints equal",
+          envelope_identity_matches(verdict_envelope("o/r", "41", 3, "a" * 40, _env_doc),
+                                    "o/r", 41, 3), False)
+    check("envelope identity rejects bool pr/round despite int equality",
+          envelope_identity_matches(verdict_envelope("o/r", True, 3, "a" * 40, _env_doc),
+                                    "o/r", 1, 3), False)
+    check("envelope identity rejects a missing round",
+          envelope_identity_matches({"host_envelope": {"repo": "o/r", "pr": 41,
+                                                       "reviewed_sha": "a" * 40}},
+                                    "o/r", 41, 3), False)
+    try:
+        verdict_envelope("o/r", 41, 3, "short", _env_doc)
+        check("envelope refuses a non-40-hex reviewed sha", "no error", "raised")
+    except WorkerPrError:
+        check("envelope refuses a non-40-hex reviewed sha", "raised", "raised")
+
+    # revalidate_outcome_head: "ok" ONLY for an open, bot-authored, draft PR at the exact
+    # reviewed sha; every other shape is a distinct stale reason (fail closed).
+    check("revalidate ok at the exact reviewed head",
+          revalidate_outcome_head("open", "sparq[bot]", True, "a" * 40, "a" * 40, "sparq[bot]"),
+          "ok")
+    check("revalidate flags a moved head",
+          revalidate_outcome_head("open", "sparq[bot]", True, "b" * 40, "a" * 40, "sparq[bot]"),
+          "head-moved")
+    check("revalidate flags a closed PR",
+          revalidate_outcome_head("closed", "sparq[bot]", True, "a" * 40, "a" * 40,
+                                  "sparq[bot]"), "closed")
+    check("revalidate flags a foreign author",
+          revalidate_outcome_head("open", "mallory[bot]", True, "a" * 40, "a" * 40,
+                                  "sparq[bot]"), "author")
+    check("revalidate flags an undrafted (armed) PR",
+          revalidate_outcome_head("open", "sparq[bot]", False, "a" * 40, "a" * 40,
+                                  "sparq[bot]"), "undrafted")
+    check("revalidate flags an unbound reviewed sha",
+          revalidate_outcome_head("open", "sparq[bot]", True, "a" * 40, "none", "sparq[bot]"),
+          "unbound")
+    check("revalidate flags a malformed live head",
+          revalidate_outcome_head("open", "sparq[bot]", True, "", "a" * 40, "sparq[bot]"),
+          "malformed-head")
+
+    # stage_verdict_for_fix: unwrap ONLY when the envelope binds the record to the live head
+    # AND names exactly this dispatch's repo/PR/round; a moved head, a legacy unbound record,
+    # or a matching-sha record for the wrong repo/PR/round refuses to stage (staged=false).
+    with tempfile.TemporaryDirectory() as _tmp:
+        _rec = Path(_tmp) / "rec.json"
+        _out = Path(_tmp) / "out.json"
+        _stage_out = {}
+        _real_wo = globals()["_write_outputs"]
+        try:
+            globals()["_write_outputs"] = _stage_out.update
+            _rec.write_text(json.dumps(verdict_envelope("o/r", 41, 3, "a" * 40, _env_doc)),
+                            encoding="utf-8")
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 3)
+            check("stage-verdict unwraps a matching record",
+                  (_stage_out.get("staged"), json.loads(_out.read_text())), (True, _env_doc))
+            _out.unlink()
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "b" * 40, "o/r", 41, 3)
+            check("stage-verdict refuses a moved head (not staged)",
+                  (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
+                  (False, "head-moved", False))
+            # Review round 2: the sha matches but the record names ANOTHER repo / PR / round —
+            # each must refuse with no staged file (the sha alone is not identity).
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/other", 41, 3)
+            check("stage-verdict refuses a matching-sha record for the wrong repo",
+                  (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
+                  (False, "identity-mismatch", False))
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 42, 3)
+            check("stage-verdict refuses a matching-sha record for the wrong pr",
+                  (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
+                  (False, "identity-mismatch", False))
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 4)
+            check("stage-verdict refuses a matching-sha record for the wrong round",
+                  (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
+                  (False, "identity-mismatch", False))
+            _rec.write_text(json.dumps(_env_doc), encoding="utf-8")  # legacy bare record
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 3)
+            check("stage-verdict refuses a legacy unbound record (not staged)",
+                  (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
+                  (False, "unbound", False))
+            # Malformed dispatch inputs DIE (never a silent stage): bad repo, non-positive pr,
+            # non-positive round.
+            for _bad_args, _label in (
+                    (("", 41, 3), "an empty --target-repo"),
+                    (("o/r", 0, 3), "a non-positive --pr"),
+                    (("o/r", 41, 0), "a non-positive --round")):
+                _stage_out.clear()
+                try:
+                    stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, *_bad_args)
+                    check(f"stage-verdict refuses {_label}", "no error", "raised")
+                except WorkerPrError:
+                    check(f"stage-verdict refuses {_label}",
+                          ("raised", _out.exists()), ("raised", False))
+        finally:
+            globals()["_write_outputs"] = _real_wo
+
     # Privacy (locked decision 22a): salted hash is 16-hex, deterministic, salt-sensitive, and
     # never the raw handle; missing salt fails closed.
     h1 = account_hash("acct02", "s3cret")
@@ -3421,13 +3720,17 @@ def _self_test():
         path = args[1] if len(args) > 1 else ""
         if "/issues/" in path:
             return {"labels": [{"name": name} for name in oc_state.get("issue_labels", ())]}
-        return {"state": "open",
+        return {"state": oc_state.get("state", "open"),
+                "draft": oc_state.get("draft", True),
+                "user": {"login": oc_state.get("login", "sparq[bot]")},
                 "labels": [{"name": name} for name in oc_state.get("labels", ())],
-                "head": {"ref": "sparq-agent/issue-7-1-1", "sha": "b" * 40}}
+                "head": {"ref": "sparq-agent/issue-7-1-1",
+                         "sha": oc_state.get("head", "b" * 40)}}
 
-    def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False):
-        oc_calls.clear(); oc_outputs.clear()
-        oc_state.update(labels=labels, issue_labels=issue_labels)
+    def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False,
+                           reviewed_sha="b" * 40, **live_over):
+        oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
+        oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
         with tempfile.TemporaryDirectory() as tmp:
             verdict_file = Path(tmp) / "verdict.json"
             files_file = Path(tmp) / "files.txt"
@@ -3441,15 +3744,16 @@ def _self_test():
                 repo="o/r", pr=41, verdict_file=str(verdict_file),
                 files_file=str(files_file), round=1, max_rounds=3, security=False,
                 surface_path=[], issue=7, impl_provider="anthropic",
-                bot_login="sparq[bot]", run_key="9.1"))
+                bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha))
 
-    def run_fix_outcome(labels=(), issue_labels=(), injection="false"):
-        oc_calls.clear(); oc_outputs.clear()
-        oc_state.update(labels=labels, issue_labels=issue_labels)
+    def run_fix_outcome(labels=(), issue_labels=(), injection="false",
+                        reviewed_sha="b" * 40, **live_over):
+        oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
+        oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
         fix_outcome(argparse.Namespace(
             repo="o/r", pr=41, round=1, run_key="9.1", bot_login="sparq[bot]",
             injection=injection, made_changes="true", gate_outcome="success",
-            pushed="true", issue=7, model=""))
+            pushed="true", issue=7, model="", reviewed_sha=reviewed_sha))
 
     try:
         globals()["_gh_json"] = oc_gh_json
@@ -3501,6 +3805,36 @@ def _self_test():
         run_fix_outcome(injection="true")
         check("unheld injection fix outcome still parks needs-user",
               (oc_calls, oc_outputs.get("decision")), (["needs-user"], "needs-user"))
+
+        # ---- issue #156: the head advanced AFTER the review/fix resolved. Every outcome path
+        # DEFERS — zero comment/label/state mutation, decision 'stale' — so stale findings can
+        # never label a new head and a stale escalation can never park a replacement head. The
+        # head is unheld here (the hold check passed first), proving the freshness gate is a
+        # SEPARATE guard, not a side effect of the hold drop. ----
+        for verdict, injection in (("request_changes", False), ("approve", False),
+                                   ("request_changes", True)):
+            run_review_outcome(verdict, injection=injection, head="d" * 40)
+            check(f"stale-head review outcome ({verdict}, inj={injection}) defers, no mutation",
+                  (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+                  ([], "stale", "head-moved"))
+        # a non-draft (already-armed) or wrong-author live PR defers the same way
+        run_review_outcome("request_changes", draft=False)
+        check("undrafted review outcome defers with no mutation",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              ([], "stale", "undrafted"))
+        run_review_outcome("approve", login="mallory[bot]")
+        check("wrong-author review outcome defers with no mutation",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              ([], "stale", "author"))
+        # the fix outcome defers identically when the live head is not the one it produced
+        run_fix_outcome(head="d" * 40)
+        check("stale-head fix outcome defers with no mutation",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              ([], "stale", "head-moved"))
+        # a HELD PR still drops as 'hold' even when the head also moved (hold is checked first)
+        run_review_outcome("request_changes", labels=("review:needs-user",), head="d" * 40)
+        check("hold wins over stale-head (hold checked first)",
+              (oc_calls, oc_outputs.get("decision")), ([], "hold"))
     finally:
         globals().update(real_oc)
 
@@ -3592,7 +3926,22 @@ def main():
     vrec.add_argument("--target-repo", required=True)
     vrec.add_argument("--pr", required=True, type=int)
     vrec.add_argument("--round", required=True, type=int)
+    vrec.add_argument("--reviewed-sha", required=True,
+                      help="the exact commit this verdict reviewed (issue #156 envelope)")
     vrec.add_argument("--verdict-file", required=True)
+
+    # Issue #156: unwrap a registry verdict record for the fixer only when its host envelope
+    # binds it to the live head the fixer will edit; a stale/unbound record is not staged.
+    svrec = subparsers.add_parser("stage-verdict")
+    svrec.add_argument("--record-file", required=True)
+    svrec.add_argument("--out-file", required=True)
+    svrec.add_argument("--expected-sha", required=True)
+    # Review round 2: the sha alone is not identity — the envelope must also name exactly this
+    # dispatch's repo/PR/round or the record is refused (a same-commit record for another PR
+    # or round must never seed the fixer).
+    svrec.add_argument("--target-repo", required=True)
+    svrec.add_argument("--pr", required=True, type=int)
+    svrec.add_argument("--round", required=True, type=int)
 
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
@@ -3642,6 +3991,9 @@ def main():
     rout.add_argument("--impl-provider", required=True)
     rout.add_argument("--bot-login", required=True)
     rout.add_argument("--run-key", required=True)
+    rout.add_argument("--reviewed-sha", required=True,
+                      help="the commit the review ran against; the outcome defers if the live "
+                           "head has moved off it (issue #156)")
 
     fout = subparsers.add_parser("fix-outcome", parents=[common])
     fout.add_argument("--round", required=True, type=int)
@@ -3654,6 +4006,9 @@ def main():
     fout.add_argument("--issue", type=int)
     fout.add_argument("--model", default="",
                       help="executed fix-model alias; recorded as a durable round marker")
+    fout.add_argument("--reviewed-sha", required=True,
+                      help="the head this fix produced (pushed sha, else the unchanged head); "
+                           "the outcome defers if the live head has moved off it (issue #156)")
 
     # Records/converges the fix-model floor pin (CLAIM's crashed-outcome convergence path; the
     # review outcome records it in-process). Idempotent — an equal-or-higher floor wins.
@@ -3716,7 +4071,10 @@ def main():
                                  args.issue, args.run_key, args.verify_bot_login)
         elif args.command == "verdict-record":
             verdict_record(args.registry_repo, args.target_repo, args.pr, args.round,
-                           args.verdict_file)
+                           args.reviewed_sha, args.verdict_file)
+        elif args.command == "stage-verdict":
+            stage_verdict_for_fix(args.record_file, args.out_file, args.expected_sha,
+                                  args.target_repo, args.pr, args.round)
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
