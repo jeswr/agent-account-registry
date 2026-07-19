@@ -581,14 +581,18 @@ jobs:
       exhausted: ${{ steps.budget.outputs.exhausted }}
       trust_outcome: ${{ steps.trust.outcome }}
       attempt_number: ${{ steps.attempt.outputs.number }}
-      # Model-access health (registry #136): a started-attempt marker. `record-attempt` COMPLETES
-      # before the model launches, so — unlike exit_class, which comes from the always() capture step
-      # that a hard model-step timeout kills before it can run — this output survives a model-step
-      # timeout/cancellation (a completed step's output is retained; see the #127 note above). It lets
-      # model_health tell a genuine provider attempt whose exit class went uncaptured (default to
-      # `unknown`, retain the timeout) apart from a pre-launch abort — budget exhaustion, trust
-      # failure, or prep failure — that made NO provider call and must record nothing.
-      model_started: ${{ steps.attempt.outcome == 'success' }}
+      # Model-access health (registry #136, round 2): a genuine-provider-attempt marker keyed on the
+      # COMPLETED `model-prep` step, which builds the model-isolation image immediately before the
+      # launch step invokes the provider CLI. record-attempt is deliberately NOT used: it completes
+      # much earlier (before the prompt and the slow, cold-cache-minute-scale image build), so a
+      # cancellation or job timeout after it but before the CLI launched would falsely mark a
+      # non-attempt as started and pollute the health ledger with a fabricated `unknown` (round-2
+      # finding). `model-prep` sits at the pre-launch boundary, and a completed step's outcome is
+      # retained even when the LATER model step is killed by the job timeout (see the #127 note above)
+      # — so a started attempt whose exit class went uncaptured is still retained (defaulted to
+      # `unknown` in model_health), while a pre-launch abort — budget exhaustion, trust failure, prep/
+      # build failure, or a cancel DURING the build — records nothing.
+      model_started: ${{ steps.model-prep.outcome == 'success' }}
     concurrency:
       group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
       cancel-in-progress: false
@@ -864,9 +868,23 @@ jobs:
             --bot-login "${{ steps.target.outputs.bot_login }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
 
+      # registry #136 (round 2): build the model-isolation image in ITS OWN step so the (cold-cache
+      # minute-scale) build sits BEHIND a completed step boundary. `model_started` keys on THIS step's
+      # completion, not on record-attempt's — so a cancellation or job timeout during the build (before
+      # any provider CLI is invoked) leaves model_started false and records NO health entry, closing
+      # the pre-launch pollution path. The launch step below fails closed if the image is absent, so
+      # build-and-launch never collapse back into one step.
+      - name: Build the model-isolation image (pre-launch marker for model_started)
+        id: model-prep
+        if: ${{ !inputs.dry_run && steps.attempt.outcome == 'success' }}
+        working-directory: target
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: bash ../registry/scripts/worker-live.sh model-prep
+
       - name: Run routed model headless on a fresh target branch
         id: model
-        if: ${{ !inputs.dry_run && steps.attempt.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && steps.model-prep.outcome == 'success' }}
         working-directory: target
         env:
           # Deliberately NO GH_TOKEN here: the model container must never see a GitHub token
@@ -890,7 +908,8 @@ jobs:
       # trust failure, or prep failure) where NO provider call occurred — it must record NOTHING, not
       # a fabricated class=unknown (#136: those non-attempts polluted the health ledger). The started-
       # vs-non-attempt distinction is carried by the `model_started` job output (set from the completed
-      # record-attempt step, which survives a hard model-step timeout that kills THIS always() step);
+      # model-prep step — the pre-launch build boundary — which survives a hard model-step timeout that
+      # kills THIS always() step);
       # a started attempt whose class is empty because this capture step never ran is defaulted to
       # `unknown` in the model_health job, so a genuine timeout is RETAINED rather than dropped.
       - name: Capture model exit class

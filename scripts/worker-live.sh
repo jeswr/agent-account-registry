@@ -232,13 +232,15 @@ _run_headless_harness() {
   # helper checkout, runner command files, or a later PAT-bearing step. The nested .git mount is
   # read-only so it cannot plant hooks/config for host-side publishing.
   local image='registry-worker-model:reg3'
-  local image_context="$worker_root/image-context"
-  mkdir -p "$image_context" "$worker_root/home/.cargo"
-  chmod 700 "$image_context" "$worker_root/home/.cargo"
-  docker build --quiet \
-    --file "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
-    --tag "$image" \
-    "$image_context" > "$worker_root/model-image.id"
+  mkdir -p "$worker_root/home/.cargo"
+  chmod 700 "$worker_root/home/.cargo"
+  # registry #136 (round 2): the model-isolation image is built by the SEPARATE `model-prep` step so
+  # its slow, cold-cache-minute-scale build sits BEHIND a completed step boundary that the
+  # `model_started` marker keys on. Fail closed here — NEVER build-and-launch inside this one step,
+  # which would reopen the pre-launch cancellation/timeout window that split exists to close (a
+  # cancel during an in-step build would otherwise mark a non-attempt as started).
+  docker image inspect "$image" >/dev/null 2>&1 \
+    || die 'model-isolation image absent; the model-prep step must build it before the CLI launch'
   # shellcheck disable=SC2054  # comma-separated Docker mount/tmpfs options are single elements
   local -a container=(
     docker run --rm --interactive
@@ -427,6 +429,26 @@ Target issue #{issue.get('number')}: {title}
 Path(prompt_path).write_text(prompt, encoding="utf-8")
 Path(prompt_path).chmod(0o600)
 PY
+}
+
+# registry #136 (round 2): build the model-isolation container image in its OWN step (the workflow
+# `model-prep` step) so the slow build sits BEHIND a completed step boundary. `model_started` keys on
+# this step's completion, so a cancel or job timeout DURING the build — before any provider CLI is
+# invoked — records NO health entry, instead of the record-attempt-based marker's fabricated `unknown`
+# for a run that never reached the provider. The launch step (`run_model`/_run_headless_harness) then
+# fails closed if this image is absent, so build-and-launch never recombine into a single step.
+prep_model() {
+  local worker_root=${WORKER_ROOT:-}
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  local image='registry-worker-model:reg3'
+  local image_context="$worker_root/image-context"
+  mkdir -p "$image_context"
+  chmod 700 "$image_context"
+  docker build --quiet \
+    --file "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
+    --tag "$image" \
+    "$image_context" > "$worker_root/model-image.id"
+  printf 'worker-live: model-prep built the model-isolation image (pre-launch boundary); the CLI launches in the next step\n'
 }
 
 run_model() {
@@ -1811,6 +1833,24 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   chk "the publish/PR step is guarded by gate success" \
     "$(_workflow_step_if "$wf" pr | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
 
+  # --- [registry #136 round 2] the model_started marker keys on the COMPLETED model-prep step (which
+  # builds the isolation image immediately before the CLI launches), NOT on the earlier record-attempt
+  # step. record-attempt completes long before the slow build, so a cancel/timeout after it but before
+  # the CLI launched used to falsely mark a non-attempt as started and pollute model_health with a
+  # fabricated `unknown`. Non-vacuous: reverting model_started (or the launch step's `if`) back to
+  # `steps.attempt.outcome` flips these red; the record-attempt negatives are the fail-closed control,
+  # and model-prep gating on `steps.attempt.outcome` proves the pre-launch ORDERING is preserved. ---
+  chk "model_started keys on the completed pre-launch model-prep step" \
+    "$(grep -aEc "^[[:space:]]+model_started:.*steps\.model-prep\.outcome == 'success'" "$wf" || true)" "1"
+  chk "model_started no longer keys on the earlier record-attempt step (non-vacuous)" \
+    "$(grep -aEc "^[[:space:]]+model_started:.*steps\.attempt\.outcome" "$wf" || true)" "0"
+  chk "the model launch step gates on the completed model-prep marker" \
+    "$(_workflow_step_if "$wf" model | grep -Fc "steps.model-prep.outcome == 'success'" || true)" "1"
+  chk "the model launch step no longer gates directly on record-attempt (non-vacuous)" \
+    "$(_workflow_step_if "$wf" model | grep -Fc "steps.attempt.outcome" || true)" "0"
+  chk "the model-prep step gates on a recorded attempt (pre-launch ordering preserved, fail-closed)" \
+    "$(_workflow_step_if "$wf" model-prep | grep -Fc "steps.attempt.outcome == 'success'" || true)" "1"
+
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
   # REAL membership semantics: sparq's root workspace excludes gui/src-tauri (a standalone
@@ -2014,6 +2054,7 @@ FAKE
 }
 
 case "${1:-}" in
+  model-prep) prep_model ;;
   model) run_model ;;
   gate) run_gate ;;
   publish) publish_pr ;;
@@ -2022,5 +2063,5 @@ case "${1:-}" in
   push-fix) push_fix ;;
   write-back) write_back ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  *) die 'usage: worker-live.sh <model-prep|model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
 esac
