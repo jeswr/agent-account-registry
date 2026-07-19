@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3640,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9baf9f6444f60d9e2b77db59cf38907c5d16e0dd",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The edited composability paragraph still says `Honest majority enjoys UC WITHOUT setup`. The new posture record correctly narrows this to no CRS/PKI given ideal authenticated/private channels, broadcast where required, and the UC session/scheduling model. Leaving the old absolute wording in a linked synthesis record preserves the prior round's security overclaim and makes the documentation internally inconsistent.",
+    "file": "research/mpc-security-models-and-benchmarks.md",
+    "fix_hint": "Replace `UC WITHOUT setup` with the same narrow formulation used by the new posture record: UC without a CRS/PKI trust root only given the theorem's specified authenticated/private communication resources, broadcast where required, and UC session/scheduling assumptions; state that applicability to current in-process code is aspirational.",
+    "severity": "major",
+    "title": "Companion record retains the unqualified UC-without-setup claim"
+   },
+   {
+    "body": "The new sentence says `the open is justified only against the bit-leaking F_join carried downstream`. But the new posture record expressly says the lemma is not a proof that secure_equal realizes F_join: the distributed protocol, complete adversarial views, and simulator remain absent. Calling the open `justified` against F_join promotes the limited distribution lemma back into the realization/composition conclusion rejected in round 1.",
+    "file": "research/mpc-sparql-capability-matrix.md",
+    "fix_hint": "Say that the record characterizes the honest masked opening as revealing only the match bit, requires a bit-leaking F_join in any future composition proof, and leaves realization/composition justification conditional on a distributed protocol and full-view simulator.",
+    "severity": "major",
+    "title": "Capability matrix overstates the masked-opening lemma as F_join justification"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 materially improves the new posture record: it now makes composition conditional on future distributed realizations and explicitly states the authenticated/private-channel, broadcast, session, and scheduling assumptions. However, two edited companion records still preserve or introduce the exact overclaims that the new record corrects. One still says honest-majority UC is without setup without qualifying the required communication resources, and another says the open is justified against F_join even though the new record establishes only a masked-opening leakage lemma and says realization of F_join remains pending. Because these are outward MPC soundness claims on an audit-gated surface, the cross-document inconsistency is major and must be fixed before approval.",
+  "verdict": "request_changes"
+ }
+}
