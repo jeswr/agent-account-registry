@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 395,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5a27a28d29e0fbf3d6ffc80dcdc74165eaa1dcd8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. The self-test now reads the authoritative review-fix workflow, scopes extraction to the resolve/claim/run/release jobs, and asserts that all critical-path timeouts and both workflow-local claim TTLs agree with the dispatcher constants and derived TTLs. Missing or unparsable workflow values fail closed. The resulting 4200/6300-second leases match the workflow claim path and cover the modeled job-timeout path plus queue slack. No new correctness, security, or test-validity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
