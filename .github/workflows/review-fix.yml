@@ -21,7 +21,8 @@
 #   escalation chain here (review-fix has no docs lane — asserted structurally in the resolve
 #   step). The reviewer model is read-only (mutation=deny,
 #   no GitHub token in the container) and its verdict is VOID unless the tree is byte-identical.
-# - Arming (gh pr ready + gh pr merge --auto) happens ONLY here, host-side, one-shot, gated on a
+# - Arming (gh pr ready + the sha-bound enablePullRequestAutoMerge latch mutation — never
+#   `gh pr merge`, which direct-merges an already-mergeable PR) happens ONLY here, host-side, gated on a
 #   schema-valid approve verdict + reviewer!=implementer (provider AND account) + the armed head
 #   SHA equalling the reviewed SHA re-read live. Security-labelled surfaces never auto-arm.
 # - rc=3 (none-free) claim handling is copied verbatim from worker.yml: skip-and-retry, never a
@@ -1241,7 +1242,7 @@ jobs:
   # 2) findings + outcome labels (or arm), 3) the reviewed-sha bind LAST. A crash between any
   # two leaves reviewed-sha != head, so the sweep re-derives the PR next tick (bounded by the
   # pre-model round marker + max_review_rounds) instead of a silent permanent stall; the arm
-  # path additionally restores the draft state if `merge --auto` fails after `pr ready`.
+  # path additionally restores the draft state if the latch mutation fails after `pr ready`.
   outcome:
     name: Apply ${{ inputs.mode }} outcome (no target code runs here)
     needs: [resolve, claim, run]

@@ -1,5 +1,6 @@
 # [OPUS-4.8] B1: the registry's own required PR gate. The onboarded review lane arms a PR with
-# `gh pr merge --auto` (allow_auto_merge is enabled live on the repo); that latch only merges when
+# the sha-bound enablePullRequestAutoMerge mutation (allow_auto_merge is enabled live on the
+# repo; never `gh pr merge --auto`, which direct-merges — sol r4 on #334); that latch only merges when
 # a REQUIRED status check named `gate` is green. This workflow IS that check — a `pull_request`
 # job literally named `gate` running the registry-selftest suite (python --self-test + actionlint).
 # It is also the authoritative check dispatch-claim.py's CI_GATE_CHECK reads (name == "gate").
