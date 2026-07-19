@@ -9,6 +9,16 @@
    "model": "opus",
    "issued_at": 1784460200,
    "expires_at": 1784462900
+  },
+  {
+   "account": "acct01",
+   "claim_id": "0da2fb0f30c349da868f168723e5bd45",
+   "holder": "review:sparq-org/sparq#3595@dispatch-29685264532.1",
+   "package": "sparq-mpc",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1784461075,
+   "expires_at": 1784465275
   }
  ]
 }
