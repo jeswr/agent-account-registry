@@ -535,6 +535,15 @@ jobs:
       # The sanitized session-limit reset time worker-live.sh extracts (review defect #9); empty
       # for every other class. Feeds the provider-capped alert's "earliest known reset".
       reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
+      # Final-state inputs (issue #127): surfaced so the SEPARATE always() `final_state` job can
+      # converge the issue status even when THIS job is killed by its `worker_timeout_minutes`
+      # timeout or a cancellation (which stops even an in-job always() step from running). On a
+      # timeout/cancel the incomplete steps leave these empty, and the downstream job fails closed
+      # to `deferred` — taking the issue OUT of status:in-progress and back into the redispatch pool.
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+      exhausted: ${{ steps.budget.outputs.exhausted }}
+      trust_outcome: ${{ steps.trust.outcome }}
+      attempt_number: ${{ steps.attempt.outputs.number }}
     concurrency:
       group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
       cancel-in-progress: false
@@ -965,37 +974,6 @@ jobs:
             --issue "${{ inputs.issue_number }}" \
             --spec-file "$WORKER_ROOT/followups.jsonl" || true
 
-      - name: Set final target issue state
-        if: ${{ always() && !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
-          ACQUIRED: ${{ needs.claim.outputs.acquired }}
-          EXHAUSTED: ${{ steps.budget.outputs.exhausted }}
-          TRUST_OUTCOME: ${{ steps.trust.outcome }}
-          ATTEMPT_NUMBER: ${{ steps.attempt.outputs.number }}
-          MAX_ATTEMPTS: ${{ needs.resolve.outputs.max_attempts }}
-          PR_URL: ${{ steps.pr.outputs.pr_url }}
-        run: |
-          set -euo pipefail
-          status=deferred
-          if [[ "$ACQUIRED" == true && "$EXHAUSTED" == true ]]; then
-            status=needs-user
-          elif [[ "$ACQUIRED" == true && -n "$PR_URL" ]]; then
-            # Completion is DEFERRED to the review-fix ARM path (the issue closes only when its
-            # PR is approved cross-provider and armed); the review loop owns it from here.
-            status=in-progress-review
-          elif [[ "$ACQUIRED" == true && "$TRUST_OUTCOME" == success \
-                  && "$ATTEMPT_NUMBER" =~ ^[1-9][0-9]*$ \
-                  && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ \
-                  && "$ATTEMPT_NUMBER" -ge "$MAX_ATTEMPTS" ]]; then
-            status=needs-user
-          fi
-          python3 registry/scripts/worker-issue.py status \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --status "$status" ||
-            printf '%s\n' "::warning::Could not set final target issue state to $status"
-
       # [OPUS-4.8] The diagnostics ARTIFACT was DROPPED for credential-safety (security review,
       # finding #1). Rationale: the `gate` step above runs target-CONTROLLED cargo (build scripts /
       # tests) while the job env exposes the account handle and credential file paths. Any file the
@@ -1036,6 +1014,79 @@ jobs:
           if [[ "${MODEL_OUTCOME:-}" == "success" && "${GATE_OUTCOME:-}" != "success" ]]; then
             echo '::warning::The model produced work but the local gate did not pass for package atom(s) ['"${RESOLVED_PACKAGES:-?}"'] — the gate error is in this run job log above (the Run policy-selected local gate step output); no artifact is produced by design (credential-safety).'
           fi
+
+  # Final-state convergence runs as its OWN always() job (issue #127). The `worker` job runs the
+  # model + host-side cargo gate under a hard `worker_timeout_minutes` timeout; a job timeout or a
+  # cancellation kills even an in-job always() STEP, so a final-state step LIVING in `worker` could
+  # never converge a timed-out run — the issue stayed status:in-progress forever while the separate
+  # `release` job still freed its lease (no live lease + still busy = un-redispatchable). A separate
+  # job is NOT bound by the worker timeout, mints a FRESH token (the worker's is minted before the
+  # long model run), and derives the status from the worker job's outputs — which are EMPTY when the
+  # worker was killed mid-run, so the logic fails closed to `deferred` (out of status:in-progress,
+  # back into the redispatch pool). Unlike the old in-job step it does NOT swallow a failed status
+  # write as a `::warning::` (that swallow re-created the same strand): it FAILS LOUD, and the
+  # dispatcher's in-progress repair sweep is the backstop for a genuinely unreachable issues API.
+  # Like provenance/model_health it runs NO target code, so co-locating an issues:write App token is
+  # safe (the reason those trust-sensitive writes are not inside the hostile-code `worker` job).
+  final_state:
+    name: Converge final target issue state (no target code runs here)
+    if: ${{ always() && !inputs.dry_run && needs.resolve.result == 'success' && needs.claim.result == 'success' }}
+    needs: [resolve, claim, worker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only).
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Mint App token for the final-state write
+        id: app-token-final
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-issues: write
+
+      - name: Set final target issue state
+        env:
+          GH_TOKEN: ${{ steps.app-token-final.outputs.token }}
+          ACQUIRED: ${{ needs.claim.outputs.acquired }}
+          EXHAUSTED: ${{ needs.worker.outputs.exhausted }}
+          TRUST_OUTCOME: ${{ needs.worker.outputs.trust_outcome }}
+          ATTEMPT_NUMBER: ${{ needs.worker.outputs.attempt_number }}
+          MAX_ATTEMPTS: ${{ needs.resolve.outputs.max_attempts }}
+          PR_URL: ${{ needs.worker.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          status=deferred
+          if [[ "$ACQUIRED" == true && "$EXHAUSTED" == true ]]; then
+            status=needs-user
+          elif [[ "$ACQUIRED" == true && -n "$PR_URL" ]]; then
+            # Completion is DEFERRED to the review-fix ARM path (the issue closes only when its
+            # PR is approved cross-provider and armed); the review loop owns it from here.
+            status=in-progress-review
+          elif [[ "$ACQUIRED" == true && "$TRUST_OUTCOME" == success \
+                  && "$ATTEMPT_NUMBER" =~ ^[1-9][0-9]*$ \
+                  && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ \
+                  && "$ATTEMPT_NUMBER" -ge "$MAX_ATTEMPTS" ]]; then
+            status=needs-user
+          fi
+          # FAIL LOUD on a failed write (issue #127): the old in-job step swallowed this as a
+          # ::warning:: and left the issue stranded status:in-progress. A red job here is the
+          # visible signal; the dispatcher in-progress repair sweep is the recovery backstop.
+          python3 registry/scripts/worker-issue.py status \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --status "$status"
 
   # Provenance is REGISTRY-recorded and is the review loop's root of trust: the review sweep
   # fails closed on a missing record (the PR is never enumerated), so this job must FAIL LOUD —
@@ -1180,7 +1231,11 @@ jobs:
   # re-enumerate (deferral repair, missed-fix accounting, next round).
   doorbell:
     name: doorbell (re-ring dispatcher)
-    needs: [release]
+    # Also waits on final_state (issue #127) so the re-rung dispatcher observes the CONVERGED issue
+    # status, never the transient "status:in-progress + lease already released" window that opens
+    # while final_state runs in parallel with release. A skipped final_state (dry run / no claim)
+    # completes immediately and does not hold the doorbell.
+    needs: [release, final_state]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
