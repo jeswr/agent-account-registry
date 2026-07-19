@@ -1370,10 +1370,18 @@ PY
   # WORKER_GH_BIN is a seam for the HERMETIC self-test's argv-capturing fake gh only; live runs
   # never set it (absolute-path default). It crosses no new trust boundary: an actor who controls
   # this process's environment already holds REGISTRY_SECRETS_PAT itself from that same env.
-  GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$current"
+  # Privacy (issue #135): `gh`'s own stdout+stderr inherit these PUBLIC logs, and the secret
+  # reference is `${ACCTNN}_TOKEN` — the raw account handle in disguise. `gh` echoes that name on
+  # success ("✓ Set secret ...") AND is free to echo it from its argv in a diagnostic on any
+  # API/auth/validation failure. So capture the COMBINED output into a variable that is never
+  # relayed, and on failure surface only a fixed, identifier-free line — do NOT report rotated=true
+  # (fail closed: the central env copy stays un-rotated rather than being reported as rotated).
+  local wb_gh_output
+  if ! wb_gh_output=$(GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$current" 2>&1); then
+    die 'write-back to the account secret failed (env dispatch-secrets); see private registry logs'
+  fi
   write_output rotated true
-  # Privacy (issue #135): the secret reference is `${ACCTNN}_TOKEN`, i.e. the raw account handle in
-  # disguise — never print it to these PUBLIC logs. The identifier-free line still confirms the write.
+  # The identifier-free line still confirms the write without naming the account secret reference.
   printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
 }
 
@@ -1764,6 +1772,11 @@ TOML
 printf '%s\n' "$*" > "$WB_CAPTURE/argv"
 cat > "$WB_CAPTURE/stdin"
 printf '%s\n' "${GH_TOKEN:-}" > "$WB_CAPTURE/token"
+# Real gh prints the secret NAME on success ("✓ Set secret ${ACCTNN}_TOKEN for o/r"); echo our argv
+# (which carries the account-derived name) to stderr so the "never echoes the account secret
+# reference" assertion is NON-VACUOUS on the success path too — dropping write_back's output capture
+# would let that name reach the public log even when the call succeeds.
+printf 'gh: Set secret %s\n' "$*" >&2
 FAKE
   chmod +x "$tmp/wb-gh"
   printf 'sk-ant-oat-ROTATED-SENTINEL' > "$wbroot/current"
@@ -1797,6 +1810,38 @@ FAKE
   # write-back log must never contain it (the identifier stays out of the log entirely).
   chk "write_back never echoes the account secret reference" \
     "$(grep -c 'ACCTEXAMPLE_TOKEN\|acctexample' "$tmp/wb.log" || true)" "0"
+
+  # --- write-back FAILURE path (#376 r1): `gh secret set` can fail (API/auth/validation) and echo
+  # the account-derived secret name from its argv in its diagnostic — that name reverses to the raw
+  # handle. So the failure must (a) leak NEITHER identifier to the PUBLIC log, and (b) fail closed:
+  # non-zero exit, and NO rotated=true (never claim a rotation the central env copy did not receive).
+  # Hermetic: a fake gh that exits non-zero while printing both identifiers to stderr. Reverting the
+  # output-capture + fixed-diagnostic in write_back turns the leak/rotated assertions red. ---
+  local wb_fail_out="$tmp/wb-fail-github-output" wbf_rc
+  cat > "$tmp/wb-gh-fail" <<'FAKE'
+#!/usr/bin/env bash
+cat > /dev/null
+printf 'gh: failed to set secret ACCTEXAMPLE_TOKEN for account acctexample: HTTP 403\n' >&2
+exit 1
+FAKE
+  chmod +x "$tmp/wb-gh-fail"
+  : > "$wb_fail_out"
+  if (
+    export WORKER_ROOT="$wbroot" \
+           WORKER_CREDENTIAL_PATH="$wbroot/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot/baseline" \
+           WORKER_CREDENTIAL_FORMAT=claude-oauth-token \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_fail_out" WORKER_GH_BIN="$tmp/wb-gh-fail" WB_CAPTURE="$wbcap"
+    write_back
+  ) > "$tmp/wb-fail.log" 2>&1; then wbf_rc=0; else wbf_rc=$?; fi
+  chk "write_back FAILS closed (non-zero) when gh secret set fails" \
+    "$([[ "$wbf_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "write_back failure never leaks the account secret reference to the public log" \
+    "$(grep -c 'ACCTEXAMPLE_TOKEN\|acctexample' "$tmp/wb-fail.log" || true)" "0"
+  chk "write_back failure does NOT report rotated=true (fail closed)" \
+    "$(grep -c '^rotated=true$' "$wb_fail_out" || true)" "0"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
