@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3640,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e15ed37eda2ca16ada0d3785005c664cf3270872",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 1, 3, and 5 say the current pipeline's honest minimal claim is sequential modular composition, that `secure_equal` standalone-realizes `F_join`, and that the straight-line pipeline composes. The shown argument establishes only the distribution of one honest masked opening conditioned on an equality bit. It does not define adversarial views for sharing, multiplication, reconstruction, the all-pairs join, or the centralized dealer/driver, nor prove those real protocol views simulatable. The same document acknowledges that the crate is an in-process simulation with every party represented by one function call. A centralized simulator is not itself a standalone-secure distributed protocol, so the composition theorem's premises have not been established. This is especially material because the document calls the citation load-bearing for the whole pipeline.",
+    "file": "research/mpc-composition-uc-posture.md",
+    "fix_hint": "Recast the current conclusion as a design target/conditional theorem: if future distributed realizations of each stated functionality are proven standalone-secure under a precisely defined communication and corruption model, sequential composition applies. Limit the present `secure_equal` result to the masked-value distribution/leakage lemma, not realization of the whole `F_join`; alternatively add a complete protocol/view definition and simulator argument for every composed stage. Update the summary table and one-line posture consistently.",
+    "severity": "major",
+    "title": "Standalone composition is claimed without a protocol-level simulation argument"
+   },
+   {
+    "body": "The document repeatedly states that honest-majority protocols achieve UC security `without any setup assumption` and therefore import no CRS/PKI trust root. This is too absolute: UC feasibility depends on the exact network/functionality model, including authenticated/private channels and, for relevant thresholds/tasks, broadcast or an equivalent ideal communication resource. The current code has no network, authentication, broadcast, session identifiers, or concurrency model, so the cited result cannot justify the whole pipeline without spelling out those assumptions. Contrasting this with dishonest-majority setup requirements does not remove the honest-majority communication setup/model obligations.",
+    "file": "research/mpc-composition-uc-posture.md",
+    "fix_hint": "State the precise theorem/model being relied on and enumerate its communication ideal functionalities and corruption/scheduling assumptions. Replace `without any setup assumption`/`without importing a ... PKI trust root` with the narrower claim actually supported (for example, no CRS for the cryptographic computation given the specified authenticated communication model), and keep applicability to today's code explicitly aspirational.",
+    "severity": "major",
+    "title": "UC-without-setup claim omits required communication and authentication assumptions"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is careful about the unimplemented proof stage and the semi-honest boundary, but it still makes two load-bearing security claims more strongly than the implementation and stated model support. In particular, it promotes a simulation sketch for one masked equality opening into a standalone-security/composition conclusion for the implemented join/pipeline, even though the implementation is explicitly a centralized in-process simulation with no defined party views or distributed transcript. It also describes honest-majority UC as requiring no setup or trust root at all, without stating the authenticated-channel/broadcast and network-model assumptions needed by the cited feasibility results. These are honesty/soundness issues on an audit-gated MPC surface, not editorial nits.",
+  "verdict": "request_changes"
+ }
+}
