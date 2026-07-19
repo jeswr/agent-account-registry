@@ -432,12 +432,22 @@ def account_backoffs(records, now):
     return {acct: b for acct, b in state.items() if b["backoff_until"] > now}
 
 
-def classify_records(records, provider_accounts, now):
+def classify_records(records, provider_accounts, now, open_alerts=()):
     """The PURE decision core. Given the pruned record window and `provider_accounts`
     ({provider: set-of-enabled-salted-hashes}, the enabled fleet per provider), return a list of
     ACTIONS. Each action = {condition, provider, fire (bool), reason, reset_hint?}. `fire=True`
     means raise/refresh the alert; `fire=False` means recover/close an existing one. RECOVERY is a
     first success after failures within the window.
+
+    `open_alerts` is the set of (condition, provider) pairs whose alert issue is currently OPEN
+    (issue #205). Actions are keyed on records, but a provider whose records have all aged out of
+    the rolling window would otherwise produce NO action at all — so its open alert (and, most
+    acutely, the fleet zero-dispatch alert, whose empty-frontier ticks intentionally record
+    nothing) could stay open forever. For every open marker the record-driven pass did not already
+    cover — AND whose provider has no records left in the window at all — an explicit recovery
+    (fire=False) is emitted so `decide` can close it. Alerts for a provider still present in the
+    window are left to the per-condition logic above (closing on absent side-knowledge, e.g. a
+    momentarily-empty fleet map, would be a false recovery, not evidence of health).
 
     Conditions:
       provider-outage    : >=3 launch fails in 30 min from >= max(2, ceil(enabled-fleet/2))
@@ -562,11 +572,45 @@ def classify_records(records, provider_accounts, now):
                 "reset_hint": reset_hints[0] if reset_hints else None,
             })
 
+    # ---- orphaned open alerts (issue #205) -----------------------------------------------------
+    # An alert whose provider has DISAPPEARED from the rolling window gets no action above, so it
+    # would never be closed. Emit an explicit recovery for each open marker the record-driven pass
+    # did not cover whose provider is absent from the window — this is the union of "providers with
+    # records" and "providers with an open alert", so recovery no longer relies on the provider
+    # still being present. A provider still in the window is left to its per-condition logic.
+    emitted = {(a["condition"], a["provider"]) for a in actions}
+    for condition, provider in sorted(set(open_alerts)):
+        if (condition, provider) in emitted or provider in providers:
+            continue
+        actions.append({
+            "condition": condition,
+            "provider": provider,
+            "fire": False,
+            "reason": "no records remain in the window for this provider — the alert is stale "
+                      "and is being cleared",
+        })
+
     return actions
 
 
 def _marker(condition, provider):
     return f"<!-- {MARKER_PREFIX}:{condition}:{provider} -->"
+
+
+# The (condition, provider) pair carried by a hidden alert marker. condition/provider are keyword
+# tokens (no colon or whitespace), so the char classes stop cleanly before the ` -->` close.
+_MARKER_RE = re.compile(re.escape(MARKER_PREFIX) + r":([^\s:>]+):([^\s:>]+)")
+
+
+def parse_alert_markers(bodies):
+    """The set of (condition, provider) pairs found in the given issue bodies (issue #205). PURE
+    so it is unit-tested without gh: `decide` feeds the resulting set to classify_records so an
+    alert whose provider aged out of the window still earns an explicit recovery."""
+    markers = set()
+    for body in bodies:
+        if isinstance(body, str):
+            markers.update(_MARKER_RE.findall(body))
+    return markers
 
 
 def _alert_title(condition, provider):
@@ -927,30 +971,36 @@ def _registry_fallback():
             os.environ.get("REGISTRY_ALERT_TOKEN") or os.environ.get("GH_TOKEN") or "")
 
 
-def _deliver_alerts(actions, maintainer):
+def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     """Upsert every action on the primary route; on a failed FIRING action retry the salted alert
-    on the public registry with the ambient token (issue #175). Failed recoveries do NOT fall
-    back cross-repo — see the inline comment. Returns the actions still undelivered (empty == all
-    delivered) so the caller can exit nonzero — an unusable alert token must fail the run, never
-    silently drop the alert."""
+    on the public registry with the ambient token (issue #175). `fallback_open` is the set of
+    (condition, provider) markers currently OPEN on the fallback route: the firing retry can
+    CREATE an alert there, so a RECOVERY whose marker was seen on the fallback is delivered on
+    BOTH routes and counts as delivered only when each route it targets confirms (review #340).
+    Beyond that explicit binding, recoveries never fall back cross-repo — "no open issue" on a
+    repository whose marker was never seen is a no-op that cannot confirm a close (review round
+    2). Returns the actions still undelivered (empty == all delivered) so the caller can exit
+    nonzero — an unusable alert token must fail the run, never silently drop the alert."""
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
+    fb_distinct = (repo, token) != (fb_repo, fb_token) and bool(fb_token)
     undelivered = []
     for action in actions:
-        if _upsert_alert(action, repo, token, maintainer):
-            continue
-        # Primary failed. If FIRING on the private route (a distinct repo/token) and a usable
-        # ambient token exists, retry on the registry. Recovery (fire=false) never falls back:
-        # it targets the open marker on the PRIMARY route, and "no open issue" on a different
-        # repository is a no-op that cannot confirm that close — treating it as delivered would
-        # leave the primary alert open while the run stays green (review round 2). Never re-run
-        # the identical route (no value).
-        if action["fire"] and (repo, token) != (fb_repo, fb_token) and fb_token:
-            print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
-                  "delivery failed on the private route — retrying on the registry")
-            if _upsert_alert(action, fb_repo, fb_token, maintainer):
-                continue
-        undelivered.append(action)
+        delivered = _upsert_alert(action, repo, token, maintainer)
+        if action["fire"]:
+            # Primary failed while FIRING: retry on the registry with the ambient token. Never
+            # re-run the identical route (no value).
+            if not delivered and fb_distinct:
+                print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
+                      "delivery failed on the private route — retrying on the registry")
+                delivered = _upsert_alert(action, fb_repo, fb_token, maintainer)
+        elif fb_distinct and (action["condition"], action["provider"]) in fallback_open:
+            # The marker was SEEN open on the fallback repo (a prior firing retry created it):
+            # close it there too, and require BOTH routes to confirm — a steady no-op on the
+            # primary says nothing about the issue that lives on the fallback (review #340).
+            delivered = _upsert_alert(action, fb_repo, fb_token, maintainer) and delivered
+        if not delivered:
+            undelivered.append(action)
     return undelivered
 
 
@@ -988,6 +1038,30 @@ def _find_marker_issue(repo, token, marker, state):
                           "(possibly truncated)")
     return next((i["number"] for i in found if isinstance(i, dict)
                  and marker in (i.get("body") or "")), None)
+
+
+def _open_alert_markers(repo, token):
+    """Every (condition, provider) whose model-health alert issue is currently OPEN on `repo`
+    (issue #205), so `decide` can recover an alert whose provider has aged out of the window.
+    FAIL-OPEN: an unreadable/garbled/possibly-truncated list yields the EMPTY set — the orphan
+    recovery it feeds only ever CLOSES a stale alert, so a spurious open here would fabricate a
+    recovery. A read failure must therefore delay a recovery (retry next tick), never invent one;
+    a firing alert is unaffected because its own records still drive its action."""
+    proc = _gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", "open",
+                "--json", "body", "--limit", str(ALERT_LOOKUP_CAP)], token, capture=True)
+    if proc.returncode != 0:
+        print("::warning::model-health decide: cannot list open alerts for recovery "
+              "(will retry next tick)")
+        return set()
+    try:
+        found = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return set()
+    if not isinstance(found, list) or len(found) >= ALERT_LOOKUP_CAP:
+        # Non-list JSON is unreadable; a full window is possibly truncated. Fail open to empty
+        # (no fabricated recovery) rather than act on a partial view.
+        return set()
+    return parse_alert_markers(i.get("body") for i in found if isinstance(i, dict))
 
 
 def _upsert_alert(action, repo, token, maintainer):
@@ -1167,14 +1241,28 @@ def _cmd_decide(args):
         return 1
     provider_accounts = _enabled_provider_accounts(
         api, registry_repo, args.policy_file, salt)
-    actions = classify_records(records, provider_accounts, now)
+    # Currently-open alert markers on EVERY route this system may have delivered to (issues #205,
+    # review #340): the firing retry (issue #175) can create an alert on the FALLBACK route, so
+    # enumerating only the primary would leave that issue open forever once its provider ages out
+    # of the window. Feed the union to classify_records so such an alert still earns an explicit
+    # recovery, and pass the fallback's markers to _deliver_alerts so each recovery closes the
+    # marker on the repository it was found on (route binding — a no-op on the primary is never
+    # proof the fallback issue closed). Each enumeration stays fail-open-to-empty, so an
+    # unreadable/truncated list only defers a recovery to the next tick, never fabricates one.
+    alert_repo, alert_token = _alert_target()
+    open_alerts = _open_alert_markers(alert_repo, alert_token)
+    fb_repo, fb_token = _registry_fallback()
+    fallback_open = set()
+    if (fb_repo, fb_token) != (alert_repo, alert_token) and fb_token:
+        fallback_open = _open_alert_markers(fb_repo, fb_token)
+    actions = classify_records(records, provider_accounts, now, open_alerts | fallback_open)
     # Issue #70: annotate firing outage/transient actions with the provider's public status —
     # AFTER classification, so a probe result can reframe an alert but never decide one.
     annotate_provider_status(actions)
     # Deliver on the primary route, falling back to the salted public registry when a private
     # ALERT_TOKEN is present but unusable (issue #175). A steady no-alert condition with no open
     # issue is a confirmed no-op (never touched), so it never churns nor counts as undelivered.
-    undelivered = _deliver_alerts(actions, maintainer)
+    undelivered = _deliver_alerts(actions, maintainer, fallback_open)
     fired = [a["condition"] for a in actions if a["fire"]]
     print(f"model-health decide: {len(actions)} conditions checked, "
           f"{len(fired)} firing ({','.join(sorted(set(fired))) or 'none'})")
@@ -1396,6 +1484,56 @@ def _self_test():
     zd_abort = zd[:2] + [zrec("claim-abort", 200)]
     chk("zero-dispatch ACT (claim-abort completes the run)",
         fires(classify_records(zd_abort, {}, now + 300), "zero-dispatch", "fleet"), True)
+
+    # ---- ORPHANED OPEN ALERTS (issue #205): a provider that aged out of the window still closes --
+    def recovers(actions, condition, provider):
+        return any(a["condition"] == condition and a["provider"] == provider and not a["fire"]
+                   for a in actions)
+
+    # the acute case: the fleet zero-dispatch alert is open, but every fleet record has aged out of
+    # the window (empty-frontier ticks record nothing). With NO open-marker knowledge the old code
+    # emitted nothing, so the alert stayed open forever; feeding the open marker yields a recovery.
+    chk("orphan zero-dispatch alert with no fleet records is NOT recovered without marker knowledge",
+        any(a["provider"] == "fleet" for a in classify_records([], {}, now)), False)
+    chk("orphan zero-dispatch alert recovers when its marker is open but the fleet aged out",
+        recovers(classify_records([], {}, now, {("zero-dispatch", "fleet")}),
+                 "zero-dispatch", "fleet"), True)
+    # any provider/condition works, not just the fleet — an aged-out outage alert closes too
+    chk("orphan provider-outage alert recovers when the provider aged out",
+        recovers(classify_records([], {}, now, {("provider-outage", "anthropic")}),
+                 "provider-outage", "anthropic"), True)
+    # the recovery is a CLOSE, never a fresh fire
+    orphan = classify_records([], {}, now, {("zero-dispatch", "fleet")})
+    chk("orphan recovery never fires (close only)", any(a["fire"] for a in orphan), False)
+    # a provider STILL in the window is governed by its per-condition logic, not orphan recovery:
+    # a firing outage with an open marker stays firing (not force-closed)...
+    chk("open marker does NOT force-close a provider still firing in the window",
+        fires(classify_records(outage, {"anthropic": set()}, now + 200,
+                               {("provider-outage", "anthropic")}), "provider-outage", "anthropic"),
+        True)
+    # ...and an open provider-capped marker for a provider present in the window but with NO fleet
+    # map is left alone (closing on absent side-knowledge would be a false recovery, not health)
+    present_no_fleet = classify_records(
+        [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=0)], {}, now + 10,
+        {("provider-capped", "anthropic")})
+    chk("open capped marker for an in-window provider without a fleet map is left untouched",
+        any(a["condition"] == "provider-capped" for a in present_no_fleet), False)
+    # already-covered markers are not double-emitted (the record-driven action wins)
+    covered = classify_records(burst, {}, now + 200, {("persistent-transient", "anthropic")})
+    chk("an already-covered open marker is not double-emitted",
+        sum(1 for a in covered if a["condition"] == "persistent-transient"), 1)
+
+    # ---- marker parsing (pure) + fail-open enumeration --------------------------------------
+    body = (render_body({"condition": "zero-dispatch", "provider": "fleet",
+                         "fire": True, "reason": "r"}, "m"))
+    chk("parse_alert_markers recovers (condition, provider) from a rendered body",
+        parse_alert_markers([body]), {("zero-dispatch", "fleet")})
+    chk("parse_alert_markers reads every marker across bodies",
+        parse_alert_markers([_marker("provider-outage", "anthropic"),
+                             _marker("provider-capped", "openai"), "no marker here"]),
+        {("provider-outage", "anthropic"), ("provider-capped", "openai")})
+    chk("parse_alert_markers ignores non-string bodies", parse_alert_markers([None, 5, {}]), set())
+    ok = _test_open_markers(chk) and ok
 
     # ---- reactive backoff for probe-exempt providers (decision 2026-07-17, issue #29) --------
     ah = account_hash("codex01", salt)
@@ -1625,6 +1763,9 @@ def _self_test():
     # ---- #175: unusable private token retries the registry, else fails nonzero ---------------
     ok = _test_delivery(chk) and ok
 
+    # ---- review #340: an alert created on the fallback route is still recovered --------------
+    ok = _test_fallback_orphan(chk) and ok
+
     # ---- provider fleet resolution (account catalog -> salted provider map) ------------------
     chk("provider parsed from YAML body",
         _provider_of("harness: claude\nprovider: anthropic\nmodels: [fable]"), "anthropic")
@@ -1846,6 +1987,44 @@ def _test_lookup_pagination(chk):
     return True
 
 
+def _test_open_markers(chk):
+    """_open_alert_markers extracts every open (condition, provider) pair and FAILS OPEN to the
+    empty set on any unreadable/garbled/possibly-truncated list (issue #205) — the orphan recovery
+    it feeds only closes stale alerts, so a fabricated 'open' here would invent a recovery, while a
+    missed read merely defers one to the next tick."""
+    import types
+    global _gh
+    real_gh = _gh
+
+    def fake_gh(returncode=0, stdout=None, issues=None):
+        payload = stdout if stdout is not None else json.dumps(issues or [])
+
+        def run(args, token, capture=False):
+            return types.SimpleNamespace(returncode=returncode, stdout=payload, stderr="")
+        return run
+
+    try:
+        _gh = fake_gh(issues=[{"body": _marker("zero-dispatch", "fleet")},
+                              {"body": _marker("provider-outage", "anthropic")},
+                              {"body": "unrelated issue, no marker"}])
+        chk("open markers enumerated from the tracker",
+            _open_alert_markers("o/r", "t"),
+            {("zero-dispatch", "fleet"), ("provider-outage", "anthropic")})
+        _gh = fake_gh(returncode=1)
+        chk("a failed list fails open to empty (no fabricated recovery)",
+            _open_alert_markers("o/r", "t"), set())
+        _gh = fake_gh(stdout="{not json")
+        chk("garbled list JSON fails open to empty", _open_alert_markers("o/r", "t"), set())
+        _gh = fake_gh(stdout="{}")
+        chk("non-list list JSON fails open to empty", _open_alert_markers("o/r", "t"), set())
+        _gh = fake_gh(issues=[{"body": _marker("zero-dispatch", "fleet")}] * ALERT_LOOKUP_CAP)
+        chk("a full (possibly truncated) window fails open to empty",
+            _open_alert_markers("o/r", "t"), set())
+    finally:
+        _gh = real_gh
+    return True
+
+
 def _test_record_exit(chk):
     """_cmd_record exits NONZERO when the CAS write is exhausted (review defect #8) — the record
     call sites are separate always()-guarded jobs, so the failure is visible, never silent."""
@@ -1994,7 +2173,7 @@ def _test_delivery(chk):
             # force a single firing action regardless of records
             global classify_records
             real_classify = classify_records
-            classify_records = lambda records, fleet, now: [dict(fire)]
+            classify_records = lambda records, fleet, now, open_alerts=(): [dict(fire)]
             _gh, calls[:] = fake_gh({"priv", "amb"}), []
             chk("decide exits NONZERO when no route can deliver the alert (#175)",
                 _cmd_decide(_ap.Namespace(policy_file="policy/repos.toml")), 1)
@@ -2040,6 +2219,99 @@ def _test_delivery(chk):
             any(r == "jeswr/agent-account-registry" for (_, _, _, r) in calls), False)
     finally:
         _gh = real_gh
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_fallback_orphan(chk):
+    """Review #340: an alert CREATED ON THE FALLBACK ROUTE (by the #175 firing retry) must still
+    be recovered. End-to-end against a stateful two-repo gh fake: primary firing delivery fails,
+    the fallback create succeeds, the records age out, and the next decide closes the fallback
+    issue — with the red direction proving a failed fallback close is NOT confirmed by the
+    primary's steady no-op (pre-fix, decide exited 0 and the issue stayed open forever)."""
+    import argparse as _ap
+    import types
+    global _gh, GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
+    real_gh = _gh
+    real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger)
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN", "GH_TOKEN")}
+    priv_repo, reg_repo = "jeswr/agent-account-data", "jeswr/agent-account-registry"
+    repos = {priv_repo: {}, reg_repo: {}}
+    seq = {"n": 100}
+    bad_tokens = {"priv"}          # phase 1: the private token is unusable
+    fail_close = {"on": False}
+
+    def state_gh(args, token, capture=False):
+        repo = args[args.index("-R") + 1] if "-R" in args else None
+        if args[0] == "label":
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if token in bad_tokens:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        verb, issues = args[1], repos[repo]
+        if verb == "list":
+            state = args[args.index("--state") + 1]
+            out = [{"number": n, "body": i["body"]}
+                   for n, i in sorted(issues.items()) if i["state"] == state]
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
+        if verb == "create":
+            seq["n"] += 1
+            issues[seq["n"]] = {"body": args[args.index("--body") + 1], "state": "open"}
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        num = int(args[2])
+        if verb == "close":
+            if fail_close["on"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            issues[num]["state"] = "closed"
+        elif verb == "edit":
+            issues[num]["body"] = args[args.index("--body") + 1]
+        elif verb == "reopen":
+            issues[num]["state"] = "open"
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def reg_states():
+        return [i["state"] for _, i in sorted(repos[reg_repo].items())]
+
+    fire = {"condition": "provider-outage", "provider": "anthropic", "fire": True, "reason": "r"}
+    try:
+        os.environ.update(REGISTRY_REPO=reg_repo, ALERT_REPO=priv_repo, ALERT_TOKEN="priv",
+                          REGISTRY_ALERT_TOKEN="amb")
+        os.environ.pop("GH_TOKEN", None)
+        _gh = state_gh
+
+        # phase 1: primary firing delivery fails -> the alert is CREATED on the fallback.
+        chk("fallback-orphan: firing delivered via the fallback create",
+            _deliver_alerts([fire], "m"), [])
+        chk("fallback-orphan: the issue lives on the registry, none on the private route",
+            (reg_states(), repos[priv_repo]), (["open"], {}))
+
+        # phase 2: the private token works again and the records have aged out. decide must
+        # enumerate the fallback marker, emit the orphan recovery, and close it THERE.
+        bad_tokens.clear()
+        GitHubAPI = lambda token: object()
+        read_ledger = lambda api, repo: ([], None)
+        prune = lambda records, now: []
+        _enabled_provider_accounts = lambda api, repo, policy, salt: {}
+        annotate_provider_status = lambda actions, **kw: None
+        ns = _ap.Namespace(policy_file="policy/repos.toml")
+
+        # red direction first: the fallback close FAILS -> the primary's steady no-op must not
+        # count as delivery (pre-fix, decide exited 0 here with the issue still open).
+        fail_close["on"] = True
+        chk("fallback-orphan: failed fallback close -> decide exits NONZERO, issue still open",
+            (_cmd_decide(ns), reg_states()), (1, ["open"]))
+
+        fail_close["on"] = False
+        chk("fallback-orphan: next decide closes the fallback issue and exits 0",
+            (_cmd_decide(ns), reg_states()), (0, ["closed"]))
+    finally:
+        _gh = real_gh
+        (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
+         prune, read_ledger) = real
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -2336,8 +2608,9 @@ def _test_decide_annotation(chk):
     this red): a firing persistent-transient action reaches the alert upsert already carrying
     provider-status, with the network probe and gh upsert both stubbed out."""
     import argparse as _ap
-    global GitHubAPI, probe_provider_status, _upsert_alert
+    global GitHubAPI, probe_provider_status, _upsert_alert, _open_alert_markers
     real_api, real_probe, real_upsert = GitHubAPI, probe_provider_status, _upsert_alert
+    real_markers = _open_alert_markers
     saved = {k: os.environ.get(k) for k in
              ("REGISTRY_REPO", "GH_TOKEN", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN")}
     now, salt, seen = int(time.time()), "s3cret", []
@@ -2350,6 +2623,7 @@ def _test_decide_annotation(chk):
         stub = _StubAPI(seed=burst)
         GitHubAPI = lambda token: stub
         probe_provider_status = lambda provider, fetch=None: (STATUS_OPERATIONAL, "none")
+        _open_alert_markers = lambda repo, token: set()  # hermetic: no real gh subprocess
         # returns True: the new delivery contract (issue #175) treats a confirmed upsert as True.
         _upsert_alert = lambda action, repo, token, maintainer: seen.append(action) or True
         rc = _cmd_decide(_ap.Namespace(policy_file="/nonexistent/repos.toml"))
@@ -2360,6 +2634,7 @@ def _test_decide_annotation(chk):
             (fired or [{}])[0].get("provider_status"), STATUS_OPERATIONAL)
     finally:
         GitHubAPI, probe_provider_status, _upsert_alert = real_api, real_probe, real_upsert
+        _open_alert_markers = real_markers
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
