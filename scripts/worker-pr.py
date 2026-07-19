@@ -94,6 +94,7 @@ DEFAULT_TRUST_SURFACE_PATHS = (
     "scripts/ready-issues.py",
     "scripts/dispatch-plan.py",
     "scripts/triage.py",
+    "scripts/retriage.py",
     "scripts/broker-refresh.py",
     "scripts/account-usage.py",
     ".github/workflows/",
