@@ -8,8 +8,10 @@
 # material and is overwritten weekly). Post-#101 both probes target the ENVIRONMENT: the
 # pipeline's real writes are env-scope, and a weekly repo-scope canary write would re-trip the
 # dispatch secrets-guard (repo scope must stay empty). Upserts ONE rolling `from:agent` alert issue on
-# invalid/insufficient-scope/near-expiry; network-unknown never alerts and never closes an
-# existing alert (no false alarms, no false recoveries). The token is never printed.
+# invalid/insufficient-scope/near-expiry; a single network-unknown never touches that credential
+# alert (no false alarms, no false recoveries). But CONSECUTIVE network-unknowns are tracked in a
+# SEPARATE rolling issue and page after a small threshold (issue #207) so a permanently-stalled
+# probe cannot stay green-and-silent — without ever reclassifying the PAT. The token is never printed.
 name: pat-validity
 on:
   schedule:
