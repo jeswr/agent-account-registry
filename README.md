@@ -329,9 +329,12 @@ fine-grained PAT with repository **Secrets: read + Environments: read/write** on
 repo — least privilege; the broker only lists/reads repo-scope secrets and writes environment
 secrets — stored in the `dispatch-secrets` environment: the broker job is env-bound to resolve
 it, and it stores captured tokens into that same environment). The broker **fails closed before
-any login**: its preflight proves the PAT can actually store a credential (a non-mutating
-repo-secret listing plus an authoritative environment canary write) and, if the PAT is missing
-or under-scoped, exits **without ever surfacing a sign-in URL** — remediation (the exact mint
-grants and the storage command
+any login**: its preflight proves the PAT can actually store a credential by invoking the same
+authoritative `pat-validity` probe the weekly cron uses (`GET /user` + `dispatch-secrets`
+public-key read + repo-secret listing + an authoritative environment canary write) and requiring a
+valid *write* verdict — so a revoked, expired, read-only, or wrong-repository PAT that passes a mere
+nonempty check is caught here, not after a credential is already captured. If the PAT is missing,
+invalid, or under-scoped, the broker exits **without ever surfacing a sign-in URL** — remediation
+(the exact mint grants and the storage command
 `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`)
 is posted on the issue, so a credential is never captured that cannot be stored.
