@@ -11,16 +11,6 @@
    "expires_at": 1784500867
   },
   {
-   "account": "acct01",
-   "claim_id": "174632a0eab34a7592038e6e7ada0091",
-   "holder": "jeswr/agent-account-registry#414@29703828417.1",
-   "package": "workflows",
-   "role": "ci",
-   "model": "sol",
-   "issued_at": 1784495338,
-   "expires_at": 1784498038
-  },
-  {
    "account": "acct4css",
    "claim_id": "6183b68147174e7ba178109639751cc9",
    "holder": "jeswr/agent-account-registry#165@dispatch-29703449693.1",
