@@ -31,14 +31,17 @@ jobs:
       - name: Verify retriage planner
         run: python3 scripts/retriage.py --self-test
 
-      - name: Sweep at most 40 untriaged issues
+      - name: Sweep at most 40 untriaged or deferred issues
         run: |
           set -euo pipefail
           tmp="$RUNNER_TEMP/retriage"
           mkdir -p "$tmp"
-          gh issue list -R "$REPO" --state open --label status:untriaged --limit 40 \
+          gh issue list -R "$REPO" --state open --label status:untriaged --limit 1000 \
             --json number,author,body,labels,updatedAt > "$tmp/untriaged.json"
-          jq -c 'sort_by(.updatedAt) | .[]' "$tmp/untriaged.json" > "$tmp/issues.jsonl"
+          gh issue list -R "$REPO" --state open --label status:deferred --limit 1000 \
+            --json number,author,body,labels,updatedAt > "$tmp/deferred.json"
+          jq -cs 'add | unique_by(.number) | sort_by(.updatedAt) | .[0:40][]' \
+            "$tmp/untriaged.json" "$tmp/deferred.json" > "$tmp/issues.jsonl"
 
           while IFS= read -r issue; do
             number=$(jq -r .number <<<"$issue")
