@@ -36,9 +36,19 @@ import tomllib
 # (`snapshot_skips`) so one oversized PR's check-run listing defers THAT PR instead of
 # killing the whole sweep. CLAIM only COUNTS these into the dispatch-summary histogram —
 # a hostile plan can at worst inflate accounting noise, never trigger an act.
-SCHEMA = "registry-dispatch-plan/v4"
+# v4 -> v5 (issue #104): the plan carries `provenance_orphans` — every worker-SHAPED PR
+# (open, same-repo worker head, [bot] author) whose provenance is INADMISSIBLE
+# (provenance_admission_error != None) and that is NOT already human-parked. Such a PR is
+# invisible to enumerate_review_items (it fail-closed `continue`s) yet still RESERVES its
+# crate through busy_packages_of_pulls, so left implicit it received neither review nor
+# replacement work AND emitted no plan row or defer reason — a fleet of provenance-write
+# failures then read as empty, apparently-healthy ticks (the CAS-stranding failure class).
+# CLAIM only COUNTS these as outstanding work + raises the rolling health alert; the record
+# is inert accounting (repo/pr/head/reason), never an act — reconciliation is
+# scripts/backfill-provenance.py re-recording the missing provenance.
+SCHEMA = "registry-dispatch-plan/v5"
 PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items", "disarm_items",
-               "snapshot_skips"}
+               "snapshot_skips", "provenance_orphans"}
 REPOSITORY_FIELDS = {"target_repo", "target_sha", "items"}
 ITEM_FIELDS = {
     "number",
@@ -65,6 +75,13 @@ REVIEW_ITEM_FIELDS = {
 }
 DISARM_ITEM_FIELDS = {"pr_number", "head_sha", "reviewed_sha", "repo"}
 SNAPSHOT_SKIP_FIELDS = {"repo", "pr_number", "reason"}
+# Provenance-orphan rows (issue #104): a worker-shaped PR with inadmissible provenance that is
+# not human-parked. `reason` is ALWAYS one of provenance_admission_error's own static return
+# strings (none interpolate record content), so it is registry-chosen and injection-free; the
+# validator bounds it as a single-line string as defence in depth. `head_sha` is the 40-hex head
+# or the "unknown" sentinel (a garbage-sha snapshot must still be counted, not dropped).
+PROVENANCE_ORPHAN_FIELDS = {"repo", "pr_number", "head_sha", "reason"}
+PROVENANCE_ORPHAN_REASON_MAX = 200
 # The reasons plan-snapshot.py may record for a per-item skip of a worker PR's CI/merge
 # snapshot (pr_number 0 = the repo-level worker-PR census overflow). Two tiers (PR #60
 # round-1 review): a PRE-detail skip (pr-detail-*/census) has NO pr_status record, so
@@ -200,6 +217,7 @@ def normalize_plan_order(document):
     fixture-local sort kept the test green). Returns the document for chaining."""
     document["review_items"].sort(key=lambda item: (item["repo"], item["pr_number"]))
     document["disarm_items"].sort(key=lambda item: (item["repo"], item["pr_number"]))
+    document["provenance_orphans"].sort(key=lambda item: (item["repo"], item["pr_number"]))
     return document
 
 
@@ -363,6 +381,38 @@ def validate_plan(document):
         if prior_skip is not None and skip_key < prior_skip:
             raise DispatchError("plan snapshot skips are not in deterministic order")
         prior_skip = skip_key
+    provenance_orphans = document["provenance_orphans"]
+    if not isinstance(provenance_orphans, list):
+        raise DispatchError("plan provenance_orphans must be a list")
+    prior_orphan = None
+    seen_orphans = set()
+    for orphan_index, item in enumerate(provenance_orphans, 1):
+        where = f"provenance orphan #{orphan_index}"
+        _require_exact_fields(item, PROVENANCE_ORPHAN_FIELDS, where)
+        number = item["pr_number"]
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            raise DispatchError(f"{where} pr_number must be a positive integer")
+        head_sha = item["head_sha"]
+        if not isinstance(head_sha, str) or not (head_sha == "unknown"
+                                                 or SAFE_SHA.fullmatch(head_sha)):
+            raise DispatchError(f"{where} head_sha is malformed")
+        reason = item["reason"]
+        # The reason is registry-chosen (a provenance_admission_error return string); bound it
+        # as a single-line, non-empty string — never trust a length/newline into the summary.
+        if (not isinstance(reason, str) or not reason
+                or len(reason) > PROVENANCE_ORPHAN_REASON_MAX
+                or "\n" in reason or "\r" in reason):
+            raise DispatchError(f"{where} reason is malformed")
+        repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
+        if repo not in seen_repositories:
+            raise DispatchError(f"{where} repo is not a planned repository")
+        orphan_key = (repo, number)
+        if orphan_key in seen_orphans:
+            raise DispatchError(f"plan repeats provenance orphan {repo}#{number}")
+        seen_orphans.add(orphan_key)
+        if prior_orphan is not None and orphan_key < prior_orphan:
+            raise DispatchError("plan provenance orphans are not in deterministic order")
+        prior_orphan = orphan_key
     return document
 
 
@@ -1196,6 +1246,121 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
     return items
 
 
+def enumerate_provenance_orphans(repo, pulls, provenance, bot_login=""):
+    """PURE provenance-orphan enumerator (issue #104; PLAN step, unit-tested by --self-test).
+
+    A worker-SHAPED PR — open, same-repo worker head branch, [bot] author (the App bot when
+    `bot_login` is known) — whose provenance record is INADMISSIBLE
+    (provenance_admission_error != None: missing, unreadable-so-absent, or malformed) is
+    fail-closed INVISIBLE to enumerate_review_items (it `continue`s at the same predicate) yet
+    still RESERVES its package through busy_packages_of_pulls (fail-closed GLOBAL). Left
+    implicit it therefore receives neither review nor replacement work AND — the actual defect —
+    creates NO plan row and NO defer reason, so a fleet of provenance-write failures reads as
+    empty, apparently-healthy ticks (the historical CAS-stranding failure class). This emits an
+    EXPLICIT, validated row per such PR so CLAIM counts it as outstanding work and raises the
+    rolling health alert; reconciliation is scripts/backfill-provenance.py re-recording the
+    missing provenance (or a human decision when the worker run cannot be located).
+
+    Worker-shape gate identical to enumerate_review_items (open / HEAD_REF_RE / head.repo ==
+    repo / [bot] author) so the two partitions cannot drift: a PR is an orphan here EXACTLY
+    when it is worker-shaped and enumerate_review_items skips it for inadmissible provenance.
+
+    EXCLUDES a PR already carrying a HUMAN_HOLD_PR_LABELS marker: groom's stale-path orphan
+    hand-off parks a lingering no-provenance draft with needs:user (and pings a maintainer), so
+    re-alerting on those would be duplicate noise. The residual window this closes is exactly
+    the orphan NOT yet in human hands — a fresh provenance-write failure before groom's age
+    threshold, and any NON-draft no-provenance PR (groom's park is draft-only) that would
+    otherwise reserve its crate silently forever."""
+    orphans = []
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            raise DispatchError("provenance-orphan enumeration met a malformed pull request")
+        number = pull.get("number")
+        head = pull.get("head") or {}
+        ref = str(head.get("ref", ""))
+        head_repo = (head.get("repo") or {}).get("full_name")
+        login = str((pull.get("user") or {}).get("login", ""))
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        if pull.get("state") != "open":
+            continue
+        if not HEAD_REF_RE.match(ref):
+            continue
+        if head_repo != repo:
+            continue                      # fork head — cannot land in a target crate; not ours
+        if not login.endswith("[bot]") or (bot_login and login != bot_login):
+            continue
+        record = provenance.get(number) if isinstance(provenance, dict) else None
+        reason = provenance_admission_error(record, number)
+        if reason is None:
+            continue                      # admissible provenance — the review loop owns it
+        labels = {
+            label.get("name") if isinstance(label, dict) else label
+            for label in (pull.get("labels") or [])
+            if isinstance(label, (dict, str))
+        } - {None}
+        if HUMAN_HOLD_PR_LABELS & labels:
+            continue                      # groom's orphan hand-off already parked it for a human
+        sha = str(head.get("sha", ""))
+        orphans.append({
+            "repo": repo,
+            "pr_number": number,
+            "head_sha": sha if SAFE_SHA.fullmatch(sha) else "unknown",
+            "reason": reason,
+        })
+    orphans.sort(key=lambda item: (item["repo"], item["pr_number"]))
+    return orphans
+
+
+def check_plan_bot_pin(minted_bot_login, plan_bot_login):
+    """Fail LOUD when PLAN's worker-bot pin diverges from the MINTED App identity (#297 r1).
+
+    PLAN is the secret-free dispatcher half and runs BEFORE the CLAIM-side App-token mint, so
+    it pins enumerate_provenance_orphans to the maintainer-set REGISTRY_APP_BOT_LOGIN
+    repository variable instead of the minted slug. CLAIM is the first place both identities
+    coexist: a stale variable mis-pins the enumerator in the SILENT-HEALTHY direction (the
+    fleet's own PRs excluded from the orphan rows — the exact #104 invisible-orphan defect
+    back again), so divergence — or a missing pin while the minted identity is known — must
+    die here, before the orphan rows are counted as outstanding work. An EMPTY minted login
+    (every mint failed) skips the check: there is no authoritative identity to compare, and
+    those owners' mutation paths already defer."""
+    if not minted_bot_login:
+        return
+    if not plan_bot_login:
+        raise DispatchError(
+            "PLAN carried no worker-bot identity pin while the minted App identity is known "
+            "— the dispatch.yml plan/claim PLAN_BOT_LOGIN wiring has regressed")
+    if plan_bot_login != minted_bot_login:
+        raise DispatchError(
+            f"PLAN worker-bot pin {plan_bot_login!r} diverges from the minted App identity "
+            f"{minted_bot_login!r} — fix the REGISTRY_APP_BOT_LOGIN repository variable; "
+            "refusing to trust this plan's provenance-orphan rows")
+
+
+def plan_orphan_pin_wiring_gaps(workflow_text):
+    """Pure: name the MISSING facets of dispatch.yml's PLAN-side orphan bot pin (#297 r1).
+
+    Empty list == fully wired. The self-test asserts this over the LIVE workflow file so the
+    PRODUCTION PLAN invocation — not only a manual helper call — is proven pinned: (a) every
+    enumerate_provenance_orphans call site passes an explicit bot_login=, (b) PLAN_BOT_LOGIN
+    is wired from vars.REGISTRY_APP_BOT_LOGIN with the IDENTICAL expression in at least two
+    places (the PLAN pin and the CLAIM cross-check must read the same source, or the
+    check_plan_bot_pin comparison is vacuous), and (c) CLAIM forwards --plan-bot-login so the
+    cross-check actually runs. Absence of any facet — including no call site at all — is a
+    gap (fail closed)."""
+    gaps = []
+    calls = re.findall(r"enumerate_provenance_orphans\(([^)]*)\)", workflow_text)
+    if not calls or any("bot_login=" not in call for call in calls):
+        gaps.append("orphan-call-bot-login")
+    pins = re.findall(r"^\s*PLAN_BOT_LOGIN:\s*(\S.*?)\s*$", workflow_text, flags=re.M)
+    if (len(pins) < 2 or len(set(pins)) != 1
+            or "vars.REGISTRY_APP_BOT_LOGIN" not in pins[0]):
+        gaps.append("plan-bot-login-env")
+    if "--plan-bot-login" not in workflow_text:
+        gaps.append("claim-plan-bot-login-flag")
+    return gaps
+
+
 def filter_deferred_items(items, repo, leases, now):
     """Drop deferred-retry items that still have a LIVE lease (a worker is already on them)."""
     live_keys = _live_holder_keys(leases, now)
@@ -1980,7 +2145,7 @@ def _load_usage():
 
 
 def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
-             registry_root=".", bot_login="", ledger_root=""):
+             registry_root=".", bot_login="", ledger_root="", plan_bot_login=""):
     policy_module = _load_module("registry_policy_resolve", script_dir / "policy-resolve.py")
     allocator = _load_module("registry_select_and_claim", script_dir / "select-and-claim.py")
     worker_pr = _load_module("registry_worker_pr", script_dir / "worker-pr.py")
@@ -2001,6 +2166,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         raise DispatchError("PLAN target manifest does not exactly match enabled registry policy")
     if not workflow_ref or "\n" in workflow_ref or "\r" in workflow_ref:
         raise DispatchError("worker workflow ref is missing or unsafe")
+    # PLAN bot-pin cross-check (#297 r1): dies BEFORE the orphan rows below are counted as
+    # outstanding work — a drifted REGISTRY_APP_BOT_LOGIN variable must never silently
+    # mis-pin the orphan enumeration (see check_plan_bot_pin).
+    check_plan_bot_pin(bot_login, plan_bot_login)
 
     dispatched = 0
     # Zero-dispatch visibility (registry #28/#32): count the ready items the PLAN carried and, per
@@ -2010,6 +2179,15 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     planned = sum(len(repository["items"]) + len(
         [e for e in plan["review_items"] if e["repo"] == repository["target_repo"]])
         for repository in plan["repositories"])
+    # Provenance orphans (issue #104) are OUTSTANDING work: a worker-shaped PR with inadmissible
+    # provenance reserves its crate through busy-area logic but is invisible to review and gets
+    # no replacement work. Counting them into `planned` (and the defer histogram + a per-PR
+    # ::warning:: below) is what stops a fleet of provenance-write failures from reading as an
+    # empty, apparently-healthy tick: when orphans are the only outstanding work, the tick now
+    # records zero-dispatch (planned>0, launched 0) and the rolling fleet health alert fires. The
+    # record is inert accounting — never an act; reconciliation is scripts/backfill-provenance.py.
+    orphans = plan["provenance_orphans"]
+    planned += len(orphans)
     # Per-item snapshot degradation (run 29617040167): PLAN skipped these PRs' CI/merge
     # snapshot (oversized check-run listing, failed detail read, census overflow) instead of
     # failing the sweep. Their snapshot-derived admissions already stood down at PLAN time
@@ -2019,6 +2197,11 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     for skip in plan["snapshot_skips"]:
         print(f"snapshot skip {skip['repo']}#{skip['pr_number']}: {skip['reason']} "
               "(snapshot-derived PR admissions stood down this tick)")
+    for orphan in orphans:
+        defer_reasons["provenance-orphan"] += 1
+        print(f"::warning::provenance orphan {orphan['repo']}#{orphan['pr_number']}: "
+              f"{orphan['reason']} — worker-shaped PR reserves its crate but is fail-closed "
+              "invisible to review; re-record via scripts/backfill-provenance.py")
     # EARLY summary write (review defect #6): persist the plan-derived planned count BEFORE any
     # claim-side work, so a mid-claim abort (API/validation/setup failure) still leaves a
     # planned>0/launched-0 summary for the workflow's always()-guarded tick recorder — instead of
@@ -2379,6 +2562,17 @@ def _self_test():
             "pr_number": 48,
             "reason": "check-runs-overflow",
         }],
+        "provenance_orphans": [{
+            "repo": "example/repo",
+            "pr_number": 50,
+            "head_sha": "a" * 40,
+            "reason": "provenance record is not a JSON object",
+        }, {
+            "repo": "example/repo",
+            "pr_number": 51,
+            "head_sha": "unknown",
+            "reason": "provenance head sha is malformed",
+        }],
     }
     assert validate_plan(fixture) is fixture
     # MIXED-REPO regression (2026-07-18 outage): the assembler must emit GLOBAL
@@ -2399,6 +2593,9 @@ def _self_test():
     di = json.loads(json.dumps(mixed["disarm_items"][0]))
     di["repo"] = "aaa/first-lexically"
     mixed["disarm_items"] = mixed["disarm_items"] + [di]
+    po = json.loads(json.dumps(mixed["provenance_orphans"][0]))
+    po["repo"] = "aaa/first-lexically"
+    mixed["provenance_orphans"] = mixed["provenance_orphans"] + [po]
     try:
         validate_plan(mixed)
         raise AssertionError("unsorted mixed-repo plan must be rejected")
@@ -2408,10 +2605,15 @@ def _self_test():
     validate_plan(normalize_plan_order(mixed))
     assert mixed["review_items"][0]["repo"] == "aaa/first-lexically"
     assert mixed["disarm_items"][0]["repo"] == "aaa/first-lexically"
+    assert mixed["provenance_orphans"][0]["repo"] == "aaa/first-lexically"
     # A skip-free plan is the common case and must validate too.
     empty_skips = json.loads(json.dumps(fixture))
     empty_skips["snapshot_skips"] = []
     validate_plan(empty_skips)
+    # An orphan-free plan (issue #104) is the healthy common case and must validate too.
+    empty_orphans = json.loads(json.dumps(fixture))
+    empty_orphans["provenance_orphans"] = []
+    validate_plan(empty_orphans)
     # The dispatch summary records the skips (run 29617040167): the fold is what dispatch()
     # seeds defer_reasons with, and the summary file carries it for the tick recorder.
     folded = snapshot_skip_reasons(fixture["snapshot_skips"])
@@ -2568,6 +2770,24 @@ def _self_test():
             (lambda d: d["snapshot_skips"].append(dict(d["snapshot_skips"][1])),
              "duplicate snapshot skip"),
             (lambda d: d["snapshot_skips"].reverse(), "unsorted snapshot skips"),
+            (lambda d: d.update(schema="registry-dispatch-plan/v4"),
+             "pre-provenance-orphans schema version"),
+            (lambda d: d.pop("provenance_orphans"), "missing provenance_orphans"),
+            (lambda d: d["provenance_orphans"][0].update(unknown=True),
+             "unknown provenance orphan field"),
+            (lambda d: d["provenance_orphans"][0].pop("reason"), "missing orphan reason"),
+            (lambda d: d["provenance_orphans"][0].update(reason=""), "empty orphan reason"),
+            (lambda d: d["provenance_orphans"][0].update(reason="x" * 201),
+             "oversized orphan reason"),
+            (lambda d: d["provenance_orphans"][0].update(reason="a\nb"),
+             "multiline orphan reason"),
+            (lambda d: d["provenance_orphans"][0].update(head_sha="zz"), "bad orphan head sha"),
+            (lambda d: d["provenance_orphans"][0].update(pr_number=0), "non-positive orphan pr"),
+            (lambda d: d["provenance_orphans"][0].update(repo="not/planned"),
+             "unplanned orphan repo"),
+            (lambda d: d["provenance_orphans"].append(dict(d["provenance_orphans"][0])),
+             "duplicate provenance orphan"),
+            (lambda d: d["provenance_orphans"].reverse(), "unsorted provenance orphans"),
     ):
         malformed = json.loads(json.dumps(fixture))
         mutate(malformed)
@@ -2615,6 +2835,102 @@ def _self_test():
     assert [item["pr_number"] for item in items] == [41], items
     assert items[0]["state"] == "needs-review" and items[0]["impl_provider"] == "anthropic"
     assert items[0]["package"] == "crate-a" and items[0]["security"] is False
+
+    # ---- provenance orphans (issue #104): a worker-shaped PR with INADMISSIBLE provenance is
+    # invisible to enumerate_review_items (it fail-closed skips) yet reserves its crate via
+    # busy-area logic — enumerate it EXPLICITLY so CLAIM counts it and raises the rolling alert. ----
+    orphan_pulls = [
+        pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"]),     # admissible -> NOT
+        pull(91, "sparq-agent/issue-3-9-1", sha_b, login="other[bot]"),          # no record -> ORPHAN
+        pull(92, "sparq-agent/issue-4-9-1", "zz", login="other[bot]"),           # no record + junk sha
+        pull(93, "sparq-agent/issue-5-9-1", sha_b, login="other[bot]",
+             labels=["needs:user"]),                                              # groom-parked -> excl
+        pull(90, "sparq-agent/issue-1-x-1", sha_b, head_repo="mallory/fork",
+             login="mallory[bot]"),                                               # fork head -> excl
+        pull(94, "not-a-worker-branch", sha_b, login="other[bot]"),              # non-worker ref -> excl
+        pull(95, "sparq-agent/issue-6-9-1", sha_b, login="human"),               # non-bot author -> excl
+        pull(42, "sparq-agent/issue-9-2-1", sha_b, labels=["review:needs"]),     # admissible -> NOT
+    ]
+    orphans = enumerate_provenance_orphans(repo, orphan_pulls, provenance)
+    assert [o["pr_number"] for o in orphans] == [91, 92], orphans
+    assert orphans[0]["head_sha"] == sha_b and orphans[0]["repo"] == repo
+    assert orphans[0]["reason"] == "provenance record is not a JSON object", orphans[0]
+    # a garbage head sha is still COUNTED (never silently dropped) with the "unknown" sentinel
+    assert orphans[1]["head_sha"] == "unknown", orphans[1]
+    # a MALFORMED (present-but-invalid) record is an orphan too — not only a missing one
+    bad_prov = {**provenance, 96: {"pr_number": 96, "impl_provider": "anthropic"}}
+    bad_pull = pull(96, "sparq-agent/issue-7-9-1", sha_a, login="other[bot]")
+    bad_orphans = enumerate_provenance_orphans(repo, [bad_pull], bad_prov)
+    assert [o["pr_number"] for o in bad_orphans] == [96], bad_orphans
+    # bot_login pin: with the App bot login known, a DIFFERENT [bot] is not ours -> not an orphan
+    assert enumerate_provenance_orphans(repo, [bad_pull], bad_prov, bot_login=bot) == []
+    # ... while the fleet's OWN no-provenance PR stays an orphan under the same pin (the pin
+    # narrows the author gate, it must never blind the enumerator — #297 r1)
+    own_orphan = pull(99, "sparq-agent/issue-8-9-1", sha_b)
+    assert [o["pr_number"] for o in enumerate_provenance_orphans(
+        repo, [bad_pull, own_orphan], bad_prov, bot_login=bot)] == [99]
+    # a CLOSED worker PR never reserves a crate -> never an orphan
+    closed = pull(97, "sparq-agent/issue-7-9-1", sha_b, login="other[bot]", state="closed")
+    assert enumerate_provenance_orphans(repo, [closed], provenance) == []
+    # both HUMAN_HOLD markers are excluded (review:needs-user park is human-owned too)
+    parked2 = pull(98, "sparq-agent/issue-7-9-1", sha_b, login="other[bot]",
+                   labels=["review:needs-user"])
+    assert enumerate_provenance_orphans(repo, [parked2], provenance) == []
+    # a malformed pull fails loud (mirrors enumerate_review_items's data-integrity posture)
+    try:
+        enumerate_provenance_orphans(repo, ["not-a-dict"], provenance)
+        raise AssertionError("malformed pull must raise")
+    except DispatchError:
+        pass
+    # PARTITION PARITY: the orphan set is EXACTLY what enumerate_review_items skips for missing
+    # provenance — PR 91 is absent from the review items and present in the orphans (drift-proof).
+    review_pr_numbers = {i["pr_number"] for i in enumerate_review_items(
+        repo, orphan_pulls, provenance, [], issue_labels, now)}
+    assert 91 not in review_pr_numbers and 91 in {o["pr_number"] for o in orphans}
+
+    # ---- PLAN bot-pin cross-check (#297 r1): CLAIM verifies PLAN's variable-sourced pin
+    # against the MINTED App identity — agreement passes, drift or a missing pin dies. ----
+    check_plan_bot_pin("", "")             # no minted identity -> nothing authoritative to verify
+    check_plan_bot_pin("", "a[bot]")
+    check_plan_bot_pin("a[bot]", "a[bot]")
+    for bad_pin in ("", "b[bot]"):
+        try:
+            check_plan_bot_pin("a[bot]", bad_pin)
+            raise AssertionError("divergent/missing PLAN bot pin must raise")
+        except DispatchError:
+            pass
+
+    # ---- PRODUCTION wiring of the orphan bot pin (#297 r1): pure verdict in both
+    # directions on synthetic text, then asserted over the LIVE dispatch.yml so the actual
+    # PLAN invocation — not only a manual helper call — is proven pinned. ----
+    wired = (
+        "          PLAN_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'x[bot]' }}\n"
+        "              orphans.extend(claim_mod.enumerate_provenance_orphans(\n"
+        "                  repo, pulls, provenance, bot_login=bot_login))\n"
+        "          PLAN_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'x[bot]' }}\n"
+        "            --plan-bot-login \"$PLAN_BOT_LOGIN\" \\\n"
+    )
+    assert plan_orphan_pin_wiring_gaps(wired) == []
+    assert plan_orphan_pin_wiring_gaps(wired.replace(", bot_login=bot_login", "")) \
+        == ["orphan-call-bot-login"]
+    assert plan_orphan_pin_wiring_gaps("no call site at all") \
+        == ["orphan-call-bot-login", "plan-bot-login-env", "claim-plan-bot-login-flag"]
+    assert plan_orphan_pin_wiring_gaps(wired.replace(
+        "PLAN_BOT_LOGIN: ${{ vars.REGISTRY_APP_BOT_LOGIN || 'x[bot]' }}\n"
+        "            --plan-bot-login", "--plan-bot-login", 1)) == ["plan-bot-login-env"]
+    assert plan_orphan_pin_wiring_gaps(wired.replace(
+        "|| 'x[bot]' }}\n            --plan-bot-login",
+        "|| 'y[bot]' }}\n            --plan-bot-login")) == ["plan-bot-login-env"]
+    assert plan_orphan_pin_wiring_gaps(wired.replace("--plan-bot-login", "")) \
+        == ["claim-plan-bot-login-flag"]
+    dispatch_workflow = (Path(__file__).resolve().parent.parent
+                        / ".github" / "workflows" / "dispatch.yml")
+    try:
+        live_gaps = plan_orphan_pin_wiring_gaps(
+            dispatch_workflow.read_text(encoding="utf-8"))
+    except OSError:
+        live_gaps = ["workflow-unreadable"]   # fail closed — the wiring proof needs the file
+    assert live_gaps == [], f"dispatch.yml orphan bot-pin wiring gaps: {live_gaps}"
 
     # security flag from the SOURCE issue labels (zk) — needs a provenance-linked issue
     sec = enumerate_review_items(
@@ -3984,6 +4300,10 @@ def main():
                              "legacy registry root only")
     parser.add_argument("--bot-login", default="",
                         help="target App bot login (<slug>[bot]); required for review/deferred")
+    parser.add_argument("--plan-bot-login", default="",
+                        help="the worker-bot identity PLAN pinned its provenance-orphan "
+                             "enumeration to (vars.REGISTRY_APP_BOT_LOGIN); cross-checked "
+                             "against the minted --bot-login, divergence fails the claim")
     parser.add_argument("--workflow-ref", default="")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -4002,6 +4322,7 @@ def main():
             registry_root=args.registry_root,
             bot_login=args.bot_login,
             ledger_root=args.ledger_root,
+            plan_bot_login=args.plan_bot_login,
         )
     except DispatchError as exc:
         print(f"dispatch-claim: {exc}", file=sys.stderr)
