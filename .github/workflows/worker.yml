@@ -257,14 +257,16 @@ jobs:
           spec.loader.exec_module(allocator)
           account_name = os.environ["ACCOUNT"]
           matches = [item for item in catalog if item.get("title", "").strip() == account_name]
+          # Privacy (issue #135): these run in PUBLIC logs, so every failure message stays
+          # identifier-free — the raw account handle is never interpolated into the diagnostic.
           if len(matches) != 1:
-              raise SystemExit(f"selected account {account_name} is missing or ambiguous")
+              raise SystemExit("selected account is missing or ambiguous in the catalog")
           item = matches[0]
           labels = {label.get("name") for label in item.get("labels", []) if isinstance(label, dict)}
           if "status:available" not in labels:
-              raise SystemExit(f"selected account {account_name} is not available")
+              raise SystemExit("selected account is not marked status:available")
           if account_name not in policy["account_pool"]:
-              raise SystemExit(f"selected account {account_name} is outside the resolved account pool")
+              raise SystemExit("selected account is outside the resolved account pool")
 
           # Round 5: route the parsed record through the SAME read-time legacy-shape
           # normalization read_accounts applies (sol r3 f1). A raw _parse_account() here gates
@@ -276,7 +278,7 @@ jobs:
           model = next((candidate for candidate in policy["model_chain"]
                         if candidate in account.get("models", [])), None)
           if model is None:
-              raise SystemExit(f"selected account {account_name} cannot serve the resolved model chain")
+              raise SystemExit("selected account cannot serve the resolved model chain")
           model_meta = routing.get("models", {}).get(model)
           if not isinstance(model_meta, dict):
               raise SystemExit(f"selected model {model} has no routing metadata")

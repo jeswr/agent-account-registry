@@ -682,10 +682,47 @@ def _remove_label(repo, pr_number, label):
         raise WorkerPrError(f"GitHub API could not remove PR label {label}")
 
 
+# ---- public-sink identifier redaction (issue #135) ----------------------------------------------
+# The registry is PUBLIC and reviewer summary/issue strings are model-controlled, untrusted text.
+# Raw account handles (acctNN pool shape) and email addresses must NEVER cross a public comment,
+# log, or registry-body sink; only the salted 16-hex account hash (decision 22a) may. That hash
+# contains neither an "acct" prefix nor an "@", so it passes these patterns through unchanged.
+_ACCOUNT_HANDLE_RE = re.compile(r"acct[0-9a-z]{2,}", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _redact_public_text(text):
+    """Redact forbidden raw identifiers from a string bound for a PUBLIC sink (issue #135). Emails
+    are collapsed first so an acctNN local-part is never partially exposed."""
+    if not isinstance(text, str):
+        return text
+    text = _EMAIL_RE.sub("[redacted-email]", text)
+    text = _ACCOUNT_HANDLE_RE.sub("[redacted-account]", text)
+    return text
+
+
+def _redact_verdict_findings(document):
+    """Scrub forbidden identifiers (issue #135) from a verdict's model-controlled free-text fields
+    before it crosses a public sink, leaving the machine fields (verdict, injection_detected, the
+    reviewed-sha binding) and any salted 16-hex hash intact."""
+    if not isinstance(document, dict):
+        return document
+    scrubbed = dict(document)
+    if isinstance(scrubbed.get("summary"), str):
+        scrubbed["summary"] = _redact_public_text(scrubbed["summary"])
+    issues = scrubbed.get("issues")
+    if isinstance(issues, list):
+        scrubbed["issues"] = [
+            {key: (_redact_public_text(value) if isinstance(value, str) else value)
+             for key, value in issue.items()} if isinstance(issue, dict) else issue
+            for issue in issues]
+    return scrubbed
+
+
 def _comment(repo, pr_number, body):
     _gh_json(
         ["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments", "--input", "-"],
-        input_doc={"body": body},
+        input_doc={"body": _redact_public_text(body)},
     )
 
 
@@ -1229,6 +1266,9 @@ def reconcile_provenance(registry_repo, target_repo, head_branch, impl_provider,
 def verdict_record(registry_repo, target_repo, pr_number, round_n, reviewed_sha, verdict_file):
     with open(verdict_file, encoding="utf-8") as handle:
         document = json.load(handle)
+    # Issue #135: the registry is public, so scrub raw account handles / emails out of the
+    # model-controlled free-text fields before this verdict record crosses the public-body sink.
+    document = _redact_verdict_findings(document)
     # Issue #156: wrap the model verdict in the host envelope so every downstream consumer can
     # revalidate it against the live head before mutating or fixing.
     envelope = verdict_envelope(target_repo, pr_number, round_n, reviewed_sha, document)
@@ -3495,17 +3535,39 @@ def _self_test():
 
     # Privacy (locked decision 22a): salted hash is 16-hex, deterministic, salt-sensitive, and
     # never the raw handle; missing salt fails closed.
-    h1 = account_hash("acct02", "s3cret")
+    h1 = account_hash("acctexample", "s3cret")
     check("account hash is 16-hex", bool(re.fullmatch(r"[0-9a-f]{16}", h1)), True)
-    check("account hash deterministic", account_hash("acct02", "s3cret"), h1)
-    check("account hash salt-sensitive", account_hash("acct02", "other") != h1, True)
-    check("account hash never the handle", "acct02" not in h1, True)
+    check("account hash deterministic", account_hash("acctexample", "s3cret"), h1)
+    check("account hash salt-sensitive", account_hash("acctexample", "other") != h1, True)
+    check("account hash never the handle", "acctexample" not in h1, True)
     try:
-        account_hash("acct02", "")
+        account_hash("acctexample", "")
     except WorkerPrError:
         check("missing salt fails closed", "rejected", "rejected")
     else:
         check("missing salt fails closed", "accepted", "rejected")
+    # Public-sink identifier redaction (issue #135): raw acctNN handles and emails are scrubbed;
+    # the salted 16-hex hash (the ONLY identifier allowed to cross) survives untouched.
+    check("redact strips a raw account handle",
+          "acct" in _redact_public_text("impl account acct07 lost the crate"), False)
+    check("redact strips an email",
+          "@" in _redact_public_text("owner alice@example.com reassigned it"), False)
+    check("redact preserves the salted 16-hex hash",
+          _redact_public_text(h1), h1)
+    check("redact leaves clean text unchanged",
+          _redact_public_text("routing precedence is wrong"), "routing precedence is wrong")
+    # The verdict-record scrub reaches the model-controlled findings fields, not the machine fields.
+    _scrubbed = _redact_verdict_findings({
+        "verdict": "request_changes", "injection_detected": False,
+        "summary": "leaked acct09 in the log", "issues": [
+            {"severity": "blocker", "file": "scripts/worker-live.sh",
+             "title": "handle acct09 crosses", "body": "email bob@corp.io too"}]})
+    check("verdict scrub keeps the machine verdict", _scrubbed["verdict"], "request_changes")
+    check("verdict scrub strips the summary handle", "acct09" in _scrubbed["summary"], False)
+    check("verdict scrub strips an issue handle",
+          "acct09" in _scrubbed["issues"][0]["title"], False)
+    check("verdict scrub strips an issue email",
+          "@" in _scrubbed["issues"][0]["body"], False)
     os.environ["REGISTRY_REPO"] = "reg/repo"
     os.environ["REGISTRY_ALERT_TOKEN"] = "t0"
     os.environ.pop("ALERT_REPO", None)

@@ -1372,7 +1372,9 @@ PY
   # this process's environment already holds REGISTRY_SECRETS_PAT itself from that same env.
   GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$current"
   write_output rotated true
-  printf 'worker-live: wrote the full refreshed credential back to %s (env dispatch-secrets)\n' "$secret_ref"
+  # Privacy (issue #135): the secret reference is `${ACCTNN}_TOKEN`, i.e. the raw account handle in
+  # disguise — never print it to these PUBLIC logs. The identifier-free line still confirms the write.
+  printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
 }
 
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
@@ -1465,19 +1467,21 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   # --- reset-hint extraction: CLOSED grammar for every persisted hint (cross-provider r2
   # finding 1) — a time form is kept, but raw tail text (e.g. an account handle echoed by the
   # CLI) must NEVER survive into the hint, for session-limit exactly as for rate-limit ---
-  printf 'You have hit your usage limit. It resets at 5pm today for acct07 private-tail\n' > "$tmp/sig-session"
+  # Fixtures use the SYNTHETIC reserved `acctexample` handle (issue #135): never a real pool-shaped
+  # acctNN, so no live account identifier is embedded in this public self-test.
+  printf 'You have hit your usage limit. It resets at 5pm today for acctexample private-tail\n' > "$tmp/sig-session"
   chk "session-limit hint keeps the closed time form only" \
     "$(_extract_reset_hint "$tmp/sig-session")" "resets at 5pm"
-  printf 'Session limit reached; resets at 14:00 UTC on the account acct07\n' > "$tmp/sig-clock"
+  printf 'Session limit reached; resets at 14:00 UTC on the account acctexample\n' > "$tmp/sig-clock"
   chk "clock+zone hint survives without the tail" \
     "$(_extract_reset_hint "$tmp/sig-clock")" "resets at 14:00 UTC"
-  printf 'rate limited, try again in 20s (request id r-123 acct07)\n' > "$tmp/sig-rate"
+  printf 'rate limited, try again in 20s (request id r-123 acctexample)\n' > "$tmp/sig-rate"
   chk "relative rate-limit hint is preserved" \
     "$(_extract_reset_hint "$tmp/sig-rate")" "try again in 20s"
   printf 'HTTP 429\nRetry-After: 120\n' > "$tmp/sig-ra"
   chk "unitless retry-after hint is preserved" \
     "$(_extract_reset_hint "$tmp/sig-ra")" "Retry-After: 120"
-  printf 'usage limit reached; resets whenever acct07 private-tail says so\n' > "$tmp/sig-freetext"
+  printf 'usage limit reached; resets whenever acctexample private-tail says so\n' > "$tmp/sig-freetext"
   chk "digit-free free text yields NO hint (never a raw capture)" \
     "$(_extract_reset_hint "$tmp/sig-freetext")" ""
 
@@ -1772,7 +1776,7 @@ FAKE
            WORKER_CREDENTIAL_PATH="$wbroot/current" \
            WORKER_CREDENTIAL_BASELINE="$wbroot/baseline" \
            WORKER_CREDENTIAL_FORMAT=claude-oauth-token \
-           WORKER_ACCOUNT=acct05 WORKER_SECRET_REF=ACCT05_TOKEN \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
            REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
            GITHUB_OUTPUT="$wb_out" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$wbcap"
     write_back
@@ -1780,7 +1784,7 @@ FAKE
   chk "write_back succeeds on a rotated credential" "$wb_rc" "0"
   chk "write_back gh argv targets the dispatch-secrets ENVIRONMENT (exact, no --body)" \
     "$(cat "$wbcap/argv" 2>/dev/null)" \
-    "secret set ACCT05_TOKEN --repo o/r --env dispatch-secrets"
+    "secret set ACCTEXAMPLE_TOKEN --repo o/r --env dispatch-secrets"
   chk "write_back streams the credential via STDIN (never argv)" \
     "$(cat "$wbcap/stdin" 2>/dev/null)" "sk-ant-oat-ROTATED-SENTINEL"
   chk "write_back authenticates gh with the registry PAT" \
@@ -1789,6 +1793,10 @@ FAKE
     "$(grep -c '^rotated=true$' "$wb_out" || true)" "1"
   chk "write_back never echoes the credential value" \
     "$(grep -c 'ROTATED-SENTINEL' "$tmp/wb.log" || true)" "0"
+  # Issue #135: the ${ACCTNN}_TOKEN secret reference reverses to the raw handle, so the public
+  # write-back log must never contain it (the identifier stays out of the log entirely).
+  chk "write_back never echoes the account secret reference" \
+    "$(grep -c 'ACCTEXAMPLE_TOKEN\|acctexample' "$tmp/wb.log" || true)" "0"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
