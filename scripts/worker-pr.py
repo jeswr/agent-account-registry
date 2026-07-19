@@ -54,6 +54,10 @@ MARKER_KINDS = {
 FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
 MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
 PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
+# Terminal-escalation outbox marker (issue #157): a bot-authored explanatory comment carries it so
+# the reconciled needs_user() transaction never re-posts the explanation on a retry that is still
+# reconciling a failed alert/issue mutation.
+NEEDS_USER_MARKER = "<!-- sparq-needs-user:v1"
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # Provider escalation ladders in ESCALATION order — weakest tier FIRST, STRONGEST (terminal)
 # tier LAST: ladder index is capability rank, exhaustion escalates UPWARD by pinning the tier
@@ -147,9 +151,15 @@ def _ops_alert(alert_repo, alert_token, title, body):
     and credential-scoped — a missing route or a failed alert call never masks the operational
     error that triggered it: every gh call is check=False AND the whole delivery is wrapped, so
     even a raising path (the issue lookup goes through _gh_json → check=True + JSON parsing, and
-    an unexpected list shape can KeyError) only logs, never propagates into the caller's raise."""
+    an unexpected list shape can KeyError) only logs, never propagates into the caller's raise.
+
+    Returns True ONLY when delivery is CONFIRMED — the comment/create gh call exited 0 AND a
+    re-probe finds an open ops-alert issue with this title. Returns False on a missing route, a
+    non-zero post, an unverified post, or any raised path (issue #157: the old calls used
+    check=False and ignored their return codes, so a failed `issue create` still reported success
+    and a terminal escalation could believe it had paged a human when no alert issue existed)."""
     if not (alert_repo and alert_token):
-        return
+        return False
     try:
         env = {"GH_TOKEN": alert_token}
         _run_gh(["label", "create", "ops-alert", "-R", alert_repo, "--color", "d73a4a",
@@ -160,13 +170,29 @@ def _ops_alert(alert_repo, alert_token, title, body):
         number = next((i["number"] for i in found
                        if isinstance(i, dict) and i.get("title") == title), None)
         if number:
-            _run_gh(["issue", "comment", str(number), "-R", alert_repo, "--body", body],
-                    check=False, env=env)
+            posted = _run_gh(["issue", "comment", str(number), "-R", alert_repo, "--body", body],
+                             check=False, env=env)
         else:
-            _run_gh(["issue", "create", "-R", alert_repo, "--title", title, "--label",
-                     "ops-alert", "--body", body], check=False, env=env)
+            posted = _run_gh(["issue", "create", "-R", alert_repo, "--title", title, "--label",
+                              "ops-alert", "--body", body], check=False, env=env)
+        if posted.returncode != 0:
+            print("ops-alert delivery failed (non-fatal): gh exited "
+                  f"{posted.returncode}: {(posted.stderr or posted.stdout or '').strip()}",
+                  file=sys.stderr)
+            return False
+        # Verify (issue #157): a 0-exit `issue create` can still leave nothing enumerable, and a
+        # comment must have targeted a live issue — re-probe and confirm an OPEN ops-alert issue
+        # with this title now exists before reporting the human was paged.
+        confirm = _gh_json(["issue", "list", "-R", alert_repo, "--label", "ops-alert", "--state",
+                            "open", "--json", "number,title", "--limit", "50"], env=env) or []
+        if any(isinstance(i, dict) and i.get("title") == title for i in confirm):
+            return True
+        print("ops-alert delivery unconfirmed (non-fatal): no open ops-alert issue with the "
+              "expected title after posting", file=sys.stderr)
+        return False
     except Exception as exc:  # noqa: BLE001 — alert delivery must never mask the caller's error
         print(f"ops-alert delivery failed (non-fatal): {exc}", file=sys.stderr)
+        return False
 
 
 def _bot_comments(comments, bot_login):
@@ -1193,22 +1219,66 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
-               maintainer=None):
-    """Terminal, human-owned stop: review:needs-user label, an explanatory comment, the source
-    issue routed to needs-user, and an ops-alert-style registry ping. The PR stays DRAFT."""
-    set_review_state(repo, pr_number, "needs-user")
+               maintainer=None, bot_login=""):
+    """Terminal, human-owned stop applied as a RECONCILED, IDEMPOTENT transaction (issue #157).
+
+    The terminal review:needs-user label is the ONLY thing that excludes a PR from the review
+    sweep, so it is applied LAST — the durable completion marker of a fully-reconciled escalation.
+    Before it, THREE notification/state mutations must all be confirmed: the explanatory PR comment
+    (idempotent via NEEDS_USER_MARKER — the escalation's on-PR outbox record), the source issue
+    routed to needs-user (idempotent label transition), and a DELIVERY-VERIFIED ops alert. All
+    three are ATTEMPTED even when an earlier one fails; if ANY is unconfirmed the PR is left
+    UNPARKED (still enumerable) and this RAISES, so the next sweep tick re-derives needs-user and
+    reconciles the missing steps before parking. Every step is idempotent, so the retry never
+    double-posts or double-pages.
+
+    The pre-#157 order applied the parking label FIRST, then commented / updated the issue /
+    alerted — and the alert used check=False with no return-code check. A failure after the label,
+    or a silently-failed alert, stranded the PR excluded-from-enumeration FOREVER with no human
+    ever paged. An UNCONFIGURED alert route (no ALERT_REPO/REGISTRY_REPO) is the operator opting
+    out of paging — it is not treated as a delivery failure, so it never blocks the park; the
+    comment + issue record still land. The PR stays DRAFT throughout."""
     handle = maintainer or os.environ.get("MAINTAINER_HANDLE", "jeswr")
-    _comment(repo, pr_number,
-             f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
-             f"@{handle} this pull request needs a human decision. It remains a DRAFT and will "
-             "not be auto-armed.")
+    marker = f"{NEEDS_USER_MARKER} pr={pr_number} -->"
+    failures = []
+    # 1) Durable explanatory comment (the escalation's on-PR outbox record). Idempotent: the
+    #    bot-authored marker means a retry that is still reconciling a later step never re-posts it.
+    already_explained = any(
+        marker in str(c.get("body", ""))
+        for c in _bot_comments(_paginated_comments(repo, pr_number), bot_login))
+    if not already_explained:
+        try:
+            _comment(repo, pr_number,
+                     f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
+                     f"@{handle} this pull request needs a human decision. It remains a DRAFT and "
+                     f"will not be auto-armed.\n\n{marker}")
+        except (WorkerPrError, OSError, json.JSONDecodeError) as exc:
+            failures.append(f"explanatory comment ({exc})")
+    # 2) Route the source issue to needs-user (idempotent label transition). worker-issue.py raises
+    #    its OWN WorkerPrError class, so this catches broadly — a failed issue update must still not
+    #    skip the alert below.
     if issue:
-        _load_worker_issue().set_status(repo, issue, "needs-user")
-    # Reuse the rolling ops-alert posture (usage-alert.py): one deduped registry issue.
-    _ops_alert(alert_repo, alert_token,
-               f"⚠️ Review loop needs a human — {repo}#{pr_number}",
-               f"> 🤖 SPARQ agent — {reason}\n\nhttps://github.com/{repo}/pull/{pr_number} "
-               f"needs @{handle}.")
+        try:
+            _load_worker_issue().set_status(repo, issue, "needs-user")
+        except Exception as exc:  # noqa: BLE001 — continue to the alert, then reconcile on retry
+            failures.append(f"source issue #{issue} needs-user routing ({exc})")
+    # 3) Delivery-VERIFIED ops alert (the human page): one deduped rolling registry issue. A
+    #    configured route that does NOT confirm delivery keeps the escalation enumerable; an
+    #    unconfigured route is an opt-out, not a failure.
+    alert_configured = bool(alert_repo and alert_token)
+    alerted = _ops_alert(alert_repo, alert_token,
+                         f"⚠️ Review loop needs a human — {repo}#{pr_number}",
+                         f"> 🤖 SPARQ agent — {reason}\n\nhttps://github.com/{repo}/pull/{pr_number} "
+                         f"needs @{handle}.")
+    if alert_configured and not alerted:
+        failures.append("ops alert delivery unconfirmed")
+    # PARK last — only once every notification + issue-state mutation is confirmed. The label is
+    # the durable completion marker; an unparked PR stays enumerable for the sweep to reconcile.
+    if failures:
+        raise WorkerPrError(
+            f"needs-user escalation incomplete for {repo}#{pr_number}; PR left enumerable for the "
+            f"sweep to reconcile (unconfirmed: {'; '.join(failures)})")
+    set_review_state(repo, pr_number, "needs-user")
     print(f"needs-user recorded: {reason}")
 
 
@@ -1902,7 +1972,8 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             needs_user(repo, pr_number,
                        "arming failed AFTER the PR left draft and the draft state could not be "
                        "restored; a human must re-arm or re-draft this PR",
-                       issue=issue, alert_repo=alert_repo, alert_token=alert_token)
+                       issue=issue, alert_repo=alert_repo, alert_token=alert_token,
+                       bot_login=bot_login)
             raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated "
                                 f"(last gh error: {arm_error})")
     set_review_state(repo, pr_number, "pass")
@@ -2093,7 +2164,7 @@ def review_outcome(args):
                       "improving")
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
-                   alert_repo=alert_repo, alert_token=alert_token)
+                   alert_repo=alert_repo, alert_token=alert_token, bot_login=args.bot_login)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
         # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
@@ -2168,7 +2239,7 @@ def fix_outcome(args):
                   "the local gate failed twice for the same review round")
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
-                   alert_repo=alert_repo, alert_token=alert_token)
+                   alert_repo=alert_repo, alert_token=alert_token, bot_login=args.bot_login)
     else:
         print("fix outcome: staying in review:changes (retried next sweep tick)")
 
@@ -2695,6 +2766,130 @@ def _self_test():
                   "round budget is exhausted" in terminal[1][1], True)
     finally:
         wiring_globals.update(real_io)
+
+    # ---- issue #157: needs_user is a RECONCILED, IDEMPOTENT transaction. The terminal park label
+    # is applied LAST and only once the explanatory comment, the source-issue routing, AND a
+    # DELIVERY-VERIFIED ops alert have all landed; a failure anywhere leaves the PR enumerable
+    # (unparked) and raises so the sweep reconciles — never stranded excluded-from-enumeration ----
+    nu_globals = globals()
+    nu_real = {name: nu_globals[name]
+               for name in ("_comment", "_load_worker_issue", "set_review_state", "_ops_alert",
+                            "_paginated_comments")}
+    nu_calls = []
+    nu_state = {"comments": [], "comment_raises": False, "issue_raises": False, "alert": True}
+
+    class _FakeIssueMod:
+        @staticmethod
+        def set_status(repo, issue, status):
+            if nu_state["issue_raises"]:
+                raise RuntimeError("issue update failed")
+            nu_calls.append(("issue", issue, status))
+
+    def _fake_needs_comment(repo, pr, body):
+        if nu_state["comment_raises"]:
+            raise WorkerPrError("comment failed")
+        nu_calls.append(("comment", body))
+        nu_state["comments"] = nu_state["comments"] + [{"user": {"login": bot}, "body": body}]
+
+    try:
+        nu_globals["_comment"] = _fake_needs_comment
+        nu_globals["_load_worker_issue"] = lambda: _FakeIssueMod
+        nu_globals["set_review_state"] = (
+            lambda repo, pr, state: nu_calls.append(("park", state)))
+        nu_globals["_ops_alert"] = (
+            lambda ar, at, title, body: nu_calls.append(("alert", title)) or nu_state["alert"])
+        nu_globals["_paginated_comments"] = lambda repo, pr: nu_state["comments"]
+
+        def run_needs_user(**over):
+            nu_calls.clear()
+            nu_state.update(comments=[], comment_raises=False, issue_raises=False, alert=True)
+            nu_state.update(over)
+            kw = {"issue": 7, "alert_repo": "reg/r", "alert_token": "t", "bot_login": bot}
+            kw.update({k: over[k] for k in ("alert_repo", "alert_token") if k in over})
+            raised = None
+            try:
+                needs_user("o/r", 5, "budget exhausted", **kw)
+            except WorkerPrError as exc:
+                raised = str(exc)
+            return raised
+
+        # Happy path: comment, then issue, then alert, then PARK — the park label is applied LAST.
+        run_needs_user()
+        check("needs_user runs comment -> issue -> alert -> park (park applied LAST)",
+              [c[0] for c in nu_calls], ["comment", "issue", "alert", "park"])
+        check("needs_user parks with the terminal needs-user state",
+              nu_calls[-1], ("park", "needs-user"))
+
+        # A configured route that does NOT confirm delivery: RAISE, and NEVER park — but every
+        # earlier mutation was still attempted (continue-all-mutations-after-a-failure).
+        raised = run_needs_user(alert=False)
+        check("an unverified alert on a configured route raises (keeps the PR enumerable)",
+              bool(raised) and "delivery unconfirmed" in raised, True)
+        check("an unconfirmed escalation NEVER applies the terminal park label",
+              any(c[0] == "park" for c in nu_calls), False)
+        check("an unconfirmed escalation still attempted comment, issue AND alert",
+              [c[0] for c in nu_calls], ["comment", "issue", "alert"])
+
+        # An UNCONFIGURED alert route is the operator opting out of paging — not a delivery
+        # failure — so it never blocks the park; the comment + issue record still land.
+        run_needs_user(alert=False, alert_repo=None, alert_token=None)
+        check("an unconfigured alert route never blocks the park (operator opt-out)",
+              nu_calls[-1], ("park", "needs-user"))
+
+        # A failed explanatory comment still routes the issue and alerts, then raises without
+        # parking — the sweep re-derives needs-user and the marker-dedup replays only the gaps.
+        raised = run_needs_user(comment_raises=True)
+        check("a failed explanatory comment blocks the park and raises", bool(raised), True)
+        check("a failed comment still attempts the issue routing and the alert",
+              [c[0] for c in nu_calls], ["issue", "alert"])
+        check("a failed comment never parks", any(c[0] == "park" for c in nu_calls), False)
+
+        # A failed source-issue routing likewise raises and keeps the PR enumerable.
+        raised = run_needs_user(issue_raises=True)
+        check("a failed source-issue routing blocks the park and raises", bool(raised), True)
+        check("a failed issue routing never parks", any(c[0] == "park" for c in nu_calls), False)
+
+        # Idempotent re-entry: a prior run already posted the marker comment, so the reconciling
+        # retry must NOT re-post it — but it must still route the issue, alert, and park.
+        prior = [{"user": {"login": bot}, "body": f"prior {NEEDS_USER_MARKER} pr=5 -->"}]
+        run_needs_user(comments=list(prior))
+        check("a reconciling retry never re-posts the explanatory comment (idempotent)",
+              any(c[0] == "comment" for c in nu_calls), False)
+        check("the reconciling retry still routes the issue, alerts, and parks",
+              [c[0] for c in nu_calls], ["issue", "alert", "park"])
+    finally:
+        nu_globals.update(nu_real)
+
+    # ---- issue #157: _ops_alert reports success ONLY when delivery is VERIFIED — the post gh
+    # call exited 0 AND a re-probe finds an open ops-alert issue with the title (the old
+    # check=False calls ignored their return codes and reported a phantom page) ----
+    oa_globals = globals()
+    oa_real = {name: oa_globals[name] for name in ("_run_gh", "_gh_json")}
+    oa_state = {"post_rc": 0, "listed": []}
+
+    def _oa_run_gh(args, **_kw):
+        # The label-create passes through rc 0; only the issue comment/create post's rc matters.
+        is_post = "issue" in args and ("create" in args or "comment" in args)
+        rc = oa_state["post_rc"] if is_post else 0
+        return argparse.Namespace(returncode=rc, stdout="", stderr="boom" if rc else "")
+
+    try:
+        oa_globals["_run_gh"] = _oa_run_gh
+        oa_globals["_gh_json"] = lambda args, **_kw: oa_state["listed"]
+        oa_title = "⚠️ Review loop needs a human — o/r#5"
+        oa_state.update(post_rc=0, listed=[{"number": 9, "title": oa_title}])
+        check("_ops_alert confirms delivery on a 0-exit post with the issue enumerable",
+              _ops_alert("reg/r", "t", oa_title, "b"), True)
+        oa_state.update(post_rc=1, listed=[{"number": 9, "title": oa_title}])
+        check("_ops_alert reports FALSE when the post gh call exits non-zero",
+              _ops_alert("reg/r", "t", oa_title, "b"), False)
+        oa_state.update(post_rc=0, listed=[])
+        check("_ops_alert reports FALSE when no ops-alert issue is enumerable after a 0-exit post",
+              _ops_alert("reg/r", "t", oa_title, "b"), False)
+        check("_ops_alert reports FALSE with no route (paging opt-out)",
+              _ops_alert(None, None, oa_title, "b"), False)
+    finally:
+        oa_globals.update(oa_real)
 
     # ---- registry record writes pin the `ledger` data-plane branch (issue #96): master's
     # required `gate` status check permanently rejects every direct contents-API PUT from
@@ -3946,6 +4141,9 @@ def main():
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
+    # Trust-filters the idempotency marker so a reconciled re-run (issue #157) never re-posts the
+    # explanatory comment; optional so a manual escalation still works without it.
+    nuser.add_argument("--bot-login", default="")
 
     dis = subparsers.add_parser("disarm", parents=[common])
     dis.add_argument("--when", choices=("mismatch", "always"), required=True)
@@ -4078,7 +4276,7 @@ def main():
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
-                       alert_repo=alert_repo, alert_token=alert_token)
+                       alert_repo=alert_repo, alert_token=alert_token, bot_login=args.bot_login)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when)
         elif args.command == "ready-and-arm":

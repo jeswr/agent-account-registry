@@ -1517,6 +1517,7 @@ jobs:
             --repo "${{ inputs.target_repo }}" \
             --pr "${{ inputs.pr_number }}" \
             --issue "${{ needs.resolve.outputs.issue }}" \
+            --bot-login "${{ needs.resolve.outputs.pr_author }}" \
             --reason "the ${{ inputs.mode }} model chain for a ${{ needs.resolve.outputs.impl_provider }}-implemented PR is unresolvable in the target routing (no concrete provider model)"
 
   # Model-access health record (registry #32): consumes the review/fix model exit CLASS (success OR
