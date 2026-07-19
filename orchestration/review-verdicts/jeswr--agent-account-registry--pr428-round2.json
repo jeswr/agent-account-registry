@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 428,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b368bb25afd25a48f9306cc0aacec8f799845164",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_ensure_actionlint` returns `$cache/actionlint` solely when it is executable; it never verifies that cached bytes match the hard-coded release. In addition, `_fetch_pinned_actionlint` removes only the tarball when extraction fails and can leave a partially extracted executable in the destination. A later run then accepts that leftover through the unchecked cache fast path. The cache test reinforces this unsound behavior by placing an arbitrary stub directly into the cache and expecting it to be trusted. Thus the production path is SHA-pinned only for a fresh successful download, not for cache reuse, contrary to the stated trust guarantee.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Verify cached binaries against a hard-coded digest for the extracted actionlint binary, or retain and re-verify the pinned tarball before every use; provision into a fresh temporary directory and atomically rename only after verification and successful extraction. Remove any destination binary on every failure. Replace the arbitrary-cache-stub success assertion with tests that a verified cached artifact is accepted and a tampered/partial cached executable is rejected or replaced fail-closed.",
+    "severity": "major",
+    "title": "Cached actionlint binaries bypass the pinned checksum boundary"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's operational blocker is substantially addressed: the worker can now fetch the same pinned actionlint release used by pr-gate, checksum verification precedes extraction, failures remain closed, and the new positive/negative fixture assertions are non-vacuous. However, the persistent-cache path bypasses that verification entirely: any executable already at the cache pathname is accepted without checking that it is the pinned artifact. Extraction failures also do not remove a partially written destination binary, so a failed provisioning attempt can leave an executable that the next run trusts. This weakens the claimed pinned-tool boundary and requires changes before approval. Because the required progress rubric defines any new finding as regressing, progress is regressing even though the prior finding itself was fixed.",
+  "verdict": "request_changes"
+ }
+}
