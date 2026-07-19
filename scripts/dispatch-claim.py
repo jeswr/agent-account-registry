@@ -184,6 +184,18 @@ CI_CONTEXT_MAX = 1000           # advisory failing-leg context cap (plan field +
 MAX_FAILING_LEGS = 20
 
 
+def plan_package(areas):
+    """The single conflict partition a plan/lease row reserves for a collection of `area:*`
+    sections (registry issue #112). EXACTLY one area -> that area; ZERO OR MULTIPLE -> the
+    serializing global partition. Mirrors dispatch-plan.py:_plan_package byte-for-byte so the
+    anti-tamper package/label agreement in _route_matches holds: the old
+    alphabetically-first reduction dropped every secondary area, so a multi-area issue/PR
+    leased or dispatched onto a crate a second area already held. Fail-closed — over-serialize
+    a multi-area row rather than free a busy sibling crate."""
+    uniq = {a for a in areas if isinstance(a, str) and a}
+    return next(iter(uniq)) if len(uniq) == 1 else GLOBAL_PACKAGE
+
+
 class DispatchError(RuntimeError):
     """A concise fail-closed error suitable for Actions logs."""
 
@@ -1183,7 +1195,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 "state": state,
                 "impl_provider": impl_provider,
                 "repo": repo,
-                "package": areas[0] if areas else "__global__",
+                "package": plan_package(areas),
                 "security": _security_flagged(set(labels) | set(source_labels)),
                 "context": context[:CI_CONTEXT_MAX],
             })
@@ -2023,7 +2035,7 @@ def _route_matches(repo, item, policy_doc, routing_doc, policy_module):
     )
     if roles != [item["role"]] or priorities != [item["priority"]]:
         raise DispatchError(f"plan labels disagree with route fields for {repo}#{item['number']}")
-    if item["package"] != (packages[0] if packages else "__global__"):
+    if item["package"] != plan_package(packages):
         raise DispatchError(f"plan package disagrees with labels for {repo}#{item['number']}")
     return resolved
 
@@ -2527,6 +2539,26 @@ def _self_test():
         }],
     }
     assert validate_plan(fixture) is fixture
+    # issue #112: the multi-area conflict partition. plan_package reduces a collection of
+    # area:* sections to the SINGLE partition a plan/lease row reserves — exactly one area is
+    # that area, zero or multiple collapse to the serializing global partition (every assert
+    # flips if it regresses to the old alphabetically-first `sorted(areas)[0]`).
+    assert plan_package(["usage"]) == "usage"
+    assert plan_package([]) == GLOBAL_PACKAGE
+    assert plan_package(["worker", "usage"]) == GLOBAL_PACKAGE
+    assert plan_package(["usage", "usage"]) == "usage"   # duplicate collapses to one area
+    # BEHAVIORAL proof the fix closes the defect: a busy SECONDARY area must exclude a
+    # multi-area row. area-b holds a live sibling lease; the global-reserving A+B row is
+    # dropped while a disjoint single-area (area-a) row still co-runs. Under the old
+    # areas[0]="area-a" reduction the A+B row would carry package "area-a", survive the area-b
+    # lease, and double-dispatch onto B — the exact bug.
+    p112_repo = "example/repo"
+    b_lease = [{"holder": f"{p112_repo}#99@run.1", "package": "area-b", "expires_at": 600}]
+    multi_row = {"number": 5, "package": plan_package(["area-a", "area-b"]), "deferred": False}
+    solo_row = {"number": 6, "package": plan_package(["area-a"]), "deferred": False}
+    assert filter_busy_area_items([multi_row], p112_repo, [], {}, {}, leases=b_lease, now=0) == []
+    assert filter_busy_area_items(
+        [solo_row], p112_repo, [], {}, {}, leases=b_lease, now=0) == [solo_row]
     # MIXED-REPO regression (2026-07-18 outage): the assembler must emit GLOBAL
     # (repo, pr_number) order — per-repo policy order inverts it lexicographically the
     # moment a second target has review items ("jeswr/..." < "sparq-org/..."), and the
