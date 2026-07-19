@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 379,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cf693737a8f457e884effdbb80b1fb4e7926dda2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`set_reviewed_sha` still performs an unconditional whole-body PATCH derived from an earlier GET. If a maintainer or automation edits the body after that GET and before the PATCH, the edit is overwritten; the following GET equals `target`, so the function reports a successful bind and cannot detect the loss. The new case 5 explicitly demonstrates this unsafe behavior by asserting that the concurrent edit is lost. Documenting and pinning the limitation is honest, but it does not resolve the prior blocker or provide a fail-closed reviewed-SHA update.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Move the binding to immutable commit-specific metadata or another store/API operation with a real conditional/CAS primitive, so a stale writer cannot replace intervening state. Add a non-vacuous test that injects an edit between the initial read and write and asserts that the edit survives or that the bind fails without overwriting it; the test must not treat silent data loss as the expected passing outcome.",
+    "severity": "blocker",
+    "title": "Read-to-PATCH race still silently clobbers concurrent body edits"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The prior blocker remains unchanged. The patch now accurately documents and tests the read-to-PATCH race, and it improves behavior for idempotent and post-PATCH cases, but it deliberately retains the trust-plane failure: a maintainer edit between the initial GET and the whole-body PATCH is silently overwritten, after which verification sees the attacker's own target and reports success. A regression test that asserts the edit is lost does not establish the required safety property. Because reviewed-SHA binding still mutates a shared mutable PR body without a conditional write, the change is not sound or complete and must fail the gate.",
+  "verdict": "request_changes"
+ }
+}
