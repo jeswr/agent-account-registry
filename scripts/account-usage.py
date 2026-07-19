@@ -326,53 +326,89 @@ def _upsert_limits_line(body, line):
     return "\n".join(out), changed
 
 
-PERSIST_ATTEMPTS = 3  # optimistic-concurrency retries per account issue (issue #198)
+PERSIST_ATTEMPTS = 3  # bounded re-merge attempts when a writer lands AFTER our edit (issue #198)
+
+# One GraphQL read serves body + the body-edit count. userContentEdits counts BODY revisions only
+# (title renames / labels / comments do not increment it), and every `gh issue edit --body` adds
+# exactly one — so totalCount is the version stamp the guarded write below keys on.
+_ISSUE_READ_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){"
+    "repository(owner:$owner,name:$name){issue(number:$number){"
+    "body userContentEdits(first:1){totalCount}}}}")
 
 
 def _issue_view(number, registry_repo, run):
-    """(doc, ok) for one `gh issue view --json body,updatedAt`. ok=False on a non-zero gh
-    returncode or unparseable JSON so the caller PROPAGATES the failure rather than mistaking a
-    failed read for an empty body (issue #198). `doc` is the parsed dict on success."""
-    proc = run(["gh", "issue", "view", str(number), "-R", registry_repo,
-                "--json", "body,updatedAt"],
+    """(body, edit_count, ok) for one issue read. edit_count is the issue's body-edit count
+    (GraphQL userContentEdits.totalCount) — the version stamp for the write-window guard in
+    _persist_one. ok=False on a non-zero gh returncode or an unparseable/ill-typed response so the
+    caller PROPAGATES the failure rather than mistaking a failed read for an empty body (issue
+    #198)."""
+    owner, _, name = (registry_repo or "").partition("/")
+    if not owner or not name:
+        return "", 0, False
+    proc = run(["gh", "api", "graphql", "-f", "query=" + _ISSUE_READ_QUERY,
+                "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=" + str(number)],
                capture_output=True, text=True, timeout=60, check=False)
     if proc.returncode != 0:
-        return None, False
+        return "", 0, False
     try:
         doc = json.loads(proc.stdout or "null")
     except json.JSONDecodeError:
-        return None, False
-    return (doc, True) if isinstance(doc, dict) else (None, False)
+        return "", 0, False
+    issue = doc.get("data") if isinstance(doc, dict) else None
+    issue = issue.get("repository") if isinstance(issue, dict) else None
+    issue = issue.get("issue") if isinstance(issue, dict) else None
+    if not isinstance(issue, dict):
+        return "", 0, False
+    count = (issue.get("userContentEdits") or {}).get("totalCount")
+    if not isinstance(count, int):
+        return "", 0, False
+    return issue.get("body") or "", count, True
 
 
 def _persist_one(number, line, registry_repo, run):
-    """Merge the single `limits:` line into ONE account issue under optimistic concurrency (issue
-    #198). `gh issue edit --body` REPLACES the whole body, so the old code — which rewrote a body
-    snapshot captured in the earlier bulk `issue list` — silently clobbered any concurrent
-    provider / credential-format / secret-reference / notes edit made between the list and the write.
-    Instead re-read the CURRENT body immediately before the write and merge only the limits line onto
-    THAT fresh body; then confirm the merge is live, and if a concurrent writer raced our edit,
-    re-read its body and retry the merge. Returns True on success (incl. an idempotent no-op), False
-    on any gh failure or exhausted retries — the caller PROPAGATES it. NOTE: gh has no conditional
-    (If-Match) write, so a tiny read->write window remains; workflow-level serialization against the
-    other catalog writers (set-up-account) is the belt-and-braces close (see follow-up)."""
+    """Merge the single `limits:` line into ONE account issue via a GUARDED read-merge-write (issue
+    #198). `gh issue edit --body` REPLACES the whole body and GitHub's issue API has no conditional
+    (If-Match/CAS) write, so a plain read->merge->write can clobber a provider / credential-format /
+    secret-reference / notes edit landing inside the read->write window — and a body-only confirm
+    cannot see that: it reads back exactly our merge and calls the loss success. The body-edit
+    count is the version stamp that closes the hole: success is claimed ONLY when the confirm shows
+    our merged body AND exactly ONE body edit (ours) happened since the fresh read. When the count
+    proves a foreign edit landed inside the window (our write replaced it), FAIL LOUDLY instead of
+    retrying — a retry would re-read our own body, find nothing to change and launder the loss into
+    a false 'refreshed'; the replaced revision stays recoverable from the issue's edit history and
+    the caller surfaces a red annotation. A foreign edit strictly AFTER ours (confirm body is
+    theirs, exactly two edits) clobbered nothing, so the merge is re-applied onto their fresh body,
+    bounded by PERSIST_ATTEMPTS. Automated writers cannot even reach the window — dispatch.yml
+    self-serializes (`registry-dispatcher`, cancel-in-progress: false) and set-up-account only
+    CREATES catalog issues (fail-closed on re-registration) — so this guard covers out-of-band
+    manual edits, and its soundness does not depend on that workflow config. Returns True on
+    success (incl. an idempotent no-op), False otherwise — the caller PROPAGATES it."""
     for _ in range(PERSIST_ATTEMPTS):
-        doc, ok = _issue_view(number, registry_repo, run)
+        body0, count0, ok = _issue_view(number, registry_repo, run)
         if not ok:
             return False
-        new_body, changed = _upsert_limits_line(doc.get("body") or "", line)
+        new_body, changed = _upsert_limits_line(body0, line)
         if not changed:
             return True  # the live body already carries this exact limits line — nothing to write
         edit = run(["gh", "issue", "edit", str(number), "-R", registry_repo, "--body", new_body],
                    capture_output=True, text=True, timeout=60, check=False)
         if edit.returncode != 0:
             return False
-        confirm, ok = _issue_view(number, registry_repo, run)
+        body2, count2, ok = _issue_view(number, registry_repo, run)
         if not ok:
             return False
-        if (confirm.get("body") or "") == new_body:
-            return True  # our merge is the live body
-        # a concurrent writer changed the issue under us -> re-read its body and re-merge the line
+        if count2 - count0 == 1:
+            # ours was provably the ONLY edit in the read->write->confirm window; a body mismatch
+            # here is an inconsistent read -> fail closed
+            return body2 == new_body
+        if count2 - count0 == 2 and body2 != new_body:
+            # ours is not the live body, so the one foreign edit landed strictly AFTER ours:
+            # nothing was lost -> re-merge the limits line onto the writer's fresh body
+            continue
+        # any other shape (our body live with >=2 edits, or >=3 edits) means a foreign edit may
+        # have landed INSIDE our read->write window and been replaced by our write -> fail loudly
+        return False
     return False
 
 
@@ -381,7 +417,8 @@ def persist_limits(usage_path, run=None):
     capacity model stops flying blind. Best-effort but HONEST (issue #198): every gh failure is
     PROPAGATED as a non-zero return (the step is continue-on-error, so this surfaces the failure as a
     red annotation instead of a false 'refreshed'), and each per-issue write goes through _persist_one
-    so a concurrent metadata edit is not silently overwritten. select-and-claim's _parse_account
+    so a concurrent metadata edit is never silently overwritten (a clobber inside the write window is
+    detected via the body-edit count and surfaced as failure, not confirmed as success). select-and-claim's _parse_account
     ignores unknown keys, so the extra line is inert for the allocator. Privacy: prints carry no
     handles or counts (locked decision 22b). `run` is injectable for the self-test ONLY."""
     run = run or subprocess.run
@@ -419,8 +456,10 @@ def persist_limits(usage_path, run=None):
             failures += 1
     if failures:
         # No count (locked decision 22b) — only that at least one write did not land.
-        print("::warning::account-usage: one or more tier-limit writes failed (gh returncode "
-              "surfaced) — capacity model may be stale for those accounts")
+        print("::warning::account-usage: one or more tier-limit writes failed (gh error, or a "
+              "concurrent catalog edit landed inside the write window — the prior revision is "
+              "recoverable from the issue's edit history) — capacity model may be stale for "
+              "those accounts")
         return 1
     print("account-usage: tier-limit lines refreshed")
     return 0
@@ -754,24 +793,28 @@ def _self_test():
 
     def _fake_gh(script):
         """(run, edits). `script` keys:
-          'list': (rc, stdout_json)              -> the bulk `issue list` response
-          'view': {num: [body_or_None, ...]}     -> successive `issue view` bodies (None = rc!=0)
-          'edit': {num: [rc, ...]}               -> successive `issue edit` returncodes (default 0)
+          'list': (rc, stdout_json)                     -> the bulk `issue list` response
+          'view': {num: [(body, edit_count)|None, ...]} -> successive GraphQL issue reads
+                                                           (None = gh failure)
+          'edit': {num: [rc, ...]}                      -> successive `issue edit` returncodes
+                                                           (default 0)
         Every `issue edit` records (num, body) into the returned `edits` list."""
         edits = []
 
         def run(args, **_kw):
+            if args[1] == "api" and args[2] == "graphql":  # _issue_view read (body + edit count)
+                num = next(a.split("=", 1)[1] for a in args if a.startswith("number="))
+                queue = script.get("view", {}).get(num, [])
+                entry = queue.pop(0) if queue else ("", 0)
+                if entry is None:
+                    return _R(1, "")               # simulate a failed read
+                body, count = entry
+                return _R(0, json.dumps({"data": {"repository": {"issue": {
+                    "body": body, "userContentEdits": {"totalCount": count}}}}}))
             sub = args[2]  # ["gh", "issue", <sub>, <num?>, ...]
             if sub == "list":
                 rc, out = script.get("list", (0, "[]"))
                 return _R(rc, out)
-            if sub == "view":
-                num = args[3]
-                queue = script.get("view", {}).get(num, [])
-                body = queue.pop(0) if queue else ""
-                if body is None:
-                    return _R(1, "")               # simulate a failed read
-                return _R(0, json.dumps({"body": body, "updatedAt": "t"}))
             if sub == "edit":
                 num = args[3]
                 body = args[args.index("--body") + 1]
@@ -800,7 +843,7 @@ def _self_test():
     fresh = "provider: anthropic-eu\nmodels: [haiku]\n"
     merged = _upsert_limits_line(fresh, limits_line)[0]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
-                           "view": {"7": [fresh, merged]}})
+                           "view": {"7": [(fresh, 0), (merged, 1)]}})
     rc = persist_limits(upath, run=run)
     chk("persist: success returns 0", rc, 0)
     chk("persist: merges limits onto the FRESH body (no stale overwrite)",
@@ -809,7 +852,7 @@ def _self_test():
 
     #   (ii) idempotent no-op: the live body already carries the exact line -> zero edits, still 0
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
-                           "view": {"7": ["provider: anthropic\n" + limits_line + "\n"]}})
+                           "view": {"7": [("provider: anthropic\n" + limits_line + "\n", 0)]}})
     chk("persist: idempotent live body writes nothing", (persist_limits(upath, run=run), edits),
         (0, []))
 
@@ -824,7 +867,7 @@ def _self_test():
     edit_body0 = "provider: anthropic\n"
     edit_merged = _upsert_limits_line(edit_body0, limits_line)[0]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
-                           "view": {"7": [edit_body0, edit_merged]},
+                           "view": {"7": [(edit_body0, 0), (edit_merged, 1)]},
                            "edit": {"7": [1]}})
     chk("persist: edit failure propagates (rc=1, no confirm swallow)",
         (persist_limits(upath, run=run), len(edits)), (1, 1))
@@ -834,13 +877,14 @@ def _self_test():
                            "view": {"7": [None]}})
     chk("persist: view failure propagates (rc=1)", persist_limits(upath, run=run), 1)
 
-    #   (vi) retry-merges-on-change: a concurrent writer clobbers our edit; the confirm re-read
-    #   detects the mismatch and the merge is re-applied onto the writer's NEW body, then confirmed.
+    #   (vi) retry-merges-on-change: a concurrent writer lands strictly AFTER our edit (their body
+    #   is live, edit count shows exactly ours + theirs — nothing lost); the merge is re-applied
+    #   onto the writer's NEW body, then confirmed as the only edit of the second window.
     body0 = "provider: anthropic\n"
     clob = "provider: anthropic\nnotes: touched-by-other\n"           # concurrent notes edit
     merged2 = _upsert_limits_line(clob, limits_line)[0]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
-                           "view": {"7": [body0, clob, clob, merged2]}})
+                           "view": {"7": [(body0, 0), (clob, 2), (clob, 2), (merged2, 3)]}})
     rc = persist_limits(upath, run=run)
     chk("persist: retries the merge after a concurrent clobber, then succeeds",
         (rc, len(edits), "notes: touched-by-other" in edits[-1][1], limits_line in edits[-1][1]),
@@ -848,10 +892,31 @@ def _self_test():
 
     #   (vii) an unrecoverable writer that keeps reverting our line: retries are BOUNDED and the
     #   exhausted state PROPAGATES as failure (never a false 'refreshed')
+    revert_seq = []
+    for i in range(PERSIST_ATTEMPTS):
+        revert_seq += [(body0, 2 * i), (body0, 2 * i + 2)]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
-                           "view": {"7": [body0] * (2 * PERSIST_ATTEMPTS)}})
+                           "view": {"7": revert_seq}})
     chk("persist: exhausted retries propagate as failure, bounded edit attempts",
         (persist_limits(upath, run=run), len(edits)), (1, PERSIST_ATTEMPTS))
+
+    #   (ix) THE losing interleaving (#198 review round 2): a concurrent metadata edit lands
+    #   BETWEEN our fresh read and our unconditional write, so our write replaces it and the
+    #   confirm reads back exactly our merged body. A body-only confirm calls that success and the
+    #   loss is silent; the edit-count guard sees TWO body edits since the fresh read and must
+    #   FAIL (rc=1) after exactly one write — and never retry, because a retry would find nothing
+    #   left to change and launder the loss into a false 'refreshed'.
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(fresh, 0), (merged, 2)]}})
+    chk("persist: writer clobbered inside the read->write window fails loudly (no silent loss)",
+        (persist_limits(upath, run=run), len(edits)), (1, 1))
+
+    #   (x) a confirm that counts OUR edit as the only one but shows a non-matching body is an
+    #   inconsistent read — fail closed, no retry
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(fresh, 0), (fresh, 1)]}})
+    chk("persist: single-edit confirm with mismatched body fails closed",
+        (persist_limits(upath, run=run), len(edits)), (1, 1))
 
     #   (viii) a non-dict usage snapshot is handled (no probed limits) without touching the catalog
     lpath = _usage_file(["not", "a", "map"])
