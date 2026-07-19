@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3621,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aaff37889b5b0281644f594a7f0f83438b4f268b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves both prior major findings. The launcher polling budget is now derived from WATCHDOG_SECS plus validated startup grace, and the hermetic self-test checks that relationship at the default and maximum watchdog values. Launcher completion now succeeds only when DONE is observed and the archive is transferred and extracted; all missing-sentinel, remote-failure, and transfer-failure paths reach a nonzero exit. The self-test passes and includes the corresponding outcome truth table. No new correctness, soundness, test-validity, or security defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
