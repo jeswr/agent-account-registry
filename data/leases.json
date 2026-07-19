@@ -89,6 +89,16 @@
    "model": "opus",
    "issued_at": 1784435129,
    "expires_at": 1784436329
+  },
+  {
+   "account": "acct2css",
+   "claim_id": "169f8a59d3bd4c8a981e8bebfc761e18",
+   "holder": "review:sparq-org/sparq#3562@dispatch-29673250834.1",
+   "package": "bench",
+   "role": "review",
+   "model": "opus",
+   "issued_at": 1784435352,
+   "expires_at": 1784436552
   }
  ]
 }
