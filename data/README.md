@@ -5,7 +5,9 @@ snapshots from the 2026-07-17 migration (issue #28) and are kept only so consume
 before the migration do not hard-crash; removing them entirely is a tracked follow-up.
 
 The live, bot-written data plane — `data/leases.json`, `data/model-health.json`,
-`data/cache-affinity.json`, plus the provenance and review-verdict record stores
+`data/model-health-fleet.json` (the last known-good enabled-fleet snapshot `decide` falls back
+to when live resolution fails, issue #206), `data/cache-affinity.json`, plus the provenance and
+review-verdict record stores
 `orchestration/provenance/*.json` and `orchestration/review-verdicts/*.json` (issue #96) —
 lives on the dedicated, **unprotected** [`ledger` branch](../../tree/ledger/data). Why a
 separate branch:
