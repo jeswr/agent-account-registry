@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The round-1 overclaim is corrected in the README and test documentation, but remains in the generator's provenance comments: the header defines each pair as `LEGAL (provable)` and calls dispatch.rs the source of truth for `which pairs are provable`. That is inconsistent with the same change's load-bearing caveat that dual-leaf host encoding is not implemented and resolve_circuit is not wired into verify_manifest. Since this script is the declared generator/source for the committed ZK artifact, its claims must use the same structural, unwired meaning as the README.",
+   "file": "bench/zk-compose/scripts/bb_gates_matrix.py",
+   "fix_hint": "Replace `LEGAL (provable)` with `LEGAL (dispatch-compatible under the unwired resolver rule)` and replace statements that dispatch identifies `which pairs are provable` with `which pairs the resolver structurally admits`. Add the explicit not-end-to-end-provable caveat to the generator header, matching the README and Rust test documentation. Also avoid `production_selectable` for dual-leaf unless it is narrowly defined as enum/registry selectable rather than operationally usable.",
+   "severity": "major",
+   "title": "Generator still equates design legality with provability"
+  }
+ ],
+ "progress": "improving",
+ "summary": "Round 2 fixes the vacuous illegal-cell-cost check with deny_unknown_fields and a real mutation guard, and the README now clearly defines legal as dispatch-compatible rather than end-to-end provable. One honesty inconsistency remains in the generator itself: its load-bearing comments still equate LEGAL with provable and describe dispatch as the source of truth for which pairs are provable, even though the generated artifact and README acknowledge that dual-leaf host encoding is absent and resolver dispatch is unwired. Because this is a ZK comparison artifact and the generator is presented as its provenance, that contradictory claim should be corrected before approval.",
+ "verdict": "request_changes"
+}
