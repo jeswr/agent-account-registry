@@ -13,6 +13,14 @@ permissions: {}
 jobs:
   whoami:
     runs-on: ubuntu-latest
+    # PUBLIC-REPO KILL SWITCH (sol deep audit 2026-07-18, issue #183 — blocker): this registry is
+    # PUBLIC (README lines 1-9), and a per-account identity probe — even one that logs only salted
+    # hashes — still writes a STABLE per-account fingerprint into a world-readable Actions log,
+    # enumerating the fleet across runs. Diagnostics of this kind belong in a PRIVATE sink, never
+    # here. So the whole job (secret-reading environment included) runs ONLY when the repository is
+    # private; on the public registry it is skipped and touches no secret and emits nothing. Guard
+    # polarity is fail-closed: a missing/false `private` field => condition false => job skipped.
+    if: ${{ github.event.repository.private == true }}
     # SECRET-EXFIL GUARD (issue #101): reads ACCT02_TOKEN + PROVENANCE_SALT, which live in the
     # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
     # rationale on the `claim` job in dispatch.yml. A dispatch from any non-default ref is

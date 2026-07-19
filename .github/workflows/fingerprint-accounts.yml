@@ -13,6 +13,14 @@ permissions: {}
 jobs:
   fingerprint:
     runs-on: ubuntu-latest
+    # PUBLIC-REPO KILL SWITCH (sol deep audit 2026-07-18, issue #183 — blocker): this registry is
+    # PUBLIC (README lines 1-9), and fingerprinting EVERY ACCTNN_TOKEN — even as salted hashes —
+    # writes a stable per-account identifier for the whole fleet into a world-readable Actions log,
+    # fully enumerating it. Such diagnostics belong in a PRIVATE sink, never here. So the whole job
+    # (secret-materializing step + secret-reading environment included) runs ONLY when the
+    # repository is private; on the public registry it is skipped, touches no secret and emits
+    # nothing. Fail-closed polarity: a missing/false `private` field => condition false => skipped.
+    if: ${{ github.event.repository.private == true }}
     # SECRET-EXFIL GUARD (issue #101): reads toJSON(secrets) (ACCT_* probe subset), which lives
     # in the `dispatch-secrets` environment (deployment-branch policy: default branch only) —
     # full rationale on the `claim` job in dispatch.yml. Without this binding the probe would
