@@ -729,6 +729,29 @@ _assert_dockerfile_pinned() {
   return 0
 }
 
+# PURE (self-tested): print a workflow step's `if:` EXPRESSION selected by its `id:`. A GitHub
+# Actions `if` with no status function is implicitly wrapped in success(), so a post-gate step
+# written `if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}` is SILENTLY skipped when
+# an earlier step (the gate) fails. Post-gate token-refresh + followups steps must therefore carry an
+# explicit always() to survive a failed gate; this extractor lets the self-test assert that they do
+# (and that a genuinely gate-gated step like `pr` does NOT), catching a regression to implicit-success.
+# Buffers per step (a step spans `- name:` to the next `- name:`) and returns the `if:` of the step
+# containing the exact `id:`; empty when the step or its `if:` is absent.
+_workflow_step_if() {
+  local file="$1" id="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  # `exit` also runs awk's END block, so guard the END print with `found` to avoid a double print.
+  awk -v id="$id" '
+    /^[[:space:]]*-[[:space:]]+name:/ {
+      if (started && has_id) { print ifv; found=1; exit }
+      started=1; has_id=0; ifv=""; next
+    }
+    started && $0 ~ ("^[[:space:]]*id:[[:space:]]*" id "[[:space:]]*$") { has_id=1 }
+    started && /^[[:space:]]*if:/ { ln=$0; sub(/^[[:space:]]*if:[[:space:]]*/,"",ln); ifv=ln }
+    END { if (started && has_id && !found) print ifv }
+  ' "$file"
+}
+
 registry_selftest_gate() {
   local changed
   changed="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
@@ -1767,6 +1790,26 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   chk "empty digest is REJECTED" \
     "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
     "unpinned"
+
+  # --- [issue #40] post-gate token-refresh survives a FAILED gate. app-token-post is minted before
+  # the (target-controlled, possibly >60min) gate, so publish/followups need a fresh mint AFTER the
+  # gate. That mint + the followups step must run even when the gate fails (model succeeded), so both
+  # carry an explicit always() — without it GitHub Actions implicitly success()-gates the `if` and a
+  # failed gate silently skips them, falling back to a possibly-expired token (the stale-token bug
+  # this PR fixes). Non-vacuous: the always() assertions flip red on a regression to implicit-success,
+  # and the `pr` step (correctly gate-gated, no always()) is a negative control proving the extractor
+  # reads per-step rather than matching anywhere in the file. ---
+  local wf="$SCRIPT_DIR/../.github/workflows/worker.yml"
+  chk "post-gate token mint runs on a failed gate (always()-guarded)" \
+    "$(_workflow_step_if "$wf" app-token-publish | grep -c 'always()' || true)" "1"
+  chk "post-gate token mint still requires model success (fail-closed on model failure)" \
+    "$(_workflow_step_if "$wf" app-token-publish | grep -Fc "steps.model.outcome == 'success'" || true)" "1"
+  chk "followups step runs on a failed gate (always()-guarded)" \
+    "$(_workflow_step_if "$wf" followups | grep -c 'always()' || true)" "1"
+  chk "the publish/PR step stays gate-gated — NOT always() (extractor is per-step, non-vacuous)" \
+    "$(_workflow_step_if "$wf" pr | grep -c 'always()' || true)" "0"
+  chk "the publish/PR step is guarded by gate success" \
+    "$(_workflow_step_if "$wf" pr | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.

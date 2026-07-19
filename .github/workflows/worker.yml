@@ -957,12 +957,14 @@ jobs:
       # the exact strand app-token-post was added to prevent, just displaced past the gate: a
       # completed, gate-green diff is lost and the issue is left stale in-progress. This fresh mint,
       # placed immediately AFTER the gate, keeps publish + followups inside a new 60-minute window.
-      # Gated like followups (model succeeded, NOT gate-gated) so it also refreshes the token for a
-      # followups-only run whose gate failed after a long build. continue-on-error + the
-      # `|| app-token-post || app-token-live` fallbacks below keep a mint hiccup no worse than before.
+      # `always()` is LOAD-BEARING and mirrors followups (model succeeded, NOT gate-gated): without a
+      # status function GitHub Actions implicitly wraps the `if` in success(), so a FAILED gate would
+      # silently skip this mint — leaving a followups-only run to fall back on a possibly-expired
+      # app-token-post, the exact stale-token failure this guard exists to prevent. continue-on-error +
+      # the `|| app-token-post || app-token-live` fallbacks below keep a mint hiccup no worse than before.
       - name: Mint pre-publish target-scoped App token (post-gate TTL guard)
         id: app-token-publish
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        if: ${{ always() && !inputs.dry_run && steps.model.outcome == 'success' }}
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -999,11 +1001,14 @@ jobs:
         run: bash ../registry/scripts/worker-live.sh publish
 
       - name: Create declared follow-up issues (discovered out-of-scope work)
+        id: followups
         # The procedure for the orchestrator to capture work it discovers but must NOT do in this PR:
         # the model appends {title, body, labels} lines to WORKER_ROOT/followups.jsonl (worker-live.sh
         # moves them out of the target tree BEFORE the commit so they are never committed), and this
         # step creates de-duplicated, labelled, back-linked issues. Best-effort; never fails the worker.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        # `always()` is load-bearing: without a status function the `if` is implicitly success()-gated,
+        # so a FAILED gate would skip the very followups-only run the post-gate token mint refreshes for.
+        if: ${{ always() && !inputs.dry_run && steps.model.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
