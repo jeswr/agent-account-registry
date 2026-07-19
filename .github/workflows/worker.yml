@@ -850,31 +850,6 @@ jobs:
           echo "class=$cls" >> "$GITHUB_OUTPUT"
           echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
 
-      # TTL guard (audit-2026-07-17): App installation tokens live 60 minutes and app-token-live is
-      # minted BEFORE the heavy checkout + toolchain + model run, so with worker_timeout_minutes=90
-      # every long run used to reach publish/followups/final-state with an EXPIRED token — the
-      # model's completed work was discarded AND the deferral write failed, stranding the issue
-      # status:in-progress. This fresh mint immediately after the model step keeps all post-model
-      # writes inside a new 60-minute window. `always()` is load-bearing: final-state also runs on
-      # the failure path. continue-on-error + the `|| app-token-live` fallbacks below keep a mint
-      # hiccup from being worse than the old single-mint behavior.
-      - name: Mint post-model target-scoped App token (publish/final-state TTL guard)
-        id: app-token-post
-        if: ${{ always() && !inputs.dry_run }}
-        continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
-          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
-          owner: ${{ needs.resolve.outputs.target_owner }}
-          repositories: ${{ needs.resolve.outputs.target_name }}
-          permission-contents: write
-          permission-issues: write
-          permission-pull-requests: write
-          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
-          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
-          permission-workflows: write
-
       - name: Write back a rotated full account credential
         id: writeback
         if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' && steps.model.outcome != 'skipped' }}
@@ -917,6 +892,38 @@ jobs:
           # GitHub job log (streamed off-runner, not a local file), which is a sufficient and safe
           # crash signal. The failure-class annotation below reads only host-derived step outcomes.
         run: bash ../registry/scripts/worker-live.sh gate
+
+      # TTL guard (audit-2026-07-19, target issue #126): App installation tokens live 60 minutes.
+      # app-token-live is minted BEFORE the heavy checkout + model run + toolchain setup + the
+      # potentially long cargo gate, so with worker_timeout_minutes up to 90 a long gate used to
+      # reach publish/followups/final-state with an EXPIRED token — the model's completed work was
+      # discarded AND the deferral write failed, stranding the issue at status:in-progress. This
+      # mint is placed AFTER the gate (the last long, target-code step) and immediately before the
+      # only steps that spend it, so publish/followups/final-state always run inside a fresh
+      # 60-minute window no matter how long the model + gate ran. `always()` is load-bearing:
+      # final-state also runs on the model/gate failure path (to write status:deferred instead of
+      # stranding the issue), so a fresh token must exist there too. continue-on-error + the
+      # `|| app-token-live` fallbacks below keep a transient mint hiccup from being worse than the
+      # old single-mint behavior — a stale fallback just fails the publish CLOSED (git/gh reject an
+      # expired token); it never grants stale access. NOTE: the mint still runs on a runner that
+      # executed the hostile cargo gate; the audit's stronger prescription (a separate publisher
+      # job with no target code) is tracked as a back-linked follow-up.
+      - name: Mint post-model target-scoped App token (publish/final-state TTL guard)
+        id: app-token-post
+        if: ${{ always() && !inputs.dry_run }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
+          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
+          permission-workflows: write
 
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
