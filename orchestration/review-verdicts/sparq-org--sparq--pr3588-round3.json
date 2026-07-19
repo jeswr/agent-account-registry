@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3588,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6deb43bb1277856d49c4a0ddb62e7f5d970513b1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The test still skips the real CircuitProver-to-capture path when nargo or bb is absent unless `SPARQ_ZK_REQUIRE_TOOLCHAIN` is set. No CI configuration in this diff sets that variable, so ordinary green test runs can continue without exercising bb's emitted proof and public-input artifacts. This is the same residual minor finding as round 2.",
+    "file": "crates/sparq-zk-compose/tests/capture_car_hire.rs",
+    "fix_hint": "Add or update a toolchain-equipped CI lane to run this test with `SPARQ_ZK_REQUIRE_TOOLCHAIN=1`, ensuring missing tools or incompatible emitted artifacts fail continuously.",
+    "severity": "minor",
+    "title": "Required-toolchain mode remains unwired in CI"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 is materially unchanged from round 2. The plural `subProofs` schema remains consistent across the Rust serializer, generator, fixture, TypeScript consumer, and contract tests; the packaging rejects ragged public-input blobs and preserves proof bytes, and the ZK/composition claims remain explicitly research-grade and not externally audited. The prior minor coverage gap also remains: `SPARQ_ZK_REQUIRE_TOOLCHAIN` can make missing tools fail, but no CI configuration in this diff sets it, so the real native CircuitProver-to-capture path is still optional coverage. This does not invalidate the serialization change, but it has not improved since round 2.",
+  "verdict": "approve"
+ }
+}
