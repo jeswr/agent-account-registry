@@ -22,16 +22,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "f229a1b82c894a5885851075983fa085",
-   "holder": "sparq-org/sparq#3067@29698990141.1",
-   "package": "bench",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784486176,
-   "expires_at": 1784492476
-  },
-  {
-   "account": "acct01",
    "claim_id": "b67e8a50a673405ba757babccfcc800e",
    "holder": "jeswr/agent-account-registry#414@dispatch-29698689616.1",
    "package": "workflows",
