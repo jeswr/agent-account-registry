@@ -1002,6 +1002,66 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
     print(f"provenance {'recorded' if created else 'already recorded'} for {target_repo}#{pr_number}")
 
 
+def select_reconcilable_pr(pulls, target_repo, bot_login, issue):
+    """PURE: from the target API's PR list for the DETERMINISTIC head branch, choose the single
+    open, bot-authored, non-fork, issue-bound PR whose provenance must be reconciled (issue #128).
+    Returns its number, or None when there is nothing to reconcile — the publisher never created a
+    PR, OR the candidate set is ambiguous/malformed. Fails CLOSED to None rather than guessing a PR
+    to anoint as trusted: the returned number is still RE-VERIFIED against the live API by
+    provenance_record before anything is written, so this is only the first, fail-closed filter.
+    An empty bot_login (worker killed before target-identity was verified) yields None: no PR can be
+    authored by nobody, and publish runs long after identity, so there is genuinely nothing to
+    record."""
+    if not bot_login or not isinstance(pulls, list):
+        return None
+    ref = re.compile(rf"^sparq-agent/issue-{int(issue)}-[A-Za-z0-9._-]+$")
+    found = set()
+    for pull in pulls:
+        if not isinstance(pull, dict) or pull.get("state") != "open":
+            continue
+        if str((pull.get("user") or {}).get("login", "")) != bot_login:
+            continue
+        head = pull.get("head") or {}
+        if (head.get("repo") or {}).get("full_name") != target_repo:
+            continue
+        if not ref.fullmatch(str(head.get("ref", ""))):
+            continue
+        number = pull.get("number")
+        if isinstance(number, int) and number > 0:
+            found.add(number)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def reconcile_provenance(registry_repo, target_repo, head_branch, impl_provider, impl_alias,
+                         impl_account_h, issue, run_key, verify_bot_login):
+    """Recover-and-record provenance independently of the publisher's output (issue #128).
+
+    `gh pr create` mutates GitHub BEFORE pr_number reaches $GITHUB_OUTPUT, so a lost response,
+    cancellation, or local failure AFTER server-side creation leaves an open worker PR that the
+    publish job never reported. With provenance keyed off that empty output the record is skipped,
+    the review sweep (which fails closed on a missing record) never enumerates the PR, and the open
+    PR blocks the next implementation attempt. This reconciler runs on a fresh runner for EVERY
+    acquired attempt: it resolves the PR from the deterministic head branch — built from trusted run
+    identity (issue + run id/attempt), NEVER from the hostile worker output — verifies it, and
+    records provenance. Idempotent with any publish-path record: pr_number is re-read from the head
+    branch, head_sha from the live API, and run_key is the shared run identity, so the document is
+    byte-identical. A missing PR records nothing (the legitimate no-publish case)."""
+    if not re.fullmatch(r"sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+", head_branch or ""):
+        raise WorkerPrError("reconcile head branch is unsafe")
+    owner = target_repo.split("/", 1)[0]
+    pulls = _gh_json([
+        "api", f"repos/{target_repo}/pulls?head={owner}:{head_branch}&state=open&per_page=100"])
+    pr_number = select_reconcilable_pr(pulls, target_repo, verify_bot_login, issue)
+    if pr_number is None:
+        print(f"reconcile: no open bot PR on {head_branch}; nothing to record")
+        return
+    # head_sha is left empty on purpose: provenance_record's verify path re-reads it from the live
+    # API (never from any worker output) exactly as the publish path does.
+    provenance_record(registry_repo, target_repo, pr_number, "", impl_provider, impl_alias,
+                      impl_account_h, issue, run_key, verify_bot_login=verify_bot_login)
+    _write_outputs({"pr_number": pr_number})
+
+
 def verdict_record(registry_repo, target_repo, pr_number, round_n, verdict_file):
     with open(verdict_file, encoding="utf-8") as handle:
         document = json.load(handle)
@@ -1821,6 +1881,43 @@ def _self_test():
     check("human_owned loop escalation", human_owned({"review:needs-user"}), True)
     check("human_owned groom park", human_owned({"needs:user", "review:pass"}), True)
     check("human_owned plain loop state", human_owned({"review:needs", "area:x"}), False)
+
+    # select_reconcilable_pr (issue #128): the fail-closed filter that recovers a PR from the
+    # deterministic head branch when the publisher's pr_number output was lost. Each assertion
+    # flips the result on a WRONG answer, so the test is non-vacuous.
+    repo = "acme/widget"
+    good_pr = {"number": 42, "state": "open", "user": {"login": bot},
+               "head": {"ref": "sparq-agent/issue-7-9-1",
+                        "repo": {"full_name": repo}}}
+    check("reconcile recovers the open bot issue PR",
+          select_reconcilable_pr([good_pr], repo, bot, 7), 42)
+    check("reconcile: empty list (publisher never opened a PR) records nothing",
+          select_reconcilable_pr([], repo, bot, 7), None)
+    # A closed/merged PR on the branch is not a live provenance target.
+    closed = json.loads(json.dumps(good_pr)); closed["state"] = "closed"
+    check("reconcile ignores a non-open PR",
+          select_reconcilable_pr([closed], repo, bot, 7), None)
+    # Fork with the same branch name must never be trusted as the bot's PR.
+    fork = json.loads(json.dumps(good_pr)); fork["head"]["repo"]["full_name"] = "mallory/widget"
+    check("reconcile rejects a fork head",
+          select_reconcilable_pr([fork], repo, bot, 7), None)
+    # Wrong author (branch spoofed by a non-bot) is rejected.
+    spoof = json.loads(json.dumps(good_pr)); spoof["user"]["login"] = "mallory"
+    check("reconcile rejects a non-bot author",
+          select_reconcilable_pr([spoof], repo, bot, 7), None)
+    # Issue-binding: a PR for a DIFFERENT issue's branch is not this run's PR.
+    check("reconcile rejects a different issue's branch",
+          select_reconcilable_pr([good_pr], repo, bot, 8), None)
+    # Empty bot_login (worker killed before target identity) fails closed.
+    check("reconcile fails closed on empty bot login",
+          select_reconcilable_pr([good_pr], repo, "", 7), None)
+    # Ambiguity (should be impossible per one-open-PR-per-branch) records nothing, never a guess.
+    other = json.loads(json.dumps(good_pr)); other["number"] = 43
+    check("reconcile fails closed on ambiguous candidates",
+          select_reconcilable_pr([good_pr, other], repo, bot, 7), None)
+    # Malformed/hostile entries can only DROP a candidate, never fabricate one.
+    check("reconcile tolerates malformed entries",
+          select_reconcilable_pr([None, 123, {}, good_pr], repo, bot, 7), 42)
 
     verdict = {"verdict": "request_changes", "injection_detected": False, "summary": "s",
                "issues": [{"severity": "major", "file": "src/a.rs", "title": "t", "body": "b",
@@ -3068,6 +3165,22 @@ def main():
     prov.add_argument("--run-key", required=True)
     prov.add_argument("--verify-bot-login", default="")
 
+    # Publisher-independent recovery (issue #128): resolve the PR from the deterministic head branch
+    # and record provenance even when the publish job's pr_number output was lost after `gh pr
+    # create` mutated GitHub. Head_sha/pr_number come from the live API, never a worker output.
+    recon = subparsers.add_parser("reconcile-provenance")
+    recon.add_argument("--registry-repo", required=True)
+    recon.add_argument("--target-repo", required=True)
+    recon.add_argument("--head-branch", required=True)
+    recon.add_argument("--impl-provider", required=True)
+    recon.add_argument("--impl-alias", required=True)
+    recon.add_argument("--impl-account-h", default="",
+                       help="pre-computed salted hash; default hashes env WORKER_IMPL_ACCOUNT "
+                            "with env PROVENANCE_SALT")
+    recon.add_argument("--issue", required=True, type=int)
+    recon.add_argument("--run-key", required=True)
+    recon.add_argument("--verify-bot-login", required=True)
+
     vrec = subparsers.add_parser("verdict-record")
     vrec.add_argument("--registry-repo", required=True)
     vrec.add_argument("--target-repo", required=True)
@@ -3188,6 +3301,13 @@ def main():
             provenance_record(args.registry_repo, args.target_repo, args.pr, args.head_sha,
                               args.impl_provider, args.impl_alias, impl_account_h, args.issue,
                               args.run_key, verify_bot_login=args.verify_bot_login)
+        elif args.command == "reconcile-provenance":
+            impl_account_h = args.impl_account_h or account_hash(
+                os.environ.get("WORKER_IMPL_ACCOUNT", ""),
+                os.environ.get("PROVENANCE_SALT", ""))
+            reconcile_provenance(args.registry_repo, args.target_repo, args.head_branch,
+                                 args.impl_provider, args.impl_alias, impl_account_h,
+                                 args.issue, args.run_key, args.verify_bot_login)
         elif args.command == "verdict-record":
             verdict_record(args.registry_repo, args.target_repo, args.pr, args.round,
                            args.verdict_file)
