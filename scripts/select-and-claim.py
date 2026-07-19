@@ -244,6 +244,30 @@ def holder_key(holder):
     return holder.split("@", 1)[0]
 
 
+# Every dispatcher-minted holder carries this marker in its run-portion (after `@`):
+# dispatch-claim.py mints `<repo>#<n>@dispatch-<run>.<attempt>` (impl lane) and
+# `<lane:><repo>#<n>@dispatch-<run>.<attempt>` (review/fix). A worker run that ADOPTS the claim
+# rewrites the holder to `<repo>#<n>@<run>.<attempt>` (NO marker), so the marker is what tells a
+# still-dispatcher-owned claim apart from one already adopted by a worker (issue #132).
+DISPATCHER_RUN_MARKER = "dispatch-"
+
+
+def adoptable_holder(current, new_holder):
+    """Whether the lease currently held by `current` may be CAS-adopted to `new_holder`.
+
+    True only when the lease is STILL dispatcher-owned — its run-portion (after `@`) carries the
+    `dispatch-` marker every dispatcher holder is minted with — or when it is ALREADY this exact
+    worker run (idempotent re-adopt / revalidation). A holder that is a DIFFERENT worker run (one
+    that has already adopted this claim) is rejected, so two runs can never both adopt the same
+    claim and a queued worker cannot steal a slot a peer is actively holding (issue #132)."""
+    if not isinstance(current, str):
+        return False
+    if current == new_holder:
+        return True
+    run_part = current.split("@", 1)[1] if "@" in current else ""
+    return run_part.startswith(DISPATCHER_RUN_MARKER)
+
+
 def partition_available(leases, holder_prefix, package):
     """Whether a repository-scoped package/global partition is free in the active ledger."""
     scoped = [
@@ -586,6 +610,59 @@ def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
     }
 
 
+def adopt(repo, claim_id, new_holder, now, ttl, expected_holder_prefix="", retries=6):
+    """CAS-transfer a dispatcher-owned lease to this worker run — an OWNERSHIP change, not the
+    read-only look inspect_claim performs (issue #132).
+
+    Under compare-and-swap it rewrites the matched lease's holder to `new_holder` (the exact worker
+    run) and re-bases its expiry to now+ttl, ONCE. It refuses — returning None — when the claim_id
+    is expired/gone (reclaim_expired dropped it, so a queued worker cannot resurrect a stale,
+    possibly-reallocated slot), when the holder does not start with `expected_holder_prefix` (a
+    different issue), or when the lease is already adopted by another worker run (adoptable_holder),
+    so no two runs ever share a lease. Returns the transferred lease plus account metadata (exactly
+    the shape inspect_claim returned) on success. Raises LeaseIOError when the ledger write kept
+    failing — an infrastructure failure that must fail LOUD, never masquerade as not-adoptable
+    (mirrors claim()'s issue #28 contract)."""
+    for attempt in range(retries):
+        if attempt:
+            _sleep_backoff(attempt)
+        leases, sha = _read_ledger(repo)
+        live = reclaim_expired(leases, now)
+        matches = [lease for lease in live if lease.get("claim_id") == claim_id]
+        if len(matches) != 1:
+            return None
+        lease = matches[0]
+        holder = str(lease.get("holder", ""))
+        if expected_holder_prefix and not holder.startswith(expected_holder_prefix):
+            return None
+        if not adoptable_holder(holder, new_holder):
+            return None
+        accounts = [
+            account for account in read_accounts(repo)
+            if account.get("handle") == lease.get("account") and account.get("available")
+        ]
+        if len(accounts) != 1 or lease.get("model") not in accounts[0].get("models", []):
+            return None
+        account = accounts[0]
+        transferred = {**lease, "holder": new_holder, "issued_at": now, "expires_at": now + ttl}
+        next_leases = [
+            transferred if row.get("claim_id") == claim_id else row
+            for row in live
+        ]
+        if _write_ledger(repo, next_leases, sha, f"adopt {claim_id[:8]} -> worker run"):
+            return {
+                **transferred,
+                "secret_ref": account.get("secret_ref"),
+                "provider": account.get("provider"),
+                "harness": account.get("harness"),
+                "credential_format": account.get("credential_format"),
+            }
+    raise LeaseIOError(
+        f"lease ledger adopt CAS write kept failing after {retries} attempts (persistent CAS "
+        f"contention, or the {LEDGER_PATH} contents PUT is being rejected) — failing loud rather "
+        "than reporting an adoptable claim as not adoptable")
+
+
 def release(repo, claim_id, now, retries=6):
     for attempt in range(retries):
         if attempt:
@@ -756,6 +833,122 @@ def _self_test():
         globals()["_read_ledger"] = saved_rl
     check("sol lease on a legacy [terra] record is adoptable (adoption path normalized)",
           adopted and adopted.get("secret_ref"), "L_TOKEN")
+
+    # ---- CAS adopt: ownership TRANSFER, not a read-only inspect (issue #132) ----
+    # adoptable_holder pure gate: a dispatcher-marked holder transfers; a DIFFERENT worker run is
+    # refused (two runs can never both adopt); the exact same worker run re-adopts idempotently
+    # (revalidation/heartbeat); a garbage/holderless value is refused.
+    WORKER_HOLDER = "o/r#7@run9.1"
+    check("adoptable: a dispatcher-held lease is adoptable",
+          adoptable_holder("o/r#7@dispatch-42.1", WORKER_HOLDER), True)
+    check("adoptable: another worker run is NOT adoptable (already adopted elsewhere)",
+          adoptable_holder("o/r#7@run8.1", WORKER_HOLDER), False)
+    check("adoptable: the exact same worker run re-adopts (idempotent revalidation)",
+          adoptable_holder(WORKER_HOLDER, WORKER_HOLDER), True)
+    check("adoptable: a garbage/holderless value is refused",
+          adoptable_holder("no-at-marker", WORKER_HOLDER), False)
+
+    # End-to-end adopt through a stubbed ledger. The holder is CAS-rewritten to the worker run and
+    # the expiry is RE-BASED to now+ttl — a read-only inspect would leave both unchanged, so these
+    # assertions flip red if adopt ever regresses to an inspect. Metadata mirrors inspect_claim.
+    # Issued 500s ago with a still-LIVE 3600s ttl (expires now+3100), so the adopt re-base to
+    # now+3600 is observably different from the dispatcher's original expiry.
+    disp_lease = {**make_lease("acctL", "o/r#7@dispatch-42.1", "p", "impl", "sol", now - 500, 3600),
+                  "claim_id": "ADOPTCID"}
+    adopt_writes = {}
+
+    def _capture_adopt_write(repo, leases, sha, msg):
+        adopt_writes["leases"] = leases
+        adopt_writes["msg"] = msg
+        return True
+
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    globals()["_read_ledger"] = lambda repo: ([dict(disp_lease)], "sha0")
+    globals()["_write_ledger"] = _capture_adopt_write
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            adopted_lease = adopt("o/r", "ADOPTCID", WORKER_HOLDER, now, 3600,
+                                  expected_holder_prefix="o/r#7@")
+    finally:
+        globals()["_run"] = real_run_fn
+        globals()["_read_ledger"], globals()["_write_ledger"] = saved_rl, saved_wl
+    check("adopt transfers the holder to the exact worker run (CAS write, not inspect)",
+          adopted_lease and adopted_lease["holder"], WORKER_HOLDER)
+    check("adopt re-bases expiry to now+ttl (refreshes the lease for the worker's full run)",
+          adopted_lease and adopted_lease["expires_at"], now + 3600)
+    check("adopt returns the account secret_ref (metadata shape like inspect_claim)",
+          adopted_lease and adopted_lease.get("secret_ref"), "L_TOKEN")
+    check("adopt persisted exactly the transferred holder to the ledger",
+          [row["holder"] for row in adopt_writes.get("leases", [])], [WORKER_HOLDER])
+    check("adopt preserves the stable holder_key (same target issue across the transfer)",
+          holder_key(adopted_lease["holder"]), "o/r#7")
+
+    # rejects already-adopted: a lease already held by ANOTHER worker run is refused, and the
+    # ledger is never written (no CAS write is even attempted).
+    other_adopted = {**disp_lease, "holder": "o/r#7@run8.1"}
+    write_called = {"hit": False}
+
+    def _forbid_write(repo, leases, sha, msg):
+        write_called["hit"] = True
+        return True
+
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    globals()["_read_ledger"] = lambda repo: ([dict(other_adopted)], "sha0")
+    globals()["_write_ledger"] = _forbid_write
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            reject_adopted = adopt("o/r", "ADOPTCID", WORKER_HOLDER, now, 3600,
+                                   expected_holder_prefix="o/r#7@")
+    finally:
+        globals()["_run"] = real_run_fn
+        globals()["_read_ledger"], globals()["_write_ledger"] = saved_rl, saved_wl
+    check("adopt REJECTS a claim already adopted by another worker run", reject_adopted, None)
+    check("adopt never writes the ledger when it rejects (no lease stolen)",
+          write_called["hit"], False)
+
+    # a queued worker whose dispatcher lease has EXPIRED (reclaim_expired drops it) finds no match
+    # and is refused — it cannot resurrect a stale, possibly-reallocated slot.
+    expired_lease = {**disp_lease, "expires_at": now - 1}
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    globals()["_read_ledger"] = lambda repo: ([dict(expired_lease)], "sha0")
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            reject_expired = adopt("o/r", "ADOPTCID", WORKER_HOLDER, now, 3600,
+                                   expected_holder_prefix="o/r#7@")
+    finally:
+        globals()["_run"] = real_run_fn
+        globals()["_read_ledger"], globals()["_write_ledger"] = saved_rl, saved_wl
+    check("adopt refuses an EXPIRED dispatcher lease (no resurrection after reallocation)",
+          reject_expired, None)
+
+    # the claim_id exists but belongs to a DIFFERENT issue -> refused on the holder prefix.
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    globals()["_read_ledger"] = lambda repo: ([dict(disp_lease)], "sha0")
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            reject_prefix = adopt("o/r", "ADOPTCID", WORKER_HOLDER, now, 3600,
+                                  expected_holder_prefix="o/r#8@")
+    finally:
+        globals()["_run"] = real_run_fn
+        globals()["_read_ledger"], globals()["_write_ledger"] = saved_rl, saved_wl
+    check("adopt refuses when the holder prefix is a different issue", reject_prefix, None)
+
+    # a persistent CAS write failure on an ADOPTABLE lease RAISES (infra failure) rather than
+    # masquerading as not-adoptable (claim()'s #28 fail-loud contract).
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    globals()["_read_ledger"] = lambda repo: ([dict(disp_lease)], "sha0")
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg: False
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            adopt("o/r", "ADOPTCID", WORKER_HOLDER, now, 3600, expected_holder_prefix="o/r#7@")
+        check("adopt raises on persistent CAS write failure", "no exception", "LeaseIOError")
+    except LeaseIOError:
+        check("adopt raises on persistent CAS write failure", "LeaseIOError", "LeaseIOError")
+    finally:
+        globals()["_run"] = real_run_fn
+        globals()["_read_ledger"], globals()["_write_ledger"] = saved_rl, saved_wl
 
     # ---- WORKER.YML DRY-RUN PATH (round 5): the embedded "Validate dry-run account" heredoc
     # imports this module and must route its parsed record through the SAME read-time
@@ -1243,6 +1436,8 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--reclaim", action="store_true", help="CAS-remove expired leases (cron)")
     ap.add_argument("--claim", action="store_true", help="claim a lease")
+    ap.add_argument("--adopt", metavar="CLAIM_ID",
+                    help="CAS-transfer a dispatcher lease to this worker run (--holder), refreshing expiry")
     ap.add_argument("--inspect", metavar="CLAIM_ID", help="inspect an active lease for worker adoption")
     ap.add_argument("--release", metavar="CLAIM_ID", help="release a lease by claim id")
     ap.add_argument("--package", default="")
@@ -1277,6 +1472,14 @@ def main():
                     ttl=args.ttl, account_pool=pool, holder_prefix=args.holder_prefix,
                     max_holder_concurrent=args.max_holder_concurrent)
         print(json.dumps(res) if res else "none-free")
+        return 0 if res else 3
+    if args.adopt:
+        if not args.holder or args.ttl <= 0:
+            print("adopt requires a non-empty --holder and a positive --ttl", file=sys.stderr)
+            return 2
+        res = adopt(args.repo, args.adopt, args.holder, int(time.time()), args.ttl,
+                    expected_holder_prefix=args.expected_holder_prefix)
+        print(json.dumps(res) if res else "not-adoptable")
         return 0 if res else 3
     if args.inspect:
         res = inspect_claim(args.repo, args.inspect, int(time.time()), args.expected_holder_prefix)

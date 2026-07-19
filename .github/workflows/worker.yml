@@ -436,7 +436,7 @@ jobs:
           print(f"lease claimed: model={model}, claim={claim_id[:8]}")
           PY
 
-      - name: Adopt dispatcher-owned CAS claim
+      - name: Adopt dispatcher-owned CAS claim (ownership transfer)
         id: adopt
         if: ${{ inputs.claim_id != '' }}
         env:
@@ -449,12 +449,24 @@ jobs:
           ACCOUNT_POOL: ${{ needs.resolve.outputs.account_pool }}
           PACKAGES: ${{ needs.resolve.outputs.packages }}
           ROLE: ${{ needs.resolve.outputs.role }}
+          TIMEOUT_MINUTES: ${{ needs.resolve.outputs.worker_timeout_minutes }}
         run: |
           set -euo pipefail
+          # Adoption is a CAS OWNERSHIP TRANSFER, not a read-only look (issue #132): --adopt swaps
+          # the lease holder from the dispatcher to THIS worker run and re-bases its expiry to
+          # now + the worker's full run budget, so (a) two runs can never both own one claim, (b) a
+          # queued worker whose dispatcher lease already expired is refused (exit 3) instead of
+          # resurrecting a reallocated slot, and (c) the lease cannot expire mid-run. The refreshed
+          # ttl matches the claim job's self-claim ttl (worker_timeout + 15m slack).
+          [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]
+          ttl=$((TIMEOUT_MINUTES * 60 + 900))
+          holder="$TARGET_REPO#$ISSUE_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           python3 registry/scripts/select-and-claim.py \
-            --inspect "$CLAIM_ID" \
+            --adopt "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --expected-holder-prefix "$TARGET_REPO#$ISSUE_NUMBER@" > "$RUNNER_TEMP/adopt.json"
+            --expected-holder-prefix "$TARGET_REPO#$ISSUE_NUMBER@" \
+            --holder "$holder" \
+            --ttl "$ttl" > "$RUNNER_TEMP/adopt.json"
           if ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
           import json
           import os
@@ -501,6 +513,10 @@ jobs:
           print(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")
           PY
           then
+            # Safe to release now: --adopt already CAS-transferred this lease to OUR run holder, so
+            # this release deletes only our own lease — never a concurrent run's (issue #132: the
+            # old --inspect path released a claim it did not own). A not-adoptable/already-adopted
+            # claim never reaches here — --adopt exits 3 and `set -e` fails the step first.
             python3 registry/scripts/select-and-claim.py \
               --release "$CLAIM_ID" \
               --repo "$GITHUB_REPOSITORY" || true
