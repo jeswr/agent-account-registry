@@ -42,16 +42,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "843903754ae04b379c59e2483060b85b",
-   "holder": "fix:sparq-org/sparq#3574@dispatch-29675980902.1",
-   "package": "bench-wasm-compare",
-   "role": "fix",
-   "model": "sol",
-   "issued_at": 1784441657,
-   "expires_at": 1784445257
-  },
-  {
-   "account": "acct01",
    "claim_id": "9e4de1cff63a4c9e9ef493ebf30a185e",
    "holder": "review:sparq-org/sparq#3576@dispatch-29675980902.1",
    "package": "sparq-zk",
