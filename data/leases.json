@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "acct03",
-   "claim_id": "d49ac00919a84f179e84d695d4e541f7",
-   "holder": "fix:jeswr/agent-account-registry#428@dispatch-29690003113.1",
-   "package": "worker",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784470106,
-   "expires_at": 1784476406
-  },
-  {
    "account": "acct2css",
    "claim_id": "b2453f2d3c4e4d19b8f584e60cf21b5c",
    "holder": "sparq-org/sparq#2990@29690375334.1",
