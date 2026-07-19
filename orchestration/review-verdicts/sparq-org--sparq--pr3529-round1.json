@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The new test is a coherent, non-vacuous wasm/native parity gate. It drives all 46 SELECT and 4 ASK fixtures through the real exported Store API under wasm_bindgen_test, independently validates the committed expectations against the native engine in the ordinary native test lane, uses deterministic ordering for multi-row results, and is wired into the existing wasm-pack --node execution path. No correctness, soundness, security, or hostile-instruction issue was found in the diff.",
+ "verdict": "approve"
+}
