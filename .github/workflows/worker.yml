@@ -507,50 +507,32 @@ jobs:
             exit 1
           fi
 
-  worker:
-    name: ${{ inputs.dry_run && 'Prove dry-run worker environment' || 'Run live target worker (DRAFT, review pending)' }}
+  # Pre-model target writes on a CLEAN runner (review round 2, issue #125). The `worker` job below
+  # runs untrusted code — the routed model (in its container) and then target-controlled cargo
+  # HOST-side (the gate) — so it must never mint or receive a WRITE-capable target credential:
+  # anything write-capable that ever enters that job outlives its step inside the runner worker
+  # process and sits in the hostile blast radius until post-job token revocation. Every pre-run
+  # target write (status:in-progress, the claim receipt, the attempt record) therefore happens
+  # HERE, before any untrusted code runs anywhere, under a token narrowed to issues:write; the
+  # worker job receives only validated non-secret outputs plus the trust-verified issue snapshot
+  # (ferried as a data artifact). The only target code this job executes is the target's own
+  # default-branch trust-gate script — reviewed, merged policy code, never model output.
+  stage:
+    name: Stage trusted pre-run state (no model or gate code runs here)
     if: ${{ always() && needs.resolve.result == 'success' && (inputs.dry_run || needs.claim.result == 'success') }}
     needs: [resolve, claim]
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(needs.resolve.outputs.worker_timeout_minutes) }}
+    timeout-minutes: 15
     permissions:
-      # READ ONLY — this job executes model-authored target code HOST-side (the cargo gate), so
-      # no registry-WRITE token may exist anywhere in its blast radius. The implementer
-      # provenance record (the review loop's root of trust) is written by the separate
-      # `provenance` job below, which executes no target code.
       contents: read
     outputs:
       bot_login: ${{ steps.target.outputs.bot_login }}
       bot_id: ${{ steps.target.outputs.bot_id }}
       default_branch: ${{ steps.target.outputs.default_branch }}
-      # Digest-bound publish handoff (issue #125): the token-bearing commit/push/PR runs in the
-      # separate `publish` job on a CLEAN runner. These host-derived, pre-gate values pin exactly
-      # what that job may publish — the gate (which runs target code AFTER this) cannot alter them.
-      bundle_sha256: ${{ steps.bundle.outputs.bundle_sha256 }}
-      base_sha: ${{ steps.bundle.outputs.base_sha }}
-      branch: ${{ steps.bundle.outputs.branch }}
-      # Concrete routing resolved BEFORE any target code ran (steps.selected / needs.claim), carried
-      # so the clean publish runner builds the PR title/body without re-reading post-hostile state.
-      model_alias: ${{ steps.selected.outputs.model }}
-      provider_model: ${{ steps.selected.outputs.provider_model }}
-      impl_provider: ${{ steps.selected.outputs.provider }}
-      # Host-observed step outcomes the publish/finalize job keys off (never target-controlled).
-      gate_outcome: ${{ steps.gate.outcome }}
-      model_outcome: ${{ steps.model.outcome }}
-      trust_outcome: ${{ steps.trust.outcome }}
+      # Host-derived pre-run state the worker/publish jobs key off (never target-controlled).
       exhausted: ${{ steps.budget.outputs.exhausted }}
+      trust_outcome: ${{ steps.trust.outcome }}
       attempt_number: ${{ steps.attempt.outputs.number }}
-      # Model-access health (registry #32): the sanitized exit CLASS of the model launch, surfaced
-      # so the separate no-target-code `model_health` job records it (success or failure). The
-      # provider/account/model come from the pre-hostile `claim` job outputs (not this job, which
-      # runs target code), exactly like the provenance record.
-      exit_class: ${{ steps.exit-class.outputs.class }}
-      # The sanitized session-limit reset time worker-live.sh extracts (review defect #9); empty
-      # for every other class. Feeds the provider-capped alert's "earliest known reset".
-      reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
-    concurrency:
-      group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
-      cancel-in-progress: false
     steps:
       - name: Checkout private registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -569,8 +551,12 @@ jobs:
           repositories: ${{ needs.resolve.outputs.target_name }}
           permission-contents: read
 
-      - name: Mint live target-scoped App token
-        id: app-token-live
+      # Narrow live scope (review round 2, issue #125): issues:write covers every pre-run write
+      # this job performs (status labels, claim receipt, attempt record); contents:read covers the
+      # trust-gate script checkout. Nothing contents/PR/workflows-write-capable exists anywhere
+      # before the clean `publish` job — the old broad worker-job mint is GONE, not relocated.
+      - name: Mint live pre-run App token (issues write, contents read)
+        id: app-token-stage
         if: ${{ !inputs.dry_run }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -578,19 +564,15 @@ jobs:
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
           owner: ${{ needs.resolve.outputs.target_owner }}
           repositories: ${{ needs.resolve.outputs.target_name }}
-          permission-contents: write
+          permission-contents: read
           permission-issues: write
-          permission-pull-requests: write
-          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
-          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
-          permission-workflows: write
 
       - name: Verify target App identity and default branch
         id: target
         env:
-          GH_TOKEN: ${{ steps.app-token-dry.outputs.token || steps.app-token-live.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token-dry.outputs.token || steps.app-token-stage.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
-          APP_SLUG: ${{ steps.app-token-dry.outputs.app-slug || steps.app-token-live.outputs.app-slug }}
+          APP_SLUG: ${{ steps.app-token-dry.outputs.app-slug || steps.app-token-stage.outputs.app-slug }}
         run: |
           set -euo pipefail
           [[ -n "$GH_TOKEN" ]] || { echo '::error::target App token was not minted'; exit 1; }
@@ -626,15 +608,174 @@ jobs:
           print(f"target token verified for {repo['full_name']} at {default_branch}")
           PY
 
-      - name: Checkout target default branch with scoped App token (pinned, no persisted token)
+      # Shallow checkout solely for the target's own trust-gate script (default-branch policy
+      # code); the reverify below executes it, which is why this job's token is issues-narrow.
+      - name: Checkout target default branch for the trust-gate script (pinned, no persisted token)
+        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.target_repo }}
           ref: ${{ steps.target.outputs.default_branch }}
           path: target
-          token: ${{ steps.app-token-dry.outputs.token || steps.app-token-live.outputs.token }}
+          token: ${{ steps.app-token-stage.outputs.token }}
+          persist-credentials: false
+
+      - name: Check durable per-issue attempt budget
+        id: budget
+        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-stage.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-issue.py attempt-check \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --max-attempts "${{ needs.resolve.outputs.max_attempts }}" \
+            --bot-login "${{ steps.target.outputs.bot_login }}"
+
+      - name: Last-step trust and issue-revision revalidation
+        id: trust
+        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token-stage.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-issue.py reverify \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --expected-author "${{ needs.resolve.outputs.issue_author }}" \
+            --expected-body-sha "${{ needs.resolve.outputs.issue_body_sha }}" \
+            --trust-gate "$GITHUB_WORKSPACE/target/scripts/trust-gate.py" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --issue-file "$RUNNER_TEMP/verified-issue.json"
+
+      # Ferried to the worker job as DATA: the snapshot was verified above, on this clean runner,
+      # before any untrusted code ran anywhere in the pipeline.
+      - name: Upload the trust-verified issue snapshot (non-secret data)
+        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.trust.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: worker-issue-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-issue.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Mark trusted live issue in progress + post claim receipt
+        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.trust.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-stage.outputs.token }}
+          WORKER_MODEL: ${{ needs.claim.outputs.model }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 registry/scripts/worker-issue.py status \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --status in-progress
+          # A GitHub App cannot be a literal issue assignee, so the receipt comment + the
+          # status:in-progress label ARE the "orchestrator is working this" assignment.
+          python3 registry/scripts/worker-issue.py claim-receipt \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --model "$WORKER_MODEL" --run-url "$RUN_URL" || true
+
+      # Recorded BEFORE the untrusted worker job by design: the budget bounds retries of runs that
+      # crash or time out mid-model, so the record cannot live after them. Deliberate semantics
+      # shift vs the old in-worker ordering: a credential-prep failure in the worker job now also
+      # consumes an attempt (conservative — repeated prep failures should stop retries too).
+      - name: Record model attempt
+        id: attempt
+        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.trust.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-stage.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-issue.py record-attempt \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --max-attempts "${{ needs.resolve.outputs.max_attempts }}" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+
+  worker:
+    name: ${{ inputs.dry_run && 'Prove dry-run worker environment' || 'Run live target worker (DRAFT, review pending)' }}
+    if: ${{ always() && needs.stage.result == 'success' && (inputs.dry_run || needs.claim.result == 'success') }}
+    needs: [resolve, claim, stage]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(needs.resolve.outputs.worker_timeout_minutes) }}
+    permissions:
+      # READ ONLY — this job executes model-authored target code HOST-side (the cargo gate), so
+      # no registry-WRITE token may exist anywhere in its blast radius. The implementer
+      # provenance record (the review loop's root of trust) is written by the separate
+      # `provenance` job below, which executes no target code. Target-WRITE credentials are
+      # equally banned here (review round 2, issue #125): pre-run issue writes happen in `stage`
+      # above, publish-side writes in `publish`/`provenance` below — this job mints nothing
+      # beyond a contents:read checkout token.
+      contents: read
+    outputs:
+      # Digest-bound publish handoff (issue #125): the token-bearing commit/push/PR runs in the
+      # separate `publish` job on a CLEAN runner. These host-derived, pre-gate values pin exactly
+      # what that job may publish — the gate (which runs target code AFTER this) cannot alter them.
+      bundle_sha256: ${{ steps.bundle.outputs.bundle_sha256 }}
+      base_sha: ${{ steps.bundle.outputs.base_sha }}
+      branch: ${{ steps.bundle.outputs.branch }}
+      # Concrete routing resolved BEFORE any target code ran (steps.selected / needs.claim), carried
+      # so the clean publish runner builds the PR title/body without re-reading post-hostile state.
+      model_alias: ${{ steps.selected.outputs.model }}
+      provider_model: ${{ steps.selected.outputs.provider_model }}
+      impl_provider: ${{ steps.selected.outputs.provider }}
+      # Host-observed step outcomes the publish/finalize job keys off (never target-controlled).
+      gate_outcome: ${{ steps.gate.outcome }}
+      model_outcome: ${{ steps.model.outcome }}
+      # Model-access health (registry #32): the sanitized exit CLASS of the model launch, surfaced
+      # so the separate no-target-code `model_health` job records it (success or failure). The
+      # provider/account/model come from the pre-hostile `claim` job outputs (not this job, which
+      # runs target code), exactly like the provenance record.
+      exit_class: ${{ steps.exit-class.outputs.class }}
+      # The sanitized session-limit reset time worker-live.sh extracts (review defect #9); empty
+      # for every other class. Feeds the provider-capped alert's "earliest known reset".
+      reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
+    concurrency:
+      group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # The ONLY credential this job may mint (review round 2, issue #125): a contents:read
+      # token, solely so the private target can be checked out. This job runs the untrusted
+      # model and then target-controlled cargo HOST-side (the gate), so a write-capable token
+      # here — even one consumed only by "early" steps — would sit in runner-process memory
+      # inside the hostile blast radius until post-job revocation. worker-live.sh's self-test
+      # asserts this job never mints a write-capable token; do not widen these permissions.
+      - name: Mint read-only target App token (checkout only)
+        id: app-token-read
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: read
+
+      - name: Checkout target default branch with read-only App token (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ needs.stage.outputs.default_branch }}
+          path: target
+          token: ${{ steps.app-token-read.outputs.token }}
           fetch-depth: 0
           persist-credentials: false
+
+      # Verified on the clean `stage` runner BEFORE any untrusted code ran; downloaded here as
+      # pure DATA (it feeds the model prompt and rides the publish bundle).
+      - name: Download the trust-verified issue snapshot (non-secret data)
+        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.stage.outputs.trust_outcome == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: worker-issue-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}
 
       - name: Resolve claimed account to concrete target model
         id: selected
@@ -740,55 +881,9 @@ jobs:
           print(f"selected account resolved: model={model}, harness={values['harness']}")
           PY
 
-      - name: Check durable per-issue attempt budget
-        id: budget
-        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
-        env:
-          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
-        run: |
-          python3 registry/scripts/worker-issue.py attempt-check \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --max-attempts "${{ needs.resolve.outputs.max_attempts }}" \
-            --bot-login "${{ steps.target.outputs.bot_login }}"
-
-      - name: Last-step trust and issue-revision revalidation
-        id: trust
-        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
-        run: |
-          python3 registry/scripts/worker-issue.py reverify \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --expected-author "${{ needs.resolve.outputs.issue_author }}" \
-            --expected-body-sha "${{ needs.resolve.outputs.issue_body_sha }}" \
-            --trust-gate "$GITHUB_WORKSPACE/target/scripts/trust-gate.py" \
-            --bot-login "${{ steps.target.outputs.bot_login }}" \
-            --issue-file "$RUNNER_TEMP/verified-issue.json"
-
-      - name: Mark trusted live issue in progress + post claim receipt
-        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.trust.outcome == 'success' }}
-        env:
-          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
-          WORKER_MODEL: ${{ needs.claim.outputs.model }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          python3 registry/scripts/worker-issue.py status \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --status in-progress
-          # A GitHub App cannot be a literal issue assignee, so the receipt comment + the
-          # status:in-progress label ARE the "orchestrator is working this" assignment.
-          python3 registry/scripts/worker-issue.py claim-receipt \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --model "$WORKER_MODEL" --run-url "$RUN_URL" || true
-
       - name: Prepare isolated selected-account environment
         id: prepare
-        if: ${{ inputs.dry_run || (needs.claim.outputs.acquired == 'true' && steps.trust.outcome == 'success') }}
+        if: ${{ inputs.dry_run || (needs.claim.outputs.acquired == 'true' && needs.stage.outputs.trust_outcome == 'success') }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
@@ -810,29 +905,18 @@ jobs:
           printf 'DRY-RUN complete: policy, target token, checkout, and worker-prep passed.\n'
           printf 'No lease was claimed, no model was run, and no pull request was opened.\n'
 
-      - name: Record model attempt
-        id: attempt
-        if: ${{ !inputs.dry_run && steps.prepare.outcome == 'success' }}
-        env:
-          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
-        run: |
-          python3 registry/scripts/worker-issue.py record-attempt \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --max-attempts "${{ needs.resolve.outputs.max_attempts }}" \
-            --bot-login "${{ steps.target.outputs.bot_login }}" \
-            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
-
       - name: Run routed model headless on a fresh target branch
         id: model
-        if: ${{ !inputs.dry_run && steps.attempt.outcome == 'success' }}
+        # The attempt record was written by the clean `stage` job (a stage record failure fails
+        # that job and skips this one entirely), so only credential prep gates the launch here.
+        if: ${{ !inputs.dry_run && steps.prepare.outcome == 'success' }}
         working-directory: target
         env:
           # Deliberately NO GH_TOKEN here: the model container must never see a GitHub token
           # (commit/push/PR are host-side in the publish step; the prompt forbids gh use).
           TARGET_DIR: ${{ github.workspace }}/target
           TARGET_REPO: ${{ inputs.target_repo }}
-          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          TARGET_DEFAULT_BRANCH: ${{ needs.stage.outputs.default_branch }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ISSUE_FILE: ${{ runner.temp }}/verified-issue.json
@@ -868,13 +952,19 @@ jobs:
           echo "class=$cls" >> "$GITHUB_OUTPUT"
           echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
 
-      # Digest-bound publish handoff (issue #125). NO write-capable App token is minted in THIS job
-      # anymore: the token-bearing commit/push/PR moved to the separate `publish` job on a clean
-      # runner (which mints its own token, inside a fresh 60-minute window — also the old TTL guard's
-      # purpose). Here we only capture the model's PRE-GATE output as a non-executable patch + a
-      # host-derived sha256 job output. Running this BEFORE the toolchain/gate steps is load-bearing:
-      # once the gate executes target code it can mutate the tree, so a post-gate snapshot could carry
-      # arbitrary injected changes. The digest pins the pre-hostile content the publish job may apply.
+      # Digest-bound publish handoff (issue #125). NO write-capable App token exists in THIS job at
+      # all (review round 2): pre-run issue writes ran in the clean `stage` job and the token-bearing
+      # commit/push/PR runs in the separate `publish` job on a clean runner (which mints its own
+      # token, inside a fresh 60-minute window — also the old TTL guard's purpose). Here we only
+      # capture the model's PRE-GATE output as a non-executable patch + a host-derived sha256 job
+      # output. The producer script below IS trusted at this point: the model ran inside a
+      # locked-down container (_run_headless_harness) that bind-mounts ONLY the target tree (.git
+      # read-only), its own HOME, and a read-only CLI — never the registry checkout, RUNNER_TEMP, or
+      # the runner command files — and worker-live.sh refuses to launch the model if any mount
+      # reaches the registry tree. The gate below is the FIRST execution of target code on this
+      # host, so running this snapshot BEFORE the toolchain/gate steps is load-bearing: by gate
+      # time the bundle is already sealed in an immutable v4 artifact, and anything the gate does
+      # to the tree cannot change what the publish job applies.
       - name: Snapshot model output into a digest-bound bundle
         id: bundle
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
@@ -939,10 +1029,13 @@ jobs:
         run: bash ../registry/scripts/worker-live.sh gate
 
       # Commit/push/PR, follow-up issue creation, and the final issue-state write ALL moved to the
-      # separate `publish` job below (issue #125): each carried a contents/issues/PR-capable App token
-      # and executed the registry checkout AFTER the gate ran target code host-side, so gated code
-      # could capture the token or publish arbitrary changes. This job now holds NO write-capable
-      # target token past the gate — there is nothing for hostile gate code to hijack.
+      # separate `publish` job below, and every pre-run issue write moved to the `stage` job above
+      # (issue #125, review round 2): each carried a write-capable App token on the same runner
+      # that executes the model and then target cargo host-side (the gate), so hostile code could
+      # capture the token — a token minted "early" still lives in runner-process memory, valid
+      # until post-job revocation. This job now NEVER holds a write-capable target token — the
+      # only credential it mints is the contents:read checkout token, and worker-live.sh's
+      # self-test trips if that ever widens.
 
       # [OPUS-4.8] The diagnostics ARTIFACT was DROPPED for credential-safety (security review,
       # finding #1). Rationale: the `gate` step above runs target-CONTROLLED cargo (build scripts /
@@ -973,7 +1066,7 @@ jobs:
       # The gate is the last worker-job step that can fail productive work: publish (commit/push/PR)
       # now runs in the separate `publish` job (issue #125), so this keys off the gate/bundle outcome.
       - name: Preserve live-attempt failure signal (annotation only)
-        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' && steps.trust.outcome == 'success' && steps.gate.outcome != 'success' }}
+        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.stage.outputs.exhausted != 'true' && needs.stage.outputs.trust_outcome == 'success' && steps.gate.outcome != 'success' }}
         continue-on-error: true
         env:
           GATE_OUTCOME: ${{ steps.gate.outcome }}
@@ -989,16 +1082,18 @@ jobs:
 
   # Token-bearing publisher on a CLEAN runner (issue #125). The worker job executes model- and
   # gate-authored target code HOST-side, so a contents/issues/PR-capable App token must NEVER be
-  # co-located with it after that code runs: gated code could poison registry/scripts, plant .git
-  # hooks, or shim $GITHUB_PATH to capture the token or publish arbitrary changes. This job runs NO
-  # target code — it mints its own token (a fresh 60-minute TTL window), checks out a CLEAN registry
-  # and a CLEAN target at the digest-bound base, verifies the pre-gate patch against the host-derived
-  # digest, applies it as DATA with hooks disabled, and only then commits/pushes/opens the DRAFT PR.
-  # Follow-up filing and the final issue-state write live here too — they carried the same token.
+  # co-located with that job AT ALL (review round 2): even a token minted before the untrusted
+  # code runs stays valid in runner-process memory until post-job revocation, where gated code
+  # could poison registry/scripts, plant .git hooks, or shim $GITHUB_PATH to capture it or publish
+  # arbitrary changes. This job runs NO target code — it mints its own token (a fresh 60-minute
+  # TTL window), checks out a CLEAN registry and a CLEAN target at the digest-bound base, verifies
+  # the pre-gate patch against the host-derived digest, applies it as DATA with hooks disabled,
+  # and only then commits/pushes/opens the DRAFT PR. Follow-up filing and the final issue-state
+  # write live here too — they carried the same token.
   publish:
     name: Publish DRAFT target PR from a clean runner (no target code runs here)
     if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
-    needs: [resolve, claim, worker]
+    needs: [resolve, claim, stage, worker]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -1066,9 +1161,9 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_DIR: ${{ github.workspace }}/target
           TARGET_REPO: ${{ inputs.target_repo }}
-          TARGET_DEFAULT_BRANCH: ${{ needs.worker.outputs.default_branch }}
-          TARGET_BOT_LOGIN: ${{ needs.worker.outputs.bot_login }}
-          TARGET_BOT_ID: ${{ needs.worker.outputs.bot_id }}
+          TARGET_DEFAULT_BRANCH: ${{ needs.stage.outputs.default_branch }}
+          TARGET_BOT_LOGIN: ${{ needs.stage.outputs.bot_login }}
+          TARGET_BOT_ID: ${{ needs.stage.outputs.bot_id }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           WORKER_ROOT: ${{ runner.temp }}/publish-root
           WORKER_BRANCH: ${{ needs.worker.outputs.branch }}
@@ -1109,9 +1204,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           ACQUIRED: ${{ needs.claim.outputs.acquired }}
-          EXHAUSTED: ${{ needs.worker.outputs.exhausted }}
-          TRUST_OUTCOME: ${{ needs.worker.outputs.trust_outcome }}
-          ATTEMPT_NUMBER: ${{ needs.worker.outputs.attempt_number }}
+          EXHAUSTED: ${{ needs.stage.outputs.exhausted }}
+          TRUST_OUTCOME: ${{ needs.stage.outputs.trust_outcome }}
+          ATTEMPT_NUMBER: ${{ needs.stage.outputs.attempt_number }}
           MAX_ATTEMPTS: ${{ needs.resolve.outputs.max_attempts }}
           PR_URL: ${{ steps.pr.outputs.pr_url }}
         run: |
@@ -1148,7 +1243,7 @@ jobs:
   provenance:
     name: Record implementer provenance (no target code runs here)
     if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.publish.outputs.pr_number != '' }}
-    needs: [resolve, claim, worker, publish]
+    needs: [resolve, claim, stage, worker, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1176,7 +1271,7 @@ jobs:
             --impl-alias "${{ needs.claim.outputs.model }}" \
             --issue "${{ inputs.issue_number }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
-            --verify-bot-login "${{ needs.worker.outputs.bot_login }}"
+            --verify-bot-login "${{ needs.stage.outputs.bot_login }}"
 
       - name: Mint App token for the review-state stamp
         id: app-token-stamp

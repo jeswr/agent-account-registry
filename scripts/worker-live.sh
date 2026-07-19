@@ -163,6 +163,46 @@ _extract_reset_hint() {
 # GitHub APIs, so the previous `--env GH_TOKEN` passthrough was an unused write-capable credential
 # handed to a model reading hostile content — the forge-extra-commits vector. The only credential
 # in the container is the model's own provider credential in the isolated HOME.
+# PURE model-containment guard (issue #125 review round 2, finding 1): every trust property of
+# the digest-bound handoff (host-derived bundle_sha256, pre-gate snapshot) rests on the model
+# container never seeing the registry checkout — the bundle producer is THIS script. Refuse any
+# bind-mount spec whose source is the registry root or lives inside it, so a future mount edit
+# that exposes the bundling/gating code to the model fails the launch closed (and the self-test
+# proves both the accept and the refuse direction).
+_assert_mounts_exclude_registry() {
+  local registry_root=$1
+  shift
+  [[ -n "$registry_root" && "$registry_root" != / ]] || die 'registry root is unsafe'
+  local spec src
+  for spec in "$@"; do
+    [[ "$spec" == type=bind,src=* ]] || die "unexpected model mount spec: $spec"
+    src=${spec#type=bind,src=}
+    src=${src%%,*}
+    if [[ "$src" == "$registry_root" || "$src" == "$registry_root"/* ]]; then
+      die 'refusing to bind-mount the registry checkout into the model container'
+    fi
+  done
+}
+
+# PURE: print the two-space-indented `worker:` job section of a workflow file (job keys are the
+# only two-space-indented `name:`-shaped lines in our workflows; steps sit deeper).
+_worker_job_section() {
+  awk '/^  [A-Za-z_-]+:[[:space:]]*$/ { injob = ($0 == "  worker:") } injob { print }' "$1"
+}
+
+# PURE token-posture checker (issue #125 review round 2, finding 2): the `worker` job executes
+# the untrusted model and then target cargo HOST-side (the gate), so it must NEVER mint a
+# write-capable App token — a token minted "early" still sits in runner-process memory, valid
+# until post-job revocation, squarely in the hostile blast radius. Every write-capable mint
+# lives in the clean stage/publish/provenance jobs instead. Prints the count of write-permission
+# mint lines inside the worker job (comment lines excluded), which must be 0.
+_worker_job_write_mints() {
+  local wf=$1
+  [[ -f "$wf" ]] || die "workflow file missing: $wf"
+  _worker_job_section "$wf" | grep -v '^[[:space:]]*#' |
+    grep -c 'permission-[a-z-]*:[[:space:]]*write' || true
+}
+
 _run_headless_harness() {
   local prompt_file=$1 mutation_mode=$2
   local worker_root=${WORKER_ROOT:-}
@@ -216,7 +256,21 @@ _run_headless_harness() {
     --file "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
     --tag "$image" \
     "$image_context" > "$worker_root/model-image.id"
-  # shellcheck disable=SC2054  # comma-separated Docker mount/tmpfs options are single elements
+  # shellcheck disable=SC2054  # comma-separated Docker mount options are single elements
+  local -a mounts=(
+    "type=bind,src=$TARGET_DIR,dst=/workspace"
+    "type=bind,src=$TARGET_DIR/.git,dst=/workspace/.git,readonly"
+    "type=bind,src=$worker_root/home,dst=/home/worker"
+    "type=bind,src=$worker_root/cli,dst=/opt/model-cli,readonly"
+  )
+  # Containment tripwire (issue #125 review round 2, finding 1): the digest-bound publish handoff
+  # is trustworthy only because the model can NEVER reach the registry checkout — the tree holding
+  # this very script, which the workflow later runs host-side as the bundle producer and gate.
+  # Refuse the launch outright if any bind mount reaches the registry tree.
+  local registry_root
+  registry_root=$(cd -- "$SCRIPT_DIR/.." && pwd)
+  _assert_mounts_exclude_registry "$registry_root" "${mounts[@]}"
+  # shellcheck disable=SC2054  # comma-separated Docker tmpfs options are single elements
   local -a container=(
     docker run --rm --interactive
     --user "$(id -u):$(id -g)"
@@ -226,16 +280,16 @@ _run_headless_harness() {
     --security-opt no-new-privileges
     --pids-limit 512
     --tmpfs /tmp:rw,nosuid,nodev,exec,size=1g
-    --mount "type=bind,src=$TARGET_DIR,dst=/workspace"
-    --mount "type=bind,src=$TARGET_DIR/.git,dst=/workspace/.git,readonly"
-    --mount "type=bind,src=$worker_root/home,dst=/home/worker"
-    --mount "type=bind,src=$worker_root/cli,dst=/opt/model-cli,readonly"
     --env HOME=/home/worker
     --env CODEX_HOME=/home/worker/.codex
     --env CARGO_HOME=/home/worker/.cargo
     --env RUSTUP_HOME=/usr/local/rustup
     --env PATH=/opt/model-cli/node_modules/.bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   )
+  local mount_spec
+  for mount_spec in "${mounts[@]}"; do
+    container+=(--mount "$mount_spec")
+  done
   # Defensive invariant for the deny/review posture: assert nothing GitHub-shaped is forwarded.
   local argv_item
   for argv_item in "${container[@]}"; do
@@ -1879,6 +1933,47 @@ TOML
     "$( [[ -e "$bdrt/add.txt" ]] && echo leaked || echo clean )" "clean"
   chk "a refused dirty-tree reconstruct never applied the bundled modification" \
     "$(cat "$bdrt/mod.txt" 2>/dev/null)" "old"
+
+  # --- model containment (issue #125 review round 2, finding 1): the digest-bound handoff is
+  # host-derived ONLY because the model container can never reach the registry checkout (this
+  # script — the bundle producer the workflow later executes). Prove the launch guard accepts the
+  # real sibling layout and refuses any mount whose source is, or sits inside, the registry. ---
+  chk "mount guard accepts target/home/cli mounts outside the registry" \
+    "$( _assert_mounts_exclude_registry /srv/registry \
+          "type=bind,src=/srv/target,dst=/workspace" \
+          "type=bind,src=/srv/target/.git,dst=/workspace/.git,readonly" \
+          "type=bind,src=/srv/wr/home,dst=/home/worker" \
+          "type=bind,src=/srv/wr/cli,dst=/opt/model-cli,readonly" >/dev/null 2>&1 && echo ok )" "ok"
+  chk "mount guard refuses a mount inside the registry checkout" \
+    "$( ( _assert_mounts_exclude_registry /srv/registry \
+          "type=bind,src=/srv/registry/scripts,dst=/workspace" ) >/dev/null 2>&1 || echo refused )" \
+    "refused"
+  chk "mount guard refuses the registry root itself" \
+    "$( ( _assert_mounts_exclude_registry /srv/registry \
+          "type=bind,src=/srv/registry,dst=/workspace" ) >/dev/null 2>&1 || echo refused )" \
+    "refused"
+  # a registry-PREFIXED sibling (e.g. /srv/registry-worker) is NOT inside the checkout — the real
+  # WORKER_ROOT lives at such a path, so an over-broad prefix match would break every launch.
+  chk "mount guard accepts a registry-prefixed sibling path" \
+    "$( _assert_mounts_exclude_registry /srv/registry \
+          "type=bind,src=/srv/registry-worker/home,dst=/home/worker" >/dev/null 2>&1 && echo ok )" "ok"
+
+  # --- hostile-job token posture (issue #125 review round 2, finding 2): the worker job runs the
+  # model and the host-side cargo gate, so it must never mint a write-capable App token (pre-run
+  # issue writes live in `stage`; publish-side writes in `publish`/`provenance`). Assert the REAL
+  # workflow keeps every worker-job mint read-only, that the section extractor actually captured
+  # the job (the read-only checkout mint is present), and that the checker trips on a fixture
+  # whose worker-job mint is widened to write — non-vacuous in both directions. ---
+  local wf="$SCRIPT_DIR/../.github/workflows/worker.yml"
+  chk "hostile worker job mints no write-capable App token" \
+    "$(_worker_job_write_mints "$wf")" "0"
+  chk "worker job section extractor finds the read-only checkout mint" \
+    "$(_worker_job_section "$wf" | grep -v '^[[:space:]]*#' |
+        grep -c 'permission-contents:[[:space:]]*read' || true)" "1"
+  sed 's/permission-contents: read/permission-contents: write/' "$wf" > "$tmp/worker-widened.yml"
+  chk "checker trips when the worker-job mint is widened to write" \
+    "$( [[ "$(_worker_job_write_mints "$tmp/worker-widened.yml")" -gt 0 ]] && echo refused )" \
+    "refused"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
