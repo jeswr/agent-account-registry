@@ -13,12 +13,16 @@
 # UNAVAILABLE, never "0% used". A wholesale probe failure (empty usage with a configured pool) therefore
 # classifies EVERY account UNAVAILABLE and always fires the alert — the exact case that used to no-op.
 #
-# Privacy (locked decision 22, issue #107): raw account handles are emitted ONLY over a VERIFIED
-# private route — ALERT_REPO together with an ALERT_TOKEN that can write to it. EVERY fallback to the
-# public registry repo carries aggregate counts only, never a handle (decision 22a): both the
-# half-configured case (ALERT_REPO set, ALERT_TOKEN missing — writing to the private repo under the
-# ambient token that can't reach it would fail silently and drop the alert, issue #39) AND the
-# fully-unconfigured case (no ALERT_REPO) redact. Account handles never appear in workflow logs.
+# Privacy (locked decision 22, issue #107; sol-audit issue #204): the DETAILED body — raw account
+# handles AND per-account/aggregate counts, pool size, and reset times — is emitted ONLY over a
+# VERIFIED private route: ALERT_REPO together with an ALERT_TOKEN that can write to it. EVERY
+# fallback to the public registry repo carries ONLY a generic, non-compositional "availability is
+# degraded" signal — never a handle, never a count, never a reset time (issue #204: even the
+# aggregate capped/unavailable/ok counts disclose the worker-account fleet on a public repo). This
+# covers both the half-configured case (ALERT_REPO set, ALERT_TOKEN missing — writing to the
+# private repo under the ambient token that can't reach it would fail silently and drop the alert,
+# issue #39) AND the fully-unconfigured case (no ALERT_REPO). Account handles never appear in
+# workflow logs.
 # Writes go through _gh(check=True), which surfaces a non-zero gh returncode as a sanitized
 # ::warning:: (op + returncode only — never gh stderr, which can echo request bodies under
 # GH_DEBUG=api).
@@ -78,15 +82,16 @@ def _util(value):
 
 
 def _alert_route(alert_repo, alert_token, registry_repo):
-    """(repo, token, redact_handles) for the alert issue (issue #107/#39, privacy d22c). The
-    account-enumerating body is emitted ONLY over a VERIFIED private route — ALERT_REPO together
-    with an ALERT_TOKEN that can write there. EVERY fallback to the registry repo REDACTS account
-    handles to aggregate counts, because that repo is public (decision 22a): a public alert must
-    never publish raw account identifiers (issue #107). This covers BOTH the half-configured case
-    (ALERT_REPO set, ALERT_TOKEN missing — where writing to the private repo under the ambient
-    registry token would fail silently and drop the alert, issue #39) AND the fully-unconfigured
-    case (no ALERT_REPO at all). token=None means "use the ambient GH_TOKEN"; the write still fails
-    loud via _gh(check=True) (review r1)."""
+    """(repo, token, redact_handles) for the alert issue (issue #107/#39/#204, privacy d22c). The
+    DETAILED body — account handles AND per-account/aggregate counts, pool size, and reset times —
+    is emitted ONLY over a VERIFIED private route: ALERT_REPO together with an ALERT_TOKEN that can
+    write there. EVERY fallback to the registry repo REDACTS to a generic, non-compositional
+    degraded signal, because that repo is public: a public alert must never publish raw account
+    identifiers (issue #107) NOR the counts/reset times that compositionally disclose the fleet
+    (issue #204). This covers BOTH the half-configured case (ALERT_REPO set, ALERT_TOKEN missing —
+    where writing to the private repo under the ambient registry token would fail silently and drop
+    the alert, issue #39) AND the fully-unconfigured case (no ALERT_REPO at all). token=None means
+    "use the ambient GH_TOKEN"; the write still fails loud via _gh(check=True) (review r1)."""
     if alert_repo and alert_token:
         return alert_repo, alert_token, False
     return registry_repo, None, True
@@ -143,35 +148,39 @@ def classify(pool, usage, margin, now=None):
 
 
 def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redact_handles=False):
-    lines = ["> 🤖 SPARQ agent — automated worker-account availability check.\n"]
+    header = "> 🤖 SPARQ agent — automated worker-account availability check.\n"
+    if redact_handles:
+        # PUBLIC-registry fallback (issue #107, #39, #204): whenever the alert lands on the PUBLIC
+        # registry repo — because no verified private route is configured, or only a
+        # half-configured one (ALERT_REPO set, ALERT_TOKEN missing) — it carries ONLY a generic,
+        # NON-COMPOSITIONAL degraded signal. Issue #204 (sol-audit): even aggregate counts and the
+        # pool size are a compositional disclosure of the worker-account fleet, so the public body
+        # emits NO account handles, NO per-account/aggregate counts, NO pool size, and NO reset
+        # times — nothing but "availability is degraded" plus how to open the private channel. All
+        # per-account (and per-count) detail requires the verified private ALERT_REPO+ALERT_TOKEN
+        # route.
+        return "\n".join([
+            header,
+            "⚠️ **Worker-account availability is DEGRADED and needs maintainer action.**\n",
+            "Per-account detail — how many accounts are affected, which are capped vs. "
+            "unavailable, and any reset times — is SUPPRESSED here because this alert landed on "
+            "the **public** registry repo, where those counts would themselves disclose the "
+            "worker-account fleet. To receive the full breakdown privately, configure a private "
+            "`ALERT_REPO` together with an `ALERT_TOKEN` secret that can write to it (the private "
+            "route is used only when BOTH are set).\n",
+            f"@{maintainer} — autonomous worker throughput is **degraded**. Open the private alert "
+            "channel above to see which accounts to reset (`claude setup-token`) or re-token "
+            "(codex `login --device-auth`). This issue updates itself and closes automatically "
+            "when availability recovers.",
+        ])
+    lines = [header]
     if probe_empty:
         lines.append("🚨 **The usage probe returned NO data — dispatch is holding fail-closed.** "
                      "This is a probe/secret-infrastructure failure (malformed secrets, endpoint or "
                      "header change, curl outage), not N individually capped accounts.\n")
     lines.append(f"**Usable workers: {eligible}/{len(pool)}**  (degraded below {threshold}).\n")
-    if redact_handles:
-        # Public-registry fallback (issue #107, #39, review r1): whenever the alert lands on the
-        # PUBLIC registry repo — because no verified private route is configured, or only a
-        # half-configured one (ALERT_REPO set, ALERT_TOKEN missing) — it carries aggregate counts
-        # only, never an account handle (decision 22a). Per-account detail requires the verified
-        # private ALERT_REPO+ALERT_TOKEN route.
-        capped = sum(1 for _h, s, _ok in rows if s.startswith("CAPPED"))
-        unavailable = sum(1 for _h, s, _ok in rows if s.startswith("UNAVAILABLE"))
-        backed_off = sum(1 for _h, s, _ok in rows if s.startswith("BACKED OFF"))
-        # healthy comes from ok_bool, never len-minus-categories (cross-provider review r3
-        # finding 4): a BACKED OFF row is neither capped nor unavailable, so the remainder
-        # arithmetic counted it healthy — "Usable workers: 0/1" alongside "✅ ok: 1".
-        ok_count = sum(1 for _h, _s, ok_bool in rows if ok_bool)
-        lines.append(f"- ⛔ capped: {capped} · unavailable: {unavailable} · backed off: "
-                     f"{backed_off} · ✅ ok: {ok_count}")
-        lines.append("\n⚠️ Per-account detail suppressed: this alert landed on the **public** "
-                     "registry repo, so it lists aggregate counts only — never account handles. To "
-                     "receive per-account detail privately, configure a private `ALERT_REPO` "
-                     "together with an `ALERT_TOKEN` secret that can write to it (a route is used "
-                     "only when BOTH are set).")
-    else:
-        for h, s, ok in rows:
-            lines.append(f"- {'✅' if ok else '⛔'} `{h}`: {s}")
+    for h, s, ok in rows:
+        lines.append(f"- {'✅' if ok else '⛔'} `{h}`: {s}")
     if eligible < threshold:
         lines.append(f"\n@{maintainer} — autonomous worker throughput is **degraded**. To restore it: reset the "
                      "usage window on any `CAPPED` subscription account, and rotate the token for any "
@@ -236,6 +245,13 @@ def main():
     # Privacy (locked decision 22b): NOTHING printed to the (public) workflow log carries an account
     # handle, a per-provider count, or the pool size — the detail lives only in the alert issue body.
     if degraded:
+        if redact_handles:
+            # FAIL LOUD (issue #204): a degraded fleet is being alerted with per-account detail
+            # SUPPRESSED because no verified private ALERT_REPO+ALERT_TOKEN route is configured.
+            # The public issue carries only a generic signal; say so in the (public) log — with no
+            # handle, count, or pool size — so the missing private channel is visible to operators.
+            print("::warning::usage-alert: no verified private ALERT_REPO+ALERT_TOKEN route — "
+                  "per-account detail SUPPRESSED; the public alert carries a generic signal only")
         if num:
             _gh(["issue", "edit", str(num), "-R", repo, "--body", body], capture=True,
                 token=alert_token, check=True)
@@ -319,25 +335,32 @@ def _self_test():
         _alert_route("", "", "org/registry"), ("org/registry", None, True))
     chk("route: None repo/token -> registry fallback, REDACTED (#107)",
         _alert_route(None, None, "org/registry"), ("org/registry", None, True))
-    # Redacted fallback body (review r1): the half-configured route must never put an account
-    # handle on the public registry repo — counts only, plus the fix-it hint.
+    # Redacted PUBLIC-registry fallback (issue #204): the body must carry NEITHER an account
+    # handle NOR any count/pool-size/reset time — only a generic degraded signal plus the
+    # private-route fix-it hint. rrows deliberately carries a capped %, a reset marker and an ok
+    # row so a regression that re-enumerates counts/resets goes RED here.
     rrows = [("acct-priv-h1", "CAPPED — 5h window 95% used, resets t", False),
              ("acct-priv-h2", "UNAVAILABLE — token invalid/expired or probe failed", False),
              ("acct-priv-h3", "ok — 5h 10%, 7d 20%", True)]
     red = render(1, rrows, ["p", "q", "r"], 2, "m", redact_handles=True)
     chk("redacted body carries no handle",
         ("acct-priv-h1" in red, "acct-priv-h2" in red, "acct-priv-h3" in red), (False, False, False))
-    chk("redacted body keeps counts + hint",
-        ("capped: 1" in red, "unavailable: 1" in red, "✅ ok: 1" in red, "ALERT_TOKEN" in red),
+    chk("redacted body carries NO counts, NO pool size, NO reset time (#204)",
+        ("capped: " in red, "unavailable: " in red, "✅ ok: " in red, "Usable workers" in red,
+         "1/3" in red, "95%" in red),
+        (False, False, False, False, False, False))
+    chk("redacted body keeps the generic degraded signal + private-route hint",
+        ("DEGRADED" in red, "SUPPRESSED" in red, "ALERT_REPO" in red, "ALERT_TOKEN" in red),
         (True, True, True, True))
-    # a BACKED OFF row is NOT healthy in the redacted render (cross-provider review r3 finding 4):
-    # ok comes from ok_bool, and the backed-off state gets its own visible category — one active
-    # backoff must not read as "Usable workers: 0/1" next to "✅ ok: 1"
+    # Issue #204: the redacted PUBLIC body enumerates NO categories at all — not even a backed-off
+    # count — and no reset epoch. The handle, the "x2" hit count and the "epoch 99" reset must all
+    # be absent (a regression that re-adds the aggregate category line goes RED here).
     rback = render(0, [("acct-priv-h4", "BACKED OFF — provider rate limit hit (x2); resumes at "
                         "epoch 99 (self-clearing)", False)], ["p"], 1, "m", redact_handles=True)
-    chk("redacted backed-off row counted backed-off, not ok",
-        ("backed off: 1" in rback, "✅ ok: 0" in rback, "acct-priv-h4" in rback),
-        (True, True, False))
+    chk("redacted backed-off row leaks no handle, no count, no reset epoch (#204)",
+        ("backed off: " in rback, "x2" in rback, "epoch 99" in rback, "acct-priv-h4" in rback,
+         "0/1" in rback),
+        (False, False, False, False, False))
     # _gh(check=True) fail-loud + sanitization (review r1): a non-zero gh returncode must emit a
     # ::warning:: naming the op + rc, and must NOT republish gh stderr (GH_DEBUG=api can echo the
     # request body) nor any argument content.
@@ -400,9 +423,11 @@ def _self_test():
     body_arg = created[created.index("--body") + 1] if created and "--body" in created else ""
     repo_arg = created[created.index("-R") + 1] if created and "-R" in created else ""
     chk("main() half-configured: alert created on the REGISTRY repo", repo_arg, "org/registry")
-    chk("main() half-configured: body is redacted END-TO-END",
-        ("acct-wire-h1" in body_arg, "acct-wire-h2" in body_arg, "unavailable: 2" in body_arg),
-        (False, False, True))
+    chk("main() half-configured: body is generic END-TO-END — no handles, no counts, no pool "
+        "size (#204)",
+        ("acct-wire-h1" in body_arg, "acct-wire-h2" in body_arg, "unavailable: " in body_arg,
+         "Usable workers" in body_arg, "SUPPRESSED" in body_arg, "ALERT_TOKEN" in body_arg),
+        (False, False, False, False, True, True))
     # END-TO-END #107 guard: the FULLY-UNCONFIGURED case (no ALERT_REPO at all) must ALSO land on
     # the public registry repo with account handles redacted. This is the exact defect issue #107
     # names — the old `redact_handles = bool(alert_repo)` published raw handles here. Reverting the
@@ -438,9 +463,10 @@ def _self_test():
     body2 = created2[created2.index("--body") + 1] if created2 and "--body" in created2 else ""
     repo2 = created2[created2.index("-R") + 1] if created2 and "-R" in created2 else ""
     chk("main() unconfigured (#107): alert created on the public REGISTRY repo", repo2, "org/registry")
-    chk("main() unconfigured (#107): body is redacted END-TO-END (no raw handles)",
-        ("acct-wire-h1" in body2, "acct-wire-h2" in body2, "unavailable: 2" in body2),
-        (False, False, True))
+    chk("main() unconfigured (#107/#204): body is generic END-TO-END — no handles, no counts",
+        ("acct-wire-h1" in body2, "acct-wire-h2" in body2, "unavailable: " in body2,
+         "Usable workers" in body2, "SUPPRESSED" in body2, "ALERT_TOKEN" in body2),
+        (False, False, False, False, True, True))
     # Probe-exempt backoff surfacing (decision 2026-07-17, registry issue #29): an exempt account
     # is `ok` by design (never probe-missing), but an ACTIVE backoff is surfaced + not eligible,
     # an EXPIRED one clears, and a forged/malformed stamp fails open to `ok` (never crashes).

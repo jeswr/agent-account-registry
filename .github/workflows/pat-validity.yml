@@ -68,4 +68,13 @@ jobs:
           # read-only PAT.
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
+          # sol-audit #204: route the DETAILED credential alert (verdict + diagnostic detail +
+          # calendar expiry) to a VERIFIED private repo. Same routing as model-health/usage-alert
+          # (decision 22c + the #39 fix): ALERT_REPO is honoured only alongside an ALERT_TOKEN that
+          # can write there; without a usable private route the alert falls back to a GENERIC
+          # public signal on the registry (no verdict/detail/expiry) and the run warns loudly. The
+          # probe-unavailable page (#207) and the streak variable carry no validity/expiry, so they
+          # stay on the registry with the ambient GH_TOKEN.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
         run: python3 scripts/pat-validity.py
