@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 428,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "efd68a4fcb6bd3ad47d8a0cc3c376a072231aa96",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new branch correctly refuses to silently degrade when actionlint is absent, but the adjacent comment states that the worker gate lane never installs actionlint. This diff does not provision it. Therefore every change classified as `wf:` dies at `command -v actionlint` in the actual worker lane, even when the workflow is valid. The separate PR-gate workflow installation does not put the binary into this worker process. This is fail-closed but incomplete and blocks all legitimate workflow maintenance.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Provision a version-pinned, checksum-verified actionlint binary in the worker environment or in the worker gate setup before `registry_selftest_gate` runs, and add a test that exercises both the available-tool success path and the unavailable-tool failure path. Keep the new fatal behavior when provisioning is missing or verification fails.",
+    "severity": "major",
+    "title": "Workflow changes are made permanently unpassable in the worker gate lane"
+   }
+  ],
+  "progress": null,
+  "summary": "The new direct-target accounting is internally consistent and the selector assertions are non-vacuous, but the workflow path is not operationally complete. The code explicitly notes that the worker gate lane does not install actionlint, then makes its absence fatal without adding a pinned installation or otherwise provisioning it. Consequently, an otherwise valid change touching any workflow is guaranteed to fail in that lane. Fail-closed behavior is appropriate, but a gate that cannot succeed for a supported trust-surface change is not a complete implementation.",
+  "verdict": "request_changes"
+ }
+}
