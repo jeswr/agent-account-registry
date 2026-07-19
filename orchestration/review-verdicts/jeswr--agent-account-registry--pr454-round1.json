@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 454,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d2c2acaac26d75f05ca0aaf205fcaa20a74bad73",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The live base/default validation is performed only after `decide_budget`. Before reaching it, `budget[\"action\"] == \"needs-user\"` calls `_pr_needs_user`, and `extend-model-pin` calls `worker-pr.py record-model-pin`. Thus a retargeted or unresolved-base needs-review PR is not actually removed from the loop before mutation: depending on its round posture, it can be relabeled/commented or have a durable pin recorded and then either exit or finally defer. The new test uses a pending top-tier fix posture whose budget action performs no mutation, so its `helper_calls == []` assertion cannot catch this ordering defect.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Validate the live PR base ref against the protected default branch before comments/budget processing or any helper capable of mutating the PR. Add a regression posture that would otherwise take `needs-user` or `extend-model-pin`, retarget it, and assert that no helper is called and no allocator claim is attempted.",
+    "severity": "major",
+    "title": "Base admission check occurs after mutation-capable budget handling"
+   }
+  ],
+  "progress": null,
+  "summary": "The new base-ref check is directionally correct and the added test proves that the selected pending-fix posture does not claim a reviewer. However, the check is placed after budget processing that can mutate the PR. A retargeted PR can therefore receive autonomous needs-user or model-pin mutations before it is excluded, contradicting the stated admission invariant and fail-closed/no-mutation intent. The regression test does not exercise either mutation-capable budget path.",
+  "verdict": "request_changes"
+ }
+}
