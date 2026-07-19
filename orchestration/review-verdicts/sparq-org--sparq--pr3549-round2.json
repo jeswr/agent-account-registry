@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "scan_records returns `(records, off, true)` whenever a checksum mismatch occurs on a record whose declared end equals EOF. Journal::open then truncates the file to `off`. This is not evidence of an unacknowledged torn append: after Journal::append returns, the complete final record has been written and sync_data'd, yet later bit corruption of its payload or checksum takes this same branch. The existing garbled_final_record test explicitly accepts silent loss. That contradicts the documented durable-append guarantee and the claim that corruption fails closed, and it can roll the envelope frontier backward after acknowledged success.",
+   "file": "crates/sparq-crdt/src/journal.rs",
+   "fix_hint": "Treat a checksum mismatch on any complete frame, including the final frame, as CorruptJournal. Reserve torn-tail truncation for structurally incomplete frame headers or payloads that run past EOF. Update the final-record corruption test to require CorruptJournal while retaining the partial-prefix crash tests as the truncation cases. If recovery from a fully written but uncommitted frame is required, add an explicit commit marker/protocol that can distinguish it from corruption rather than inferring from EOF position.",
+   "severity": "major",
+   "title": "Final-record checksum corruption silently discards acknowledged data"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The round-1 u64::MAX overflow is fixed: missing_intervals now uses checked successor arithmetic, handles exhaustion explicitly, and has non-vacuous boundary tests for clock and cloud cases. However, journal recovery still violates its durable/fail-closed contract. scan_records treats any checksum mismatch on the final complete record as a torn, unacknowledged tail and Journal::open truncates it. A record that append already write_all'd and sync_data'd can later suffer corruption while remaining the final record; reopening then silently loses an acknowledged envelope and rolls back the frontier. Because this is a newly recorded major finding despite the prior one being resolved, progress is regressing under the mandated scale.",
+ "verdict": "request_changes"
+}
