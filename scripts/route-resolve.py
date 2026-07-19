@@ -20,12 +20,34 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
 
-class AmbiguousRoleError(ValueError):
-    """A malformed issue carries more than one role:* label — reject, never guess (fail-closed).
+class RoleResolutionError(ValueError):
+    """Base for a fail-closed role-validation failure: a malformed role:* set must DEFER/DIE, never
+    resolve to a permissive default. resolve() raises a SUBCLASS so a caller (dispatch-plan) can
+    reject the issue as one class. Mirrors policy-resolve.resolve (the CLAIM-side resolver), which
+    raises PolicyError on the SAME three malformed-role cases — empty value, ambiguous set, unknown
+    role — all BEFORE any route match, so PLAN and CLAIM agree on which issues never route (#122).
+    """
 
-    Mirrors policy-resolve.resolve (the CLAIM-side resolver), which raises PolicyError on multiple
-    roles. resolve() distinguishes this from a ROLELESS issue (which legitimately routes to
-    security/defaults) so ambiguous input can never fall through to a permissive default (#122).
+
+class AmbiguousRoleError(RoleResolutionError):
+    """More than one distinct role:* label — reject, never guess. Mirrors policy-resolve's
+    ``len(roles) > 1`` check. resolve() distinguishes this from a ROLELESS issue (which legitimately
+    routes to security/defaults) so ambiguous input can never fall to a permissive default (#122).
+    """
+
+
+class EmptyRoleError(RoleResolutionError):
+    """A role:* label with an EMPTY value (a bare ``role:``). Mirrors policy-resolve's
+    ``any(not role ...)`` check. Without it ``role`` became "" and, matching no role route, fell
+    through to Phase-3 defaults — a permissive route CLAIM rejects (empty role value).
+    """
+
+
+class UnknownRoleError(RoleResolutionError):
+    """A single role with NO explicit role route in routing.toml. Mirrors policy-resolve's
+    ``role not in role_routes`` check. Without it an unconfigured role fell through to Phase-3
+    defaults (or became a default-routed planner row), only to be rejected downstream at CLAIM —
+    the exact PLAN/CLAIM divergence this resolver exists to prevent. Must DIE here, not route.
     """
 
 
@@ -37,27 +59,33 @@ def resolve(labels, doc):
     before ANY role rule; within each phase the first match wins. The old single-pass first-match
     let a role block that preceded a matching security block win, planning a chain CLAIM rejects.
 
-    RAISES AmbiguousRoleError when the issue carries more than one distinct role:* label — the
-    ambiguity guard precedes route matching (as in policy-resolve.resolve), so a malformed issue
-    can never resolve to a security/defaults route regardless of a caller's own precheck.
+    RAISES a RoleResolutionError subclass for a MALFORMED role:* set — more than one distinct role
+    (AmbiguousRoleError), an empty value like a bare ``role:`` (EmptyRoleError), or a single role
+    with no explicit role route (UnknownRoleError). All three checks precede route matching (exactly
+    as in policy-resolve.resolve: empty > ambiguous > unknown, then routing), so a malformed issue
+    can never resolve to a security/role/defaults route regardless of a caller's own precheck.
     """
     labels = set(labels)
-
-    def role_of(lbs):
-        # The SINGLE declared role, or None when ROLELESS. RAISES on an AMBIGUOUS set (>1 distinct
-        # role:*) rather than silently returning None: returning None collapsed ambiguity into the
-        # roleless case and let a multi-role issue fall to a security/defaults route (default-allow)
-        # for any caller that skips the planner precheck. This matches policy-resolve.resolve, which
-        # REJECTS multiple roles, and complements the planner (dispatch-plan.plan_dispatch), which
-        # skips an ambiguous issue before it reaches here (#122). Never picks one of several roles.
-        roles = {lb[5:] for lb in lbs if lb.startswith("role:")}
-        if len(roles) > 1:
-            raise AmbiguousRoleError(
-                f"ambiguous role labels: {', '.join(sorted(roles))} — exactly one role:* required")
-        return next(iter(roles)) if roles else None
-
-    role = role_of(labels)
     routes = doc.get("route", [])
+    # The explicit role routes declared in routing.toml (role blocks, never security blocks); the
+    # unknown-role guard rejects any role absent from this set, mirroring policy-resolve's role_routes.
+    role_routes = {r.get("role") for r in routes if "match_labels" not in r and "role" in r}
+
+    # SINGLE declared role, or None when ROLELESS. A malformed set fails closed here, BEFORE any
+    # route match (same order as policy-resolve.resolve), so it can never slip into a security/role/
+    # defaults route: returning None collapsed ambiguity/empty/unknown into the roleless case and let
+    # a malformed issue fall to a permissive default — a chain CLAIM rejects, stranding the issue.
+    roles = {lb[5:] for lb in labels if lb.startswith("role:")}
+    if any(not r for r in roles):
+        raise EmptyRoleError("empty role:* value — exactly one non-empty role:* required")
+    if len(roles) > 1:
+        raise AmbiguousRoleError(
+            f"ambiguous role labels: {', '.join(sorted(roles))} — exactly one role:* required")
+    role = next(iter(roles)) if roles else None
+    if role is not None and role not in role_routes:
+        raise UnknownRoleError(
+            f"unknown role {role!r} — no matching role route in routing.toml")
+
     # Phase 1 — security-label overrides: any keyword is a substring of any label; first match wins.
     for r in routes:
         kws = r.get("match_labels")
@@ -83,12 +111,14 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
 
-    def raises_ambiguous(n, fn):
+    def raises(n, exc_type, fn):
         nonlocal ok
         try:
             fn()
-        except AmbiguousRoleError:
-            good, detail = True, "raised AmbiguousRoleError"
+        except exc_type as exc:
+            good, detail = True, f"raised {exc_type.__name__}: {exc}"
+        except Exception as exc:  # a DIFFERENT exception is still a failure (wrong fail-closed class)
+            good, detail = False, f"raised {type(exc).__name__} (want {exc_type.__name__})"
         else:
             good, detail = False, "did NOT raise (routed instead)"
         ok = ok and good
@@ -113,17 +143,33 @@ def _self_test():
     chk("ci chain has no sub-frontier tier", sorted(set(mc) & {"sonnet", "haiku"}), [])
     # no role -> defaults (sol-led, 2026-07-18).
     chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "sol")
-    # [#122] an AMBIGUOUS multi-role set is REJECTED, never silently routed. The pre-fix role_of
+    # [#122] an AMBIGUOUS multi-role set is REJECTED, never silently routed. An earlier resolver
     # returned None for >1 role, collapsing ambiguity into the roleless case so the set fell to a
     # security/defaults route (a default-allow path for any caller that skips the planner precheck).
     # resolve now RAISES AmbiguousRoleError, mirroring policy-resolve.resolve (CLAIM), which raises
     # PolicyError on multiple roles. Non-vacuous: the pre-fix code returned ("sol", ...) here.
-    raises_ambiguous("ambiguous roles rejected, not routed to a default",
-                     lambda: resolve(["role:impl", "role:docs", "area:usage"], doc))
+    raises("ambiguous roles rejected, not routed to a default", AmbiguousRoleError,
+           lambda: resolve(["role:impl", "role:docs", "area:usage"], doc))
     # the guard precedes route matching (as in policy-resolve), so a security label present on the
     # malformed issue does NOT let it slip past the ambiguity check into a security route.
-    raises_ambiguous("ambiguous roles rejected even with a security label present",
-                     lambda: resolve(["role:impl", "role:docs", "area:worker"], doc))
+    raises("ambiguous roles rejected even with a security label present", AmbiguousRoleError,
+           lambda: resolve(["role:impl", "role:docs", "area:worker"], doc))
+    # [#122 r2] a bare `role:` (EMPTY value) and an UNCONFIGURED `role:<name>` are ALSO rejected,
+    # not routed to Phase-3 defaults — the CLAIM-side policy-resolve.resolve rejects an empty role
+    # value and a role absent from role_routes, so PLAN must too or the two diverge. Non-vacuous:
+    # the pre-fix resolver returned the permissive defaults chain (("sol", ...)) for BOTH inputs.
+    raises("empty role value rejected, not routed to defaults", EmptyRoleError,
+           lambda: resolve(["role:", "area:usage"], doc))
+    raises("unknown role rejected, not routed to defaults", UnknownRoleError,
+           lambda: resolve(["role:unknown", "area:usage"], doc))
+    # like ambiguity, both malformed-single-role guards PRECEDE route matching, so a security label
+    # on the malformed issue cannot let it slip into a security route (matches policy-resolve order).
+    raises("empty role rejected even with a security label present", EmptyRoleError,
+           lambda: resolve(["role:", "area:worker"], doc))
+    raises("unknown role rejected even with a security label present", UnknownRoleError,
+           lambda: resolve(["role:unknown", "area:worker"], doc))
+    # a CONFIGURED single role with a matching route still resolves (guards do not over-reject).
+    chk("configured role still routes", resolve(["role:research"], doc)[1], "registry-researcher")
     # review role -> opus + escalate.
     chk("review -> opus/escalate", resolve(["role:review"], doc)[1:], ("registry-reviewer", True))
 
