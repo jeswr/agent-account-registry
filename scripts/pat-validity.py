@@ -37,8 +37,13 @@
 # becomes `expiring-soon`, which upserts the SAME rolling alert issue — a ::warning annotation
 # alone is only a green-run log entry, not an actionable alert.
 #
-# Verdicts (machine-readable JSON on stdout + GITHUB_OUTPUT `verdict=`):
+# Verdicts (GITHUB_OUTPUT `verdict=` — the runner-internal outputs file, rendered nowhere unless
+# a later step deliberately echoes it, and none does):
 #   valid | expiring-soon | invalid | insufficient-scope | network-unknown
+# PUBLIC-LOG REDACTION (sol review round 1 of #432): stdout lands in the PUBLIC registry repo's
+# workflow log whatever the alert route, so it carries ONLY a coarse
+# {"status": "ok"|"attention-required"|"unknown"} plus generic annotations — never the exact
+# verdict, the free-text detail, or the token's calendar expiry / days-left.
 # FAIL-CLOSED AGAINST FALSE ALARMS: an unreachable/throttled/5xx-ing API proves nothing about the
 # PAT, so `network-unknown` is NOT `invalid` — it neither opens the CREDENTIAL rolling alert NOR
 # closes an existing one (unknown is not recovery either). But a PERMANENT unknown (a dead proxy,
@@ -57,13 +62,19 @@
 #
 # Alerting mirrors usage-alert.py: ONE rolling `from:agent` issue, upserted by exact title —
 # edited when open, REOPENED (never duplicated) when closed, closed with a comment on recovery.
-# ROUTING (sol-audit issue #204): the DETAILED credential alert — verdict, diagnostic detail, and
-# calendar expiry — is emitted ONLY over a VERIFIED private route (ALERT_REPO + an ALERT_TOKEN that
-# can write there). EVERY fallback to the public registry repo REDACTS to a generic "needs
-# attention" signal carrying no verdict, no detail, and no expiry (a public issue must never
-# publish credential validity or lifecycle); the run also fails loud that the private route is
-# absent. The probe-unavailable page (#207) and the streak variable carry no validity/expiry, so
-# they stay on the registry with the ambient token.
+# ROUTING (sol-audit issue #204; hardened in #432 round 1): the DETAILED credential alert —
+# verdict, diagnostic detail, and calendar expiry — is emitted ONLY over a POSITIVELY VERIFIED
+# private route: ALERT_REPO distinct from the registry repo, ALERT_TOKEN set, AND the destination
+# CONFIRMED `"private": true` via GET /repos/{ALERT_REPO} under ALERT_TOKEN — configuration alone
+# (two non-empty strings) is NOT verification. EVERY other shape — unconfigured, half-configured,
+# same-repo, a public destination, or a failed/indeterminate visibility lookup — fails CLOSED to
+# the public registry with a REDACTED generic "needs attention" signal carrying no verdict, no
+# detail, and no expiry (a public issue must never publish credential validity or lifecycle); the
+# run also warns loud that the private route is absent. A verified private route whose token then
+# fails at lookup/write time RETRIES a separately rendered redacted alert on the registry (never
+# the detailed body), so a stale ALERT_TOKEN cannot drop the rolling credential signal. The
+# probe-unavailable page (#207) and the streak variable carry no validity/expiry, so they stay on
+# the registry with the ambient token.
 # The lookup is the PAGINATED Issues REST API (authoritative — no fixed --limit window that an
 # old closed alert could fall out of), and a FAILED lookup raises instead of writing: a blind
 # create on top of an unlisted existing issue would duplicate the roll. A FAILED WRITE raises
@@ -459,19 +470,28 @@ def render_alert(result, repo, redact=False):
     return "\n".join(lines)
 
 
-def _alert_route(alert_repo, alert_token, registry_repo):
-    """(repo, token, redact) for the CREDENTIAL alert (sol-audit issue #204). The DETAILED body —
-    the verdict, the free-text detail, and the token's calendar expiry — is emitted ONLY over a
-    VERIFIED private route: ALERT_REPO together with an ALERT_TOKEN that can write there. EVERY
-    fallback to the public registry repo REDACTS to a generic "needs attention" signal carrying no
-    verdict, no detail, and no expiry, because a public issue must never publish credential
-    validity or lifecycle. This covers BOTH the half-configured case (ALERT_REPO set, ALERT_TOKEN
-    missing — where the private write would fail under the ambient token and drop the alert) AND
-    the fully-unconfigured case (no ALERT_REPO). token=None means "use the ambient GH_TOKEN". The
-    probe-unavailable page (issue #207) and the streak variable carry NO validity/expiry, so they
-    stay on the registry with the ambient token — this route governs only the credential alert."""
+def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
+    """(repo, token, redact) for the CREDENTIAL alert (sol-audit issue #204; hardened in review
+    round 1 of #432). The DETAILED body — the verdict, the free-text detail, and the token's
+    calendar expiry — is emitted ONLY over a POSITIVELY VERIFIED private route: ALERT_REPO and
+    ALERT_TOKEN both set, ALERT_REPO distinct from the public registry repo (case-insensitive —
+    a "private route" naming the registry itself IS the public repo), AND the destination
+    CONFIRMED private by a live GET /repos/{ALERT_REPO} under ALERT_TOKEN. Configuration alone
+    (two non-empty strings) is NOT verification: it would fail OPEN on a same-repo or public
+    ALERT_REPO. EVERY other shape — unconfigured, half-configured, same-repo, public, or a
+    failed/indeterminate visibility lookup — falls back to the public registry with redact=True:
+    a generic "needs attention" signal carrying no verdict, no detail, and no expiry, because a
+    public issue must never publish credential validity or lifecycle. token=None means "use the
+    ambient GH_TOKEN". The probe-unavailable page (issue #207) and the streak variable carry NO
+    validity/expiry, so they stay on the registry with the ambient token — this route governs
+    only the credential alert. `confirmed_private` is injectable for the self-test; the default
+    performs the live lookup, and it is only consulted once both halves of the route are set (a
+    half-configured route needs no API call to be rejected)."""
     if alert_repo and alert_token:
-        return alert_repo, alert_token, False
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token, False
     return registry_repo, None, True
 
 
@@ -487,6 +507,22 @@ def _gh(args, check=False, token=None):
         raise AlertWriteError(f"gh {args[0]} {args[1] if len(args) > 1 else ''} "
                               f"failed (rc={result.returncode})")
     return result
+
+
+def _confirmed_private(repo, token):
+    """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
+    token (sol review round 1 of #432). FAIL-CLOSED: a failed lookup, an unparseable payload, or
+    anything but a literal boolean true reads as NOT private — the caller then redacts. The
+    response body is never echoed (it is only parsed), so a lookup against a wrong/hostile repo
+    name can put nothing in the public log."""
+    listed = _gh(["api", f"repos/{repo}"], token=token)
+    if listed.returncode != 0:
+        return False
+    try:
+        payload = json.loads(listed.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
 
 
 def _find_alert(repo, title=ALERT_TITLE, token=None):
@@ -672,34 +708,66 @@ def main(argv):
     if not repo:
         print("::error::pat-validity: REGISTRY_REPO/GITHUB_REPOSITORY not set")
         return 2
-    # Route the DETAILED credential alert to a verified private repo; the public registry gets only
-    # a generic signal (sol-audit issue #204). The probe-unavailable page (#207) and the streak
-    # variable carry no validity/expiry, so they stay on the registry with the ambient token.
-    alert_repo, alert_token, redact = _alert_route(
-        os.environ.get("ALERT_REPO"), os.environ.get("ALERT_TOKEN"), repo)
     result = probe(os.environ.get("REGISTRY_PAT"), repo)
-    print(json.dumps(result))  # the machine-readable verdict; never contains the token
+    # PUBLIC-LOG REDACTION (sol review round 1 of #432): this stdout is the PUBLIC registry
+    # repo's workflow log WHATEVER the alert route, so it must never carry the verdict, the
+    # free-text detail, or the calendar expiry / days-left — exactly the fields issue #204
+    # suppresses from public issues. Only a coarse status prints; the full verdict travels
+    # solely in the alert issue (private route when configured, generic public signal
+    # otherwise). GITHUB_OUTPUT is the runner-internal outputs file — rendered nowhere unless a
+    # later step deliberately echoes it (none does) — so it keeps the exact verdict for
+    # workflow-internal automation.
+    public_status = {VALID: "ok", NETWORK_UNKNOWN: "unknown"}.get(
+        result["verdict"], "attention-required")
+    print(json.dumps({"status": public_status}))
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a", encoding="utf-8") as handle:
             handle.write(f"verdict={result['verdict']}\n")
-    if result["verdict"] == EXPIRING:
-        # The ahead-of-time half of issue #37. The annotation is a courtesy for whoever opens
-        # the run; the ACTIONABLE alert is the rolling issue upserted below.
-        print(f"::warning::pat-validity: REGISTRY_SECRETS_PAT expires in "
-              f"~{result['days_left']} days — rotate it before the calendar does")
-    if redact and result["verdict"] in (INVALID, INSUFFICIENT, EXPIRING):
-        # FAIL LOUD (issue #204): a bad/expiring verdict is being alerted with the verdict/detail/
-        # expiry SUPPRESSED because no verified private ALERT_REPO+ALERT_TOKEN route is configured.
-        # The (public) log line names neither the verdict nor the expiry — only the missing route.
-        print("::warning::pat-validity: no verified private ALERT_REPO+ALERT_TOKEN route — the "
-              "credential verdict/detail/expiry is SUPPRESSED; the public alert carries a generic "
-              "signal only")
+    if result["verdict"] in (INVALID, INSUFFICIENT, EXPIRING):
+        # The ahead-of-time half of issue #37: a courtesy annotation for whoever opens the run.
+        # As redacted as the rest of the public log — one generic line for EVERY
+        # attention-worthy verdict, naming neither the verdict class nor any expiry countdown
+        # (#432 round 1: the old EXPIRING-only branch printed days_left — credential lifecycle —
+        # into the public log). The ACTIONABLE alert is the rolling issue upserted below.
+        print("::warning::pat-validity: REGISTRY_SECRETS_PAT needs maintainer attention — the "
+              "specific verdict, detail, and any expiry live in the rolling alert issue "
+              "(private ALERT_REPO route when configured), never in this public log")
     probe_paging = False
     if not probe_only:
+        # Route the DETAILED credential alert ONLY to a POSITIVELY VERIFIED private repo (#204,
+        # hardened #432 round 1): distinct from the registry AND confirmed `"private": true`
+        # under ALERT_TOKEN. Resolved here — not before the probe — because the verification is
+        # a live API call the --probe-only path must not make. The probe-unavailable page (#207)
+        # and the streak variable carry no validity/expiry, so they stay on the registry with
+        # the ambient token.
+        alert_repo, alert_token, redact = _alert_route(
+            os.environ.get("ALERT_REPO"), os.environ.get("ALERT_TOKEN"), repo)
+        if redact and result["verdict"] in (INVALID, INSUFFICIENT, EXPIRING):
+            # FAIL LOUD (issue #204): a bad/expiring verdict is being alerted with the verdict/
+            # detail/expiry SUPPRESSED because no verified private ALERT_REPO+ALERT_TOKEN route
+            # exists. The (public) log line names neither the verdict nor the expiry — only the
+            # missing route.
+            print("::warning::pat-validity: no verified private ALERT_REPO+ALERT_TOKEN route — "
+                  "the credential verdict/detail/expiry is SUPPRESSED; the public alert carries "
+                  "a generic signal only")
         try:
-            upsert_alert(result["verdict"], render_alert(result, repo, redact=redact),
-                         alert_repo, token=alert_token, redact=redact)
+            try:
+                upsert_alert(result["verdict"], render_alert(result, repo, redact=redact),
+                             alert_repo, token=alert_token, redact=redact)
+            except (AlertLookupError, AlertWriteError) as exc:
+                if redact:
+                    raise
+                # #432 round 1 finding 5: a VERIFIED private route whose token still fails at
+                # lookup/write time (revoked since verification, lost issues scope, deleted
+                # repo) must not drop the rolling credential signal — retry a SEPARATELY
+                # RENDERED redacted body on the public registry under the ambient token: never
+                # the detailed body, and never the private route's error beyond the sanitized
+                # op + rc the exception already carries.
+                print(f"::warning::pat-validity: private alert route failed ({exc}) — retrying "
+                      "a generic redacted alert on the public registry")
+                upsert_alert(result["verdict"], render_alert(result, repo, redact=True),
+                             repo, token=None, redact=True)
             # Separately track CONSECUTIVE network-unknowns so a permanently-stalled probe pages
             # instead of staying green-and-silent (issue #207). Distinct rolling issue; never
             # reclassifies the PAT. Shares the fail-red-on-failure contract above. This page carries
@@ -1163,10 +1231,13 @@ def _self_test():
         module["probe"] = lambda token, repo: {"verdict": EXPIRING, "detail": "stub",
                                                "expires_at": None, "days_left": 3.0}
         saved_env = {k: os.environ.get(k) for k in ("REGISTRY_PAT", "REGISTRY_REPO",
-                                                    "GITHUB_OUTPUT")}
+                                                    "GITHUB_OUTPUT", "ALERT_REPO",
+                                                    "ALERT_TOKEN")}
         os.environ["REGISTRY_PAT"] = "stub"
         os.environ["REGISTRY_REPO"] = "o/r"
         os.environ.pop("GITHUB_OUTPUT", None)
+        os.environ.pop("ALERT_REPO", None)   # hermetic: the redact route, not an ambient one
+        os.environ.pop("ALERT_TOKEN", None)
         main_out = io.StringIO()
         try:
             with contextlib.redirect_stdout(main_out):
@@ -1345,10 +1416,13 @@ def _self_test():
         module["probe"] = lambda token, repo: {"verdict": NETWORK_UNKNOWN, "detail": "stub",
                                                "expires_at": None, "days_left": None}
         saved_env = {k: os.environ.get(k) for k in ("REGISTRY_PAT", "REGISTRY_REPO",
-                                                    "GITHUB_OUTPUT")}
+                                                    "GITHUB_OUTPUT", "ALERT_REPO",
+                                                    "ALERT_TOKEN")}
         os.environ["REGISTRY_PAT"] = "stub"
         os.environ["REGISTRY_REPO"] = "o/r"
         os.environ.pop("GITHUB_OUTPUT", None)
+        os.environ.pop("ALERT_REPO", None)   # hermetic: the redact route, not an ambient one
+        os.environ.pop("ALERT_TOKEN", None)
         try:
             calls, subprocess.run = stub_probe_gh(PA_CLOSED, streak=2)  # 2 -> 3: threshold
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1370,17 +1444,70 @@ def _self_test():
         chk("main(): a single transient unknown -> rc=0 (green) and ZERO issue operations",
             (green_rc, silent_issue_ops), (0, []))
 
-        # --- sol-audit issue #204: the DETAILED credential alert routes to a VERIFIED private
-        #     repo; the PUBLIC-registry fallback carries ONLY a generic signal (no verdict,
-        #     detail, or expiry). Pure route + render first, then END-TO-END through main().
-        chk("route: repo+token -> private + token, no redact",
-            _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok", False))
-        chk("route: repo but NO token -> registry fallback, REDACT (#39/#204)",
-            _alert_route("org/private", "", "org/registry"), ("org/registry", None, True))
+        # --- sol-audit issue #204 (+ #432 round 1): the DETAILED credential alert routes ONLY
+        #     to a POSITIVELY VERIFIED private repo — distinct from the registry AND confirmed
+        #     `"private": true` under the route token; the PUBLIC-registry fallback carries ONLY
+        #     a generic signal (no verdict, detail, or expiry). Pure route + render first, then
+        #     END-TO-END through main().
+        vis_calls = []
+        chk("route: repo+token+CONFIRMED private -> private + token, no redact",
+            _alert_route("org/private", "tok", "org/registry",
+                         confirmed_private=lambda r, t: vis_calls.append((r, t)) or True),
+            ("org/private", "tok", False))
+        chk("route: the visibility check runs against the ALERT repo under the ALERT token",
+            vis_calls, [("org/private", "tok")])
+        # #432 round 1 finding 2: configuration alone is NOT verification — both fail-open
+        # shapes (same-repo and unverified-visibility) must land redacted on the registry even
+        # though ALERT_REPO and ALERT_TOKEN are both non-empty.
+        chk("route: ALERT_REPO == REGISTRY_REPO -> REDACT (the registry is never private)",
+            _alert_route("org/registry", "tok", "org/registry",
+                         confirmed_private=lambda r, t: True), ("org/registry", None, True))
+        chk("route: same-repo rejection is case-insensitive (GitHub repo names are)",
+            _alert_route("Org/Registry", "tok", "org/registry",
+                         confirmed_private=lambda r, t: True), ("org/registry", None, True))
+        chk("route: UNCONFIRMED visibility (public repo or failed lookup) -> REDACT, fail closed",
+            _alert_route("org/other-public", "tok", "org/registry",
+                         confirmed_private=lambda r, t: False), ("org/registry", None, True))
+        half_calls = []
+        chk("route: repo but NO token -> registry fallback, REDACT, and NO visibility call "
+            "(#39/#204)",
+            (_alert_route("org/private", "", "org/registry",
+                          confirmed_private=lambda r, t: half_calls.append(r) or True),
+             half_calls),
+            (("org/registry", None, True), []))
         chk("route: token but NO repo -> registry fallback, REDACT",
-            _alert_route("", "tok", "org/registry"), ("org/registry", None, True))
+            _alert_route("", "tok", "org/registry",
+                         confirmed_private=lambda r, t: True), ("org/registry", None, True))
         chk("route: neither repo nor token -> registry fallback, REDACT",
-            _alert_route(None, None, "org/registry"), ("org/registry", None, True))
+            _alert_route(None, None, "org/registry",
+                         confirmed_private=lambda r, t: True), ("org/registry", None, True))
+        # _confirmed_private itself: True ONLY on a definitive `"private": true`; every failure
+        # shape is False (fail closed), and the lookup runs under the ROUTE token.
+        vis_seen = []
+
+        def vis_gh(rc, stdout):
+            def run(args, **kw):
+                vis_seen.append((list(args), (kw.get("env") or {}).get("GH_TOKEN")))
+                return _Run(stdout, rc)
+            return run
+
+        subprocess.run = vis_gh(0, json.dumps({"private": True, "full_name": "org/private"}))
+        chk("_confirmed_private: definitive private=true -> True, GET /repos under the route "
+            "token",
+            (_confirmed_private("org/private", "route-tok"), vis_seen[0]),
+            (True, (["gh", "api", "repos/org/private"], "route-tok")))
+        subprocess.run = vis_gh(0, json.dumps({"private": False, "full_name": "org/pub"}))
+        chk("_confirmed_private: a PUBLIC destination -> False (fail closed)",
+            _confirmed_private("org/pub", "t"), False)
+        subprocess.run = vis_gh(1, "")
+        chk("_confirmed_private: failed lookup -> False (fail closed, never assumed private)",
+            _confirmed_private("org/private", "t"), False)
+        subprocess.run = vis_gh(0, "gh: not json")
+        chk("_confirmed_private: unparseable payload -> False (fail closed)",
+            _confirmed_private("org/private", "t"), False)
+        subprocess.run = vis_gh(0, json.dumps({"visibility": "private"}))
+        chk("_confirmed_private: anything but a literal private=true bool -> False",
+            _confirmed_private("org/private", "t"), False)
         res_bad = {"verdict": INVALID,
                    "detail": "GET /user returned 401 — the PAT is revoked, expired, or malformed",
                    "expires_at": "2026-08-01 04:33:41 UTC", "days_left": None}
@@ -1396,23 +1523,34 @@ def _self_test():
             ("SUPPRESSED" in red_b, "ALERT_REPO" in red_b, "ALERT_TOKEN" in red_b,
              "needs maintainer attention" in red_b),
             (True, True, True, True))
-        # END-TO-END main(): a capturing gh records the create's -R repo, GH_TOKEN and body. The
-        # probe-unavailable page (#207) makes no create on a definitive verdict, so the ONE create
-        # captured is the credential alert.
+        # END-TO-END main(): a capturing gh records the create's -R repo, GH_TOKEN and body, and
+        # answers the visibility verification per `visibility` / fails routes per `fail`. The
+        # probe-unavailable page (#207) makes no create on a definitive verdict, so every create
+        # captured is the credential alert's.
         captured = []
+        visibility = {}   # "repos/<repo>" -> (stdout, rc) for the GET /repos verification
+        fail = set()      # "private-lookup" | "private-create" | "registry-create"
 
         def cap_gh(args, **_kw):
             r = args[args.index("-R") + 1] if "-R" in args else None
             env = _kw.get("env") or {}
             if args[1] == "api" and any("actions/variables" in a for a in args):
                 return _Run(json.dumps({"message": "Not Found", "status": "404"}), 1)
+            if args[1] == "api" and args[2] in visibility:
+                return _Run(*visibility[args[2]])
             if args[1] == "api":
+                if ("private-lookup" in fail
+                        and any("repos/org/private/issues" in a for a in args)):
+                    return _Run("", 1)
                 return _Run("[]")
             if args[1] == "variable":
                 return _Run()
             if args[1:3] == ["issue", "create"]:
                 captured.append({"repo": r, "token": env.get("GH_TOKEN"),
                                  "body": args[args.index("--body") + 1]})
+                if (r == "org/private" and "private-create" in fail) or \
+                        (r == "o/r" and "registry-create" in fail):
+                    return _Run("", 1)
             return _Run()
 
         module = globals()
@@ -1430,7 +1568,8 @@ def _self_test():
             os.environ.pop("ALERT_REPO", None)
             os.environ.pop("ALERT_TOKEN", None)
             captured.clear()
-            with contextlib.redirect_stdout(io.StringIO()):
+            pub_out = io.StringIO()
+            with contextlib.redirect_stdout(pub_out):
                 rc_pub = main([])
             pub = captured[0] if captured else {}
             chk("main() unconfigured (#204): ONE credential create on the public REGISTRY repo",
@@ -1440,11 +1579,14 @@ def _self_test():
                  "SUPPRESSED" in pub.get("body", "")),
                 (False, False, True))
             chk("main() unconfigured (#204): definitive bad verdict still exits red", rc_pub, 1)
-            # (b) CONFIGURED private route -> FULL body on the PRIVATE repo, written with the token.
+            # (b) CONFIGURED + CONFIRMED-private route -> FULL body on the PRIVATE repo, written
+            # with ALERT_TOKEN.
             os.environ["ALERT_REPO"] = "org/private"
             os.environ["ALERT_TOKEN"] = "priv"
+            visibility["repos/org/private"] = (json.dumps({"private": True}), 0)
             captured.clear()
-            with contextlib.redirect_stdout(io.StringIO()):
+            priv_out = io.StringIO()
+            with contextlib.redirect_stdout(priv_out):
                 main([])
             priv = captured[0] if captured else {}
             chk("main() configured (#204): ONE credential create on the PRIVATE repo w/ ALERT_TOKEN",
@@ -1454,6 +1596,112 @@ def _self_test():
                 ("revoked" in priv.get("body", ""), "2026-08-01" in priv.get("body", ""),
                  "SUPPRESSED" in priv.get("body", "")),
                 (True, True, False))
+            # #432 round 1 finding 1: the PUBLIC workflow log (stdout) must be generic on EVERY
+            # route — the configured-private run above included — never the verdict, the detail,
+            # or the expiry the issue body carries.
+            for label, text in [("unconfigured", pub_out.getvalue()),
+                                ("configured-private", priv_out.getvalue())]:
+                chk(f"main() {label}: stdout carries NO verdict/detail/expiry — coarse status "
+                    "only (#432 r1)",
+                    ("revoked" in text, "2026-08-01" in text, f'"{INVALID}"' in text,
+                     json.dumps({"status": "attention-required"}) in text),
+                    (False, False, False, True))
+            # (c) #432 round 1 finding 2: ALERT_REPO whose visibility is NOT confirmed private
+            # (public repo / failed or unparseable lookup) fails CLOSED to the generic registry
+            # alert — configuration alone must never select the detailed route.
+            for label, answer in [("public repo", (json.dumps({"private": False}), 0)),
+                                  ("failed lookup", ("", 1))]:
+                visibility["repos/org/private"] = answer
+                captured.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main([])
+                unver = captured[0] if captured else {}
+                chk(f"main() unverified private route ({label}): generic create on the REGISTRY, "
+                    "ambient token (#432 r1)",
+                    (len(captured), unver.get("repo"), unver.get("token"),
+                     "SUPPRESSED" in unver.get("body", ""), "revoked" in unver.get("body", "")),
+                    (1, "o/r", None, True, False))
+            # (d) ALERT_REPO naming the registry itself is the fail-open the finding names: the
+            # visibility stub is not even consulted (same-repo rejection comes first).
+            os.environ["ALERT_REPO"] = "o/r"
+            visibility["repos/o/r"] = (json.dumps({"private": True}), 0)
+            captured.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                main([])
+            same = captured[0] if captured else {}
+            chk("main() ALERT_REPO == REGISTRY_REPO: generic create on the registry, never the "
+                "detailed body (#432 r1)",
+                (len(captured), same.get("repo"), "SUPPRESSED" in same.get("body", ""),
+                 "revoked" in same.get("body", "")),
+                (1, "o/r", True, False))
+            del visibility["repos/o/r"]
+            # (e) #432 round 1 finding 5: a VERIFIED private route whose token fails at RUN time
+            # (issue lookup or write) retries a REDACTED generic alert on the registry with the
+            # ambient token instead of dropping the rolling signal; only both routes failing
+            # goes red with no page.
+            os.environ["ALERT_REPO"] = "org/private"
+            visibility["repos/org/private"] = (json.dumps({"private": True}), 0)
+            for mode in ("private-lookup", "private-create"):
+                fail.clear()
+                fail.add(mode)
+                captured.clear()
+                fb_out = io.StringIO()
+                with contextlib.redirect_stdout(fb_out):
+                    rc_fb = main([])
+                fallback = captured[-1] if captured else {}
+                chk(f"main() {mode} failure: REDACTED retry lands on the registry with the "
+                    "ambient token (#432 r1)",
+                    (fallback.get("repo"), fallback.get("token"),
+                     "SUPPRESSED" in fallback.get("body", ""),
+                     "revoked" in fallback.get("body", "")),
+                    ("o/r", None, True, False))
+                chk(f"main() {mode} failure: warns, stays sanitized, and still exits red on the "
+                    "bad verdict",
+                    (rc_fb, "private alert route failed" in fb_out.getvalue(),
+                     "revoked" in fb_out.getvalue()), (1, True, False))
+            # expiring-soon distinguishes rc: the page landing via the fallback keeps the run
+            # green (the page IS the signal); both routes failing must go red.
+            module["probe"] = lambda token, repo: {"verdict": EXPIRING, "detail": "stub-detail",
+                                                   "expires_at": "2099-01-02 03:04:05 UTC",
+                                                   "days_left": 3.5}
+            fail.clear()
+            fail.add("private-lookup")
+            captured.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_green = main([])
+            chk("main() expiring + fallback delivered -> green run, page on the registry",
+                (rc_green, (captured[-1] if captured else {}).get("repo")), (0, "o/r"))
+            fail.add("registry-create")
+            captured.clear()
+            both_out = io.StringIO()
+            with contextlib.redirect_stdout(both_out):
+                rc_both = main([])
+            chk("main() expiring + BOTH routes fail -> rc=1 with ::error (never a green no-page "
+                "run)",
+                (rc_both, "::error::pat-validity" in both_out.getvalue()), (1, True))
+            # #432 round 1 finding 1, per-verdict: stdout stays generic for every
+            # attention-worthy verdict — a distinctive detail, the expiry, the days-left count,
+            # and the verdict string itself must never print.
+            fail.clear()
+            for verdict in (INVALID, INSUFFICIENT, EXPIRING):
+                module["probe"] = lambda token, repo, v=verdict: {
+                    "verdict": v, "detail": "DISTINCTIVE-DETAIL-NEVER-PUBLIC",
+                    "expires_at": "2099-01-02 03:04:05 UTC", "days_left": 3.5}
+                captured.clear()
+                verdict_out = io.StringIO()
+                with contextlib.redirect_stdout(verdict_out):
+                    main([])
+                text = verdict_out.getvalue()
+                chk(f"main() stdout for {verdict}: no detail/expiry/days-left/verdict string, "
+                    "coarse status only (#432 r1)",
+                    ("DISTINCTIVE-DETAIL-NEVER-PUBLIC" in text, "2099-01-02" in text,
+                     "3.5" in text, verdict in text,
+                     json.dumps({"status": "attention-required"}) in text),
+                    (False, False, False, False, True))
+                chk(f"main() private-route body for {verdict} still carries the detail "
+                    "(suppression is log-side, not alert-side)",
+                    "DISTINCTIVE-DETAIL-NEVER-PUBLIC" in (captured[0] if captured
+                                                          else {}).get("body", ""), True)
         finally:
             module["probe"] = real_probe3
             for key, val in saved_env.items():

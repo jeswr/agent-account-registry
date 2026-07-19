@@ -1073,6 +1073,23 @@ def _registry_fallback():
             os.environ.get("REGISTRY_ALERT_TOKEN") or os.environ.get("GH_TOKEN") or "")
 
 
+def _repo_confirmed_private(repo, token):
+    """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
+    token (sol review round 1 of #432). A configured ALERT_REPO+ALERT_TOKEN pair alone must never
+    select the detailed body: the pair can name the public registry itself or any other public
+    repository, and token presence proves nothing about destination visibility. FAIL-CLOSED: a
+    failed lookup, an unparseable payload, or anything but a literal boolean true reads as NOT
+    private and the caller redacts. The response body is parsed, never echoed."""
+    proc = _gh(["api", f"repos/{repo}"], token, capture=True)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
 def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     """Upsert every action on the primary route; on a failed FIRING action retry the salted alert
     on the public registry with the ambient token (issue #175). `fallback_open` is the set of
@@ -1086,14 +1103,18 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
     fb_distinct = (repo, token) != (fb_repo, fb_token) and bool(fb_token)
-    # A DETAILED body (failure/fleet counts + reset hints + diagnostics) is emitted ONLY over the
-    # verified private route — a distinct ALERT_REPO reached with its ALERT_TOKEN. Any write to the
-    # PUBLIC registry repo REDACTS to a generic signal (sol-audit issue #204): the #39 half-config
-    # primary (ALERT_REPO set but no token -> primary IS the registry), a no-ALERT_REPO deployment,
-    # the #175 firing retry on the registry, and any fallback recovery all land redacted. The
-    # registry_fallback route is always public, so its writes are always redacted.
+    # A DETAILED body (failure/fleet counts + reset hints + diagnostics) is emitted ONLY over a
+    # POSITIVELY VERIFIED private route (sol-audit issue #204, hardened in #432 round 1): an
+    # ALERT_REPO distinct from the public registry repo (case-insensitive) AND confirmed
+    # `"private": true` by a live GET /repos/{repo} under its ALERT_TOKEN — configuration alone
+    # is not verification, since it can name the registry itself or any other public repository.
+    # Everything else REDACTS to a generic signal: the #39 half-config primary (ALERT_REPO set
+    # but no token -> primary IS the registry), a no-ALERT_REPO deployment, a same-repo or
+    # public/unverifiable ALERT_REPO, the #175 firing retry on the registry, and any fallback
+    # recovery. The registry_fallback route is always public, so its writes are always redacted.
     registry_repo = os.environ["REGISTRY_REPO"]
-    primary_redact = repo == registry_repo
+    primary_redact = (repo.strip().lower() == registry_repo.strip().lower()
+                      or not _repo_confirmed_private(repo, token))
     if primary_redact and any(a.get("fire") for a in actions):
         # FAIL LOUD (issue #204): a firing model-health alert is being filed with fleet/failure
         # detail SUPPRESSED because no verified private route exists. The (public) log line carries
@@ -2572,12 +2593,21 @@ def _test_redaction(chk):
         ("2026-07-20 14:00 UTC" in red_c, "Earliest known reset" in red_c,
          "all 4 enabled" in red_c),
         (False, False, False))
-    # --- end-to-end wiring: with NO verified private route the delivered body is redacted; with
-    #     one it is full. A capturing gh records the create --body per repo.
+    # --- end-to-end wiring: with NO POSITIVELY VERIFIED private route the delivered body is
+    #     redacted; with one it is full. A capturing gh records the create --body per repo and
+    #     answers the #432 round-1 visibility verification per `visibility` — so a regression
+    #     that stops CHECKING visibility (or trusts configuration alone) goes RED on the
+    #     public-repo / failed-lookup / same-repo cases below.
     created = {}
+    visibility = {"stdout": json.dumps({"private": True}), "rc": 0}
+    vis_calls = []
 
     def capture_gh(args, token, capture=False):
         repo = args[args.index("-R") + 1] if "-R" in args else None
+        if args[0] == "api":
+            vis_calls.append((list(args), token))
+            return types.SimpleNamespace(returncode=visibility["rc"],
+                                         stdout=visibility["stdout"], stderr="")
         if args[:2] == ["issue", "list"]:
             return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
         if args[:2] == ["issue", "create"]:
@@ -2585,7 +2615,8 @@ def _test_redaction(chk):
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     try:
-        # (a) no ALERT_REPO -> primary IS the public registry -> redacted body.
+        # (a) no ALERT_REPO -> primary IS the public registry -> redacted body, and the
+        # visibility stub answering "private" must not matter (same-repo rejection is absolute).
         os.environ["REGISTRY_REPO"] = "jeswr/agent-account-registry"
         os.environ["REGISTRY_ALERT_TOKEN"] = "amb"
         os.environ.pop("GH_TOKEN", None)
@@ -2598,8 +2629,10 @@ def _test_redaction(chk):
         body = created.get("jeswr/agent-account-registry", "")
         chk("END-TO-END no-private-route: registry body is redacted (no counts, SUPPRESSED)",
             ("3 of 8 accounts" in body, "SUPPRESSED" in body), (False, True))
-        # (b) verified private route -> full body on the private repo.
+        # (b) CONFIRMED-private route -> full body on the private repo, and the visibility
+        # lookup ran against the ALERT repo under the ALERT token.
         created.clear()
+        vis_calls.clear()
         os.environ["ALERT_REPO"] = "jeswr/agent-account-data"
         os.environ["ALERT_TOKEN"] = "priv"
         with contextlib.redirect_stdout(io.StringIO()):
@@ -2607,6 +2640,37 @@ def _test_redaction(chk):
         pbody = created.get("jeswr/agent-account-data", "")
         chk("END-TO-END private route: private body is FULL (counts present, not redacted)",
             ("3 of 8 accounts" in pbody, "SUPPRESSED" in pbody), (True, False))
+        chk("END-TO-END private route: visibility verified via GET /repos under ALERT_TOKEN "
+            "(#432 r1)",
+            vis_calls, [(["api", "repos/jeswr/agent-account-data"], "priv")])
+        # (c) #432 round 1: a PUBLIC ALERT_REPO (private=false) must deliver the REDACTED body —
+        # token presence is not privacy.
+        created.clear()
+        visibility["stdout"] = json.dumps({"private": False})
+        with contextlib.redirect_stdout(io.StringIO()):
+            _deliver_alerts([dict(outage)], "m")
+        pub_body = created.get("jeswr/agent-account-data", "")
+        chk("END-TO-END public ALERT_REPO: body is REDACTED (fail closed, #432 r1)",
+            ("3 of 8 accounts" in pub_body, "SUPPRESSED" in pub_body), (False, True))
+        # (d) #432 round 1: a FAILED/indeterminate visibility lookup redacts too.
+        created.clear()
+        visibility.update(stdout="", rc=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _deliver_alerts([dict(outage)], "m")
+        unk_body = created.get("jeswr/agent-account-data", "")
+        chk("END-TO-END failed visibility lookup: body is REDACTED (fail closed, #432 r1)",
+            ("3 of 8 accounts" in unk_body, "SUPPRESSED" in unk_body), (False, True))
+        # (e) #432 round 1: ALERT_REPO naming the REGISTRY itself is rejected by the same-repo
+        # clause alone — the visibility stub deliberately answers "private" so only the
+        # equality check can force the redaction.
+        created.clear()
+        visibility.update(stdout=json.dumps({"private": True}), rc=0)
+        os.environ["ALERT_REPO"] = "jeswr/agent-account-registry"
+        with contextlib.redirect_stdout(io.StringIO()):
+            _deliver_alerts([dict(outage)], "m")
+        same_body = created.get("jeswr/agent-account-registry", "")
+        chk("END-TO-END ALERT_REPO == REGISTRY_REPO: body is REDACTED (#432 r1)",
+            ("3 of 8 accounts" in same_body, "SUPPRESSED" in same_body), (False, True))
     finally:
         _gh = real_gh
         for k, v in saved.items():
@@ -2642,6 +2706,11 @@ def _test_fallback_orphan(chk):
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
         if token in bad_tokens:
             return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        if args[0] == "api":
+            # The #432 round-1 visibility verification: a working token reads the private route
+            # as PRIVATE (an unusable one already answered rc=1 above -> fail-closed redact).
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=json.dumps({"private": True}), stderr="")
         verb, issues = args[1], repos[repo]
         if verb == "list":
             state = args[args.index("--state") + 1]

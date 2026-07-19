@@ -13,16 +13,19 @@
 # UNAVAILABLE, never "0% used". A wholesale probe failure (empty usage with a configured pool) therefore
 # classifies EVERY account UNAVAILABLE and always fires the alert — the exact case that used to no-op.
 #
-# Privacy (locked decision 22, issue #107; sol-audit issue #204): the DETAILED body — raw account
-# handles AND per-account/aggregate counts, pool size, and reset times — is emitted ONLY over a
-# VERIFIED private route: ALERT_REPO together with an ALERT_TOKEN that can write to it. EVERY
-# fallback to the public registry repo carries ONLY a generic, non-compositional "availability is
-# degraded" signal — never a handle, never a count, never a reset time (issue #204: even the
-# aggregate capped/unavailable/ok counts disclose the worker-account fleet on a public repo). This
-# covers both the half-configured case (ALERT_REPO set, ALERT_TOKEN missing — writing to the
-# private repo under the ambient token that can't reach it would fail silently and drop the alert,
-# issue #39) AND the fully-unconfigured case (no ALERT_REPO). Account handles never appear in
-# workflow logs.
+# Privacy (locked decision 22, issue #107; sol-audit issue #204; hardened #432 round 1): the
+# DETAILED body — raw account handles AND per-account/aggregate counts, pool size, and reset
+# times — is emitted ONLY over a POSITIVELY VERIFIED private route: ALERT_REPO distinct from the
+# public registry repo AND confirmed `"private": true` by a live GET /repos/{ALERT_REPO} under
+# ALERT_TOKEN. Configuration alone (two non-empty strings) is NOT verification — it could name
+# the registry itself or any other public repository. EVERY other shape falls back to the public
+# registry with ONLY a generic, non-compositional "availability is degraded" signal — never a
+# handle, never a count, never a reset time (issue #204: even the aggregate
+# capped/unavailable/ok counts disclose the worker-account fleet on a public repo): the
+# half-configured case (ALERT_REPO set, ALERT_TOKEN missing — writing to the private repo under
+# the ambient token that can't reach it would fail silently and drop the alert, issue #39), the
+# fully-unconfigured case (no ALERT_REPO), the same-repo case, and a public/unverifiable
+# ALERT_REPO. Account handles never appear in workflow logs.
 # Writes go through _gh(check=True), which surfaces a non-zero gh returncode as a sanitized
 # ::warning:: (op + returncode only — never gh stderr, which can echo request bodies under
 # GH_DEBUG=api).
@@ -81,19 +84,46 @@ def _util(value):
     return parsed
 
 
-def _alert_route(alert_repo, alert_token, registry_repo):
-    """(repo, token, redact_handles) for the alert issue (issue #107/#39/#204, privacy d22c). The
-    DETAILED body — account handles AND per-account/aggregate counts, pool size, and reset times —
-    is emitted ONLY over a VERIFIED private route: ALERT_REPO together with an ALERT_TOKEN that can
-    write there. EVERY fallback to the registry repo REDACTS to a generic, non-compositional
-    degraded signal, because that repo is public: a public alert must never publish raw account
-    identifiers (issue #107) NOR the counts/reset times that compositionally disclose the fleet
-    (issue #204). This covers BOTH the half-configured case (ALERT_REPO set, ALERT_TOKEN missing —
-    where writing to the private repo under the ambient registry token would fail silently and drop
-    the alert, issue #39) AND the fully-unconfigured case (no ALERT_REPO at all). token=None means
-    "use the ambient GH_TOKEN"; the write still fails loud via _gh(check=True) (review r1)."""
+def _repo_confirmed_private(repo, token):
+    """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
+    token (sol review round 1 of #432). A configured ALERT_REPO+ALERT_TOKEN pair alone must never
+    select the account-enumerating body: the pair can name the public registry itself or any
+    other public repository, and token presence proves nothing about destination visibility.
+    FAIL-CLOSED: a failed lookup, an unparseable payload, or anything but a literal boolean true
+    reads as NOT private and the caller redacts. The response body is parsed, never echoed."""
+    proc = _gh(["api", f"repos/{repo}"], capture=True, token=token)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
+def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
+    """(repo, token, redact_handles) for the alert issue (issue #107/#39/#204, privacy d22c;
+    hardened in review round 1 of #432). The DETAILED body — account handles AND
+    per-account/aggregate counts, pool size, and reset times — is emitted ONLY over a POSITIVELY
+    VERIFIED private route: ALERT_REPO and ALERT_TOKEN both set, ALERT_REPO distinct from the
+    public registry repo (case-insensitive — a "private route" naming the registry IS the public
+    repo), AND the destination CONFIRMED private by a live GET /repos/{ALERT_REPO} under
+    ALERT_TOKEN. EVERY other shape falls back to the registry repo and REDACTS to a generic,
+    non-compositional degraded signal, because that repo is public: a public alert must never
+    publish raw account identifiers (issue #107) NOR the counts/reset times that compositionally
+    disclose the fleet (issue #204). This covers the half-configured case (ALERT_REPO set,
+    ALERT_TOKEN missing — where writing to the private repo under the ambient registry token
+    would fail silently and drop the alert, issue #39), the fully-unconfigured case (no
+    ALERT_REPO at all), the same-repo case, and a public or unverifiable ALERT_REPO (#432 round
+    1: presence of a token is not privacy). token=None means "use the ambient GH_TOKEN"; the
+    write still fails loud via _gh(check=True) (review r1). `confirmed_private` is injectable
+    for the self-test; the default performs the live lookup, consulted only once both halves of
+    the route are set."""
     if alert_repo and alert_token:
-        return alert_repo, alert_token, False
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token, False
     return registry_repo, None, True
 
 
@@ -317,24 +347,50 @@ def _self_test():
     chk("policy pool union", got_pool, ["acct01", "acct02", "acct03"])
     chk("policy margin is the max", got_margin, 0.15)
     chk("absent policy falls back", _policy_pool_margin("/nonexistent/policy.toml"), (None, None))
-    # Alert routing (issue #39): private repo used ONLY when its token is present; a half-configured
-    # deployment (repo set, token missing) falls back to the registry repo so the write can't fail
-    # silently under the ambient token. token=None means "use the ambient GH_TOKEN".
-    chk("route: repo+token -> private + token, no redaction",
-        _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok", False))
-    chk("route: repo but NO token -> registry fallback, REDACTED",
-        _alert_route("org/private", "", "org/registry"), ("org/registry", None, True))
+    # Alert routing (issue #39; hardened #432 round 1): the private repo is used ONLY when its
+    # token is present, it is distinct from the registry, AND its visibility is positively
+    # CONFIRMED private; a half-configured deployment (repo set, token missing) falls back to the
+    # registry repo so the write can't fail silently under the ambient token. token=None means
+    # "use the ambient GH_TOKEN".
+    vis_calls = []
+    chk("route: repo+token+CONFIRMED private -> private + token, no redaction",
+        _alert_route("org/private", "tok", "org/registry",
+                     confirmed_private=lambda r, t: vis_calls.append((r, t)) or True),
+        ("org/private", "tok", False))
+    chk("route: the visibility check runs against the ALERT repo under the ALERT token",
+        vis_calls, [("org/private", "tok")])
+    # #432 round 1: configuration alone is NOT verification — same-repo and public/unverifiable
+    # ALERT_REPOs must land redacted on the registry even with both env vars non-empty.
+    chk("route: ALERT_REPO == REGISTRY_REPO -> registry, REDACTED (#432 r1)",
+        _alert_route("org/registry", "tok", "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None, True))
+    chk("route: same-repo rejection is case-insensitive (GitHub repo names are)",
+        _alert_route("Org/Registry", "tok", "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None, True))
+    chk("route: UNCONFIRMED visibility (public repo or failed lookup) -> registry, REDACTED "
+        "(#432 r1)",
+        _alert_route("org/other-public", "tok", "org/registry",
+                     confirmed_private=lambda r, t: False), ("org/registry", None, True))
+    half_calls = []
+    chk("route: repo but NO token -> registry fallback, REDACTED, and NO visibility call",
+        (_alert_route("org/private", "", "org/registry",
+                      confirmed_private=lambda r, t: half_calls.append(r) or True), half_calls),
+        (("org/registry", None, True), []))
     chk("route: repo but None token -> registry fallback, REDACTED",
-        _alert_route("org/private", None, "org/registry"), ("org/registry", None, True))
+        _alert_route("org/private", None, "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None, True))
     # Issue #107: an UNCONFIGURED route (no ALERT_REPO) must ALSO land redacted on the public
     # registry — a lone ALERT_TOKEN is not a verified private destination, and no route at all
     # certainly is not. The public fallback must never enumerate raw account handles.
     chk("route: token but NO repo -> registry fallback, REDACTED (#107)",
-        _alert_route("", "tok", "org/registry"), ("org/registry", None, True))
+        _alert_route("", "tok", "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None, True))
     chk("route: neither repo nor token -> registry fallback, REDACTED (#107)",
-        _alert_route("", "", "org/registry"), ("org/registry", None, True))
+        _alert_route("", "", "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None, True))
     chk("route: None repo/token -> registry fallback, REDACTED (#107)",
-        _alert_route(None, None, "org/registry"), ("org/registry", None, True))
+        _alert_route(None, None, "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None, True))
     # Redacted PUBLIC-registry fallback (issue #204): the body must carry NEITHER an account
     # handle NOR any count/pool-size/reset time — only a generic degraded signal plus the
     # private-route fix-it hint. rrows deliberately carries a capped %, a reset marker and an ok
@@ -385,6 +441,41 @@ def _self_test():
         ("::warning::" in warned, "issue edit" in warned, "rc=1" in warned), (True, True, True))
     chk("gh failure warning is sanitized",
         ("SENTINEL-STDERR-ECHO" in warned, "SENTINEL-BODY-HANDLE" in warned), (False, False))
+    # _repo_confirmed_private (#432 round 1): True ONLY on a definitive `"private": true`; every
+    # failure shape is False (fail closed), and the lookup runs under the ROUTE token.
+    vis_seen = []
+
+    def _vis_run(rc, stdout):
+        def run(args, **kw):
+            vis_seen.append((list(args), (kw.get("env") or {}).get("GH_TOKEN")))
+
+            class _R:
+                returncode, stderr = rc, ""
+            _R.stdout = stdout
+            return _R()
+        return run
+
+    real_run = subprocess.run
+    try:
+        subprocess.run = _vis_run(0, json.dumps({"private": True, "full_name": "org/private"}))
+        chk("_repo_confirmed_private: definitive private=true -> True, GET /repos under the "
+            "route token",
+            (_repo_confirmed_private("org/private", "route-tok"), vis_seen[0]),
+            (True, (["gh", "api", "repos/org/private"], "route-tok")))
+        subprocess.run = _vis_run(0, json.dumps({"private": False}))
+        chk("_repo_confirmed_private: a PUBLIC destination -> False (fail closed)",
+            _repo_confirmed_private("org/pub", "t"), False)
+        subprocess.run = _vis_run(1, "")
+        chk("_repo_confirmed_private: failed lookup -> False (never assumed private)",
+            _repo_confirmed_private("org/private", "t"), False)
+        subprocess.run = _vis_run(0, "gh: not json")
+        chk("_repo_confirmed_private: unparseable payload -> False (fail closed)",
+            _repo_confirmed_private("org/private", "t"), False)
+        subprocess.run = _vis_run(0, json.dumps({"visibility": "private"}))
+        chk("_repo_confirmed_private: anything but a literal private=true bool -> False",
+            _repo_confirmed_private("org/private", "t"), False)
+    finally:
+        subprocess.run = real_run
     # END-TO-END redaction wiring (review r2): main() itself must feed _alert_route's redact flag
     # into render() AND write to the registry repo — deleting the redact_handles wiring in main()
     # (not just the pure helpers) must go red here. Half-configured env + stubbed gh.
@@ -467,6 +558,55 @@ def _self_test():
         ("acct-wire-h1" in body2, "acct-wire-h2" in body2, "unavailable: " in body2,
          "Usable workers" in body2, "SUPPRESSED" in body2, "ALERT_TOKEN" in body2),
         (False, False, False, False, True, True))
+    # END-TO-END #432 round 1: a fully-configured route is honoured ONLY once GET /repos answers
+    # `"private": true` under ALERT_TOKEN. (3) confirmed private -> detailed body on the private
+    # repo; (4) the SAME configuration with an unverifiable destination (the stub answers the
+    # visibility probe with junk) -> generic body on the registry. Reverting _alert_route to
+    # trust configuration alone turns (4) RED — that is the exact fail-open the finding names.
+    class _VisOk:
+        returncode = 0
+        stdout = json.dumps({"private": True})
+        stderr = ""
+
+    for label, private_ok, want_repo, want_handles in [
+            ("verified-private route -> FULL body on the private repo", True,
+             "org/private", True),
+            ("UNVERIFIABLE ALERT_REPO -> generic body on the registry (fail closed)", False,
+             "org/registry", False)]:
+        calls3 = []
+
+        def _capture_run3(args, **_kw):
+            calls3.append(list(args))
+            if args[:3] == ["gh", "api", "repos/org/private"]:
+                return _VisOk() if private_ok else _OkRun()   # _OkRun stdout "[]" -> not private
+            return _OkRun()
+
+        configured_env = {"REGISTRY_REPO": "org/registry", "ALERT_REPO": "org/private",
+                          "ALERT_TOKEN": "tok",
+                          "ACCOUNT_POOL": '["acct-wire-h1", "acct-wire-h2"]',
+                          "POLICY_FILE": "/nonexistent/policy.toml"}
+        saved_env3 = {k: os.environ.get(k)
+                      for k in list(configured_env) + ["WORKER_USAGE_FILE"]}
+        os.environ.update(configured_env)
+        os.environ.pop("WORKER_USAGE_FILE", None)
+        real_run = subprocess.run
+        subprocess.run = _capture_run3
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                main()
+        finally:
+            subprocess.run = real_run
+            for k, v in saved_env3.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        created3 = next((c for c in calls3 if c[:3] == ["gh", "issue", "create"]), None)
+        body3 = created3[created3.index("--body") + 1] if created3 and "--body" in created3 else ""
+        repo3 = created3[created3.index("-R") + 1] if created3 and "-R" in created3 else ""
+        chk(f"main() {label} (#432 r1)",
+            (repo3, "acct-wire-h1" in body3, "SUPPRESSED" in body3),
+            (want_repo, want_handles, not want_handles))
     # Probe-exempt backoff surfacing (decision 2026-07-17, registry issue #29): an exempt account
     # is `ok` by design (never probe-missing), but an ACTIVE backoff is surfaced + not eligible,
     # an EXPIRED one clears, and a forged/malformed stamp fails open to `ok` (never crashes).
