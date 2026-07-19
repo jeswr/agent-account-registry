@@ -26,6 +26,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 REVIEW_LABELS = ("review:needs", "review:changes", "review:pass", "review:needs-user")
 LABEL_COLOURS = {
@@ -983,6 +984,65 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     print(f"needs-user recorded: {reason}")
 
 
+def live_human_holds(repo, pr_number, issue=None, live=None):
+    """[round-5 P1] LIVE hold-surface probe shared by EVERY outcome mutation path — the
+    review/fix outcome label transitions AND the ready+arm — not just the arm (round 4 covered
+    only ready_and_arm): a human/groom park that lands while a run is in flight must WIN over
+    the run's stale outcome. A stale request_changes that reaches set_review_state(..,"changes")
+    strips review:needs-user (the review:* labels are mutually exclusive) and silently unparks
+    a PR whose crate the PLAN busy partition already freed for a sibling.
+
+    Returns the sorted list of live hold labels: the PR's own HUMAN_OWNED_LABELS if any, else
+    the source issue's needs:* set (the issue is the explicit `issue` when supplied, else
+    derived from the worker head ref). `live` may carry an already-fetched pulls/N document to
+    avoid a duplicate read (ready_and_arm reuses its CAS read).
+
+    FAIL CLOSED on ambiguity [round-5 P2]: a malformed PR read, a malformed/hostile label
+    payload (a non-list, or any non-dict entry / non-string name), or an unreadable
+    source-issue probe RAISES WorkerPrError — the caller mutates nothing and the sweep simply
+    retries. The old shape-tolerant read collapsed malformed label data to "no hold" and
+    ready_and_arm still issued `pr ready` + `merge --auto` (fail OPEN on the dangerous act).
+
+    DEFENSE-IN-DEPTH ONLY — RESIDUAL TOCTOU WINDOW (descoped from PR #286, tracked in
+    issue #294): this probe is an unbound PREFLIGHT read; a hold that lands in the
+    probe-to-mutation gap is still overwritten, because set_review_state deletes the
+    mutually-exclusive review:* labels unconditionally and the arm path has the same gap
+    before `pr ready`/`merge --auto`. The concrete worst case is a transiently-removed hold
+    label (or, via the freed crate, a duplicate same-crate worker PR) — humanly recoverable
+    churn, never credential exposure or data corruption. Closing the window needs a
+    monotonic hold/disarm handshake: label transitions that can never delete a
+    concurrently-added terminal hold (ETag/If-Match or a label compare-and-swap, or a
+    tombstone marker automated paths cannot remove) — see issue #294 for the design
+    constraints."""
+    if live is None:
+        live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    if not isinstance(live, dict):
+        raise WorkerPrError("live PR hold state is unreadable; refusing to mutate (fail closed)")
+    raw_labels = live.get("labels")
+    if not isinstance(raw_labels, list) or any(
+            not isinstance(label, dict) or not isinstance(label.get("name"), str)
+            for label in raw_labels):
+        raise WorkerPrError(
+            "live PR label payload is malformed; refusing to mutate (fail closed)")
+    holds = sorted({label["name"] for label in raw_labels} & set(HUMAN_OWNED_LABELS))
+    if holds:
+        return holds
+    source_issue = issue
+    if not source_issue:
+        ref_match = WORKER_HEAD_RE.fullmatch(str((live.get("head") or {}).get("ref", "")))
+        source_issue = int(ref_match.group(1)) if ref_match else None
+    if not source_issue:
+        return []
+    probe = _gh_json(["api", f"repos/{repo}/issues/{source_issue}"])
+    if not isinstance(probe, dict) or not isinstance(probe.get("labels"), list) or any(
+            not isinstance(label, dict) or not isinstance(label.get("name"), str)
+            for label in probe["labels"]):
+        raise WorkerPrError(
+            "source issue hold state is unreadable; refusing to mutate (fail closed)")
+    return sorted({label["name"] for label in probe["labels"]
+                   if label["name"].startswith("needs:")})
+
+
 def _merge_only_carry_forward(repo, head_sha, reviewed_sha, base_ref):
     """Issue #69 half 1, LIVE side: True only when BOTH halves hold — (a) the first-parent
     chain from the live head reaches the reviewed sha through two-parent merges whose
@@ -1222,7 +1282,11 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
                   reviewed_base=""):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
-    mismatch returns the PR to review:needs (a fixer/other push raced the approval).
+    mismatch returns the PR to review:needs (a fixer/other push raced the approval). [round-4 P1]
+    the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:* on the source issue) are re-read
+    live immediately before the first mutation: a park that landed mid-review-run aborts the
+    ready+arm untouched (arm_complete=false), so an in-flight run can never arm past a
+    human/groom park the busy-partition carve-out relies on.
 
     Account disjointness is asserted on SALTED HASHES (locked decision 22a): the registry
     provenance record stores impl_account_h, and the live reviewer handle is hashed here with the
@@ -1246,6 +1310,29 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
     if live.get("state") != "open":
         raise WorkerPrError("pull request is no longer open")
+    # [round-4 P1, shared helper since round 5] PARKED-BUT-ARMING RACE: a human/groom park
+    # that landed WHILE this review run was in flight must WIN over the run's stale
+    # mark-ready+arm decision — the busy-partition carve-out (dispatch-claim.py
+    # busy_packages_of_pulls) frees a parked draft's crate on the premise that a parked PR
+    # cannot reach main on its own, and an arm that ignores a mid-run park breaks exactly
+    # that premise (the enumerator excluded holds at PLAN time, but this run launched BEFORE
+    # the park landed). Re-read the hold surfaces HERE, before ANY mutation
+    # (ready/arm/audit-comment/review-state) via live_human_holds — the SAME probe every
+    # outcome mutation runs (round-5 P1: the round-4 recheck covered only this arm path
+    # while a stale `changes` outcome could still strip review:needs-user) — over the live
+    # PR labels from the same fresh read the head CAS uses, plus the source issue's needs:*
+    # state. Unreadable/malformed hold surfaces RAISE (fail closed, round-5 P2: malformed
+    # label payloads previously read as no-hold and the arm still issued ready+merge).
+    # Any hold aborts with the valid-exit shape (arm_complete=false — review-fix.yml then
+    # never binds reviewed-sha) and NO comment/label churn: the PR is human-owned, and the
+    # sweep's enumerator already excludes it for as long as the park stands.
+    holds = live_human_holds(repo, pr_number, issue=issue, live=live)
+    if holds:
+        _write_outputs({"armed": False, "head_moved": False, "human_hold": True,
+                        "arm_complete": False})
+        print(f"ready+arm ABORTED pre-arm: human hold detected ({', '.join(holds)}) — "
+              "the park stands; no ready/arm/review-state mutation was applied")
+        return
     head_sha = str(live.get("head", {}).get("sha", ""))
     if head_sha != reviewed_sha:
         # Not an error: new commits landed between approve and arm; re-review binds to the new head.
@@ -1393,6 +1480,24 @@ def review_outcome(args):
     with open(args.verdict_file, encoding="utf-8") as handle:
         document = json.load(handle)
     has_blockers = validate_verdict(document, diff_files)  # raises => verdict VOID, step fails
+    # [round-5 P1] HOLD WINS on EVERY outcome, not just the arm (the round-4 recheck lived
+    # only in ready_and_arm): re-read the live hold surfaces BEFORE any comment/label/state
+    # mutation. A terminal human/groom park that landed after this review resolved makes the
+    # whole outcome STALE — applying `changes` would call set_review_state(.., "changes"),
+    # which REMOVES review:needs-user (the review:* labels are mutually exclusive) and
+    # silently unparks a PR whose crate the PLAN busy partition already freed for a sibling;
+    # `needs-user` would comment on and relabel a human-owned PR. The outcome is DROPPED
+    # with a log line and NOTHING mutated — findings unposted, reviewed-sha left unbound
+    # (review-fix.yml keys the bind step off decision != 'hold'), arm_complete=false — so
+    # the sweep re-derives this head after a human clears the park. Unreadable/malformed
+    # hold surfaces raise (fail closed; the step fails and the sweep retries).
+    holds = live_human_holds(args.repo, args.pr, issue=args.issue)
+    if holds:
+        _write_outputs({"decision": "hold", "human_hold": True, "arm_complete": False})
+        print(f"review outcome DROPPED: human hold detected ({', '.join(holds)}) — the hold "
+              "wins; no findings/label/state mutation was applied and reviewed-sha stays "
+              "unbound")
+        return
     post_findings(args.repo, args.pr, args.verdict_file, args.round)
     # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
     # the PR's own diff file set (the same list the reviewer just used). ANY gate-weakening /
@@ -1453,6 +1558,19 @@ def fix_outcome(args):
     made_changes = args.made_changes == "true"
     gate_ok = args.gate_outcome == "success"
     pushed = args.pushed == "true"
+    # [round-5 P1] HOLD WINS on every outcome mutation (see review_outcome): a human/groom
+    # park that landed while this fix ran makes the outcome stale — `re-review` would call
+    # set_review_state(.., "needs") and strip review:needs-user (a silent unpark), and
+    # `needs-user` would churn a human-owned PR. Drop the whole outcome BEFORE any
+    # marker/label/state mutation; the sweep re-derives once a human clears the park.
+    # Unreadable/malformed hold surfaces raise (fail closed; the step fails, the sweep
+    # retries).
+    holds = live_human_holds(args.repo, args.pr, issue=args.issue)
+    if holds:
+        _write_outputs({"decision": "hold", "human_hold": True})
+        print(f"fix outcome DROPPED: human hold detected ({', '.join(holds)}) — the hold "
+              "wins; no marker/label/state mutation was applied")
+        return
     if args.model:
         # Durable executed-model record for this fix round (maintainer directive 2026-07-17):
         # recorded on EVERY outcome — a no-change or gate-failed attempt still consumed the
@@ -1880,8 +1998,14 @@ def _self_test():
     wiring_globals = globals()
     real_io = {name: wiring_globals[name]
                for name in ("_paginated_comments", "set_review_state", "needs_user",
-                            "post_findings", "record_model_pin", "_alert_route")}
+                            "post_findings", "record_model_pin", "_alert_route", "_gh_json")}
     try:
+        # [round-5 P1] the outcome now probes the live hold surfaces before mutating; this
+        # block exercises the budget machinery, so its fake serves an UNHELD PR + source issue.
+        wiring_globals["_gh_json"] = lambda args, **_kw: (
+            {"labels": []} if "/issues/" in (args[1] if len(args) > 1 else "")
+            else {"state": "open", "labels": [],
+                  "head": {"ref": "sparq-agent/issue-7-1-1", "sha": "b" * 40}})
         wiring_globals["_paginated_comments"] = (
             lambda repo, pr: fake_state.get("comments", []))
         wiring_globals["set_review_state"] = (
@@ -2333,7 +2457,17 @@ def _self_test():
             files = ([{"filename": "scripts/worker-pr.py"}]
                      if sha_in_path == "b" * 40 else [])
             return {"files": files}
-        return {"state": "open", "head": {"sha": raa_state["head"]},
+        if "/issues/" in path:
+            # the [round-4 P1] pre-arm SOURCE-issue hold probe
+            if raa_state.get("issue_probe_garbage"):
+                return "garbage"
+            return {"labels": [{"name": name}
+                               for name in raa_state.get("issue_labels", ())]}
+        labels_payload = raa_state.get("labels_payload")
+        return {"state": "open",
+                "labels": (labels_payload if labels_payload is not None
+                           else [{"name": name} for name in raa_state.get("labels", ())]),
+                "head": {"ref": "sparq-agent/issue-7-1-1", "sha": raa_state["head"]},
                 "base": {"ref": "main"}}
 
     def raa_run_gh(args, **kw):
@@ -2344,10 +2478,13 @@ def _self_test():
             return argparse.Namespace(returncode=1, stdout="", stderr="")
         return argparse.Namespace(returncode=0, stdout="", stderr="")
 
-    def run_raa(head_ok=True, merge_fails=False, comments=()):
+    def run_raa(head_ok=True, merge_fails=False, comments=(), labels=(),
+                issue_labels=(), issue=None, probe_garbage=False, labels_payload=None):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
-        raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails)
+        raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
+                         labels=labels, issue_labels=issue_labels,
+                         issue_probe_garbage=probe_garbage, labels_payload=labels_payload)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -2356,7 +2493,8 @@ def _self_test():
         globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
         globals()["_write_outputs"] = raa_outputs.update
         ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
-                      bot_login="sparq[bot]", reviewed_base=raa_state.get("reviewed_base", "main"))
+                      issue=issue, bot_login="sparq[bot]",
+                      reviewed_base=raa_state.get("reviewed_base", "main"))
 
     try:
         sha = "b" * 40
@@ -2433,8 +2571,153 @@ def _self_test():
             check("arm failure raises (draft restored path)", "raised", "raised")
         check("the pre-arm audit survives an arm failure (re-review re-audits per sha)",
               any(TRUST_AUDIT_MARKER_PREFIX in c for c in raa_calls), True)
+        # ---- [round-4 P1] PARKED-BUT-ARMING RACE: a human/groom park that landed while
+        # this review run was in flight WINS — the pre-arm hold recheck aborts with the
+        # valid-exit shape and NO ready/arm/audit/review-state mutation at all ----
+        for park in ("needs:user", "review:needs-user"):
+            run_raa(labels=(park,))
+            check(f"parked-mid-review PR label {park} aborts pre-arm (no ready/arm argv)",
+                  (any(c.startswith("pr ready") or "merge" in c for c in raa_calls),
+                   any("trust-surface" in c or c.startswith("state:") for c in raa_calls),
+                   raa_outputs.get("arm_complete"), raa_outputs.get("human_hold"),
+                   raa_outputs.get("armed")),
+                  (False, False, False, True, False))
+        run_raa(issue_labels=("needs:maintainer",), issue=7)
+        check("parked-mid-review SOURCE issue needs:* aborts pre-arm the same way",
+              (any(c.startswith("pr ready") or "merge" in c for c in raa_calls),
+               raa_outputs.get("arm_complete"), raa_outputs.get("human_hold")),
+              (False, False, True))
+        # the --issue arg may be absent: the source issue is derived from the worker head
+        run_raa(issue_labels=("needs:user",))
+        check("head-ref-derived source hold aborts pre-arm too",
+              (any("merge" in c for c in raa_calls), raa_outputs.get("arm_complete")),
+              (False, False))
+        run_raa(issue_labels=("area:crate-a", "role:impl"))
+        check("unparked run is UNCHANGED (the hold recheck admits the ready+arm)",
+              (any(c.startswith("pr ready") for c in raa_calls),
+               any("--match-head-commit" in c for c in raa_calls),
+               raa_outputs.get("arm_complete")), (True, True, True))
+        try:
+            run_raa(probe_garbage=True)
+            check("unreadable source-issue hold state fails closed (no arm)",
+                  "no error", "raised")
+        except WorkerPrError:
+            check("unreadable source-issue hold state fails closed (no arm)",
+                  ("raised", any(c.startswith("pr ready") or "merge" in c
+                                 for c in raa_calls)), ("raised", False))
+        # ---- [round-5 P2] malformed live LABEL data must never read as "no hold": the old
+        # shape-tolerant read collapsed a garbage payload to an empty label set and STILL
+        # issued `pr ready` + `merge --auto` (fail open on the dangerous act). Unknown
+        # shapes now refuse with WorkerPrError and no ready/arm argv. ----
+        for payload in ("junk", ["junk"], [{"name": 7}], [{"no_name": "x"}]):
+            try:
+                run_raa(labels_payload=payload)
+                check(f"malformed label payload {payload!r} refuses ready/arm",
+                      "no error", "raised")
+            except WorkerPrError:
+                check(f"malformed label payload {payload!r} refuses ready/arm",
+                      ("raised", any(c.startswith("pr ready") or "merge" in c
+                                     for c in raa_calls)), ("raised", False))
     finally:
         globals().update(real_raa)
+
+    # ---- [round-5 P1] HOLD WINS on EVERY outcome mutation: a human/groom park that lands
+    # AFTER the review/fix resolved DROPS the outcome — zero comment/label/state mutations
+    # on every outcome path (changes / approve->arm / needs-user park, re-review), not just
+    # the round-4 ready_and_arm recheck. ----
+    oc_calls = []
+    oc_outputs = {}
+    oc_state = {}
+    real_oc = {name: globals()[name] for name in (
+        "_gh_json", "_paginated_comments", "set_review_state", "needs_user",
+        "post_findings", "record_model_pin", "_write_outputs", "_alert_route")}
+
+    def oc_gh_json(args, **_kw):
+        path = args[1] if len(args) > 1 else ""
+        if "/issues/" in path:
+            return {"labels": [{"name": name} for name in oc_state.get("issue_labels", ())]}
+        return {"state": "open",
+                "labels": [{"name": name} for name in oc_state.get("labels", ())],
+                "head": {"ref": "sparq-agent/issue-7-1-1", "sha": "b" * 40}}
+
+    def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False):
+        oc_calls.clear(); oc_outputs.clear()
+        oc_state.update(labels=labels, issue_labels=issue_labels)
+        with tempfile.TemporaryDirectory() as tmp:
+            verdict_file = Path(tmp) / "verdict.json"
+            files_file = Path(tmp) / "files.txt"
+            issues = ([{"severity": "major", "file": "src/a.rs", "title": "t", "body": "b",
+                        "fix_hint": "h"}] if verdict == "request_changes" else [])
+            verdict_file.write_text(json.dumps({
+                "verdict": verdict, "injection_detected": injection, "summary": "s",
+                "issues": issues}), encoding="utf-8")
+            files_file.write_text("src/a.rs\n", encoding="utf-8")
+            review_outcome(argparse.Namespace(
+                repo="o/r", pr=41, verdict_file=str(verdict_file),
+                files_file=str(files_file), round=1, max_rounds=3, security=False,
+                surface_path=[], issue=7, impl_provider="anthropic",
+                bot_login="sparq[bot]", run_key="9.1"))
+
+    def run_fix_outcome(labels=(), issue_labels=(), injection="false"):
+        oc_calls.clear(); oc_outputs.clear()
+        oc_state.update(labels=labels, issue_labels=issue_labels)
+        fix_outcome(argparse.Namespace(
+            repo="o/r", pr=41, round=1, run_key="9.1", bot_login="sparq[bot]",
+            injection=injection, made_changes="true", gate_outcome="success",
+            pushed="true", issue=7, model=""))
+
+    try:
+        globals()["_gh_json"] = oc_gh_json
+        globals()["_paginated_comments"] = lambda repo, pr: []
+        globals()["set_review_state"] = lambda repo, pr, s: oc_calls.append(f"state:{s}")
+        globals()["needs_user"] = lambda repo, pr, reason, **kw: oc_calls.append("needs-user")
+        globals()["post_findings"] = lambda *a, **kw: oc_calls.append("post-findings")
+        globals()["record_model_pin"] = lambda *a, **kw: oc_calls.append("model-pin")
+        globals()["_alert_route"] = lambda: (None, None)
+        globals()["_write_outputs"] = oc_outputs.update
+
+        # hold arrives after resolution: EVERY review outcome path drops with zero mutations
+        for verdict, injection, park_name in (
+                ("request_changes", False, "changes"),
+                ("approve", False, "approve->arm"),
+                ("request_changes", True, "injection->needs-user")):
+            for hold in ({"labels": ("needs:user",)},
+                         {"labels": ("review:needs-user",)},
+                         {"issue_labels": ("needs:maintainer",)}):
+                run_review_outcome(verdict, injection=injection, **hold)
+                check(f"held review outcome ({park_name}, {hold}) drops with no mutation",
+                      (oc_calls, oc_outputs.get("decision"), oc_outputs.get("human_hold")),
+                      ([], "hold", True))
+        # unheld control: the same outcomes still apply
+        run_review_outcome("request_changes")
+        check("unheld request_changes outcome still applies",
+              (oc_calls, oc_outputs.get("decision")),
+              (["post-findings", "state:changes"], "changes"))
+        run_review_outcome("approve")
+        check("unheld approve outcome still routes to the arm step",
+              (oc_calls, oc_outputs.get("decision")), (["post-findings"], "arm"))
+        run_review_outcome("request_changes", injection=True)
+        check("unheld injection outcome still parks needs-user",
+              (oc_calls, oc_outputs.get("decision")),
+              (["post-findings", "needs-user"], "needs-user"))
+
+        # the fix outcome paths drop the same way (re-review + injection->needs-user)
+        for injection, park_name in (("false", "re-review"), ("true", "needs-user")):
+            run_fix_outcome(labels=("needs:user",), injection=injection)
+            check(f"held fix outcome ({park_name}) drops with no mutation",
+                  (oc_calls, oc_outputs.get("decision"), oc_outputs.get("human_hold")),
+                  ([], "hold", True))
+        run_fix_outcome(issue_labels=("needs:maintainer",))
+        check("source-issue hold drops the fix outcome too",
+              (oc_calls, oc_outputs.get("decision")), ([], "hold"))
+        run_fix_outcome()
+        check("unheld fix outcome still applies re-review",
+              (oc_calls, oc_outputs.get("decision")), (["state:needs"], "re-review"))
+        run_fix_outcome(injection="true")
+        check("unheld injection fix outcome still parks needs-user",
+              (oc_calls, oc_outputs.get("decision")), (["needs-user"], "needs-user"))
+    finally:
+        globals().update(real_oc)
 
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

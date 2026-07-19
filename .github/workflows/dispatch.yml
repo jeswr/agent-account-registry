@@ -482,10 +482,26 @@ jobs:
                   repo, pulls, pr_status, provenance))
               # Deferred-retry items with a still-live lease are dropped registry-side, then the
               # busy-area union over ALL open worker PRs (issue #27) keeps impl items out of any
-              # crate with an in-flight review-loop PR.
+              # crate with an in-flight review-loop PR. The busy partition reads the SAME
+              # provenance linkage and the SAME per-PR arm state as the enumerator above
+              # (round-2 P1/P2, drafts-only since round 3, coherent-detail-confirmed since
+              # round 4): a human-parked PR frees its crate only when it is a provably-inert
+              # DRAFT whose NEWER pr_status detail record (the pulls listing predates the
+              # per-PR detail reads) is head-matched, unlatched AND itself confirms draft —
+              # a missing/incoherent/non-draft detail stays BUSY (the split-snapshot race:
+              # a draft that flipped ready between the two reads must never free a crate it
+              # can merge into); parked NON-drafts stay busy unconditionally (queue state is
+              # GraphQL-only, unprovable from this snapshot) — and a PR with missing/
+              # divergent linkage reserves fail-closed. CLAIM re-proves each item's crate
+              # against the LIVE pull listing again right before launch (dispatch-claim.py
+              # revalidate_items_against_live_pulls closes the PLAN->CLAIM window).
+              # [round-5 P1] `leases`/`now` feed the CROSS-LANE lease partition: any live
+              # sibling lease (impl `<repo>#<issue>`, `review:`/`fix:`) on an item's package
+              # defers it — the lanes share ONE crate-ownership view (the same ledger the
+              # enumerator's superseded-until-sibling-resolves exclusion reads).
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
-                  repo, pulls, issue_labels)
+                  repo, pulls, issue_labels, provenance, pr_status, leases, now)
 
           snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
           document = {

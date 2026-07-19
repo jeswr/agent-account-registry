@@ -1374,7 +1374,10 @@ jobs:
         # sol r7 on #257: step SUCCESS is not enough — the head/base-race paths exit 0 with
         # armed=false after setting review:needs, and binding reviewed-sha there wedges the
         # sweep into skipping the pending re-review. Key on the armed OUTPUT.
-        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
+        # [round-5 P1] decision == 'hold' is the hold-wins DROP (a human/groom park landed
+        # after the review resolved): the outcome applied NOTHING, so reviewed-sha must stay
+        # unbound — the sweep re-derives this head once a human clears the park.
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
         run: |
