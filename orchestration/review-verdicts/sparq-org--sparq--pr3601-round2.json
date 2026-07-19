@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3601,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "108f0a1a4972e0ea1ca31d56e09a7a64db880e77",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ResultGraphView now correctly uses a literal dynamic import, but deriveGraph is still statically imported into the already-lazy hero chunk and React.useMemo performs the full graph construction for every result before the visitor selects Graph. This is feature-specific code and work for a rarely used net-new view, contrary to the repository policy requiring optional GUI functionality that increases bundle size to load on its invocation path. The comment labels deriveGraph a cheap eligibility check, but it is the complete derivation: it scans all rows and variables, constructs node and edge maps, and stores the resulting graph merely to decide whether to show the toggle.",
+    "file": "site/src/components/home/hero-runner.tsx",
+    "fix_hint": "Keep only a genuinely minimal eligibility predicate in the core hero chunk, and dynamically import the complete derivation together with the renderer after Graph is invoked. Alternatively, dynamically import a graph controller on invocation that derives and renders the graph. Ensure the toggle design does not require eagerly executing the full optional feature, and extend the bundle check if the optional chunk is material.",
+    "severity": "major",
+    "title": "Graph-specific derivation remains eager in the hero chunk"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The injective term-key defect is fixed with structural JSON tuple encoding and a meaningful delimiter-collision regression test. The renderer is now invocation-loaded, but the graph-specific derivation remains statically imported and eagerly runs for every settled result, so the prior optional-code-policy finding is only partially resolved.",
+  "verdict": "request_changes"
+ }
+}
