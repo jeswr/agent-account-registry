@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The added pre-store gate is sound and fail-closed. It reads the captured credential format, rejects an absent format, parses the checked-out routing catalog with tomllib, requires a nonempty alias list, rejects unknown aliases or aliases lacking credential_format, and requires every declared alias to match the captured format. The MODELS value is internally derived from the structured provider choice rather than untrusted issue text. Because the gate precedes the claim/secret-write step and exits nonzero on any validation or catalog error, the later store step is suppressed by the workflow's success condition. No credential contents are logged or exposed, permissions/actions are unchanged, and the diff contains no reviewer-directed prompt injection. No blocker or major issue is supported by the diff.",
+ "verdict": "approve"
+}
