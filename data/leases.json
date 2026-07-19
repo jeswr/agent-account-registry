@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct03",
-   "claim_id": "49d8cdb77946477988763e8c31f23d7c",
-   "holder": "fix:sparq-org/sparq#3576@dispatch-29677622462.1",
-   "package": "sparq-zk",
-   "role": "fix",
-   "model": "opus",
-   "issued_at": 1784445330,
-   "expires_at": 1784448930
-  },
-  {
-   "account": "acct03",
    "claim_id": "3f046d079f5c4bbd8785ef1db1b6d92f",
    "holder": "jeswr/agent-account-registry#114@dispatch-29677929739.1",
    "package": "dispatch",
