@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3628,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4cb584d1fff483baf97280d03ce46a731fdb36b5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new circuit relies on `slot_active = i < counts[g]` to prevent a private antecedent hidden in padding from satisfying membership, but no test places a well-formed antecedent in an inactive slot and proves rejection. Likewise, every test uses K=1, so the strict commitment-order guard and cross-graph attribution accumulation are never exercised. These are security-relevant branches of the claimed committed-membership statement. The module comment also says there is one `should_fail` per rejection clause, which is not true for the ordering clause or inactive-padding case.",
+    "file": "zk/compose/compose_core/src/tests.nr",
+    "fix_hint": "Add a `should_fail` test whose rule remains well formed but one required antecedent occurs only at an index >= count, expecting `antecedent not a member of any committed graph`. Add K=2 tests covering a valid split-antecedent derivation with exact `[true, true]` attribution and rejection of non-strict/duplicate commitment ordering (plus incorrect cross-graph attribution if not covered by the valid case). Update the test-suite comment so its coverage claim exactly matches the cases present.",
+    "severity": "major",
+    "title": "Load-bearing padding and multi-graph constraints are not tested"
+   }
+  ],
+  "progress": null,
+  "summary": "The relation's rule-shape, commitment recomputation, active-slot membership, and fail-closed host documentation are internally consistent and appropriately caveated as research-grade/not externally audited. However, this soundness-critical circuit lacks tests for two load-bearing constraints that are specifically claimed and implemented: inactive padding must not satisfy antecedent membership, and K>1 commitment ordering/source attribution must work. The test comment's claim of one rejection test per clause is therefore inaccurate, and the untested branches could admit regressions without detection.",
+  "verdict": "request_changes"
+ }
+}
