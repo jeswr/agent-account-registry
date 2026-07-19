@@ -440,6 +440,10 @@ run_model() {
   write_output branch "$branch"
   if [[ -n ${GITHUB_ENV:-} ]]; then
     printf 'WORKER_BRANCH=%s\n' "$branch" >> "$GITHUB_ENV"
+    # The pre-model base: the gate runs AFTER the pre-gate push commits the model's work
+    # (PR #310 round 2 clean-publisher split), so its change detection needs this committed-diff
+    # baseline (_changed_paths) instead of a dirty worktree.
+    printf 'WORKER_BASE_SHA=%s\n' "$base_sha" >> "$GITHUB_ENV"
   fi
   printf 'worker-live: headless %s run completed with repository changes\n' "${WORKER_HARNESS:-}"
 }
@@ -504,6 +508,23 @@ _resolve_gate_package() {
   printf 'degrade:%s\n' "$atom"
 }
 
+# Changed-path source for the gate. Pre-#310 the gate always ran on a DIRTY tree (the commit
+# happened at publish, after the gate); the clean-publisher split commits + pushes the candidate
+# branch BEFORE the gate, so a clean tree is now the normal live-worker case and the committed
+# diff against the recorded pre-model base (WORKER_BASE_SHA, exported by run_model) is the
+# change set. A dirty tree still wins (the review-fix lane gates uncommitted edits); a clean
+# tree WITHOUT a safe recorded base emits nothing, which the registry-selftest caller treats as
+# fail-closed ("no changed files to validate") — never an arbitrary rev-spec.
+_changed_paths() {
+  local dirty
+  dirty="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
+  if [[ -n "$dirty" ]]; then
+    printf '%s\n' "$dirty"
+  elif [[ "${WORKER_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    git diff --name-only "${WORKER_BASE_SHA}..HEAD"
+  fi
+}
+
 run_gate() {
   require_target
   local profile=${GATE_PROFILE:-}
@@ -527,7 +548,7 @@ run_gate() {
         # docs-quality gate is the real backstop. But it is a REAL error if the diff actually
         # touches crate source with no crate label, so fail closed in that case.
         local changed_paths
-        changed_paths="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
+        changed_paths="$(_changed_paths)"
         if printf '%s\n' "$changed_paths" | grep -qE '^crates/|^Cargo\.toml$|^Cargo\.lock$'; then
           die 'crate-scoped gate requires an area:<crate> label (diff touches crate source)'
         fi
@@ -633,7 +654,7 @@ _registry_selftest_targets() {
 
 registry_selftest_gate() {
   local changed
-  changed="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
+  changed="$(_changed_paths)"
   [[ -n "$changed" ]] || die 'registry-selftest gate: no changed files to validate (fail closed)'
   local -a targets=()
   mapfile -t targets < <(printf '%s\n' "$changed" | _registry_selftest_targets "$FULL_SELFTEST_SUITE")
@@ -758,14 +779,44 @@ ASKPASS
   GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git "${push_args[@]}"
 }
 
-publish_pr() {
+# Pre-gate host-side commit + push of the model's candidate branch (PR #310 round 2 blocker).
+# Runs on the WORKER runner in the window BEFORE the gate executes any target-controlled code,
+# as the IMMEDIATE next step after its token mint (TTL: no intervening step can erode the
+# 60-minute installation-token window; worker-live self-test enforces the adjacency). After this
+# step no credential of any kind exists in the worker job — the pushed per-run branch is the
+# integrity hand-off to the clean publish job, which is the only place a PR is opened.
+push_branch() {
   require_target
+  local issue_number=${ISSUE_NUMBER:-}
+  local branch=${WORKER_BRANCH:-}
+  local model_alias=${WORKER_MODEL_ALIAS:-}
+  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
+  [[ "$branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] || die 'unsafe worker branch'
+  safe_atom "$model_alias" || die 'unsafe routed model alias'
+  printf '::add-mask::%s\n' "$GH_TOKEN"
+
+  _git_commit_and_push "$branch" \
+    "feat: resolve target issue #$issue_number [$model_alias]" \
+    "Co-Authored-By: $(coauthor_for "$model_alias")"
+  local head_sha
+  head_sha=$(git rev-parse HEAD)
+  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || die 'pushed head sha is unsafe'
+  write_output head_sha "$head_sha"
+  printf 'worker-live: pushed candidate branch %s (DRAFT PR opens from the clean publish job)\n' \
+    "$branch"
+}
+
+# CLEAN-RUNNER publisher (PR #310 round 2 blocker): opens the DRAFT PR for the candidate branch
+# the worker pushed BEFORE its hostile gate ran. Runs with NO target checkout and executes no
+# target code. Trust posture: the per-run branch can only have been pushed by a registry App
+# token (the hostile gate held none), so the LIVE API ref is the integrity anchor — it must
+# resolve and match the head sha the pre-gate push recorded, or publishing fails CLOSED.
+publish_pr() {
   local issue_file=${WORKER_ISSUE_FILE:-}
   local issue_number=${ISSUE_NUMBER:-}
   local branch=${WORKER_BRANCH:-}
   local default_branch=${TARGET_DEFAULT_BRANCH:-}
-  local bot_login=${TARGET_BOT_LOGIN:-}
-  local bot_id=${TARGET_BOT_ID:-}
   local model_alias=${WORKER_MODEL_ALIAS:-}
   local provider_model=${WORKER_PROVIDER_MODEL:-}
   local agent=${WORKER_AGENT:-}
@@ -773,19 +824,31 @@ publish_pr() {
   local worker_root=${WORKER_ROOT:-}
   local target_repo=${TARGET_REPO:-}
   local arm_requested=${ARM_AUTO_MERGE_REQUESTED:-false}
+  local expected_head=${WORKER_EXPECTED_HEAD_SHA:-}
   [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
   [[ -f "$issue_file" && ! -L "$issue_file" ]] || die 'verified issue snapshot is missing'
   [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
-  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe worker branch'
+  [[ "$branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] || die 'unsafe worker branch'
   safe_atom "$default_branch" || die 'unsafe target default branch'
-  [[ "$bot_id" =~ ^[0-9]+$ ]] || die 'unsafe target bot id'
-  [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] || die 'unsafe target bot login'
   [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die 'pre-gate push head sha is missing or unsafe'
   printf '::add-mask::%s\n' "$GH_TOKEN"
+  mkdir -p "$worker_root"
+  chmod 700 "$worker_root"
 
   local impl_provider=${WORKER_PROVIDER:-}
   [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
     die 'unsafe implementation provider'
+
+  # Integrity anchor: the branch head from the LIVE API must equal the sha the pre-gate push
+  # recorded. A forged worker output or a tampered ref fails CLOSED into the deferral path.
+  local head_sha
+  head_sha=$(gh api "repos/$target_repo/git/ref/heads/$branch" --jq '.object.sha')
+  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || die 'candidate branch head could not be resolved'
+  [[ "$head_sha" == "$expected_head" ]] ||
+    die 'candidate branch head does not match the pre-gate push; refusing to publish'
+
   local pr_title_file="$worker_root/pr-title.txt"
   local pr_body_file="$worker_root/pr-body.md"
   python3 - "$issue_file" "$pr_title_file" "$pr_body_file" "$issue_number" "$agent" \
@@ -845,7 +908,7 @@ Fixes #{issue_number}
 ## Local gate
 
 - Policy profile: `{gate}`
-- Result: passed before push
+- Result: passed on the pushed candidate branch before this PR was opened
 
 ## Merge posture
 
@@ -862,27 +925,40 @@ Path(title_file).chmod(0o600)
 Path(body_file).chmod(0o600)
 PY
 
-  _git_commit_and_push "$branch" \
-    "feat: resolve target issue #$issue_number [$model_alias]" \
-    "Co-Authored-By: $(coauthor_for "$model_alias")"
+  # REST creation (no local git context exists on the clean runner; `gh pr create` needs one).
+  python3 - "$pr_title_file" "$pr_body_file" "$branch" "$default_branch" \
+    > "$worker_root/pr-payload.json" <<'PY'
+import json
+import sys
 
-  local pr_url pr_number head_sha
-  head_sha=$(git rev-parse HEAD)
-  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || die 'pushed head sha is unsafe'
-  pr_url=$(gh pr create \
-    --repo "$target_repo" \
-    --base "$default_branch" \
-    --head "$branch" \
-    --draft \
-    --title "$(<"$pr_title_file")" \
-    --body-file "$pr_body_file")
-  [[ "$pr_url" =~ ^https://github.com/[^/]+/[^/]+/pull/[0-9]+$ ]] || die 'PR creation returned no URL'
-  pr_number=${pr_url##*/}
-  [[ "$pr_number" =~ ^[0-9]+$ ]] || die 'PR number could not be derived from the URL'
+title_file, body_file, head, base = sys.argv[1:]
+with open(title_file, encoding="utf-8") as handle:
+    title = handle.read().strip()
+with open(body_file, encoding="utf-8") as handle:
+    body = handle.read()
+print(json.dumps({"title": title, "body": body, "head": head, "base": base, "draft": True}))
+PY
+  local pr_number pr_url
+  gh api --method POST "repos/$target_repo/pulls" \
+    --input "$worker_root/pr-payload.json" > "$worker_root/pr-response.json"
+  pr_number=$(python3 - "$worker_root/pr-response.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    pr = json.load(handle)
+number = pr.get("number")
+if not isinstance(number, int) or number <= 0:
+    raise SystemExit("worker-live: PR creation returned no number")
+print(number)
+PY
+)
+  [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || die 'PR number could not be derived from the response'
+  pr_url="https://github.com/$target_repo/pull/$pr_number"
   write_output pr_url "$pr_url"
   write_output pr_number "$pr_number"
   write_output head_sha "$head_sha"
-  printf 'worker-live: opened DRAFT target pull request %s (cross-provider review pending)\n' "$pr_url"
+  printf 'worker-live: opened DRAFT target pull request %s from the clean publisher (cross-provider review pending)\n' "$pr_url"
 }
 
 # ---- cross-provider review / same-provider fix (review-fix.yml) ----------------------------------
@@ -1334,6 +1410,66 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to %s\n' "$secret_ref"
 }
 
+# PURE structural guard for the worker workflow's credential boundary (PR #310 rounds 1+2).
+# Parses a worker.yml and enforces, fail-closed:
+#   (1) the post-model mint (id app-token-post) is IMMEDIATELY followed by its sole consumer
+#       (id push), which runs before the gate — no intervening step may re-open the mint→use
+#       TTL window (round 2 major);
+#   (2) NO step after `push` in the worker job (between push and the hostile gate, or after the
+#       gate) references a credential in any form — once the gate has run target-controlled
+#       code the runner may hold a surviving hostile process (round 2 blocker);
+#   (3) privileged publish/final-state work lives in the separate, bounded `publish` job, which
+#       never checks out or executes target code.
+# The self-test runs this against the LIVE workflow AND against mutated fixtures (each rule
+# violated in turn), so the guard itself cannot rot vacuous.
+_worker_yml_boundary_check() {
+  python3 - "$1" <<'PY'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = yaml.safe_load(handle)
+jobs = (doc or {}).get("jobs") or {}
+worker = jobs.get("worker") or {}
+steps = worker.get("steps") or []
+ids = [step.get("id") for step in steps]
+for required in ("app-token-post", "push", "gate"):
+    if required not in ids:
+        raise SystemExit(f"worker.yml boundary: worker step id {required} is missing")
+mint, push, gate = (ids.index(name) for name in ("app-token-post", "push", "gate"))
+if push != mint + 1:
+    raise SystemExit("worker.yml boundary: the push step must IMMEDIATELY follow the "
+                     "app-token-post mint (an intervening step erodes the TTL window)")
+if gate <= push:
+    raise SystemExit("worker.yml boundary: the hostile gate must run after the push")
+for step in steps[push + 1:]:
+    dump = yaml.safe_dump(step)
+    for marker in ("GH_TOKEN", "app-token", "create-github-app-token", "secrets."):
+        if marker in dump:
+            raise SystemExit("worker.yml boundary: step "
+                             f"{step.get('name') or step.get('id')!r} runs in or after the "
+                             f"hostile gate window but references {marker}")
+publish = jobs.get("publish") or {}
+dump = yaml.safe_dump(publish)
+if "worker-live.sh publish" not in dump or "worker-issue.py status" not in dump:
+    raise SystemExit("worker.yml boundary: the clean publish job must own DRAFT-PR creation "
+                     "and the final issue state")
+for marker in ("working-directory: target", "worker-live.sh gate", "worker-live.sh model"):
+    if marker in dump:
+        raise SystemExit(f"worker.yml boundary: the publish job must never execute target "
+                         f"code (found {marker!r})")
+for step in publish.get("steps") or []:
+    uses = str(step.get("uses") or "")
+    if uses.startswith("actions/checkout") and (step.get("with") or {}).get("repository"):
+        raise SystemExit("worker.yml boundary: the publish job must not check out the target")
+timeout = publish.get("timeout-minutes")
+if not isinstance(timeout, int) or not 0 < timeout <= 30:
+    raise SystemExit("worker.yml boundary: the publish job must carry a <=30 minute timeout")
+print("worker.yml credential boundary holds")
+PY
+}
+
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
 # stream-json + codex --json fixtures, privacy: no transcript content crosses), and task-prompt
 # prefix stability (byte-identical static head across two different issues, variance only below
@@ -1687,6 +1823,87 @@ TOML
     printf '  skip (d) live cargo crash-reproduction (cargo not on PATH)\n'
   fi
 
+  # --- committed-tree change detection (PR #310 round 2): the clean-publisher split pushes the
+  # candidate branch BEFORE the gate, so the live gate now sees a CLEAN tree and must fall back
+  # to the committed diff vs the recorded pre-model base. The dirty path must keep working (the
+  # review-fix lane still gates uncommitted edits), and an unsafe/absent base must yield nothing
+  # (the registry gate then dies fail-closed) rather than evaluate an arbitrary rev-spec. ---
+  local cp="$tmp/changed-paths"
+  git init -q -b main "$cp"
+  _cpgit() { git -C "$cp" -c user.name=t -c user.email=t@example.invalid "$@"; }
+  printf 'a\n' > "$cp/kept.txt"
+  _cpgit add . && _cpgit commit -qm base
+  local cp_base
+  cp_base=$(git -C "$cp" rev-parse HEAD)
+  printf 'b\n' > "$cp/added.py"
+  chk "dirty tree reports porcelain paths (review-fix lane unchanged)" \
+    "$( cd "$cp" && WORKER_BASE_SHA="" _changed_paths )" "added.py"
+  _cpgit add . && _cpgit commit -qm change
+  chk "clean tree with NO recorded base reports nothing (gate fails closed)" \
+    "$( cd "$cp" && WORKER_BASE_SHA="" _changed_paths )" ""
+  chk "clean tree diffs against the recorded pre-model base" \
+    "$( cd "$cp" && WORKER_BASE_SHA="$cp_base" _changed_paths )" "added.py"
+  chk "an unsafe recorded base yields nothing (never an arbitrary rev-spec)" \
+    "$( cd "$cp" && WORKER_BASE_SHA="origin/main" _changed_paths )" ""
+
+  # --- worker.yml credential boundary (PR #310 rounds 1+2): the LIVE workflow must satisfy the
+  # structural guard, and each mutated fixture must be REFUSED — re-introducing a post-gate
+  # credential, inserting a step into the mint→push window, or moving target execution into the
+  # clean publish job all turn this red (non-vacuity in both directions). ---
+  if python3 -c 'import yaml' 2>/dev/null; then
+    chk "LIVE worker.yml satisfies the credential boundary" \
+      "$( (_worker_yml_boundary_check "$SCRIPT_DIR/../.github/workflows/worker.yml" \
+        >/dev/null 2>&1 && echo ok) || echo refused)" "ok"
+    # worker is deliberately the LAST mapping so mutation (m2) can append a hostile-window step
+    # to ITS step list by concatenation.
+    cat > "$tmp/wf-good.yml" <<'YML'
+jobs:
+  publish:
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@sha
+        with:
+          path: registry
+      - run: bash registry/scripts/worker-live.sh publish
+      - run: python3 registry/scripts/worker-issue.py status --x
+  worker:
+    steps:
+      - id: model
+        run: bash model
+      - id: app-token-post
+        uses: actions/create-github-app-token@sha
+      - id: push
+        env:
+          GH_TOKEN: t
+        run: bash push
+      - id: gate
+        run: bash gate
+      - name: cleanup
+        run: rm -rf -- "$WORKER_ROOT"
+YML
+    chk "minimal boundary fixture passes" \
+      "$( (_worker_yml_boundary_check "$tmp/wf-good.yml" >/dev/null 2>&1 && echo ok) || echo refused)" "ok"
+    # (m1) an intervening step between the mint and its sole consumer re-opens the TTL window
+    sed 's/^      - id: push$/      - id: writeback\n      - id: push/' "$tmp/wf-good.yml" \
+      > "$tmp/wf-m1.yml"
+    chk "(m1) a step inserted between mint and push is refused" \
+      "$( (_worker_yml_boundary_check "$tmp/wf-m1.yml" >/dev/null 2>&1 && echo ok) || echo refused)" "refused"
+    # (m2) a post-gate step holding a credential re-opens the round-2 exfiltration boundary
+    { cat "$tmp/wf-good.yml"; printf '%s\n' \
+      "      - name: final-state" "        env:" "          GH_TOKEN: t" "        run: echo x"
+    } > "$tmp/wf-m2.yml"
+    chk "(m2) a post-gate step referencing GH_TOKEN is refused" \
+      "$( (_worker_yml_boundary_check "$tmp/wf-m2.yml" >/dev/null 2>&1 && echo ok) || echo refused)" "refused"
+    # (m3) the clean publish job must never execute target code
+    sed 's|^      - run: bash registry/scripts/worker-live.sh publish$|      - run: bash registry/scripts/worker-live.sh publish\n        working-directory: target|' \
+      "$tmp/wf-good.yml" > "$tmp/wf-m3.yml"
+    chk "(m3) target execution inside the publish job is refused" \
+      "$( (_worker_yml_boundary_check "$tmp/wf-m3.yml" >/dev/null 2>&1 && echo ok) || echo refused)" "refused"
+  else
+    printf '  FAIL worker.yml boundary checks need PyYAML (install pyyaml)\n'
+    failures=$((failures + 1))
+  fi
+
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
   else
@@ -1698,11 +1915,12 @@ TOML
 case "${1:-}" in
   model) run_model ;;
   gate) run_gate ;;
+  push) push_branch ;;
   publish) publish_pr ;;
   review) run_review ;;
   fix) run_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|push|publish|review|fix|push-fix|write-back|self-test>' ;;
 esac
