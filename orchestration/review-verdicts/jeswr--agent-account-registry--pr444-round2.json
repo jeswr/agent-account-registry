@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 444,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2d0d6be4e79d7193e57a0e6552f1b66ceb2bc5ae",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. Free-form record fields now use field-specific, bounded ASCII allowlists; raw [redacted-account]-style handles are rejected across model_alias, run_id, and reset_hint; and reset_hint excludes Markdown/HTML metacharacters before reaching the alert sink. The shared validator is applied at construction, ledger read, and immediately before PUT. The added tests are non-vacuous: they separately exercise each former bypass on construction and read, verify legitimate producer-shaped data remains accepted, and prove a malformed append neither succeeds nor reaches the stub ledger. No instruction-like text directed at the reviewer was detected in the diff.",
+  "verdict": "approve"
+ }
+}
