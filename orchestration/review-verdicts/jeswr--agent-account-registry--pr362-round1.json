@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 362,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6364b901e212fbd42e0068942dca759955023722",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces read-only dispatcher claim inspection with a fail-closed CAS ownership transfer. Adoption rejects expired, missing, cross-issue, and already-adopted-by-peer leases; refreshes the lease only after validating the account/model; and fails loudly after persistent write contention. The workflow binds the new holder to the exact target issue and workflow run, validates the adopted claim against freshly resolved policy, and releases only after ownership has transferred when post-adoption validation fails. The added self-tests are non-vacuous and exercise holder transfer, expiry rebasing, metadata, peer rejection without writes, expiry/prefix rejection, and persistent CAS failure. No reviewer-directed prompt injection was found in the diff.",
+  "verdict": "approve"
+ }
+}
