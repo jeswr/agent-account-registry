@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "require_deployable() returns Ok solely when randomness_model() is Prss or HonestMajorityCoinToss, while the docs claim that mask secrecy and VSS verification hold exactly when it returns Ok. The test's DeployableStub is a direct counterexample: it reports Prss, every protocol method returns NotYetImplemented, yet require_deployable() succeeds. Any incomplete or incorrectly implemented source can likewise self-label and pass. Moreover, no production caller is wired through this gate in the diff, despite the trait documentation saying production call sites use it. Thus this public seam does not actually fail closed or establish the security properties it advertises.",
+   "file": "crates/sparq-mpc/src/randomness.rs",
+   "fix_hint": "Do not derive deployability from a descriptive model enum. Represent validated capabilities with an unforgeable construction/registration boundary or split simulation and deployable traits so only implementations satisfying the stronger contract can enter production APIs. At minimum, make deployment acceptance validate the required operations/capabilities and wire the real production entry point through that mandatory check; remove the stub assertion that a label alone is sufficient. Keep hypothetical model variants descriptive rather than automatically deployable until concrete implementations and validation exist.",
+   "severity": "major",
+   "title": "The deployability gate trusts a self-reported enum instead of verified capabilities"
+  },
+  {
+   "body": "Section 4 says shared_mask returns a mask that no <= t parties know, but the revised Rust trait explicitly makes this a model property and ShamirDealer, its sole implementation, knows the mask. This recreates the prior contract contradiction in the audit/design record and can mislead callers about what the trait guarantees.",
+   "file": "research/mpc-distributed-randomness-design.md",
+   "fix_hint": "Rewrite the Section 4 shared_mask bullet to match the structural Rust contract: it returns a uniform degree-t sharing; secrecy from up to t parties is a capability of a validated dealer-less implementation, not a guarantee of the method itself.",
+   "severity": "minor",
+   "title": "The design record still states the superseded strong shared_mask contract"
+  }
+ ],
+ "progress": "improving",
+ "summary": "Round 2 fixes the IT-MAC/nonzero-mask explanation and the repeated-dealer test, and it weakens the trait method contracts appropriately. One major fail-closed/capability issue remains: deployability is inferred solely from an enum label, and the included stub demonstrates that an implementation with no working cryptography passes the production gate. The design record also retains the old stronger shared_mask contract. Progress is improving because two prior findings are resolved and the remaining contract issue is narrower.",
+ "verdict": "request_changes"
+}
