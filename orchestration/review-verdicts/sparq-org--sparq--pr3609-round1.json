@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3609,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "47441ab97189342e5061c12967727444bf851744",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "The module and skill claim that the secx:SemiHonest set is pinned to SecurityDescriptor.adversary so it cannot silently over-claim. The test only iterates a hard-coded mapping for aggregate, join, and comparison. It omits hidden-property-path and both protocols classified as malicious-with-abort, and it checks only the forward assertion that those three selected descriptors are SemiHonest. If SemiHonest were removed from one of those RDF blocks, or from a newly added/omitted semi-honest protocol, this test would still pass. Likewise, the strong classification of auth-comparison/auth-disclose is not checked against implementation metadata. This makes the stated load-bearing honesty guard incomplete and the test non-equivalent to the invariant it claims to enforce.",
+    "file": "crates/sparq-mpc/src/secprop.rs",
+    "fix_hint": "Create a single exhaustive protocol-to-implementation-adversary mapping covering every MPC_PROTOCOL_IRIS and assert exact set equality in both directions between implementation classifications and RDF assumptions. If some protocols lack SecurityDescriptor metadata, add an equally authoritative typed descriptor for them or weaken the public claim and encode/test their status through a real implementation-backed source. Include explicit checks for hidden-property-path and both auth protocols.",
+    "severity": "major",
+    "title": "The adversary-model drift test does not pin the complete annotation set"
+   },
+   {
+    "body": "The diff repeatedly cites research/security-properties-ontology-design.md \u00a75c as authority, but that section says sparq-mpc protocols carry both HonestMajority and SemiHonest so a malicious-security preference excludes them. This graph instead introduces two protocols without SemiHonest and intentionally admits them under that preference. That may be a valid evolution, but as submitted the implementation and its normative design/audit evidence disagree on the central admission rule, so soundness-as-scoped cannot be confirmed from the cited record.",
+    "file": "crates/sparq-mpc/ontologies/secprop-mpc.ttl",
+    "fix_hint": "Update the relevant design record in the same change to specify the mixed semi-honest/malicious-with-abort estate, the closed-world meaning of assumption absence, and the evidence required before an auth protocol is admitted; then make the exhaustive implementation-backed test enforce that revised rule. Alternatively, keep \u00a75c's current model and exclude all protocols under a malicious-security requirement.",
+    "severity": "major",
+    "title": "The graph departs from the cited \u00a75c design contract without updating it"
+   }
+  ],
+  "progress": null,
+  "summary": "The annotation parser and exclusion tests are internally coherent, and the new dependency is correctly feature-gated. However, the load-bearing claim that the RDF adversary labels are pinned to the implementation is not established: the advertised test checks only three preselected semi-honest protocols, omits hidden-property-path, and never validates either malicious-with-abort protocol. It therefore cannot detect the most dangerous drift\u2014removing SemiHonest from a protocol whose implementation is still semi-honest. The change also diverges from the cited design record's \u00a75c model without updating that record. The diff contains an embedded process instruction to flag the work for later re-review, so injection_detected is true.",
+  "verdict": "request_changes"
+ }
+}
