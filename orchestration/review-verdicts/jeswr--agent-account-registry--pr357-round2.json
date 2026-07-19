@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 357,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a50c67526ee641cbf2f4e89fb3e84d0b899d8699",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior round's major finding is resolved. Non-conflict transient failures (HTTP 5xx, 429, and rate-limit 403 responses) now receive bounded, jittered retries, while permanent failures still fail immediately and genuine CAS conflicts retain their separate deadline-bound retry path. The new self-tests are non-vacuous: they prove recovery after a transient 502, termination and alerting after persistent 503 responses, exact PUT/backoff counts, classifier boundaries, and preservation of the real terminal error. I found no new correctness, soundness, fail-closed, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
