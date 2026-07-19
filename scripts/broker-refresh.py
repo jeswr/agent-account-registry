@@ -112,6 +112,47 @@ def broker(provider, cred):
         subprocess.run(["rm", "-rf", home], check=False)
 
 
+def write_capability(cap, path):
+    """Persist the short-lived capability to a caller-supplied file at mode 0600.
+    The capability carries the access token, so it must go to a PRIVATE file — NEVER stdout (in
+    Actions or ordinary automation stdout becomes a log entry, breaking the token-never-printed
+    invariant), and NEVER through a pre-existing permissive file or a symlink planted at `path`.
+
+    Opening the destination directly with O_CREAT|O_TRUNC would (a) truncate+write the token into an
+    already-existing mode-0644 file and only narrow the mode AFTERWARD — a window in which the secret
+    is group/world readable — and (b) follow a symlink at `path`, redirecting the token into another
+    file. Instead we stage the bytes into a fresh mode-0600 temp file in the SAME directory
+    (tempfile.mkstemp => O_CREAT|O_EXCL, 0600), fsync, then os.replace() atomically into place: the
+    secret only ever lands in a brand-new 0600 inode, and rename REPLACES a symlink at `path` rather
+    than following it and writing the token into some other file. Returns the path."""
+    dest_dir = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".broker-cap.", dir=dest_dir)  # mkstemp guarantees mode 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cap, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)  # atomic; overwrites a symlink at `path`, never follows it
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def emit_live_capability(cap, out_file):
+    """Live path (registry Actions): write the capability to a mode-0600 `out_file` and return a
+    human-facing confirmation that carries NO token. Fail closed if no destination is supplied —
+    never fall back to printing the capability to stdout."""
+    if not out_file:
+        raise ValueError("refusing to emit a live capability without --out-file "
+                         "(the access token must never be printed to stdout)")
+    write_capability(cap, out_file)
+    return f"broker-refresh: wrote capability to {out_file} (mode 0600); access token not printed"
+
+
 # ---- self-test (mocked; never touches a live login) ---------------------------------------------
 def _self_test():
     ok = True
@@ -147,6 +188,56 @@ def _self_test():
     chk("leak detector fires on a refresh_token key (non-vacuous)", leaked)
     chk("cred_relpath openai", cred_relpath("openai") == ".codex/auth.json")
     chk("cred_relpath anthropic", cred_relpath("anthropic") == ".claude/.credentials.json")
+    # the live capability is written to a private file, NEVER printed (the #193 invariant)
+    d = tempfile.mkdtemp(prefix="broker-selftest-")
+    try:
+        outp = os.path.join(d, "cap.json")
+        msg = emit_live_capability(co, outp)
+        mode = stat.S_IMODE(os.stat(outp).st_mode)
+        chk("live capability file is mode 0600", mode == 0o600)
+        with open(outp) as f:
+            chk("live capability round-trips to file", json.load(f) == co)
+        # confirmation is safe to log: it names the destination but carries no token value
+        chk("confirmation carries no access token", "ACCESS_short" not in msg)
+        # fail closed: no out_file => refuse, never emit the capability anywhere
+        refused = False
+        try:
+            emit_live_capability(co, None)
+        except ValueError:
+            refused = True
+        chk("live path refuses without an out_file (fail closed)", refused)
+        # EXISTING PERMISSIVE destination: the token must NOT be written through the old 0644 inode.
+        # A hardlink pins the pre-existing inode so we can read it back after the write; the atomic
+        # replace lands the secret in a fresh 0600 inode, so the old (permissive) inode stays empty.
+        exist = os.path.join(d, "existing.json")
+        os.close(os.open(exist, os.O_WRONLY | os.O_CREAT, 0o644))
+        os.chmod(exist, 0o644)
+        pin = os.path.join(d, "pinned-old-inode")
+        os.link(exist, pin)  # same inode as the pre-existing permissive file
+        write_capability(co, exist)
+        with open(pin) as f:
+            chk("existing permissive inode never receives the token", "ACCESS_short" not in f.read())
+        chk("existing-dest final file is mode 0600", stat.S_IMODE(os.stat(exist).st_mode) == 0o600)
+        with open(exist) as f:
+            chk("existing-dest final content is the capability", json.load(f) == co)
+        # SYMLINK destination: the token must NOT be redirected through the link into another file.
+        victim = os.path.join(d, "victim.json")
+        with open(victim, "w") as f:
+            f.write("PREEXISTING")
+        os.chmod(victim, 0o644)
+        link = os.path.join(d, "link.json")
+        os.symlink(victim, link)
+        write_capability(co, link)
+        with open(victim) as f:
+            vbytes = f.read()
+        chk("symlink target is not overwritten with the token", "ACCESS_short" not in vbytes)
+        chk("symlink target retains its original content", vbytes == "PREEXISTING")
+        chk("symlink dest replaced by a real (non-symlink) file", not os.path.islink(link))
+        chk("symlink-dest final file is mode 0600", stat.S_IMODE(os.lstat(link).st_mode) == 0o600)
+        with open(link) as f:
+            chk("symlink-dest final content is the capability", json.load(f) == co)
+    finally:
+        subprocess.run(["rm", "-rf", d], check=False)
     print("broker-refresh self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -156,14 +247,20 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--provider", choices=PROVIDERS)
     ap.add_argument("--cred-file", help="path to the stored credential JSON (registry Actions only)")
+    ap.add_argument("--out-file", help="write the short-lived capability here at mode 0600 (REQUIRED "
+                    "for the live path; the access token is never printed to stdout)")
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
     if args.provider and args.cred_file:
+        if not args.out_file:
+            print("broker-refresh: refusing to emit a live capability without --out-file "
+                  "(the access token must never be printed to stdout)", file=sys.stderr)
+            return 2
         with open(args.cred_file) as f:
             cred = json.load(f)
         cap = broker(args.provider, cred)
-        print(json.dumps(cap))  # access token + expiry only; refresh token never emitted
+        print(emit_live_capability(cap, args.out_file))  # a path, never the token itself
         return 0
     print("broker-refresh: pure extraction + isolation ready; live refresh runs in registry Actions "
           "against an account secret. See --self-test.")
