@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 398,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "83ba3db951d8d2bff54bcf296d79b89b80cda487",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly moves the arm-time hold, reviewed-head, draft/state/author, same-repository head, base-ref, and live security-label checks onto a second PR snapshot taken after the potentially slow immutable changed-file inspection. Head changes are returned to review:needs; other invariant failures stop the operation; holds preserve the human-owned state; and the actual arm remains SHA-bound by expectedHeadOid. Trust-surface and label-derived audit behavior is preserved. The added self-tests are non-vacuous: they inject races only after the entry read and assert that no ready/latch/pass mutation occurs, while also covering the newly enforced live invariants. The remaining post-probe label/base TOCTOU is explicitly documented and not widened by this patch.",
+  "verdict": "approve"
+ }
+}
