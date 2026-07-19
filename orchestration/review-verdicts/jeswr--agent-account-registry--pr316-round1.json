@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_persist_one` reads the current body and then performs an unconditional `gh issue edit --body`. If another writer changes provider, credential metadata, secret reference, or notes after that read but before this edit, this edit replaces and loses the concurrent change. The confirm read sees exactly `new_body` and returns `True`, so the loss is silent. The retry only detects writers that run after this edit; it cannot detect the read-to-write race. Test (i) models a change before the fresh read, and test (vi) models a change after this edit, but no test models the losing interleaving between fresh read and unconditional edit. Calling this optimistic concurrency is therefore unsound, and the referenced workflow serialization is not part of this diff.",
+   "file": "scripts/account-usage.py",
+   "fix_hint": "Close the read-to-write race before claiming success: use a real conditional/CAS update keyed to a version or `updatedAt` if the API supports it, or serialize this workflow with every catalog-body writer using the same concurrency lock. Add a non-vacuous test for a writer that edits between the fresh read and this write and assert its metadata is preserved (or that this operation fails without overwriting it).",
+   "severity": "major",
+   "title": "Unconditional body replacement still silently loses concurrent metadata edits"
+  }
+ ],
+ "progress": null,
+ "summary": "The fresh-read and post-write verification reduce the stale-snapshot window and the new tests exercise the implemented retry/error paths, but the change does not provide optimistic concurrency or prevent silent metadata loss. Because `gh issue edit --body` is unconditional, a concurrent catalog edit that lands after `_issue_view` and before this writer's edit is overwritten; the subsequent exact-body confirmation then reports success. The diff itself acknowledges the remaining window and refers to serialization as a follow-up, but no serialization or compare-and-swap mechanism is included. This is incomplete for the stated no-silent-overwrite trust-plane guarantee.",
+ "verdict": "request_changes"
+}
