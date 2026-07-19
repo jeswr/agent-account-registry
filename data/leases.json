@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct01",
-   "claim_id": "4128e67bdac74101b100aa29a1dff240",
-   "holder": "sparq-org/sparq#3067@29701236639.1",
-   "package": "bench",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784490378,
-   "expires_at": 1784496678
-  },
-  {
-   "account": "acct01",
    "claim_id": "54aa55482a3244779c11fd2157ee9572",
    "holder": "review:sparq-org/sparq#3624@dispatch-29700965913.1",
    "package": "sparq-zk-compose",
