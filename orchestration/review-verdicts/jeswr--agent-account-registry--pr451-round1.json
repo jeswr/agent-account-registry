@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 451,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "428c183949b7574168aad9d152a2975950d78ee6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is correct and complete for the stated regression: it makes the intended conflict-first, review-state-agnostic behavior explicit and adds non-vacuous coverage for a non-draft review:pass PR on a conflicting base. The new assertion verifies both precedence over a failing CI gate (needs-rebase, not needs-ci-fix) and empty context, while the lease cases verify that either live review or fix ownership suppresses duplicate repair dispatch. Existing control flow already implements those assertions by validating the status head, checking human holds and provenance first, requiring an explicit conflicting=true snapshot, honoring both lease classes, emitting needs-rebase, and terminating further enumeration for that PR. No trust check is weakened, no permissive fallback is introduced, and the diff contains no reviewer-directed prompt injection.",
+  "verdict": "approve"
+ }
+}
