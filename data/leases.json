@@ -12,16 +12,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "35299b6c946d4255b7e00643e94bba07",
-   "holder": "review:sparq-org/sparq#3628@dispatch-29703420259.1",
-   "package": "sparq-zk-compose",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1784494933,
-   "expires_at": 1784499133
-  },
-  {
-   "account": "acct01",
    "claim_id": "8806f04befd14bd485abe86a1cf155fc",
    "holder": "review:jeswr/agent-account-registry#454@dispatch-29703420259.1",
    "package": "review-loop",
