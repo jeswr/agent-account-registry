@@ -1,0 +1,29 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The file repeatedly claims every exact (policy, request) decision and its verbatim matched/unmet output is pinned by a named crate test. That is false for multiple scenarios. For example, datetime_window_gates, prohibition_overrides_permission, recipient_is_part_of_set, and duty_must_be_discharged use blank-node rules rather than the named rule IRIs shown here, and primarily assert allow/deny; they do not assert these exact matched_rules/unmet_constraints strings. Consequently changes to evaluator output, rule IDs, or these pasted strings can drift without any cited test failing.",
+   "file": "site/src/lib/policy.ts",
+   "fix_hint": "Add real crate tests using the exact displayed Turtle and requests and assert the complete Decision values (including rule IDs and all explanation strings), or generate/import the captured fixtures from a checked artifact produced by those tests. Point each variant to a test that actually pins that exact variant and output; soften/remove the verbatim and exact-pair claims until then.",
+   "severity": "major",
+   "title": "Captured decisions are not pinned by the cited crate tests"
+  },
+  {
+   "body": "The test named `every verdict carries real crate-test provenance` only checks that an arbitrary string starts with `odrl_eval.rs::`; it neither verifies that the function exists nor that it exercises the displayed policy/request and exact Decision. The other tests check internal shape only. Thus the stated fabrication failure mode remains entirely possible: any internally consistent hand-edited verdict with a made-up prefixed test name passes.",
+   "file": "site/test/policy.test.mjs",
+   "fix_hint": "Use a generated manifest from the Rust test/evaluator path, or otherwise verify exact fixture content against evaluator-produced output. At minimum validate test-name existence and add exact Rust assertions for every captured Decision; do not describe this JS suite as pinning real provenance by itself.",
+   "severity": "major",
+   "title": "Provenance test is vacuous and cannot detect fabricated captured output"
+  },
+  {
+   "body": "`requestLine` emits context calls such as `.with(dateTime, \"...\")` and duty calls such as `.discharge(odrl:anonymize)`. Those bare values are not the string/Value/action expressions used by the Rust API and the latter is not valid Rust syntax. This conflicts with the claim that the line is the compact API line the crate builds and expands the builder faithfully.",
+   "file": "site/src/lib/policy.ts",
+   "fix_hint": "Render valid API-like expressions, for example quoted/full left-operand IRIs plus the appropriate Value constructor and a quoted/full duty action (matching the actual Request API), and make the test assert the complete expected line for representative context and duty variants.",
+   "severity": "minor",
+   "title": "Displayed Request builder calls are not faithful Rust expressions"
+  }
+ ],
+ "progress": null,
+ "summary": "The walkthrough's central provenance claim is not supported by the cited tests. Several scenarios change blank-node rules into named rules and publish exact matched/unmet strings, while the named Rust tests assert only allow/deny (and occasionally counts/substrings), not the displayed output. The new site tests validate only self-consistency of the pasted fixtures and that a provenance string has the expected prefix, so fabricated or stale captured output would still pass. The rendered Request builder lines are also not faithful Rust expressions for context and duty arguments.",
+ "verdict": "request_changes"
+}
