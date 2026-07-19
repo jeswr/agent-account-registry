@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 410,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8f9f2f829d994ef3e2c2fdb3ef8df2eafe747bcf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved. Both the post-gate token mint and follow-up creation now use an explicit always() status function while retaining the model-success and non-dry-run guards, so they remain eligible after a failed gate. Publishing remains fail-closed on gate success. The added self-test is non-vacuous: it checks the two positive always() requirements, the mint's model-success guard, and uses the PR step as a negative control while separately confirming its gate-success condition. No new correctness, soundness, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
