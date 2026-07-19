@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "missing_intervals performs both `prev.last + 1` in the interval-merging closure and `counter + 1` while skipping remote cloud dots. Dot counters accept every non-zero u64, and parse_dec_u64 explicitly accepts u64::MAX, so these are reachable with valid inputs. In debug builds either expression can panic; in release builds it wraps to zero, potentially emitting an invalid interval beginning at 0 or merging/splitting the result incorrectly. For example, have clock a:u64::MAX with remote clock a:(u64::MAX-1) reaches the merge comparison with a last boundary, while a remote cloud dot at u64::MAX reaches the cursor increment. This violates the stated first>=1 invariant and makes reconciliation attacker-triggerable via a valid bounded hello.",
+   "file": "crates/sparq-crdt/src/sync.rs",
+   "fix_hint": "Avoid unchecked successor arithmetic. Merge only via `prev.last.checked_add(1) == Some(first)`, and when consuming a cloud counter of u64::MAX represent exhaustion explicitly (for example, set an Option cursor to None and skip the trailing interval). Add regression tests covering local/remote clocks and cloud dots at u64::MAX, asserting no panic and exact intervals in both boundary cases. Audit the nearby epoch successor expression for the same overflow pattern.",
+   "severity": "major",
+   "title": "u64::MAX sequence causes overflow in missing_intervals"
+  }
+ ],
+ "progress": null,
+ "summary": "The new CRDT surface is generally careful about canonical encoding and bounded decoding, but the missing-interval arithmetic is not correct for the explicitly supported u64 counter domain. A valid summary containing sequence u64::MAX can panic in debug builds and wrap in release builds, so peer reconciliation is neither total nor reliably correct. This boundary needs checked/saturating control flow and a real regression test before approval.",
+ "verdict": "request_changes"
+}
