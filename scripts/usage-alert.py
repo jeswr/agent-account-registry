@@ -28,7 +28,12 @@
 # ALERT_REPO. Account handles never appear in workflow logs.
 # Writes go through _gh(check=True), which surfaces a non-zero gh returncode as a sanitized
 # ::warning:: (op + returncode only — never gh stderr, which can echo request bodies under
-# GH_DEBUG=api).
+# GH_DEBUG=api). Delivery is additionally FAIL-LOUD end-to-end (#432 round 2): the visibility
+# probe proves only metadata read, so a fine-grained ALERT_TOKEN without Issues write can pass it
+# and then fail at issue list/create/edit. _deliver_alert() returns that failure to main(), which
+# retries a FRESHLY RENDERED redacted body on the public registry under the ambient token (never
+# the detailed body — the fallback repo is public) and exits nonzero when every route fails,
+# instead of printing "maintainer alerted" over a dropped alert.
 #
 # Pure classify()/_policy_pool_margin() are unit-tested (--self-test); the CLI wraps them over the
 # usage file + `gh`.
@@ -235,6 +240,37 @@ def _gh(args, capture=False, token=None, check=False):
     return result
 
 
+def _deliver_alert(repo, token, body):
+    """Create-or-update the alert issue on `repo` under `token` (None -> ambient GH_TOKEN).
+    Returns True ONLY when the existing-issue lookup AND the create/edit both succeed (review
+    round 2 of #432): a failed `issue list` must NOT be read as "no open alert" (its empty stdout
+    would parse as []), and a failed create/edit must not report success — a fine-grained token
+    with metadata read but no Issues write passes the visibility probe and would otherwise drop
+    the alert while the run stays green. The label create stays best-effort (it fails routinely
+    when the label already exists)."""
+    _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", "d73a4a",
+         "--description", "Autonomous worker availability alert (maintainer action)"],
+        capture=True, token=token)
+    listed = _gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", "open",
+                  "--json", "number,title", "--limit", "10"], capture=True, token=token,
+                 check=True)
+    if listed.returncode != 0:
+        return False
+    try:
+        found = json.loads(listed.stdout or "[]")
+    except ValueError:
+        return False
+    num = next((i["number"] for i in found
+                if isinstance(i, dict) and i.get("title") == ALERT_TITLE), None)
+    if num:
+        written = _gh(["issue", "edit", str(num), "-R", repo, "--body", body], capture=True,
+                      token=token, check=True)
+    else:
+        written = _gh(["issue", "create", "-R", repo, "--title", ALERT_TITLE, "--label",
+                       ALERT_LABEL, "--body", body], capture=True, token=token, check=True)
+    return written.returncode == 0
+
+
 def main():
     registry_repo = os.environ["REGISTRY_REPO"]
     # Where the alert issue lives + which token writes it. A private ALERT_REPO is used ONLY when
@@ -264,14 +300,6 @@ def main():
     body = render(eligible, rows, pool, threshold, maintainer, probe_empty=not usage,
                   redact_handles=redact_handles)
 
-    _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", "d73a4a",
-         "--description", "Autonomous worker availability alert (maintainer action)"],
-        capture=True, token=alert_token)
-    found = json.loads(_gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", "open",
-                            "--json", "number,title", "--limit", "10"],
-                           capture=True, token=alert_token).stdout or "[]")
-    num = next((i["number"] for i in found if i["title"] == ALERT_TITLE), None)
-
     # Privacy (locked decision 22b): NOTHING printed to the (public) workflow log carries an account
     # handle, a per-provider count, or the pool size — the detail lives only in the alert issue body.
     if degraded:
@@ -282,19 +310,56 @@ def main():
             # handle, count, or pool size — so the missing private channel is visible to operators.
             print("::warning::usage-alert: no verified private ALERT_REPO+ALERT_TOKEN route — "
                   "per-account detail SUPPRESSED; the public alert carries a generic signal only")
-        if num:
-            _gh(["issue", "edit", str(num), "-R", repo, "--body", body], capture=True,
-                token=alert_token, check=True)
-        else:
-            _gh(["issue", "create", "-R", repo, "--title", ALERT_TITLE, "--label", ALERT_LABEL,
-                 "--body", body], capture=True, token=alert_token, check=True)
+        delivered = _deliver_alert(repo, alert_token, body)
+        if not delivered and not redact_handles:
+            # DEGRADED private-route delivery failure (review round 2 of #432): the visibility
+            # probe proves only that ALERT_TOKEN can READ repo metadata, not that it can write
+            # Issues, so delivery can still fail after route selection. Retry on the public
+            # registry under the ambient token with a FRESHLY RENDERED redacted body — NEVER the
+            # detailed one already in `body`: the fallback repo is public and must see no handle,
+            # count, or reset time.
+            print("::warning::usage-alert: private-route alert delivery FAILED — retrying a "
+                  "REDACTED generic alert on the public registry repo")
+            body = render(eligible, rows, pool, threshold, maintainer, probe_empty=not usage,
+                          redact_handles=True)
+            delivered = _deliver_alert(registry_repo, None, body)
+        if not delivered:
+            # FAIL LOUD (review round 2 of #432): every route failed, so the degraded-fleet
+            # signal was dropped — a green exit here would hide exactly the condition this
+            # script exists to surface.
+            print("::error::usage-alert: degraded=true but the alert could NOT be delivered on "
+                  "any route — treat this run as FAILED")
+            return 1
         print("::warning::usage-alert: degraded=true — maintainer alerted (detail in the alert issue)")
     else:
+        listed = _gh(["issue", "list", "-R", repo, "--label", ALERT_LABEL, "--state", "open",
+                      "--json", "number,title", "--limit", "10"], capture=True,
+                     token=alert_token, check=True)
+        if listed.returncode != 0:
+            # Review round 2 of #432: a failed lookup is NOT "no open alert" — a stale degraded
+            # alert may remain open, pointing the maintainer at a problem that already cleared.
+            print("::warning::usage-alert: recovered, but the open-alert lookup failed — a "
+                  "stale alert may remain open")
+            return 1
+        try:
+            found = json.loads(listed.stdout or "[]")
+        except ValueError:
+            print("::warning::usage-alert: recovered, but the open-alert lookup returned an "
+                  "unparseable payload — a stale alert may remain open")
+            return 1
+        num = next((i["number"] for i in found
+                    if isinstance(i, dict) and i.get("title") == ALERT_TITLE), None)
         if num:
-            _gh(["issue", "comment", str(num), "-R", repo, "--body",
-                 "✅ Recovered — worker availability is back above the degraded threshold. Auto-closing."],
-                capture=True, token=alert_token, check=True)
-            _gh(["issue", "close", str(num), "-R", repo], capture=True, token=alert_token, check=True)
+            commented = _gh(["issue", "comment", str(num), "-R", repo, "--body",
+                             "✅ Recovered — worker availability is back above the degraded "
+                             "threshold. Auto-closing."],
+                            capture=True, token=alert_token, check=True)
+            closed = _gh(["issue", "close", str(num), "-R", repo], capture=True,
+                         token=alert_token, check=True)
+            if commented.returncode != 0 or closed.returncode != 0:
+                print("::warning::usage-alert: recovered, but closing the stale alert failed — "
+                      "it may still show as open")
+                return 1
         print("usage-alert: degraded=false")
     return 0
 
@@ -607,6 +672,124 @@ def _self_test():
         chk(f"main() {label} (#432 r1)",
             (repo3, "acct-wire-h1" in body3, "SUPPRESSED" in body3),
             (want_repo, want_handles, not want_handles))
+    # END-TO-END delivery-failure handling (review round 2 of #432): _repo_confirmed_private
+    # proves only metadata READ, so a fine-grained ALERT_TOKEN without Issues write passes the
+    # visibility probe and then fails at issue list/create/edit. main() must observe that
+    # failure, retry a FRESHLY RENDERED redacted body on the public registry under the ambient
+    # token (never reuse the detailed body), print "maintainer alerted" only on a real delivery,
+    # and return nonzero when every route fails.
+
+    class _Res:
+        def __init__(self, rc, stdout=""):
+            self.returncode, self.stdout, self.stderr = rc, stdout, ""
+
+    def _e2e(env, stub):
+        """Run main() with env overrides (None -> unset) and a stubbed subprocess.run; returns
+        (exit code, captured stdout)."""
+        saved = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        real = subprocess.run
+        subprocess.run = stub
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = main()
+        finally:
+            subprocess.run = real
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return rc, out.getvalue()
+
+    def _fail_stub(fail, calls):
+        """gh stub: the visibility probe answers private:true, `issue list` answers []; any
+        ("list"/"create"/"edit", repo) pair in `fail` returns rc 1."""
+        def run(args, **_kw):
+            calls.append(list(args))
+            if args[:3] == ["gh", "api", "repos/org/private"]:
+                return _Res(0, json.dumps({"private": True}))
+            op = args[2] if args[:2] == ["gh", "issue"] else None
+            repo_of = args[args.index("-R") + 1] if "-R" in args else None
+            if op and (op, repo_of) in fail:
+                return _Res(1)
+            return _Res(0, "[]" if op == "list" else "")
+        return run
+
+    CONF = {"REGISTRY_REPO": "org/registry", "ALERT_REPO": "org/private", "ALERT_TOKEN": "tok",
+            "ACCOUNT_POOL": '["acct-wire-h1", "acct-wire-h2"]',
+            "POLICY_FILE": "/nonexistent/policy.toml", "WORKER_USAGE_FILE": None}
+    # (1) private issue-LIST failure -> no detailed create anywhere, redacted retry on registry.
+    calls_lf = []
+    rc_lf, out_lf = _e2e(CONF, _fail_stub({("list", "org/private")}, calls_lf))
+    fb = next((c for c in calls_lf if c[:3] == ["gh", "issue", "create"]
+               and c[c.index("-R") + 1] == "org/registry"), None)
+    fb_body = fb[fb.index("--body") + 1] if fb else ""
+    priv_create = next((c for c in calls_lf if c[:3] == ["gh", "issue", "create"]
+                        and c[c.index("-R") + 1] == "org/private"), None)
+    chk("e2e private list failure -> redacted retry on the registry, rc 0 (#432 r2)",
+        (rc_lf, priv_create, fb is not None, "maintainer alerted" in out_lf),
+        (0, None, True, True))
+    chk("e2e fallback body is FRESHLY REDACTED — no handle, generic signal only (#432 r2)",
+        ("acct-wire-h1" in fb_body, "acct-wire-h2" in fb_body, "Usable workers" in fb_body,
+         "SUPPRESSED" in fb_body), (False, False, False, True))
+    # (2) private CREATE failure (the exact metadata-read-only token shape) -> public fallback.
+    calls_cf = []
+    rc_cf, _out_cf = _e2e(CONF, _fail_stub({("create", "org/private")}, calls_cf))
+    fb2 = next((c for c in calls_cf if c[:3] == ["gh", "issue", "create"]
+                and c[c.index("-R") + 1] == "org/registry"), None)
+    fb2_body = fb2[fb2.index("--body") + 1] if fb2 else ""
+    chk("e2e private create failure -> successful REDACTED public fallback, rc 0 (#432 r2)",
+        (rc_cf, fb2 is not None, "acct-wire-h1" in fb2_body, "SUPPRESSED" in fb2_body),
+        (0, True, False, True))
+    # (2b) private EDIT failure on an existing alert issue -> same public fallback.
+    calls_ef = []
+
+    def _edit_fail(args, **_kw):
+        calls_ef.append(list(args))
+        if args[:3] == ["gh", "api", "repos/org/private"]:
+            return _Res(0, json.dumps({"private": True}))
+        if args[:3] == ["gh", "issue", "list"]:
+            on_private = args[args.index("-R") + 1] == "org/private"
+            return _Res(0, json.dumps([{"number": 7, "title": ALERT_TITLE}]) if on_private
+                        else "[]")
+        if args[:3] == ["gh", "issue", "edit"]:
+            return _Res(1)
+        return _Res(0)
+
+    rc_ef, _out_ef = _e2e(CONF, _edit_fail)
+    fb3 = next((c for c in calls_ef if c[:3] == ["gh", "issue", "create"]
+                and c[c.index("-R") + 1] == "org/registry"), None)
+    fb3_body = fb3[fb3.index("--body") + 1] if fb3 else ""
+    chk("e2e private edit failure -> REDACTED public fallback, rc 0 (#432 r2)",
+        (rc_ef, fb3 is not None, "acct-wire-h1" in fb3_body, "SUPPRESSED" in fb3_body),
+        (0, True, False, True))
+    # (3) BOTH routes fail -> nonzero exit, ::error::, and NO "maintainer alerted" claim.
+    calls_bf = []
+    rc_bf, out_bf = _e2e(CONF, _fail_stub({("create", "org/private"),
+                                           ("create", "org/registry")}, calls_bf))
+    chk("e2e BOTH routes fail -> rc 1, ::error::, no 'maintainer alerted' (#432 r2)",
+        (rc_bf, "::error::" in out_bf, "maintainer alerted" in out_bf), (1, True, False))
+    # (4) recovery side: a failed `issue list` is a LOOKUP FAILURE (rc 1, stale alert may remain
+    # open), never parsed as "no open alert"; a healthy fleet with working gh stays rc 0.
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as uf:
+        json.dump({"acct-wire-h1": {"5h_util": "0.1", "7d_util": "0.1"},
+                   "acct-wire-h2": {"exempt": True}}, uf)
+        healthy_usage = uf.name
+    HEALTHY = dict(CONF, ALERT_REPO=None, ALERT_TOKEN=None, WORKER_USAGE_FILE=healthy_usage)
+    calls_rf = []
+    rc_rf, out_rf = _e2e(HEALTHY, _fail_stub({("list", "org/registry")}, calls_rf))
+    calls_rok = []
+    rc_rok, out_rok = _e2e(HEALTHY, _fail_stub(set(), calls_rok))
+    os.unlink(healthy_usage)
+    chk("e2e recovery-side list failure observed -> rc 1, stale-alert warning (#432 r2)",
+        (rc_rf, "stale alert" in out_rf), (1, True))
+    chk("e2e healthy fleet + working gh -> rc 0, degraded=false",
+        (rc_rok, "degraded=false" in out_rok), (0, True))
     # Probe-exempt backoff surfacing (decision 2026-07-17, registry issue #29): an exempt account
     # is `ok` by design (never probe-missing), but an ACTIVE backoff is surfaced + not eligible,
     # an EXPIRED one clears, and a forged/malformed stamp fails open to `ok` (never crashes).
