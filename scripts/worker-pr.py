@@ -412,8 +412,10 @@ def trust_surface_paths_touched(diff_files, surface_paths=DEFAULT_TRUST_SURFACE_
 
 def human_owned(labels):
     """A PR carrying review:needs-user (loop escalation) or needs:user (groom's parked-PR
-    "Human attention required" marker) is human-owned terminal: no autonomous disarm, redraft,
-    fix push, or review may touch it until a human clears the label."""
+    "Human attention required" marker) is human-owned terminal: no autonomous fix push, review,
+    or when=always defuse may touch it until a human clears the label. The ONE exception is the
+    when=mismatch safety-only latch retraction (issue #105): a human hold parks pushes/reviews
+    but must never strand an auto-merge latch on an unreviewed head — see disarm()."""
     return any(label in HUMAN_OWNED_LABELS for label in labels)
 
 
@@ -1176,12 +1178,15 @@ def disarm(repo, pr_number, when):
     row that requested this is hostile — every precondition is re-derived from the API here).
 
     Trust surface mirrors the review enumerator: only an open, same-repo, bot-authored
-    `sparq-agent/*` PR is ever touched, and a PR labelled review:needs-user OR needs:user is
-    human-owned (a human arm/park decision stands). when=always additionally consults the
-    head-ref-linked SOURCE issue: a `needs:*`-parked issue is human-owned too, and the defuse
-    precedes an autonomous push into that human's territory — mismatch mode deliberately does
-    NOT consult the issue, because retracting a latch that would merge a never-reviewed tree is
-    the safety invariant and must not be blocked by work-item parking. when=mismatch requires
+    `sparq-agent/*` PR is ever touched. A PR labelled review:needs-user OR needs:user is
+    human-owned, and when=always (the autonomous-fix defuse) stands down on it entirely — as it
+    does on a `needs:*`-parked head-ref-linked SOURCE issue, which it additionally consults so a
+    fix push never rides into that human's territory. But when=mismatch — the issue #42 safety
+    invariant, retracting a latch that would merge a never-reviewed tree — must NOT be blocked by
+    a human hold (issue #105): it retracts the latch (disable-auto/dequeue + redraft) while
+    PRESERVING the hold label, dropping only the relabel that would re-admit the PR to the loop
+    and never rebinding a held arm forward. mismatch also does NOT consult the source issue,
+    for the same reason work-item parking must not strand a live latch. when=mismatch requires
     (armed OR ready-but-unarmed) AND head != reviewed-sha (registry issue #42 invariant —
     matching SHAs are NEVER disarmed).
 
@@ -1215,7 +1220,17 @@ def disarm(repo, pr_number, when):
         _write_outputs({"disarmed": False})
         print("disarm skipped: not a same-repo bot worker PR")
         return
-    if human_owned(labels):
+    held = human_owned(labels)
+    if when == "always" and held:
+        # A human hold (review:needs-user / needs:user) parks autonomous PUSHES and reviews, so
+        # the when=always fix-admission defuse stands down entirely on a held PR. But it must
+        # NEVER suppress when=mismatch, the registry issue #42 safety invariant: retracting an
+        # auto-merge latch that would otherwise merge a never-reviewed tree on green CI. Issue
+        # #105: a stale armed head escalated to review:needs-user after a failed disarm — or a
+        # human label applied while the auto-merge latch survives — must still have that latch
+        # retracted. mismatch falls through here; the `held` carve-out below keeps it to the
+        # SAFETY actions only (disable-auto / dequeue + redraft), dropping the relabel that would
+        # strip a review:needs-user hold and re-admit the PR to the autonomous loop.
         _write_outputs({"disarmed": False})
         print("disarm skipped: the PR is human-owned (review:needs-user / needs:user)")
         return
@@ -1259,7 +1274,11 @@ def disarm(repo, pr_number, when):
         # (live base.ref, never the repo default branch): both the chain shape and the
         # diff-vs-merge-base identity are verified live and fail closed — any real content
         # change, unknown shape, or API failure falls through to the disarm below.
-        if when == "mismatch" and reviewed != "none" and head_sha != reviewed:
+        # Issue #105: a HELD PR never carries the arm forward. Carry-forward rebinds the marker
+        # and KEEPS the latch (a content-identical base-merge advance is a valid arm) — but a
+        # human hold applied to an armed PR is an explicit "hand control back to me", so the
+        # latch is retracted instead of preserved. The safety actions below run unconditionally.
+        if when == "mismatch" and not held and reviewed != "none" and head_sha != reviewed:
             base_ref = str((live.get("base") or {}).get("ref") or "")
             if base_ref and _merge_only_carry_forward(repo, head_sha, reviewed, base_ref):
                 set_reviewed_sha(repo, pr_number, head_sha)
@@ -1267,6 +1286,12 @@ def disarm(repo, pr_number, when):
                 print("reviewed-sha carried forward: the head advanced only by verified "
                       "base-branch merge commits and the diff vs the merge base is unchanged")
                 return
+        # Issue #105: on a HELD PR keep ONLY the safety-only latch retraction (disable-auto /
+        # dequeue + redraft — a draft cannot merge). The relabel (review:* -> needs) is dropped:
+        # it would strip a review:needs-user hold and re-admit the PR to the autonomous review
+        # loop. The human's park stands; the unreviewed head simply can no longer auto-merge.
+        if held:
+            actions = [action for action in actions if action != "relabel"]
         # Issue #81: per-action isolation — a failed action never skips the SAFETY actions
         # after it. Dequeue can succeed while the auto-merge disable fails; the redraft must
         # still run (converting to draft cancels a surviving auto-merge latch and a draft
@@ -2311,7 +2336,8 @@ def _self_test():
                 f"GitHub API request failed for {args[1] if len(args) > 1 else 'request'}")
         return argparse.Namespace(returncode=code, stdout="", stderr="")
 
-    def run_disarm(base_ref="main", draft=False, armed=True, **overrides):
+    def run_disarm(base_ref="main", draft=False, armed=True, labels=(), when="mismatch",
+                   **overrides):
         disarm_calls.clear()
         compare_paths.clear()
         fake_outputs.clear()
@@ -2319,7 +2345,8 @@ def _self_test():
         net.update({
             "live": {"state": "open", "draft": draft,
                      "auto_merge": {"merge_method": "squash"} if armed else None,
-                     "user": {"login": "sparq[bot]"}, "labels": [],
+                     "user": {"login": "sparq[bot]"},
+                     "labels": [{"name": name} for name in labels],
                      "body": f"pr body\n\n<!-- sparq-reviewed-sha:{rev_sha} -->\n",
                      "head": {"sha": head_69, "ref": "sparq-agent/issue-7-fix",
                               "repo": {"full_name": "o/r"}},
@@ -2328,7 +2355,7 @@ def _self_test():
             "compare": {key: json.loads(json.dumps(doc))
                         for key, doc in identical_compares.items()},
         }, **overrides)
-        disarm("o/r", 41, "mismatch")
+        disarm("o/r", 41, when)
 
     try:
         wiring_globals["_gh_json"] = fake_gh_json
@@ -2508,6 +2535,33 @@ def _self_test():
         check("partial disarm never advances the marker",
               (f"rebind:{head_69}" in disarm_calls, fake_outputs.get("disarmed"),
                bool(fake_outputs.get("disarm_error"))), (False, False, True))
+
+        # ---- Issue #105: a human hold must never suppress the safety-only latch retraction ----
+        held_evil = json.loads(json.dumps(evil))  # content-changed => a real mismatch to retract
+        for hold in ("review:needs-user", "needs:user"):
+            # when=mismatch on a HELD armed PR: the latch IS retracted (disable-auto + redraft),
+            # but the relabel is DROPPED so the hold survives — the PR stays human-parked and can
+            # no longer auto-merge an unreviewed head. Red if the pre-#105 human_owned skip
+            # returns before any mutation, or if relabel is not filtered for held PRs.
+            run_disarm(compare=json.loads(json.dumps(held_evil)), labels=(hold,))
+            check(f"held mismatch ({hold}) retracts the latch (disable-auto + redraft)",
+                  ("pr merge 41 -R o/r --disable-auto" in disarm_calls
+                   and "pr ready 41 -R o/r --undo" in disarm_calls,
+                   "state:needs" in disarm_calls, fake_outputs.get("disarmed")),
+                  (True, False, True))
+            # a HELD content-identical base-merge advance is retracted too, never carried
+            # forward: a human label on an armed PR hands control back, so the arm is not kept.
+            run_disarm(labels=(hold,))
+            check(f"held content-identical advance ({hold}) retracts, never rebinds/keeps arm",
+                  (f"rebind:{head_69}" in disarm_calls,
+                   "pr merge 41 -R o/r --disable-auto" in disarm_calls,
+                   "state:needs" in disarm_calls, fake_outputs.get("disarmed")),
+                  (False, True, False, True))
+            # when=always STILL stands down entirely on a human hold (the autonomous-fix defuse
+            # must never touch a human-parked PR): no mutation at all.
+            run_disarm(labels=(hold,), when="always")
+            check(f"held always-defuse ({hold}) stands down untouched",
+                  (disarm_calls, fake_outputs.get("disarmed")), ([], False))
     finally:
         wiring_globals.update(real_disarm_io)
 
