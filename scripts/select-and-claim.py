@@ -484,6 +484,32 @@ def _parse_account(body):
     return d
 
 
+KNOWN_ACCOUNT_PROVIDERS = frozenset({"anthropic", "openai"})
+KNOWN_CREDENTIAL_FORMATS = frozenset({
+    "codex-auth-json",
+    "claude-credentials-json",
+    "claude-oauth-token",
+    "anthropic-api-key",
+})
+
+
+def _valid_catalog_account(account):
+    """Reject malformed routing metadata at the shared catalog parse boundary."""
+    reasons = []
+    provider = account.get("provider")
+    if provider not in KNOWN_ACCOUNT_PROVIDERS:
+        reasons.append("missing provider" if not provider else f"unknown provider {provider!r}")
+    credential_format = account.get("credential_format")
+    if credential_format not in KNOWN_CREDENTIAL_FORMATS:
+        reasons.append("missing credential_format" if not credential_format else
+                       f"unknown credential_format {credential_format!r}")
+    if reasons:
+        print(f"account catalog: dropping account {account.get('handle')!r}: "
+              f"{'; '.join(reasons)}", file=sys.stderr)
+        return False
+    return True
+
+
 # [FABLE-5] LEGACY-SHAPE NORMALIZATION (sol r3 f1), read-time only. The retired terra-era broker
 # minted every openai account record as exactly `models: [terra]`; the current broker
 # (set-up-account.yml) mints the FULL codex alias set. Membership gating in this file is LITERAL,
@@ -540,8 +566,8 @@ def normalize_legacy_models(account):
 
 def read_accounts(repo):
     """The account catalog from the open account issues (title=handle, YAML body, status:available).
-    Applies the read-time legacy-shape normalization above, so every downstream membership
-    consumer sees a consistent catalog."""
+    Drops records with invalid provider/credential-format metadata, then applies the read-time
+    legacy-shape normalization above, so every downstream consumer sees a valid catalog."""
     out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
                 "--json", "title,body,labels"]).stdout
     accounts = []
@@ -549,7 +575,7 @@ def read_accounts(repo):
         a = _parse_account(it.get("body"))
         a["handle"] = it["title"].strip()
         a["available"] = any(lb["name"] == "status:available" for lb in it.get("labels", []))
-        if a["handle"] and a["models"]:
+        if _valid_catalog_account(a) and a["handle"] and a["models"]:
             accounts.append(normalize_legacy_models(a))
     return accounts
 
@@ -800,9 +826,11 @@ def _self_test():
     # fixture handle ever reaches the captured stderr/stdout.
     FIXTURE_HANDLES = ("acctL", "acctC")
     issue_rows = json.dumps([
-        {"title": "acctL", "body": "provider: openai\nmodels: [terra]\nsecret_ref: L_TOKEN",
+        {"title": "acctL", "body": "provider: openai\nmodels: [terra]\nsecret_ref: L_TOKEN\n"
+         "credential_format: codex-auth-json",
          "labels": [{"name": "status:available"}]},
-        {"title": "acctC", "body": "provider: openai\nmodels: [terra, luna]\nsecret_ref: C_TOKEN",
+        {"title": "acctC", "body": "provider: openai\nmodels: [terra, luna]\nsecret_ref: C_TOKEN\n"
+         "credential_format: codex-auth-json",
          "labels": [{"name": "status:available"}]},
     ])
     real_run_fn = globals()["_run"]
@@ -849,6 +877,56 @@ def _self_test():
     check("NEGATIVE: salt-less path leaks no raw fixture handle either",
           [h for h in FIXTURE_HANDLES
            if h in log_buf2.getvalue() or h in out_buf2.getvalue()], [])
+
+    # ---- fail-closed account-catalog parse boundary (issue #424) ----
+    # Reproduce the outage alongside healthy rows: the legacy acct01-shaped openai record has no
+    # credential_format, while two valid records and two other malformed records share its catalog.
+    boundary_rows = json.dumps([
+        {"title": "healthy-openai",
+         "body": "provider: openai\nharness: codex\nmodels: [sol]\n"
+                 "credential_format: codex-auth-json\nsecret_ref: OPENAI_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        {"title": "healthy-anthropic",
+         "body": "provider: anthropic\nharness: claude\nmodels: [fable]\n"
+                 "credential_format: claude-credentials-json\nsecret_ref: ANTHROPIC_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        {"title": "acct01",
+         "body": "provider: openai\nharness: codex\nmodels: [terra]\nsecret_ref: ACCT01_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        {"title": "unknown-provider",
+         "body": "provider: legacy\nharness: codex\nmodels: [terra]\n"
+                 "credential_format: codex-auth-json\nsecret_ref: LEGACY_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        {"title": "bad-credential-format",
+         "body": "provider: anthropic\nharness: claude\nmodels: [fable]\n"
+                 "credential_format: legacy-token\nsecret_ref: BAD_TOKEN",
+         "labels": [{"name": "status:available"}]},
+    ])
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=boundary_rows)
+    boundary_log = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(boundary_log):
+            boundary_catalog = read_accounts("o/r")
+    finally:
+        globals()["_run"] = real_run_fn
+    boundary_handles = [account["handle"] for account in boundary_catalog]
+    check("valid provider+credential_format rows are kept",
+          boundary_handles, ["healthy-openai", "healthy-anthropic"])
+    check("missing credential_format is dropped at parse (acct01 outage regression)",
+          "acct01" not in boundary_handles, True)
+    check("unknown provider is dropped at parse",
+          "unknown-provider" not in boundary_handles, True)
+    check("out-of-set credential_format is dropped at parse",
+          "bad-credential-format" not in boundary_handles, True)
+    check("one bad row does not drop healthy rows", len(boundary_catalog), 2)
+    check("missing credential_format warning names handle and reason",
+          "dropping account 'acct01': missing credential_format" in boundary_log.getvalue(), True)
+    check("unknown provider warning names handle and reason",
+          "dropping account 'unknown-provider': unknown provider 'legacy'"
+          in boundary_log.getvalue(), True)
+    check("out-of-set credential_format warning names handle and reason",
+          "dropping account 'bad-credential-format': unknown credential_format 'legacy-token'"
+          in boundary_log.getvalue(), True)
 
     # CLAIM SELECTION: a legacy [terra] record now serves a sol-led claim end-to-end (claim()
     # reads the catalog through read_accounts), while a customized [terra, luna] record still
