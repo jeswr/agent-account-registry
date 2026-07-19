@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "PLAN receives only policy `trusted_bots`, while CLAIM unions that list with the runtime `bot_login`. The `trusted()` logic uses suffix fallback only when the policy set is empty. Therefore, if policy contains any additional trusted bot, an issue authored by the pipeline's own App bot with association NONE is filtered out unless that App bot is redundantly listed. CLAIM never gets a chance to apply its runtime union. This contradicts the new policy contract that the pipeline App needs no entry and can silently strand its bot-authored work.",
+   "file": ".github/workflows/dispatch.yml",
+   "fix_hint": "Make PLAN preserve candidates for the runtime App bot even when additional policy bots exist, without granting them authority. For example, keep the advisory `[bot]` over-proposal for logins PLAN cannot authenticate and rely on CLAIM's exact authoritative check, or securely provide the exact resolved App login from registry-owned pre-target code. Add a PLAN regression test covering a nonempty additional allowlist plus an own-App-authored issue.",
+   "severity": "major",
+   "title": "Configuring an additional trusted bot excludes the pipeline's own App bot during PLAN"
+  },
+  {
+   "body": "The changed `trusted()` helper evaluates `issue.get(\"user\", {}).get(\"login\")`. A truthy non-dict `user` supplied by the issue snapshot, such as a string or list, raises `AttributeError`. This is untrusted target data and the exception aborts planning for all repositories instead of denying that item. CLAIM now handles precisely this malformed shape, but the PLAN-side copy does not.",
+   "file": ".github/workflows/dispatch.yml",
+   "fix_hint": "Type-check both the issue object and its nested `user` before reading `login`, returning false for malformed shapes. Add a non-vacuous PLAN-side assertion or exercised test showing that `user: \"malformed\"` is rejected without an exception.",
+   "severity": "major",
+   "title": "Malformed nested issue users can abort the entire PLAN step"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The prior-round malformed nested `user` defect in CLAIM is fixed and now has meaningful regression coverage. However, the PLAN-side allowlist integration is not complete: as soon as a repository configures any additional `trusted_bots`, PLAN stops accepting the runtime worker App bot even though the documented policy says that bot is implicitly trusted and needs no entry. Because PLAN is the only producer of candidates, CLAIM's authoritative union with `bot_login` cannot recover rows that PLAN omitted. The changed PLAN helper also still dereferences an untrusted truthy non-object `user`, allowing one malformed snapshot issue to abort planning. These are new major findings, so progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
