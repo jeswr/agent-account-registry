@@ -376,6 +376,38 @@ def _provenance_record(
     return record
 
 
+def _worker_pr_identity(
+    repo: str, pull: dict[str, Any], bot: str
+) -> re.Match[str] | None:
+    """The worker-branch match for ``pull`` IFF it clears the worker-PR IDENTITY gate for
+    ``repo`` — a worker-pattern head branch, a same-repository head (a fork head is
+    attacker-controlled), the App-bot author, and the worker PR body marker — else None.
+
+    This is the identity subset shared by two admissions so they cannot drift: `_admitted_worker_prs`
+    (which additionally requires the registry-provenance root of trust) and `_current_links`
+    (recovery-suppression linkage, issue #172). An outsider's fork PR, a non-bot author, or a PR
+    whose body merely says `Fixes #N` must never pass — any of those could otherwise hold a stale
+    issue out of recovery or exhaustion-park indefinitely. ``bot`` MUST be the casefolded, non-empty
+    bot login; callers fail closed on an unresolved identity before calling."""
+    head = pull.get("head") or {}
+    ref = head.get("ref", "")
+    branch = WORKER_BRANCH.match(ref) if isinstance(ref, str) else None
+    if branch is None:
+        return None
+    head_repo = head.get("repo") or {}
+    author = (pull.get("user") or {}).get("login", "")
+    body = pull.get("body") or ""
+    if (
+        (head_repo.get("full_name") if isinstance(head_repo, dict) else None) != repo
+        or not isinstance(author, str)
+        or author.casefold() != bot
+        or not isinstance(body, str)
+        or not body.lstrip().startswith(WORKER_PR_MARKER)
+    ):
+        return None
+    return branch
+
+
 def _admitted_worker_prs(
     repo: str,
     pulls: dict[int, dict[str, Any]],
@@ -387,8 +419,8 @@ def _admitted_worker_prs(
     the ONLY linkage strong enough to suppress the exhausted-attempt defer (issue #170, review
     round 1).
 
-    `_current_links` linkage (a worker-looking branch OR a `Fixes #N` body reference) is
-    deliberately NOT trusted for suppression: anyone can open a PR whose body says `Fixes #N`,
+    Linkage weaker than these admissions (a worker-looking branch or a `Fixes #N` body
+    reference) is deliberately NOT trusted for suppression: anyone can open a PR whose body says `Fixes #N`,
     and a fork can spoof a worker-shaped head ref — under loose linkage either would hold an
     exhausted issue out of `needs:user` indefinitely. Suppression instead requires the SAME
     identity and provenance admissions the review loop applies before it will drive a PR
@@ -407,21 +439,8 @@ def _admitted_worker_prs(
     if not bot:
         return admitted  # no bot identity resolved — nothing can be proven, fail closed
     for number, pull in pulls.items():
-        head = pull.get("head") or {}
-        ref = head.get("ref", "")
-        branch = WORKER_BRANCH.match(ref) if isinstance(ref, str) else None
+        branch = _worker_pr_identity(repo, pull, bot)
         if branch is None:
-            continue
-        head_repo = head.get("repo") or {}
-        author = (pull.get("user") or {}).get("login", "")
-        body = pull.get("body") or ""
-        if (
-            (head_repo.get("full_name") if isinstance(head_repo, dict) else None) != repo
-            or not isinstance(author, str)
-            or author.casefold() != bot
-            or not isinstance(body, str)
-            or not body.lstrip().startswith(WORKER_PR_MARKER)
-        ):
             continue
         record = _provenance_record(repo, number, registry_root, ledger_root=ledger_root)
         if record is None:
@@ -955,11 +974,37 @@ def _fresh_issue(api: GitHubAPI, repo: str, number: int) -> dict[str, Any] | Non
     return item
 
 
-def _current_links(pulls: dict[int, dict[str, Any]]) -> dict[int, set[int]]:
+def _current_links(
+    repo: str, pulls: dict[int, dict[str, Any]], bot_login: str
+) -> dict[int, set[int]]:
+    """Map source-issue number -> open worker PR numbers, counting ONLY PRs that clear the
+    worker-PR identity gate (`_worker_pr_identity`: App-authored, same-repository, worker-pattern
+    head branch, worker body marker). An untrusted PR — a fork with a worker-shaped head, or any
+    PR whose body merely says `Fixes #N` — is deliberately NOT counted (issue #172): recovery
+    suppression keys on this map (a linked issue is skipped by the stale/orphan repair below and by
+    the mutation-boundary re-check), so trusting outsider linkage would let anyone hold a stale
+    issue out of recovery indefinitely.
+
+    The sole linked issue is the one the head branch encodes — a worker attempt is bound to
+    exactly one source issue. Body closing references (`Fixes #N`) are ignored even on an
+    authenticated worker PR (review round 1): the branch is not bound to those issues, so
+    linking them would suppress stale/orphan recovery for unrelated issues the App is not
+    actually working.
+
+    This is the identity gate WITHOUT the registry-provenance record `_admitted_worker_prs`
+    additionally requires: recovery suppression asks 'is the App itself actively working this issue
+    right now', for which the authoring identity is authoritative — provenance-record visibility
+    (issue #96) is not, and demanding it here would prematurely reset a legitimately in-progress
+    issue whose record is not yet on the read branch."""
     links: dict[int, set[int]] = {}
+    bot = bot_login.casefold()
+    if not bot:
+        return links  # no bot identity resolved — trust no linkage, fail closed
     for number, pull in pulls.items():
-        for issue in linked_issue_numbers(pull):
-            links.setdefault(issue, set()).add(number)
+        branch = _worker_pr_identity(repo, pull, bot)
+        if branch is None:
+            continue
+        links.setdefault(int(branch.group("issue")), set()).add(number)
     return links
 
 
@@ -973,6 +1018,7 @@ def _plan_actions(
     leases: list[dict[str, Any]],
     stale_prs: dict[tuple[str, int], str],
     now: int,
+    bot_login: str,
 ) -> tuple[list[IssueAction], list[PullAction], set[str]]:
     live_by_issue: set[tuple[str, int]] = set()
     dead_claims: set[str] = set()
@@ -989,7 +1035,7 @@ def _plan_actions(
 
     actions: list[IssueAction] = []
     for repo, repo_issues in issues.items():
-        links = _current_links(pulls[repo])
+        links = _current_links(repo, pulls[repo], bot_login)
         for number, issue in repo_issues.items():
             key = (repo, number)
             labels = _labels(issue, f"target issue {repo}#{number}")
@@ -1200,7 +1246,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         for repo in groomable
     }
     issue_actions, pull_actions, dead_claims = _plan_actions(
-        limits, issues, pulls, admitted, attempts, lease_states, leases, stale_prs, now
+        limits, issues, pulls, admitted, attempts, lease_states, leases, stale_prs, now,
+        bot_login,
     )
 
     # Re-read the mutex before issue mutation. A newly claimed lease suppresses repair; claims
@@ -1215,7 +1262,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     }
     current_pulls = {repo: _pulls(api, repo) for repo, api in groomable.items()}
     current_links = {
-        repo: _current_links(repo_pulls) for repo, repo_pulls in current_pulls.items()
+        repo: _current_links(repo, repo_pulls, bot_login)
+        for repo, repo_pulls in current_pulls.items()
     }
 
     reset = 0
@@ -1796,12 +1844,20 @@ def _self_test() -> int:
             },
         }
     }
+    # PR #91 carries the FULL worker identity (App author, same-repo head, worker branch, body
+    # marker) so `_current_links` legitimately links issue #9 — the genuine admitted worker PR the
+    # comment above describes. An identity-incomplete PR would no longer link (issue #172), so this
+    # fixture must be faithful to the "admitted worker PR is open" scenario it stands in for.
     fixture_pulls = {
         "owner/repo": {
             91: {
                 "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat(),
-                "head": {"ref": "sparq-agent/issue-9-91-1"},
-                "body": "Fixes #9",
+                "head": {
+                    "ref": "sparq-agent/issue-9-91-1",
+                    "repo": {"full_name": "owner/repo"},
+                },
+                "user": {"login": "app[bot]"},
+                "body": WORKER_PR_MARKER + "\n\nFixes #9",
             }
         }
     }
@@ -1817,6 +1873,7 @@ def _self_test() -> int:
         [base],
         {},
         now,
+        "app[bot]",
     )
     check(
         "fixture plans dead reset and exhaustion",
@@ -1845,6 +1902,7 @@ def _self_test() -> int:
         [base],
         {},
         now,
+        "app[bot]",
     )
     check(
         "MUTATION: an UNADMITTED linking PR does NOT suppress the exhaustion defer (round 1)",
@@ -1897,10 +1955,59 @@ def _self_test() -> int:
             _admitted_worker_prs("owner/repo", {92: arbitrary_pull}, "app[bot]", admit_root),
             set(),
         )
+        # issue #172: `_current_links` (recovery-suppression linkage) now applies the SAME
+        # worker-PR identity gate, so an untrusted PR can no longer hold a stale issue out of
+        # recovery. Unlike `_admitted_worker_prs` it does NOT require a provenance record (see its
+        # docstring) — for "is the App working this issue right now" the authoring identity is
+        # authoritative. Positive first, so the gate rejecting everything flips these red.
         check(
-            "…although loose _current_links WOULD have linked it (the closed hole)",
-            9 in _current_links({92: arbitrary_pull}),
-            True,
+            "links: a genuine App-authored worker PR IS linked to its source issue",
+            _current_links("owner/repo", {91: proven_pull}, "app[bot]").get(9),
+            {91},
+        )
+        check(
+            "NEGATIVE: an arbitrary `Fixes #9` PR no longer links it (the closed hole)",
+            9 in _current_links("owner/repo", {92: arbitrary_pull}, "app[bot]"),
+            False,
+        )
+        # Round 1: even a FULLY authenticated worker PR links ONLY its branch-encoded issue —
+        # a `Fixes #25` body reference on the issue-9 branch must not enter #25 in the map, or
+        # the App's own PR would suppress stale/orphan recovery for an unrelated issue.
+        cross_ref_pull = {**proven_pull, "body": WORKER_PR_MARKER + "\n\nFixes #25"}
+        check(
+            "round 1: an authenticated worker PR links only the branch-encoded issue",
+            _current_links("owner/repo", {91: cross_ref_pull}, "app[bot]"),
+            {9: {91}},
+        )
+        check(
+            "NEGATIVE: a fork PR with a spoofed worker-shaped head does not link",
+            _current_links(
+                "owner/repo",
+                {91: {**proven_pull,
+                      "head": {"ref": "sparq-agent/issue-9-91-1",
+                               "repo": {"full_name": "mallory/repo"}}}},
+                "app[bot]",
+            ),
+            {},
+        )
+        check(
+            "NEGATIVE: a non-bot author with a worker-shaped head does not link",
+            _current_links(
+                "owner/repo", {91: {**proven_pull, "user": {"login": "mallory"}}}, "app[bot]"
+            ),
+            {},
+        )
+        check(
+            "NEGATIVE: a bot worker PR WITHOUT the worker body marker does not link",
+            _current_links(
+                "owner/repo", {91: {**proven_pull, "body": "Fixes #9"}}, "app[bot]"
+            ),
+            {},
+        )
+        check(
+            "NEGATIVE: an unresolved (empty) bot login links nothing (fail closed)",
+            _current_links("owner/repo", {91: proven_pull}, ""),
+            {},
         )
         fork_pull = {
             **proven_pull,
@@ -1984,10 +2091,17 @@ def _self_test() -> int:
                  "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat()},
         }
     }
+    # A genuine open worker PR for issue #25 (full identity) suppresses its orphan repair — the
+    # "has no open PR" recovery precondition. Identity-incomplete linkage no longer counts (issue
+    # #172), so this stand-in must carry the App author, same-repo head, worker branch, and marker.
     linked_pull = {
         "updated_at": stale_at,
-        "head": {"ref": "sparq-agent/issue-25-99-1"},
-        "body": "Fixes #25",
+        "head": {
+            "ref": "sparq-agent/issue-25-99-1",
+            "repo": {"full_name": "owner/repo"},
+        },
+        "user": {"login": "app[bot]"},
+        "body": WORKER_PR_MARKER + "\n\nFixes #25",
     }
     orphan_attempts = {("owner/repo", n): 1 for n in (21, 22, 24, 25, 26, 27)}
     orphan_attempts[("owner/repo", 23)] = 0
@@ -2001,6 +2115,7 @@ def _self_test() -> int:
         [],
         {},
         now,
+        "app[bot]",
     )
     check(
         "orphan repair readies dead states only",
@@ -2015,6 +2130,64 @@ def _self_test() -> int:
             "no orchestration status after a worker attempt",
         ],
     )
+    # issue #172, end-to-end: an UNTRUSTED PR that only loose-links issue #25 (fork head, no bot
+    # author, no marker) must NOT suppress its orphan repair — issue #25 is now readied alongside
+    # #22. Reverting `_current_links` to loose linkage reds this: an outsider could otherwise hold
+    # a stale issue out of recovery indefinitely by opening a fork PR that mentions it.
+    untrusted_pull = {
+        "updated_at": stale_at,
+        "head": {"ref": "sparq-agent/issue-25-99-1", "repo": {"full_name": "mallory/repo"}},
+        "user": {"login": "mallory"},
+        "body": "helpful contribution\n\nFixes #25",
+    }
+    untrusted_actions, _prs3, _dead3 = _plan_actions(
+        {"owner/repo": limits},
+        orphan_issues,
+        {"owner/repo": {99: untrusted_pull}},
+        {"owner/repo": set()},
+        orphan_attempts,
+        {},
+        [],
+        {},
+        now,
+        "app[bot]",
+    )
+    check(
+        "issue #172: an untrusted linking PR does NOT suppress orphan recovery of issue #25",
+        sorted((a.number, a.mode) for a in untrusted_actions),
+        [(21, "ready"), (22, "ready"), (25, "ready")],
+    )
+    # Round 1, end-to-end: a fully AUTHENTICATED worker PR bound to issue #22 by its branch, whose
+    # body also says `Fixes #25`, suppresses recovery for #22 ONLY — #25 is readied. Linking body
+    # closing references back into `_current_links` reds this: the App's own PR would then hold an
+    # unrelated stale issue out of recovery.
+    cross_linked_pull = {
+        "updated_at": stale_at,
+        "head": {
+            "ref": "sparq-agent/issue-22-99-1",
+            "repo": {"full_name": "owner/repo"},
+        },
+        "user": {"login": "app[bot]"},
+        "body": WORKER_PR_MARKER + "\n\nFixes #25",
+    }
+    cross_actions, _prs4, _dead4 = _plan_actions(
+        {"owner/repo": limits},
+        orphan_issues,
+        {"owner/repo": {99: cross_linked_pull}},
+        {"owner/repo": set()},
+        orphan_attempts,
+        {},
+        [],
+        {},
+        now,
+        "app[bot]",
+    )
+    check(
+        "round 1: a worker PR's body reference does NOT suppress recovery of unrelated issue #25",
+        sorted((a.number, a.mode) for a in cross_actions),
+        [(21, "ready"), (25, "ready")],
+    )
+
     malformed_failed = False
     try:
         validate_ledger({"leases": [{**base, "claim_id": "unsafe"}]})
