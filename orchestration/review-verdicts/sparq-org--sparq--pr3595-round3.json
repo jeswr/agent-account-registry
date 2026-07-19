@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3595,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f47b316ba4232aa5e0b9db220144b5bce815e5e9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves both prior findings. FreshnessBinding::out_of_circuit_message now accepts only the ordered SourceSegment slice, reconstructs the public-input bytes internally from that same slice, and derives the holder block directly from each segment's holder, eliminating the independently supplied metadata that allowed holder attribution to diverge. The focused relabelling and byte-identical-holder tests exercise the real public API boundary and demonstrate that changing only SourceSegment.holder leaves holder-anonymous public inputs unchanged but changes the signed digest. The MPC skill now documents the current sources-based signature and the enforced same-source derivation. The implementation remains explicit that signature verification and proof generation are deferred and unaudited, consistent with the cited feasibility record.",
+  "verdict": "approve"
+ }
+}
