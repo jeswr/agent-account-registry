@@ -158,9 +158,29 @@
 #
 #   --phase resume-writers (the workflow's always() `reenable-writers` job, env-BOUND so its
 #     mint resolves in every reachable state — repo-scope bootstrap copies before the migration,
-#     environment copies after cleanup drains them; needs Actions RW ONLY): re-enable the four
-#     quiesced writer workflows. Tries ALL four before failing (one failure never leaves the
-#     rest disabled) and any failure names the manual remediation.
+#     environment copies after cleanup drains them; needs Actions RW + Secrets R, round 14):
+#     R0. RESUME PRECONDITION (sol round 14 — resume had NO migration-state precondition):
+#         mint a repo-scope secrets LISTING and assert it holds NONE of the 14 names — i.e.
+#         a successful cleanup has converged. Writers only resume from a CLEAN cutover state:
+#         a migrate that copied V1 into the env and died before its repo delete leaves a
+#         dual-scope V1/V1; resuming the writers from there lets a post-cutover rotation write
+#         the ENVIRONMENT copy to V2 while the stale repo V1 survives, and the next
+#         quiesce+migrate snapshots repo V1 into S_<name> and — by M3's
+#         repo-presence-is-authoritative rule — overwrites env V2 with stale V1 then deletes
+#         repo V1: newest credential lost, every gate green (the exact INVERSE of the
+#         scenario-22 topology, which only covers repo-newer). The refusal is a CAUSAL
+#         barrier, not a state repair: it prevents the writer from ever CREATING V2, so the
+#         dual-scope state stays V1/V1 — where the repo-authoritative overwrite is
+#         value-preserving and the documented recovery (re-dispatch phase: migrate, then
+#         cleanup) is safe. Requiring the FULL 14 absent (bootstrap pair included) is the
+#         strictest reading and matches the runbook: resume follows a SUCCESSFUL cleanup;
+#         recovery from a partial migrate is a fresh migrate (then cleanup), NEVER resume.
+#         Unrelated stray names do not block (they are the dispatch secrets-guard's job). The
+#         migrate-run SELF-resume path only fires behind needs.cleanup-bootstrap.result ==
+#         'success' (C4 just proved the repo scope empty), so R0 passes trivially there — it
+#         is load-bearing for the STANDALONE phase: resume dispatch.
+#     R.  re-enable the four quiesced writer workflows. Tries ALL four before failing (one
+#         failure never leaves the rest disabled) and any failure names the manual remediation.
 #
 #   ATTEMPT GATE — ALL FOUR PHASES (sol round-11 finding — M0c is NOT attempt-aware):
 #     GITHUB_RUN_ID is CONSTANT across `gh run rerun` attempts while GITHUB_RUN_ATTEMPT
@@ -205,8 +225,9 @@
 # drain check to the old per-status loop turns this scenario red, while the single-snapshot
 # check catches the run), the fake-gh DISABLED-workflow model (name-based run lookup without
 # --all fails on a disabled workflow, with --all works — so dropping --all from the drain check
-# goes red), listing-failure (both phases), env-missing-bootstrap, resume-writers (happy /
-# one-enable-fails / under-granted), and PER-ENDPOINT PERMISSION-model failures (workflow
+# goes red), listing-failure (both phases), env-missing-bootstrap, resume-writers (happy over
+# a PROVEN-empty repo scope / one-enable-fails / under-granted both ways — no actions:write
+# and, round 14, no secrets:read), and PER-ENDPOINT PERMISSION-model failures (workflow
 # disable without actions:write on the QUIESCE phase; env-secret write without
 # environments:write; plus the round-8 least-privilege ACCEPT direction: the migrate phase
 # converges under actions:READ) so an under-granted mint is caught by the harness, not
@@ -259,7 +280,17 @@
 # cleanup-bootstrap`; removing the phase choice, the env binding, re-coupling the standalone
 # job to migrate via `needs:`, or retargeting the script invocation each goes red — and the
 # standalone job's mint + actor pins are enrolled in the two contracts above (mint set
-# identical to cleanup-bootstrap's).
+# identical to cleanup-bootstrap's). Round 14 (sol — phase_resume had NO migration-state
+# precondition): the ENV-NEWER/REPO-STALE regression — env=V2, repo-scope ACCT02_TOKEN=V1
+# (the dual-scope state a died-before-delete migrate leaves, after the rotation the refusal
+# exists to prevent) — dispatching resume must REFUSE with rc 1, ZERO `workflow enable` argv
+# (the repo listing is the ONLY call — the refusal lands BEFORE any enable), and the env V2
+# values untouched; the full-14-absent accept direction (scenario 19 seeds an explicitly
+# empty repo listing) must still proceed; resume without secrets:read fails closed at the
+# listing with zero enables; and the mint contract pins `permission-secrets: read` on the
+# reenable mint (removing it goes red). MUTATION CHECK: comment out the
+# assert_repo_scope_clear_for_resume call in phase_resume and the refusal scenario goes red
+# (rc 0, 4 enables issued from the dual-scope state).
 # Wired into pr-gate.yml and worker-live's FULL_SELFTEST_SUITE so it gates. When the migration
 # workflow is deleted after its successful run, delete this script too and unenrol it from BOTH
 # suite lists.
@@ -526,7 +557,7 @@ phase_quiesce() {
   quiesce_writers
   echo '== phase Q2: coherent drain check — no ALREADY-ADMITTED writer run is still nonterminal =='
   drain_check_no_live_writers
-  printf 'QUIESCE PHASE COMPLETE: writers disabled + drained. NOW dispatch phase: migrate — its fresh queue takes a fresh secrets snapshot that postdates this drain. (A failed migrate leaves the writers disabled BY DESIGN; finish with a converging migrate rerun, or dispatch phase: resume to abandon.)\n'
+  printf 'QUIESCE PHASE COMPLETE: writers disabled + drained. NOW dispatch phase: migrate — its fresh queue takes a fresh secrets snapshot that postdates this drain. (A failed migrate leaves the writers disabled BY DESIGN; finish with a converging migrate rerun, then cleanup — round 14: phase: resume REFUSES while any of the 14 remain at repo scope, so a partial migrate is never abandoned into a dual-scope state.)\n'
 }
 
 phase_main() {
@@ -734,6 +765,45 @@ phase_cleanup() {
   printf 'MIGRATION COMPLETE (both phases): all 14 live in %s and the repo scope holds none of them — the secrets-guard goes green now. Delete migrate-secrets-to-env.yml (and unenrol+delete this script). Any LATER repo-scope stray trips the secrets-guard loudly; remediation is direct admin deletion, not a migration rerun.\n' "$ENV_NAME"
 }
 
+# RESUME PRECONDITION (sol round 14 — phase_resume had NO migration-state precondition):
+# writers only resume from a CLEAN cutover state, i.e. the repo scope holds NONE of the 14.
+# The hazard the refusal kills: a migrate copies <name>=V1 into the environment and dies
+# BEFORE deleting the repo copy (dual-scope V1/V1); the operator dispatches resume; a
+# resumed POST-CUTOVER writer rotates the ENVIRONMENT copy to V2 while the stale repo V1
+# survives; the next quiesce+migrate snapshots repo V1 into S_<name> and — by M3's
+# repo-presence-is-authoritative rule — overwrites env V2 with stale V1, then M5 deletes
+# repo V1: the newest credential is destroyed with every gate green. (Scenario 22 covers
+# only the INVERSE topology — repo-newer — where the repo-authoritative rule is exactly
+# right; env-newer is the case that rule cannot survive.) NOTE the refusal is a CAUSAL
+# BARRIER, not a state repair: once env V2 EXISTS alongside repo V1, even the documented
+# recovery (re-dispatch migrate) copies repo V1 over env V2 — still losing V2. The refusal
+# works because no resume => no writer run => V2 is never CREATED: the dual-scope state
+# stays V1/V1, where the overwrite is value-preserving and a fresh migrate (then cleanup)
+# converges safely. Hence the check must land BEFORE any enable argv — pinned by the
+# self-test. The FULL 14 are required absent (bootstrap pair included — strictest): per the
+# runbook, resume follows a SUCCESSFUL cleanup, whose C4 asserted exactly this; recovery
+# from a partial migrate is a fresh migrate (then cleanup), NEVER resume. Unrelated stray
+# names do NOT block resume — they are the dispatch secrets-guard's job (direct admin
+# deletion), and no writer rotates them. The migrate-run SELF-resume path only fires behind
+# needs.cleanup-bootstrap.result == 'success' (verified in migrate-secrets-to-env.yml —
+# C4 has just proven the repo scope empty), so this gate passes trivially there; it is
+# load-bearing for the STANDALONE phase: resume dispatch. The listing needs the resume
+# mint's round-14 Secrets: READ grant (pinned by the mint contract below).
+assert_repo_scope_clear_for_resume() {
+  local repo_names name held=0
+  repo_names=$(_repo_names) \
+    || die 'could not list repo-scope secrets — cannot prove the migration converged, so the writers must not resume (fail closed before any enable; NOTE: this listing needs the App token'"'"'s round-14 Secrets: read grant)'
+  for name in "${SECRET_NAMES[@]}"; do
+    if _has_name "$name" "$repo_names"; then
+      printf '::error::migrate-secrets: %s still present at repo scope — a resumed post-cutover writer would rotate the ENVIRONMENT copy while this stale repo copy survives, and the next migrate would overwrite the newer environment value from it (repo-presence-is-authoritative) then delete it: newest-credential loss\n' "$name" >&2
+      held=1
+    fi
+  done
+  [[ "$held" -eq 0 ]] \
+    || die 'repo scope not empty — writers must not resume from a partial dual-scope state; re-dispatch phase: migrate (then cleanup-bootstrap) to converge first, and only then dispatch phase: resume (fail closed before any enable)'
+  printf 'resume precondition: repo scope holds none of the 14 (cleanup converged — clean cutover state, writers safe to resume)\n'
+}
+
 # Re-enable the four quiesced writer workflows (the workflow's reenable-writers job — round 8:
 # it runs as the self-resume after a COMPLETED migrate, or standalone via phase: resume; a
 # FAILED migrate deliberately leaves the writers disabled so a rerun stays raceless).
@@ -743,6 +813,8 @@ phase_resume() {
   echo '== attempt gate (round 11): this must be attempt 1 — re-runs are prohibited =='
   assert_first_attempt
   setup
+  echo '== phase R0 (round 14): resume precondition — repo scope must hold NONE of the 14 (writers only resume from a clean cutover state) =='
+  assert_repo_scope_clear_for_resume
   echo '== phase R: re-enable the 4 quiesced secret-writer workflows (always path) =='
   local wf failures=0
   for wf in "${WRITER_WORKFLOWS[@]}"; do
@@ -774,7 +846,9 @@ phase_resume() {
 #   main job `migrate`:            secrets: write + environments: write + actions: read
 #   job `cleanup-bootstrap`:       secrets: write + environments: read  + actions: read
 #   job `cleanup-standalone`:      secrets: write + environments: read  + actions: read
-#   job `reenable-writers`:        actions: write ONLY (no secrets/environments power at all)
+#   job `reenable-writers`:        actions: write + secrets: read (round 14: the R0 resume
+#                                  precondition LISTS the repo scope to prove none of the 14
+#                                  remain; still no secret-WRITE and no environments power)
 # The comparison is against the FULL sorted set, so REMOVING, WEAKENING (write -> read), or
 # silently WIDENING any `permission-*` declaration goes red in --self-test (wired into
 # pr-gate.yml and worker-live's FULL_SELFTEST_SUITE). When the workflow is deleted after the
@@ -816,10 +890,10 @@ check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
     printf '::error::migrate-secrets: workflow contract violated — the STANDALONE CLEANUP mint (job cleanup-standalone, round 13) must declare EXACTLY the same set as cleanup-bootstrap {permission-secrets: write, permission-environments: read, permission-actions: read}; found:\n%s\n' "${got:-<none>}" >&2
     rc=1
   fi
-  want=$(printf 'permission-actions: write')
+  want=$(printf 'permission-actions: write\npermission-secrets: read')
   got=$(_mint_grants "$wf" reenable-writers)
   if [[ "$got" != "$want" ]]; then
-    printf '::error::migrate-secrets: workflow contract violated — the RE-ENABLE mint (job reenable-writers) must declare EXACTLY {permission-actions: write} and NOTHING else (least privilege: it only runs gh workflow enable); found:\n%s\n' "${got:-<none>}" >&2
+    printf '::error::migrate-secrets: workflow contract violated — the RE-ENABLE mint (job reenable-writers) must declare EXACTLY {permission-actions: write, permission-secrets: read} (least privilege: actions write to run gh workflow enable, secrets READ for the round-14 R0 resume precondition'"'"'s repo-scope listing — no secret-write, no environments power); found:\n%s\n' "${got:-<none>}" >&2
     rc=1
   fi
   return "$rc"
@@ -1214,6 +1288,9 @@ FAKE
   local expected_quiesce="$tmp/expected-quiesce.log" expected_resume="$tmp/expected-resume.log"
   : > "$expected_quiesce"
   : > "$expected_resume"
+  # Round 14: the resume phase's FIRST gh call is the R0 repo-scope listing (the resume
+  # precondition) — it must precede EVERY enable, so it heads the exact-argv pin.
+  printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n' >> "$expected_resume"
   for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
     printf 'workflow disable %s -R o/r\n' "$wf" >> "$expected_quiesce"
     printf 'workflow enable %s -R o/r\n' "$wf" >> "$expected_resume"
@@ -1797,6 +1874,14 @@ FAKE
     "$wf_real" > "$wf_mut"
   rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18d.out" 2>&1 || rc=$?
   chk "contract goes RED when an extra grant is silently WIDENED in (exact-set pin)" "$rc" 1
+  # Round 14: the resume mint's secrets:READ is load-bearing (the R0 precondition's repo
+  # listing) — `permission-secrets: read` appears ONLY on the reenable mint, so stripping the
+  # line under-grants exactly that mint and the contract must go red.
+  grep -v 'permission-secrets: read' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18p.out" 2>&1 || rc=$?
+  chk "contract goes RED when the resume mint's permission-secrets: read (round 14 R0 listing) is removed" "$rc" 1
+  chk "contract names the under-granted RE-ENABLE mint when secrets:read is stripped" \
+    "$(grep -c 'the RE-ENABLE mint' "$tmp/s18p.out")" 1
 
   # --- scenario 18h: ACTOR CONTRACT (round-9 finding 2 — the RE-RUN bypass): github.actor
   # stays the ORIGINAL initiator when a run is re-run, while github.triggering_actor is the
@@ -1847,13 +1932,16 @@ FAKE
     "$(grep -c 'must carry NO needs:' "$tmp/s18o.out")" 1
 
   # --- scenario 19: RESUME-WRITERS happy path (the self-resume after a COMPLETED migrate, or
-  # the standalone phase: resume) — exactly the 4 enables, in the canonical writer order, and
-  # nothing else.
+  # the standalone phase: resume) — round 14 accept direction: the repo scope is EXPLICITLY
+  # empty (the state a successful cleanup's C4 proved — the full 14 absent), so the R0
+  # precondition passes and the phase proceeds: the R0 listing, then exactly the 4 enables in
+  # the canonical writer order, and nothing else.
   local s19="$tmp/s19"
   mkdir -p "$s19"
+  : > "$s19/repo_secrets"
   rc=$(run_case "$s19" "$tmp/s19.out" resume-writers none)
-  chk "resume-writers succeeds" "$rc" 0
-  chk "resume-writers: EXACT gh argv sequence (4 enables, nothing else)" \
+  chk "resume-writers over an empty repo scope (full 14 absent — post-cleanup state) succeeds" "$rc" 0
+  chk "resume-writers: EXACT gh argv sequence (R0 repo listing FIRST, then 4 enables, nothing else)" \
     "$(diff -q "$expected_resume" "$s19/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
 
   # --- scenario 20: RESUME-WRITERS with ONE enable failing — still ATTEMPTS all 4 (one failure
@@ -1869,14 +1957,29 @@ FAKE
     "$(grep -c 'gh workflow enable review-fix.yml failed — re-enable it manually' "$tmp/s20.out")" 1
 
   # --- scenario 21: PERMISSION MODEL — resume-writers without actions:write fails loud (the
-  # writers would silently stay disabled otherwise).
+  # writers would silently stay disabled otherwise). secrets:read IS granted so the round-14
+  # R0 precondition passes and the failure exercised is the ENABLE stage, as before.
   local s21="$tmp/s21"
   mkdir -p "$s21"
-  printf 'actions:read\n' > "$s21/grants"
+  printf 'actions:read\nsecrets:read\n' > "$s21/grants"
   rc=$(run_case "$s21" "$tmp/s21.out" resume-writers none)
   chk "resume-writers without actions:write -> hard fail" "$rc" 1
   chk "resume-writers without actions:write: still attempts ALL 4 enables" \
     "$(grep -cE '^workflow enable ' "$s21/calls.log")" 4
+
+  # --- scenario 21b: PERMISSION MODEL (round 14) — resume-writers without secrets:READ cannot
+  # take the R0 repo-scope listing, so it cannot PROVE the clean cutover state: fail closed at
+  # the listing with ZERO enables (an unprovable precondition is treated exactly like a failed
+  # one — the writers stay disabled).
+  local s21b="$tmp/s21b"
+  mkdir -p "$s21b"
+  printf 'actions:write\n' > "$s21b/grants"
+  rc=$(run_case "$s21b" "$tmp/s21b.out" resume-writers none)
+  chk "resume-writers without secrets:read (round 14) -> fail closed at the R0 listing" "$rc" 1
+  chk "resume-writers without secrets:read: names the missing grant" \
+    "$(grep -c 'round-14 Secrets: read grant' "$tmp/s21b.out")" 1
+  chk "resume-writers without secrets:read: ZERO enables (unprovable precondition = failed precondition)" \
+    "$(grep -cE '^workflow enable ' "$s21b/calls.log" || true)" 0
 
   # --- scenario 22: LATE-WRITER V1/V2 RECOVERY (round-7 finding — the newest-credential loss):
   # env holds V1 for all 14; a late writer (token rotation) re-created ACCT02_TOKEN at repo
@@ -2267,6 +2370,45 @@ FAKE
     chk "unattested ${axis}: zero mutations" \
       "$(grep -cE '^secret (set|delete) ' "$s27b/calls.log" || true)" 0
   done
+
+  # --- scenario 28: RESUME PRECONDITION — ENV-NEWER/REPO-STALE REFUSAL (sol round 14 —
+  # phase_resume had NO migration-state precondition). The modeled state: a migrate copied
+  # ACCT02_TOKEN=V1 into the environment and DIED before its repo delete (dual-scope), a
+  # resumed post-cutover writer then rotated the ENVIRONMENT copy to V2 — env=V2, repo=V1
+  # (stale). Scenario 22 covers only the INVERSE topology (repo-newer), where M3's
+  # repo-presence-is-authoritative rule is exactly right; HERE that same rule is the weapon:
+  # the next quiesce+migrate would snapshot repo V1 into S_ACCT02_TOKEN, overwrite env V2
+  # with stale V1 (M3) and delete repo V1 (M5) — newest credential lost, all gates green.
+  # WHY REFUSING RESUME IS THE FIX EVEN THOUGH IT DOES NOT REPAIR THIS STATE: after the
+  # refusal the documented recovery is re-dispatch phase: migrate — which ALSO copies repo V1
+  # over env V2, still losing V2! The refusal is a CAUSAL BARRIER, not a state repair: with
+  # the precondition in place the WRITER never runs from the dual-scope state (no resume =>
+  # no writer => V2 is never CREATED), so the state a migrate rerun actually meets is V1/V1 —
+  # where the repo-authoritative overwrite is value-preserving and the rerun is SAFE. The
+  # env=V2 modeled here is the counterfactual the barrier prevents; it makes the loss
+  # OBSERVABLE if the precondition ever regresses far enough for the pipeline to replay.
+  # That causality is exactly why the refusal must land BEFORE any enable argv — asserted
+  # below (the repo listing must be the ONLY gh call). MUTATION CHECK: comment out the
+  # assert_repo_scope_clear_for_resume call in phase_resume and this scenario goes red
+  # (rc 0, 4 enables issued from the dual-scope state).
+  local s28="$tmp/s28"
+  mkdir -p "$s28"
+  printf '%s\n' "${names[@]}" > "$s28/env_secrets"
+  for n in "${names[@]}"; do printf '%s=v2-%s\n' "$n" "$n"; done > "$s28/env_values"
+  printf 'ACCT02_TOKEN\n' > "$s28/repo_secrets"
+  printf 'ACCT02_TOKEN=v1-ACCT02_TOKEN\n' > "$s28/repo_values"
+  rc=$(run_case "$s28" "$tmp/s28.out" resume-writers none)
+  chk "resume from a dual-scope state (env=V2, repo-stale ACCT02_TOKEN=V1) -> REFUSED" "$rc" 1
+  chk "resume refusal: names the stale repo copy + the newest-credential-loss mechanism" \
+    "$(grep -c 'ACCT02_TOKEN still present at repo scope' "$tmp/s28.out")" 1
+  chk "resume refusal: the distinct partial-dual-scope runbook message (re-dispatch migrate, then cleanup — never resume)" \
+    "$(grep -c 'repo scope not empty — writers must not resume from a partial dual-scope state' "$tmp/s28.out")" 1
+  chk "resume refusal: ZERO enables (the refusal lands BEFORE any enable argv — no writer can ever create the diverging value)" \
+    "$(grep -cE '^workflow enable ' "$s28/calls.log" || true)" 0
+  chk "resume refusal: the R0 repo listing is the ONLY gh call" \
+    "$(cat "$s28/calls.log")" "api repos/o/r/actions/secrets --paginate --jq .secrets[].name"
+  chk "resume refusal: the newer env V2 values survive untouched (resume mutates no secret in any state)" \
+    "$(grep -c '=v2-' "$s28/env_values")" 14
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'migrate-secrets self-test PASSED\n'
