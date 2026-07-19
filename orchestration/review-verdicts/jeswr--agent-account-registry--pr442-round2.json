@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 442,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d6fdce48d4cf0afeab006331d1ce90d28d97bdb6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "After the initial trust step succeeds, `Mark trusted live issue in progress` calls `status --status in-progress`. `set_status` removes `status:ready` and adds `status:in-progress`. Much later, `republish-trust` invokes the unchanged `reverify`, which requires `status:ready` and rejects `status:in-progress` through `BUSY_OR_GATED`. No intervening step restores ready. Thus `republish-trust.outcome` is always failure on the normal live path, and the newly gated `pr` step is always skipped. This makes publication completely non-functional rather than providing a usable last-step trust check.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Add a dedicated pre-publish verification mode that recognizes exactly this run's still-valid in-progress claim while remaining fail-closed against another run, human parking, or other busy/gated states (for example, bind the accepted state to an immutable claim/run receipt). Do not simply allow all status:in-progress issues. Add an end-to-end/self-test covering the actual transition: ready -> this run's in-progress claim -> pre-publish reverify succeeds, while a mismatched claim or human gate fails.",
+    "severity": "blocker",
+    "title": "Pre-publish reverify always rejects the worker's own in-progress state"
+   },
+   {
+    "body": "The new assertions prove that the publish step references republish-trust and that the verifier is pinned, but they would all pass while republish-trust deterministically rejects every real run because the issue is already status:in-progress. The missing assertion is that pre-publish revalidation succeeds after the workflow's own ready-to-in-progress transition for the same claim, and fails for a foreign or unbound in-progress claim.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Add a non-vacuous test that models the workflow label lifecycle and invokes the pre-publish reverify path: the current run's bound in-progress state must pass, while status:in-progress without the matching current-run claim must fail.",
+    "severity": "major",
+    "title": "Self-tests omit the live label-state transition required by republish-trust"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The immutable verifier work addresses the prior round's trust-root findings, but the new publish-time reverify cannot succeed in the actual workflow. Before the model runs, the workflow transitions the issue from status:ready to status:in-progress; reverify still requires status:ready and also treats status:in-progress as a blocker. Consequently every otherwise successful live run aborts at republish-trust and never publishes. The added workflow self-tests validate wiring and verifier provenance but do not exercise this label-state lifecycle. Because this is a new blocker despite resolution of the prior findings, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
