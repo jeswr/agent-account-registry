@@ -41,6 +41,12 @@
 #   cross_provider_fallback  = bool (default false)          # opt-in same-provider degrade when the
 #                                                            # opposite provider is starved; false =
 #                                                            # stay queued + alert (honest default)
+#   trusted_bots             = [string, ...] (default [])    # issue #111: the EXACT allowlist of
+#                              trusted App bot issue-author logins, added to the OWNER/MEMBER/
+#                              COLLABORATOR associations of `trust = "collaborators"`. CLAIM unions
+#                              it with the runtime-resolved worker App `bot_login`, so the pipeline's
+#                              own App bot needs NO entry here; list ONLY additional trusted bots.
+#                              Suffix-matching "<x>[bot]" is gone — an unlisted bot is never trusted.
 
 [repos."sparq-org/sparq"]
 enabled = true
