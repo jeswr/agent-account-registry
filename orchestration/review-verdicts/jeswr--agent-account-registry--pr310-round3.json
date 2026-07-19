@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "actions/create-github-app-token registers a post-job cleanup phase by default. The worker invokes it for app-token-live and app-token-post before the gate, but their post phases execute after normal steps, hence after target-controlled gate code. Token revocation necessarily uses the installation token, creating exactly the later credential-bearing process that a detached gate process can observe. Moving publish to a fresh job therefore does not yet make the worker credential-free after the gate. The added checker is also blind to action post phases, so its live and mutation tests pass despite this boundary violation.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Prevent post-gate token cleanup from running on the hostile worker (for this action, use its supported skip-token-revoke input on every pre-gate mint), and rely on short token expiry or revoke from a clean job if required. Extend the structural guard and a negative fixture to require that pre-gate token actions cannot register credential-bearing post phases.",
+   "severity": "blocker",
+   "title": "App-token post actions reintroduce credentials after the hostile gate"
+  }
+ ],
+ "progress": "improving",
+ "summary": "The clean publisher resolves the prior TTL issue and moves ordinary privileged write steps off the hostile runner, but the credential boundary is still incomplete. Both actions/create-github-app-token invocations in the worker register post-job cleanup that runs after the target-controlled gate. The action's post phase uses the minted installation token to revoke it, so a gate-surviving process still gets a later credential-bearing process on the same runner. The new structural self-test only scans declared workflow steps and cannot see post-action execution, making its claimed boundary unsound. Progress is improving because the prior TTL finding is fixed and only the credential-boundary blocker remains, but this blocker still requires changes.",
+ "verdict": "request_changes"
+}
