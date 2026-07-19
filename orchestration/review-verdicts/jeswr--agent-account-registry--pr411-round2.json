@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 411,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f0c52a8f432b68ec1edc4c880d708f65a9b632d4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "review_outcome calls record_round_void for every result other than `ok`, but revalidate_outcome_head also returns `closed`, `author`, `undrafted`, `malformed-head`, and `unbound`. Those are not legitimate head churn. In particular, a missing/malformed `--reviewed-sha` after the model ran now voids the pre-model charge, so the sweep can repeatedly rerun the same deterministic wiring/identity failure without consuming `max_review_rounds`; wrong-author or undraft tampering likewise weakens accounting instead of preserving the human/tamper stop. The updated tests explicitly bless this for author and undrafted states, but do not assert that identity failures remain charged. This contradicts the stated bounded-crash/fail-closed invariant.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Only write a round-void marker when `freshness == \"head-moved\"` (and ideally verify the exact bot-authored `(round, run)` marker is bound to `args.reviewed_sha`). For closed, author, undrafted, malformed-head, and unbound outcomes, defer or fail closed without voiding the charge. Update the outcome self-tests to assert a void for head-moved only and no void for every other freshness reason, especially malformed/missing reviewed SHA.",
+    "severity": "major",
+    "title": "All freshness failures erase the charged round instead of only a moved head"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior round's SHA-binding defect is fixed: --head-sha is required, record_round rejects malformed values before posting, and the self-test exercises both rejection and a valid bound marker. However, the new void path is broader than head churn. Every freshness failure\u2014including malformed or missing reviewed SHA, wrong author, closed/undrafted state, and malformed live head\u2014mints a void and removes the attempt from the crash budget. That converts identity/wiring failures and tamper stops into uncharged retries, contrary to fail-closed bounded accounting. Because this is a new major issue while the prior major was repaired, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
