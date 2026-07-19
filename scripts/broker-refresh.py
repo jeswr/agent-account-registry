@@ -114,13 +114,31 @@ def broker(provider, cred):
 
 def write_capability(cap, path):
     """Persist the short-lived capability to a caller-supplied file at mode 0600.
-    The capability carries the access token, so it must go to a private file — NEVER stdout (in
+    The capability carries the access token, so it must go to a PRIVATE file — NEVER stdout (in
     Actions or ordinary automation stdout becomes a log entry, breaking the token-never-printed
-    invariant). Returns the path."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(cap, f)
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    invariant), and NEVER through a pre-existing permissive file or a symlink planted at `path`.
+
+    Opening the destination directly with O_CREAT|O_TRUNC would (a) truncate+write the token into an
+    already-existing mode-0644 file and only narrow the mode AFTERWARD — a window in which the secret
+    is group/world readable — and (b) follow a symlink at `path`, redirecting the token into another
+    file. Instead we stage the bytes into a fresh mode-0600 temp file in the SAME directory
+    (tempfile.mkstemp => O_CREAT|O_EXCL, 0600), fsync, then os.replace() atomically into place: the
+    secret only ever lands in a brand-new 0600 inode, and rename REPLACES a symlink at `path` rather
+    than following it and writing the token into some other file. Returns the path."""
+    dest_dir = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".broker-cap.", dir=dest_dir)  # mkstemp guarantees mode 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cap, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)  # atomic; overwrites a symlink at `path`, never follows it
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -188,6 +206,36 @@ def _self_test():
         except ValueError:
             refused = True
         chk("live path refuses without an out_file (fail closed)", refused)
+        # EXISTING PERMISSIVE destination: the token must NOT be written through the old 0644 inode.
+        # A hardlink pins the pre-existing inode so we can read it back after the write; the atomic
+        # replace lands the secret in a fresh 0600 inode, so the old (permissive) inode stays empty.
+        exist = os.path.join(d, "existing.json")
+        os.close(os.open(exist, os.O_WRONLY | os.O_CREAT, 0o644))
+        os.chmod(exist, 0o644)
+        pin = os.path.join(d, "pinned-old-inode")
+        os.link(exist, pin)  # same inode as the pre-existing permissive file
+        write_capability(co, exist)
+        with open(pin) as f:
+            chk("existing permissive inode never receives the token", "ACCESS_short" not in f.read())
+        chk("existing-dest final file is mode 0600", stat.S_IMODE(os.stat(exist).st_mode) == 0o600)
+        with open(exist) as f:
+            chk("existing-dest final content is the capability", json.load(f) == co)
+        # SYMLINK destination: the token must NOT be redirected through the link into another file.
+        victim = os.path.join(d, "victim.json")
+        with open(victim, "w") as f:
+            f.write("PREEXISTING")
+        os.chmod(victim, 0o644)
+        link = os.path.join(d, "link.json")
+        os.symlink(victim, link)
+        write_capability(co, link)
+        with open(victim) as f:
+            vbytes = f.read()
+        chk("symlink target is not overwritten with the token", "ACCESS_short" not in vbytes)
+        chk("symlink target retains its original content", vbytes == "PREEXISTING")
+        chk("symlink dest replaced by a real (non-symlink) file", not os.path.islink(link))
+        chk("symlink-dest final file is mode 0600", stat.S_IMODE(os.lstat(link).st_mode) == 0o600)
+        with open(link) as f:
+            chk("symlink-dest final content is the capability", json.load(f) == co)
     finally:
         subprocess.run(["rm", "-rf", d], check=False)
     print("broker-refresh self-test", "PASSED" if ok else "FAILED")
