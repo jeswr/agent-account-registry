@@ -476,7 +476,7 @@ def decide_disarm(armed, draft, head_sha, reviewed_sha, when):
     when="mismatch" — the sweep-side safety invariant: act on a PR whose live head differs from
     its recorded reviewed-sha AND that is either ARMED (the latch would merge a never-reviewed
     tree) or READY-but-unarmed (a disarm interrupted between disable-auto and redraft, or an arm
-    crashed between ready and merge --auto — completing the redraft is what makes the sweep
+    crashed between ready and the arm latch — completing the redraft is what makes the sweep
     re-entrant across those crash windows). Matching SHAs are never touched: an armed match is a
     valid arm, and a ready-unarmed match is the valid arm=false-policy terminal (human merges).
     A drafted unarmed PR has nothing latched and nothing interrupted — never touched.
@@ -1050,13 +1050,13 @@ def live_human_holds(repo, pr_number, issue=None, live=None):
     payload (a non-list, or any non-dict entry / non-string name), or an unreadable
     source-issue probe RAISES WorkerPrError — the caller mutates nothing and the sweep simply
     retries. The old shape-tolerant read collapsed malformed label data to "no hold" and
-    ready_and_arm still issued `pr ready` + `merge --auto` (fail OPEN on the dangerous act).
+    ready_and_arm still issued `pr ready` + the arm latch (fail OPEN on the dangerous act).
 
     DEFENSE-IN-DEPTH ONLY — RESIDUAL TOCTOU WINDOW (descoped from PR #286, tracked in
     issue #294): this probe is an unbound PREFLIGHT read; a hold that lands in the
     probe-to-mutation gap is still overwritten, because set_review_state deletes the
     mutually-exclusive review:* labels unconditionally and the arm path has the same gap
-    before `pr ready`/`merge --auto`. The concrete worst case is a transiently-removed hold
+    before `pr ready`/the arm latch. The concrete worst case is a transiently-removed hold
     label (or, via the freed crate, a duplicate same-crate worker PR) — humanly recoverable
     churn, never credential exposure or data corruption. Closing the window needs a
     monotonic hold/disarm handshake: label transitions that can never delete a
@@ -1396,6 +1396,163 @@ def disarm(repo, pr_number, when):
     print(f"disarm applied ({when}): {','.join(actions)}")
 
 
+# [P1 arm regression — review-fix runs 29674274380 (#326) / 29674657458 (#332)] GitHub
+# REFUSES the auto-merge latch while the PR reads ALREADY fully mergeable ("clean"/"unstable"
+# status): pr-gate.yml re-runs `gate` on ready_for_review, but GitHub takes 1-14s (observed)
+# to REGISTER that queued run after `pr ready`, so an immediate enable sees every requirement
+# satisfied and errors "Pull request is in clean status". (sol r3 on #334) that refusal is
+# RETRYABLE like any other transient — NEVER a direct merge. The round-2 direct-merge
+# fallback was REMOVED because it (a) merged while the fresh ready_for_review `gate` run was
+# queued-but-unregistered — bypassing a required gate that might fail — and (b) closed the PR
+# before the post-arm metadata (review:pass / source-issue completion / reviewed-sha bind)
+# landed, an unrecoverable crash window (sweep + groom enumerate OPEN PRs only). The latch,
+# once accepted, natively waits for the fresh gate; if every attempt loses the registration
+# race, the caller's fail-closed draft-restore path runs and the sweep retries next tick —
+# convergent, never gate-bypassing.
+#
+# (sol r4 on #334) THE LATCH PRIMITIVE IS THE EXPLICIT GraphQL enablePullRequestAutoMerge
+# MUTATION (`gh api graphql`), NEVER `gh pr merge --auto`: current gh CLI semantics (sol
+# cites the v2.96 source) make `pr merge --auto` fall through to a DIRECT merge when the PR
+# reads CLEAN/HAS_HOOKS/UNSTABLE — exactly the already-mergeable registration-lag window this
+# retry loop exists for — so with the CLI verb the "latch-only" invariant above was FALSE.
+# The raw mutation can only ever latch; GitHub rejects it outright on a clean-status PR
+# ("Pull request is in clean status"), which remains the retryable signal. The head CAS moves
+# from `--match-head-commit` into the mutation's expectedHeadOid input.
+ARM_AUTO_MERGE_MUTATION = (
+    "mutation($pr:ID!,$oid:GitObjectID!){"
+    "enablePullRequestAutoMerge(input:{pullRequestId:$pr,expectedHeadOid:$oid,"
+    "mergeMethod:SQUASH}){clientMutationId}}")
+ARM_ATTEMPTS = 6
+# Per-retry backoff bounds (seconds) for the 5 sleeps between the 6 attempts.
+# (sol r4 on #334) FLOORS are a deterministic MINIMUM cumulative schedule: each sleep is
+# max(floor, jitter), so the delay before the FINAL attempt is >= sum(floors) = 20s
+# regardless of jitter draws — the old uniform(1s, ceiling) lower bound admitted a ~5s
+# cumulative total that never covered the evidenced 14s registration tail. CEILINGS keep the
+# Fibonacci-ish full-jitter decorrelation with a bounded ~31s worst case.
+ARM_BACKOFF_FLOORS = (2.0, 3.0, 4.0, 5.0, 6.0)
+ARM_BACKOFF_CEILINGS = (2.0, 3.0, 5.0, 8.0, 13.0)
+
+
+def _arm_backoff_ceiling(attempt):
+    """Upper bound (seconds) for the sleep before arm retry `attempt` (1-based)."""
+    return ARM_BACKOFF_CEILINGS[min(attempt, len(ARM_BACKOFF_CEILINGS)) - 1]
+
+
+def _arm_backoff_floor(attempt):
+    """Deterministic MINIMUM sleep (seconds) before arm retry `attempt` (1-based)."""
+    return ARM_BACKOFF_FLOORS[min(attempt, len(ARM_BACKOFF_FLOORS)) - 1]
+
+
+def _arm_sleep_backoff(attempt):
+    # (sol r4 on #334) max(floor, jitter): the retry exists to give Actions time to register
+    # the ready_for_review-triggered gate run, and the floors alone guarantee >= 20s
+    # cumulative before the final attempt (evidenced tail: 14s) with NO reliance on jitter
+    # luck; the jittered ceiling keeps parallel arms decorrelated. Module-level so
+    # --self-test patches it instead of sleeping.
+    time.sleep(max(_arm_backoff_floor(attempt),
+                   random.uniform(0.0, _arm_backoff_ceiling(attempt))))
+
+
+def _arm_error_text(result):
+    """One sanitized single-line string from a failed gh call (stderr wins, stdout appended)."""
+    return " ".join(f"{result.stderr or ''} {result.stdout or ''}".split())[:300]
+
+
+def _arm_hold_recheck(repo, pr_number, issue):
+    """(sol r2 on #334) LIVE hold revalidation INSIDE the arm retry window — the SAME
+    live_human_holds probe the pre-arm recheck runs, re-read fresh. Returns
+    ('hold', labels) when a human/groom park is live, ('unreadable', error) when the hold
+    surface cannot be read (fail CLOSED — the caller treats it as a failed attempt so the
+    draft-restore liveness path still runs, instead of raising past the undo), and
+    (None, '') when clear."""
+    try:
+        holds = live_human_holds(repo, pr_number, issue=issue)
+    except WorkerPrError as exc:
+        return "unreadable", str(exc)
+    if holds:
+        return "hold", ", ".join(holds)
+    return None, ""
+
+
+def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=None):
+    """Latch the sha-bound auto-merge, surviving the post-`pr ready` CLEAN-STATUS race
+    (P1, runs 29674274380/29674657458: every failed arm's ready_for_review `gate` run
+    STARTED 1-14s AFTER the enable call failed — the arm raced GitHub's check-run
+    registration and lost, and GitHub refuses enablePullRequestAutoMerge on a PR whose
+    requirements are all satisfied). Strategy: the LATCH IS THE ONLY MERGE PRIMITIVE
+    (sol r3 on #334 — the round-2 direct-merge fallback is gone; see the
+    ARM_BACKOFF_CEILINGS block comment for why it was structurally unsafe), and (sol r4
+    on #334) the latch is issued as the EXPLICIT enablePullRequestAutoMerge GraphQL
+    mutation, never `gh pr merge --auto` — the CLI verb direct-merges a
+    CLEAN/HAS_HOOKS/UNSTABLE PR (gh v2.96 source), which falsified the latch-only
+    invariant exactly inside the registration-lag window. The PR node id is fetched and
+    the live head oid verified against the reviewed sha up front (fail closed on
+    mismatch/unreadable — the reviewed tree can never come back under a moved head), and
+    the head CAS rides in the mutation's expectedHeadOid input so GitHub itself refuses
+    a latch on any later head move. EVERY refusal — the clean/unstable already-mergeable
+    family included — backs off with floored, capped jitter and retries the mutation;
+    once GitHub registers the queued ready_for_review `gate` run the latch is accepted
+    and natively waits for that fresh gate, so a required check can never be bypassed.
+    Exhausting every attempt returns failure and the caller's fail-closed draft-restore
+    path runs (the sweep retries next tick — convergent). Every gh failure is PRINTED —
+    the pre-fix path swallowed stderr, leaving runs with only the generic 'arm failed'
+    line.
+
+    (sol r2 on #334) HOLD REVALIDATION PER ATTEMPT: this retry/backoff loop (~31s worst
+    case) runs AFTER ready_and_arm's single pre-arm hold probe, and a park that lands
+    during backoff (review:needs-user / needs:user on the PR, needs:* on the source
+    issue) does NOT move the head — --match-head-commit cannot refuse it, so without a
+    re-probe the retry would arm straight past the park. The live hold probe re-runs
+    immediately BEFORE every retry attempt; any hold aborts with mode 'human_hold' (the
+    caller restores the draft and exits with the valid human_hold shape); an unreadable
+    hold surface aborts as a plain failure (fail closed, draft restored, the sweep
+    retries). Returns (ok, mode, last_error) with mode in {'auto', 'human_hold'}."""
+    # (sol r4 on #334) node id + head pre-verify, ONCE before the loop: the mutation needs
+    # the GraphQL node id, and a head already moved past the reviewed sha can never latch
+    # (expectedHeadOid would refuse every attempt) — fail closed immediately instead of
+    # burning the full backoff schedule. Per-attempt races stay covered by expectedHeadOid,
+    # GitHub's own atomic CAS at mutation time.
+    try:
+        live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    except WorkerPrError as exc:
+        return False, "", f"PR node lookup failed before the latch (fail closed): {exc}"
+    node_id = str(live.get("node_id") or "") if isinstance(live, dict) else ""
+    live_head = (str((live.get("head") or {}).get("sha", ""))
+                 if isinstance(live, dict) else "")
+    if not node_id:
+        return False, "", "PR node id unavailable; refusing to latch (fail closed)"
+    if live_head != reviewed_sha:
+        return False, "", (f"live head {live_head[:12] or '(unreadable)'} != reviewed sha "
+                           f"{reviewed_sha[:12]}; refusing to latch (fail closed)")
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            _arm_sleep_backoff(attempt - 1)
+            # (sol r2 on #334) re-probe immediately before the retry: the backoff window
+            # is exactly where a mid-arm park lands without moving the head.
+            verdict, detail = _arm_hold_recheck(repo, pr_number, issue)
+            if verdict == "hold":
+                print(f"arm attempt {attempt}/{attempts}: ABORTED — human hold live "
+                      f"({detail}); the park wins over the retry", file=sys.stderr)
+                return False, "human_hold", f"human hold live mid-arm: {detail}"
+            if verdict == "unreadable":
+                print(f"arm attempt {attempt}/{attempts}: hold revalidation unreadable; "
+                      f"refusing to retry (fail closed): {detail}", file=sys.stderr)
+                return False, "", f"hold revalidation unreadable (fail closed): {detail}"
+        # (sol r4 on #334) the explicit mutation: latch-or-refuse, structurally incapable
+        # of a direct merge. The reviewed sha rides in expectedHeadOid (the CAS).
+        merge = _run_gh(["api", "graphql",
+                         "-f", f"query={ARM_AUTO_MERGE_MUTATION}",
+                         "-f", f"pr={node_id}",
+                         "-f", f"oid={reviewed_sha}"], check=False)
+        if merge.returncode == 0:
+            return True, "auto", ""
+        last_error = _arm_error_text(merge) or "unknown gh error"
+        print(f"arm attempt {attempt}/{attempts}: enable auto-merge failed: {last_error}",
+              file=sys.stderr)
+    return False, "", last_error
+
+
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
                   reviewed_base="", security_keywords=None):
@@ -1404,12 +1561,21 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:* on the source issue) are re-read
     live immediately before the first mutation: a park that landed mid-review-run aborts the
     ready+arm untouched (arm_complete=false), so an in-flight run can never arm past a
-    human/groom park the busy-partition carve-out relies on.
+    human/groom park the busy-partition carve-out relies on. (sol r2 on #334) the same probe
+    re-runs INSIDE the arm retry window — before every retry attempt (see _arm_auto_merge) —
+    because a park landing during backoff does not move the head and the expectedHeadOid
+    CAS alone cannot refuse it; a mid-arm hold exits with the same human_hold shape after the
+    draft restore. (sol r3 on #334) the auto-merge LATCH is the only merge primitive — the
+    direct-merge fallback was removed, so the fresh ready_for_review `gate` run is always
+    waited on and the post-arm metadata (review:pass / issue completion / reviewed-sha bind)
+    always lands while the PR is still open. (sol r4 on #334) the latch is the explicit
+    enablePullRequestAutoMerge GraphQL mutation, never `gh pr merge --auto` (the CLI verb
+    direct-merges a CLEAN/HAS_HOOKS/UNSTABLE PR — see _arm_auto_merge).
 
     Account disjointness is asserted on SALTED HASHES (locked decision 22a): the registry
     provenance record stores impl_account_h, and the live reviewer handle is hashed here with the
     same PROVENANCE_SALT. Liveness (crash-window hardening): `gh pr ready` un-drafts the PR, so if
-    the subsequent `merge --auto` fails the draft state is restored (`gh pr ready --undo`) — the
+    the subsequent latch mutation fails the draft state is restored (`gh pr ready --undo`) — the
     PR stays visible to the sweep for a bounded re-review instead of stalling non-draft/unarmed
     forever; if even the undo fails, this escalates to review:needs-user (never silent).
 
@@ -1515,31 +1681,58 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         _apply_trust_surface_audit(repo, pr_number, trust_hits, reviewed_sha,
                                    bot_login=bot_login)
     _run_gh(["pr", "ready", str(pr_number), "-R", repo])
+    arm_mode = ""
     if arm:
-        # Atomic SHA-bound arm (sol r2): GitHub's own CAS — the latch only sets if the head
-        # still equals the reviewed sha at mutation time, closing the read-to-arm race.
-        merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto",
-                         "--match-head-commit", reviewed_sha],
-                        check=False)
-        if merge.returncode != 0:
+        # Atomic SHA-bound arm (sol r2): GitHub's own CAS — the mutation's expectedHeadOid
+        # only latches if the head still equals the reviewed sha at mutation time, closing
+        # the read-to-arm race.
+        # [P1 arm regression] the latch is retried through the post-ready clean-status race
+        # (see _arm_auto_merge), and the REAL gh error rides every failure message — the
+        # pre-fix single-shot attempt swallowed stderr and lost to the race deterministically
+        # on any PR whose draft-time `gate` was already green (#326 lost 3 rounds -> parked).
+        # (sol r2 on #334) _arm_auto_merge re-runs the live hold probe before every retry
+        # attempt — a park landing during the backoff window (~31s worst case) does not move
+        # the head, so the head CAS alone cannot refuse it; a mid-arm hold comes back as
+        # mode 'human_hold'. (sol r3 on #334) latch-only: exhaustion falls into the
+        # draft-restore path below, never a direct merge. (sol r4 on #334) the latch is the
+        # explicit enablePullRequestAutoMerge mutation — `gh pr merge --auto` is banned from
+        # this path outright (the CLI verb direct-merges an already-mergeable PR).
+        armed_ok, arm_mode, arm_error = _arm_auto_merge(repo, pr_number, reviewed_sha,
+                                                        issue=issue)
+        if not armed_ok:
             undo = _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
             if undo.returncode == 0:
+                if arm_mode == "human_hold":
+                    # (sol r2 on #334) a park landed MID-ARM (during the retry backoff
+                    # window): same valid-exit shape as the pre-arm hold
+                    # abort (arm_complete=false — review-fix.yml never binds reviewed-sha)
+                    # with the draft restored (undo above — semantics unchanged) and NO
+                    # review-state/comment churn: the PR is human-owned, the sweep's
+                    # enumerator excludes it while the park stands.
+                    _write_outputs({"armed": False, "head_moved": False,
+                                    "human_hold": True, "arm_complete": False})
+                    print(f"ready+arm ABORTED mid-arm: {arm_error} — the park stands; "
+                          "draft restored, no review-state mutation was applied")
+                    return
                 # Back to draft with review:needs and NO reviewed-sha bind (the bind runs after
                 # this step) — the sweep re-reviews next tick, bounded by max_review_rounds.
                 raise WorkerPrError(
-                    "auto-merge arm failed; draft restored for the sweep to retry")
+                    "auto-merge arm failed; draft restored for the sweep to retry "
+                    f"(last gh error: {arm_error})")
             alert_repo, alert_token = _alert_route()
             needs_user(repo, pr_number,
                        "arming failed AFTER the PR left draft and the draft state could not be "
                        "restored; a human must re-arm or re-draft this PR",
                        issue=issue, alert_repo=alert_repo, alert_token=alert_token)
-            raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated")
+            raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated "
+                                f"(last gh error: {arm_error})")
     set_review_state(repo, pr_number, "pass")
     if issue:
         # Deferred issue completion (locked decision 16): complete only on arm, not on publish.
         _load_worker_issue().set_status(repo, issue, "complete")
     _write_outputs({"armed": bool(arm), "head_moved": False,
-                    "trust_surface": bool(trust_hits), "arm_complete": True})
+                    "trust_surface": bool(trust_hits), "arm_complete": True,
+                    "arm_mode": arm_mode})
     print(f"pull request marked ready{' and armed (auto-merge)' if arm else ''}")
 
 
@@ -2670,7 +2863,7 @@ def _self_test():
     raa_state = {}
     real_raa = {name: globals()[name] for name in (
         "_gh_json", "_run_gh", "_pr_changed_files", "set_review_state",
-        "_paginated_comments", "needs_user", "_write_outputs")}
+        "_paginated_comments", "needs_user", "_write_outputs", "_arm_sleep_backoff")}
 
     def raa_gh_json(args, **_kw):
         path = args[1] if len(args) > 1 else ""
@@ -2687,53 +2880,87 @@ def _self_test():
             return {"labels": [{"name": name}
                                for name in raa_state.get("issue_labels", ())]}
         labels_payload = raa_state.get("labels_payload")
-        return {"state": "open",
+        return {"state": "open", "node_id": "PR_kwTESTNODE",
                 "labels": (labels_payload if labels_payload is not None
                            else [{"name": name} for name in raa_state.get("labels", ())]),
                 "head": {"ref": "sparq-agent/issue-7-1-1", "sha": raa_state["head"]},
                 "base": {"ref": "main"}}
 
     def raa_run_gh(args, **kw):
-        raa_calls.append(" ".join(args))
-        if "merge" in args and raa_state.get("merge_fails"):
-            if kw.get("check", True):
-                raise WorkerPrError("GitHub API request failed for merge")
-            return argparse.Namespace(returncode=1, stdout="", stderr="")
+        joined = " ".join(args)
+        raa_calls.append(joined)
+        if "enablePullRequestAutoMerge" in joined or list(args[:2]) == ["pr", "merge"]:
+            # Merge-CAPABLE argv (the enablePullRequestAutoMerge mutation — or a regressed
+            # `pr merge` of any form, which the structural anchor below turns red on).
+            # [P1 arm regression] scripted per-merge-call results: a list of (rc, stderr)
+            # rows consumed in order, so the retry/fallback shape is pinned exactly.
+            script = raa_state.get("merge_script")
+            if script is not None:
+                rc, err = script.pop(0) if script else (0, "")
+                if rc != 0 and raa_state.get("hold_after_fail"):
+                    # (sol r2 on #334) mid-arm park injection: the hold labels land on the
+                    # live PR only AFTER a failed merge attempt — simulating a human/groom
+                    # park arriving during the retry backoff window, with the head unmoved.
+                    raa_state["labels"] = raa_state.pop("hold_after_fail")
+                return argparse.Namespace(returncode=rc, stdout="", stderr=err)
+            if raa_state.get("merge_fails"):
+                if kw.get("check", True):
+                    raise WorkerPrError("GitHub API request failed for merge")
+                return argparse.Namespace(returncode=1, stdout="", stderr="")
         return argparse.Namespace(returncode=0, stdout="", stderr="")
 
     def run_raa(head_ok=True, merge_fails=False, comments=(), labels=(),
                 issue_labels=(), issue=None, probe_garbage=False, labels_payload=None,
-                benign_diff=False, security_keywords=()):
+                benign_diff=False, security_keywords=(), merge_script=None,
+                hold_after_fail=None):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
         raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
                          labels=labels, issue_labels=issue_labels,
                          issue_probe_garbage=probe_garbage, labels_payload=labels_payload,
-                         benign_diff=benign_diff)
+                         benign_diff=benign_diff, merge_script=merge_script,
+                         hold_after_fail=hold_after_fail)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
         globals()["set_review_state"] = lambda repo, pr, s: raa_calls.append(f"state:{s}")
         globals()["_paginated_comments"] = lambda repo, pr: list(comments)
         globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
+        globals()["_arm_sleep_backoff"] = lambda attempt: raa_calls.append(f"sleep:{attempt}")
         globals()["_write_outputs"] = raa_outputs.update
         ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
                       issue=issue, bot_login="sparq[bot]",
                       reviewed_base=raa_state.get("reviewed_base", "main"),
                       security_keywords=security_keywords or None)
 
+    # (sol r4 on #334) mutation-NAME matching, not flag matching: the latch argv is
+    # recognised by the literal GraphQL mutation name, and "merge-capable" argv is the
+    # mutation OR any `gh pr merge` invocation (with or without --auto — the CLI verb
+    # direct-merges an already-mergeable PR, so EVERY form is banned from the arm path and
+    # turned red by the structural anchor below).
+    LATCH_MUTATION = "enablePullRequestAutoMerge"
+
+    def raa_latches():
+        """Every recorded merge-CAPABLE gh argv (latch mutation or any `pr merge` form)."""
+        return [c for c in raa_calls
+                if LATCH_MUTATION in c or c.startswith("pr merge")]
+
     try:
         sha = "b" * 40
         run_raa()
         check("approved trust-surface diff ARMS (Decision 7 revision)",
-              (any("merge" in c for c in raa_calls), raa_outputs.get("armed"),
+              (any(LATCH_MUTATION in c for c in raa_calls), raa_outputs.get("armed"),
                raa_outputs.get("trust_surface")), (True, True, True))
         audit_i = next(i for i, c in enumerate(raa_calls) if "trust-surface" in c)
-        merge_i = next(i for i, c in enumerate(raa_calls) if "merge" in c)
+        # default -1: a MISSING latch mutation FAILS this check (red, not a crash) — that is
+        # what a `pr merge` regression looks like to the mutation-name matchers.
+        merge_i = next((i for i, c in enumerate(raa_calls) if LATCH_MUTATION in c), -1)
         check("audit trail is DURABLE BEFORE the merge latch (sol r2)",
               audit_i < merge_i, True)
-        check("the arm is SHA-bound (--match-head-commit CAS)",
-              any("--match-head-commit" in c and sha in c for c in raa_calls), True)
+        check("the arm is SHA-bound (expectedHeadOid CAS in the mutation variables)",
+              any(LATCH_MUTATION in c and f"oid={sha}" in c for c in raa_calls), True)
+        check("the mutation targets the fetched PR node id",
+              any(LATCH_MUTATION in c and "pr=PR_kwTESTNODE" in c for c in raa_calls), True)
         check("audit comment carries the SHA-bound idempotency marker",
               any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
         bot_marker = {"body": f"x {TRUST_AUDIT_MARKER_PREFIX}{sha} -->",
@@ -2782,13 +3009,13 @@ def _self_test():
         run_raa()
         check("base retarget returns to review:needs with NO arm and NO audit (sol r5)",
               ("state:needs" in raa_calls,
-               any("merge" in c for c in raa_calls),
+               bool(raa_latches()),
                any("trust-surface" in c for c in raa_calls)), (True, False, False))
         raa_state["reviewed_base"] = "main"
         run_raa(head_ok=False)
         check("head race returns to review:needs with NO arm and NO audit",
               ("state:needs" in raa_calls,
-               any("merge" in c for c in raa_calls),
+               bool(raa_latches()),
                any("trust-surface" in c for c in raa_calls)), (True, False, False))
         try:
             run_raa(merge_fails=True)
@@ -2797,31 +3024,161 @@ def _self_test():
             check("arm failure raises (draft restored path)", "raised", "raised")
         check("the pre-arm audit survives an arm failure (re-review re-audits per sha)",
               any(TRUST_AUDIT_MARKER_PREFIX in c for c in raa_calls), True)
+        # ---- [P1 arm regression — review-fix runs 29674274380 (#326) / 29674657458 (#332)]
+        # the post-`pr ready` CLEAN-STATUS race: pr-gate re-runs `gate` on ready_for_review,
+        # but until GitHub registers that queued run the PR reads CLEAN and the auto-merge
+        # latch is REFUSED ("Pull request is in clean status"). (sol r3+r4 on #334) the arm
+        # must (a) mark ready STRICTLY before any latch call, (b) RETRY the latch with
+        # backoff on EVERY refusal — the already-mergeable clean/unstable family included,
+        # NEVER a direct merge (a direct merge bypasses the queued-but-unregistered fresh
+        # gate run and closes the PR before the post-arm metadata lands), (c) issue the
+        # latch ONLY as the enablePullRequestAutoMerge mutation — `gh pr merge --auto`
+        # direct-merges a CLEAN/HAS_HOOKS/UNSTABLE PR (gh v2.96), so every `pr merge` form
+        # is banned — and (d) surface the REAL gh error on terminal failure (the pre-fix
+        # path swallowed stderr). ----
+        run_raa()
+        ready_i = next(i for i, c in enumerate(raa_calls) if c.startswith("pr ready"))
+        merge_i = next((i for i, c in enumerate(raa_calls) if LATCH_MUTATION in c), -1)
+        check("mark-ready STRICTLY precedes the arm (ready->arm ordering pinned)",
+              0 <= merge_i and ready_i < merge_i, True)
+        check("arm backoff ceilings cover the observed 1-14s registration tail with margin",
+              (tuple(_arm_backoff_ceiling(a) for a in range(1, ARM_ATTEMPTS)),
+               _arm_backoff_ceiling(99)),
+              (ARM_BACKOFF_CEILINGS, ARM_BACKOFF_CEILINGS[-1]))
+        # (sol r4 on #334) deterministic MINIMUM cumulative schedule: the floors sum to
+        # >= 20s across the 5 sleeps before the FINAL attempt, covering the evidenced 14s
+        # registration tail with NO reliance on jitter draws (the old 1s uniform lower
+        # bound admitted a ~5s cumulative total).
+        check("arm backoff floors are a >=20s cumulative minimum before the final attempt",
+              (tuple(_arm_backoff_floor(a) for a in range(1, ARM_ATTEMPTS)),
+               sum(_arm_backoff_floor(a) for a in range(1, ARM_ATTEMPTS)) >= 20.0,
+               _arm_backoff_floor(99)),
+              (ARM_BACKOFF_FLOORS, True, ARM_BACKOFF_FLOORS[-1]))
+        check("every arm backoff sleep has a floor admitted by its ceiling (5 sleeps)",
+              (len(ARM_BACKOFF_FLOORS), len(ARM_BACKOFF_CEILINGS),
+               all(f <= c for f, c in zip(ARM_BACKOFF_FLOORS, ARM_BACKOFF_CEILINGS))),
+              (ARM_ATTEMPTS - 1, ARM_ATTEMPTS - 1, True))
+        # The REAL sleep respects the floors under ADVERSARIAL jitter: pin random.uniform
+        # to its lower bound (worst draw) and sum what time.sleep is actually asked for —
+        # no mocked-jitter luck. Dropping the max(floor, ...) makes this red (~0s total).
+        slept = []
+        real_uniform, real_time_sleep = random.uniform, time.sleep
+        try:
+            random.uniform = lambda low, high: low
+            time.sleep = slept.append
+            for a in range(1, ARM_ATTEMPTS):
+                real_raa["_arm_sleep_backoff"](a)
+        finally:
+            random.uniform, time.sleep = real_uniform, real_time_sleep
+        check("MINIMUM cumulative delay before the final attempt is >= 20s (floors, not luck)",
+              (sum(slept) >= 20.0,
+               [s >= f for s, f in zip(slept, ARM_BACKOFF_FLOORS)], len(slept)),
+              (True, [True] * (ARM_ATTEMPTS - 1), ARM_ATTEMPTS - 1))
+        clean_err = "GraphQL: Pull request is in clean status (enablePullRequestAutoMerge)"
+        run_raa(merge_script=[(1, clean_err), (1, clean_err), (0, "")])
+        latches = raa_latches()
+        check("clean-status refusal RETRIES the latch; it latches once the fresh run registers",
+              (len(latches), all(LATCH_MUTATION in c for c in latches),
+               all(f"oid={sha}" in c and "pr=PR_kwTESTNODE" in c for c in latches),
+               sum(1 for c in raa_calls if c.startswith("sleep:"))),
+              (3, True, True, 2))
+        check("the retried latch ARMS mode=auto: no draft undo, no needs-user, arm_complete",
+              (raa_outputs.get("armed"), raa_outputs.get("arm_complete"),
+               raa_outputs.get("arm_mode"),
+               any("--undo" in c for c in raa_calls), "needs-user" in raa_calls),
+              (True, True, "auto", False, False))
+        try:
+            run_raa(merge_script=[(1, clean_err)] * (ARM_ATTEMPTS + 1))
+            check("clean-status exhaustion restores the draft with ZERO merges",
+                  "no error", "raised")
+        except WorkerPrError as exc:
+            # MUTATION-CHECK anchor (sol r3+r4 on #334): re-adding ANY `gh pr merge` form
+            # on the clean-status refusal — a direct merge OR the --auto verb (which
+            # direct-merges an already-mergeable PR) — makes a `pr merge` argv appear and
+            # drops the mutation count below ARM_ATTEMPTS -> red.
+            check("clean-status exhaustion restores the draft with ZERO merges",
+                  ("draft restored for the sweep to retry" in str(exc),
+                   "clean status" in str(exc),
+                   sum(1 for c in raa_calls if LATCH_MUTATION in c),
+                   any(c.startswith("pr merge") for c in raa_calls),
+                   any("--undo" in c for c in raa_calls), "state:pass" in raa_calls),
+                  (True, True, ARM_ATTEMPTS, False, True, False))
+        # STRUCTURAL ANCHOR (sol r4 on #334): the arm path's ONLY merge-capable argv is the
+        # enablePullRequestAutoMerge mutation — matched by MUTATION NAME, with zero
+        # `gh pr merge` invocations of ANY form (no flag-matching: --auto itself is the
+        # direct-merge hazard).
+        check("the ONLY merge-capable argv is the enablePullRequestAutoMerge mutation",
+              (bool(raa_latches()),
+               all(LATCH_MUTATION in c and not c.startswith("pr merge")
+                   for c in raa_latches()),
+               any(c.startswith("pr merge") for c in raa_calls)),
+              (True, True, False))
+        lag_err = "GraphQL: Draft pull requests cannot be merged (enablePullRequestAutoMerge)"
+        run_raa(merge_script=[(1, lag_err), (0, "")])
+        latches = raa_latches()
+        check("a transient non-clean refusal RETRIES the latch with backoff (never `pr merge`)",
+              (len(latches), all(LATCH_MUTATION in c for c in latches),
+               any(c.startswith("sleep:") for c in raa_calls),
+               raa_outputs.get("armed"), raa_outputs.get("arm_mode")),
+              (2, True, True, True, "auto"))
+        try:
+            run_raa(merge_script=[(1, "boom: base branch was modified")] * (ARM_ATTEMPTS + 1))
+            check("persistent arm failure raises with the REAL gh error surfaced",
+                  "no error", "raised")
+        except WorkerPrError as exc:
+            check("persistent arm failure raises with the REAL gh error surfaced",
+                  ("draft restored for the sweep to retry" in str(exc),
+                   "boom: base branch was modified" in str(exc),
+                   sum(1 for c in raa_calls if LATCH_MUTATION in c),
+                   any(c.startswith("pr merge") for c in raa_calls),
+                   any("--undo" in c for c in raa_calls)),
+                  (True, True, ARM_ATTEMPTS, False, True))
+        # ---- (sol r2 on #334) HOLD REVALIDATION INSIDE THE ARM RETRY WINDOW: the
+        # retry/backoff (~31s worst case) runs AFTER the single pre-arm hold probe, and a
+        # park landing during backoff does NOT move the head — the expectedHeadOid CAS
+        # cannot refuse it. The live hold probe must re-run before EVERY retry attempt; any
+        # hold refuses with the valid-exit human_hold shape and the draft restored (no
+        # needs-user, no review-state churn). ----
+        run_raa(merge_script=[(1, lag_err)], hold_after_fail=("needs:user",))
+        latches = raa_latches()
+        check("a hold injected during backoff REFUSES the retry (zero further latch argv)",
+              (len(latches), raa_outputs.get("human_hold"), raa_outputs.get("arm_complete"),
+               raa_outputs.get("armed"), any("--undo" in c for c in raa_calls),
+               "needs-user" in raa_calls, "state:pass" in raa_calls),
+              (1, True, False, False, True, False, False))
+        run_raa(merge_script=[(1, clean_err)], hold_after_fail=("review:needs-user",))
+        latches = raa_latches()
+        check("a hold injected during the clean-status backoff REFUSES the retry (no merge)",
+              (len(latches), any(c.startswith("pr merge") for c in raa_calls),
+               raa_outputs.get("human_hold"), raa_outputs.get("arm_complete"),
+               raa_outputs.get("armed"), any("--undo" in c for c in raa_calls),
+               "needs-user" in raa_calls, "state:pass" in raa_calls),
+              (1, False, True, False, False, True, False, False))
         # ---- [round-4 P1] PARKED-BUT-ARMING RACE: a human/groom park that landed while
         # this review run was in flight WINS — the pre-arm hold recheck aborts with the
         # valid-exit shape and NO ready/arm/audit/review-state mutation at all ----
         for park in ("needs:user", "review:needs-user"):
             run_raa(labels=(park,))
             check(f"parked-mid-review PR label {park} aborts pre-arm (no ready/arm argv)",
-                  (any(c.startswith("pr ready") or "merge" in c for c in raa_calls),
+                  (any(c.startswith("pr ready") for c in raa_calls) or bool(raa_latches()),
                    any("trust-surface" in c or c.startswith("state:") for c in raa_calls),
                    raa_outputs.get("arm_complete"), raa_outputs.get("human_hold"),
                    raa_outputs.get("armed")),
                   (False, False, False, True, False))
         run_raa(issue_labels=("needs:maintainer",), issue=7)
         check("parked-mid-review SOURCE issue needs:* aborts pre-arm the same way",
-              (any(c.startswith("pr ready") or "merge" in c for c in raa_calls),
+              (any(c.startswith("pr ready") for c in raa_calls) or bool(raa_latches()),
                raa_outputs.get("arm_complete"), raa_outputs.get("human_hold")),
               (False, False, True))
         # the --issue arg may be absent: the source issue is derived from the worker head
         run_raa(issue_labels=("needs:user",))
         check("head-ref-derived source hold aborts pre-arm too",
-              (any("merge" in c for c in raa_calls), raa_outputs.get("arm_complete")),
+              (bool(raa_latches()), raa_outputs.get("arm_complete")),
               (False, False))
         run_raa(issue_labels=("area:crate-a", "role:impl"))
         check("unparked run is UNCHANGED (the hold recheck admits the ready+arm)",
               (any(c.startswith("pr ready") for c in raa_calls),
-               any("--match-head-commit" in c for c in raa_calls),
+               any(LATCH_MUTATION in c and f"oid={sha}" in c for c in raa_calls),
                raa_outputs.get("arm_complete")), (True, True, True))
         try:
             run_raa(probe_garbage=True)
@@ -2829,11 +3186,11 @@ def _self_test():
                   "no error", "raised")
         except WorkerPrError:
             check("unreadable source-issue hold state fails closed (no arm)",
-                  ("raised", any(c.startswith("pr ready") or "merge" in c
-                                 for c in raa_calls)), ("raised", False))
+                  ("raised", any(c.startswith("pr ready") for c in raa_calls)
+                   or bool(raa_latches())), ("raised", False))
         # ---- [round-5 P2] malformed live LABEL data must never read as "no hold": the old
         # shape-tolerant read collapsed a garbage payload to an empty label set and STILL
-        # issued `pr ready` + `merge --auto` (fail open on the dangerous act). Unknown
+        # issued `pr ready` + the arm latch (fail open on the dangerous act). Unknown
         # shapes now refuse with WorkerPrError and no ready/arm argv. ----
         for payload in ("junk", ["junk"], [{"name": 7}], [{"no_name": "x"}]):
             try:
@@ -2842,15 +3199,15 @@ def _self_test():
                       "no error", "raised")
             except WorkerPrError:
                 check(f"malformed label payload {payload!r} refuses ready/arm",
-                      ("raised", any(c.startswith("pr ready") or "merge" in c
-                                     for c in raa_calls)), ("raised", False))
+                      ("raised", any(c.startswith("pr ready") for c in raa_calls)
+                       or bool(raa_latches())), ("raised", False))
         # ---- Issue #153: the arm recomputes the LIVE label-derived security posture (PR +
         # SOURCE issue, routing keywords) so a security label added DURING the review still
         # lands in the SHA-bound audit trail. Per Decision 7 it AUDITS, never withholds. A
         # BENIGN-path diff isolates the LABEL signal from the path signal. ----
         run_raa(benign_diff=True, labels=("trust:review",))
         check("live trust:* PR label on a benign-path diff ARMS with an audit trail (#153)",
-              (any("merge" in c for c in raa_calls),
+              (any(LATCH_MUTATION in c for c in raa_calls),
                any("trust-surface" in c for c in raa_calls),
                raa_outputs.get("armed"), raa_outputs.get("arm_complete")),
               (True, True, True, True))
@@ -2858,7 +3215,7 @@ def _self_test():
               any(SECURITY_LABEL_AUDIT_HIT in c for c in raa_calls), True)
         run_raa(benign_diff=True)
         check("benign-path diff with NO security posture ARMS with NO audit (#153 control)",
-              (any("merge" in c for c in raa_calls),
+              (any(LATCH_MUTATION in c for c in raa_calls),
                any("trust-surface" in c for c in raa_calls),
                raa_outputs.get("armed")), (True, False, True))
         run_raa(benign_diff=True, issue_labels=("area:worker",),
