@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3581,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "90fdd4260123310ef65ded119fe9544fac227db4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The hardened `rustfmt (check)` gate runs `cargo fmt --all --check`, which formats only members of the root workspace. bench/dict carries its own `[workspace]` table (confirmed by the neighboring `bench/dict standalone selftest` step, whose comment notes bench/parse and bench/serve do the same), so `--all` never reaches them. Their formatting therefore stays ungated \u2014 a small blind spot in the PR's 'gate the workspace formatting' intent. Not a regression (these were never fmt-gated) and not blocking; carried over unchanged from round 1.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Optional: add `cargo fmt --manifest-path bench/dict/Cargo.toml --check` (and bench/parse, bench/serve) alongside the existing standalone clippy step, or file a follow-up bead recording that these workspaces are intentionally outside the fmt gate.",
+    "severity": "nit",
+    "title": "`cargo fmt --all` does not cover the standalone bench/ workspaces"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 of the repo-wide rustfmt normalization that also flips rustfmt from informational to a hard CI gate. The one functional change remains in .github/workflows/ci.yml: the `rustfmt (check)` step now runs `cargo fmt --all --check` with `continue-on-error` removed, and the lint job is renamed `clippy (gate) + fmt (non-blocking)` -> `fmt + clippy (gate)`. Verified in the checkout: (1) the job installs rustfmt via `rustup component add rustfmt clippy`, so the gate is runnable; (2) the new name contains neither 'informational' nor 'advisory', so the ci-summary aggregator still treats the job as GATING (the documented sq-wjth/sq-0lk hazard is avoided). New since round 1: bench/feature-off-declarations/3581.json, a well-formed declaration matching its siblings' schema (pr/date/reason), recording that reflowing always-compiled sparq-core/sparq-engine sources moves feature-OFF wasm bytes by design (size still governed by the wasm_bundle_bytes ratchet). The remaining ~hundreds of hunks are a pure rustfmt pass: I spot-checked ~20 across sparq-acbench, sparq-conformance (entail.rs numeric-datatype match arms incl. the `if v < 0` guard, the solve()/inconsistency() boolean-chain reflows, dl/ql taxonomy structs), sparq-canon, sparq-cli, sparq-arrow \u2014 all struct-literal expansion / use-list reorder / method-chain + match-arm rewrapping with NO logic change. Completeness is self-enforcing: any file the pass missed fails the newly-hardened gate and blocks merge. No correctness, soundness, test-validity, or security issues. Progress vs round 1: the single nit (standalone bench/dict|parse|serve workspaces carry their own [workspace] table and are not reached by `cargo fmt --all`) is unchanged and still non-blocking \u2014 materially the same finding at the same severity, hence stagnant.",
+  "verdict": "approve"
+ }
+}
