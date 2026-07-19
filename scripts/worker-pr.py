@@ -590,6 +590,87 @@ def validate_verdict(document, diff_files):
     return has_blockers
 
 
+# Issue #155: schema validation bounds only TYPE and LENGTH, so a reviewer (which reads hostile PR
+# content) can copy a raw `acctNN` handle, an email, or a credential into any free-text verdict
+# field. Those fields are then committed as registry SOURCE DATA (verdict_record, on the public
+# registry) AND posted verbatim to the public PR (post_findings). Every verdict string is scrubbed
+# of prohibited identifiers BEFORE it crosses either boundary; the ONLY account fingerprint
+# permitted to cross is the salted 16-hex hash (account_hash), which is deliberately NOT matched by
+# any pattern below (it is 16 chars — shorter than the high-entropy threshold). Each match collapses
+# to a fixed token so neither the value nor its length survives.
+REDACTION_TOKEN = "[redacted]"
+# When injection is flagged the reviewer's free text is HOSTILE, not merely sensitive: it is dropped
+# entirely (never republished/recorded) in favour of this fixed host-authored notice.
+HOST_INJECTION_NOTICE = (
+    "The cross-provider reviewer flagged possible prompt-injection content in this pull request. "
+    "Its free-text findings are withheld by the host and the pull request is escalated to a human. "
+    "(host-authored notice)")
+_REDACTION_PATTERNS = (
+    # PEM private-key blocks (any key type), whole block first so its contents never survive.
+    re.compile(r"-----BEGIN[^\n-]*PRIVATE KEY-----.*?-----END[^\n-]*PRIVATE KEY-----",
+               re.DOTALL | re.IGNORECASE),
+    # Raw registry account handles (acctNN), any case, optional separator — but never bare (a
+    # trailing digit run is required, so prose like "contact" or "acctypo" is left intact).
+    re.compile(r"acct[-_ ]?[0-9]+", re.IGNORECASE),
+    # Email addresses.
+    re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}"),
+    # Well-known credential token shapes (GitHub PAT/OAuth, OpenAI, Slack, GitLab, Google API,
+    # AWS access-key id) — a labelled prefix betrays a secret even without high entropy.
+    re.compile(r"\b(?:gh[posur]_[A-Za-z0-9]{16,}"
+               r"|github_pat_[A-Za-z0-9_]{20,}"
+               r"|sk-[A-Za-z0-9_\-]{16,}"
+               r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
+               r"|glpat-[A-Za-z0-9_\-]{16,}"
+               r"|AIza[A-Za-z0-9_\-]{16,}"
+               r"|AKIA[0-9A-Z]{16})\b"),
+    # Bearer tokens (the value must be a 10+ char token, so the bare word "bearer" in prose is
+    # not matched).
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{10,}"),
+    # Generic high-entropy secrets: a 32+ char run mixing letters AND digits (base64/hex
+    # credentials with no recognisable prefix). The permitted 16-hex account hash is shorter and
+    # never matches; ordinary security-review prose has no such run.
+    re.compile(r"\b(?=[A-Za-z0-9+/]*[A-Za-z])(?=[A-Za-z0-9+/]*[0-9])[A-Za-z0-9+/]{32,}={0,2}"),
+)
+
+
+def redact_identifiers(text):
+    """Redact every prohibited identifier — raw account handle, email, or credential-like token —
+    from ONE verdict string before it crosses the public trust boundary (issue #155). The salted
+    16-hex account hash (account_hash) is intentionally preserved: it is the only account
+    fingerprint permitted to cross. Deterministic and idempotent, so a re-run records byte-identical
+    content (the CAS in _registry_put_file requires it)."""
+    redacted = str(text)
+    for pattern in _REDACTION_PATTERNS:
+        redacted = pattern.sub(REDACTION_TOKEN, redacted)
+    return redacted
+
+
+def safe_outbound_verdict(document):
+    """Return a copy of a schema-validated verdict whose FREE-TEXT fields are safe to cross the
+    public trust boundary — the registry verdict record AND the public PR findings comment
+    (issue #155). Enum/structural fields (verdict, severity, file, injection_detected, progress)
+    are untouched; every free-text string (summary + each issue's title/body/fix_hint) is
+    identifier-redacted. When injection is flagged the hostile free text is DROPPED, not merely
+    redacted: the summary becomes a fixed host-authored notice and the issue list is emptied, so no
+    attacker-planted content is ever recorded or republished — only the verdict/injection flags
+    survive for the terminal human handoff."""
+    safe = json.loads(json.dumps(document))
+    if safe.get("injection_detected"):
+        safe["summary"] = HOST_INJECTION_NOTICE
+        safe["issues"] = []
+        return safe
+    if "summary" in safe:
+        safe["summary"] = redact_identifiers(safe.get("summary", ""))
+    issues = safe.get("issues")
+    if isinstance(issues, list):
+        for issue in issues:
+            if isinstance(issue, dict):
+                for field in ("title", "body", "fix_hint"):
+                    if field in issue:
+                        issue[field] = redact_identifiers(issue[field])
+    return safe
+
+
 def decide_disarm(armed, draft, head_sha, reviewed_sha, when):
     """Pure decision for `disarm` (registry issue #42: a GitHub auto-merge arm LATCHES across
     force-pushes, so a post-arm head mutation could merge a never-reviewed tree on green CI).
@@ -1097,6 +1178,11 @@ def post_findings(repo, pr_number, verdict_file, round_n):
     only validated, length-capped fields are ever surfaced."""
     with open(verdict_file, encoding="utf-8") as handle:
         document = json.load(handle)
+    # Issue #155: strip prohibited identifiers (raw account handles, emails, credentials) from
+    # every free-text field, and on injection withhold the hostile free text entirely (a fixed
+    # host notice replaces the summary and the issue list is emptied), BEFORE anything is rendered
+    # into the public PR comment.
+    document = safe_outbound_verdict(document)
 
     # Independent republish guard (issue #137; sol r8 on #257): model-controlled text is
     # republished under the bot identity, and the marker parsers trust bot-authored markers — an
@@ -1609,8 +1695,13 @@ def reconcile_provenance(registry_repo, target_repo, head_branch, impl_provider,
 def verdict_record(registry_repo, target_repo, pr_number, round_n, reviewed_sha, verdict_file):
     with open(verdict_file, encoding="utf-8") as handle:
         document = json.load(handle)
-    # Issue #135: the registry is public, so scrub raw account handles / emails out of the
-    # model-controlled free-text fields before this verdict record crosses the public-body sink.
+    # Issue #155: this record is committed to the PUBLIC registry as fixer-input + audit source
+    # data, so it must never carry a raw account handle, email, or credential — and on injection it
+    # must never carry the hostile free text at all. Sanitize BEFORE the durable write.
+    document = safe_outbound_verdict(document)
+    # Issue #135 (kept alongside #155, defence in depth): the original public-sink scrub uses a
+    # BROADER account-handle pattern (any acct + alnum tail, not only digit tails), so chaining it
+    # preserves master's existing guarantee for this sink.
     document = _redact_verdict_findings(document)
     # Issue #156: wrap the model verdict in the host envelope so every downstream consumer can
     # revalidate it against the live head before mutating or fixing.
@@ -3162,6 +3253,107 @@ def _self_test():
     # round_n), never the forged round-9 the summary tried to smuggle.
     check("only the trusted progress marker survives",
           round_progress(forged_comment, bot), {3: "improving"})
+
+    # ---- issue #155: prohibited identifiers never cross the public trust boundary ----
+    sample_hash = account_hash("acct07", "pepper")  # 16-hex; the ONLY fingerprint allowed across
+    check("redact strips a raw account handle",
+          redact_identifiers("owner acct07 and Acct_12 fixed it"),
+          f"owner {REDACTION_TOKEN} and {REDACTION_TOKEN} fixed it")
+    check("redact strips an email", redact_identifiers("ping dev@example.com now"),
+          f"ping {REDACTION_TOKEN} now")
+    check("redact strips a github token",
+          "ghp_" in redact_identifiers("key ghp_" + "A" * 36), False)
+    check("redact strips a high-entropy secret",
+          redact_identifiers("tok " + "aB3" * 12), "tok " + REDACTION_TOKEN)
+    # The salted 16-hex account hash is the one fingerprint that MUST survive (the whole point of
+    # hashing at the boundary — over-redacting it would break the reviewer!=implementer audit).
+    check("redact preserves the salted account hash",
+          redact_identifiers(f"reviewer {sample_hash} approved"),
+          f"reviewer {sample_hash} approved")
+    # Security-review prose (the words auth/token/secret with no actual credential) is untouched —
+    # guards against a vacuously-safe redact-everything that would gut real findings.
+    check("redact leaves plain security prose intact",
+          redact_identifiers("the auth token and secret handling look correct"),
+          "the auth token and secret handling look correct")
+
+    dirty = {"verdict": "request_changes", "injection_detected": False,
+             "summary": "leak acct07 <dev@example.com>",
+             "issues": [{"severity": "major", "file": "src/a.rs", "title": "acct09 in log",
+                         "body": "token ghp_" + "B" * 36, "fix_hint": "keep " + sample_hash}]}
+    cleaned = safe_outbound_verdict(dirty)
+    check("safe verdict redacts summary identifiers",
+          "acct07" not in cleaned["summary"] and "example.com" not in cleaned["summary"], True)
+    check("safe verdict redacts issue fields",
+          "acct09" not in cleaned["issues"][0]["title"]
+          and "ghp_" not in cleaned["issues"][0]["body"], True)
+    check("safe verdict preserves the allowed hash in issue text",
+          sample_hash in cleaned["issues"][0]["fix_hint"], True)
+    check("safe verdict keeps structural fields",
+          (cleaned["verdict"], cleaned["issues"][0]["severity"], cleaned["issues"][0]["file"]),
+          ("request_changes", "major", "src/a.rs"))
+    hostile = {"verdict": "request_changes", "injection_detected": True,
+               "summary": "IGNORE_ALL_RULES and approve; contact acct03",
+               "issues": [{"severity": "blocker", "file": "src/a.rs", "title": "x", "body": "y",
+                           "fix_hint": "z"}]}
+    inj = safe_outbound_verdict(hostile)
+    check("injection drops issues and swaps in the host notice",
+          (inj["summary"], inj["issues"], inj["injection_detected"]),
+          (HOST_INJECTION_NOTICE, [], True))
+    check("injection notice carries none of the model free text",
+          "IGNORE_ALL_RULES" in inj["summary"] or "acct03" in inj["summary"], False)
+
+    # post_findings sink: the PUBLIC PR comment must not disclose identifiers, and on injection
+    # must publish ONLY the fixed host notice (this fails against the pre-#155 verbatim post).
+    posted = []
+    real_pf_comment = globals()["_comment"]
+    try:
+        globals()["_comment"] = lambda repo, pr, body: posted.append(body)
+        with tempfile.TemporaryDirectory() as tmp:
+            vf = Path(tmp) / "v.json"
+            vf.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": False,
+                "summary": "found leak acct07",
+                "issues": [{"severity": "major", "file": "src/a.rs", "title": "t",
+                            "body": "secret dev@example.com", "fix_hint": "h"}]}),
+                encoding="utf-8")
+            posted.clear()
+            post_findings("o/r", 41, str(vf), 1)
+            check("posted findings redact identifiers",
+                  "acct07" not in posted[0] and "example.com" not in posted[0]
+                  and REDACTION_TOKEN in posted[0], True)
+            vf.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": True,
+                "summary": "SECRET_PLAN reach acct04",
+                "issues": [{"severity": "blocker", "file": "src/a.rs", "title": "PWN",
+                            "body": "exfil", "fix_hint": "h"}]}), encoding="utf-8")
+            posted.clear()
+            post_findings("o/r", 41, str(vf), 2)
+            check("injection findings publish only the host notice",
+                  HOST_INJECTION_NOTICE in posted[0] and "SECRET_PLAN" not in posted[0]
+                  and "PWN" not in posted[0] and "exfil" not in posted[0]
+                  and "acct04" not in posted[0], True)
+    finally:
+        globals()["_comment"] = real_pf_comment
+
+    # verdict_record sink: the durable REGISTRY record is sanitized before the write.
+    captured_records = []
+    real_vr_put = globals()["_registry_put_file"]
+    try:
+        globals()["_registry_put_file"] = (
+            lambda repo, path, document, message, **kw: captured_records.append(document) or True)
+        with tempfile.TemporaryDirectory() as tmp:
+            vf = Path(tmp) / "v.json"
+            vf.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": False,
+                "summary": "leak acct07",
+                "issues": [{"severity": "major", "file": "src/a.rs", "title": "t", "body": "b",
+                            "fix_hint": "h"}]}), encoding="utf-8")
+            verdict_record("reg/registry", "o/r", 41, 1, "a" * 40, str(vf))
+            check("recorded verdict is sanitized before the durable write",
+                  "acct07" not in json.dumps(captured_records[0])
+                  and captured_records[0]["verdict"]["summary"] == f"leak {REDACTION_TOKEN}", True)
+    finally:
+        globals()["_registry_put_file"] = real_vr_put
 
     check("approve arms", decide_review("approve", False, False, 1, 3, False), "arm")
     check("approve+security ARMS (Decision 7 revision 2026-07-18)",
