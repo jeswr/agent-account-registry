@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-2 approved result remains sound. Open markers are enumerated on both the primary and distinct fallback routes, their union drives orphan recovery after a provider ages out of the record window, and fallback-specific marker knowledge binds recovery delivery to the route where a prior firing retry may have created the issue. A primary-route no-op cannot falsely confirm fallback recovery: when the fallback marker was observed, both targeted routes must confirm, and a failed fallback close leaves the action undelivered and makes decide return nonzero. Failed, malformed, or possibly truncated marker enumeration yields no marker knowledge, delaying rather than fabricating recovery. The added pure tests cover orphan classification and parsing, while the stateful two-route test is non-vacuous and exercises the red direction (failed fallback close remains open and returns nonzero) followed by successful retry. No reviewer-directed prompt injection appears in the diff.",
+ "verdict": "approve"
+}
