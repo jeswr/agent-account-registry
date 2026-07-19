@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The round-3 diff remains correct and complete, with no material change from the approved round-2 result. The live source-issue route is resolved through the shared policy resolver, routes without an in-provider ladder member fail closed, and the stricter of the route-implied floor and durable escalation pin governs both allocator eligibility and the fix worker's model_pin. The pure and end-to-end assertions are non-vacuous and cover ordinary, trust-surface, CI, cross-provider, combined-floor, and failure cases. No trust check, audit binding, permission boundary, token-handling path, or match-label set is weakened, and the diff contains no reviewer-directed prompt injection.",
+ "verdict": "approve"
+}
