@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "_live_provenance_record treats every allow_404 result of None as a conclusive missing record (denies). The GitHub Contents API uses 404 both when the requested file is absent and when the requested ref/repository is absent or inaccessible. Therefore a deleted/misconfigured LEDGER_REF, or loss of registry visibility, is classified as denial rather than indeterminate. Both callers may then apply terminal needs:user labels even though the authoritative live source could not be read, violating the promised fail-closed behavior. The self-test encodes this unsafe assumption by testing only an empty stub response as a 'clean 404'.",
+   "file": "scripts/groom.py",
+   "fix_hint": "Establish that the authoritative ledger ref is readable before interpreting a Contents 404 as file absence (for example, resolve/verify the exact ref through an API read and treat failure or absence as indeterminate), then read the file pinned to that verified ref. Add a mutation-boundary test where the ref lookup is missing/unavailable and assert that no terminal write occurs and an alert is emitted.",
+   "severity": "major",
+   "title": "Contents 404 does not prove the ledger ref exists"
+  }
+ ],
+ "progress": null,
+ "summary": "The mutation-boundary revalidation and its schema/identity checks are otherwise coherent and non-vacuously tested, but the live lookup does not actually distinguish a missing provenance file from an unavailable authoritative ledger ref. GitHub's Contents endpoint reports 404 for both, so the code can classify an unusable live read as a conclusive denial and perform the terminal needs:user mutation. That contradicts the change's stated fail-closed contract and must be corrected before approval.",
+ "verdict": "request_changes"
+}
