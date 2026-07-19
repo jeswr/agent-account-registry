@@ -12,16 +12,6 @@
   },
   {
    "account": "acct03",
-   "claim_id": "cf5e1c04f85a451f884d23b1ac50e04d",
-   "holder": "fix:jeswr/agent-account-registry#425@dispatch-29689871748.1",
-   "package": "set-up-account",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784469758,
-   "expires_at": 1784476058
-  },
-  {
-   "account": "acct03",
    "claim_id": "d49ac00919a84f179e84d695d4e541f7",
    "holder": "fix:jeswr/agent-account-registry#428@dispatch-29690003113.1",
    "package": "worker",
