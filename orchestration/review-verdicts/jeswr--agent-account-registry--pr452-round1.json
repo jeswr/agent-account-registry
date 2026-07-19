@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 452,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a5f4e61325bfd777d6e51d966649102bf42a70cd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes the six-round hard cap authoritative before base-budget continuation and rejects a base budget above the cap fail-closed. Input validation excludes booleans and non-positive caps. The self-tests are non-vacuous: they cover continuation immediately below the base==cap boundary, stopping exactly at that boundary, and rejection when base_rounds exceeds the cap, each with an outcome that would fail under the prior behavior. No trust check is weakened and no injection-directed text appears in the diff.",
+  "verdict": "approve"
+ }
+}
