@@ -63,6 +63,8 @@ LIST_PAGE_LIMIT = 50        # issues/pulls ceiling: 5000 entries, repo-level, sw
 CHECK_RUN_PAGE_LIMIT = 40
 WORKER_PR_STATUS_LIMIT = 100
 WORKER_HEAD_PREFIX = "sparq-agent/"
+MERGEABLE_POLL_ATTEMPTS = 3
+MERGEABLE_POLL_INTERVAL_SECONDS = 1
 SAFE_SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -179,12 +181,21 @@ def _pr_status_record(fetch, claim, repo, number):
     `check_runs_degraded` reason) instead of discarding it: the detail fields are exactly
     what the #42 armed-SHA-mismatch disarm needs, and dropping them on check-run VOLUME
     would let an armed PR defeat its own safety net by churning past the ceiling."""
-    try:
-        detail = fetch(f"https://api.github.com/repos/{repo}/pulls/{number}")
-    except FetchError as exc:
-        raise SnapshotItemError("pr-detail-read-failed") from exc
-    if not isinstance(detail, dict):
-        raise SnapshotItemError("pr-detail-malformed")
+    detail_url = f"https://api.github.com/repos/{repo}/pulls/{number}"
+    for attempt in range(MERGEABLE_POLL_ATTEMPTS):
+        try:
+            detail = fetch(detail_url)
+        except FetchError as exc:
+            raise SnapshotItemError("pr-detail-read-failed") from exc
+        if not isinstance(detail, dict):
+            raise SnapshotItemError("pr-detail-malformed")
+        if detail.get("mergeable") is not None:
+            break
+        # Issue #464: REST computes mergeability asynchronously. A pipeline restart/base
+        # advance can make the first detail read null even for an old DIRTY PR; without a
+        # bounded re-poll it stays unknown for the sweep and never reaches needs-rebase.
+        if attempt + 1 < MERGEABLE_POLL_ATTEMPTS:
+            time.sleep(MERGEABLE_POLL_INTERVAL_SECONDS)
     sha = str((detail.get("head") or {}).get("sha", ""))
     record = {
         "head_sha": sha,
@@ -275,6 +286,7 @@ def snapshot_targets(fetch, claim, repos, out_dir):
 
 def _self_test():
     import tempfile
+    from unittest.mock import patch
 
     claim = _load_claim()
     gate = claim.CI_GATE_CHECK
@@ -289,7 +301,8 @@ def _self_test():
                 "head": {"ref": f"sparq-agent/issue-{number}-1-1", "sha": sha,
                          "repo": {"full_name": repo}}}
 
-    sha_ok, sha_red, sha_over, sha_legs_over = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+    sha_ok, sha_red, sha_over, sha_legs_over, sha_conflict = (
+        "1" * 40, "2" * 40, "3" * 40, "4" * 40, "5" * 40)
     pulls = [
         worker_pull(7, sha_over),        # gate-filtered listing never shortens -> overflow
         worker_pull(9, sha_ok),          # healthy sibling: must still be planned
@@ -297,11 +310,15 @@ def _self_test():
         worker_pull(13, sha_ok),         # detail read hard-fails -> per-item skip
         worker_pull(15, sha_legs_over),  # gate failure but the unfiltered legs walk overflows
         worker_pull(17, sha_ok),         # detail WITHOUT an auto_merge field (round-6 P2)
+        worker_pull(19, sha_conflict),   # mergeable null first, then DIRTY (issue #464)
         {"number": 90, "state": "open",  # non-worker head: excluded from the census entirely
          "head": {"ref": "topic", "sha": sha_ok, "repo": {"full_name": repo}}},
     ]
 
+    conflict_detail_reads = 0
+
     def fake_fetch(url):
+        nonlocal conflict_detail_reads
         if url.split("?")[0].endswith(f"/repos/{repo}/issues"):
             return []
         if url.split("?")[0].endswith(f"/repos/{repo}/pulls"):
@@ -312,6 +329,11 @@ def _self_test():
             # [round-6 P2] a detail read that never carried the auto_merge field (degraded/
             # projected upstream response): the record must PRESERVE the absence.
             return {"head": {"sha": sha_ok}, "mergeable": True, "draft": True}
+        if url.split("?")[0].endswith("/pulls/19"):
+            conflict_detail_reads += 1
+            return {"head": {"sha": sha_conflict},
+                    "mergeable": None if conflict_detail_reads == 1 else False,
+                    "draft": True, "auto_merge": None}
         for number, sha in ((7, sha_over), (9, sha_ok), (11, sha_red), (15, sha_legs_over)):
             if url.split("?")[0].endswith(f"/pulls/{number}"):
                 # PR 7 is ARMED (auto_merge latched) — the round-1 disarm-under-overflow case.
@@ -332,9 +354,12 @@ def _self_test():
             if "check_name=" in url:
                 return {"check_runs": [gate_run(conclusion="failure")]}
             return {"check_runs": [gate_run(conclusion="failure") for _ in range(100)]}
+        if f"/commits/{sha_conflict}/" in url:
+            assert "check_name=" in url, "conflicting head must be read gate-filtered"
+            return {"check_runs": [gate_run()]}
         raise AssertionError(f"unexpected fetch {url}")
 
-    with tempfile.TemporaryDirectory() as out_dir:
+    with patch.object(time, "sleep") as sleep, tempfile.TemporaryDirectory() as out_dir:
         snapshot_targets(fake_fetch, claim, [repo], out_dir)
         doc = json.loads(Path(out_dir, "raw-prstatus-0.json").read_text(encoding="utf-8"))
 
@@ -354,7 +379,7 @@ def _self_test():
     # (iii) POST-detail degradation (PR #60 round-1 fix): a check-run overflow KEEPS the
     # detail record — check_runs EMPTY + an explicit marker — while the pre-detail
     # failure (13) stays a full skip with no record at all.
-    assert sorted(doc["items"]) == ["11", "15", "17", "7", "9"], sorted(doc["items"])
+    assert sorted(doc["items"]) == ["11", "15", "17", "19", "7", "9"], sorted(doc["items"])
     assert doc["items"]["7"] == {"head_sha": sha_over, "mergeable": True, "draft": False,
                                  "auto_merge": {"merge_method": "squash"},
                                  "check_runs": [],
@@ -380,7 +405,41 @@ def _self_test():
     assert doc["items"]["15"]["check_runs"] == []
     assert claim.pr_ci_status(doc["items"]["15"])["gate"] == "missing"
 
-    # (iv) THE round-1 point — the degraded record restores the #42 disarm under overflow:
+    # (iv) Issue #464 snapshot -> rows -> enumeration regression: GitHub's first detail
+    # response is mergeable=null, the bounded second read resolves it to False, and the
+    # review:changes worker PR surfaces in the rebase fix flavour. Reverting the poll leaves
+    # mergeable null: the filtered assertion then sees zero rebase items (mutation check).
+    review_changes = {
+        "number": 19, "state": "open", "draft": True, "body": "Fixes #19",
+        "labels": [{"name": "review:changes"}],
+        "head": {"ref": "sparq-agent/issue-19-1-1", "sha": sha_conflict,
+                 "repo": {"full_name": repo}},
+        "user": {"login": "sparq-agent[bot]", "type": "Bot"},
+    }
+    provenance19 = {19: {
+        "pr_number": 19, "head_sha_at_open": sha_conflict, "impl_provider": "openai",
+        "impl_alias": "sol", "impl_account_h": "ab" * 8, "issue": 19,
+        "recorded_at_run": "1.1",
+    }}
+    status19 = {19: claim.pr_ci_status(doc["items"]["19"])}
+    repair_items = claim.enumerate_review_items(
+        repo, [review_changes], provenance19, [], {19: ["role:impl"]}, 1000,
+        pr_status=status19)
+    assert [(item["state"], claim.FIX_KIND_OF_STATE[item["state"]])
+            for item in repair_items] == [("needs-rebase", "rebase")], repair_items
+    assert conflict_detail_reads == 2
+    sleep.assert_called_once_with(MERGEABLE_POLL_INTERVAL_SECONDS)
+    unresolved19 = {19: claim.pr_ci_status({**doc["items"]["19"], "mergeable": None})}
+    assert [item for item in claim.enumerate_review_items(
+        repo, [review_changes], provenance19, [], {19: ["role:impl"]}, 1000,
+        pr_status=unresolved19) if item["state"] == "needs-rebase"] == []
+    human_owned = {**review_changes,
+                   "labels": [{"name": "review:changes"}, {"name": "needs:user"}]}
+    assert claim.enumerate_review_items(
+        repo, [human_owned], provenance19, [], {19: ["role:impl"]}, 1000,
+        pr_status=status19) == []
+
+    # (v) THE round-1 point — the degraded record restores the #42 disarm under overflow:
     # an ARMED worker PR whose churned head advanced past its reviewed-sha marker IS
     # enumerated for disarm even though its check-run listing blew the ceiling. Deleting
     # the degraded-record preservation in _pr_status_record turns this red (mutation-
@@ -398,7 +457,7 @@ def _self_test():
     assert [item["pr_number"] for item in claim.enumerate_disarm_items(
         repo, [moved], pr_status, provenance)] == [7]
 
-    # (v) the PRE-detail residual (documented, accepted): PR 13's detail read itself
+    # (vi) the PRE-detail residual (documented, accepted): PR 13's detail read itself
     # failed, so nothing sound is derivable — no record, and the disarm stands down even
     # for an armed mismatch this tick. A detail-read failure is a GitHub API outage
     # condition, NOT attacker-inducible by inflating check-run volume on a head (the
