@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 425,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5859c15b584a1fd3ee89657bb26028588adab7b3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "No blocker, major, or other actionable issue is evident. The producing-job attempt is preserved in worker and review/fix outputs and used in the recorder key, while dispatch records in the producing job itself. This keeps recorder-only retries idempotent and full producing-job reruns countable. The CAS retry backoff is bounded, full-jitter, and placed only between attempts; the self-tests non-vacuously cover deduplication, fresh-attempt appends, escalation counts, retry placement, exponential ceilings, and exact RNG bounds. The empty-output fallback favors recording over silently dropping an outcome. The diff does not weaken trust checks, workflow permissions, SHA pinning, audit binding, or injection/tamper stops. With zero prior and zero current findings, progress is stagnant under the mandated comparison scale.",
+  "verdict": "approve"
+ }
+}
