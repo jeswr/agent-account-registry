@@ -608,7 +608,8 @@ jobs:
           print(f"account_pool PR #{number} open for {handle}")
           PY
 
-      - name: Comment PENDING on the request issue — activation waits for merge (#185)
+      - name: Comment PENDING (or activate inline if already in account_pool) on the request issue (#185)
+        id: activate_inline
         if: steps.login.outputs.status == 'ok'
         env:
           HANDLE: ${{ steps.store.outputs.handle }}
@@ -620,14 +621,35 @@ jobs:
           set -euo pipefail
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
           if [ "${PR:-none}" = none ] || [ -z "${PR:-}" ]; then
-            # Handle already in master account_pool (prior merge) — policy is in place, so activate
-            # now: flip the pending account issue to available and close this request.
-            num=$(gh issue list -R "${{ github.repository }}" --state open --search "\"$HANDLE\" in:title" \
-                    --json number,title --jq "([.[]|select(.title==\"$HANDLE\")][0]).number // empty")
-            if [ -n "$num" ]; then
-              gh issue edit "$num" -R "${{ github.repository }}" \
-                --remove-label status:pending --add-label status:available || true
+            # Handle already in master account_pool (a prior run's PR merged) — policy is in place,
+            # so activate INLINE. This is a real state transition (identical in consequence to the
+            # `activate` job), so it FAILS CLOSED rather than claiming a false success on a transient
+            # API/permission failure (review round 1 of #383): require EXACTLY ONE exact-title account
+            # issue, require it status:pending (or idempotently already status:available), perform the
+            # label flip WITHOUT suppressing failure, and RE-READ status:available before commenting
+            # success or closing the request. Any failure exits non-zero and is surfaced by the
+            # always() alarm via this step's `activate_inline` outcome, not swallowed as success.
+            mapfile -t nums < <(gh issue list -R "${{ github.repository }}" --state all --search "\"$HANDLE\" in:title" \
+                    --json number,title --jq ".[]|select(.title==\"$HANDLE\")|.number")
+            if [ "${#nums[@]}" -ne 1 ]; then
+              echo "::error::expected exactly one account issue titled '$HANDLE' in any state, found ${#nums[@]} — refusing to activate (fail closed)"; exit 1
             fi
+            num=${nums[0]}
+            labels=$(gh issue view "$num" -R "${{ github.repository }}" --json labels --jq '[.labels[].name]|join(" ")')
+            case " $labels " in
+              *" status:available "*)
+                echo "$HANDLE (issue #$num) already status:available — idempotent re-run, nothing to flip" ;;
+              *" status:pending "*)
+                gh issue edit "$num" -R "${{ github.repository }}" \
+                  --remove-label status:pending --add-label status:available
+                after=$(gh issue view "$num" -R "${{ github.repository }}" --json labels --jq '[.labels[].name]|join(" ")')
+                case " $after " in
+                  *" status:available "*) : ;;
+                  *) echo "::error::label flip for $HANDLE (issue #$num) did not land (labels now: $after) — refusing to claim activation (fail closed)"; exit 1 ;;
+                esac ;;
+              *)
+                echo "::error::issue #$num for $HANDLE is neither status:pending nor status:available (labels: $labels) — refusing to activate (fail closed)"; exit 1 ;;
+            esac
             gh issue comment "$ISSUE" -R "${{ github.repository }}" \
               --body "✅ Account **$HANDLE** registered and activated: secret \`$SECRET\` (format \`$fmt\`), \`models: $MODELS\`, already present in \`policy/repos.toml\` account_pool — flipped to \`status:available\`. Closing." || true
             gh issue close "$ISSUE" -R "${{ github.repository }}" || true
@@ -657,6 +679,7 @@ jobs:
           REGISTER: ${{ steps.register.outcome }}
           VALIDATE: ${{ steps.validate.outcome }}
           POLICY_PR: ${{ steps.policy_pr.outcome }}
+          ACTIVATE_INLINE: ${{ steps.activate_inline.outcome }}
         run: |
           set -uo pipefail
           comment() { gh issue comment "$ISSUE" -R "${{ github.repository }}" --body "$1" || true; }
@@ -668,6 +691,8 @@ jobs:
             comment "🚨 **$HANDLE** was stored and the pending issue created, but read_accounts validation failed (\`$VALIDATE\`) — the account body may be malformed, so no policy PR was opened. **Recovery:** fix the \`$HANDLE\` issue body (models / secret_ref), then open the account_pool PR manually (branch \`account-pool/$HANDLE\`)."
           elif [ "$POLICY_PR" != success ]; then
             comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** open a PR adding \`$HANDLE\` to account_pool (head branch \`account-pool/$HANDLE\`); on merge it activates automatically."
+          elif [ "$ACTIVATE_INLINE" != success ]; then
+            comment "🚨 **$HANDLE** was stored, registered \`status:pending\`, and its handle was ALREADY in master \`account_pool\` (no policy PR needed), but the INLINE activation FAILED (activate: \`$ACTIVATE_INLINE\`) — the account may still be \`status:pending\` and this request may still be open despite policy being in place, so no false success was claimed. **Recovery:** confirm there is exactly one \`$HANDLE\` account issue and flip it to \`status:available\` (or re-apply \`set-up-account\`); re-merging/re-triggering the account_pool PR also drives the \`activate\` job to flip it."
           else
             echo "enrollment consistent: $HANDLE pending; activation awaits account_pool PR merge"
           fi
