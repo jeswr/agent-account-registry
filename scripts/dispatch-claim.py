@@ -3374,11 +3374,15 @@ def _self_test():
                 def release(self, *_args, **_kwargs):
                     return True
 
-            def bot_comment(body):
-                return {"user": {"login": bot}, "body": body}
+            def bot_comment(marker, login=bot):
+                # A canonical host-authored DEDICATED marker comment (worker-pr.py issue #154
+                # grammar): the budget parsers trust a marker ONLY from a comment whose ENTIRE
+                # body is this shape, so `marker` is the bare marker, never embedded in prose.
+                return {"user": {"login": login},
+                        "body": wiring_worker_pr.marker_comment("recorded", marker)}
 
             def round_markers(count):
-                return [bot_comment(f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->")
+                return [bot_comment(f"{wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->")
                         for i in range(1, count + 1)]
 
             def write_verdict(round_n, progress, root=None):
@@ -3407,8 +3411,8 @@ def _self_test():
             # (opus < fable, sol r2 f2), fable pin converged, and a chain WITHOUT opus;
             # the None claim then defers with a missed marker, NOT needs-user
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=2 model=opus run=2.9 -->")]
+                bot_comment(f"{fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"{fix_model} round=2 model=opus run=2.9 -->")]
             write_verdict(3, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -3431,23 +3435,22 @@ def _self_test():
             # a recorded bot pin governs the chain even under budget (the floor never lowers) —
             # a fable floor offers ONLY fable (tiers below the floor are never offered) ...
             fake["comments"] = round_markers(2) + [
-                bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->")]
+                bot_comment(f"{pin_marker} round=1 tier=fable run=1.5 -->")]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert alloc.chains == [["fable"]], alloc.chains
             # ... while a NON-bot forged pin marker is inert (bot-login trust filter)
             fake["comments"] = round_markers(2) + [
-                {"user": {"login": "mallory"},
-                 "body": f"z {pin_marker} round=1 tier=fable run=6.6 -->"}]
+                bot_comment(f"{pin_marker} round=1 tier=fable run=6.6 -->", login="mallory")]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert alloc.chains == [["fable", "opus"]], alloc.chains
 
             # top tier ran + latest verdict improving -> progress extension (pin floor kept)
             fake["comments"] = round_markers(4) + [
-                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->"),
-                bot_comment(f"z {pin_marker} round=3 tier=fable run=3.9 -->")]
+                bot_comment(f"{fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"{fix_model} round=3 model=fable run=3.9 -->"),
+                bot_comment(f"{pin_marker} round=3 tier=fable run=3.9 -->")]
             write_verdict(4, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -3457,8 +3460,8 @@ def _self_test():
 
             # flip-goes-red: top tier + stagnant -> the loud terminal needs-user, no claim
             fake["comments"] = round_markers(4) + [
-                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+                bot_comment(f"{fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"{fix_model} round=3 model=fable run=3.9 -->")]
             write_verdict(4, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -3468,7 +3471,7 @@ def _self_test():
 
             # hard cap: 6 rounds stop even with a weaker tier + an improving grade
             fake["comments"] = round_markers(6) + [
-                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->")]
+                bot_comment(f"{fix_model} round=1 model=opus run=1.9 -->")]
             write_verdict(6, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -3478,8 +3481,8 @@ def _self_test():
             # a corrupt bot-authored pin tier is LOUD (needs-user) — silently ignoring it
             # would run the unpinned chain, the exact fall-back-down the pin forbids
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
-                bot_comment(f"z {pin_marker} round=1 tier=gpt-omega run=1.1 -->")]
+                bot_comment(f"{fix_model} round=1 model=fable run=1.9 -->"),
+                bot_comment(f"{pin_marker} round=1 tier=gpt-omega run=1.1 -->")]
             write_verdict(3, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -3497,10 +3500,10 @@ def _self_test():
             review_item = dict(fix_item, state="needs-review")
             fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=2 model=opus run=2.9 -->"),
-                bot_comment(f"z {pin_marker} round=3 tier=fable run=3.5 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+                bot_comment(f"{fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"{fix_model} round=2 model=opus run=2.9 -->"),
+                bot_comment(f"{pin_marker} round=3 tier=fable run=3.5 -->"),
+                bot_comment(f"{fix_model} round=3 model=fable run=3.9 -->")]
             write_verdict(3, "stagnant")
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
@@ -3511,9 +3514,9 @@ def _self_test():
             # floor (a pin violation / forged marker) mints NO re-review — with the top tier
             # already graded stagnant it is the loud terminal instead
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
-                bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->"),
-                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
+                bot_comment(f"{fix_model} round=1 model=fable run=1.9 -->"),
+                bot_comment(f"{pin_marker} round=1 tier=fable run=1.5 -->"),
+                bot_comment(f"{fix_model} round=3 model=opus run=3.9 -->")]
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
@@ -3527,7 +3530,7 @@ def _self_test():
             assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 5, [],
                                             bot) == "regressing"
             marker_only = [bot_comment(
-                f"y {wiring_worker_pr.PROGRESS_MARKER} round=9 progress=improving -->")]
+                f"{wiring_worker_pr.PROGRESS_MARKER} round=9 progress=improving -->")]
             assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 9,
                                             marker_only, bot) == "improving"
             assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 8,
