@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3640,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "079c9ae85f7edbf26998888010037f0e30868a99",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves both round-2 major findings. The security-models record now qualifies the honest-majority UC statement with the required authenticated/private communication resources, broadcast where required, and UC session/scheduling assumptions, while explicitly describing applicability to the current in-process implementation as aspirational. The capability matrix now limits the secure_equal result to a masked-opening distribution lemma, carries the bit-leaking F_join into any future composition proof, and leaves realization conditional on a distributed protocol and full-view simulator. The new posture record consistently preserves those limitations, describes the semi-honest and malicious-opener boundaries, keeps collaborative proving fail-closed, and retains the sq-qhy4 external-audit caveat. No correctness, soundness, test-validity, security, or instruction-injection issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
