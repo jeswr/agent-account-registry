@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3585,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "34a6ca3520ad113569a5c23e476a56d366fca090",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`mutations_turn_the_oracle_differential_red` injects faults only into `sort_merge_model`, a second cleartext implementation. `model_matches_production` checks only ordinary outputs of the unmutated implementations; it does not prove that corrupting a selector, equality, scan direction, or swap in the secret-shared production path is observed by the production differential. The model and production code can share the same conceptual description while differing in wiring, indexing, share operations, or fault behavior. Thus the new test proves that the plaintext oracle distinguishes mutations of the model, not that the test harness catches a deliberately wrong answer from the new MPC path.",
+    "file": "crates/sparq-mpc/src/sort_merge_join.rs",
+    "fix_hint": "Add test-only fault injection at the named production decision points (or factor the production control logic through a generic/testable seam used by both normal and mutated executions), run `sort_merge_semi_anti` itself under each mutation, and assert that its output diverges from the plaintext oracle for a witness input. Keep the existing generated production-vs-oracle differential; the cleartext model may remain supplemental but should not substitute for mutating the real path.",
+    "severity": "major",
+    "title": "Mutation check does not mutate the production fast path"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 improves substantially: the privacy language now accurately describes statistical hiding and composition, and the generated differential covers varied lengths, duplicates, empty sides, party counts, seeds, and boundary values. One prior major concern remains partially unresolved: the mutation check corrupts only a separate cleartext model, never the production secret-shared path. Equality of the unmutated model and production outputs does not establish that a production wiring defect is represented by the model's mutation switches, so this cannot demonstrate that the real differential harness turns red when the implementation is deliberately corrupted.",
+  "verdict": "request_changes"
+ }
+}
