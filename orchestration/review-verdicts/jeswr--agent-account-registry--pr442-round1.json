@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 442,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6eb5c28aa2e9441ecd19fb8aa460bc70e2912e80",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `republish-trust` step runs after the model and local gate, but passes `$GITHUB_WORKSPACE/target/scripts/trust-gate.py`. The model runs with `target` as its working tree and may legitimately or maliciously modify that path, especially for a trust-surface issue. Thus the candidate change controls the trust-gate program used to authorize its own publish. Gate success does not restore the file or bind the verifier to the pre-model/base revision, so a weakened or replaced script can return `trusted`/`promoted` and make this last-step check succeed. This defeats the stated independent live trust revalidation.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Run the recheck with an immutable verifier obtained from a checkout/ref that the model cannot modify (for example, a separate read-only checkout pinned to the resolved base SHA), while still querying the live issue. Add a self-test/assertion that the republish step's `--trust-gate` path is rooted in that immutable checkout and cannot resolve into the model's `target` tree.",
+    "severity": "blocker",
+    "title": "Pre-publish reverification executes a model-mutable trust gate"
+   },
+   {
+    "body": "The added checks establish only that the publish step references `republish-trust` and that `republish-trust` references gate success. They pass even when `--trust-gate` points at the post-model mutable target checkout, so they do not turn red for the security failure introduced by this diff.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Extend the self-test to assert that the reverify command uses the designated immutable, SHA-bound checkout's trust-gate and explicitly rejects `$GITHUB_WORKSPACE/target/scripts/trust-gate.py` (or any equivalent path in the model-mutable tree).",
+    "severity": "major",
+    "title": "Workflow self-test misses the trust-root property"
+   }
+  ],
+  "progress": null,
+  "summary": "The new publish-time check is fail-open with respect to the code implementing the check: it executes trust-gate.py from the target working tree after the model has modified that tree. A worker change can therefore alter the verifier that is supposed to authorize its own publication. The workflow assertions only check step conditions and do not detect this trust-root substitution.",
+  "verdict": "request_changes"
+ }
+}
