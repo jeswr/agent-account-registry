@@ -899,16 +899,31 @@ phase_resume() {
 # old job-wide aggregate let an ADDED second mint step with NO permission-* inputs pass
 # byte-identically, though create-github-app-token treats "no permission-* inputs" as
 # "inherit EVERY permission of the App installation" (a full-power token minted behind an
-# exact-grants green tick). When the workflow is deleted after the migration succeeds, this
-# script is deleted with it (see header), taking the contract along.
+# exact-grants green tick). Round 19 (sol): "the step's OWN with: mapping" is enforced by
+# INDENTATION now, not proximity — the round-18 scan still counted any permission-* line
+# anywhere inside the mint step until the next step marker, so relocating the lines under a
+# step-level `env:` mapping kept every grant listing green while the action, receiving zero
+# permission-* inputs, again inherited the full installation grants. When the workflow is
+# deleted after the migration succeeds, this script is deleted with it (see header), taking
+# the contract along.
 
 _mint_grants() {  # _mint_grants WORKFLOW_FILE JOB_KEY -> the permission-* lines of that job's mint step's OWN `with:` mapping, sorted
+  # Round 19 (sol): INDENTATION-ANCHORED to the mint step's `with:` block. The old "any
+  # permission-* line after the `uses:` until the next step" scan counted lines belonging to
+  # ANY sibling mapping of the step — relocating the permission lines under a step-level
+  # `env:` mapping still passed byte-identically while the ACTION received no permission-*
+  # inputs at all (create-github-app-token treats that as "inherit EVERY permission of the
+  # App installation"). Only the ten-space children of the eight-space `with:` key of the
+  # mint step count now; any other eight-space step key (`env:`, `id:`, ...) closes the
+  # `with:` block. Same narrow two-space-indentation discipline as every parser here —
+  # reshaping the step goes red (empty grant set), never silently green.
   awk -v job="$2" '
     /^[ \t]*#/ { next }
     /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
-    injob && /^      - / { inmint = 0 }
-    injob && /uses:[ \t]*actions\/create-github-app-token/ { inmint = 1 }
-    injob && inmint && /^ +permission-[a-z-]+:/ { sub(/^ +/, ""); sub(/[ \t]+$/, ""); print }
+    injob && /^      - / { inmint = 0; inwith = 0 }
+    injob && /uses:[ \t]*actions\/create-github-app-token/ { inmint = 1; next }
+    injob && inmint && /^        [A-Za-z_-]+:/ { inwith = ($0 ~ /^        with:[ \t]*$/) }
+    injob && inmint && inwith && /^          permission-[a-z-]+:/ { sub(/^ +/, ""); sub(/[ \t]+$/, ""); print }
   ' "$1" | sort
 }
 
@@ -1992,6 +2007,21 @@ FAKE
   chk "contract goes RED when an extra mint step arrives in a NEW non-phase job (whole-file five-mint pin)" "$rc" 1
   chk "contract names the whole-file mint count" \
     "$(grep -c 'EXACTLY FIVE create-github-app-token' "$tmp/s18r.out")" 1
+  # Round 19 (sol): RELOCATE the migrate mint's permission-* lines under a step-level `env:`
+  # mapping — every line still sits inside the mint step (the round-18 proximity scan stayed
+  # green), but the ACTION's `with:` mapping carries no permission-* inputs, so the minted
+  # token inherits EVERY installation permission. Inserting `        env:` before the first
+  # `          permission-secrets: write` (the migrate mint's — quiesce holds only
+  # permission-actions) turns the three grant lines into env children; the with:-anchored
+  # parser must report the MAIN mint as under-granted.
+  awk '
+    !done && $0 == "          permission-secrets: write" { print "        env:"; done = 1 }
+    { print }
+  ' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18s.out" 2>&1 || rc=$?
+  chk "contract goes RED when the migrate mint's permission-* lines are RELOCATED under a step-level env: mapping (round 19: the action would receive no permission inputs and inherit EVERY installation grant)" "$rc" 1
+  chk "contract names the under-granted MAIN mint on the env: relocation" \
+    "$(grep -c 'the MAIN mint' "$tmp/s18s.out")" 1
 
   # --- scenario 18h: ACTOR CONTRACT (round-9 finding 2 — the RE-RUN bypass): github.actor
   # stays the ORIGINAL initiator when a run is re-run, while github.triggering_actor is the

@@ -80,14 +80,22 @@
 # hardcoded entries are the deliberate exceptions (BINDING_EXCEPTIONS):
 # dispatch.yml's secrets-guard job (its UNBOUND toJSON(secrets) read IS check 1 above) and the
 # one-shot migration's quiesce/migrate jobs (env-UNBOUND by design — documented in that file's
-# header); an exception whose job stops consuming, disappears, or gains the binding goes red as
-# STALE so the allowlist can never silently cover a future job. Two env-scoped WRITES are pinned
-# the same way: the broker's final store (set-up-account.yml `gh secret set "$SECRET_NAME" ...
-# --env dispatch-secrets`) and the rotation write-back (worker-live.sh `... secret set
-# "$secret_ref" ... --env dispatch-secrets`) — a repo-scope write would re-trip the guard AND
-# strand the env-bound consumers on the pre-rotation credential. The workflows directory and
-# scripts/worker-live.sh ship in the guard job's sparse checkout so both contracts also run live
-# every tick.
+# header). Round 19 (sol finding 1): an exception job must carry NO environment AT ALL, not
+# merely "not dispatch-secrets" — environment secrets OVERRIDE same-named repository secrets,
+# so an exception bound to ANY other environment would resolve that environment's copies
+# instead of the repo-scope originals it exists to read (a stale-value injection into the
+# migration wearing a green tick). An exception whose job stops consuming, disappears, or
+# carries any binding therefore goes red so the allowlist can never silently cover a future
+# job. Two env-scoped WRITES are pinned the same way: the broker's final store
+# (set-up-account.yml `gh secret set "$SECRET_NAME" ... --env dispatch-secrets`) and the
+# rotation write-back (worker-live.sh `... secret set "$secret_ref" ... --env
+# dispatch-secrets`) — a repo-scope write would re-trip the guard AND strand the env-bound
+# consumers on the pre-rotation credential. Round 19 (sol findings 3+4): EVERY shell-text
+# check — both write pins and the whole slot-union dataflow chain — first strips inline shell
+# comments QUOTE-AWARELY (strip_shell_comments): sol planted `--env dispatch-secrets` and
+# `"$env_secret_nums"` inside `# ...` comment tails and the raw-text matching counted comment
+# prose as evidence. The workflows directory and scripts/worker-live.sh ship in the guard
+# job's sparse checkout so both contracts also run live every tick.
 #
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
@@ -220,6 +228,54 @@ SETUP_ACCOUNT_SLOT_RE = re.compile(r"(?:^|\s)n=")
 SETUP_ACCOUNT_CAND_RE = re.compile(r"(?:^|\s)cand=")
 
 
+def strip_shell_comments(text):
+    """Pure: `text` with inline shell comments removed, line by line, QUOTE-AWARELY — the ONE
+    shared stripper every shell-text check in this guard runs BEFORE matching (round 19, sol
+    findings 3+4: `... < file # --env dispatch-secrets` and `"" # "$env_secret_nums"` planted
+    the load-bearing evidence inside comments, and raw-text matching counted it). Rules,
+    following shell tokenization: an unquoted `#` at the START OF A WORD (line start or
+    preceded by whitespace) begins a comment cut to end of line; a `#` inside single or
+    double quotes, backslash-escaped, or mid-word (`${VAR#pat}`, `$((10#$n))` — never
+    comments in shell) is literal and preserved. Backslashes escape outside quotes and
+    inside double quotes, and are literal inside single quotes. Line-at-a-time (quote state
+    deliberately does not span physical lines): the checked texts join their own backslash
+    continuations AFTER stripping, and a `#` comment consumes any trailing backslash exactly
+    as a real shell would (a commented-out continuation does not continue)."""
+    stripped_lines = []
+    for line in text.split("\n"):
+        out = []
+        quote = None  # None | "'" | '"'
+        escaped = False
+        for char in line:
+            if escaped:  # only ever set outside single quotes
+                out.append(char)
+                escaped = False
+                continue
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                out.append(char)
+                continue
+            if char == "\\":
+                out.append(char)
+                escaped = True
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                out.append(char)
+                continue
+            if char in "'\"":
+                quote = char
+                out.append(char)
+                continue
+            if char == "#" and (not out or out[-1] in " \t"):
+                break  # word-start unquoted `#`: comment to end of line
+            out.append(char)
+        stripped_lines.append("".join(out))
+    return "\n".join(stripped_lines)
+
+
 def setup_account_store_step_lines(workflow_text):
     """Pure: the lines of the set-up-account store step (`id: store`), or None when the step
     cannot be located (callers treat None as a failure — fail closed). The union is pure
@@ -257,9 +313,14 @@ def setup_account_union_verdict(step_lines):
     `git/refs` creation claims `refs/acct-claims/$cand` — otherwise the union is a dead
     computation and e.g. `n=$reserved` burns a reserved-but-occupied slot with every listing
     green. A missing store step, claim mutation, union, slot, or candidate construction is a
-    refusal (fail closed); every refusal names what is missing."""
+    refusal (fail closed); every refusal names what is missing. Round 19 (sol finding 4):
+    every line passes through strip_shell_comments BEFORE any matching — dataflow and
+    argument checks alike (listings, the union, the whole taken -> n -> cand -> claim
+    chain) — so comment prose (`"" # "$env_secret_nums"`, `n=$reserved # "$taken"`) can
+    never stand in for a real argument or a real dependency edge."""
     if step_lines is None:
         return False, "store step (`id: store`) not found in set-up-account.yml (fail closed)"
+    step_lines = [strip_shell_comments(line) for line in step_lines]
 
     def joined(index):
         # Join shell continuation lines so a check sees the whole command.
@@ -377,7 +438,11 @@ BINDING_JOB_HEADER_RE = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*):\s*(?:#.*)?$")
 # The ONLY jobs allowed to consume secrets UNBOUND — each deliberate, each documented at the
 # job. Any other consumer without the binding is a refusal; an entry here whose job no longer
 # exists, no longer consumes, or now carries the binding is a STALE-exception refusal (an
-# allowlist entry nobody needs is a future bypass wearing that job's name).
+# allowlist entry nobody needs is a future bypass wearing that job's name). Round 19 (sol
+# finding 1): "unbound" means NO environment WHATSOEVER (`environment is None`), not merely
+# "not dispatch-secrets" — environment secrets OVERRIDE same-named repository secrets, so an
+# exception job bound to any other environment would read that environment's stale copies
+# instead of the repo-scope originals the exception exists to consume.
 BINDING_EXCEPTIONS = {
     ("dispatch.yml", "secrets-guard"):
         "the guard's UNBOUND toJSON(secrets) read IS the empty-repo-scope assertion (check 1)",
@@ -515,6 +580,14 @@ def binding_map_verdict(workflow_docs):
                 return False, (f"STALE binding exception: {filename}::{job_name} is on the "
                                f"deliberately-UNBOUND list but now carries `environment: "
                                f"{ENVIRONMENT}` — remove the exception")
+            if environment is not None:
+                return False, (
+                    f"{filename}::{job_name} is a deliberately-UNBOUND binding exception but "
+                    f"is bound to environment {environment!r} — environment secrets OVERRIDE "
+                    "same-named repository secrets, so ANY binding lets that environment's "
+                    "copies shadow the repo-scope originals this exception exists to read "
+                    "(round 19: a stale-value injection wearing a green tick); exceptions "
+                    "must carry NO `environment:` at all")
             continue
         if environment != ENVIRONMENT:
             bound = f" (bound to {environment!r} instead)" if environment else ""
@@ -529,16 +602,18 @@ def binding_map_verdict(workflow_docs):
 
 def secret_env_write_verdict(text, secret_arg, where):
     """Pure: (ok, reason). Locates every `gh secret set <secret_arg> ...` invocation in `where`
-    (comment lines ignored, backslash continuations joined) and requires each to carry
+    (comments stripped, backslash continuations joined) and requires each to carry
     `--env dispatch-secrets`: a repo-scope write would re-trip the empty-repo-scope check on
     the next tick AND strand the env-bound consumers on the pre-rotation credential (they
     resolve secrets from the environment, never repo scope). A write site that cannot be
-    located is a refusal — reshaping it out of recognition must surface here (fail closed)."""
-    lines = text.splitlines()
+    located is a refusal — reshaping it out of recognition must surface here (fail closed).
+    Round 19 (sol finding 3): inline comments are stripped QUOTE-AWARELY (strip_shell_comments)
+    BEFORE matching — `... < file # --env dispatch-secrets` used to pass on comment prose while
+    the real invocation wrote to repo scope; stripping happens before continuation-joining, so
+    a commented-out trailing backslash also stops continuing, exactly as in a real shell."""
+    lines = [strip_shell_comments(line) for line in text.splitlines()]
     found = False
     for index, line in enumerate(lines):
-        if line.lstrip().startswith("#"):
-            continue
         joined = line.rstrip()
         follow = index
         while joined.endswith("\\") and follow + 1 < len(lines):
@@ -755,6 +830,30 @@ def _self_test():
     chk("setup-account union: claim ref ignores cand -> refuse, severed claim named",
         (verdict_unbound[0], "severed from the union-derived candidate" in verdict_unbound[1]),
         (False, True))
+    # sol round-19 mutation (finding 4, COMMENT-AS-EVIDENCE): the real "$env_secret_nums"
+    # argument is replaced by "" with the variable name parked in an inline comment — the raw
+    # text still CONTAINS the string, but the union no longer receives the listing. The
+    # quote-aware comment strip must run before the participation match.
+    comment_arg = union_sample.replace(
+        ' "$env_secret_nums" \\', ' "" # "$env_secret_nums"', 1)
+    verdict_comment = setup_account_union_verdict(
+        setup_account_store_step_lines(comment_arg))
+    chk("setup-account union: sol round-19 mutation (arg -> \"\" + comment) -> refuse, DEAD "
+        "listing named (comments are stripped before matching)",
+        (verdict_comment[0], "$env_secret_nums" in verdict_comment[1],
+         "does not flow into" in verdict_comment[1]),
+        (False, True, True))
+    # Same stripping on the DETERMINATION chain: `n=$reserved # "$taken"` must not let comment
+    # prose stand in for the taken -> n dependency edge.
+    slot_comment = list(store_step_sample)
+    slot_comment[10:12] = ['          n=$reserved # "$taken"']
+    verdict_slot_comment = setup_account_union_verdict(
+        setup_account_store_step_lines("\n".join(slot_comment)))
+    chk("setup-account union: n=$reserved with \"$taken\" only in a comment -> refuse "
+        "(the chain match also strips comments first)",
+        (verdict_slot_comment[0],
+         "does not reference the `taken` union" in verdict_slot_comment[1]),
+        (False, True))
     chk("setup-account union: missing store step -> refuse (fail closed)",
         setup_account_union_verdict(setup_account_store_step_lines("jobs:\n  login:\n"))[0],
         False)
@@ -891,6 +990,18 @@ def _self_test():
          "worker.yml": bound_doc})
     chk("binding map: exception job now BOUND -> refuse as STALE (remove the dead allowlist entry)",
         (bound_guard[0], "STALE" in bound_guard[1]), (False, True))
+    # Round 19 (sol finding 1): an exception bound to ANY OTHER environment must refuse too —
+    # environment secrets OVERRIDE same-named repo secrets, so `environment: other-secret-env`
+    # on a migration job injects that environment's stale copies while the old
+    # only-reject-dispatch-secrets check stayed green.
+    otherenv = binding_map_verdict(
+        {"dispatch.yml": guard_doc.replace(
+            "    steps:", "    environment: other-secret-env\n    steps:"),
+         "worker.yml": bound_doc})
+    chk("binding map: exception job bound to ANY OTHER environment -> refuse (round 19: env "
+        "secrets override same-named repo secrets — stale-value injection)",
+        (otherenv[0], "'other-secret-env'" in otherenv[1], "OVERRIDE" in otherenv[1]),
+        (False, True, True))
     stale_exc = binding_map_verdict(
         {"dispatch.yml": "jobs:\n  plan:\n    steps:\n      - run: true",
          "worker.yml": bound_doc})
@@ -928,6 +1039,25 @@ def _self_test():
          all(key in live_consumers for key in BINDING_EXCEPTIONS)),
         (True, True, True, True))
 
+    # Round 19: the ONE shared quote-aware comment stripper, tested directly — every shell-text
+    # check strips through it before matching.
+    chk("comment strip: unquoted word-start # cuts to end of line",
+        strip_shell_comments('gh secret set "$X" < f # --env dispatch-secrets'),
+        'gh secret set "$X" < f ')
+    chk("comment strip: # inside DOUBLE quotes preserved",
+        strip_shell_comments('echo "a # b" tail'), 'echo "a # b" tail')
+    chk("comment strip: # inside SINGLE quotes preserved",
+        strip_shell_comments("echo 'a # b' tail"), "echo 'a # b' tail")
+    chk("comment strip: mid-word # never a comment (${VAR#pat}, $((10#$n)))",
+        strip_shell_comments('r=${H#acct}; r=$((10#$r))'), 'r=${H#acct}; r=$((10#$r))')
+    chk("comment strip: backslash-escaped # preserved",
+        strip_shell_comments('echo \\# literal'), 'echo \\# literal')
+    chk("comment strip: full-line comment -> emptied",
+        strip_shell_comments('  # only a comment'), '  ')
+    chk("comment strip: multi-line text stripped line by line",
+        strip_shell_comments('keep "a # b"\n# gone\ntail # gone too'),
+        'keep "a # b"\n\ntail ')
+
     # Env-scoped WRITE pins (round 17): the broker's final store + the rotation write-back must
     # keep `--env dispatch-secrets` — synthetic accept/reject, then the LIVE files.
     write_sample = ('# comment: gh secret set "$SECRET_NAME" (prose, ignored)\n'
@@ -939,6 +1069,21 @@ def _self_test():
         write_sample.replace(" --env dispatch-secrets", ""), '"$SECRET_NAME"', "sample")
     chk("env write: --env dispatch-secrets stripped -> refuse, repo-scope risk named",
         (stripped_write[0], "--env dispatch-secrets" in stripped_write[1]), (False, True))
+    # sol round-19 mutation (finding 3): the flag lives ONLY in an inline shell comment — the
+    # raw line contains the substring, but the invocation writes to repo scope. Broker shape
+    # AND rotation shape (the `"${WORKER_GH_BIN:-...}"`-expanded gh) must both refuse.
+    commented_broker = ('GH_TOKEN="$PAT" gh secret set "$SECRET_NAME" -R "o/r" '
+                        '< "$DIR/token" # --env dispatch-secrets\n')
+    verdict_commented = secret_env_write_verdict(
+        commented_broker, '"$SECRET_NAME"', "sample")
+    chk("env write: --env dispatch-secrets ONLY in an inline comment -> refuse (round 19: "
+        "comment prose is not evidence)",
+        (verdict_commented[0], "--env dispatch-secrets" in verdict_commented[1]),
+        (False, True))
+    rotation_commented = ('GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set '
+                          '"$secret_ref" --repo "o/r" < "$current" # --env dispatch-secrets\n')
+    chk("env write: rotation-shaped invocation with --env ONLY in a comment -> refuse",
+        secret_env_write_verdict(rotation_commented, '"$secret_ref"', "sample")[0], False)
     continued = ('gh secret set "$SECRET_NAME" -R "o/r" \\\n'
                  '  --env dispatch-secrets < "$DIR/token"\n')
     chk("env write: backslash-continued invocation -> joined and accepted",
