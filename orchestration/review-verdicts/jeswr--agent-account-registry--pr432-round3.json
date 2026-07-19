@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 432,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3eeaf88bfc50a68947ddf642ced55b506b56ad69",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding in scripts/usage-alert.py. Delivery now checks issue-list and create/edit return codes, retries failed verified-private delivery on the registry using a freshly rendered generic body, returns nonzero when both routes fail, and avoids claiming the maintainer was alerted unless a write succeeds. The added end-to-end tests cover private lookup, create, and edit failures; successful redacted public fallback; both-route failure; and recovery-side lookup failure. The broader changes remain fail-closed: detailed PAT, usage, and model-health data is emitted only after a token-scoped private-repository confirmation, same-repository and indeterminate routes redact, runtime private-route failures do not reuse detailed bodies on the public fallback, and public PAT stdout is coarse. I found no remaining blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
