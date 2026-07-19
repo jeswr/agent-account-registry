@@ -9,9 +9,12 @@
 # pipeline's real writes are env-scope, and a weekly repo-scope canary write would re-trip the
 # dispatch secrets-guard (repo scope must stay empty). Upserts ONE rolling `from:agent` alert issue on
 # invalid/insufficient-scope/near-expiry; a single network-unknown never touches that credential
-# alert (no false alarms, no false recoveries). But CONSECUTIVE network-unknowns are tracked in a
-# SEPARATE rolling issue and page after a small threshold (issue #207) so a permanently-stalled
-# probe cannot stay green-and-silent — without ever reclassifying the PAT. The token is never printed.
+# alert (no false alarms, no false recoveries). But CONSECUTIVE network-unknowns are counted in
+# the PAT_PROBE_UNKNOWN_STREAK repository variable (silent state — below the threshold NO issue
+# is touched, since GitHub creates every issue OPEN and even a create-then-close would notify)
+# and page via a SEPARATE rolling issue once a small threshold is crossed (issue #207), so a
+# permanently-stalled probe cannot stay green-and-silent — without ever reclassifying the PAT.
+# The token is never printed.
 name: pat-validity
 on:
   schedule:
@@ -26,6 +29,11 @@ permissions:
   # on this private repo needs contents:read or the job dies before the probe runs.
   contents: read
   issues: write   # rolling alert upsert only
+  # The consecutive-unknown streak (issue #207) is persisted in a repository variable — the
+  # silent cross-run store: a variable write notifies nobody, whereas an issue-body counter
+  # would page on its own creation (GitHub creates every issue OPEN). The variables REST API
+  # sits under the `actions` permission (no narrower `variables:` key exists for GITHUB_TOKEN).
+  actions: write
 
 concurrency:
   group: pat-validity

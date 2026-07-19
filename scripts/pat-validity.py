@@ -97,17 +97,20 @@ EXPIRY_WARN_DAYS = 14
 
 # Persistent-unknown alerting (issue #207). network-unknown is deliberately no-op for the
 # CREDENTIAL alert (an unreachable API is not evidence about the PAT), but a PERMANENT unknown
-# would then leave the probe green-and-silent forever. So a DISTINCT rolling `from:agent` issue
-# tracks CONSECUTIVE network-unknown verdicts and is OPENED (the page) only once the streak reaches
-# UNKNOWN_STREAK_THRESHOLD — a single transient unknown stays silent (the issue is held CLOSED as a
-# counter until then), and ANY definitive verdict (valid/invalid/insufficient-scope/expiring-soon,
-# all of which prove the probe itself completed) RESETS the streak. The streak is persisted in the
-# issue body as a machine-readable marker; the PAT is NEVER reclassified as invalid.
+# would then leave the probe green-and-silent forever. So CONSECUTIVE network-unknown verdicts
+# are counted in the PAT_PROBE_UNKNOWN_STREAK repository variable, and a DISTINCT rolling
+# `from:agent` issue is created/reopened ONLY once the streak reaches UNKNOWN_STREAK_THRESHOLD —
+# that is the page. The counter lives in a VARIABLE, not an issue body, because GitHub creates
+# every issue OPEN: even a create-then-immediately-close "silent counter" notifies subscribers,
+# fires issue-created automation, and flashes in open-alert views — exactly the false page the
+# threshold exists to prevent. A variable write notifies nobody, so below the threshold NO issue
+# operation happens at all. ANY definitive verdict (valid/invalid/insufficient-scope/
+# expiring-soon, all of which prove the probe itself completed) zeroes the variable and closes an
+# open page; the PAT is NEVER reclassified as invalid.
 PROBE_ALERT_TITLE = ("🛰️ REGISTRY_SECRETS_PAT validity probe cannot complete — "
                      "verification has stalled")
 UNKNOWN_STREAK_THRESHOLD = 3
-STREAK_MARKER = "pat-probe-unknown-streak"
-_STREAK_RE = re.compile(r"<!--\s*" + STREAK_MARKER + r":\s*(\d+)\s*-->")
+STREAK_VAR = "PAT_PROBE_UNKNOWN_STREAK"
 
 VALID = "valid"
 EXPIRING = "expiring-soon"
@@ -442,13 +445,13 @@ def _gh(args, check=False):
 
 
 def _find_alert(repo, title=ALERT_TITLE):
-    """(number, STATE, body) of a rolling `from:agent` alert issue by EXACT `title` across ALL
+    """(number, STATE) of a rolling `from:agent` alert issue by EXACT `title` across ALL
     states — the closed one must be found too, so recovery-then-relapse REOPENS instead of
-    duplicating, and the probe-unavailable counter (issue #207) can read its streak marker off a
-    CLOSED issue's body. Authoritative: the PAGINATED Issues REST API (no fixed --limit window an
-    old closed alert could age out of; the Search API is eventually consistent, so not it either).
-    A failed or unparseable lookup raises AlertLookupError — 'lookup failed' must never degrade
-    into 'not found'."""
+    duplicating (the credential alert and the probe-unavailable page (issue #207) both roll this
+    way). Authoritative: the PAGINATED Issues REST API (no fixed --limit window an old closed
+    alert could age out of; the Search API is eventually consistent, so not it either). A failed
+    or unparseable lookup raises AlertLookupError — 'lookup failed' must never degrade into 'not
+    found'."""
     listed = _gh(["api", "--paginate", "--slurp",
                   f"repos/{repo}/issues?state=all"
                   f"&labels={urllib.parse.quote(ALERT_LABEL, safe='')}&per_page=100"])
@@ -461,8 +464,8 @@ def _find_alert(repo, title=ALERT_TITLE):
     for item in (entry for page in pages for entry in page):
         # The Issues listing endpoint interleaves PRs — a PR sharing the title must not match.
         if item.get("title") == title and "pull_request" not in item:
-            return item["number"], str(item.get("state", "")).upper(), item.get("body") or ""
-    return None, None, ""
+            return item["number"], str(item.get("state", "")).upper()
+    return None, None
 
 
 def upsert_alert(verdict, body, repo):
@@ -476,7 +479,7 @@ def upsert_alert(verdict, body, repo):
     lands."""
     if verdict == NETWORK_UNKNOWN:
         return []
-    number, state, _ = _find_alert(repo)
+    number, state = _find_alert(repo)
     ops = []
     if verdict in (INVALID, INSUFFICIENT, EXPIRING):
         if number is None:
@@ -498,30 +501,43 @@ def upsert_alert(verdict, body, repo):
     return ops
 
 
-def _streak_from_body(body):
-    """The consecutive-unknown count persisted in a probe-unavailable issue body, or 0 when the
-    marker is absent (no issue yet, or a body predating this tracking). The marker is the ONLY
-    cross-run state the probe has — GitHub issues, not a datastore, are where this repo keeps
-    rolling-alert state."""
-    match = _STREAK_RE.search(body or "")
-    return int(match.group(1)) if match else 0
+def _read_streak(repo):
+    """The persisted consecutive-unknown count from the STREAK_VAR repository variable. A 404
+    means the variable has never been written -> 0 (the one benign miss). ANY other failure —
+    network, auth, an unparseable response, a non-numeric value — raises AlertLookupError:
+    degrading a failed read to 0 would hold the streak below threshold forever and permanently
+    silence the very page this state exists to trigger."""
+    result = _gh(["api", f"repos/{repo}/actions/variables/{STREAK_VAR}"])
+    try:
+        payload = json.loads(result.stdout or "")
+    except ValueError:
+        payload = None
+    if result.returncode != 0:
+        # gh api relays the server's JSON error body on stdout; only a definitive 404 (variable
+        # never created) may read as zero.
+        if isinstance(payload, dict) and str(payload.get("status")) == "404":
+            return 0
+        raise AlertLookupError(
+            f"probe-streak variable read failed (gh api rc={result.returncode})")
+    value = payload.get("value") if isinstance(payload, dict) else None
+    if not (isinstance(value, str) and value.strip().isdigit()):
+        raise AlertLookupError("probe-streak variable holds a non-numeric value")
+    return int(value.strip())
 
 
-def _issue_number_from_url(stdout):
-    """The number `gh issue create` printed (its output is the new issue's URL). FAIL-CLOSED: an
-    unparseable output raises rather than leaving a freshly-created OPEN probe alert un-silenced —
-    a below-threshold counter that could not be closed would be a premature page on a single
-    transient unknown, the exact false alarm the threshold exists to prevent."""
-    match = re.search(r"/issues/(\d+)", stdout or "")
-    if match is None:
-        raise AlertWriteError("could not parse the created probe-alert issue number to silence it")
-    return int(match.group(1))
+def _write_streak(repo, streak):
+    """Persist the consecutive-unknown count. `gh variable set` upserts (creates on the first
+    write). This write is SILENT — a repository variable notifies nobody and appears in no
+    issue/alert view — which is the whole reason the counter lives here and not in an issue:
+    GitHub creates every issue OPEN, so an issue-body counter pages on its own creation."""
+    _gh(["variable", "set", STREAK_VAR, "-R", repo, "--body", str(streak)], check=True)
 
 
 def render_probe_alert(streak, threshold, repo):
-    """Body for the probe-unavailable alert (issue #207). Carries the streak marker (the persisted
-    counter) plus a human explanation that this is a PROBE-health page, NOT a credential verdict —
-    the PAT is explicitly not reclassified."""
+    """Body for the probe-unavailable alert (issue #207): a human explanation that this is a
+    PROBE-health page, NOT a credential verdict — the PAT is explicitly not reclassified. Only
+    rendered at/above the page threshold; the authoritative counter is the STREAK_VAR repository
+    variable, never this body."""
     return "\n".join([
         "> 🤖 SPARQ agent — scheduled REGISTRY_SECRETS_PAT validity check "
         "(issue #37; probe health #207).\n",
@@ -538,68 +554,64 @@ def render_probe_alert(streak, threshold, repo):
         f"**What to check:** the latest `pat-validity` workflow run's `detail` field, "
         f"[GitHub status](https://www.githubstatus.com/), and any self-hosted-runner proxy/egress "
         f"problem. This issue updates itself on the weekly probe and closes automatically once the "
-        f"probe reaches ANY definitive verdict again.\n",
-        f"<!-- {STREAK_MARKER}: {streak} -->",
+        f"probe reaches ANY definitive verdict again.",
     ])
 
 
 def upsert_probe_alert(verdict, repo, threshold=UNKNOWN_STREAK_THRESHOLD):
     """Rolling 'probe unavailable' alert for CONSECUTIVE network-unknown verdicts (issue #207),
     kept DISTINCT from the credential alert and never reclassifying the PAT. Returns
-    {"ops", "streak", "paging"} (self-tested). The streak is persisted in the issue body marker:
-    a transient unknown is held as a CLOSED silent counter (no page on a single blip), and only
-    once the streak reaches `threshold` is the issue OPENED — that is the page. ANY definitive
-    verdict proves the probe itself completed, so it RESETS the streak: an open alert is closed and
-    the marker is zeroed, so a later unknown starts fresh instead of re-paging on its first run.
-    Lookup/write failures propagate (AlertLookupError/AlertWriteError) exactly like upsert_alert —
-    a swallowed failure here would re-hide the very stall this alert exists to surface."""
-    number, state, body = _find_alert(repo, PROBE_ALERT_TITLE)
-    streak = _streak_from_body(body)
+    {"ops", "streak", "paging"} (self-tested). The counter is the STREAK_VAR repository variable
+    (silent writes); the issue is created/reopened ONLY once the streak reaches `threshold` —
+    that is the page. Below the threshold NO issue operation happens: GitHub creates every issue
+    OPEN, so even a created-then-closed counter would notify subscribers and flash in open-alert
+    views — a false page on a single transient blip, and one an output-parse failure between the
+    create and the close would leave stranded open. ANY definitive verdict proves the probe
+    itself completed, so it zeroes the variable and closes an open page. Lookup/write failures
+    propagate (AlertLookupError/AlertWriteError) exactly like upsert_alert — a swallowed failure
+    here would re-hide the very stall this alert exists to surface."""
     if verdict != NETWORK_UNKNOWN:
         # The probe reached a real verdict -> the consecutive-unknown streak is broken.
         ops = []
-        if number is None:
-            return {"ops": ops, "streak": 0, "paging": False}
-        if state == "OPEN":
+        number, state = _find_alert(repo, PROBE_ALERT_TITLE)
+        if number is not None and state == "OPEN":
             _gh(["issue", "comment", str(number), "-R", repo, "--body",
                  "✅ The validity probe reached a definitive verdict again — verification has "
                  "resumed. Auto-closing (this is probe health, not a credential recovery)."],
                 check=True)
             _gh(["issue", "close", str(number), "-R", repo], check=True)
             ops += ["comment", "close"]
-        if streak != 0:
+        if _read_streak(repo) != 0:
             # Zero the counter so a future unknown restarts from 1, not from the stale streak
             # (which would re-cross the threshold and re-page after a single unknown).
-            _gh(["issue", "edit", str(number), "-R", repo, "--body",
-                 render_probe_alert(0, threshold, repo)], check=True)
-            ops.append("edit")
+            _write_streak(repo, 0)
+            ops.append("reset-streak")
         return {"ops": ops, "streak": 0, "paging": False}
-    # network-unknown: extend the streak and page once it crosses the threshold.
-    streak += 1
+    # network-unknown: extend the streak, then page only once it crosses the threshold. The
+    # count is persisted BEFORE any issue work: it is silent state, and if a later issue write
+    # fails red, the outage run still counted — the next unknown resumes instead of undercounting.
+    streak = _read_streak(repo) + 1
     paging = streak >= threshold
-    new_body = render_probe_alert(streak, threshold, repo)
-    ops = []
-    if number is None:
-        created = _gh(["issue", "create", "-R", repo, "--title", PROBE_ALERT_TITLE,
-                       "--label", ALERT_LABEL, "--body", new_body], check=True)
-        ops.append("create")
-        if not paging:
-            # Below threshold: keep it a SILENT closed counter — a single transient unknown must
-            # not page. (gh always creates OPEN, so a fresh sub-threshold counter is created then
-            # closed; this happens once, at the first unknown of an outage.)
-            _gh(["issue", "close", str(_issue_number_from_url(created.stdout)), "-R", repo],
-                check=True)
-            ops.append("close")
-    else:
-        if paging and state != "OPEN":
-            _gh(["issue", "reopen", str(number), "-R", repo], check=True)
-            ops.append("reopen")
-        _gh(["issue", "edit", str(number), "-R", repo, "--body", new_body], check=True)
-        ops.append("edit")
-        if not paging and state == "OPEN":
-            # Defensive: a below-threshold counter must never stay open (e.g. threshold raised).
-            _gh(["issue", "close", str(number), "-R", repo], check=True)
-            ops.append("close")
+    _write_streak(repo, streak)
+    ops = ["set-streak"]
+    number, state = _find_alert(repo, PROBE_ALERT_TITLE)
+    if paging:
+        new_body = render_probe_alert(streak, threshold, repo)
+        if number is None:
+            _gh(["issue", "create", "-R", repo, "--title", PROBE_ALERT_TITLE,
+                 "--label", ALERT_LABEL, "--body", new_body], check=True)
+            ops.append("create")  # left OPEN — the create IS the page
+        else:
+            if state != "OPEN":
+                _gh(["issue", "reopen", str(number), "-R", repo], check=True)
+                ops.append("reopen")
+            _gh(["issue", "edit", str(number), "-R", repo, "--body", new_body], check=True)
+            ops.append("edit")
+    elif number is not None and state == "OPEN":
+        # Defensive: a below-threshold streak must never keep a page open (a raised threshold or
+        # a manual reopen) — closing is a SILENCING op, the one issue write allowed sub-threshold.
+        _gh(["issue", "close", str(number), "-R", repo], check=True)
+        ops.append("close")
     return {"ops": ops, "streak": streak, "paging": paging}
 
 
@@ -1112,143 +1124,157 @@ def _self_test():
         chk("create carries exact title + from:agent label",
             (ALERT_TITLE in created, ALERT_LABEL in created), (True, True))
 
-        # --- upsert_probe_alert: consecutive-unknown tracking (issue #207). A DISTINCT rolling
-        # issue that NEVER reclassifies the PAT. A single transient unknown stays a SILENT closed
-        # counter; only a streak >= threshold OPENS the page; any definitive verdict RESETS it.
-        def probe_body(streak):
-            return f"stalled for {streak} run(s)\n<!-- {STREAK_MARKER}: {streak} -->"
-
-        def probe_issue(number, state, streak):
-            return {"number": number, "title": PROBE_ALERT_TITLE, "state": state,
-                    "body": probe_body(streak)}
+        # --- upsert_probe_alert: consecutive-unknown tracking (issue #207). The counter is a
+        # repository variable (SILENT writes); the DISTINCT rolling issue is created/reopened
+        # ONLY at threshold. Below it NO issue operation may run: GitHub creates every issue
+        # OPEN, so even create-then-close would notify subscribers and flash in open-alert
+        # views — the tests therefore assert on the RAW gh call list, not just the summarized
+        # ops, to prove ABSENCE of issue writes. Never reclassifies the PAT.
+        def probe_issue(number, state):
+            return {"number": number, "title": PROBE_ALERT_TITLE, "state": state, "body": "page"}
 
         PA_EMPTY = json.dumps([[]])
-        PA_CLOSED0 = json.dumps([[probe_issue(50, "closed", 0)]])
-        PA_CLOSED1 = json.dumps([[probe_issue(50, "closed", 1)]])
-        PA_CLOSED2 = json.dumps([[probe_issue(50, "closed", 2)]])
-        PA_OPEN3 = json.dumps([[probe_issue(50, "open", 3)]])
-        # A same-title PR row must never be mistaken for the counter (the Issues listing
+        PA_CLOSED = json.dumps([[probe_issue(50, "closed")]])
+        PA_OPEN = json.dumps([[probe_issue(50, "open")]])
+        # A same-title PR row must never be mistaken for the page (the Issues listing
         # interleaves PRs); find is issue-only and by exact title.
         PA_PR_DECOY = json.dumps([[{"number": 9, "title": PROBE_ALERT_TITLE, "state": "open",
-                                    "body": probe_body(9),
+                                    "body": "page",
                                     "pull_request": {"url": "https://example.invalid"}}]])
 
-        def stub_probe_gh(list_json, list_rc=0, create_url="https://github.com/o/r/issues/77",
-                          fail_op=None):
+        def stub_probe_gh(list_json, streak=None, list_rc=0, var_read="ok", fail_op=None):
+            # streak None -> STREAK_VAR never written (gh api answers 404). var_read: "ok" |
+            # "down" (a non-404 read failure) | "garbage" (a non-numeric value). fail_op:
+            # "variable-set" or an `issue` subcommand to fail.
             calls = []
 
             def run(args, **_kw):
                 calls.append(list(args))
+                if args[1] == "api" and any("actions/variables" in a for a in args):
+                    if var_read == "down":
+                        return _Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
+                    if var_read == "garbage":
+                        return _Run(json.dumps({"name": STREAK_VAR, "value": "not-a-number"}))
+                    if streak is None:
+                        return _Run(json.dumps({"message": "Not Found", "status": "404"}), 1)
+                    return _Run(json.dumps({"name": STREAK_VAR, "value": str(streak)}))
                 if args[1] == "api":
                     return _Run(list_json, list_rc)
+                if args[1] == "variable":
+                    return (_Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
+                            if fail_op == "variable-set" else _Run())
                 if fail_op and args[2] == fail_op:
                     return _Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
-                if args[1:3] == ["issue", "create"]:
-                    return _Run(create_url + "\n")  # gh prints the new issue URL
                 return _Run()
             return calls, run
 
-        def run_probe(verdict, listing, threshold=UNKNOWN_STREAK_THRESHOLD):
-            calls, subprocess.run = stub_probe_gh(listing)
+        def run_probe(verdict, listing, streak=None, threshold=UNKNOWN_STREAK_THRESHOLD):
+            calls, subprocess.run = stub_probe_gh(listing, streak=streak)
             with contextlib.redirect_stdout(io.StringIO()):
                 res = upsert_probe_alert(verdict, "o/r", threshold=threshold)
-            return res, [c[2] for c in calls if c[1] == "issue"], calls
+            issue_ops = [c[2] for c in calls if c[1] == "issue"]
+            streak_writes = [c[c.index("--body") + 1] for c in calls if c[1] == "variable"]
+            return res, issue_ops, streak_writes
 
-        # _find_alert now returns the body, and the streak marker round-trips off a CLOSED issue.
-        calls, subprocess.run = stub_probe_gh(PA_CLOSED2)
-        num, st, bdy = _find_alert("o/r", PROBE_ALERT_TITLE)
-        chk("_find_alert locates the probe issue by its DISTINCT title, returns state + body",
-            (num, st, _streak_from_body(bdy)), (50, "CLOSED", 2))
-        chk("_streak_from_body: absent marker -> 0", _streak_from_body("no marker here"), 0)
-        chk("_streak_from_body: parses the marker", _streak_from_body(probe_body(4)), 4)
-        chk("_issue_number_from_url parses gh's created-issue URL",
-            _issue_number_from_url("https://github.com/o/r/issues/77\n"), 77)
-        raised = False
-        try:
-            _issue_number_from_url("no url here")
-        except AlertWriteError:
-            raised = True
-        chk("_issue_number_from_url: unparseable output raises (never a silent-open page)",
-            raised, True)
+        calls, subprocess.run = stub_probe_gh(PA_CLOSED)
+        chk("_find_alert locates the probe issue by its DISTINCT title across states",
+            _find_alert("o/r", PROBE_ALERT_TITLE), (50, "CLOSED"))
 
-        # network-unknown streak progression (threshold 3): silent below, page at/after it.
-        res, ops, _ = run_probe(NETWORK_UNKNOWN, PA_EMPTY)
-        chk("unknown #1 (no issue) -> streak 1, SILENT: create then close, not paging",
-            (res["streak"], res["paging"], ops), (1, False, ["create", "close"]))
-        res, ops, _ = run_probe(NETWORK_UNKNOWN, PA_CLOSED1)
-        chk("unknown #2 (closed counter) -> streak 2, edit-only, STILL silent",
-            (res["streak"], res["paging"], ops), (2, False, ["edit"]))
-        res, ops, _ = run_probe(NETWORK_UNKNOWN, PA_CLOSED2)
-        chk("unknown #3 crosses threshold -> streak 3, PAGES: reopen + edit",
-            (res["streak"], res["paging"], ops), (3, True, ["reopen", "edit"]))
-        res, ops, _ = run_probe(NETWORK_UNKNOWN, PA_OPEN3)
-        chk("unknown #4 (already-open page) -> streak 4, edit-only, stays paging",
-            (res["streak"], res["paging"], ops), (4, True, ["edit"]))
-        res, ops, _ = run_probe(NETWORK_UNKNOWN, PA_EMPTY, threshold=1)
-        chk("threshold 1: first unknown pages -> create only, stays OPEN (never silenced)",
-            (res["paging"], ops), (True, ["create"]))
+        # network-unknown streak progression (threshold 3): below it, ZERO issue-touching gh
+        # calls — the load-bearing absence — and only the silent variable is written.
+        res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_EMPTY)
+        chk("unknown #1 (no state) -> streak 1: variable=1 and NO issue operation at all",
+            (res["streak"], res["paging"], iops, wrote), (1, False, [], ["1"]))
+        res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_EMPTY, streak=1)
+        chk("unknown #2 -> streak 2: variable=2, STILL no issue operation",
+            (res["streak"], res["paging"], iops, wrote), (2, False, [], ["2"]))
+        res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_EMPTY, streak=2)
+        chk("unknown #3 crosses threshold -> PAGES: create, left OPEN (no close after it)",
+            (res["streak"], res["paging"], iops, wrote), (3, True, ["create"], ["3"]))
+        res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_CLOSED, streak=2)
+        chk("unknown #3 with a prior outage's closed page -> REOPEN + edit, never a duplicate",
+            (res["streak"], res["paging"], iops), (3, True, ["reopen", "edit"]))
+        res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_OPEN, streak=3)
+        chk("unknown #4 (already-open page) -> edit only, stays paging",
+            (res["streak"], res["paging"], iops), (4, True, ["edit"]))
+        res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_EMPTY, threshold=1)
+        chk("threshold 1: first unknown pages immediately -> create, stays OPEN",
+            (res["paging"], iops), (True, ["create"]))
+        res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_OPEN)
+        chk("defensive: sub-threshold streak but an OPEN page (raised threshold/manual reopen) "
+            "-> close it (silencing is the one sub-threshold issue write)",
+            (res["streak"], res["paging"], iops), (1, False, ["close"]))
 
-        # The create body carries the streak marker (the persisted counter) + label/title, and
-        # the sub-threshold counter is closed by the number PARSED from create's URL.
-        calls, subprocess.run = stub_probe_gh(PA_EMPTY)
+        # The page create carries the rolling label + distinct title (what find-by-title keys on).
+        calls, subprocess.run = stub_probe_gh(PA_EMPTY, streak=2)
         with contextlib.redirect_stdout(io.StringIO()):
             upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
         pcreate = next(c for c in calls if c[1:3] == ["issue", "create"])
-        chk("probe create carries the distinct title, from:agent label, and streak-1 marker",
-            (PROBE_ALERT_TITLE in pcreate, ALERT_LABEL in pcreate,
-             _streak_from_body(pcreate[pcreate.index("--body") + 1])), (True, True, 1))
-        pclose = next(c for c in calls if c[1:3] == ["issue", "close"])
-        chk("sub-threshold create is closed by the parsed issue number (77)", "77" in pclose, True)
+        chk("page create carries the distinct title + from:agent label",
+            (PROBE_ALERT_TITLE in pcreate, ALERT_LABEL in pcreate), (True, True))
 
-        res, ops, _ = run_probe(NETWORK_UNKNOWN, PA_PR_DECOY)
-        chk("same-title PR never matches -> treated as absent, fresh streak-1 counter created",
-            (res["streak"], ops), (1, ["create", "close"]))
+        res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_PR_DECOY, streak=2)
+        chk("same-title PR never matches -> treated as absent, page created fresh",
+            (res["streak"], iops), (3, ["create"]))
 
         # ANY definitive verdict RESETS the streak — the PAT is never reclassified here.
         for name, verdict in [("valid", VALID), ("invalid", INVALID),
                               ("insufficient", INSUFFICIENT), ("expiring", EXPIRING)]:
-            res, ops, _ = run_probe(verdict, PA_OPEN3)
-            chk(f"definitive({name}) + open page -> comment + close + zero the marker",
-                (res["streak"], res["paging"], ops), (0, False, ["comment", "close", "edit"]))
-        # The reset edit actually writes marker 0 (else the next unknown re-pages after one run).
-        calls, subprocess.run = stub_probe_gh(PA_OPEN3)
-        with contextlib.redirect_stdout(io.StringIO()):
-            upsert_probe_alert(VALID, "o/r")
-        reset_edit = next(c for c in calls if c[1:3] == ["issue", "edit"])
-        chk("recovery zeroes the persisted streak marker",
-            _streak_from_body(reset_edit[reset_edit.index("--body") + 1]), 0)
-        res, ops, _ = run_probe(VALID, PA_CLOSED2)
-        chk("definitive + CLOSED stale counter -> zero the marker only (no comment/close)",
-            (res["streak"], ops), (0, ["edit"]))
-        res, ops, _ = run_probe(VALID, PA_CLOSED0)
-        chk("definitive + already-zero closed counter -> no writes at all (no churn)",
-            (res["streak"], ops), (0, []))
-        res, ops, _ = run_probe(VALID, PA_EMPTY)
-        chk("definitive + no probe issue -> no write churn", (res["streak"], ops), (0, []))
+            res, iops, wrote = run_probe(verdict, PA_OPEN, streak=3)
+            chk(f"definitive({name}) + open page -> comment + close + variable zeroed",
+                (res["streak"], res["paging"], iops, wrote),
+                (0, False, ["comment", "close"], ["0"]))
+        res, iops, wrote = run_probe(VALID, PA_EMPTY, streak=2)
+        chk("definitive + stale sub-threshold count -> variable zeroed only, no issue op",
+            (res["streak"], iops, wrote), (0, [], ["0"]))
+        res, iops, wrote = run_probe(VALID, PA_EMPTY)
+        chk("definitive + no state at all -> no writes (no churn)", (iops, wrote), ([], []))
+        res, iops, wrote = run_probe(VALID, PA_CLOSED, streak=0)
+        chk("definitive + closed page + zero variable -> no writes (no churn)",
+            (iops, wrote), ([], []))
 
-        # A failed probe-alert WRITE propagates AlertWriteError, sanitized (never gh stderr).
-        calls, subprocess.run = stub_probe_gh(PA_CLOSED2, fail_op="reopen")
-        raised = False
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
-        except AlertWriteError as exc:
-            raised = "LEAKY-STDERR" not in str(exc)
-        chk("failed probe-alert write raises AlertWriteError, sanitized", raised, True)
-        # A failed LOOKUP raises before any write (never degrades to 'not found').
-        calls, subprocess.run = stub_probe_gh("", list_rc=1)
+        # A failed (non-404) streak READ must RAISE, never degrade to 0 — degrading would hold
+        # the count below threshold forever and permanently silence the page. Sanitized.
+        for mode, name in [("down", "read failure"), ("garbage", "non-numeric value")]:
+            calls, subprocess.run = stub_probe_gh(PA_EMPTY, var_read=mode)
+            raised = False
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
+            except AlertLookupError as exc:
+                raised = "LEAKY-STDERR" not in str(exc)
+            chk(f"streak-variable {name} -> AlertLookupError (sanitized), zero writes",
+                (raised, [c for c in calls if c[1] in ("issue", "variable")]), (True, []))
+        # A failed streak WRITE raises before any issue op (fail red, the count is never
+        # silently lost); a failed page write raises too — both sanitized (never gh stderr).
+        for fail_op, want_issue_ops, name in [
+                ("variable-set", [], "failed streak write"),
+                ("reopen", ["reopen"], "failed page reopen")]:
+            calls, subprocess.run = stub_probe_gh(PA_CLOSED, streak=2, fail_op=fail_op)
+            raised = False
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
+            except AlertWriteError as exc:
+                raised = "LEAKY-STDERR" not in str(exc)
+            chk(f"{name} raises AlertWriteError, sanitized; ops after it never run",
+                (raised, [c[2] for c in calls if c[1] == "issue"]), (True, want_issue_ops))
+        # A failed page LOOKUP raises before any ISSUE write. The streak was already persisted —
+        # deliberate: the outage run must still count even when the Issues API is down too.
+        calls, subprocess.run = stub_probe_gh("", streak=2, list_rc=1)
         raised = False
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
         except AlertLookupError:
             raised = True
-        chk("failed probe-alert lookup -> AlertLookupError, zero writes",
-            (raised, [c for c in calls if c[1] != "api"]), (True, []))
+        chk("failed page lookup -> AlertLookupError, zero issue writes",
+            (raised, [c for c in calls if c[1] == "issue"]), (True, []))
 
         # End-to-end through main(): a persistent unknown at threshold goes RED and pages; a
-        # single transient unknown stays GREEN and silent. network-unknown never touches the
-        # CREDENTIAL alert (upsert_alert short-circuits), so only the probe issue is written.
+        # single transient unknown stays GREEN with ZERO issue operations (nothing is created,
+        # so nothing can notify or be stranded open). network-unknown never touches the
+        # CREDENTIAL alert (upsert_alert short-circuits), so every issue call is the page's.
         module = globals()
         real_probe2 = module["probe"]
         module["probe"] = lambda token, repo: {"verdict": NETWORK_UNKNOWN, "detail": "stub",
@@ -1259,14 +1285,14 @@ def _self_test():
         os.environ["REGISTRY_REPO"] = "o/r"
         os.environ.pop("GITHUB_OUTPUT", None)
         try:
-            calls, subprocess.run = stub_probe_gh(PA_CLOSED2)  # streak 2 -> 3 crosses threshold
+            calls, subprocess.run = stub_probe_gh(PA_CLOSED, streak=2)  # 2 -> 3: threshold
             with contextlib.redirect_stdout(io.StringIO()):
                 red_rc = main([])
             paged_ops = [c[2] for c in calls if c[1] == "issue"]
-            calls, subprocess.run = stub_probe_gh(PA_EMPTY)    # streak 1 -> silent
+            calls, subprocess.run = stub_probe_gh(PA_EMPTY)  # first unknown ever -> silent
             with contextlib.redirect_stdout(io.StringIO()):
                 green_rc = main([])
-            silent_ops = [c[2] for c in calls if c[1] == "issue"]
+            silent_issue_ops = [c[2] for c in calls if c[1] == "issue"]
         finally:
             module["probe"] = real_probe2
             for key, val in saved_env.items():
@@ -1276,8 +1302,8 @@ def _self_test():
                     os.environ[key] = val
         chk("main(): persistent unknown crossing threshold -> rc=1 and pages (reopen+edit)",
             (red_rc, paged_ops), (1, ["reopen", "edit"]))
-        chk("main(): a single transient unknown -> rc=0 (green) and SILENT (create+close)",
-            (green_rc, silent_ops), (0, ["create", "close"]))
+        chk("main(): a single transient unknown -> rc=0 (green) and ZERO issue operations",
+            (green_rc, silent_issue_ops), (0, []))
     finally:
         subprocess.run = real_run
 
