@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 405,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9a27949931fd92168df5c60bdacd3b25d61004ad",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The stranded-state change is sound and fail-closed. It preserves live re-derivation of the exact drafted, explicitly unarmed, reviewed-head, clean-base, green-gate posture before acting; drift or unknown state still defers. Recovery uses the existing cross-provider review chain and shared round-budget machinery, while the matching reviewed-SHA bypass is narrowly limited to the stranded state. At budget exhaustion it retains the terminal needs-user hand-off. The added tests are non-vacuous: they prove the recovery reaches only the review allocator with the expected chain, prove hard-cap exhaustion escalates without dispatch, and prove a failed live posture neither dispatches nor escalates. No trust check, audit binding, label keyword set, permission boundary, or token handling is weakened.",
+  "verdict": "approve"
+ }
+}
