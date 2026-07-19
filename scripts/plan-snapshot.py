@@ -190,6 +190,12 @@ def _pr_status_record(fetch, claim, repo, number):
         "head_sha": sha,
         "mergeable": detail.get("mergeable"),
         "auto_merge": detail.get("auto_merge"),
+        # [round-4 P1] the detail read's own draft bit (present on the pulls/N REST
+        # response): the busy-partition carve-out (_pull_provably_inactive) frees a
+        # human-parked draft's crate ONLY when this NEWER, head-matched read CONFIRMS
+        # draft — the older pulls LISTING alone is racy (a draft flipped ready between
+        # the listing and this read would otherwise free a crate the PR can merge into).
+        "draft": detail.get("draft"),
         "check_runs": [],
     }
     if SAFE_SHA.fullmatch(sha):
@@ -297,7 +303,8 @@ def _self_test():
         for number, sha in ((7, sha_over), (9, sha_ok), (11, sha_red), (15, sha_legs_over)):
             if url.split("?")[0].endswith(f"/pulls/{number}"):
                 # PR 7 is ARMED (auto_merge latched) — the round-1 disarm-under-overflow case.
-                return {"head": {"sha": sha}, "mergeable": True,
+                # PR 9 is a DRAFT on the detail read — the round-4 carve-out confirmation bit.
+                return {"head": {"sha": sha}, "mergeable": True, "draft": number == 9,
                         "auto_merge": {"merge_method": "squash"} if number == 7 else None}
         if f"/commits/{sha_over}/" in url:
             return {"check_runs": [gate_run() for _ in range(100)]}     # never a short page
@@ -336,13 +343,16 @@ def _self_test():
     # detail record — check_runs EMPTY + an explicit marker — while the pre-detail
     # failure (13) stays a full skip with no record at all.
     assert sorted(doc["items"]) == ["11", "15", "7", "9"], sorted(doc["items"])
-    assert doc["items"]["7"] == {"head_sha": sha_over, "mergeable": True,
+    assert doc["items"]["7"] == {"head_sha": sha_over, "mergeable": True, "draft": False,
                                  "auto_merge": {"merge_method": "squash"},
                                  "check_runs": [],
                                  "check_runs_degraded": "check-runs-overflow"}
     degraded = claim.pr_ci_status(doc["items"]["7"])
     assert degraded["gate"] == "missing" and degraded["armed"] is True
     assert degraded["check_runs_degraded"] is True
+    # [round-4 P1] the detail's draft bit flows through to the claim-side interpreter:
+    # the busy-partition carve-out consumes it as the NEWER-read draft confirmation.
+    assert healthy["draft"] is True and degraded["draft"] is False
     # The PARTIAL gate=failure read whose advisory-legs walk overflowed is blanked too:
     # a degraded record must never admit a ci-fix (gate reads missing, not failure).
     assert doc["items"]["15"]["check_runs"] == []

@@ -1215,7 +1215,11 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
                   reviewed_base=""):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
-    mismatch returns the PR to review:needs (a fixer/other push raced the approval).
+    mismatch returns the PR to review:needs (a fixer/other push raced the approval). [round-4 P1]
+    the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:* on the source issue) are re-read
+    live immediately before the first mutation: a park that landed mid-review-run aborts the
+    ready+arm untouched (arm_complete=false), so an in-flight run can never arm past a
+    human/groom park the busy-partition carve-out relies on.
 
     Account disjointness is asserted on SALTED HASHES (locked decision 22a): the registry
     provenance record stores impl_account_h, and the live reviewer handle is hashed here with the
@@ -1239,6 +1243,43 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
     if live.get("state") != "open":
         raise WorkerPrError("pull request is no longer open")
+    # [round-4 P1] PARKED-BUT-ARMING RACE: a human/groom park that landed WHILE this review
+    # run was in flight must WIN over the run's stale mark-ready+arm decision — the busy-
+    # partition carve-out (dispatch-claim.py busy_packages_of_pulls) frees a parked draft's
+    # crate on the premise that a parked PR cannot reach main on its own, and an arm that
+    # ignores a mid-run park breaks exactly that premise (the enumerator excluded holds at
+    # PLAN time, but this run launched BEFORE the park landed). Re-read the hold surfaces
+    # HERE, before ANY mutation (ready/arm/audit-comment/review-state): the live PR labels
+    # from the same fresh read the head CAS uses, plus the source issue's needs:* state.
+    # Any hold aborts with the valid-exit shape (arm_complete=false — review-fix.yml then
+    # never binds reviewed-sha) and NO comment/label churn: the PR is human-owned, and the
+    # sweep's enumerator already excludes it for as long as the park stands.
+    live_labels = {label.get("name") for label in (live.get("labels") or [])
+                   if isinstance(label, dict)}
+    holds = sorted(live_labels & set(HUMAN_OWNED_LABELS))
+    if not holds:
+        source_issue = issue
+        if not source_issue:
+            ref_match = WORKER_HEAD_RE.fullmatch(
+                str((live.get("head") or {}).get("ref", "")))
+            source_issue = int(ref_match.group(1)) if ref_match else None
+        if source_issue:
+            probe = _gh_json(["api", f"repos/{repo}/issues/{source_issue}"])
+            if not isinstance(probe, dict) or not isinstance(probe.get("labels"), list):
+                # Fail closed: arming is the dangerous act — an unreadable hold surface
+                # never admits it. No mutation happened; the sweep simply retries.
+                raise WorkerPrError(
+                    "source issue hold state is unreadable; refusing to ready/arm")
+            holds = sorted({
+                str(label.get("name", "")) for label in probe["labels"]
+                if isinstance(label, dict)
+                and str(label.get("name", "")).startswith("needs:")})
+    if holds:
+        _write_outputs({"armed": False, "head_moved": False, "human_hold": True,
+                        "arm_complete": False})
+        print(f"ready+arm ABORTED pre-arm: human hold detected ({', '.join(holds)}) — "
+              "the park stands; no ready/arm/review-state mutation was applied")
+        return
     head_sha = str(live.get("head", {}).get("sha", ""))
     if head_sha != reviewed_sha:
         # Not an error: new commits landed between approve and arm; re-review binds to the new head.
@@ -2304,7 +2345,15 @@ def _self_test():
             files = ([{"filename": "scripts/worker-pr.py"}]
                      if sha_in_path == "b" * 40 else [])
             return {"files": files}
-        return {"state": "open", "head": {"sha": raa_state["head"]},
+        if "/issues/" in path:
+            # the [round-4 P1] pre-arm SOURCE-issue hold probe
+            if raa_state.get("issue_probe_garbage"):
+                return "garbage"
+            return {"labels": [{"name": name}
+                               for name in raa_state.get("issue_labels", ())]}
+        return {"state": "open",
+                "labels": [{"name": name} for name in raa_state.get("labels", ())],
+                "head": {"ref": "sparq-agent/issue-7-1-1", "sha": raa_state["head"]},
                 "base": {"ref": "main"}}
 
     def raa_run_gh(args, **kw):
@@ -2315,10 +2364,13 @@ def _self_test():
             return argparse.Namespace(returncode=1, stdout="", stderr="")
         return argparse.Namespace(returncode=0, stdout="", stderr="")
 
-    def run_raa(head_ok=True, merge_fails=False, comments=()):
+    def run_raa(head_ok=True, merge_fails=False, comments=(), labels=(),
+                issue_labels=(), issue=None, probe_garbage=False):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
-        raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails)
+        raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
+                         labels=labels, issue_labels=issue_labels,
+                         issue_probe_garbage=probe_garbage)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -2327,7 +2379,8 @@ def _self_test():
         globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
         globals()["_write_outputs"] = raa_outputs.update
         ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
-                      bot_login="sparq[bot]", reviewed_base=raa_state.get("reviewed_base", "main"))
+                      issue=issue, bot_login="sparq[bot]",
+                      reviewed_base=raa_state.get("reviewed_base", "main"))
 
     try:
         sha = "b" * 40
@@ -2404,6 +2457,40 @@ def _self_test():
             check("arm failure raises (draft restored path)", "raised", "raised")
         check("the pre-arm audit survives an arm failure (re-review re-audits per sha)",
               any(TRUST_AUDIT_MARKER_PREFIX in c for c in raa_calls), True)
+        # ---- [round-4 P1] PARKED-BUT-ARMING RACE: a human/groom park that landed while
+        # this review run was in flight WINS — the pre-arm hold recheck aborts with the
+        # valid-exit shape and NO ready/arm/audit/review-state mutation at all ----
+        for park in ("needs:user", "review:needs-user"):
+            run_raa(labels=(park,))
+            check(f"parked-mid-review PR label {park} aborts pre-arm (no ready/arm argv)",
+                  (any(c.startswith("pr ready") or "merge" in c for c in raa_calls),
+                   any("trust-surface" in c or c.startswith("state:") for c in raa_calls),
+                   raa_outputs.get("arm_complete"), raa_outputs.get("human_hold"),
+                   raa_outputs.get("armed")),
+                  (False, False, False, True, False))
+        run_raa(issue_labels=("needs:maintainer",), issue=7)
+        check("parked-mid-review SOURCE issue needs:* aborts pre-arm the same way",
+              (any(c.startswith("pr ready") or "merge" in c for c in raa_calls),
+               raa_outputs.get("arm_complete"), raa_outputs.get("human_hold")),
+              (False, False, True))
+        # the --issue arg may be absent: the source issue is derived from the worker head
+        run_raa(issue_labels=("needs:user",))
+        check("head-ref-derived source hold aborts pre-arm too",
+              (any("merge" in c for c in raa_calls), raa_outputs.get("arm_complete")),
+              (False, False))
+        run_raa(issue_labels=("area:crate-a", "role:impl"))
+        check("unparked run is UNCHANGED (the hold recheck admits the ready+arm)",
+              (any(c.startswith("pr ready") for c in raa_calls),
+               any("--match-head-commit" in c for c in raa_calls),
+               raa_outputs.get("arm_complete")), (True, True, True))
+        try:
+            run_raa(probe_garbage=True)
+            check("unreadable source-issue hold state fails closed (no arm)",
+                  "no error", "raised")
+        except WorkerPrError:
+            check("unreadable source-issue hold state fails closed (no arm)",
+                  ("raised", any(c.startswith("pr ready") or "merge" in c
+                                 for c in raa_calls)), ("raised", False))
     finally:
         globals().update(real_raa)
 

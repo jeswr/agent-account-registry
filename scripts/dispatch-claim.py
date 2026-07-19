@@ -423,11 +423,17 @@ def pr_ci_status(record):
     if not isinstance(head_sha, str) or not SAFE_SHA.fullmatch(head_sha):
         return {}
     mergeable = record.get("mergeable")
+    draft = record.get("draft")
     status = {
         "head_sha": head_sha,
         # REST tri-state: False = conflicting, True = clean, null = still computing (unknown).
         "conflicting": True if mergeable is False else (False if mergeable is True else None),
         "armed": isinstance(record.get("auto_merge"), dict),
+        # [round-4 P1] the detail read's OWN draft bit (the pulls/N REST response carries
+        # `draft`): the busy-partition carve-out frees a parked draft ONLY when this NEWER
+        # read confirms the listing's stale draft flag on the same head. Strict bool;
+        # anything else degrades to None (unknown never frees — fail closed to BUSY).
+        "draft": draft if isinstance(draft, bool) else None,
         # PLAN's post-detail degradation marker (oversized/unreadable check-run listing).
         # Hostile-tolerant AND narrows-only: ANY truthy marker forces gate=missing below
         # (the check-run payload is ignored outright), so a forged marker can only stand
@@ -550,29 +556,45 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
 
 def _pull_provably_inactive(pull, status):
     """True iff a HUMAN-PARKED worker PR provably cannot reach main on its own — the busy-
-    partition carve-out guard (round-2 P1 HELD != INACTIVE, restricted to DRAFTS ONLY in
-    round 3). Provably inactive means exactly one thing: a DRAFT with no latched arm
-    visible anywhere. Draft is the loop's own defused state — the disarm path converts to
-    draft, and GitHub cancels/refuses auto-merge on drafts — and the measured
-    frontier-collapse population is exactly parked drafts (26/27 open sparq worker PRs,
-    2026-07-18). A draft that still SHOWS a latched arm — an `auto_merge` dict on a
-    raw-REST row (defense in depth; the PLAN snapshot projection drops the field), or a
-    fresher PLAN detail record (pr_ci_status) whose armed bit reads True — is a
-    crashed-disarm artifact and reads ACTIVE, fail closed.
+    partition carve-out guard (round-2 P1 HELD != INACTIVE; DRAFTS ONLY since round 3;
+    COHERENT-DETAIL-CONFIRMED since round 4). Provably inactive means exactly one thing:
+    a DRAFT with no latched arm visible anywhere, CONFIRMED by a coherent newer read.
+    Draft is the loop's own defused state — the disarm path converts to draft, and GitHub
+    cancels/refuses auto-merge on drafts — and the measured frontier-collapse population
+    is exactly parked drafts (26/27 open sparq worker PRs, 2026-07-18).
 
-    EVERY parked NON-draft stays busy unconditionally: non-draft queue/arm state is NOT
-    provable from the REST snapshot. The dispatch.yml PLAN `pr_snapshot` projection
-    carries no `auto_merge` field at all, and even a full REST row cannot prove a
-    non-draft inert — merge-queue membership is GraphQL-only (worker-pr.py
-    `_merge_queue_state`, issue #69: a directly-queued PR can show NO REST latch), so a
-    null/absent `auto_merge` may still be a queued PR about to merge. Round 2's non-draft
-    `auto_merge: null` branch was therefore unsound AND unreachable in production
-    (round-3 P1s); it is gone. A missing/garbage `draft` field reads ACTIVE (busy)."""
+    [round-4 P1] SPLIT-SNAPSHOT RACE: the PLAN snapshot lists pulls BEFORE fetching the
+    per-PR details, so the detail record (`status`, from pr_ci_status) is the NEWER of
+    the two reads. A draft flipped ready — and possibly armed or directly QUEUED
+    (GraphQL-only, latch-invisible over REST) — between the two reads presents as a
+    stale listing `draft: True` plus a newer detail with no visible latch; round 3 freed
+    its crate while the PR could merge. The carve-out therefore frees ONLY when the
+    NEWER read coherently CONFIRMS the defused draft state:
+      - listing `draft` is True (non-draft/unknown never frees, unchanged), AND
+      - no latch signal anywhere: no `auto_merge` dict on a raw-REST row (defense in
+        depth; the PLAN projection drops the field) and the detail's armed bit is
+        exactly False (True is a crashed-disarm artifact; a missing bit is unknown), AND
+      - the detail record EXISTS and its head_sha equals the listing head (a head that
+        moved between the reads means the listing row is stale — unprovable), AND
+      - the detail's OWN `draft` bit is True (the pulls/N REST detail carries `draft`;
+        a record without the field — the pre-round-4 snapshot shape — proves nothing).
+    Missing detail, head mismatch, or detail draft absent/False all read ACTIVE (busy,
+    fail closed): a pre-detail snapshot skip or census overflow now RESERVES a parked
+    draft's crate for that tick instead of freeing on one stale listing bit."""
+    if pull.get("draft") is not True:
+        return False                      # non-draft/unknown: never provably inactive
     if isinstance(pull.get("auto_merge"), dict):
         return False                      # latched arm on a raw-REST row — it may merge
-    if isinstance(status, dict) and status.get("armed") is True:
-        return False                      # detail read says latched — crashed-disarm artifact
-    return pull.get("draft") is True      # non-draft/unknown: never provably inactive
+    if not isinstance(status, dict):
+        return False                      # no newer detail read — unconfirmable, fail closed
+    if status.get("armed") is not False:
+        return False                      # latched (crashed disarm) or unknown arm bit
+    head_sha = str((pull.get("head") or {}).get("sha", ""))
+    if not SAFE_SHA.fullmatch(head_sha) or status.get("head_sha") != head_sha:
+        return False                      # head moved between listing and detail — incoherent
+    if status.get("draft") is not True:
+        return False                      # newer read does not CONFIRM draft (absent/False)
+    return True
 
 
 def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None):
@@ -596,10 +618,12 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     which still emits that PR as `__global__`.
 
     HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse, DRAFTS-ONLY since
-    round 3): a human-parked PR — `review:needs-user`/`needs:user` on the PR, or `needs:*`
-    on the provenance-linked source issue — frees its packages ONLY when it is a
-    provably-inert DRAFT (_pull_provably_inactive: draft with no visible latch; a latched
-    draft is a crashed-disarm artifact and stays busy). EVERY parked NON-draft stays BUSY
+    round 3, coherent-detail-confirmed since round 4): a human-parked PR —
+    `review:needs-user`/`needs:user` on the PR, or `needs:*` on the provenance-linked
+    source issue — frees its packages ONLY when it is a provably-inert DRAFT
+    (_pull_provably_inactive: draft with no visible latch, CONFIRMED by a head-matched
+    newer detail record whose own draft bit is True — a stale listing bit alone frees
+    nothing after the round-4 split-snapshot race). EVERY parked NON-draft stays BUSY
     unconditionally: groom parks stale non-draft PRs WITHOUT disarming, and non-draft
     queue/arm state is not provable from the REST snapshot (the PLAN projection carries no
     auto_merge field, and merge-queue membership is GraphQL-only per worker-pr.py's own
@@ -667,6 +691,106 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
             continue
         kept.append(item)
     return kept
+
+
+def live_pull_detail_stub(pull):
+    """[round-4] PURE single-read coherence stub for a raw REST pull LISTING row, feeding
+    the CLAIM-side busy revalidation. Unlike the PLAN snapshot's split listing->detail
+    pair, a raw `/pulls?state=open` row carries head + draft + auto_merge in ONE
+    response, so the row is its own head-matched "newer detail" for
+    _pull_provably_inactive — synthesizing the status from the same row encodes exactly
+    that atomicity, and keeps the one strict coherence contract in one place instead of
+    a key-presence side channel. Returns None (no status -> the carve-out fails closed
+    to BUSY) when the row does not carry the full latch+draft surface or a well-formed
+    head sha (a projected/partial row must never read as its own confirmation)."""
+    if not isinstance(pull, dict) or "auto_merge" not in pull or "draft" not in pull:
+        return None
+    head_sha = str((pull.get("head") or {}).get("sha", ""))
+    if not SAFE_SHA.fullmatch(head_sha):
+        return None
+    draft = pull.get("draft")
+    return {"head_sha": head_sha,
+            "armed": isinstance(pull.get("auto_merge"), dict),
+            "draft": draft if isinstance(draft, bool) else None}
+
+
+def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, provenance):
+    """[round-4 P1] PURE CLAIM-side re-check of the PLAN busy partition against the LIVE
+    pull listing CLAIM already fetches: the PLAN artifact's freeing decisions are minutes
+    old by the time an item launches, so a parked draft that went ready (or a brand-new
+    worker PR) inside the PLAN->CLAIM window could get a sibling dispatched into a crate
+    it can still merge into. Recomputes the SAME filter_busy_area_items partition over
+    the live raw rows — same linkage (provenance), same hold surfaces (issue labels),
+    with each row serving as its own coherent detail via live_pull_detail_stub — and
+    returns the set of item numbers still dispatchable; the caller DEFERS the rest to
+    the next tick (the fail-closed direction: a busy re-read never launches)."""
+    rows = []
+    for page in pull_pages if isinstance(pull_pages, list) else []:
+        if isinstance(page, list):
+            rows.extend(row for row in page if isinstance(row, dict))
+    live_status = {}
+    for row in rows:
+        number = row.get("number")
+        if isinstance(number, int) and not isinstance(number, bool):
+            stub = live_pull_detail_stub(row)
+            if stub is not None:
+                live_status[number] = stub
+    kept = filter_busy_area_items(items, repo, rows, issue_labels, provenance, live_status)
+    return {item["number"] for item in kept}
+
+
+def _live_issue_labels(repo):
+    """LIVE open-issue label map for the CLAIM-side busy revalidation — the same linkage
+    input the PLAN partition read from its issue snapshot (round-2 P2 parity: the busy
+    union and the enumerator must read the same source-issue hold/area state), re-read
+    from the list API at claim time. PR rows in the issues listing are skipped; a source
+    issue absent from the map (closed in the window) reserves `__global__` inside
+    busy_packages_of_pulls exactly as at PLAN time. Malformed listings raise (the whole
+    repo's claim aborts loudly rather than revalidating against garbage)."""
+    pages = _gh_json(["api", "--paginate", "--slurp",
+                      f"repos/{repo}/issues?state=open&per_page=100"])
+    if not isinstance(pages, list):
+        raise DispatchError("target issue listing is malformed")
+    labels_map = {}
+    for page in pages:
+        if not isinstance(page, list):
+            raise DispatchError("target issue listing page is malformed")
+        for issue in page:
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            number = issue.get("number")
+            if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+                continue
+            labels_map[number] = [
+                label.get("name") for label in (issue.get("labels") or [])
+                if isinstance(label, dict) and isinstance(label.get("name"), str)]
+    return labels_map
+
+
+def _claim_provenance_map(repo, registry_root, ledger_root=""):
+    """Provenance records for `repo`'s worker PRs from the LOCAL checkouts, legacy-first so
+    a ledger record wins any collision — the same precedence the PLAN assemble step uses
+    (issue #96). Pure file reads (no API cost). An unreadable/garbage record is skipped:
+    its PR then reserves fail-closed as missing-linkage inside busy_packages_of_pulls."""
+    owner, name = repo.split("/", 1)
+    pattern = re.compile(rf"{re.escape(owner)}--{re.escape(name)}--pr([1-9][0-9]*)\.json")
+    provenance = {}
+    for root in (registry_root, ledger_root):
+        if not root:
+            continue
+        provenance_dir = Path(root) / "orchestration" / "provenance"
+        if not provenance_dir.is_dir():
+            continue
+        for record_path in sorted(provenance_dir.iterdir()):
+            match = pattern.fullmatch(record_path.name)
+            if not match:
+                continue
+            try:
+                provenance[int(match.group(1))] = json.loads(
+                    record_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+    return provenance
 
 
 def provenance_admission_error(record, pr_number):
@@ -1715,6 +1839,15 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             "api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100"
         ])
         linked_open_prs = _linked_open_pr_issues(pull_pages)
+        # [round-4 P1] PLAN->CLAIM busy-window revalidation: the PLAN partition's freeing
+        # decisions are minutes stale by launch time. Re-prove every item's crate against
+        # the LIVE pull listing just fetched (zero extra pulls-API cost), the live issue
+        # labels, and the local provenance checkouts BEFORE anything launches; an item
+        # whose crate re-reads busy (a parked draft went ready, a new worker PR opened)
+        # defers to the next tick instead of racing a PR that can now merge into it.
+        live_dispatchable = revalidate_items_against_live_pulls(
+            repository["items"], repo, pull_pages, _live_issue_labels(repo),
+            _claim_provenance_map(repo, registry_root, ledger_root))
 
         # Safety invariant FIRST (issue #42): stale arm latches are retracted before any fix or
         # review admission can push onto (or re-review past) an armed, mutated head.
@@ -1727,6 +1860,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             if number in linked_open_prs:
                 defer_reasons["existing-pr"] += 1
                 print(f"defer {repo}#{number}: an open worker/closing PR already exists")
+                continue
+            if number not in live_dispatchable:
+                # [round-4 P1] the crate freed at PLAN time re-read BUSY on the live pull
+                # state — a worker PR went active (or appeared) in the PLAN->CLAIM window.
+                defer_reasons["live-busy-crate"] += 1
+                print(f"defer {repo}#{number}: its crate re-read busy on the live pull "
+                      "state (PLAN->CLAIM window)")
                 continue
             # [OPUS-4.8] Per-item resilience: a single item's trust/route/policy resolution failure
             # must SKIP that item, not abort the whole dispatch (which would strand the other ready
@@ -2402,6 +2542,13 @@ def _self_test():
     assert pr_ci_status({**record, "auto_merge": None})["armed"] is False
     assert pr_ci_status({**record, "head_sha": "zz"}) == {}
     assert pr_ci_status("junk") == {}
+    # [round-4 P1] the detail draft bit is STRICT-bool tri-state: absent (the pre-round-4
+    # record shape) and garbage both degrade to None — unknown never frees a crate.
+    assert pr_ci_status(record)["draft"] is None
+    assert pr_ci_status({**record, "draft": True})["draft"] is True
+    assert pr_ci_status({**record, "draft": False})["draft"] is False
+    assert pr_ci_status({**record, "draft": "yes"})["draft"] is None
+    assert pr_ci_status({**record, "draft": 1})["draft"] is None
     # post-detail degradation (PR #60 round-1): ANY truthy marker forces gate=missing and
     # the check-run payload is ignored OUTRIGHT — so a forged/hostile marker on a record
     # that also smuggles check runs can only stand admissions DOWN (narrows-only); the
@@ -3024,28 +3171,37 @@ def _self_test():
         pull(76, "sparq-agent/issue-81-1-1", sha_a, labels=["review:needs-user"]),
         pull(77, "sparq-agent/issue-82-1-1", sha_a, labels=["review:needs"]),
     ]
+
+    def confirmed_draft(sha=sha_a):
+        # [round-4] the coherent NEWER detail read the carve-out requires: head-matched,
+        # arm bit exactly False, draft CONFIRMED by the detail's own bit (production
+        # shape: plan-snapshot's per-PR pulls/N read via pr_ci_status).
+        return {"head_sha": sha, "armed": False, "draft": True}
+
+    collapse_status = {75: confirmed_draft(), 76: confirmed_draft()}
     assert busy_packages_of_pulls(repo, collapse_pulls, collapse_labels,
-                                  busy_prov) == {"crate-c"}
-    kept = filter_busy_area_items(frontier, repo, collapse_pulls, collapse_labels, busy_prov)
+                                  busy_prov, collapse_status) == {"crate-c"}
+    kept = filter_busy_area_items(frontier, repo, collapse_pulls, collapse_labels, busy_prov,
+                                  collapse_status)
     assert [item["number"] for item in kept] == [70, 71, 73], kept
     # a needs:user PR label parks just as terminally as review:needs-user
     assert filter_busy_area_items(
         frontier, repo, [pull(78, "sparq-agent/issue-81-1-1", sha_a, labels=["needs:user"])],
-        collapse_labels, busy_prov) == frontier
+        collapse_labels, busy_prov, {78: confirmed_draft()}) == frontier
     # the GLOBAL-freeze slice of the same bug: a PARKED PR whose known source issue has no
     # area labels must not reserve the serializing global partition (pre-fix it froze the
     # ENTIRE repo frontier); the unparked twin still does.
     assert filter_busy_area_items(
         frontier, repo, [pull(79, "sparq-agent/issue-84-1-1", sha_a)],
-        {84: ["needs:user", "role:impl"]}, busy_prov) == frontier
+        {84: ["needs:user", "role:impl"]}, busy_prov, {79: confirmed_draft()}) == frontier
     assert filter_busy_area_items(
         frontier, repo, [pull(79, "sparq-agent/issue-84-1-1", sha_a)],
-        {84: ["role:impl"]}, busy_prov) == []
+        {84: ["role:impl"]}, busy_prov, {79: confirmed_draft()}) == []
     # a parked PR's own area:* labels are discarded with it (the whole PR is terminal)
     assert filter_busy_area_items(
         frontier, repo, [pull(78, "sparq-agent/issue-81-1-1", sha_a,
                               labels=["needs:user", "area:crate-d"])],
-        collapse_labels, busy_prov) == frontier
+        collapse_labels, busy_prov, {78: confirmed_draft()}) == frontier
 
     # ---- [round-3 P1, drafts-only] HELD != INACTIVE: a human-parked PR frees its crates
     # ONLY when it is a provably-inert DRAFT. Round 2 also freed a parked NON-draft on an
@@ -3091,15 +3247,63 @@ def _self_test():
                                  labels=["review:needs-user"]), **synthetic)
 
     latched = {"enabled_by": {"login": bot}, "merge_method": "squash"}
-    # parked DRAFT, no visible latch — the production frontier-collapse population
-    # (26/27 open sparq worker PRs on 2026-07-18): provably inert, frees its crate
+    # parked DRAFT with a coherent confirming detail — the production frontier-collapse
+    # population (26/27 open sparq worker PRs on 2026-07-18): provably inert, frees its
+    # crate. The detail record is REQUIRED since round 4 (see the split-race block below).
     assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
-                                  busy_prov) == set()
+                                  busy_prov, {76: confirmed_draft()}) == set()
+    # ... and the SAME confirmation in the production record shape end-to-end: a raw
+    # plan-snapshot detail record interpreted by pr_ci_status carries the draft bit.
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
+                           "draft": True, "check_runs": []})}) == set()
     # parked DRAFT whose fresher PLAN detail record says the arm is still latched: a
     # crashed-disarm artifact — busy (pr_status is the production-visible latch signal;
     # the snapshot row itself carries no auto_merge field)
     assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels, busy_prov,
                                   {76: {"head_sha": sha_a, "armed": True}}) == {"crate-b"}
+    # ---- [round-4 P1] SPLIT-SNAPSHOT RACE: the pulls LISTING (draft bit) predates the
+    # per-PR detail read; a draft that flipped ready(->queued) between the two reads
+    # presents as stale listing draft=True + a newer unlatched detail. The carve-out
+    # frees ONLY on a coherent, head-matched detail CONFIRMING draft — every incoherent
+    # shape below stays BUSY (fail closed). ----
+    # (a) detail record entirely ABSENT (pre-detail snapshot skip / census overflow /
+    #     PLAN handed no pr_status at all): unconfirmable — busy both call shapes
+    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
+                                  busy_prov) == {"crate-b"}
+    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
+                                  busy_prov, {}) == {"crate-b"}
+    # (b) newer detail is NON-DRAFT-shaped (draft went ready in the window — the exact
+    #     race): busy, in the hand-rolled AND the production pr_ci_status record shape
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: {"head_sha": sha_a, "armed": False, "draft": False}}) == {"crate-b"}
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
+                           "draft": False, "check_runs": []})}) == {"crate-b"}
+    # (c) detail's draft field ABSENT (the pre-round-4 record shape): proves nothing — busy
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: {"head_sha": sha_a, "armed": False}}) == {"crate-b"}
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
+                           "check_runs": []})}) == {"crate-b"}
+    # (d) HEAD-MISMATCHED detail (the head moved between the reads: the listing row —
+    #     including its draft bit — is stale): busy even though the detail says draft
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: confirmed_draft(sha_b)}) == {"crate-b"}
+    # (e) unknown/garbage arm bit on an otherwise-confirming detail: busy (only an
+    #     explicit armed=False frees; absent is unknown, never inert)
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: {"head_sha": sha_a, "draft": True}}) == {"crate-b"}
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: {"head_sha": sha_a, "armed": None, "draft": True}}) == {"crate-b"}
     # parked DRAFT with a synthetic auto_merge dict (raw-REST defense in depth, NOT a
     # snapshot field): same crashed-disarm artifact — busy
     assert busy_packages_of_pulls(repo, [parked_draft(auto_merge=latched)],
@@ -3130,11 +3334,11 @@ def _self_test():
         repo, [snapshot_row(75, "sparq-agent/issue-80-1-1", draft=False,
                             labels=["review:needs"])],
         collapse_labels, busy_prov) == {"crate-a"}
-    # ...while its parked-DRAFT twin frees it
+    # ...while its detail-confirmed parked-DRAFT twin frees it
     assert busy_packages_of_pulls(
         repo, [snapshot_row(75, "sparq-agent/issue-80-1-1", draft=True,
                             labels=["review:needs"])],
-        collapse_labels, busy_prov) == set()
+        collapse_labels, busy_prov, {75: confirmed_draft()}) == set()
 
     # ---- [round-2 P2] LINKAGE PARITY: when the branch-derived and provenance-derived
     # source issues differ, the busy result must mirror the enumerator's classification in
@@ -3151,18 +3355,112 @@ def _self_test():
     assert [(item["pr_number"], item["package"]) for item in cross_items] \
         == [(85, "crate-c")], cross_items
     # Direction 2 — branch says LIVE issue 82, provenance says PARKED issue 80: the
-    # enumerator skips it (human-owned), and the provably-inert draft frees its crates the
-    # same way (pre-fix the branch-derived linkage kept crate-c reserved -> frontier
-    # collapse preserved).
+    # enumerator skips it (human-owned), and the detail-confirmed provably-inert draft
+    # frees its crates the same way (pre-fix the branch-derived linkage kept crate-c
+    # reserved -> frontier collapse preserved).
     cross_parked = pull(86, "sparq-agent/issue-82-1-1", sha_a, labels=["review:needs"])
     assert busy_packages_of_pulls(repo, [cross_parked], collapse_labels,
-                                  busy_prov) == set()
+                                  busy_prov, {86: confirmed_draft()}) == set()
     assert enumerate_review_items(repo, [cross_parked], busy_prov, [],
                                   collapse_labels, now) == []
     # ... and the SAME divergent-linkage PR with the arm latched stays busy on the
     # provenance-linked crate (P1's HELD != INACTIVE composes with P2's parity)
     assert busy_packages_of_pulls(repo, [dict(cross_parked, auto_merge=latched)],
                                   collapse_labels, busy_prov) == {"crate-a"}
+
+    # ---- [round-4 P1] CLAIM-side PLAN->CLAIM revalidation over the LIVE pull listing ----
+    def live_row(number, ref, *, draft, auto_merge=None, labels=(), sha=sha_a):
+        # a raw `/pulls?state=open` listing row: unlike the PLAN projection it carries
+        # BOTH `draft` and `auto_merge` from the same single read
+        return dict(pull(number, ref, sha, draft=draft, labels=labels),
+                    auto_merge=auto_merge)
+
+    parked_live = live_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                           labels=["review:needs-user"])
+    # a full raw row is its own coherent head-matched detail...
+    assert live_pull_detail_stub(parked_live) == \
+        {"head_sha": sha_a, "armed": False, "draft": True}
+    assert live_pull_detail_stub(dict(parked_live, auto_merge=latched))["armed"] is True
+    assert live_pull_detail_stub(dict(parked_live, draft="yes"))["draft"] is None
+    # ...but a partial/projected row never self-confirms (missing latch or draft surface,
+    # or a malformed head sha -> None -> the carve-out fails closed to BUSY)
+    assert live_pull_detail_stub(pull(76, "sparq-agent/issue-81-1-1", sha_a)) is None
+    assert live_pull_detail_stub(
+        {k: v for k, v in parked_live.items() if k != "draft"}) is None
+    assert live_pull_detail_stub(live_row(76, "x", draft=True, sha="zz")) is None
+    assert live_pull_detail_stub("junk") is None
+
+    # the revalidation recomputes the SAME partition over the live rows: a parked draft
+    # (unlatched, single-read-confirmed) still frees its crate at CLAIM time...
+    assert revalidate_items_against_live_pulls(
+        frontier, repo, [[parked_live]], collapse_labels, busy_prov) \
+        == {70, 71, 72, 73}
+    # ...the EXACT round-4 window race — the same PR re-read NON-draft (went ready
+    # between PLAN and CLAIM) — re-reserves crate-b and defers item 71...
+    assert revalidate_items_against_live_pulls(
+        frontier, repo, [[dict(parked_live, draft=False)]], collapse_labels,
+        busy_prov) == {70, 72, 73}
+    # ...a re-latched arm on the live row re-reserves the same way...
+    assert revalidate_items_against_live_pulls(
+        frontier, repo, [[dict(parked_live, auto_merge=latched)]], collapse_labels,
+        busy_prov) == {70, 72, 73}
+    # ...a brand-new LIVE worker PR invisible to the PLAN reserves its crate...
+    assert revalidate_items_against_live_pulls(
+        frontier, repo,
+        [[parked_live], [live_row(77, "sparq-agent/issue-82-1-1", draft=False)]],
+        collapse_labels, busy_prov) == {70, 71, 73}
+    # ...and non-list pages / non-dict rows are skipped (the listing was already
+    # shape-validated by _linked_open_pr_issues before this runs)
+    assert revalidate_items_against_live_pulls(
+        frontier, repo, [None, ["junk"], [parked_live]], collapse_labels, busy_prov) \
+        == {70, 71, 72, 73}
+
+    # the local provenance map mirrors the PLAN precedence: legacy-first, ledger wins
+    with tempfile.TemporaryDirectory() as prov_tmp:
+        for root, issue_n in (("legacy", 81), ("ledger", 99)):
+            prov_dir = Path(prov_tmp) / root / "orchestration" / "provenance"
+            prov_dir.mkdir(parents=True)
+            (prov_dir / "example--repo--pr76.json").write_text(
+                json.dumps(busy_record(76, issue_n)), encoding="utf-8")
+        legacy_root = str(Path(prov_tmp) / "legacy")
+        ledger_dir = str(Path(prov_tmp) / "ledger")
+        assert _claim_provenance_map(repo, legacy_root)[76]["issue"] == 81
+        assert _claim_provenance_map(repo, legacy_root, ledger_dir)[76]["issue"] == 99
+        # garbage records and foreign names are skipped, not fatal (the PR then
+        # reserves fail-closed as missing-linkage)
+        prov_dir = Path(prov_tmp) / "legacy" / "orchestration" / "provenance"
+        (prov_dir / "example--repo--pr77.json").write_text("{not json", encoding="utf-8")
+        (prov_dir / "other--repo--pr9.json").write_text("{}", encoding="utf-8")
+        assert set(_claim_provenance_map(repo, legacy_root)) == {76}
+        assert _claim_provenance_map(repo, str(Path(prov_tmp) / "absent")) == {}
+
+    # the live issue-label read: PR rows skipped, malformed listings fail LOUD
+    prev_live_gh = globals()["_gh_json"]
+    try:
+        globals()["_gh_json"] = lambda args: [[
+            {"number": 81, "labels": [{"name": "area:crate-b"}, {"name": "needs:user"}]},
+            {"number": 90, "labels": [{"name": "x"}], "pull_request": {}},
+            {"number": "bad", "labels": []},
+            {"number": 82, "labels": [{"name": 5}, "loose", {"name": "role:impl"}]},
+        ]]
+        assert _live_issue_labels(repo) == {81: ["area:crate-b", "needs:user"],
+                                            82: ["role:impl"]}
+        globals()["_gh_json"] = lambda args: "garbage"
+        try:
+            _live_issue_labels(repo)
+        except DispatchError:
+            pass
+        else:
+            raise AssertionError("a malformed live issue listing must fail loud")
+        globals()["_gh_json"] = lambda args: ["garbage-page"]
+        try:
+            _live_issue_labels(repo)
+        except DispatchError:
+            pass
+        else:
+            raise AssertionError("a malformed live issue page must fail loud")
+    finally:
+        globals()["_gh_json"] = prev_live_gh
 
     # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
     deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]
