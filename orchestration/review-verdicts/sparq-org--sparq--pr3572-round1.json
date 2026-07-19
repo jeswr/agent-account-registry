@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "checkout@v4, dtolnay/rust-toolchain@stable, Swatinem/rust-cache@v2, and actions/upload-artifact@v4 are pinned to mutable refs. Every other uses: in the repository (~30 workflows) is pinned to a 40-hex commit SHA with a trailing '# vX' comment (verified: a grep for @v-/@stable/@main refs across all workflows matched only this new file). The repo documents this as a 'code-scanning=0 SHA-pin policy' (scripts/check-install-action-tool.py header) and attests OpenSSF Scorecard Pinned-Dependencies (scorecard.yml: 'Third-party actions pinned by full commit SHA'). @stable is a moving branch and rust-cache is third-party, so a compromised or force-moved tag would execute arbitrary code in CI. This introduces a code-scanning Pinned-Dependencies alert and regresses an attested security posture. Only the taiki-e/install-action step is correctly SHA-pinned.",
+   "file": ".github/workflows/mutants-diff.yml",
+   "fix_hint": "Replace the four refs with the exact 40-hex SHAs already used elsewhere in the repo (grep other workflows): actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2, actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1. Keep the trailing version comment so dependabot can still update them.",
+   "severity": "major",
+   "title": "4 of 5 actions use mutable tags/branches instead of full-SHA pins, breaking the repo-wide pinning policy"
+  }
+ ],
+ "progress": null,
+ "summary": "New advisory-only mutation-testing lane (workflow + shell script + registry entry) for changed Rust code. The design is sound: it is a genuinely non-gating advisory job (job name contains \"advisory\" so ci-summary excludes it; continue-on-error at job and step level), correctly registered in advisory-registry.json with the required {owner_bead, promotion_criteria, registered} fields, triggered by pull_request (not pull_request_target) with contents:read and no secret exposure. The deterministic cap invariant is mathematically correct: SHARDS=ceil(TOTAL/CAP) and shard 0 holds at most ceil(TOTAL/SHARDS) <= CAP mutants; input validation on CAP/TIMEOUT, empty-diff and zero-mutant paths, and survivor counting from mutants.out/missed.txt are all handled. The taiki-e/install-action step is SHA-pinned AND carries with:tool:, so it satisfies the gated check-install-action-tool.py lint. One real problem blocks approval: 4 of the 5 actions use mutable tags/branches (checkout@v4, dtolnay/rust-toolchain@stable, Swatinem/rust-cache@v2, upload-artifact@v4) whereas every other uses: across the ~30 workflows in the repo is pinned to a full 40-hex commit SHA. This violates the documented code-scanning=0 SHA-pin policy and regresses the OpenSSF Scorecard Pinned-Dependencies posture the repo explicitly attests (scorecard.yml). rust-toolchain@stable in particular is a moving branch and rust-cache is third-party, so this is a supply-chain exposure, not just a style nit.",
+ "verdict": "request_changes"
+}
