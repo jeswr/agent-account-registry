@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The prior major finding is resolved. `_ops_alert` now wraps the complete delivery path, including the throwing `_gh_json` lookup and response-shape handling, so alert failures cannot replace the terminal registry-write error. The added self-test exercises the real helper with a deliberately raising lookup and verifies that the original PUT stderr remains in the surfaced `WorkerPrError`, making the regression check non-vacuous. The retry backoff remains bounded, occurs only between attempts, and its tests meaningfully cover timing hooks and the terminal alert. I found no new correctness, fail-closed, test-validity, or security issue in the diff.",
+ "verdict": "approve"
+}
