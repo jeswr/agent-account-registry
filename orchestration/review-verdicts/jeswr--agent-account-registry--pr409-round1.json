@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 409,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3acd4ea1ac8da0fcaf6e2d453aee0fcba85c42d3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly removes the job-wide GitHub token from the login job, restores it only on steps that actually use the default GitHub identity, disables checkout credential persistence, and explicitly strips all recognized GitHub credential variables from npm lifecycle execution and the provider-login subprocess. The background login command receives the sanitized environment while the surrounding trusted shell retains GH_TOKEN for the subsequent issue comment. The activation checkout is also hardened without changing its API authentication path. No trust check is weakened, the workflow remains fail-closed, action pins and least-privilege job permissions are preserved, and no hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
