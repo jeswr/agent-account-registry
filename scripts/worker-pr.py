@@ -808,7 +808,10 @@ def set_review_state(repo, pr_number, state):
     means a crash can only ever leave a SUPERSET of review labels (never zero), which the two
     guards above then converge on the next read. No atomic label CAS exists, so a hold landing in
     the read-to-write gap is the residual TOCTOU window tracked in issue #294 — now narrowed from
-    the whole outcome step down to this primitive."""
+    the whole outcome step down to this primitive. To keep that window fail-closed, the removes
+    delete only the stale labels OBSERVED in the validated snapshot: a review:needs-user (or any
+    review:* label) that lands AFTER the live read is never in `live_review`, so it is never
+    deleted — it survives to be converged on the next read instead of being silently erased."""
     label = f"review:{state}"
     if label not in REVIEW_LABELS:
         raise WorkerPrError(f"unknown review state {state}")
@@ -826,7 +829,7 @@ def set_review_state(repo, pr_number, state):
         ["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels", "--input", "-"],
         input_doc={"labels": [label]},
     )
-    for other in REVIEW_LABELS:
+    for other in live_review:
         if other != label:
             _remove_label(repo, pr_number, other)
     print(f"PR review state: {state}")
@@ -2521,6 +2524,28 @@ def _self_test():
               norm_posted, [["review:changes"]])
         check("normal transition never deletes the label it just applied",
               "review:changes" in norm_removed, False)
+        # The DECISIVE interleaving (issue #138 / #294): a human applies review:needs-user AFTER
+        # the live read but BEFORE the removes. The away transition must delete only the stale
+        # labels it OBSERVED, so the freshly-landed hold survives (converged on the next read).
+        # The POST hook injects the concurrent hold; a regression that removed the whole
+        # REVIEW_LABELS set instead of only the observed ones would erase it right here.
+        def srs_gh_racing_hold(args, **kwargs):
+            if "-X" in args and "POST" in args:
+                srs_state["posted"].append(kwargs.get("input_doc", {}).get("labels"))
+                srs_state["live"] = srs_state["live"] + [{"name": "review:needs-user"}]
+                return {}
+            return srs_state["live"]
+
+        srs_globals["_gh_json"] = srs_gh_racing_hold
+        srs_state["live"] = [{"name": "review:needs"}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        set_review_state("o/r", 5, "changes")
+        check("a hold landing after the live read is not erased",
+              "review:needs-user" in srs_state["removed"], False)
+        check("the away transition still removes only the stale label it observed",
+              srs_state["removed"], ["review:needs"])
+        srs_globals["_gh_json"] = srs_gh
+
         # A malformed live label payload fails closed (RAISES) instead of reading as no-hold.
         malformed_failed_closed = False
         try:
