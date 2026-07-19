@@ -141,6 +141,24 @@
 #     quiesced writer workflows. Tries ALL four before failing (one failure never leaves the
 #     rest disabled) and any failure names the manual remediation.
 #
+#   ATTEMPT GATE — ALL FOUR PHASES (sol round-11 finding — M0c is NOT attempt-aware):
+#     GITHUB_RUN_ID is CONSTANT across `gh run rerun` attempts while GITHUB_RUN_ATTEMPT
+#     increments, so a RE-RUN of an old migrate run fetches the ORIGINAL attempt's created_at
+#     and total-orders the quiesce/resume history against THAT instant — every resume/Q2 event
+#     that landed AFTER the original queue is excluded from the order by the strictly-precedes
+#     filter, while the re-run attempt's own secrets-snapshot timing diverges from that
+#     timestamp: M0c would attest an ordering that held for attempt 1, not for THIS attempt.
+#     Rather than make the attestation attempt-aware, re-runs are PROHIBITED outright (the
+#     simplest total kill): every phase asserts GITHUB_RUN_ATTEMPT == 1 as its FIRST check —
+#     before setup, before any gh invocation — and fails closed otherwise: "re-runs are
+#     prohibited for this workflow (queue-time attestation is attempt-unaware) — dispatch a
+#     FRESH run of this phase". An UNSET GITHUB_RUN_ATTEMPT fails closed the same way (absent
+#     is NEVER assumed to mean attempt 1 — pinned semantics). Recovery is always a fresh
+#     workflow_dispatch of the same phase (cheap; the two-run protocol + total-order
+#     attestation then apply cleanly at the fresh queue time). GITHUB_RUN_ATTEMPT is the
+#     runner's default env var, exactly like GITHUB_RUN_ID — the workflow does not (and, the
+#     GITHUB_* prefix being reserved, cannot) re-map it.
+#
 # Any other inconsistency is a hard fail with a distinct message. Secret VALUES are never echoed,
 # never traced, never placed in argv; only NAMES are printed.
 #
@@ -187,7 +205,14 @@
 # with zero mutations and V2 untouched, for the main AND cleanup phases), newest-event-is-a-
 # RESUME -> fail closed, newest-event-is-an-IN-PROGRESS-quiesce (null conclusion) -> fail
 # closed; reverting the event filter to the old success-only-quiesce selection turns all of
-# them red (the harness shows the V2 values being destroyed). The suite also STATICALLY pins the WORKFLOW's
+# them red (the harness shows the V2 values being destroyed). Round 11: RE-RUN PROHIBITED —
+# GITHUB_RUN_ATTEMPT=2 on EVERY phase fails closed with ZERO gh invocations (the gate precedes
+# every call); an UNSET GITHUB_RUN_ATTEMPT fails closed identically (absent never means 1);
+# and sol's exact re-run sequence (attempt=2 presenting the ORIGINAL attempt's created_at with
+# a NEWER resume + failed-Q2 history the strictly-precedes filter excludes, every repo value
+# rotated to V2) must fail closed with V2 untouched — commenting out the assert_first_attempt
+# calls lets that scenario reach the mutation stage (rc 0, 26 mutations, V2 destroyed), which
+# the harness turns red. The suite also STATICALLY pins the WORKFLOW's
 # declared mint grants (round-4 finding 3: the fake-gh model alone never noticed a permission
 # line deleted from migrate-secrets-to-env.yml): check_workflow_mint_contract asserts all FOUR
 # mint steps' exact phase-specific `permission-*` sets and goes red on any
@@ -246,6 +271,24 @@ setup() {
   [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
     || die 'REGISTRY_REPO is unsafe or unset (fail closed)'
   [[ "$ENV_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die 'SECRETS_ENV is unsafe (fail closed)'
+}
+
+# ATTEMPT GATE (sol round-11 finding — M0c is NOT attempt-aware): GITHUB_RUN_ID stays CONSTANT
+# across `gh run rerun` attempts while GITHUB_RUN_ATTEMPT increments, so a re-run of an old
+# migrate run would fetch the ORIGINAL attempt's created_at and total-order the quiesce/resume
+# history against THAT instant — every resume/Q2 event newer than the original queue excluded —
+# while this attempt's own secrets-snapshot timing diverges from that timestamp. Total kill:
+# EVERY phase calls this FIRST (before setup, before any gh invocation) and fails closed on
+# anything but a literal attempt 1. An UNSET GITHUB_RUN_ATTEMPT fails closed too — absent is
+# NEVER assumed to mean attempt 1 (pinned by the self-test's absent scenarios). Recovery is a
+# FRESH workflow_dispatch of the same phase; never a re-run.
+assert_first_attempt() {
+  local attempt=${GITHUB_RUN_ATTEMPT:-}
+  [[ -n "$attempt" ]] \
+    || die "GITHUB_RUN_ATTEMPT is unset — cannot prove this is a fresh attempt-1 run (absent is NEVER assumed to mean attempt 1), and re-runs are prohibited for this workflow (queue-time attestation is attempt-unaware) — dispatch a FRESH run of this phase (fail closed before any API call)"
+  [[ "$attempt" == "1" ]] \
+    || die "GITHUB_RUN_ATTEMPT is ${attempt}, not 1 — re-runs are prohibited for this workflow (queue-time attestation is attempt-unaware: GITHUB_RUN_ID is constant across re-runs, so the M0c total order would run against the ORIGINAL attempt's created_at while this attempt's secrets-snapshot timing diverges from it) — dispatch a FRESH run of this phase (fail closed before any API call)"
+  printf 'attempt gate: GITHUB_RUN_ATTEMPT == 1 (fresh dispatch — re-runs are prohibited for this workflow)\n'
 }
 
 # The five NONTERMINAL run statuses GitHub models (round-6 finding 2), filtered CLIENT-SIDE
@@ -402,6 +445,8 @@ assert_quiesce_completed_before_queue() {
 # The SECRET-FREE first run of the two-run protocol (round-8 finding 1): its workflow job maps
 # no S_* input and mints Actions:write ONLY — it cannot read or move a secret even if buggy.
 phase_quiesce() {
+  echo '== attempt gate (round 11): this must be attempt 1 — re-runs are prohibited =='
+  assert_first_attempt
   setup
   echo '== phase Q1: disable the 4 secret-writer workflows (no NEW writer run can start after this) =='
   quiesce_writers
@@ -411,6 +456,8 @@ phase_quiesce() {
 }
 
 phase_main() {
+  echo '== attempt gate (round 11): this must be attempt 1 — re-runs are prohibited =='
+  assert_first_attempt
   setup
   echo '== phase M0a: quiesce gate — the 4 writers must already be disabled by a quiesce RUN (two-run protocol) =='
   assert_writers_quiesced
@@ -528,6 +575,8 @@ phase_main() {
 }
 
 phase_cleanup() {
+  echo '== attempt gate (round 11): this must be attempt 1 — re-runs are prohibited =='
+  assert_first_attempt
   setup
   echo '== phase C0: quiesce gate + coherent drain check + ordering attestation (same fail-closed gate as the main phase) =='
   assert_writers_quiesced
@@ -617,6 +666,8 @@ phase_cleanup() {
 # Tries ALL four before failing so one failure never leaves the rest disabled; idempotent
 # (enabling an enabled workflow succeeds).
 phase_resume() {
+  echo '== attempt gate (round 11): this must be attempt 1 — re-runs are prohibited =='
+  assert_first_attempt
   setup
   echo '== phase R: re-enable the 4 quiesced secret-writer workflows (always path) =='
   local wf failures=0
@@ -955,6 +1006,13 @@ FAKE
     # GITHUB_RUN_ID: the round-9 ordering attestation fetches this run's created_at from it
     # (in production it is the runner's default env var; fixed here so the fake can model it).
     local -a assigns=(PATH="$tmp/bin:$PATH" FAKE_GH_STATE="$state" REGISTRY_REPO=o/r GITHUB_RUN_ID=7777)
+    # GITHUB_RUN_ATTEMPT (round 11): every child models a FRESH attempt-1 dispatch unless the
+    # caller overrides RUN_ATTEMPT_OVERRIDE (a number, or 'absent' to model the variable
+    # missing entirely). The `env -u` below strips any value inherited from a REAL Actions
+    # runner first, so the harness stays hermetic where GITHUB_RUN_ATTEMPT is always set.
+    if [[ "${RUN_ATTEMPT_OVERRIDE:-1}" != absent ]]; then
+      assigns+=("GITHUB_RUN_ATTEMPT=${RUN_ATTEMPT_OVERRIDE:-1}")
+    fi
     local n
     for n in "${names[@]}"; do
       case "$mode" in
@@ -973,7 +1031,7 @@ FAKE
     done
     [[ -n "$empty_name" ]] && assigns+=("S_${empty_name}=")
     local rc=0
-    env "${assigns[@]}" bash "$me" --phase "$phase" > "$out" 2>&1 || rc=$?
+    env -u GITHUB_RUN_ATTEMPT "${assigns[@]}" bash "$me" --phase "$phase" > "$out" 2>&1 || rc=$?
     printf '%s' "$rc"
   }
 
@@ -1831,6 +1889,91 @@ FAKE
     "$(grep -c 'the latest quiesce attempt has not CONCLUDED' "$tmp/s25c.out")" 1
   chk "newest-is-in-progress: zero mutations" \
     "$(grep -cE '^secret (set|delete) ' "$s25c/calls.log" || true)" 0
+
+  # --- scenario 26: RE-RUN PROHIBITED, EVERY PHASE (sol round 11 — M0c is not attempt-aware):
+  # GITHUB_RUN_ID is constant across re-runs while GITHUB_RUN_ATTEMPT increments, so a re-run
+  # would total-order the quiesce/resume history against the ORIGINAL attempt's created_at.
+  # The kill is total: each of the four phases asserts attempt 1 FIRST and fails closed on
+  # attempt 2 with ZERO gh invocations (the gate precedes setup and every API call — calls.log
+  # is never even created), naming the prohibition + the fresh-dispatch recovery.
+  local ph s26 s26b
+  for ph in quiesce main cleanup-bootstrap resume-writers; do
+    s26="$tmp/s26-$ph"
+    mkdir -p "$s26"
+    seed_quiesced "$s26"
+    printf '%s\n' "${names[@]}" > "$s26/repo_secrets"
+    : > "$s26/env_secrets"
+    rc=$(RUN_ATTEMPT_OVERRIDE=2 run_case "$s26" "$tmp/s26-$ph.out" "$ph" all)
+    chk "re-run (attempt 2) on phase ${ph} -> fail closed" "$rc" 1
+    chk "re-run (attempt 2) on phase ${ph}: names the prohibition + fresh-dispatch recovery" \
+      "$(grep -c 're-runs are prohibited for this workflow (queue-time attestation is attempt-unaware' "$tmp/s26-$ph.out")-$(grep -c 'dispatch a FRESH run of this phase' "$tmp/s26-$ph.out")" 1-1
+    chk "re-run (attempt 2) on phase ${ph}: ZERO gh invocations (no calls.log ever created)" \
+      "$(test -e "$s26/calls.log" && echo exists || echo absent)" absent
+  done
+
+  # --- scenario 26b: GITHUB_RUN_ATTEMPT ABSENT — PINNED fail-closed semantics: outside a real
+  # runner (or under a harness that strips the default env) a phase cannot prove it is a fresh
+  # dispatch, and absent is NEVER assumed to mean attempt 1. Same zero-invocation refusal on
+  # every phase.
+  for ph in quiesce main cleanup-bootstrap resume-writers; do
+    s26b="$tmp/s26b-$ph"
+    mkdir -p "$s26b"
+    seed_quiesced "$s26b"
+    printf '%s\n' "${names[@]}" > "$s26b/repo_secrets"
+    : > "$s26b/env_secrets"
+    rc=$(RUN_ATTEMPT_OVERRIDE=absent run_case "$s26b" "$tmp/s26b-$ph.out" "$ph" all)
+    chk "GITHUB_RUN_ATTEMPT absent on phase ${ph} -> fail closed (absent never means attempt 1)" "$rc" 1
+    chk "GITHUB_RUN_ATTEMPT absent on phase ${ph}: distinct unset message" \
+      "$(grep -c 'GITHUB_RUN_ATTEMPT is unset' "$tmp/s26b-$ph.out")" 1
+    chk "GITHUB_RUN_ATTEMPT absent on phase ${ph}: ZERO gh invocations" \
+      "$(test -e "$s26b/calls.log" && echo exists || echo absent)" absent
+  done
+
+  # --- scenario 26c: SOL'S RE-RUN SEQUENCE (round-11 non-vacuity — the exact state an
+  # attempt-2 re-run presents to M0a/M0b/M0c): the ORIGINAL migrate run was queued at 12:00
+  # behind a good quiesce (completed 11:50) and failed for an unrelated reason; later a resume
+  # re-enabled the writers (13:00) and a Q2 quiesce attempt FAILED its drain (14:00 -> 14:10);
+  # the writers ended up disabled again (M0a passes, M0b drained) and every repo value rotated
+  # to V2. NOW the old run is RE-RUN: GITHUB_RUN_ID is unchanged, so M0c fetches the ORIGINAL
+  # created_at (12:00) and its strictly-precedes filter EXCLUDES the newer resume + failed-Q2
+  # events — the stale attestation would PASS on the 11:50 quiesce while this attempt's secret
+  # snapshot timing diverges from that queue instant. Only the attempt gate stands between
+  # this state and the mutation stage: attempt=2 must fail closed with ZERO gh invocations and
+  # the rotated V2 values untouched. MUTATION CHECK: comment out the assert_first_attempt
+  # calls and THIS scenario goes red (rc 0, 26 mutations, the V2 repo values destroyed) — the
+  # harness proves the gate is load-bearing, not decorative.
+  local s26c="$tmp/s26c"
+  mkdir -p "$s26c"
+  seed_quiesced "$s26c"
+  printf '2026-07-18T12:00:00Z\n' > "$s26c/run_created"
+  printf '%s\n' \
+    '[{"databaseId":7000,"displayTitle":"migrate-secrets [quiesce]","conclusion":"success","createdAt":"2026-07-18T11:40:00Z","updatedAt":"2026-07-18T11:50:00Z"},' \
+    ' {"databaseId":7001,"displayTitle":"migrate-secrets [resume]","conclusion":"success","createdAt":"2026-07-18T13:00:00Z","updatedAt":"2026-07-18T13:03:00Z"},' \
+    ' {"databaseId":7002,"displayTitle":"migrate-secrets [quiesce]","conclusion":"failure","createdAt":"2026-07-18T14:00:00Z","updatedAt":"2026-07-18T14:10:00Z"}]' \
+    > "$s26c/wf_runs"
+  printf '%s\n' "${names[@]}" > "$s26c/repo_secrets"
+  for n in "${names[@]}"; do printf '%s=v2-%s\n' "$n" "$n"; done > "$s26c/repo_values"
+  : > "$s26c/env_secrets"
+  rc=$(RUN_ATTEMPT_OVERRIDE=2 run_case "$s26c" "$tmp/s26c.out" main all)
+  chk "sol re-run sequence (attempt 2, stale created_at vs newer resume+Q2 history) -> fail closed" "$rc" 1
+  chk "sol re-run sequence: the prohibition message names the fresh-dispatch recovery" \
+    "$(grep -c 'dispatch a FRESH run of this phase' "$tmp/s26c.out")" 1
+  chk "sol re-run sequence: ZERO gh invocations (the stale M0c attestation is never even consulted)" \
+    "$(test -e "$s26c/calls.log" && echo exists || echo absent)" absent
+  chk "sol re-run sequence: the rotated V2 repo values survive untouched" \
+    "$(grep -c '=v2-' "$s26c/repo_values")" 14
+  # ... and an attempt-2 re-run of the CLEANUP phase fails closed identically (its C0 gate
+  # shares M0c, so it shares the attempt-unawareness — and the total kill).
+  local s26d="$tmp/s26d"
+  mkdir -p "$s26d"
+  seed_quiesced "$s26d"
+  cp "$s26c/run_created" "$s26d/run_created"
+  cp "$s26c/wf_runs" "$s26d/wf_runs"
+  printf '%s\n' "${names[@]}" > "$s26d/env_secrets"
+  printf '%s\n' "${bootstrap[@]}" > "$s26d/repo_secrets"
+  rc=$(RUN_ATTEMPT_OVERRIDE=2 run_case "$s26d" "$tmp/s26d.out" cleanup-bootstrap none)
+  chk "sol re-run sequence (cleanup): fail closed with zero invocations" \
+    "$rc-$(test -e "$s26d/calls.log" && echo exists || echo absent)" 1-absent
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'migrate-secrets self-test PASSED\n'
