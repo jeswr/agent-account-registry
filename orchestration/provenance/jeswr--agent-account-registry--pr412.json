@@ -1,0 +1,9 @@
+{
+ "head_sha_at_open": "2f13ada883dfc275931bdd4aa13238ee30123656",
+ "impl_account_h": "9e13ea21abf27e68",
+ "impl_alias": "opus",
+ "impl_provider": "anthropic",
+ "issue": 131,
+ "pr_number": 412,
+ "recorded_at_run": "29685646156.1"
+}
