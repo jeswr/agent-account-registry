@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3588,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3a08ed5f9df890140bbf8c076901907f9a751ac9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`CapturedCarHireManifest` serializes `{type,note,capturedAt,subProofs}`. The existing `CapturedManifest` consumed by `site/src/lib/zk-prover.ts` requires `{type,note,circuit,capturedAt,subProof}` and `verifyCapturedManifest` reads the singular proof. Consequently this output cannot be consumed by the fallback that the module docs, README, and skill explicitly identify as its consumer. The unit test merely checks that the new keys exist and never deserializes through or invokes the real consumer, so it cannot catch this incompatibility.",
+    "file": "crates/sparq-zk-compose/src/capture.rs",
+    "fix_hint": "Either preserve the currently consumed singular schema (including `circuit`) until the site supports multiple proofs, or update the site consumer and fixture in the same PR to accept and verify `subProofs`. Add a contract test against the actual TypeScript/fixture schema rather than only asserting selected JSON substrings, and adjust the docs to describe only compatibility that exists in the landed change.",
+    "severity": "major",
+    "title": "Serialized manifest does not match the browser consumer schema"
+   },
+   {
+    "body": "When `nargo` or `bb` is unavailable, the test returns normally and is reported as passing. This means the claimed real `CircuitProver -> capture` path is typically untested by ordinary runs, while the toolchain-free tests use synthetic `ProofArtifacts` and cannot detect changes in bb's emitted artifact format.",
+    "file": "crates/sparq-zk-compose/tests/capture_car_hire.rs",
+    "fix_hint": "Run the native round-trip in a toolchain-equipped CI lane with an explicit required environment marker, and fail that lane if the tools are absent. Keep the lightweight synthetic tests for default CI, but do not treat a runtime early return as coverage of the real seam.",
+    "severity": "minor",
+    "title": "Native integration test silently passes without exercising the native path"
+   }
+  ],
+  "progress": null,
+  "summary": "The capture helper's field-word conversion is reasonable and fail-closed, and the external-audit caveats are appropriately explicit. However, the newly serialized manifest is not the JSON contract currently consumed by the cited browser fallback: the site expects singular `subProof` plus `circuit`, while this change emits plural `subProofs` and omits `circuit`. Thus the public docs and API claim an end-to-end consumer compatibility that does not exist. The only native prove/capture test also returns success when the toolchain is absent, so normal CI does not validate the real seam.",
+  "verdict": "request_changes"
+ }
+}
