@@ -775,11 +775,52 @@ def _load_worker_issue():
     return module
 
 
+def _live_review_labels(repo, pr_number):
+    """The LIVE set of review:* labels on a PR, read immediately before a review-state decision
+    (issue #138). Read FRESH so an automated stamp never acts on a stale snapshot. FAIL CLOSED on
+    a malformed/hostile payload (a non-list, or any non-dict entry / non-string name) — an
+    unreadable label surface must never collapse to "no hold" (same shape as live_human_holds)."""
+    labels = _gh_json(["api", f"repos/{repo}/issues/{pr_number}/labels"])
+    if not isinstance(labels, list) or any(
+            not isinstance(label, dict) or not isinstance(label.get("name"), str)
+            for label in labels):
+        raise WorkerPrError("live PR label payload is malformed; refusing to mutate (fail closed)")
+    return {label["name"] for label in labels} & set(REVIEW_LABELS)
+
+
 def set_review_state(repo, pr_number, state):
-    """Apply the mutually-exclusive review:* label for `state` and drop the others."""
+    """Apply the mutually-exclusive review:* label for `state` and drop the OTHER review:* labels.
+
+    Issue #138 — a review-state stamp must NEVER erase a human terminal hold. Re-read the LIVE
+    review labels immediately before mutating and:
+
+    - REFUSE every automated transition AWAY from the human-owned hold: if review:needs-user is
+      live and the requested state is anything else, mutate NOTHING and return. A delayed initial
+      stamp (`review-state set --state needs` from the provenance job, which can land long after
+      the worker finished) or an autonomous re-review transition must not undo a human/loop stop.
+    - CONVERGE an AMBIGUOUS live review namespace (more than one review:* label — e.g. a crash
+      between the add and the removes below, or a manual mislabel) to the fail-closed human hold
+      (review:needs-user) instead of the requested state: a split state reads inconsistently
+      downstream, so it stops at a human rather than resolving to a guessed "clean" value.
+
+    Only the review:* namespace is ever touched — needs:user and every non-review label are left
+    intact, so a groom park is never collaterally stripped, and the add-before-removes ordering
+    means a crash can only ever leave a SUPERSET of review labels (never zero), which the two
+    guards above then converge on the next read. No atomic label CAS exists, so a hold landing in
+    the read-to-write gap is the residual TOCTOU window tracked in issue #294 — now narrowed from
+    the whole outcome step down to this primitive."""
     label = f"review:{state}"
     if label not in REVIEW_LABELS:
         raise WorkerPrError(f"unknown review state {state}")
+    live_review = _live_review_labels(repo, pr_number)
+    if "review:needs-user" in live_review and label != "review:needs-user":
+        print(f"review state '{state}' REFUSED: review:needs-user is a live human hold "
+              "(issue #138) — no label mutation applied")
+        return
+    if len(live_review) > 1 and label != "review:needs-user":
+        print(f"ambiguous live review labels {sorted(live_review)} — converging to the "
+              f"fail-closed human hold review:needs-user instead of '{state}' (issue #138)")
+        label, state = "review:needs-user", "needs-user"
     _ensure_label(repo, label)
     _gh_json(
         ["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels", "--input", "-"],
@@ -792,10 +833,16 @@ def set_review_state(repo, pr_number, state):
 
 
 def get_review_state(repo, pr_number):
-    labels = _gh_json(["api", f"repos/{repo}/issues/{pr_number}/labels"])
-    names = {label.get("name") for label in labels if isinstance(label, dict)}
-    current = sorted(names & set(REVIEW_LABELS))
-    state = current[0][7:] if len(current) == 1 else ""
+    current = _live_review_labels(repo, pr_number)
+    if "review:needs-user" in current or len(current) > 1:
+        # Fail closed (issue #138): a live human hold — OR an ambiguous split review namespace —
+        # reads as the human hold, so a downstream consumer stands the loop down rather than
+        # acting on a state the requester never cleanly reached.
+        state = "needs-user"
+    elif len(current) == 1:
+        state = next(iter(current))[len("review:"):]
+    else:
+        state = ""
     _write_outputs({"state": state})
     print(f"PR review state: {state or '(none)'}")
 
@@ -2426,6 +2473,77 @@ def _self_test():
     check("human_owned loop escalation", human_owned({"review:needs-user"}), True)
     check("human_owned groom park", human_owned({"needs:user", "review:pass"}), True)
     check("human_owned plain loop state", human_owned({"review:needs", "area:x"}), False)
+
+    # set_review_state / get_review_state fail-closed hold guard (issue #138): a delayed or stale
+    # review stamp must NEVER erase a review:needs-user human hold, and an ambiguous/split review
+    # namespace must converge to the hold. Each assertion flips on the WRONG behaviour (the guard
+    # is defence-in-depth BELOW the live_human_holds preflight, closing the residual #294 window
+    # at the label primitive). I/O is monkeypatched; nothing hits GitHub.
+    srs_globals = globals()
+    srs_real = {name: srs_globals[name]
+                for name in ("_gh_json", "_ensure_label", "_remove_label", "_write_outputs")}
+    try:
+        srs_state = {"live": [], "posted": [], "removed": [], "output": {}}
+
+        def srs_gh(args, **kwargs):
+            if "-X" in args and "POST" in args:          # the label ADD
+                srs_state["posted"].append(kwargs.get("input_doc", {}).get("labels"))
+                return {}
+            return srs_state["live"]                      # the live-labels GET
+
+        srs_globals["_gh_json"] = srs_gh
+        srs_globals["_ensure_label"] = lambda repo, label: None
+        srs_globals["_remove_label"] = (
+            lambda repo, pr, other: srs_state["removed"].append(other))
+        srs_globals["_write_outputs"] = lambda values: srs_state["output"].update(values)
+
+        def run_set(live, state):
+            srs_state["live"] = [{"name": name} for name in live]
+            srs_state["posted"], srs_state["removed"] = [], []
+            set_review_state("o/r", 5, state)
+            return srs_state["posted"], srs_state["removed"]
+
+        # A live human hold REFUSES every automated transition away from it: no add, no removes.
+        check("hold refuses a stamp to needs (delayed initial stamp)",
+              run_set(["review:needs-user"], "needs"), ([], []))
+        check("hold refuses a stamp to pass",
+              run_set(["review:needs-user"], "pass"), ([], []))
+        # ...but an explicit (re)escalation TO the hold is always allowed through.
+        esc_posted, _esc_removed = run_set(["review:needs-user"], "needs-user")
+        check("re-escalation to needs-user is applied", esc_posted, [["review:needs-user"]])
+        # An ambiguous split state converges to the fail-closed hold, NOT the requested state.
+        amb_posted, _amb_removed = run_set(["review:needs", "review:changes"], "pass")
+        check("ambiguous review labels converge to the human hold",
+              amb_posted, [["review:needs-user"]])
+        # A normal single-state transition applies the requested label and never removes it.
+        norm_posted, norm_removed = run_set(["review:needs"], "changes")
+        check("normal transition adds the requested review label",
+              norm_posted, [["review:changes"]])
+        check("normal transition never deletes the label it just applied",
+              "review:changes" in norm_removed, False)
+        # A malformed live label payload fails closed (RAISES) instead of reading as no-hold.
+        malformed_failed_closed = False
+        try:
+            srs_state["live"] = "nope"
+            set_review_state("o/r", 5, "needs")
+        except WorkerPrError:
+            malformed_failed_closed = True
+        check("malformed live labels fail closed", malformed_failed_closed, True)
+
+        def run_get(live):
+            srs_state["live"] = [{"name": name} for name in live]
+            srs_state["output"] = {}
+            get_review_state("o/r", 5)
+            return srs_state["output"].get("state")
+
+        check("get: a live hold reads as needs-user",
+              run_get(["review:needs-user"]), "needs-user")
+        check("get: ambiguous review labels read as the hold",
+              run_get(["review:needs", "review:pass"]), "needs-user")
+        check("get: a single clean state reads through", run_get(["review:changes"]), "changes")
+        check("get: no review label reads empty", run_get(["area:x"]), "")
+    finally:
+        srs_globals.update(srs_real)
 
     # select_reconcilable_pr (issue #128): the fail-closed filter that recovers a PR from the
     # deterministic head branch when the publisher's pr_number output was lost. Each assertion
