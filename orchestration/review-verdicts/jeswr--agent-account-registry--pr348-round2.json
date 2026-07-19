@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_cmd_decide` refreshes the snapshot only when `resolution.accounts` is non-empty, while `parse_fleet_snapshot` rejects an empty fleet. If policy legitimately changes from a non-empty enabled pool to no enabled accounts, resolution succeeds but the old snapshot remains on the ledger branch. On a later policy/catalog failure, `_read_fleet_snapshot` returns that obsolete fleet and `classify_records` may fire `provider-capped` for accounts that are no longer enabled. The fallback is therefore not actually the last known-good configuration and can make decisions using stale membership.",
+   "file": "scripts/model-health.py",
+   "fix_hint": "Represent and persist an authoritative successful empty fleet, or explicitly invalidate/delete the old snapshot with safe CAS semantics when empty resolution succeeds. The failure path must distinguish that known-good empty state from an absent/unreadable snapshot. Add an end-to-end self-test that writes a non-empty snapshot, processes a successful empty resolution, then simulates a resolution failure and asserts the old fleet is not reused and no stale provider-capped action fires.",
+   "severity": "major",
+   "title": "A successful empty fleet leaves a stale snapshot eligible for later fallback"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The prior round's incomplete-catalog finding is addressed: every pooled handle must now have one unambiguous provider, failures are typed, the prior snapshot is retained, and the added tests exercise the missing/invalid/conflicting cases plus decide-level fallback. However, the snapshot lifecycle is still unsound for a legitimate successful transition to an empty enabled fleet. That authoritative state neither replaces nor invalidates the previous non-empty snapshot, so a later resolution failure resurrects accounts that are no longer enabled. This can produce provider-capped decisions from stale configuration. Because this is a new major correctness finding, progress is regressing under the required scale.",
+ "verdict": "request_changes"
+}
