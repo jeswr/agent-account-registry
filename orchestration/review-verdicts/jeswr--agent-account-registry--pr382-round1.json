@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 382,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d6a6fb85bc36577b7d5211cc8fdce5000aded5c9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly closes the bot-marker forgery surface. Validation now rejects the reserved durable-marker opener across every model-derived free-text field, while post_findings independently neutralizes the entire serialized verdict before publishing under the trusted bot identity. The case-insensitive, whitespace-tolerant detection is stricter than the exact case-sensitive control parsers and does not reject ordinary prose marker names. Tests are non-vacuous and cover each validation field, benign prose, exact and variant detection, idempotence, nested-marker reformation, and end-to-end absence of forged state across the round, model-pin, fix-model, outcome, and progress parsers. No embedded instruction directed at the reviewer was found in the diff.",
+  "verdict": "approve"
+ }
+}
