@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly closes the cross-App disarm gap at both layers. CLAIM rebinds each hostile plan row to the paginated live pull snapshot, exact trusted App identity, strict local provenance, same-repository worker ref, valid/current head SHA, and a live reviewed-SHA mismatch before invoking the helper. The helper independently re-reads the PR and enforces exact App authorship before any mutation, including for the unconditional defuse path. Missing identity, token, live state, provenance, or matching head all fail closed. The new tests are non-vacuous: they assert zero helper/mutation calls for foreign authorship and each failed binding, plus positive controls that exercise the intended mismatch disarm and verify the trusted identity argument. No trust check is weakened, no untrusted value is promoted to the expected identity, and no injection-directed text appears in the diff.",
+ "verdict": "approve"
+}
