@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_issue_is_trusted` checks that `issue` is a dict, but then evaluates `(issue.get(\"user\") or {}).get(\"login\")`. If `user` is any truthy non-dict value (for example a string or list), this raises `AttributeError`. `_current_issue_matches` is called inside a block that catches only `DispatchError`, so the exception aborts the whole dispatch rather than denying/skipping that item. The added tests cover `user: None` and a non-dict top-level issue, but not this malformed nested shape, despite the comment claiming malformed shapes fail closed.",
+   "file": "scripts/dispatch-claim.py",
+   "fix_hint": "Type-check the nested `user` value before reading `login` and return false (or raise `DispatchError` so the item is deferred) when it is not a dict. Add an assertion such as `assert not _issue_is_trusted({\"user\": \"malformed\", \"author_association\": \"MEMBER\"}, allow)` so the fail-closed behavior cannot regress.",
+   "severity": "major",
+   "title": "Malformed user objects can abort CLAIM instead of failing closed"
+  }
+ ],
+ "progress": null,
+ "summary": "The exact allowlist is threaded into the authoritative CLAIM check and the suffix-trust regression tests are meaningful. However, the new helper's advertised fail-closed malformed-input behavior is incomplete: a truthy non-object `user` shape raises AttributeError instead of returning false or producing a per-item DispatchError. Because that exception escapes the existing per-item handler, one malformed issue response can abort the dispatch run. This needs correction before approval.",
+ "verdict": "request_changes"
+}
