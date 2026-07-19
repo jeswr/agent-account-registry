@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "fromBytes calls WasmStore.loadBytes / loadBytesWithBase, which only exist when the wasm is built with the bytes-ingest feature. The published build:wasm now enables it, but build:wasm:lean does not, so on a lean bundle fromBytes fails with 'WasmStore.loadBytes is not a function' rather than a clear 'byte ingest not available in this build' message. This is a documented, intentional tradeoff (the doc-comment notes the lean bundle omits byte variants) and does not affect the published package, so it is non-blocking.",
+   "file": "js/src/store.ts",
+   "fix_hint": "Optionally guard with `if (typeof WasmStore.loadBytes !== 'function') throw new Error('fromBytes requires a wasm bundle built with the bytes-ingest feature; use fromString on the lean bundle')` for a clearer failure on lean builds. Not required for correctness.",
+   "severity": "nit",
+   "title": "fromBytes throws an opaque TypeError on the lean wasm bundle"
+  }
+ ],
+ "progress": null,
+ "summary": "Adds SparqStore.fromBytes() to the JS wrapper, delegating to the real opt-in wasm bindings WasmStore.loadBytes / loadBytesWithBase (crates/sparq-wasm/src/bytes.rs, gated on the bytes-ingest feature now enabled in build:wasm and kept off the lean bundle). The Rust path does a fail-closed UTF-8 decode of already-in-memory bytes then reuses the existing Graph::load_str parse path, so the resulting store is byte-for-byte equivalent to string ingest with no reparsing and zero new deps. Verified correctness: fromBytes signature (Pick<...,'baseIri'>) matches implementation and SKILL.md; baseIri branch is correct; dataset/compressed are correctly excluded. Tests are non-vacuous and layered: native equivalence + multibyte-UTF8 tests, wasm32 tests covering the fail-closed invalid-UTF-8 Err arm that native tests can't reach, and a JS integration test asserting equal size and identical queryJson across byte/string ingest (deterministic same-parse, so the ORDER-BY-less JSON comparison holds). Benchmark additions are explicitly labeled advisory:true / canonical:false and only exercise existing store methods. No injected instructions in the diff. Change is correct and complete.",
+ "verdict": "approve"
+}
