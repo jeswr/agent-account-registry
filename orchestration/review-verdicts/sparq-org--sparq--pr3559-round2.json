@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "fromBytes calls WasmStore.loadBytes / loadBytesWithBase, which only exist when the wasm is built with the bytes-ingest feature. The published build:wasm enables it, but build:wasm:lean does not, so on a lean bundle fromBytes fails with 'WasmStore.loadBytes is not a function' rather than a clear 'byte ingest not available in this build' message. This is a documented, intentional tradeoff (the doc-comment notes the lean bundle omits byte variants) and does not affect the published package, so it is non-blocking. Unchanged from round 1.",
+   "file": "js/src/store.ts",
+   "fix_hint": "Optionally guard with `if (typeof WasmStore.loadBytes !== 'function') throw new Error('fromBytes requires a wasm bundle built with the bytes-ingest feature; use fromString on the lean bundle')` for a clearer failure on lean builds. Not required for correctness.",
+   "severity": "nit",
+   "title": "fromBytes throws an opaque TypeError on the lean wasm bundle"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "Round 2 of the SparqStore.fromBytes() change is materially identical to round 1. Verified against the checkout: js/src/store.ts#fromBytes delegates to the opt-in wasm bindings WasmStore.loadBytes / loadBytesWithBase (crates/sparq-wasm/src/bytes.rs), which fail-closed-decode UTF-8 (std::str::from_utf8) of already-in-memory bytes then reuse the EXISTING Graph::load_str / load_str_with_base parse path \u2014 byte-for-byte equivalent to string ingest, no reparsing, zero new deps. Feature-gating is correct: `bytes-ingest = []`, `default = []`, `#[cfg(feature = \"bytes-ingest\")] mod bytes;` in lib.rs, build:wasm enables it, build:wasm:lean omits it (lean bundle stays byte-identical). Tests are non-vacuous and layered: native equivalence + multibyte-UTF8 (crates/sparq-wasm/src/bytes.rs), wasm32 tests/web.rs covering the fail-closed invalid-UTF-8 Err arm the native tests cannot reach (JsError traps off-wasm), and a JS integration test (js/test/store.test.mjs) asserting equal size and identical queryJson between byte and string ingest (deterministic same-parse). The fromBytes signature (Pick<..., 'baseIri'>) matches the impl and SKILL.md; baseIri branch is correct; dataset/compressed correctly still require the string loaders. Benchmark additions (js/bench/vs-oxigraph.mjs) are advisory-only, labeled advisory:true / canonical:false, exercise existing store methods, and ship no perf claim. No injected instructions in the diff. The single round-1 nit (opaque TypeError on the lean bundle) remains unaddressed but is a non-published-path DX issue and non-blocking. Change is correct and complete for the published package.",
+ "verdict": "approve"
+}
