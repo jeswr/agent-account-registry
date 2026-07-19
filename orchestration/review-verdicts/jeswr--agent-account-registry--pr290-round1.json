@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "_find_marker_issue only converts JSON decoding failures into HealthError. If `gh issue list --json` returns valid JSON of the wrong top-level type, such as `{}`, iteration succeeds over dictionary keys, no marker matches, and the firing path proceeds to create a new issue. This is exactly the blind-create behavior the change says it prevents. A `null` response instead raises an uncaught TypeError, also bypassing the explicit delivery-failure contract.",
+   "file": "scripts/model-health.py",
+   "fix_hint": "After json.loads, require the result to be a list (and preferably validate the relevant item fields) and raise HealthError on any structural mismatch. Add self-tests using valid-but-wrong JSON such as `{}` and `null`, asserting False is returned and no create occurs.",
+   "severity": "major",
+   "title": "Valid non-list JSON is still treated as an empty tracker"
+  },
+  {
+   "body": "In the closed-marker flap path, a successful `issue reopen` is followed by an unchecked `issue edit`, after which _upsert_alert unconditionally returns True. If the edit fails, the alert remains stale but _deliver_alerts considers the desired state confirmed, so it neither tries the registry fallback nor makes the decide run fail. This violates the new stated contract that True means the desired state is confirmed and False is returned on any failed gh mutation.",
+   "file": "scripts/model-health.py",
+   "fix_hint": "Check the edit return code after reopening and return False when it fails (with an appropriate warning), so fallback/nonzero propagation occurs. Add a self-test where reopen succeeds but edit fails and assert that _upsert_alert returns False.",
+   "severity": "major",
+   "title": "Reopen reports success even when the body refresh fails"
+  }
+ ],
+ "progress": null,
+ "summary": "The change improves delivery failure propagation and adds meaningful fallback coverage, but two fail-closed gaps remain in the alert upsert path. A structurally malformed yet valid JSON tracker response can still be treated as an empty tracker and trigger a blind duplicate create, and a reopened alert is reported delivered even when refreshing its body fails. Both contradict the new delivery contract and can suppress fallback/nonzero failure signaling.",
+ "verdict": "request_changes"
+}
