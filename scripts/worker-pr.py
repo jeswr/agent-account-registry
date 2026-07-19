@@ -1092,6 +1092,52 @@ def live_human_holds(repo, pr_number, issue=None, live=None):
                    if label["name"].startswith("needs:")})
 
 
+# Issue #153: a synthetic audit hit for the LIVE label-derived security posture. The path-based
+# trust hits are file names; this stands in for a posture that came from a label rather than a
+# touched path so the arm-time audit trail (Decision 7) still names WHY the surface armed.
+SECURITY_LABEL_AUDIT_HIT = (
+    "(live security label: routing match_labels / trust:* posture recomputed at arm time)")
+
+
+def live_security_flagged(repo, pr_number, keywords, issue=None, live=None):
+    """Issue #153: recompute the LABEL-derived security posture from LIVE data immediately before
+    the arm — the union of the PR's OWN labels and its SOURCE issue's labels, classified against
+    the builtin SECURITY_KEYWORDS + the TARGET routing's own `match_labels` keywords + the
+    `trust:*` prefix (the SAME classifier the resolve step ran, only up to a full review round —
+    25min+, or much longer queued — staler). resolve computes this posture ONCE, before the
+    review; a `trust:*` / security-keyword label added to the PR or its source issue DURING the
+    review window is otherwise invisible to the path-only arm recheck.
+
+    Per Decision 7 (maintainer 2026-07-18) a stricter posture does NOT withhold the arm (approve
+    IS the arm decision on every surface); a True return instead forces the SHA-bound POST-arm
+    audit trail, so an auto-armed trust-plane change is durably recorded whether it was flagged by
+    a touched PATH or only by a LABEL. FAIL CLOSED on ambiguity: an unreadable/malformed PR or
+    source-issue label payload RAISES (the arm stands down rather than assume a permissive
+    posture) — the same fail-closed shape as live_human_holds."""
+    if live is None:
+        live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    raw_labels = live.get("labels") if isinstance(live, dict) else None
+    if not isinstance(raw_labels, list) or any(
+            not isinstance(label, dict) or not isinstance(label.get("name"), str)
+            for label in raw_labels):
+        raise WorkerPrError(
+            "live PR label payload is malformed; refusing to arm (fail closed)")
+    labels = {label["name"] for label in raw_labels}
+    source_issue = issue
+    if not source_issue:
+        ref_match = WORKER_HEAD_RE.fullmatch(str((live.get("head") or {}).get("ref", "")))
+        source_issue = int(ref_match.group(1)) if ref_match else None
+    if source_issue:
+        probe = _gh_json(["api", f"repos/{repo}/issues/{source_issue}"])
+        if not isinstance(probe, dict) or not isinstance(probe.get("labels"), list) or any(
+                not isinstance(label, dict) or not isinstance(label.get("name"), str)
+                for label in probe["labels"]):
+            raise WorkerPrError(
+                "source issue label state is unreadable; refusing to arm (fail closed)")
+        labels |= {label["name"] for label in probe["labels"]}
+    return security_flagged(labels, extra_keywords=tuple(keywords or ()))
+
+
 def _merge_only_carry_forward(repo, head_sha, reviewed_sha, base_ref):
     """Issue #69 half 1, LIVE side: True only when BOTH halves hold — (a) the first-parent
     chain from the live head reaches the reviewed sha through two-parent merges whose
@@ -1352,7 +1398,7 @@ def disarm(repo, pr_number, when):
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
-                  reviewed_base=""):
+                  reviewed_base="", security_keywords=None):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval). [round-4 P1]
     the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:* on the source issue) are re-read
@@ -1371,7 +1417,12 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     still re-derived on LIVE changed files (renamed-path safe), but a hit no longer withholds
     the arm — approve IS the arm decision on every surface. The hits feed the POST-arm audit
     trail (_apply_trust_surface_audit: trust-surface label + one idempotent marker comment),
-    applied only after a successful live arm, with loud failures."""
+    applied only after a successful live arm, with loud failures.
+
+    [issue #153] the LABEL-derived security posture is re-derived LIVE here too (PR + source
+    issue labels vs the routing keywords), not just at resolve: a security label added mid
+    review folds into the same audit trail (a True posture appends SECURITY_LABEL_AUDIT_HIT),
+    so an auto-armed trust-plane change is audited whether it was flagged by path or by label."""
     if reviewer_provider == impl_provider:
         raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
@@ -1446,6 +1497,16 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             trust_hits = (FILES_TRUNCATED_SENTINEL,)
         else:
             trust_hits = trust_surface_paths_touched(sha_files, surfaces)
+        # Issue #153: the LABEL-derived security posture is recomputed LIVE here too. resolve
+        # classified it ONCE, before a review that may have taken 25min+ (or queued far
+        # longer); a trust:* / routing-keyword label added to the PR or its SOURCE issue mid
+        # review is invisible to the path-only recheck above. Per Decision 7 a stricter
+        # posture does NOT withhold the arm — it is folded into the SHA-bound audit trail so
+        # the auto-armed trust-plane change is durably recorded whether flagged by path or by
+        # label. Malformed live label surfaces RAISE (fail closed, same shape as the hold
+        # recheck); the arm never proceeds on an unreadable posture.
+        if live_security_flagged(repo, pr_number, security_keywords, issue=issue, live=live):
+            trust_hits = tuple(trust_hits) + (SECURITY_LABEL_AUDIT_HIT,)
     if arm and trust_hits:
         # Durable audit BEFORE the merge latch can fire (sol r2 on #257): auto-merge can
         # complete immediately, and a post-merge crash would leave an armed trust diff with
@@ -2616,8 +2677,8 @@ def _self_test():
         if "/compare/" in path:
             # the SHA-bound snapshot (sol r3): only the reviewed sha's compare carries hits
             sha_in_path = path.split("...", 1)[1].split("?", 1)[0]
-            files = ([{"filename": "scripts/worker-pr.py"}]
-                     if sha_in_path == "b" * 40 else [])
+            path_hit = sha_in_path == "b" * 40 and not raa_state.get("benign_diff")
+            files = [{"filename": "scripts/worker-pr.py"}] if path_hit else []
             return {"files": files}
         if "/issues/" in path:
             # the [round-4 P1] pre-arm SOURCE-issue hold probe
@@ -2641,12 +2702,14 @@ def _self_test():
         return argparse.Namespace(returncode=0, stdout="", stderr="")
 
     def run_raa(head_ok=True, merge_fails=False, comments=(), labels=(),
-                issue_labels=(), issue=None, probe_garbage=False, labels_payload=None):
+                issue_labels=(), issue=None, probe_garbage=False, labels_payload=None,
+                benign_diff=False, security_keywords=()):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
         raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
                          labels=labels, issue_labels=issue_labels,
-                         issue_probe_garbage=probe_garbage, labels_payload=labels_payload)
+                         issue_probe_garbage=probe_garbage, labels_payload=labels_payload,
+                         benign_diff=benign_diff)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -2656,7 +2719,8 @@ def _self_test():
         globals()["_write_outputs"] = raa_outputs.update
         ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
                       issue=issue, bot_login="sparq[bot]",
-                      reviewed_base=raa_state.get("reviewed_base", "main"))
+                      reviewed_base=raa_state.get("reviewed_base", "main"),
+                      security_keywords=security_keywords or None)
 
     try:
         sha = "b" * 40
@@ -2780,6 +2844,62 @@ def _self_test():
                 check(f"malformed label payload {payload!r} refuses ready/arm",
                       ("raised", any(c.startswith("pr ready") or "merge" in c
                                      for c in raa_calls)), ("raised", False))
+        # ---- Issue #153: the arm recomputes the LIVE label-derived security posture (PR +
+        # SOURCE issue, routing keywords) so a security label added DURING the review still
+        # lands in the SHA-bound audit trail. Per Decision 7 it AUDITS, never withholds. A
+        # BENIGN-path diff isolates the LABEL signal from the path signal. ----
+        run_raa(benign_diff=True, labels=("trust:review",))
+        check("live trust:* PR label on a benign-path diff ARMS with an audit trail (#153)",
+              (any("merge" in c for c in raa_calls),
+               any("trust-surface" in c for c in raa_calls),
+               raa_outputs.get("armed"), raa_outputs.get("arm_complete")),
+              (True, True, True, True))
+        check("the label-driven audit comment names the live-security-label hit (#153)",
+              any(SECURITY_LABEL_AUDIT_HIT in c for c in raa_calls), True)
+        run_raa(benign_diff=True)
+        check("benign-path diff with NO security posture ARMS with NO audit (#153 control)",
+              (any("merge" in c for c in raa_calls),
+               any("trust-surface" in c for c in raa_calls),
+               raa_outputs.get("armed")), (True, False, True))
+        run_raa(benign_diff=True, issue_labels=("area:worker",),
+                security_keywords=("worker", "dispatch"))
+        check("live routing-keyword SOURCE-issue label audits ONLY when the keyword is threaded",
+              any("trust-surface" in c for c in raa_calls), True)
+        run_raa(benign_diff=True, issue_labels=("area:worker",))
+        check("the same routing-keyword label does NOT audit without the keyword (#153 control)",
+              any("trust-surface" in c for c in raa_calls), False)
+        # live_security_flagged unit facets: PR + source-issue union, keyword threading, and the
+        # fail-closed refusal on an unreadable source-issue label payload.
+        real_lsf_gh = globals()["_gh_json"]
+        try:
+            def lsf(labels=(), issue_labels=(), keywords=(), issue=7):
+                globals()["_gh_json"] = lambda a, **k: (
+                    {"labels": [{"name": n} for n in issue_labels]}
+                    if "/issues/" in (a[1] if len(a) > 1 else "") else {})
+                live = {"labels": [{"name": n} for n in labels],
+                        "head": {"ref": "sparq-agent/issue-7-1-1"}}
+                return live_security_flagged("o/r", 41, keywords, issue=issue, live=live)
+            check("live trust:* PR label flags", lsf(labels=("trust:review",)), True)
+            check("live builtin-keyword PR label flags without routing keywords",
+                  lsf(labels=("area:sparq-zk",)), True)
+            check("live routing-keyword label flags ONLY when the keyword is threaded",
+                  (lsf(labels=("area:worker",)),
+                   lsf(labels=("area:worker",), keywords=("worker",))), (False, True))
+            check("live SOURCE-issue security label flags at arm time",
+                  lsf(issue_labels=("trust:untrusted",)), True)
+            check("a plain live posture is not flagged",
+                  lsf(labels=("area:core",), issue_labels=("role:impl",)), False)
+            try:
+                globals()["_gh_json"] = lambda a, **k: (
+                    "garbage" if "/issues/" in (a[1] if len(a) > 1 else "") else {})
+                live_security_flagged(
+                    "o/r", 41, (), issue=7,
+                    live={"labels": [], "head": {"ref": "sparq-agent/issue-7-1-1"}})
+                check("unreadable live security posture fails closed", "no error", "raised")
+            except WorkerPrError:
+                check("unreadable live security posture fails closed", "raised", "raised")
+        finally:
+            globals()["_gh_json"] = real_lsf_gh
     finally:
         globals().update(real_raa)
 
@@ -2979,6 +3099,11 @@ def main():
                      help="the App bot login (exact audit-marker suppression identity)")
     arm.add_argument("--reviewed-base", default="",
                      help="the base ref the review compared against (arm re-validates it)")
+    # Issue #153: the target routing's own security match_labels keywords (repeatable; resolve
+    # unions the builtin set with the routing's). The arm re-reads LIVE PR + source-issue labels
+    # against these so a security label added DURING review still lands in the audit trail.
+    arm.add_argument("--security-keyword", action="append", default=[],
+                     help="security label keyword (repeatable; from the target routing match_labels)")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -3078,7 +3203,8 @@ def main():
                           os.environ.get("WORKER_REVIEWER_ACCOUNT", ""),
                           args.arm == "true", issue=args.issue,
                           surface_paths=args.surface_path or None,
-                          bot_login=args.bot_login, reviewed_base=args.reviewed_base)
+                          bot_login=args.bot_login, reviewed_base=args.reviewed_base,
+                          security_keywords=args.security_keyword or None)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":

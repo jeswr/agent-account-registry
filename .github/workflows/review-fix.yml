@@ -106,6 +106,7 @@ jobs:
       already_done: ${{ steps.pr.outputs.already_done }}
       issue: ${{ steps.pr.outputs.issue }}
       security: ${{ steps.pr.outputs.security }}
+      security_keywords: ${{ steps.pr.outputs.security_keywords }}
       packages: ${{ steps.pr.outputs.packages }}
       package: ${{ steps.pr.outputs.package }}
       routing: ${{ steps.policy.outputs.routing }}
@@ -344,25 +345,36 @@ jobs:
           # non-security and would auto-arm. Union the builtin set with the TARGET routing's own
           # `[[route]].match_labels` keywords (read from the protected routing at its policy
           # pointer), so a trust-surface issue on ANY target is flagged before the arm gate ever
-          # sees it. A missing/unreadable routing degrades to the builtin set (fail closed:
-          # trust:* still flags, and the path-based arm gate is an independent backstop).
-          import tomllib
-          from pathlib import Path as _Path, PurePosixPath as _PPP
-          keywords = {"zk", "mpc", "crypto", "auth", "e2ee"}
+          # sees it. [#325 round 2] An unreadable policy row or a missing/malformed routing is
+          # FATAL here, never a degrade-to-builtin: this same set drives the arm-time LIVE label
+          # audit (worker-pr.live_security_flagged), so a silently reduced set would let a
+          # routing-keyword label added mid-review classify as benign and auto-arm without the
+          # trust-surface audit — the path classifier is no backstop for a label-only posture.
+          # routing_security_keywords RAISES PolicyError on ANY load or validation failure
+          # (self-tested in policy-resolve.py), the resolve job dies, and the downstream arm
+          # step is never reached.
+          spec_policy = importlib.util.spec_from_file_location(
+              "registry_policy_resolve", Path("registry", "scripts", "policy-resolve.py"))
+          policy_resolve = importlib.util.module_from_spec(spec_policy)
+          spec_policy.loader.exec_module(policy_resolve)
           try:
-              _pol = tomllib.loads(
-                  _Path("registry/policy/repos.toml").read_text(encoding="utf-8"))
-              _routing_ptr = _pol["repos"][repo]["routing"]
-              _routing_path = _Path("target-routing").joinpath(*_PPP(_routing_ptr).parts)
-              _routing = tomllib.loads(_routing_path.read_text(encoding="utf-8"))
-              for _r in _routing.get("route", []):
-                  for _kw in (_r.get("match_labels") or []):
-                      if isinstance(_kw, str) and _kw:
-                          keywords.add(_kw)
-          except (OSError, KeyError, tomllib.TOMLDecodeError):
-              pass  # builtin keywords + trust:* prefix + the path-based arm gate still apply
+              routing_keywords = policy_resolve.routing_security_keywords(
+                  repo, policy_file="registry/policy/repos.toml", target_root="target-routing")
+          except policy_resolve.PolicyError as exc:
+              raise SystemExit(
+                  f"target routing security keywords unresolvable (fail closed): {exc}")
+          keywords = {"zk", "mpc", "crypto", "auth", "e2ee"} | set(routing_keywords)
           security = (any(k in label for label in merged for k in keywords)
                       or any(label.startswith("trust:") for label in merged))
+          # Issue #153: the SAME keyword set the arm step re-applies to LIVE labels. resolve
+          # classifies `security` ONCE, before a review that may take 25min+ (or queue longer);
+          # a trust:* / routing-keyword label added to the PR or its source issue mid-review is
+          # invisible to the arm's path-only recheck unless the arm re-runs this classifier on
+          # live labels. Ride the union set to the arm as a single-line base64 JSON list (a
+          # keyword may hold any char; base64 keeps the output single-line + injection-safe).
+          import base64 as _b64
+          security_keywords_b64 = _b64.b64encode(
+              json.dumps(sorted(keywords)).encode("utf-8")).decode("ascii")
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
           if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
               raise SystemExit("source issue has an unsafe area:* label")
@@ -377,6 +389,7 @@ jobs:
               "already_done": "true" if already_done else "false",
               "issue": str(issue),
               "security": "true" if security else "false",
+              "security_keywords": security_keywords_b64,
               "packages": ",".join(packages),
               "package": packages[0] if packages else "__global__",
           }
@@ -1359,6 +1372,10 @@ jobs:
           # [OPUS-4.8] B3, revised per Decision 7 (2026-07-18): the LIVE trust-surface
           # derivation now feeds the SHA-bound pre-arm AUDIT trail instead of a human park.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
+          # Issue #153: the routing's own security match_labels keywords (union with the builtin
+          # set, resolved once above). The arm re-reads LIVE PR + source-issue labels against
+          # these so a security label added DURING the review still lands in the audit trail.
+          SECURITY_KEYWORDS_B64: ${{ needs.resolve.outputs.security_keywords }}
         run: |
           set -euo pipefail
           args=(
@@ -1377,6 +1394,10 @@ jobs:
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
+            | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
+          while IFS= read -r k; do
+            [[ -n "$k" ]] && args+=(--security-keyword "$k")
+          done < <(printf '%s' "${SECURITY_KEYWORDS_B64:-W10=}" | base64 -d \
             | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
           python3 registry/scripts/worker-pr.py "${args[@]}"
 
