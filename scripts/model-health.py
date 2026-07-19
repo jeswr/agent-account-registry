@@ -962,6 +962,10 @@ def _find_marker_issue(repo, token, marker, state):
         found = json.loads(proc.stdout or "[]")
     except ValueError as exc:
         raise HealthError("gh issue list returned malformed JSON") from exc
+    if not isinstance(found, list):
+        # Valid-but-wrong JSON ({} / null / a scalar) is just as unreadable as garbled JSON:
+        # treating it as an empty tracker would re-enable the blind create this guard exists for.
+        raise HealthError("gh issue list returned non-list JSON")
     return next((i["number"] for i in found if isinstance(i, dict)
                  and marker in (i.get("body") or "")), None)
 
@@ -1007,8 +1011,12 @@ def _upsert_alert(action, repo, token, maintainer):
                   f"({exc}) — treating as undelivered (no blind create)")
             return False
         if closed is not None:
-            if _gh(["issue", "reopen", str(closed), "-R", repo], token).returncode == 0:
-                _gh(["issue", "edit", str(closed), "-R", repo, "--body", body], token)
+            # True only when BOTH the reopen and the body refresh land: a reopened issue with a
+            # stale body is not the desired state. A reopen that lands with a failed edit is safe
+            # to retry — next tick finds the issue open and takes the refresh path.
+            if (_gh(["issue", "reopen", str(closed), "-R", repo], token).returncode == 0
+                    and _gh(["issue", "edit", str(closed), "-R", repo,
+                             "--body", body], token).returncode == 0):
                 print(f"::warning::model-health: reopened {action['condition']} alert "
                       "(detail in the issue)")
                 return True
@@ -1754,6 +1762,20 @@ def _test_upsert(chk):
         chk("unreadable tracker returns False (undelivered)",
             _upsert_alert(action, "o/r", "t", "m"), False)
         chk("unreadable tracker does NOT create over itself", "create" in issue_verbs(), False)
+        # valid-but-NON-LIST list JSON ({} / null) is unreadable too, never an empty tracker
+        _gh, calls[:] = fake_gh({}, [], set()), []
+        chk("non-list tracker JSON ({}) returns False (undelivered)",
+            _upsert_alert(action, "o/r", "t", "m"), False)
+        chk("non-list tracker JSON ({}) does NOT create over itself",
+            "create" in issue_verbs(), False)
+        _gh, calls[:] = fake_gh(None, [], set()), []
+        chk("null tracker JSON returns False (undelivered)",
+            _upsert_alert(action, "o/r", "t", "m"), False)
+        chk("null tracker JSON does NOT create over itself", "create" in issue_verbs(), False)
+        # reopen lands but the body refresh FAILS -> False (stale body is not the desired state)
+        _gh, calls[:] = fake_gh([], [{"number": 7, "body": marker}], {"edit"}), []
+        chk("upsert returns False when reopen succeeds but the edit fails",
+            _upsert_alert(action, "o/r", "t", "m"), False)
     finally:
         _gh = real_gh
     return True
