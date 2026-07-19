@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The check named `bundle leaves the worker tree pristine for the gate (index reset)` only reads `mod.txt` and expects `new`. That result is identical whether or not `worker_bundle` resets the index, so deleting the `git reset` line would leave this security-critical test green. The assertion therefore does not test the invariant it names.",
+   "file": "scripts/worker-live.sh",
+   "fix_hint": "After running `bundle`, assert that the index is clean, for example by checking that `git -C \"$bsrc\" diff --cached --quiet` succeeds, while separately retaining checks that the intended working-tree edits still exist. Ensure the assertion turns red if the reset is removed.",
+   "severity": "blocker",
+   "title": "Index-reset self-test is vacuous"
+  },
+  {
+   "body": "The self-test commentary says a DIRTY destination tree is proved to fail closed, and `reconstruct_bundle` contains a load-bearing cleanliness check, but the added cases cover only digest tampering and a moved base. There is no reconstruction attempt against a checkout with an uncommitted or untracked change, nor an assertion that the patch was not applied. A regression removing or weakening the dirty-tree guard would pass the suite.",
+   "file": "scripts/worker-live.sh",
+   "fix_hint": "Create a fresh clone at the expected base, add an uncommitted/untracked file, invoke the real `reconstruct` command with a valid digest, assert a nonzero result, and assert that none of the bundled changes were applied.",
+   "severity": "major",
+   "title": "Dirty-checkout fail-closed path has no test"
+  }
+ ],
+ "progress": null,
+ "summary": "The clean-runner, digest-bound publish split is directionally sound and the runtime reconstruction checks fail closed. However, the new trust-plane self-test contains a vacuous assertion for the load-bearing index reset and claims dirty-tree coverage that it never implements. Because these tests can remain green after weakening important handoff invariants, the change is not yet approvable.",
+ "verdict": "request_changes"
+}
