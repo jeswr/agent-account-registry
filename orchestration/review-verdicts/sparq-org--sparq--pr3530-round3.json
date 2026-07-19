@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 3 resolves both prior findings. Deployment acceptance now fails closed for every descriptive RandomnessModel, including the self-labelled PRSS stub, and the documentation explicitly says this gate is necessary but not sufficient and is not yet wired into production. The design record's shared_mask contract now matches the Rust trait: it guarantees a structural uniform sharing, while secrecy from up to t parties is reserved for a future validated dealer-less implementation. The tests exercise the revised refusal behavior and the current dealer's nonzero-mask and input-sharing paths. The change remains honestly scoped as design plus seam only, with no claim that dealer-less cryptography or external audit has landed.",
+ "verdict": "approve"
+}
