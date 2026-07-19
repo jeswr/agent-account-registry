@@ -19,6 +19,16 @@
    "model": "opus",
    "issued_at": 1784459941,
    "expires_at": 1784466241
+  },
+  {
+   "account": "acct2css",
+   "claim_id": "607d0c8d4b354af0858e7d9d7543cdb3",
+   "holder": "fix:sparq-org/sparq#3595@dispatch-29684894714.1",
+   "package": "sparq-mpc",
+   "role": "fix",
+   "model": "opus",
+   "issued_at": 1784460168,
+   "expires_at": 1784466468
   }
  ]
 }
