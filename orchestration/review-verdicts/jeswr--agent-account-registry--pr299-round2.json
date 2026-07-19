@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The model step runs before `Snapshot model output into a digest-bound bundle` and has host filesystem access. The bundle step then executes `../registry/scripts/worker-live.sh bundle` from the same writable workspace. A hostile model can rewrite that sibling script so it emits a benign-looking digest output while placing any chosen patch in the artifact; the later gate can test a different working tree, and reconstruction will faithfully publish the attacker-selected, digest-matching artifact. Thus `bundle_sha256` is not host-derived and the pre-gate snapshot does not bind publication to what the gate evaluated.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Make bundle construction and its output generation execute from trusted material that the model cannot mutate, and bind the gate's evaluated tree to the exact patch digest handed to publish. Add an adversarial test that rewrites the workspace copy of the bundling script after the model phase and proves the handoff refuses or remains bound to the trusted implementation/content.",
+   "severity": "blocker",
+   "title": "Untrusted model can replace the bundle producer before it runs"
+  },
+  {
+   "body": "Despite the new comments claiming this job holds no write-capable target token, `app-token-live` is still minted near the start of `worker` with contents, issues, pull-requests, and workflows write permissions. The same runner subsequently executes the model and target-controlled gate. Moving only the post-model mint/publish step does not remove the original token or its runner-resident output from that blast radius; hostile code can persist or inspect the runner and target later token-consuming steps. This defeats the stated isolation property.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Move all write-capable target operations and token minting out of the hostile worker job. Use separate clean jobs with narrowly scoped tokens for pre-run issue mutations/finalization, passing only validated non-secret outputs into the model/gate job; the hostile job should never mint or receive a write-capable target credential.",
+   "severity": "blocker",
+   "title": "Broad write token remains co-located with hostile model and gate code"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The two prior self-test defects are fixed with non-vacuous index-cleanliness and dirty-destination assertions. However, the new handoff does not establish the claimed trust boundary: the untrusted model runs before the bundle step and can rewrite the sibling registry checkout, including the very script later invoked to construct the supposedly host-derived bundle. The worker job also still mints and retains a broad write-capable target token on the same runner before model and gate execution. These are new trust-plane blockers, so progress is regressing despite the prior findings being resolved.",
+ "verdict": "request_changes"
+}
