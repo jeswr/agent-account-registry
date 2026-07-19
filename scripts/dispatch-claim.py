@@ -626,8 +626,10 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     interrupted — never emitted. CLAIM re-derives every precondition live (worker-pr.py disarm
     --when mismatch) before acting, and matching SHAs are NEVER emitted (an unarmed ready PR
     whose head equals its marker is the valid arm=false-policy terminal). Trust surface mirrors
-    enumerate_review_items; a review:needs-user or needs:user PR is human-owned (a human
-    arm/park decision stands). A check_runs_degraded snapshot record is CONSUMED here on
+    enumerate_review_items EXCEPT for the human hold: a review:needs-user or needs:user PR is
+    human-owned for pushes/reviews, but issue #105 — this net is safety-ONLY (latch retraction),
+    so a held PR with an armed-SHA mismatch is STILL emitted (worker-pr.py disarm --when mismatch
+    retracts the latch while preserving the hold). A check_runs_degraded snapshot record is CONSUMED here on
     purpose (PR #60 round-1): the disarm reads only head_sha + the armed bit — both detail
     fields — so check-run volume must never stand this net down (that would be fail-OPEN:
     the one admission whose ACT is the safety measure, defeatable by churning a head past
@@ -659,10 +661,15 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
             continue                      # never loop-armed without provenance — leave to humans
         if not SAFE_SHA.fullmatch(sha):
             continue
-        labels = {label.get("name") if isinstance(label, dict) else label
-                  for label in (pull.get("labels") or [])}
-        if labels & HUMAN_HOLD_PR_LABELS:
-            continue
+        # Issue #105: a human hold (review:needs-user / needs:user) parks autonomous PUSHES and
+        # reviews, but it must NEVER suppress this safety-only latch retraction. A stale armed
+        # head escalated to review:needs-user after a failed disarm — or a human label applied
+        # while auto-merge stays latched — would otherwise strand the latch and merge an
+        # unreviewed tree on green CI. Held PRs are enumerated here on the same footing as any
+        # other armed-SHA mismatch; worker-pr.py disarm --when mismatch retracts the latch
+        # (disable-auto/dequeue + redraft) while PRESERVING the hold label (it drops the relabel
+        # that would strip review:needs-user and re-admit the PR). enumerate_review_items still
+        # skips held PRs, so the hold keeps stopping pushes/reviews.
         status = pr_status.get(number) if isinstance(pr_status, dict) else None
         if not isinstance(status, dict) or status.get("head_sha") != sha:
             continue                      # stale/unknown snapshot — unknown never acts
@@ -1884,9 +1891,10 @@ def _apply_disarm_items(disarm_items, repo, script_dir, bot_login):
     """GAP-C (registry issue #42): retract stale GitHub auto-merge latches BEFORE any fix/review
     admission each sweep. The plan rows are HOSTILE — worker-pr.py `disarm --when mismatch`
     re-derives every precondition from the LIVE API (open same-repo bot worker PR, armed OR
-    ready with an interrupted disarm, head != reviewed-sha marker, not human-owned via
-    review:needs-user / needs:user) and is a no-op otherwise, so a spoofed row can never disarm
-    a validly-armed or human-owned PR. Failures skip the item (per-item resilience); the
+    ready with an interrupted disarm, head != reviewed-sha marker) and is a no-op otherwise, so a
+    spoofed row can never disarm a validly-armed PR. A human hold (review:needs-user / needs:user)
+    does NOT block this safety-only retraction (issue #105): --when mismatch retracts the latch
+    while preserving the hold label. Failures skip the item (per-item resilience); the
     enumeration re-emits next tick until the invariant holds — including across a crash between
     disable-auto and redraft, which mismatch mode re-enters via the ready-but-unarmed leg."""
     for item in disarm_items:
@@ -3046,18 +3054,29 @@ def _self_test():
     assert enumerate_disarm_items(repo, [drafted_moved], {41: status_of(sha_b)},
                                   provenance) == []
     assert enumerate_disarm_items(repo, [bound], {41: status_of(sha_b)}, provenance) == []
-    # unknown snapshot / stale snapshot head / missing provenance / human-owned
-    # (review:needs-user OR groom's needs:user) are all DO-NOTHING
+    # unknown snapshot / stale snapshot head / missing provenance are all DO-NOTHING
     assert enumerate_disarm_items(repo, [moved], {}, provenance) == []
     assert enumerate_disarm_items(repo, [moved], {41: status_of(sha_a, armed=True)},
                                   provenance) == []
     assert enumerate_disarm_items(
         repo, [pull(90, "sparq-agent/issue-1-1-1", sha_b, draft=False)],
         {90: status_of(sha_b, armed=True)}, provenance) == []
+    # Issue #105: a human hold (review:needs-user / needs:user) parks pushes/reviews but must NOT
+    # suppress the safety-only latch retraction — a held ARMED mismatch is STILL emitted so the
+    # sweep retracts the latch (worker-pr.py disarm --when mismatch preserves the hold, dropping
+    # only the relabel). Red if the old human-hold skip is restored (would flip these to []).
     for hold in ("review:needs-user", "needs:user"):
         parked = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=False,
-                      labels=[hold], body="x")
-        assert enumerate_disarm_items(repo, [parked], armed_status, provenance) == []
+                      labels=[hold], body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+        assert enumerate_disarm_items(repo, [parked], armed_status, provenance) == [
+            {"pr_number": 41, "head_sha": sha_b, "reviewed_sha": sha_a, "repo": repo}]
+    # ... but a held DRAFTED-unarmed PR still has nothing latched and nothing interrupted — the
+    # hold never manufactures a safety violation where none exists (DO-NOTHING).
+    for hold in ("review:needs-user", "needs:user"):
+        held_draft = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=True,
+                          labels=[hold], body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+        assert enumerate_disarm_items(repo, [held_draft], {41: status_of(sha_b)},
+                                      provenance) == []
     # a never-bound marker reads as "none" (crash-window recovery: arm landed, bind crashed)
     unbound = pull(41, "sparq-agent/issue-7-1-1", sha_b, draft=False, labels=["review:pass"])
     assert enumerate_disarm_items(repo, [unbound], armed_status, provenance)[0][
