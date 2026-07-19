@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 407,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9f69823f9214fb43baa170bca2056bf4cbe05778",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new role guard only rejects more than one distinct role. `resolve([\"role:\", \"area:usage\"], doc)` sets `role` to the empty string, and `resolve([\"role:unknown\", \"area:usage\"], doc)` sets it to an unconfigured role; in both cases no role route matches and Phase 3 returns the permissive defaults. CLAIM-side `policy-resolve.resolve` rejects an empty role value and rejects any role absent from `role_routes`, so PLAN and CLAIM still diverge despite this file's exact-match contract. An unknown role can also become a normal truthy planner row using the default agent/model chain, only to be rejected later at CLAIM. The added tests cover ambiguity but have no assertion for these malformed single-role cases.",
+    "file": "scripts/route-resolve.py",
+    "fix_hint": "Validate that the sole role value is non-empty and corresponds to an explicit role route before returning any route; raise a fail-closed resolver exception otherwise, matching policy-resolve. Add non-vacuous self-tests asserting that both `role:` and an unconfigured `role:<name>` raise, plus planner coverage showing malformed issues cannot produce default-routed plan rows.",
+    "severity": "major",
+    "title": "Empty and unknown roles still fall through to defaults"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior multi-role default-route flaw is fixed with a non-vacuous exception test, but PLAN/CLAIM resolution is still not exact or fail-closed for other malformed declared roles. route-resolve accepts an empty or unknown role and returns defaults, while policy-resolve rejects both. The planner can likewise construct a default-routed row for an unknown role. Because this is the same trust boundary and the changed code explicitly promises parity with CLAIM, the fix is incomplete. This is a new major finding relative to round 1, so progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
