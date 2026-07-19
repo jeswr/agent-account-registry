@@ -931,6 +931,32 @@ jobs:
           # No summary at all = the claim aborted before even the early plan-summary write
           # (validation/API/setup); that is a zero-dispatch-shaped tick, not a quiet one.
           abort = summary is None and os.environ.get("CLAIM_OUTCOME") == "failure"
+          # Issue #108: per-lane health, so a productive WORKER launch can no longer mark the tick
+          # healthy while a safety disarm or an entire review/fix lane failed. The disarm lane
+          # consumes no account/lease, so it is invisible to the fleet planned/dispatched counts
+          # above — a disarm ERROR (a stale auto-merge latch that could not be retracted) is
+          # safety-critical and MUST alert on its own. A review/fix lane that planned work, launched
+          # nothing, AND hit hard errors is a genuine stall (as opposed to plain capacity
+          # contention, which is `deferred`, not `error`). Any of these records the SAME
+          # `zero-dispatch` health class the fleet signal uses (ready work that did not launch), so a
+          # persistent stall accumulates over consecutive ticks and pages — while a healthy tick
+          # (every planned lane launched, no disarm error) still records `success` and closes it.
+          lanes = (summary or {}).get("lanes", {})
+          lanes = lanes if isinstance(lanes, dict) else {}
+          def _lane(name):
+              lane = lanes.get(name, {})
+              return lane if isinstance(lane, dict) else {}
+          def _n(lane, key):
+              value = lane.get(key, 0)
+              return value if isinstance(value, int) else 0
+          disarm_failed = _n(_lane("disarm"), "error") > 0
+          def _lane_stalled(name):
+              lane = _lane(name)
+              return _n(lane, "planned") > 0 and _n(lane, "launched") == 0 \
+                  and _n(lane, "error") > 0
+          review_stalled = _lane_stalled("review")
+          fix_stalled = _lane_stalled("fix")
+          lane_unhealthy = disarm_failed or review_stalled or fix_stalled
           step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
           # Every tick with a summary emits the frontier/ledger health line (issue #28) — an
           # empty frontier (frontier_size=0) is now visibly distinct from a ledger failure
@@ -948,9 +974,27 @@ jobs:
                       out.write(f"- `{reason}`: {count}\n")
                   if not reasons:
                       out.write("- (no per-item defer reason captured)\n")
+          # Issue #108: surface a lane stall that the fleet dispatched>0 count would otherwise hide,
+          # so the masked safety failure is human-visible on the tick it happens (not just after the
+          # consecutive-tick page).
+          if lane_unhealthy and not zero and step_summary:
+              with open(step_summary, "a", encoding="utf-8") as out:
+                  out.write("### ⚠️ Lane stall masked by other lanes\n\n")
+                  if disarm_failed:
+                      out.write(f"- safety **disarm** errored on "
+                                f"{_n(_lane('disarm'), 'error')} item(s) — a stale auto-merge "
+                                "latch could not be retracted\n")
+                  if review_stalled:
+                      out.write("- **review** lane planned work but launched nothing "
+                                "(every item errored)\n")
+                  if fix_stalled:
+                      out.write("- **fix** lane planned work but launched nothing "
+                                "(every item errored)\n")
           # Emit a marker file the record step reads (keeps the record invocation out of this
-          # inline python so the salted-hash discipline stays in model-health.py).
-          state = "zero" if zero else "abort" if abort else "ok" if productive else "none"
+          # inline python so the salted-hash discipline stays in model-health.py). A lane stall or a
+          # failed safety disarm counts as a zero-dispatch tick even when the fleet dispatched>0.
+          state = "zero" if (zero or lane_unhealthy) else "abort" if abort \
+              else "ok" if productive else "none"
           with open(os.environ["RUNNER_TEMP"] + "/dispatch-tick-state", "w",
                     encoding="utf-8") as flag:
               flag.write(state)

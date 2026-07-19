@@ -91,6 +91,30 @@ SNAPSHOT_SKIP_REASONS = {
 # without a red gate), so CLAIM re-derives it live and applies the needs-user hand-off.
 REVIEW_STATES = {"needs-review", "needs-fix", "needs-ci-fix", "needs-rebase", "stranded"}
 FIX_KIND_OF_STATE = {"needs-fix": "verdict", "needs-ci-fix": "ci", "needs-rebase": "rebase"}
+# Independent per-lane tick accounting (issue #108): a productive worker launch must NEVER mask a
+# failed safety disarm or a review/fix lane that planned work but launched nothing. Each lane keeps
+# its own planned/launched/deferred/error tally so the tick-health recorder can surface a stalled
+# lane (and a safety-critical disarm error) regardless of activity in the other lanes.
+DISPATCH_LANES = ("worker", "review", "fix", "disarm")
+# The review-loop lane owns needs-review re-reviews and the stranded terminal escalation; every
+# other REVIEW_STATE (needs-fix / needs-ci-fix / needs-rebase) is a fix-loop launch.
+REVIEW_LANE_STATES = {"needs-review", "stranded"}
+
+
+def _review_item_lane(state):
+    """The dispatch lane a review-plan item belongs to (issue #108): the review loop (needs-review
+    plus the stranded escalation) vs the fix loop (needs-fix / needs-ci-fix / needs-rebase). Used so
+    a stalled review lane is counted apart from the fix lane and from worker launches — a worker
+    launch can otherwise mark the whole tick healthy while every review item fails forever."""
+    return "review" if state in REVIEW_LANE_STATES else "fix"
+
+
+def _new_lane_counts():
+    """A fresh per-lane accumulator: {lane: Counter(planned/launched/deferred/error)} (issue #108).
+    planned is seeded up front from the plan; the worker loop and the review/fix/disarm helpers fold
+    in launched/error as each item resolves, and deferred is derived (planned-launched-error) at
+    summary time so escalations and capacity holds are neither launches nor hard errors."""
+    return {lane: Counter() for lane in DISPATCH_LANES}
 # Human-owned PR labels: review:needs-user is the loop's own terminal escalation; needs:user is
 # groom's parked-PR marker ("Human attention required"). EITHER parks the whole autonomous
 # surface for the PR — enumeration, repair admission, and worker-pr.py disarm all stand down.
@@ -1500,18 +1524,28 @@ def _resolvable_chain(chain, routing):
 
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
-                           defer_reasons, ledger_root=""):
+                           defer_reasons, lanes=None, ledger_root=""):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
     that item (per-item resilience, like the issue loop). `defer_reasons` is the tick's SHARED
     histogram: allocator lease errors here must fold into the same `lease-error` counter the
     issue loop uses, because _ledger_health/_ledger_rot_zeroed_dispatch (issue #28) read that
     counter — an all-review/fix tick whose claims all errored would otherwise report ledger=ok
-    and dodge the zero-dispatch fail-loud."""
+    and dodge the zero-dispatch fail-loud.
+
+    `lanes` is the tick's per-lane accumulator (issue #108). Each item's plan state selects its lane
+    (review vs fix via _review_item_lane); a launch folds into that lane's `launched` and a hard
+    failure (lease error, revalidation DispatchError, failed workflow launch) into its `error`. This
+    keeps a review/fix lane that launched NOTHING visible to the tick-health recorder even when the
+    worker lane launched — the exact masking this loop's bare launched-count return used to allow."""
+    if lanes is None:
+        lanes = _new_lane_counts()
     launched = 0
     script_dir = Path(__file__).resolve().parent
     max_rounds = int(policy.get("max_review_rounds", 3))
     for item in review_items:
         number = item["pr_number"]
+        lane = _review_item_lane(item["state"])
+        lanes[lane]["planned"] += 1
         try:
             if not bot_login:
                 print(f"defer review {repo}#{number}: bot login unavailable (no App token)")
@@ -1794,6 +1828,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "unresolvable in the target routing (no concrete provider model)")
                 continue
         except DispatchError as exc:
+            lanes[lane]["error"] += 1
             print(f"defer review {repo}#{number}: revalidation failed ({exc}); skipped")
             continue
         now = int(time.time())
@@ -1817,6 +1852,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             defer_reasons["lease-error"] += 1
+            lanes[lane]["error"] += 1
             print(f"defer review {repo}#{number}: lease allocation errored ({exc}); skipped")
             continue
         if claim is None:
@@ -1877,9 +1913,16 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             released = _release_failed_dispatch(allocator, registry_repo, claim_id)
             if not released:
                 print("::error::review-fix dispatch failed and its lease could not be released")
+            # A failed workflow launch is a HARD dispatch error, not capacity contention: fold it
+            # into the lane's error tally (issue #108) so an all-launch-failed review/fix lane
+            # reads planned>0/launched=0/error>0 (stalled) instead of deriving as `deferred` and
+            # dodging the tick-health recorder while another lane launched.
+            defer_reasons["dispatch-launch-failed"] += 1
+            lanes[lane]["error"] += 1
             print(f"defer review {repo}#{number}: {mode} dispatch failed; skipped")
             continue
         launched += 1
+        lanes[lane]["launched"] += 1
         # Privacy (locked decision 22b): public workflow logs never carry account handles.
         kind_note = "" if fix_kind == "verdict" else f"/{fix_kind}"
         print(f"dispatched {mode}{kind_note} {repo}#{number}: round={round_number}, "
@@ -1887,7 +1930,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     return launched
 
 
-def _apply_disarm_items(disarm_items, repo, script_dir, bot_login):
+def _apply_disarm_items(disarm_items, repo, script_dir, bot_login, disarm_counts=None):
     """GAP-C (registry issue #42): retract stale GitHub auto-merge latches BEFORE any fix/review
     admission each sweep. The plan rows are HOSTILE — worker-pr.py `disarm --when mismatch`
     re-derives every precondition from the LIVE API (open same-repo bot worker PR, armed OR
@@ -1896,19 +1939,33 @@ def _apply_disarm_items(disarm_items, repo, script_dir, bot_login):
     does NOT block this safety-only retraction (issue #105): --when mismatch retracts the latch
     while preserving the hold label. Failures skip the item (per-item resilience); the
     enumeration re-emits next tick until the invariant holds — including across a crash between
-    disable-auto and redraft, which mismatch mode re-enters via the ready-but-unarmed leg."""
+    disable-auto and redraft, which mismatch mode re-enters via the ready-but-unarmed leg.
+
+    `disarm_counts` (issue #108) is the disarm lane's tick accumulator: `launched` when the
+    live-revalidated retraction applied (or was a confirmed no-op), `error` when the helper RAISED,
+    `deferred` when no App token/bot identity was available to even attempt it. An `error` here is
+    safety-critical — a stale auto-merge latch that could not be retracted — so the caller surfaces
+    disarm_counts['error'] to the tick-health recorder INDEPENDENTLY of the fleet dispatch count; a
+    worker launch must never let a failed disarm read as a healthy tick."""
+    if disarm_counts is None:
+        disarm_counts = Counter()
     for item in disarm_items:
         number = item["pr_number"]
+        disarm_counts["planned"] += 1
         try:
             if not bot_login or not _target_token(repo):
+                disarm_counts["deferred"] += 1
                 print(f"defer disarm {repo}#{number}: target App token unavailable")
                 continue
             _run_target_helper(script_dir, repo, "worker-pr.py", [
                 "disarm", "--repo", repo, "--pr", str(number), "--when", "mismatch"])
+            disarm_counts["launched"] += 1
             print(f"disarm {repo}#{number}: live armed-SHA invariant re-checked and applied")
         except DispatchError as exc:
+            disarm_counts["error"] += 1
             print(f"defer disarm {repo}#{number}: {exc}; retried next tick")
             continue
+    return disarm_counts
 
 
 def _route_matches(repo, item, policy_doc, routing_doc, policy_module):
@@ -2018,6 +2075,14 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     planned = sum(len(repository["items"]) + len(
         [e for e in plan["review_items"] if e["repo"] == repository["target_repo"]])
         for repository in plan["repositories"])
+    # Independent per-lane accounting (issue #108): each lane's iterator (the worker loop,
+    # _dispatch_review_items, _apply_disarm_items) folds its own planned/launched/error into this
+    # shared accumulator as items resolve; deferred is derived at summary time. worker+review+fix
+    # planned == the fleet `planned` above; disarm is its OWN lane (it consumes no account/lease, so
+    # it was invisible to the fleet count — the exact gap that let a failed safety disarm hide
+    # behind a worker launch). A worker launch can no longer mark the whole tick healthy while a
+    # safety disarm or an entire review/fix lane failed.
+    lanes = _new_lane_counts()
     # Per-item snapshot degradation (run 29617040167): PLAN skipped these PRs' CI/merge
     # snapshot (oversized check-run listing, failed detail read, census overflow) instead of
     # failing the sweep. Their snapshot-derived admissions already stood down at PLAN time
@@ -2032,7 +2097,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     # planned>0/launched-0 summary for the workflow's always()-guarded tick recorder — instead of
     # a missing file that used to read as planned=0 and record nothing. The final write below
     # overwrites it with the real launched count + histogram.
-    _write_dispatch_summary(planned, 0, defer_reasons)
+    _write_dispatch_summary(planned, 0, defer_reasons, lanes)
     for repository in plan["repositories"]:
         repo = repository["target_repo"]
         try:
@@ -2058,13 +2123,16 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             leases=_ledger_leases(ledger_root), now=int(time.time()))
 
         # Safety invariant FIRST (issue #42): stale arm latches are retracted before any fix or
-        # review admission can push onto (or re-review past) an armed, mutated head.
+        # review admission can push onto (or re-review past) an armed, mutated head. The disarm lane
+        # folds its own launched/error/deferred into `lanes` (issue #108) — an error here alerts
+        # regardless of the worker/review/fix outcome below.
         _apply_disarm_items(
             [entry for entry in plan["disarm_items"] if entry["repo"] == repo],
-            repo, script_dir, bot_login)
+            repo, script_dir, bot_login, lanes["disarm"])
 
         for item in repository["items"]:
             number = item["number"]
+            lanes["worker"]["planned"] += 1
             if number in linked_open_prs:
                 defer_reasons["existing-pr"] += 1
                 print(f"defer {repo}#{number}: an open worker/closing PR already exists")
@@ -2179,6 +2247,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
                 defer_reasons["lease-error"] += 1
+                lanes["worker"]["error"] += 1
                 print(f"defer {repo}#{number}: lease allocation errored ({exc}); skipped")
                 continue
             if claim is None:
@@ -2229,9 +2298,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 if not released:
                     print("::error::worker dispatch failed and its lease could not be released")
                 defer_reasons["dispatch-launch-failed"] += 1
+                # Same hard-error classification as the review/fix lanes: a failed launch must
+                # not derive as `deferred` in the lane summary.
+                lanes["worker"]["error"] += 1
                 print(f"defer {repo}#{number}: worker dispatch failed; skipped")
                 continue
             dispatched += 1
+            lanes["worker"]["launched"] += 1
             kind = "deferred-retry" if item["deferred"] else "worker"
             # Privacy (locked decision 22b): public workflow logs never carry account handles.
             print(f"dispatched {kind} {repo}#{number}: model={model}, claim={claim_id[:8]}")
@@ -2244,12 +2317,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 repo_review_items, repo, policy, routing, allocator, worker_pr,
                 registry_repo, registry_root, workflow_ref, bot_login, usage,
                 float(policy.get("usage_safety_margin", 0.10)),
-                defer_reasons, ledger_root=ledger_root)
+                defer_reasons, lanes=lanes, ledger_root=ledger_root)
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
+    # Per-lane tick summary (issue #108) — coarse counts only (no issue numbers/handles). A stalled
+    # review/fix lane or a failed safety disarm is visible here even when the worker lane launched.
+    for name in DISPATCH_LANES:
+        counts = lanes[name]
+        print(f"lane {name}: planned={counts.get('planned', 0)} "
+              f"launched={counts.get('launched', 0)} error={counts.get('error', 0)}")
 
     # Final summary (registry #28/#32): overwrite the early claim-start write with the real
-    # launched count + defer-reason histogram.
-    _write_dispatch_summary(planned, dispatched, defer_reasons)
+    # launched count + defer-reason histogram + per-lane counts.
+    _write_dispatch_summary(planned, dispatched, defer_reasons, lanes)
 
     # Fail LOUD on ledger rot (issue #28): a tick that launched NOTHING because the lease ledger
     # errored (CAS failures, unreadable ledger, auth) is byte-identical to a genuinely empty
@@ -2282,15 +2361,33 @@ def _ledger_health(defer_reasons):
     return "error" if defer_reasons.get("lease-error", 0) else "ok"
 
 
-def _write_dispatch_summary(planned, dispatched, defer_reasons):
+def _lane_summary(lanes):
+    """Serialize the per-lane accumulator (issue #108) into the summary's `lanes` field: for every
+    lane {planned, launched, deferred, error}, with deferred DERIVED (planned-launched-error,
+    clamped at 0) so escalations and capacity holds — neither launches nor hard errors — are counted
+    without instrumenting every defer path. Coarse counts only (no issue numbers/handles)."""
+    summary = {}
+    for name in DISPATCH_LANES:
+        counts = (lanes or {}).get(name) or {}
+        planned = int(counts.get("planned", 0) or 0)
+        launched = int(counts.get("launched", 0) or 0)
+        error = int(counts.get("error", 0) or 0)
+        summary[name] = {"planned": planned, "launched": launched,
+                         "deferred": max(0, planned - launched - error), "error": error}
+    return summary
+
+
+def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None):
     """Zero-dispatch visibility (registry #28/#32): emit a compact, privacy-safe summary
-    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram}) for the CLAIM step to
-    render + record. `frontier_size` is the ready-frontier size the tick observed (== planned) and
-    `ledger` is ok|error — together they let the run summary distinguish an empty frontier from a
-    lease-ledger failure (issue #28), which both otherwise present as a green 0-dispatch tick. NO
-    issue numbers or account handles — only coarse category counts. Best-effort file write; a
-    failure here must never fail dispatch. Called at claim START (planned only — review defect #6)
-    and again at the end with the launched counts."""
+    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram, lanes}) for the CLAIM
+    step to render + record. `frontier_size` is the ready-frontier size the tick observed (==
+    planned) and `ledger` is ok|error — together they let the run summary distinguish an empty
+    frontier from a lease-ledger failure (issue #28), which both otherwise present as a green
+    0-dispatch tick. `lanes` (issue #108) carries the worker/review/fix/disarm decomposition so the
+    tick-health recorder can surface a stalled lane — or a failed safety disarm — regardless of
+    activity in the other lanes. NO issue numbers or account handles — only coarse category counts.
+    Best-effort file write; a failure here must never fail dispatch. Called at claim START (planned
+    only — review defect #6) and again at the end with the launched counts."""
     summary_path = os.environ.get("DISPATCH_SUMMARY_FILE")
     if not summary_path:
         return
@@ -2298,7 +2395,8 @@ def _write_dispatch_summary(planned, dispatched, defer_reasons):
         with open(summary_path, "w", encoding="utf-8") as handle:
             json.dump({"planned": planned, "dispatched": dispatched,
                        "frontier_size": planned, "ledger": _ledger_health(defer_reasons),
-                       "defer_reasons": dict(defer_reasons)}, handle)
+                       "defer_reasons": dict(defer_reasons),
+                       "lanes": _lane_summary(lanes)}, handle)
     except OSError as exc:
         print(f"::warning::dispatch summary write failed ({exc}); continuing")
 
@@ -2429,21 +2527,56 @@ def _self_test():
         summary_file = os.path.join(summary_dir, "summary.json")
         prior_summary = os.environ.get("DISPATCH_SUMMARY_FILE")
         os.environ["DISPATCH_SUMMARY_FILE"] = summary_file
+        # Issue #108: a worker launch must NOT mask a failed safety disarm or a stalled review/fix
+        # lane. Feed a tick where the worker lane launched but disarm ERRORED and the review lane
+        # planned work yet launched nothing (all errored) — the summary must carry those per-lane
+        # counts distinctly so the tick-health recorder can alert regardless of the worker launch.
+        masking_lanes = _new_lane_counts()
+        masking_lanes["worker"].update({"planned": 1, "launched": 1})
+        masking_lanes["review"].update({"planned": 2, "error": 2})
+        masking_lanes["fix"].update({"planned": 1, "launched": 1})
+        masking_lanes["disarm"].update({"planned": 1, "error": 1})
         try:
             _write_dispatch_summary(5, 0, folded)
+            with open(summary_file, encoding="utf-8") as handle:
+                planned_only = json.load(handle)
+            _write_dispatch_summary(4, 2, Counter(), masking_lanes)
+            with open(summary_file, encoding="utf-8") as handle:
+                masked = json.load(handle)
         finally:
             if prior_summary is None:
                 del os.environ["DISPATCH_SUMMARY_FILE"]
             else:
                 os.environ["DISPATCH_SUMMARY_FILE"] = prior_summary
-        with open(summary_file, encoding="utf-8") as handle:
-            recorded = json.load(handle)
-    assert recorded["defer_reasons"]["snapshot-skip:check-runs-overflow"] == 1
+    assert planned_only["defer_reasons"]["snapshot-skip:check-runs-overflow"] == 1
     # Issue #28: the summary carries the ready-frontier size and lease-ledger health so a
     # 0-dispatch tick can be told apart from a ledger failure. A snapshot-skip-only tick has a
     # HEALTHY ledger (no lease-error), so ledger == "ok".
-    assert recorded["frontier_size"] == 5, recorded
-    assert recorded["ledger"] == "ok", recorded
+    assert planned_only["frontier_size"] == 5, planned_only
+    assert planned_only["ledger"] == "ok", planned_only
+    # The lanes field is always present; an unpopulated call reports all-zero lanes (never absent,
+    # so the workflow's .get never has to guess a default).
+    assert planned_only["lanes"]["disarm"] == {
+        "planned": 0, "launched": 0, "deferred": 0, "error": 0}, planned_only
+    # Issue #108 core assertion: even though the fleet DISPATCHED 2 (worker+fix launched), the
+    # disarm lane's error and the review lane's stall are preserved verbatim — the exact signals the
+    # tick-health recorder keys on to alert past a productive worker launch. Every field below flips
+    # if the per-lane accounting is dropped back to a single conflated launched count.
+    assert masked["lanes"]["disarm"]["error"] == 1, masked
+    assert masked["lanes"]["review"] == {
+        "planned": 2, "launched": 0, "deferred": 0, "error": 2}, masked
+    assert masked["lanes"]["worker"]["launched"] == 1 and masked["dispatched"] == 2, masked
+    # deferred is DERIVED (planned-launched-error, clamped): a lane with a capacity hold (no error)
+    # counts as deferred, a fully-errored lane has deferred 0, and over-count never goes negative.
+    assert _lane_summary({"review": Counter({"planned": 3, "launched": 1})})["review"] == {
+        "planned": 3, "launched": 1, "deferred": 2, "error": 0}
+    assert _lane_summary({"fix": Counter({"planned": 1, "launched": 2})})["fix"]["deferred"] == 0
+    # Every REVIEW_STATE maps to exactly one lane and the split is EXHAUSTIVE (a new state would
+    # KeyError the assertion below rather than silently land in the fix lane): needs-review + the
+    # stranded escalation are the review lane; the three fix-run states are the fix lane.
+    assert {state: _review_item_lane(state) for state in REVIEW_STATES} == {
+        "needs-review": "review", "stranded": "review",
+        "needs-fix": "fix", "needs-ci-fix": "fix", "needs-rebase": "fix"}
     # _ledger_health flips to "error" exactly when a lease-error is folded in, and stays "ok"
     # otherwise (an empty histogram or non-ledger defers must NOT masquerade as ledger rot).
     assert _ledger_health(Counter()) == "ok"
@@ -3161,11 +3294,15 @@ def _self_test():
     def run_items(items, allocator=None, routing=None):
         helper_calls.clear()
         reasons = Counter()
+        # Issue #108: a fresh per-lane accumulator each call; run_items.lanes exposes it for the
+        # review/fix stall assertions below without changing the (launched, reasons) return arity.
+        lanes = _new_lane_counts()
         launched = _dispatch_review_items(
             items, repo, {"max_review_rounds": 3, "account_pool": []},
             routing or {}, allocator, wiring_worker_pr, "reg/repo",
-            wiring_root, "main", bot, None, 0.10, reasons,
+            wiring_root, "main", bot, None, 0.10, reasons, lanes=lanes,
             ledger_root=wiring_ledger_root)
+        run_items.lanes = lanes
         return launched, reasons
 
     ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
@@ -3437,6 +3574,11 @@ def _self_test():
             assert launched == 0 and reasons["lease-error"] == 0, (launched, reasons)
             assert _ledger_health(reasons) == "ok", reasons
             assert _ledger_rot_zeroed_dispatch(launched, reasons) is False
+            # Issue #108: a needs-fix item is the FIX lane. Capacity contention (None claim) is a
+            # DEFER, not an error — the fix lane records planned=1, launched=0, error=0, so the
+            # health recorder does NOT read it as a hard stall while accounts are simply busy.
+            assert _lane_summary(run_items.lanes)["fix"] == {
+                "planned": 1, "launched": 0, "deferred": 1, "error": 0}, run_items.lanes
 
             # ---- review/fix lease-error propagation (PR #258 review defect): an allocator
             # that RAISES inside the review/fix loop must land in the tick's SHARED
@@ -3453,6 +3595,67 @@ def _self_test():
             assert launched == 0 and reasons["lease-error"] == 1, (launched, reasons)
             assert _ledger_health(reasons) == "error", reasons
             assert _ledger_rot_zeroed_dispatch(launched, reasons) is True
+            # Issue #108: the SAME raise also lands in the FIX lane's error tally (launched 0,
+            # error 1) — so "every fix item fails forever" is visible per-lane even when the worker
+            # lane launched on the same tick and the fleet dispatched>0 hid the ledger-rot signal.
+            # A needs-fix plan row is the fix lane, so the review lane stays clean this tick.
+            errored = _lane_summary(run_items.lanes)
+            assert errored["fix"] == {
+                "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+            assert errored["review"]["planned"] == 0, run_items.lanes
+
+            # ---- review/fix workflow-launch failure is a LANE ERROR (PR #321 review): a
+            # nonzero `gh workflow run` is a hard dispatch failure, not capacity contention.
+            # It must fold into the lane's error tally + the shared dispatch-launch-failed
+            # histogram, so an all-launch-failed fix lane reads stalled (planned>0,
+            # launched=0, error>0) instead of deriving as `deferred` and dodging the
+            # tick-health recorder while another lane launched. ----
+            class ClaimingAllocator:
+                def __init__(self):
+                    self.released = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    return {"account": "acct01", "claim_id": "ab" * 16,
+                            "model": chain[0], "provider": "anthropic"}
+
+                def release(self, _repo, claim_id, _now):
+                    self.released.append(claim_id)
+                    return True
+
+            gh_runs = []
+            real_run_gh = _run_gh
+
+            def fake_run_gh(args, *, check=True):
+                gh_runs.append(list(args))
+                return subprocess.CompletedProcess(args, fake_run_gh.returncode)
+
+            try:
+                globals()["_run_gh"] = fake_run_gh
+                fake_run_gh.returncode = 1
+                alloc = ClaimingAllocator()
+                launched, reasons = run_items([fix_item], allocator=alloc,
+                                              routing=routing_ok)
+                assert gh_runs and gh_runs[0][:3] == [
+                    "workflow", "run", "review-fix.yml"], gh_runs
+                assert launched == 0 and reasons["dispatch-launch-failed"] == 1, \
+                    (launched, reasons)
+                assert alloc.released == ["ab" * 16], alloc.released  # lease not leaked
+                assert _lane_summary(run_items.lanes)["fix"] == {
+                    "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+                # flip-goes-green: the SAME posture with a zero-exit launch is a lane launch,
+                # not an error, and the lease stays held for the launched workflow
+                gh_runs.clear()
+                fake_run_gh.returncode = 0
+                alloc = ClaimingAllocator()
+                launched, reasons = run_items([fix_item], allocator=alloc,
+                                              routing=routing_ok)
+                assert launched == 1 and reasons["dispatch-launch-failed"] == 0, \
+                    (launched, reasons)
+                assert alloc.released == [], alloc.released
+                assert _lane_summary(run_items.lanes)["fix"] == {
+                    "planned": 1, "launched": 1, "deferred": 0, "error": 0}, run_items.lanes
+            finally:
+                globals()["_run_gh"] = real_run_gh
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io
@@ -3930,20 +4133,32 @@ def _self_test():
                 raise DispatchError("boom")
 
         globals()["_run_target_helper"] = fake_helper
+        disarm_counts = Counter()
         _apply_disarm_items([
             {"pr_number": 13, "head_sha": "1" * 40, "reviewed_sha": "none",
              "repo": "example/repo"},
             {"pr_number": 14, "head_sha": "1" * 40, "reviewed_sha": "none",
              "repo": "example/repo"},
-        ], "example/repo", Path("."), "reg[bot]")
+        ], "example/repo", Path("."), "reg[bot]", disarm_counts)
         # a failing item SKIPS (never aborts the sweep) and every call is the strict
         # mismatch-only mode — CLAIM never requests an unconditional disarm from the plan
         assert [args[4] for args in calls] == ["13", "14"], calls
         assert all(args[0] == "disarm" and args[-1] == "mismatch" for args in calls)
+        # Issue #108: PR 13's raise lands in the disarm lane's ERROR tally (a stale auto-merge latch
+        # that could NOT be retracted — safety-critical), while PR 14's clean retraction is a
+        # `launched`. This error MUST alert the tick regardless of worker/review/fix launches, so it
+        # is recorded per-lane rather than swallowed by a bare per-item skip.
+        assert disarm_counts["error"] == 1 and disarm_counts["launched"] == 1, disarm_counts
+        assert disarm_counts["deferred"] == 0, disarm_counts
         calls.clear()
+        # No bot identity -> DEFER with NO mutation attempted, and the disarm lane records it as
+        # `deferred` (never `error`): we could not even attempt the safety retraction this tick.
+        no_token = Counter()
         _apply_disarm_items([{"pr_number": 15, "head_sha": "1" * 40, "reviewed_sha": "none",
-                              "repo": "example/repo"}], "example/repo", Path("."), "")
-        assert calls == []            # no bot identity -> defer with NO mutation attempted
+                              "repo": "example/repo"}], "example/repo", Path("."), "", no_token)
+        assert calls == []
+        assert no_token["deferred"] == 1 and no_token["error"] == 0 \
+            and no_token["launched"] == 0, no_token
     finally:
         globals()["_run_target_helper"] = real_helper
         globals()["_target_token"] = real_token
