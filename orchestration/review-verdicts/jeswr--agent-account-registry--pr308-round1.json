@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly separates human-held autonomous work from the fail-safe armed-SHA mismatch retraction. Enumeration still requires an open same-repo bot worker PR, valid provenance and SHA, a coherent status snapshot, and an actual armed or ready/unarmed mismatch. The live disarm path independently re-derives identity, queue/arm state, draft state, and reviewed-SHA mismatch; held PRs bypass carry-forward and retain only latch removal/redraft actions, while relabeling is suppressed so the hold survives. The when=always repair path remains fully blocked by a human hold. Tests cover both hold labels, armed content-changing and content-identical advances, preservation of the hold via absence of relabeling, and the when=always no-op; the dispatch tests also retain the drafted/unarmed no-op. No trust check is weakened beyond the intentional safety-action exception, and the added tests would fail if the prior early-return behavior were restored.",
+ "verdict": "approve"
+}
