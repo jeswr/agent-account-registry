@@ -1114,10 +1114,16 @@ jobs:
           record="ledger/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
           [[ -f "$record" ]] || record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
           [[ -f "$record" ]] || { echo "::error::no registry verdict record for round $REVIEW_ROUND"; exit 1; }
+          # The sha alone is not identity — the record's envelope must ALSO name exactly this
+          # dispatch's repo/PR/round (a same-commit record for another PR or round sets
+          # staged=false and the fix step below skips).
           python3 registry/scripts/worker-pr.py stage-verdict \
             --record-file "$record" \
             --out-file "$WORKER_ROOT/review-verdict.json" \
-            --expected-sha "$EXPECTED_SHA"
+            --expected-sha "$EXPECTED_SHA" \
+            --target-repo "$TARGET_REPO" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "$REVIEW_ROUND"
 
       - name: Run same-provider fix (findings framed as untrusted data)
         id: fix

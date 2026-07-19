@@ -1051,6 +1051,22 @@ def envelope_reviewed_sha(record):
     return None
 
 
+def envelope_identity_matches(record, expected_repo, expected_pr, expected_round):
+    """PURE: True ONLY when the record's host envelope names EXACTLY the dispatch context —
+    same repo (str), same PR and round (real ints; bool is rejected even though it compares
+    equal to an int). The reviewed sha alone does not identify a verdict: two PRs (or two
+    rounds of one PR) can share a commit, so a matching-sha record for the wrong repo/PR/round
+    must never seed the fixer. Any missing, malformed, or mismatched field is False."""
+    if not (isinstance(record, dict) and isinstance(record.get("host_envelope"), dict)):
+        return False
+    env = record["host_envelope"]
+    repo, pr, round_n = env.get("repo"), env.get("pr"), env.get("round")
+    return (isinstance(repo, str) and repo == expected_repo
+            and isinstance(pr, int) and not isinstance(pr, bool) and pr == expected_pr
+            and isinstance(round_n, int) and not isinstance(round_n, bool)
+            and round_n == expected_round)
+
+
 def select_reconcilable_pr(pulls, target_repo, bot_login, issue, head_branch):
     """PURE: from the target API's PR list for the DETERMINISTIC head branch, choose the single
     open, bot-authored, non-fork, issue-bound PR whose provenance must be reconciled (issue #128).
@@ -1129,16 +1145,28 @@ def verdict_record(registry_repo, target_repo, pr_number, round_n, reviewed_sha,
           f"for {target_repo}#{pr_number} round {round_n}")
 
 
-def stage_verdict_for_fix(record_file, out_file, expected_sha):
+def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, expected_pr,
+                          expected_round):
     """Issue #156, fixer-consumption guard: unwrap a registry verdict record for the same
     provider fixer ONLY when its host envelope binds it to `expected_sha` — the exact commit
-    the fixer is about to check out and edit. A legacy unbound record (no envelope) or a
-    reviewed sha that no longer matches the live head is STALE: refuse to stage it
-    (staged=false) so the fixer is never seeded against code that was never reviewed; the
-    sweep re-reviews the advanced head instead. Fails closed on a malformed expected sha or
-    an unreadable record. The staged file is written 0600 (the findings are untrusted data)."""
+    the fixer is about to check out and edit — AND names exactly this dispatch's repo, PR,
+    and round (a matching sha alone is not identity: a record for another PR or round that
+    happens to name the same commit must never seed this fixer). A legacy unbound record (no
+    envelope), a reviewed sha that no longer matches the live head, or an envelope whose
+    identity fields are missing/malformed/mismatched refuses to stage (staged=false) so the
+    fixer is never seeded against code that was never reviewed as this PR; the sweep
+    re-reviews the advanced head instead. Fails closed on malformed dispatch inputs or an
+    unreadable record. The staged file is written 0600 (the findings are untrusted data)."""
     if not re.fullmatch(r"[0-9a-f]{40}", expected_sha or ""):
         raise WorkerPrError("stage-verdict requires a 40-hex --expected-sha")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+", expected_repo or ""):
+        raise WorkerPrError("stage-verdict requires an owner/name --target-repo")
+    if not (isinstance(expected_pr, int) and not isinstance(expected_pr, bool)
+            and expected_pr > 0):
+        raise WorkerPrError("stage-verdict requires a positive integer --pr")
+    if not (isinstance(expected_round, int) and not isinstance(expected_round, bool)
+            and expected_round > 0):
+        raise WorkerPrError("stage-verdict requires a positive integer --round")
     with open(record_file, encoding="utf-8") as handle:
         record = json.load(handle)
     bound = envelope_reviewed_sha(record)
@@ -1148,6 +1176,12 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha):
         detail = ("unbound legacy record" if bound is None
                   else f"reviewed {bound[:12]} != live head {expected_sha[:12]}")
         print(f"verdict NOT staged for the fixer ({detail}); deferring to a fresh review")
+        return
+    if not envelope_identity_matches(record, expected_repo, expected_pr, expected_round):
+        _write_outputs({"staged": False, "stale_reason": "identity-mismatch"})
+        print("verdict NOT staged for the fixer (envelope repo/pr/round does not name "
+              f"{expected_repo}#{expected_pr} round {expected_round}); "
+              "deferring to a fresh review")
         return
     path = Path(out_file)
     path.write_text(json.dumps(envelope_verdict(record), indent=1, sort_keys=True) + "\n",
@@ -3131,6 +3165,27 @@ def _self_test():
           envelope_reviewed_sha(_env_doc), None)
     check("envelope_reviewed_sha is None for a malformed bound sha",
           envelope_reviewed_sha({"host_envelope": {"reviewed_sha": "nope"}}), None)
+    # Review round 2: identity is repo AND pr AND round, exact values and exact types.
+    check("envelope identity matches the exact repo/pr/round",
+          envelope_identity_matches(_env, "o/r", 41, 3), True)
+    check("envelope identity rejects a wrong repo",
+          envelope_identity_matches(_env, "o/other", 41, 3), False)
+    check("envelope identity rejects a wrong pr",
+          envelope_identity_matches(_env, "o/r", 42, 3), False)
+    check("envelope identity rejects a wrong round",
+          envelope_identity_matches(_env, "o/r", 41, 4), False)
+    check("envelope identity rejects a legacy bare document",
+          envelope_identity_matches(_env_doc, "o/r", 41, 3), False)
+    check("envelope identity rejects a string pr even when it prints equal",
+          envelope_identity_matches(verdict_envelope("o/r", "41", 3, "a" * 40, _env_doc),
+                                    "o/r", 41, 3), False)
+    check("envelope identity rejects bool pr/round despite int equality",
+          envelope_identity_matches(verdict_envelope("o/r", True, 3, "a" * 40, _env_doc),
+                                    "o/r", 1, 3), False)
+    check("envelope identity rejects a missing round",
+          envelope_identity_matches({"host_envelope": {"repo": "o/r", "pr": 41,
+                                                       "reviewed_sha": "a" * 40}},
+                                    "o/r", 41, 3), False)
     try:
         verdict_envelope("o/r", 41, 3, "short", _env_doc)
         check("envelope refuses a non-40-hex reviewed sha", "no error", "raised")
@@ -3161,8 +3216,9 @@ def _self_test():
           revalidate_outcome_head("open", "sparq[bot]", True, "", "a" * 40, "sparq[bot]"),
           "malformed-head")
 
-    # stage_verdict_for_fix: unwrap ONLY when the envelope binds the record to the live head;
-    # a moved head or a legacy unbound record refuses to stage (staged=false).
+    # stage_verdict_for_fix: unwrap ONLY when the envelope binds the record to the live head
+    # AND names exactly this dispatch's repo/PR/round; a moved head, a legacy unbound record,
+    # or a matching-sha record for the wrong repo/PR/round refuses to stage (staged=false).
     with tempfile.TemporaryDirectory() as _tmp:
         _rec = Path(_tmp) / "rec.json"
         _out = Path(_tmp) / "out.json"
@@ -3173,21 +3229,51 @@ def _self_test():
             _rec.write_text(json.dumps(verdict_envelope("o/r", 41, 3, "a" * 40, _env_doc)),
                             encoding="utf-8")
             _stage_out.clear()
-            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40)
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 3)
             check("stage-verdict unwraps a matching record",
                   (_stage_out.get("staged"), json.loads(_out.read_text())), (True, _env_doc))
             _out.unlink()
             _stage_out.clear()
-            stage_verdict_for_fix(str(_rec), str(_out), "b" * 40)
+            stage_verdict_for_fix(str(_rec), str(_out), "b" * 40, "o/r", 41, 3)
             check("stage-verdict refuses a moved head (not staged)",
                   (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
                   (False, "head-moved", False))
+            # Review round 2: the sha matches but the record names ANOTHER repo / PR / round —
+            # each must refuse with no staged file (the sha alone is not identity).
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/other", 41, 3)
+            check("stage-verdict refuses a matching-sha record for the wrong repo",
+                  (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
+                  (False, "identity-mismatch", False))
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 42, 3)
+            check("stage-verdict refuses a matching-sha record for the wrong pr",
+                  (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
+                  (False, "identity-mismatch", False))
+            _stage_out.clear()
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 4)
+            check("stage-verdict refuses a matching-sha record for the wrong round",
+                  (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
+                  (False, "identity-mismatch", False))
             _rec.write_text(json.dumps(_env_doc), encoding="utf-8")  # legacy bare record
             _stage_out.clear()
-            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40)
+            stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 3)
             check("stage-verdict refuses a legacy unbound record (not staged)",
                   (_stage_out.get("staged"), _stage_out.get("stale_reason"), _out.exists()),
                   (False, "unbound", False))
+            # Malformed dispatch inputs DIE (never a silent stage): bad repo, non-positive pr,
+            # non-positive round.
+            for _bad_args, _label in (
+                    (("", 41, 3), "an empty --target-repo"),
+                    (("o/r", 0, 3), "a non-positive --pr"),
+                    (("o/r", 41, 0), "a non-positive --round")):
+                _stage_out.clear()
+                try:
+                    stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, *_bad_args)
+                    check(f"stage-verdict refuses {_label}", "no error", "raised")
+                except WorkerPrError:
+                    check(f"stage-verdict refuses {_label}",
+                          ("raised", _out.exists()), ("raised", False))
         finally:
             globals()["_write_outputs"] = _real_wo
 
@@ -3850,6 +3936,12 @@ def main():
     svrec.add_argument("--record-file", required=True)
     svrec.add_argument("--out-file", required=True)
     svrec.add_argument("--expected-sha", required=True)
+    # Review round 2: the sha alone is not identity — the envelope must also name exactly this
+    # dispatch's repo/PR/round or the record is refused (a same-commit record for another PR
+    # or round must never seed the fixer).
+    svrec.add_argument("--target-repo", required=True)
+    svrec.add_argument("--pr", required=True, type=int)
+    svrec.add_argument("--round", required=True, type=int)
 
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
@@ -3981,7 +4073,8 @@ def main():
             verdict_record(args.registry_repo, args.target_repo, args.pr, args.round,
                            args.reviewed_sha, args.verdict_file)
         elif args.command == "stage-verdict":
-            stage_verdict_for_fix(args.record_file, args.out_file, args.expected_sha)
+            stage_verdict_for_fix(args.record_file, args.out_file, args.expected_sha,
+                                  args.target_repo, args.pr, args.round)
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
