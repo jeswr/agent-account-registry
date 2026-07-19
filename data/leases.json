@@ -9,6 +9,16 @@
    "model": "fable",
    "issued_at": 1784421647,
    "expires_at": 1784425247
+  },
+  {
+   "account": "acct01",
+   "claim_id": "fc1e5231c8f24b2180285641ac51a014",
+   "holder": "review:jeswr/agent-account-registry#290@dispatch-29667420060.1",
+   "package": "groom",
+   "role": "review",
+   "model": "terra",
+   "issued_at": 1784422004,
+   "expires_at": 1784423204
   }
  ]
 }
