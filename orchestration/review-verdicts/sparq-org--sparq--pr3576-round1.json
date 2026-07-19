@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Q16 uses PATH_REACH_MEMBERS, whose compiled depths are 2, 4, 4, and 8, while the real fragment dispatcher requires PathClosure::ZeroOrOne.fixed_k() == 1 and rejects any member with d != 1 (PathDepthExceedsClosure). The builder also selects the smallest available member, d=2. Thus an accepted p? query cannot successfully bind any member listed here, contradicting the new definition of covered as having a dedicated member that proves it. This also makes the generated covered/gap summary inaccurate.",
+   "file": "bench/zk-compose/scripts/sparql_catalog.py",
+   "fix_hint": "Either add and snapshot a genuine d=1 path_reach member and list only compatible members for Q16, or keep Q16 as a gap until such a member exists. Update the generated JSON/counts accordingly. Strengthen the focused test to exercise real p? builder/fragment dispatch (or at minimum assert a listed member has d=1), rather than only checking the path_reach_ prefix.",
+   "severity": "major",
+   "title": "p? is marked covered but every listed circuit member is rejected"
+  }
+ ],
+ "progress": null,
+ "summary": "Q16 is promoted to covered even though no compiled path-reach member can satisfy the verifier's fixed-depth rule for p?. The catalog test only checks member-name prefixes, so it does not exercise the real builder/dispatch path and misses this contradiction.",
+ "verdict": "request_changes"
+}
