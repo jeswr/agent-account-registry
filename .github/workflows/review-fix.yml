@@ -106,6 +106,7 @@ jobs:
       already_done: ${{ steps.pr.outputs.already_done }}
       issue: ${{ steps.pr.outputs.issue }}
       security: ${{ steps.pr.outputs.security }}
+      security_keywords: ${{ steps.pr.outputs.security_keywords }}
       packages: ${{ steps.pr.outputs.packages }}
       package: ${{ steps.pr.outputs.package }}
       routing: ${{ steps.policy.outputs.routing }}
@@ -363,6 +364,15 @@ jobs:
               pass  # builtin keywords + trust:* prefix + the path-based arm gate still apply
           security = (any(k in label for label in merged for k in keywords)
                       or any(label.startswith("trust:") for label in merged))
+          # Issue #153: the SAME keyword set the arm step re-applies to LIVE labels. resolve
+          # classifies `security` ONCE, before a review that may take 25min+ (or queue longer);
+          # a trust:* / routing-keyword label added to the PR or its source issue mid-review is
+          # invisible to the arm's path-only recheck unless the arm re-runs this classifier on
+          # live labels. Ride the union set to the arm as a single-line base64 JSON list (a
+          # keyword may hold any char; base64 keeps the output single-line + injection-safe).
+          import base64 as _b64
+          security_keywords_b64 = _b64.b64encode(
+              json.dumps(sorted(keywords)).encode("utf-8")).decode("ascii")
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
           if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
               raise SystemExit("source issue has an unsafe area:* label")
@@ -377,6 +387,7 @@ jobs:
               "already_done": "true" if already_done else "false",
               "issue": str(issue),
               "security": "true" if security else "false",
+              "security_keywords": security_keywords_b64,
               "packages": ",".join(packages),
               "package": packages[0] if packages else "__global__",
           }
@@ -1346,6 +1357,10 @@ jobs:
           # [OPUS-4.8] B3, revised per Decision 7 (2026-07-18): the LIVE trust-surface
           # derivation now feeds the SHA-bound pre-arm AUDIT trail instead of a human park.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
+          # Issue #153: the routing's own security match_labels keywords (union with the builtin
+          # set, resolved once above). The arm re-reads LIVE PR + source-issue labels against
+          # these so a security label added DURING the review still lands in the audit trail.
+          SECURITY_KEYWORDS_B64: ${{ needs.resolve.outputs.security_keywords }}
         run: |
           set -euo pipefail
           args=(
@@ -1364,6 +1379,10 @@ jobs:
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
+            | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
+          while IFS= read -r k; do
+            [[ -n "$k" ]] && args+=(--security-keyword "$k")
+          done < <(printf '%s' "${SECURITY_KEYWORDS_B64:-W10=}" | base64 -d \
             | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
           python3 registry/scripts/worker-pr.py "${args[@]}"
 
