@@ -4,8 +4,6 @@
 import argparse
 import copy
 import datetime as dt
-import hashlib
-import hmac
 import importlib.util
 import io
 import json
@@ -40,9 +38,10 @@ DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
 # (data/observability.json); dashboard.yml hands it in via --observability and
 # _normalize_observability() validates it FAIL-CLOSED here before it may reach the public
 # data.json (rendered by the dashboard's Observability panels; absent file => hidden panel).
-# Decision 22: no raw account handles anywhere on the public surface — lease rows must already
-# carry the 8-hex salted label (the _salted_labels shape); anything else dies loudly, and
-# _assert_private additionally backstops every known raw handle over the finished document.
+# Decision 22: no raw account handles anywhere on the public surface — observability lease rows
+# must already carry the collector's 8-hex salted label (OBS_SALTED_LABEL_RE below); anything else
+# dies loudly, and _assert_private additionally backstops every known raw handle over the finished
+# document. (The dashboard's OWN account labels use the canonical 16-hex hash — see _salted_labels.)
 OBS_SCHEMA = "registry-observability/v1"
 OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{8}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
@@ -196,12 +195,19 @@ def _catalog(issues):
 
 
 def _salted_labels(handles, salt):
-    if not salt:
-        return {handle: "salt-missing" for handle in handles}
-    labels = {
-        handle: hmac.new(salt.encode(), handle.encode(), hashlib.sha256).hexdigest()[:8]
-        for handle in handles
-    }
+    """Canonical 16-hex salted account labels (issue #184), reusing the ONE shared hasher
+    model-health.account_hash — sha256(handle + ':' + salt)[:16], identical to the ledger and
+    worker-pr fingerprints (locked decision 22a) — instead of a divergent 8-hex HMAC. A missing
+    PROVENANCE_SALT FAILS CLOSED: account_hash raises on an empty salt, so the whole build dies
+    rather than deploying `salt-missing` rows that would pin a public row to a single account
+    with no salt at all."""
+    account_hash = _model_health_module().account_hash
+    try:
+        labels = {handle: account_hash(handle, salt) for handle in handles}
+    except ValueError as exc:
+        raise DashboardError(
+            "dashboard account labels require PROVENANCE_SALT (issue #184): "
+            f"{exc}") from exc
     if len(set(labels.values())) != len(labels):
         raise DashboardError("salted account label collision")
     return labels
@@ -1037,7 +1043,7 @@ def _self_test():
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
         "accounts": [{
-            "label": "b01f153c", "provider": "anthropic", "availability": "available",
+            "label": "26208fef35e33b14", "provider": "anthropic", "availability": "available",
             "active_agents": 1,
             "weekly_reset_at": "2025-06-16T15:06:40Z",
             "windows": [
@@ -1089,8 +1095,17 @@ def _self_test():
     else:
         rejected = False
     check("privacy assertion rejects injected raw handle", rejected, True)
-    no_salt = build_dashboard(issues, {"leases": []}, {}, [], None, now, "")
-    check("missing salt fails closed", no_salt["accounts"][0]["label"], "salt-missing")
+    try:
+        build_dashboard(issues, {"leases": []}, {}, [], None, now, "")
+    except DashboardError:
+        salt_missing_failed = True
+    else:
+        salt_missing_failed = False
+    check("missing salt fails closed (no dashboard is built without PROVENANCE_SALT)",
+          salt_missing_failed, True)
+    check("canonical label is the shared 16-hex hash, not the old 8-hex HMAC",
+          _salted_labels([handle], "fixture-salt")[handle],
+          _model_health_module().account_hash(handle, "fixture-salt"))
 
     def issue(account_handle, provider, secret):
         return {
@@ -1572,7 +1587,9 @@ def main(argv=None):
         issues, leases, usage, history, model_health, int(time.time()),
         os.environ.get("PROVENANCE_SALT", ""), observability=observability)
     _write_site(document, args.assets, args.site)
-    print(f"dashboard-gen: wrote {args.site}/data.json with {len(document['accounts'])} account(s)")
+    # Public workflow log: never disclose the account count (issue #184; the codebase norm in
+    # model-health.py — "the public workflow log never carries provider counts").
+    print(f"dashboard-gen: wrote {args.site}/data.json")
     return 0
 
 
