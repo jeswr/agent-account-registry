@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 412,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5eb20b143f213bcf86cacaae4a0c581811a9c98a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The filtered dictionaries are compared with Python `==`, which is not an exact JSON value comparison: `True == 1`, `False == 0`, and `7.0 == 7`. Consequently, with a valid matching `recorded_at_run`, a stored root-of-trust record containing (for example) `\"pr_number\": true` can compare equal to a candidate with `\"pr_number\": 1`, and `\"issue\": 7.0` can compare equal to `\"issue\": 7`. `_registry_record_equivalent` then reports idempotent success instead of rejecting the malformed stored provenance. This contradicts the function's exact-match/fail-closed contract. The new tests exercise missing and malformed volatile stamps, but omit any type-confused non-volatile identifying value.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Compare non-volatile JSON values with type-sensitive structural equality (recursing through objects/lists and requiring identical JSON types), or validate both complete provenance documents against a strict schema before comparison. Add negative self-tests with a valid same-run stamp but stored `pr_number: true` versus candidate `pr_number: 1`, and stored `issue: 7.0` versus candidate `issue: 7`, asserting `WorkerPrError`.",
+    "severity": "major",
+    "title": "Python equality accepts type-confused identifying fields"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two round-1 counterexamples are addressed: run identity is now retained while only the attempt changes, and missing or malformed volatile stamps are rejected. However, the new semantic comparison still does not enforce the documented exact match for identifying fields. Python equality treats JSON booleans and numbers (and integral floats and integers) as equal, so a malformed immutable provenance record can still be accepted as idempotent success. The expanded self-test does not cover this type-confusion case.",
+  "verdict": "request_changes"
+ }
+}
