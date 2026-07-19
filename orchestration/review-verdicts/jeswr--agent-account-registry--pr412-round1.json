@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 412,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2f13ada883dfc275931bdd4aa13238ee30123656",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_registry_record_equivalent removes recorded_at_run from both objects wholesale. Consequently an existing record with recorded_at_run=\"100.1\" is treated as equivalent not only to the intended rerun value \"100.2\", but also to \"999.1\" from a different workflow run. recorded_at_run is the provenance audit link documented as <run>.<attempt>; only the attempt is volatile. Accepting a different run ID weakens the create-only provenance binding and contradicts the claim that only per-attempt metadata is ignored. The self-test is non-vacuous for its covered cases, but it omits the exact assertion needed to catch this over-broad relaxation: same record plus a different run ID must raise WorkerPrError.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Compare recorded_at_run structurally: require a valid value on both records, split it into run identity and attempt, require the run identity/prefix to match exactly, and ignore only the attempt component. Add a negative self-test such as existing 100.1 versus candidate 200.1 and assert different-content failure. Account explicitly for any supported backfill format rather than dropping the field globally.",
+    "severity": "major",
+    "title": "Equivalence drops the run identity along with the attempt"
+   },
+   {
+    "body": "Because the comparator filters keys before equality, an existing JSON object with no recorded_at_run key is equivalent to a complete candidate whenever all remaining fields match. The same is true for an existing field with any arbitrary value/type. This turns a malformed or truncated immutable root-of-trust record into idempotent success rather than failing closed, despite the docstring saying stored text that is not the JSON object that would be written is never equivalent.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Require both documents to contain recorded_at_run with the expected validated representation before applying narrowly scoped attempt equivalence. Add negative self-tests for a missing field and malformed/type-invalid field and assert WorkerPrError.",
+    "severity": "major",
+    "title": "Malformed stored provenance can be accepted as equivalent"
+   }
+  ],
+  "progress": null,
+  "summary": "The retry-idempotency goal is reasonable, but the implementation ignores the entire recorded_at_run value instead of only the rerun-attempt component. That weakens an immutable provenance audit binding and also accepts malformed records that omit the field. The new tests cover the intended .1-to-.2 case and unrelated identifying fields, but not these trust-relevant counterexamples.",
+  "verdict": "request_changes"
+ }
+}
