@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves the sole round-1 blocker. All five GitHub Actions are now pinned to full 40-hex commit SHAs that exactly match the repo's canonical pins used across ~30 other workflows (checkout@9c091bb, dtolnay/rust-toolchain@29eef33 tagged '# stable', Swatinem/rust-cache@e18b497, actions/upload-artifact@043fb46, taiki-e/install-action@43aecc8) \u2014 verified by grep against the existing workflow tree. This restores the code-scanning SHA-pin policy and the attested OpenSSF Scorecard Pinned-Dependencies posture. The advisory registry entry carries the required {owner_bead, promotion_criteria, registered} fields, and the file's missing-trailing-newline was fixed. Re-verified correctness of the rest: the job name 'changed-code mutation review (advisory)' matches the ci-summary \\b(advisory)\\b exclusion, both job/step are continue-on-error (genuinely non-gating), and the trigger is pull_request (not pull_request_target) with contents:read and no secret exposure \u2014 the safe pattern for building untrusted PR code. The deterministic cap invariant holds: SHARDS=ceil(TOTAL/CAP), and cargo-mutants' modulo sharding gives shard 0 exactly ceil(TOTAL/SHARDS) <= CAP mutants. Input validation on CAP/TIMEOUT, empty-diff, list-failure, zero-mutant, and survivor-count-from-missed.txt paths are all handled; set -euo pipefail with a scoped set +e around the mutants run. No blocker/major/minor issues remain.",
+ "verdict": "approve"
+}
