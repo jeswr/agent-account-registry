@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 399,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8c1dfc0dfbaf826ad92fbf156ab2e5cdaa8cdf4b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes planner-side routing use the same security-first, two-phase precedence as the claim-side resolver for valid routing documents. Security-label rules are evaluated in declaration order before role rules, role routing remains available when no security keyword matches, and defaults remain the final fallback. The added reordered fixture is non-vacuous: its primary assertion fails under the former single-pass implementation, while the additional assertions cover the unaffected role and default paths. No trust check, label keyword set, permission, token handling, or audit control is weakened by this diff.",
+  "verdict": "approve"
+ }
+}
