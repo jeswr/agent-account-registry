@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves the prior major finding by explicitly narrowing the implemented contract: the seed scan remains fully materialized, while incremental emission is now claimed and tested only relative to completion of the block-driven join. The module docs, public testing-hook docs, API rustdoc, telemetry semantics, and `first_emit_observed_before_join_complete` test consistently state that distinction. The probe is non-vacuous for the revised property because it forces multiple seed blocks, records the total after materialization, and observes the first sink callback before all materialized seed rows have been driven. The added differential suites exercise the real public sink path, force both streamed and buffered strategies, cover multiset/set/slice equivalence, UNION and fallback behavior, production and test block ramps, determinism, early sink termination, and include a solution-level mutation witness. No correctness, soundness, test-validity, security, or prompt-injection issue remains in the diff-scoped evidence.",
+ "verdict": "approve"
+}
