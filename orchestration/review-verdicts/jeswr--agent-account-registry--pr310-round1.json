@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The moved `actions/create-github-app-token` step runs after `worker-live.sh gate`, which executes target-controlled cargo build scripts and tests. Such code can persist beyond its step (for example via a detached process) and observe or interfere with subsequent processes on the shared runner. The later token action receives the Registry Admin App private key and produces a token with contents/issues/pull-requests/workflows write access, so this ordering creates a credential-exfiltration path. The inline NOTE explicitly recognizes that the mint remains on the compromised runner; tracking isolation as a follow-up is insufficient for a trust-plane credential boundary.",
+   "file": ".github/workflows/worker.yml",
+   "fix_hint": "Perform the post-gate publish/final-state work in a separate job on a fresh runner that never executes target code, passing only bounded, integrity-checked artifacts and binding them to the expected repository and SHA before minting. Mint the target-scoped App token only in that clean publisher job. Preserve an always-running failure-state path without placing the App private key on the target-code runner.",
+   "severity": "blocker",
+   "title": "Privileged token is minted after hostile target code on the same runner"
+  }
+ ],
+ "progress": null,
+ "summary": "The TTL rationale is sound, but the new placement crosses a security boundary: it mints and exposes a highly privileged target-repository App credential only after attacker-controlled target code has executed in the cargo gate on the same runner. A malicious build script or test can leave a background process or otherwise persist runner state and capture the later action's private key/token. The comment acknowledges this exposure and defers the isolation fix, but that follow-up does not make the current trust-plane change safe. Because the token includes contents, issues, pull requests, and workflows write permissions, this must be fixed before approval.",
+ "verdict": "request_changes"
+}
