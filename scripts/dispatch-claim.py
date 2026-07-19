@@ -2128,6 +2128,24 @@ ESCALATE_PERSIST_SECONDS = 30 * 60
 # Durable, privacy-safe receipt marking an escalate-tier starvation alert. Its presence + timestamp
 # ARE the persistence clock (mirroring the worker-attempt receipt idiom); it carries no PII.
 STARVE_ALERT_MARKER = "<!-- sparq-escalate-starved:v1 -->"
+# Issue #116 (round 1): durable receipt that LIVE capacity RECOVERED (effective_cap > 0) for an
+# escalate-tier issue that still carried an open starvation streak. Recovery is a genuine end of
+# continuous starvation even when it yields NO worker attempt (the allocator returned no slot, the
+# launch failed, or another pre-dispatch hold intervened), so this receipt — not a subsequent
+# attempt — is what closes the streak. Carries no PII, same idiom as the alert receipt.
+STARVE_RESET_MARKER = "<!-- sparq-escalate-recovered:v1 -->"
+
+
+def _latest_receipt(comments, bot, marker):
+    """Newest `created_at` (ISO-8601 UTC, lexicographically comparable) among comments authored by
+    `bot` (casefolded login) that carry `marker`; "" when none. Shared clock helper for the
+    starvation-persistence + recovery-reset logic."""
+    return max(
+        (str(c.get("created_at", "")) for c in comments
+         if str(c.get("user", {}).get("login", "")).casefold() == bot
+         and marker in str(c.get("body", ""))),
+        default="",
+    )
 
 
 def escalate_persist_decision(comments, bot_login, now, attempt_marker,
@@ -2151,22 +2169,40 @@ def escalate_persist_decision(comments, bot_login, now, attempt_marker,
     when that oldest receipt is at least `persist_seconds` old — a bounded persistent failure,
     never one snapshot. ISO-8601 UTC `created_at` values compare lexicographically."""
     bot = bot_login.casefold()
-    last_attempt = max(
-        (str(c.get("created_at", "")) for c in comments
-         if str(c.get("user", {}).get("login", "")).casefold() == bot
-         and attempt_marker in str(c.get("body", ""))),
-        default="",
-    )
+    # The continuous-starvation streak ENDS on any durable end-of-starvation signal, not solely a
+    # worker attempt: a live-capacity RECOVERY receipt (STARVE_RESET_MARKER) closes it too (issue
+    # #116 round 1). Recovery is a real streak end even when it produced no attempt (allocator
+    # returned no slot, the launch failed, or a later pre-dispatch hold intervened), so alerts at or
+    # before the NEWER of {last attempt, last reset} are stale and must not age a later snapshot.
+    reset_at = max(_latest_receipt(comments, bot, attempt_marker),
+                   _latest_receipt(comments, bot, STARVE_RESET_MARKER))
     streak = sorted(
         str(c.get("created_at", "")) for c in comments
         if str(c.get("user", {}).get("login", "")).casefold() == bot
         and STARVE_ALERT_MARKER in str(c.get("body", ""))
-        and str(c.get("created_at", "")) > last_attempt
+        and str(c.get("created_at", "")) > reset_at
     )
     if not streak:
         return False, ""
     threshold_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - persist_seconds))
     return streak[0] <= threshold_iso, streak[0]
+
+
+def escalate_recovery_pending(comments, bot_login, attempt_marker):
+    """True when an escalate-tier issue carries an ACTIVE starvation alert — a STARVE_ALERT_MARKER
+    posted strictly after the latest reset/attempt receipt — so an observed live-capacity recovery
+    should now persist a STARVE_RESET_MARKER that closes the streak (issue #116 round 1). Returns
+    False once a reset (or attempt) already supersedes every alert, which keeps recovery recording to
+    ONE receipt per streak — no per-tick comment spam while capacity stays healthy."""
+    bot = bot_login.casefold()
+    reset_at = max(_latest_receipt(comments, bot, attempt_marker),
+                   _latest_receipt(comments, bot, STARVE_RESET_MARKER))
+    return any(
+        str(c.get("user", {}).get("login", "")).casefold() == bot
+        and STARVE_ALERT_MARKER in str(c.get("body", ""))
+        and str(c.get("created_at", "")) > reset_at
+        for c in comments
+    )
 
 
 def _load_usage():
@@ -2411,6 +2447,32 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                         print(f"defer {repo}#{number}: escalate-tier starved, escalation "
                               f"failed ({exc}); retried next tick")
                     continue
+                elif resolved.get("escalate"):
+                    # Issue #116 (round 1): effective_cap > 0 here — LIVE capacity RECOVERED for
+                    # this escalate-tier route. If a prior starvation streak is still open, persist a
+                    # durable recovery receipt so a LATER shortage starts a FRESH transient streak
+                    # instead of inheriting this (now-ended) streak's age. Recovery MUST be recorded
+                    # even though it produced no worker attempt — the claim below may still find no
+                    # slot or the launch may fail; the receipt, not a subsequent attempt, is what
+                    # ends "continuous starvation". Best-effort: a failed post retries next tick, and
+                    # escalate_recovery_pending caps this at one receipt per streak (no spam). Then
+                    # fall through to normal dispatch (no `continue`).
+                    try:
+                        recovery_comments = _pr_comments(repo, number)
+                        if escalate_recovery_pending(
+                                recovery_comments, bot_login, worker_issue.ATTEMPT_MARKER):
+                            _run_gh_target_comment(
+                                repo, number,
+                                "> 🤖 SPARQ agent — escalate-tier capacity has RECOVERED: an "
+                                "account now has usage headroom for the restricted "
+                                f"`{'/'.join(resolved['model_chain'])}` tier. Closing the prior "
+                                "starvation streak — normal dispatch resumes and any later shortage "
+                                f"starts a fresh grace window.{STARVE_RESET_MARKER}")
+                            print(f"recovery {repo}#{number}: escalate-tier capacity recovered; "
+                                  "starvation streak reset")
+                    except DispatchError as exc:
+                        print(f"note {repo}#{number}: escalate-tier recovery receipt failed "
+                              f"({exc}); retried next tick")
             else:
                 effective_cap = resolved["max_concurrent"]
             try:
@@ -4660,6 +4722,37 @@ def _self_test():
     spoof = [{"user": {"login": "someone"}, "body": STARVE_ALERT_MARKER,
               "created_at": iso116(ESCALATE_PERSIST_SECONDS + 999)}]
     assert escalate_persist_decision(spoof, "app[bot]", now116, attempt) == (False, "")
+    # (vi) RECOVERY WITHOUT A WORKER ATTEMPT still resets the streak (issue #116 round 1). Capacity
+    # refilled — a live-recovery receipt — but no worker started (allocator found no slot / the
+    # launch failed / a later hold intervened). An old past-grace alert BEFORE that reset is stale,
+    # so a fresh post-reset alert opens a NEW transient streak and does NOT escalate. This is the
+    # exact counterexample the attempt-only reset missed: observed recovery, then a first fresh
+    # snapshot, must not read as continuously starved.
+    reset = lambda ago: {"user": {"login": "app[bot]"},  # noqa: E731
+                         "body": f"recovered {STARVE_RESET_MARKER}", "created_at": iso116(ago)}
+    recovered_noattempt = [starve(ESCALATE_PERSIST_SECONDS + 600),
+                           reset(ESCALATE_PERSIST_SECONDS + 300),
+                           starve(120)]
+    assert escalate_persist_decision(recovered_noattempt, "app[bot]", now116, attempt) \
+        == (False, iso116(120))
+    # (vii) a reset must NOT suppress a GENUINELY persistent NEW streak: an old reset followed by a
+    # post-reset alert that has itself aged past the grace still escalates to a human (fail-closed
+    # toward the human terminal when starvation is truly continuous after recovery).
+    persisted_after_reset = [reset(ESCALATE_PERSIST_SECONDS + 900),
+                             starve(ESCALATE_PERSIST_SECONDS + 60)]
+    assert escalate_persist_decision(persisted_after_reset, "app[bot]", now116, attempt) \
+        == (True, iso116(ESCALATE_PERSIST_SECONDS + 60))
+    # (viii) escalate_recovery_pending gates the reset-receipt write: True while an alert is open,
+    # then False once a reset (or attempt) supersedes every alert — exactly one receipt per streak
+    # (no per-tick spam), and nothing to write when there was never an alert.
+    assert escalate_recovery_pending([], "app[bot]", attempt) is False
+    assert escalate_recovery_pending([starve(120)], "app[bot]", attempt) is True
+    assert escalate_recovery_pending([starve(600), reset(300)], "app[bot]", attempt) is False
+    attempt_closed = [starve(600), {"user": {"login": "app[bot]"},
+                                    "body": f"{attempt} run=9 -->", "created_at": iso116(300)}]
+    assert escalate_recovery_pending(attempt_closed, "app[bot]", attempt) is False
+    # a post-reset alert is once again an OPEN streak (recovery recurred into a new shortage).
+    assert escalate_recovery_pending(recovered_noattempt, "app[bot]", attempt) is True
 
     print("dispatch-claim self-test PASSED")
 
