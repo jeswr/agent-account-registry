@@ -1,0 +1,29 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "Section 1 says a forced r = 0 (or any tamper) fails the MAC check and calls MAC-checked open the only construction that defends against this attack. An IT-MAC authenticates the shared value/opening; if the randomness protocol produces an authenticated sharing of zero, opening m = d*r = 0 can pass authentication. Thus this does not enforce r != 0 and can still turn every comparison into equality. The same incorrect defense is referenced by the new module documentation.",
+   "file": "research/mpc-distributed-randomness-design.md",
+   "fix_hint": "Remove the claim that MAC-checking alone detects a zero mask. Specify and justify a protocol that establishes nonzeroness (or derives a nonzero mask by a sound construction) under the claimed adversary model, including abort/bias behavior, and keep malicious deployability disabled until that protocol exists. Add a test only when a concrete implementation exists.",
+   "severity": "major",
+   "title": "IT-MAC authentication does not prove that the equality mask is nonzero"
+  },
+  {
+   "body": "shared_mask promises a mask that no <= t parties know, but ShamirDealer draws r directly and therefore knows it. vss_own_input likewise describes dealer-less VSS while the implementation performs an unchecked plain sharing. Implementation comments acknowledge both violations, but Rust trait method contracts apply to every implementor; a generic caller cannot safely infer weaker semantics from the concrete type. randomness_model() does not repair a violated method pre/postcondition, especially because callers are only advised, not required, to check it.",
+   "file": "crates/sparq-mpc/src/randomness.rs",
+   "fix_hint": "Define contracts common to all implementations and expose security capabilities separately (for example, describe shared_mask only as a sharing and make secrecy/dealer/VSS guarantees explicit model properties). Alternatively split simulation and deployable traits so ShamirDealer cannot implement the stronger contract. Ensure production acceptance fails closed rather than relying on callers remembering an optional model check.",
+   "severity": "major",
+   "title": "DistributedRandomness contract is violated by its sole implementation"
+  },
+  {
+   "body": "shared_nonzero_mask_never_shares_zero constructs backend.dealer() inside the 1,000-iteration loop. If dealer() clones or deterministically initializes the backend RNG state, this exercises the same first mask 1,000 times rather than many draws, weakening the claimed coverage.",
+   "file": "crates/sparq-mpc/src/randomness.rs",
+   "fix_hint": "Create one mutable dealer before the loop and draw 1,000 successive masks from it; reconstruct each result with the backend.",
+   "severity": "minor",
+   "title": "Nonzero-mask loop repeatedly resets the deterministic dealer"
+  }
+ ],
+ "progress": null,
+ "summary": "The seam is honestly labelled as non-implemented, but two soundness contracts are incorrect. The trait promises secrecy properties that its sole implementor knowingly violates, so generic callers cannot rely on the public API contract. More seriously, the design claims an authenticated (IT-MAC) open detects a jointly generated mask forced to zero; authentication only detects inconsistent/tampered shares or opens, not a validly authenticated zero mask. The proposed malicious-tier defense therefore does not establish the load-bearing r != 0 invariant. The nonzero test also recreates the dealer on every iteration and likely samples the same deterministic first draw repeatedly.",
+ "verdict": "request_changes"
+}
