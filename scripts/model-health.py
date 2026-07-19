@@ -632,13 +632,33 @@ def _alert_title(condition, provider):
     return f"⚠️ {labels.get(condition, condition)}"
 
 
-def render_body(action, maintainer):
+def render_body(action, maintainer, redact=False):
     """Alert body. Enumerates NO account handles (records carry only salted hashes; a hash is not
     maintainer-actionable and would only clutter) — the actionable facts are the provider, the
-    condition, and any reset time."""
+    condition, and any reset time.
+
+    PUBLIC-registry route (redact=True, sol-audit issue #204): when the alert lands on the PUBLIC
+    registry repo — because no verified private ALERT_REPO+ALERT_TOKEN route is configured, or a
+    private token proved unusable and the alert fell back (issue #175) — the body carries ONLY the
+    provider and condition (none of which is a handle, a count, or a reset time) and SUPPRESSES the
+    failure/fleet COUNTS (the `reason` string), the reset hints, and the status diagnostics that
+    would compositionally disclose the account infrastructure on a public repo. The marker is kept
+    either way so the idempotent upsert still finds/reopens the rolling issue. The full breakdown
+    is emitted only over the verified private route."""
     cond = action["condition"]
     lines = [_marker(cond, action["provider"]),
              "> 🤖 SPARQ agent — automated model-access health alert.\n"]
+    if redact:
+        lines.append(
+            f"⚠️ **Model-access health for provider `{action['provider']}` is degraded "
+            f"(`{cond}`).** The failure/fleet counts, reset times, and diagnostics are SUPPRESSED "
+            "because this alert landed on the **public** registry repo, where they would "
+            "compositionally disclose the worker-account fleet. To receive the full breakdown "
+            "privately, configure a private `ALERT_REPO` together with an `ALERT_TOKEN` secret "
+            "that can write to it (the private route is used only when BOTH are set).")
+        lines.append(f"\n@{maintainer} — this issue updates itself and closes automatically on the "
+                     "first successful model launch for this provider.")
+        return "\n".join(lines)
     if cond == "provider-outage":
         lines.append(f"🚨 **Provider `{action['provider']}` model access is DOWN.** "
                      f"{action['reason']}. Every recent launch on this provider failed — the "
@@ -1028,8 +1048,10 @@ def _alert_target():
     ALERT_REPO (jeswr/agent-account-data) + ALERT_TOKEN routes the alert to a PRIVATE repo. THE #39
     FIX: when ALERT_REPO is set but ALERT_TOKEN is absent/empty, DO NOT fail silently (the old bug —
     the private write had no usable token so nothing was filed). Fall back to filing on the REGISTRY
-    repo itself with the ambient workflow token. Account identifiers stay salted either way, so the
-    fallback to the public registry leaks nothing."""
+    repo itself with the ambient workflow token. Account identifiers stay salted either way, and the
+    body on any public-registry write is REDACTED to a generic signal (sol-audit #204: even the
+    failure/fleet counts and reset hints disclose the fleet), so the fallback to the public registry
+    leaks nothing — see render_body(redact=True)."""
     registry_repo = os.environ["REGISTRY_REPO"]
     alert_repo = os.environ.get("ALERT_REPO") or ""
     alert_token = os.environ.get("ALERT_TOKEN") or ""
@@ -1044,10 +1066,28 @@ def _registry_fallback():
     """The always-available public route: (registry_repo, ambient_token). Used at RUN TIME when
     the primary (private) route's token is present but UNUSABLE (issue #175) — a nonempty
     ALERT_TOKEN selects the private route without proving access, so an expired/wrong token would
-    otherwise drop every alert while the run stays green. Identifiers are salted (decision 22a), so
-    retrying the alert on the public registry leaks nothing."""
+    otherwise drop every alert while the run stays green. Identifiers are salted (decision 22a) and
+    the retried body is REDACTED to a generic signal on this public route (sol-audit #204,
+    render_body(redact=True)), so retrying the alert on the public registry leaks nothing."""
     return (os.environ["REGISTRY_REPO"],
             os.environ.get("REGISTRY_ALERT_TOKEN") or os.environ.get("GH_TOKEN") or "")
+
+
+def _repo_confirmed_private(repo, token):
+    """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
+    token (sol review round 1 of #432). A configured ALERT_REPO+ALERT_TOKEN pair alone must never
+    select the detailed body: the pair can name the public registry itself or any other public
+    repository, and token presence proves nothing about destination visibility. FAIL-CLOSED: a
+    failed lookup, an unparseable payload, or anything but a literal boolean true reads as NOT
+    private and the caller redacts. The response body is parsed, never echoed."""
+    proc = _gh(["api", f"repos/{repo}"], token, capture=True)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
 
 
 def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
@@ -1063,21 +1103,41 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
     fb_distinct = (repo, token) != (fb_repo, fb_token) and bool(fb_token)
+    # A DETAILED body (failure/fleet counts + reset hints + diagnostics) is emitted ONLY over a
+    # POSITIVELY VERIFIED private route (sol-audit issue #204, hardened in #432 round 1): an
+    # ALERT_REPO distinct from the public registry repo (case-insensitive) AND confirmed
+    # `"private": true` by a live GET /repos/{repo} under its ALERT_TOKEN — configuration alone
+    # is not verification, since it can name the registry itself or any other public repository.
+    # Everything else REDACTS to a generic signal: the #39 half-config primary (ALERT_REPO set
+    # but no token -> primary IS the registry), a no-ALERT_REPO deployment, a same-repo or
+    # public/unverifiable ALERT_REPO, the #175 firing retry on the registry, and any fallback
+    # recovery. The registry_fallback route is always public, so its writes are always redacted.
+    registry_repo = os.environ["REGISTRY_REPO"]
+    primary_redact = (repo.strip().lower() == registry_repo.strip().lower()
+                      or not _repo_confirmed_private(repo, token))
+    if primary_redact and any(a.get("fire") for a in actions):
+        # FAIL LOUD (issue #204): a firing model-health alert is being filed with fleet/failure
+        # detail SUPPRESSED because no verified private route exists. The (public) log line carries
+        # no count or reset — only that the private channel is missing.
+        print("::warning::model-health: no verified private ALERT_REPO+ALERT_TOKEN route — "
+              "model-health alerts SUPPRESS fleet/failure counts and reset times; the public "
+              "issue carries a generic signal only")
     undelivered = []
     for action in actions:
-        delivered = _upsert_alert(action, repo, token, maintainer)
+        delivered = _upsert_alert(action, repo, token, maintainer, redact=primary_redact)
         if action["fire"]:
             # Primary failed while FIRING: retry on the registry with the ambient token. Never
-            # re-run the identical route (no value).
+            # re-run the identical route (no value). The registry retry is PUBLIC -> redacted.
             if not delivered and fb_distinct:
                 print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
                       "delivery failed on the private route — retrying on the registry")
-                delivered = _upsert_alert(action, fb_repo, fb_token, maintainer)
+                delivered = _upsert_alert(action, fb_repo, fb_token, maintainer, redact=True)
         elif fb_distinct and (action["condition"], action["provider"]) in fallback_open:
             # The marker was SEEN open on the fallback repo (a prior firing retry created it):
             # close it there too, and require BOTH routes to confirm — a steady no-op on the
-            # primary says nothing about the issue that lives on the fallback (review #340).
-            delivered = _upsert_alert(action, fb_repo, fb_token, maintainer) and delivered
+            # primary says nothing about the issue that lives on the fallback (review #340). The
+            # fallback repo is the public registry -> redacted.
+            delivered = _upsert_alert(action, fb_repo, fb_token, maintainer, redact=True) and delivered
         if not delivered:
             undelivered.append(action)
     return undelivered
@@ -1143,7 +1203,7 @@ def _open_alert_markers(repo, token):
     return parse_alert_markers(i.get("body") for i in found if isinstance(i, dict))
 
 
-def _upsert_alert(action, repo, token, maintainer):
+def _upsert_alert(action, repo, token, maintainer, redact=False):
     """Idempotent one-issue-per-(condition,provider) upsert keyed by the hidden body marker.
     OPERATIONAL idempotency (review defect #7): every gh return code is checked; a flap REOPENS the
     closed marker issue instead of creating a duplicate; and the recovery comment is posted only
@@ -1155,7 +1215,7 @@ def _upsert_alert(action, repo, token, maintainer):
     NONZERO so an unusable ALERT_TOKEN can never drop an alert while the run stays green."""
     title = _alert_title(action["condition"], action["provider"])
     marker = _marker(action["condition"], action["provider"])
-    body = render_body(action, maintainer)
+    body = render_body(action, maintainer, redact=redact)
     # best-effort, idempotent (exists -> nonzero is fine)
     _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", "d73a4a",
          "--description", "Autonomous model-access health alert (maintainer action)"],
@@ -1872,6 +1932,9 @@ def _self_test():
     # ---- #175: unusable private token retries the registry, else fails nonzero ---------------
     ok = _test_delivery(chk) and ok
 
+    # ---- #204: public-registry writes REDACT the fleet/failure counts + reset hints ----------
+    ok = _test_redaction(chk) and ok
+
     # ---- review #340: an alert created on the fallback route is still recovered --------------
     ok = _test_fallback_orphan(chk) and ok
 
@@ -2489,6 +2552,135 @@ def _test_delivery(chk):
     return True
 
 
+def _test_redaction(chk):
+    """sol-audit issue #204: a model-health alert filed on the PUBLIC registry repo must carry a
+    generic body — provider + condition only — with the failure/fleet COUNTS (the `reason`), the
+    reset hints, and the status diagnostics SUPPRESSED. Only the verified private ALERT_REPO+
+    ALERT_TOKEN route renders the full detail. Mutation strength: dropping `redact=` from
+    render_body/_upsert_alert republishes the counts on the registry and turns the public-route
+    assertions RED; leaving the private route redacted turns the full-body assertions RED."""
+    import contextlib
+    import io
+    import types
+    global _gh
+    real_gh = _gh
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN", "GH_TOKEN")}
+    outage = {"condition": "provider-outage", "provider": "anthropic", "fire": True,
+              "reason": "5 model-launch failures across 3 of 8 accounts in 10 min with no "
+                        "per-account successes"}
+    capped = {"condition": "provider-capped", "provider": "openai", "fire": True,
+              "reason": "all 4 enabled openai accounts are usage-limited",
+              "reset_hint": "2026-07-20 14:00 UTC"}
+    # --- pure render: private (full) body enumerates counts + reset; public (redacted) body
+    #     suppresses them but keeps provider/condition/marker + the fix-it hint.
+    full_o = render_body(outage, "m")
+    red_o = render_body(outage, "m", redact=True)
+    chk("full outage body carries the failure counts (private route)",
+        "3 of 8 accounts" in full_o, True)
+    chk("redacted outage body SUPPRESSES the failure counts (#204)",
+        ("3 of 8 accounts" in red_o, "5 model-launch failures" in red_o), (False, False))
+    chk("redacted outage body keeps provider/condition + marker + private-route hint",
+        (_marker("provider-outage", "anthropic") in red_o, "anthropic" in red_o,
+         "provider-outage" in red_o, "SUPPRESSED" in red_o,
+         "ALERT_REPO" in red_o, "ALERT_TOKEN" in red_o),
+        (True, True, True, True, True, True))
+    full_c = render_body(capped, "m")
+    red_c = render_body(capped, "m", redact=True)
+    chk("full capped body carries the reset time (private route)",
+        ("2026-07-20 14:00 UTC" in full_c, "Earliest known reset" in full_c), (True, True))
+    chk("redacted capped body SUPPRESSES the reset time + count (#204)",
+        ("2026-07-20 14:00 UTC" in red_c, "Earliest known reset" in red_c,
+         "all 4 enabled" in red_c),
+        (False, False, False))
+    # --- end-to-end wiring: with NO POSITIVELY VERIFIED private route the delivered body is
+    #     redacted; with one it is full. A capturing gh records the create --body per repo and
+    #     answers the #432 round-1 visibility verification per `visibility` — so a regression
+    #     that stops CHECKING visibility (or trusts configuration alone) goes RED on the
+    #     public-repo / failed-lookup / same-repo cases below.
+    created = {}
+    visibility = {"stdout": json.dumps({"private": True}), "rc": 0}
+    vis_calls = []
+
+    def capture_gh(args, token, capture=False):
+        repo = args[args.index("-R") + 1] if "-R" in args else None
+        if args[0] == "api":
+            vis_calls.append((list(args), token))
+            return types.SimpleNamespace(returncode=visibility["rc"],
+                                         stdout=visibility["stdout"], stderr="")
+        if args[:2] == ["issue", "list"]:
+            return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        if args[:2] == ["issue", "create"]:
+            created[repo] = args[args.index("--body") + 1]
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    try:
+        # (a) no ALERT_REPO -> primary IS the public registry -> redacted body, and the
+        # visibility stub answering "private" must not matter (same-repo rejection is absolute).
+        os.environ["REGISTRY_REPO"] = "jeswr/agent-account-registry"
+        os.environ["REGISTRY_ALERT_TOKEN"] = "amb"
+        os.environ.pop("GH_TOKEN", None)
+        os.environ.pop("ALERT_REPO", None)
+        os.environ.pop("ALERT_TOKEN", None)
+        created.clear()
+        _gh = capture_gh
+        with contextlib.redirect_stdout(io.StringIO()):
+            _deliver_alerts([dict(outage)], "m")
+        body = created.get("jeswr/agent-account-registry", "")
+        chk("END-TO-END no-private-route: registry body is redacted (no counts, SUPPRESSED)",
+            ("3 of 8 accounts" in body, "SUPPRESSED" in body), (False, True))
+        # (b) CONFIRMED-private route -> full body on the private repo, and the visibility
+        # lookup ran against the ALERT repo under the ALERT token.
+        created.clear()
+        vis_calls.clear()
+        os.environ["ALERT_REPO"] = "jeswr/agent-account-data"
+        os.environ["ALERT_TOKEN"] = "priv"
+        with contextlib.redirect_stdout(io.StringIO()):
+            _deliver_alerts([dict(outage)], "m")
+        pbody = created.get("jeswr/agent-account-data", "")
+        chk("END-TO-END private route: private body is FULL (counts present, not redacted)",
+            ("3 of 8 accounts" in pbody, "SUPPRESSED" in pbody), (True, False))
+        chk("END-TO-END private route: visibility verified via GET /repos under ALERT_TOKEN "
+            "(#432 r1)",
+            vis_calls, [(["api", "repos/jeswr/agent-account-data"], "priv")])
+        # (c) #432 round 1: a PUBLIC ALERT_REPO (private=false) must deliver the REDACTED body —
+        # token presence is not privacy.
+        created.clear()
+        visibility["stdout"] = json.dumps({"private": False})
+        with contextlib.redirect_stdout(io.StringIO()):
+            _deliver_alerts([dict(outage)], "m")
+        pub_body = created.get("jeswr/agent-account-data", "")
+        chk("END-TO-END public ALERT_REPO: body is REDACTED (fail closed, #432 r1)",
+            ("3 of 8 accounts" in pub_body, "SUPPRESSED" in pub_body), (False, True))
+        # (d) #432 round 1: a FAILED/indeterminate visibility lookup redacts too.
+        created.clear()
+        visibility.update(stdout="", rc=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _deliver_alerts([dict(outage)], "m")
+        unk_body = created.get("jeswr/agent-account-data", "")
+        chk("END-TO-END failed visibility lookup: body is REDACTED (fail closed, #432 r1)",
+            ("3 of 8 accounts" in unk_body, "SUPPRESSED" in unk_body), (False, True))
+        # (e) #432 round 1: ALERT_REPO naming the REGISTRY itself is rejected by the same-repo
+        # clause alone — the visibility stub deliberately answers "private" so only the
+        # equality check can force the redaction.
+        created.clear()
+        visibility.update(stdout=json.dumps({"private": True}), rc=0)
+        os.environ["ALERT_REPO"] = "jeswr/agent-account-registry"
+        with contextlib.redirect_stdout(io.StringIO()):
+            _deliver_alerts([dict(outage)], "m")
+        same_body = created.get("jeswr/agent-account-registry", "")
+        chk("END-TO-END ALERT_REPO == REGISTRY_REPO: body is REDACTED (#432 r1)",
+            ("3 of 8 accounts" in same_body, "SUPPRESSED" in same_body), (False, True))
+    finally:
+        _gh = real_gh
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
 def _test_fallback_orphan(chk):
     """Review #340: an alert CREATED ON THE FALLBACK ROUTE (by the #175 firing retry) must still
     be recovered. End-to-end against a stateful two-repo gh fake: primary firing delivery fails,
@@ -2514,6 +2706,11 @@ def _test_fallback_orphan(chk):
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
         if token in bad_tokens:
             return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        if args[0] == "api":
+            # The #432 round-1 visibility verification: a working token reads the private route
+            # as PRIVATE (an unusable one already answered rc=1 above -> fail-closed redact).
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=json.dumps({"private": True}), stderr="")
         verb, issues = args[1], repos[repo]
         if verb == "list":
             state = args[args.index("--state") + 1]
@@ -2887,7 +3084,8 @@ def _test_decide_annotation(chk):
         probe_provider_status = lambda provider, fetch=None: (STATUS_OPERATIONAL, "none")
         _open_alert_markers = lambda repo, token: set()  # hermetic: no real gh subprocess
         # returns True: the new delivery contract (issue #175) treats a confirmed upsert as True.
-        _upsert_alert = lambda action, repo, token, maintainer: seen.append(action) or True
+        _upsert_alert = lambda action, repo, token, maintainer, redact=False: (
+            seen.append(action) or True)
         rc = _cmd_decide(_ap.Namespace(policy_file="/nonexistent/repos.toml"))
         fired = [a for a in seen
                  if a["condition"] == "persistent-transient" and a["fire"]]
