@@ -105,8 +105,10 @@ SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # This is the ACTIVE, WIRED FILE-level control (previously the policy-row `security_paths` was
 # unwired config). Prefix-matched against every PR-diff path; a trailing `/` marks a directory
 # subtree, a bare path is an exact-or-descendant match. review-fix.yml passes the resolved list
-# from the target policy row; this constant is the built-in fail-closed default when no list is
-# supplied (so the guard is never silently absent).
+# from the target policy row; this constant is the MANDATORY fail-closed floor. [issue #166] A
+# policy `security_paths` list is UNIONED with this floor by resolve_trust_surface_paths (it
+# EXTENDS these defaults, it does not replace them), so the guard is never silently absent and a
+# narrow custom list can never disable a built-in surface.
 #
 # [issue #145 — sol-audit worker] The manifest is DIRECTORY PREFIXES, not an enumerated file list.
 # The prior per-script enumeration was a standing blind spot: it omitted credential materialization
@@ -115,10 +117,11 @@ SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # arm gate — and EVERY newly added trust-plane script would silently inherit the same hole. A
 # whole-directory prefix is fail-closed by construction: every script under scripts/, every
 # container definition under containers/, and every workflow/policy/routing/agent file is a trust
-# surface, and a NEW file in any of those trees is covered the moment it lands. Keep this in sync
-# with policy/repos.toml `security_paths` (the per-target override that REPLACES this default in
-# production) and the worker-live.sh registry-selftest gate — they are the one canonical manifest
-# consumed by routing, the arm check, and the gate respectively.
+# surface, and a NEW file in any of those trees is covered the moment it lands. [issue #166] This
+# is the MANDATORY floor: policy/repos.toml `security_paths` is UNIONED onto it (a per-target
+# EXTENSION, not a replacement), so the two lists no longer need manual sync — a default added
+# here protects every target at once. Keep it aligned with the worker-live.sh registry-selftest
+# gate, the other consumer of this manifest.
 DEFAULT_TRUST_SURFACE_PATHS = (
     "scripts/",          # every orchestration/credential/health/provenance control script
     "containers/",       # the model-isolation sandbox (worker-model.Dockerfile)
@@ -470,6 +473,35 @@ def trust_surface_paths_touched(diff_files, surface_paths=DEFAULT_TRUST_SURFACE_
                 touched.add(path)
                 break
     return sorted(touched)
+
+
+def resolve_trust_surface_paths(supplied):
+    """[issue #166] The single choke point that turns a target's policy `security_paths`
+    into the ENFORCED trust-surface set: the mandatory built-in DEFAULT_TRUST_SURFACE_PATHS
+    UNIONED with the supplied list — a policy list EXTENDS the defaults, it never REPLACES
+    them. Before this, a non-empty `security_paths` wholly replaced the defaults, which made
+    two lists that had to be hand-synced (a new mandatory default did NOT protect a target
+    that already specified its own list) and let a narrow custom list SILENTLY disable the
+    built-in workflow/policy/orchestration protections. Unioning here keeps the defaults as
+    a fail-closed floor: adding a mandatory default protects every target at once, and a
+    custom list can only ADD surfaces, never subtract one. Removal of a built-in default is
+    therefore possible ONLY through an explicit, separately-reviewed deny/override mechanism
+    (not by omission from a policy row). Every entry is normalized (`_norm_path`, so a
+    trailing `/` subtree marker is preserved) and de-duplicated with the defaults FIRST in a
+    stable order; hostile/empty/non-string supplied entries are dropped (they could only add
+    a surface anyway, never demote the guard). Both wired call sites — the ready-and-arm live
+    re-derivation and the review-outcome diff check — resolve through here, so worker-pr.py
+    enforces the union regardless of what review-fix.yml passes."""
+    resolved = []
+    seen = set()
+    for path in list(DEFAULT_TRUST_SURFACE_PATHS) + list(supplied or ()):
+        if not isinstance(path, str) or not path.strip():
+            continue
+        norm = _norm_path(path)
+        if norm and norm not in seen:
+            seen.add(norm)
+            resolved.append(norm)
+    return tuple(resolved)
 
 
 def human_owned(labels):
@@ -2250,7 +2282,9 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # Decision 7 REVISED (maintainer 2026-07-18): a hit no longer parks — it feeds the
         # POST-arm audit trail below (label + comment applied only after a SUCCESSFUL arm,
         # with checked failures — sol r1 on #257).
-        surfaces = tuple(surface_paths) if surface_paths else DEFAULT_TRUST_SURFACE_PATHS
+        # [issue #166] policy `security_paths` EXTEND the mandatory defaults (union), never
+        # replace them — a narrow custom list can no longer silently disable a built-in surface.
+        surfaces = resolve_trust_surface_paths(surface_paths)
         # SHA-BOUND snapshot (sol r3): the mutable PR files endpoint is ABA-racable
         # (A -> benign B -> A force-push between the head check and this read would hide
         # the hits while the CAS still accepts A). The compare at the immutable
@@ -2546,10 +2580,12 @@ def review_outcome(args):
     # the PR's own diff file set (the same list the reviewer just used). ANY gate-weakening /
     # orchestration-control path forces the security posture — the review stays automated, but an
     # approved PR that touches one is HUMAN-armed (needs-user), never auto-armed. The surface list
-    # comes from the target policy row's `security_paths` (workflow-supplied via --surface-path);
-    # an empty supplied list means "not configured for this target" and falls back to the built-in
-    # DEFAULT_TRUST_SURFACE_PATHS so the guard is never silently absent (fail closed).
-    surface_paths = tuple(args.surface_path) if args.surface_path else DEFAULT_TRUST_SURFACE_PATHS
+    # comes from the target policy row's `security_paths` (workflow-supplied via --surface-path).
+    # [issue #166] That list EXTENDS the mandatory built-in DEFAULT_TRUST_SURFACE_PATHS (union),
+    # it does not replace them: an empty supplied list falls back to the defaults alone, and a
+    # non-empty one adds to — never subtracts from — the fail-closed floor, so the guard is never
+    # silently absent and a narrow custom list cannot disable a built-in surface.
+    surface_paths = resolve_trust_surface_paths(args.surface_path)
     surface_hits = trust_surface_paths_touched(diff_files, surface_paths)
     trust_surface = bool(surface_hits)
     security = args.security or trust_surface
@@ -2813,14 +2849,40 @@ def _self_test():
     check("trust-surface flags the model-health CAS (issue #145)",
           trust_surface_paths_touched(["scripts/model-health.py"]),
           ["scripts/model-health.py"])
-    # a caller-supplied (policy security_paths) list REPLACES the default set.
-    check("trust-surface honours a supplied path list",
+    # trust_surface_paths_touched itself honours EXACTLY the list it is handed (a pure matcher);
+    # a custom-only list flags only its own paths.
+    check("trust-surface honours the exact supplied path list",
           trust_surface_paths_touched(["scripts/worker-pr.py", "custom/thing.py"],
                                       surface_paths=("custom/",)),
           ["custom/thing.py"])
     # hostile/malformed diff entries can only DEMOTE to human-arm, never silently approve.
     check("trust-surface tolerates malformed entries",
           trust_surface_paths_touched(["", None, 123, "policy/x.toml"]), ["policy/x.toml"])
+
+    # [issue #166] resolve_trust_surface_paths UNIONS the policy security_paths with the mandatory
+    # defaults — a policy list EXTENDS the built-in floor, it never REPLACES it. Each assertion
+    # flips red on the pre-fix replace semantics.
+    # (1) an empty/None supplied list is exactly the mandatory defaults (never silently absent).
+    check("resolve: empty supplied -> mandatory defaults",
+          resolve_trust_surface_paths([]), tuple(DEFAULT_TRUST_SURFACE_PATHS))
+    check("resolve: None supplied -> mandatory defaults",
+          resolve_trust_surface_paths(None), tuple(DEFAULT_TRUST_SURFACE_PATHS))
+    # (2) a NARROW custom list can no longer disable a built-in surface: the defaults survive AND
+    #     the custom path is added (defaults first, custom appended, de-duplicated).
+    check("resolve: narrow custom list keeps the defaults (union, not replace)",
+          resolve_trust_surface_paths(["custom/"]),
+          tuple(DEFAULT_TRUST_SURFACE_PATHS) + ("custom/",))
+    # (3) a resolved narrow list still flags a built-in surface the custom list omitted — the
+    #     concrete bug: pre-fix, security_paths=["custom/"] left scripts/ unguarded.
+    check("resolve: union still guards an omitted built-in surface",
+          trust_surface_paths_touched(["scripts/worker-pr.py", "custom/thing.py"],
+                                      resolve_trust_surface_paths(["custom/"])),
+          ["custom/thing.py", "scripts/worker-pr.py"])
+    # (4) a supplied path duplicating a default does not double it, and hostile/empty entries are
+    #     dropped (they could only add a surface, never demote the guard).
+    check("resolve: de-dups a default and drops malformed entries",
+          resolve_trust_surface_paths(["scripts/", "", None, 123, "  ", "extra/"]),
+          tuple(DEFAULT_TRUST_SURFACE_PATHS) + ("extra/",))
 
     # human_owned: EITHER the loop's own escalation label or groom's parked-PR marker parks the
     # autonomous surface; plain loop states do not.
@@ -5167,7 +5229,8 @@ def main():
     arm.add_argument("--arm", choices=("true", "false"), required=True)
     arm.add_argument("--issue", type=int)
     # [OPUS-4.8] B3: the live trust-surface arm gate's path list (repeatable; from policy
-    # security_paths). Empty -> DEFAULT_TRUST_SURFACE_PATHS (fail closed, never silently absent).
+    # security_paths). [issue #166] Unioned onto the mandatory DEFAULT_TRUST_SURFACE_PATHS floor
+    # (resolve_trust_surface_paths) — it extends the defaults; empty -> defaults alone (fail closed).
     arm.add_argument("--surface-path", action="append", default=[],
                      help="trust-surface path/prefix (repeatable; from policy security_paths)")
     arm.add_argument("--bot-login", default="",
@@ -5188,7 +5251,8 @@ def main():
     rout.add_argument("--security", action="store_true")
     # [OPUS-4.8] B3 / defects #2,#4: the WIRED trust-surface FILE list from the target policy
     # row's `security_paths` (repeatable). Any PR-diff path under one of these forces the human
-    # arm even for a benign-labelled PR. Empty -> the built-in DEFAULT_TRUST_SURFACE_PATHS.
+    # arm even for a benign-labelled PR. [issue #166] Unioned onto the mandatory
+    # DEFAULT_TRUST_SURFACE_PATHS floor (it extends the defaults); empty -> the defaults alone.
     rout.add_argument("--surface-path", action="append", default=[],
                       help="trust-surface path/prefix (repeatable; from policy security_paths)")
     rout.add_argument("--issue", type=int)

@@ -64,8 +64,10 @@ POLICY_FIELDS = {
 # [OPUS-4.8] security_paths (B3 / defects #2,#4): the additive FILE-level trust-surface control
 # for the review lane. A worker PR whose diff touches ANY listed path/prefix routes its ARM to a
 # HUMAN even for a benign-labelled PR — CONSUMED by review-fix.yml (review-outcome + ready-and-arm
-# pass it to worker-pr.trust_surface_paths_touched). NOT a dead tier: an empty/absent list simply
-# means the worker-pr.py DEFAULT_TRUST_SURFACE_PATHS applies (the guard is never silently off).
+# pass it to worker-pr.trust_surface_paths_touched). NOT a dead tier: [issue #166] this list is
+# UNIONED onto the mandatory worker-pr.py DEFAULT_TRUST_SURFACE_PATHS (resolve_trust_surface_paths)
+# — it EXTENDS the built-in floor, it never replaces it, so a non-empty list only ADDS per-target
+# surfaces and an empty/absent one leaves the defaults in force (the guard is never silently off).
 # trusted_bots (registry issue #111): the EXACT, policy-controlled allowlist of trusted App bot
 # logins (or App-derived login strings) that the dispatcher admits as issue authors ALONGSIDE the
 # `trust = "collaborators"` associations (OWNER/MEMBER/COLLABORATOR). It exists to give the declared

@@ -104,9 +104,12 @@ cross_provider_fallback = false
 # isolation container (containers/), and the model-health CAS (scripts/model-health.py) — a benign
 # PR could weaken any of them without the arm gate firing, and every newly added trust-plane script
 # inherited the same hole. Whole-directory prefixes are fail-closed: a NEW file under any of these
-# trees is a trust surface the moment it lands. This is the canonical manifest — keep it in sync
-# with worker-pr.py DEFAULT_TRUST_SURFACE_PATHS (the built-in default this REPLACES when supplied)
-# and the worker-live.sh registry-selftest gate.
+# trees is a trust surface the moment it lands. [issue #166] This list is UNIONED onto (it EXTENDS,
+# it does NOT replace) worker-pr.py DEFAULT_TRUST_SURFACE_PATHS via resolve_trust_surface_paths, so
+# it can only ADD per-target surfaces — a built-in default can never be silently dropped by
+# narrowing this list, and the two lists no longer need manual sync (a default added there protects
+# this target too). Removing a mandatory default requires an explicit, separately-reviewed deny
+# mechanism. Aligns with the worker-live.sh registry-selftest gate.
 security_paths = [
   "scripts/",           # every orchestration/credential/health/provenance control script
   "containers/",        # the model-isolation sandbox (worker-model.Dockerfile)
