@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change consistently replaces the unreliable Fuseki container with the existing direct Apache Fuseki distribution pattern, handles missing Java and download/startup failures as absent-engine cases, cleans up the Java process, reports the actual distribution version, and correctly disables compare.py's default sparq endpoint when sparq is unavailable. The shell parses successfully, and the empty --sparq value is intentionally treated as inactive by compare.py. No correctness, soundness, security, or vacuous-test issue is evident in this scoped harness change.",
+ "verdict": "approve"
+}
