@@ -226,6 +226,16 @@ def _probe_account(account, secrets, probe=None, fable_probe=None):
     ref = account.get("secret_ref")
     if not isinstance(ref, str) or SECRET_REF_RE.fullmatch(ref) is None:
         return None  # fail-closed omit: never dereference a non-worker-token secret name
+    # Bind the secret to THIS handle (issue #197): the ACCT*_TOKEN allow-list above accepts ANY
+    # worker token, so a poisoned or typo'd catalog row for one handle could name a DIFFERENT
+    # account's credential (e.g. handle acct01 -> secret_ref ACCT02_TOKEN). The probe would then
+    # bill acct02's token to acct01 — corrupting selection + tier-limit persistence, and later
+    # failing the worker's own account check into repeated dead leases. The real broker
+    # (set-up-account.yml) mints secret_ref = `${handle^^}_TOKEN` verbatim, so require exactly that;
+    # any mismatch fail-closed OMITS (surfaces as UNAVAILABLE in usage-alert, like every other omit).
+    handle = account.get("handle")
+    if not isinstance(handle, str) or ref != f"{handle.upper()}_TOKEN":
+        return None  # fail-closed omit: secret_ref must be this handle's OWN token
     token = secrets.get(ref)
     if not token:
         return None  # fail-closed omit
@@ -640,21 +650,41 @@ def _self_test():
                              probe=_rec_probe, fable_probe=_rec_probe)
         chk(f"unknown provider {prov!r} fail-closed omitted", got, None)
     chk("unknown providers never invoked a probe", probe_calls, [])
-    got = _probe_account({"handle": "x", "provider": " Anthropic ", "secret_ref": "ACCT01_TOKEN",
+    got = _probe_account({"handle": "acct01", "provider": " Anthropic ", "secret_ref": "ACCT01_TOKEN",
                           "models": ["haiku"]}, stub_secrets,
                          probe=_rec_probe, fable_probe=_rec_probe)
     chk("anthropic account still probes (normalized match)", (got or {}).get("status"), "allowed")
     chk("non-fable account probes exactly once", probe_calls, ["tok"])
     probe_calls.clear()
-    _probe_account({"handle": "x", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+    _probe_account({"handle": "acct01", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
                     "models": ["fable"]}, stub_secrets, probe=_rec_probe, fable_probe=_rec_probe)
     chk("fable account gets the second (fable) probe", probe_calls, ["tok", "tok"])
     probe_calls.clear()
     chk("non-worker secret_ref still never dereferenced/probed",
-        (_probe_account({"handle": "x", "provider": "anthropic",
+        (_probe_account({"handle": "acct01", "provider": "anthropic",
                          "secret_ref": "REGISTRY_ADMIN_APP_KEY"},
                         {"REGISTRY_ADMIN_APP_KEY": "priv"},
                         probe=_rec_probe, fable_probe=_rec_probe), probe_calls), (None, []))
+    # ---- secret_ref bound to its OWN handle (issue #197) ----
+    #   the ACCT*_TOKEN allow-list alone lets a catalog row name ANOTHER account's credential; the
+    #   probe would then bill the foreign token to the wrong handle, corrupting selection + tier-
+    #   limit persistence and later dead-leasing. A ref that PASSES the allow-list but is not THIS
+    #   handle's own `${handle^^}_TOKEN` must fail-closed OMIT (None) with ZERO probe invocations —
+    #   this case returned a probed entry under the old allow-list-only gate.
+    probe_calls.clear()
+    chk("foreign ACCT token (wrong handle) fail-closed omitted",
+        _probe_account({"handle": "acct01", "provider": "anthropic", "secret_ref": "ACCT02_TOKEN",
+                        "models": ["haiku"]}, {"ACCT02_TOKEN": "victim-tok"},
+                       probe=_rec_probe, fable_probe=_rec_probe), None)
+    chk("foreign-token row never dereferenced/probed", probe_calls, [])
+    chk("own-handle token still probes (mixed-case handle binds)",
+        (_probe_account({"handle": "Acct01", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+                         "models": ["haiku"]}, {"ACCT01_TOKEN": "tok"},
+                        probe=_rec_probe, fable_probe=_rec_probe) or {}).get("status"), "allowed")
+    chk("missing handle fail-closed omitted (no probe)",
+        (_probe_account({"provider": "anthropic", "secret_ref": "ACCT01_TOKEN", "models": ["haiku"]},
+                        {"ACCT01_TOKEN": "tok"}, probe=_rec_probe, fable_probe=_rec_probe)), None)
+    probe_calls.clear()
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
