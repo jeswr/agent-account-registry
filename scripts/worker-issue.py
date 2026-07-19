@@ -36,6 +36,20 @@ LABEL_COLOURS = {
     "status:ready": "0e8a16",
     "needs:user": "b60205",
 }
+# status -> (labels to add, labels to remove). Module-level so the self-test can model the REAL
+# workflow lifecycle (ready -> in-progress -> pre-publish reverify) from the same table set_status
+# applies, instead of a hand-written label set that could drift from it.
+STATUS_TRANSITIONS = {
+    "in-progress": ({"status:in-progress"}, {"status:ready", "status:deferred"}),
+    "in-progress-review": ({"status:in-progress-review"},
+                           {"status:ready", "status:in-progress", "status:deferred"}),
+    "retry": ({"status:ready"}, {"status:deferred"}),
+    "deferred": ({"status:deferred"},
+                 {"status:ready", "status:in-progress", "status:in-progress-review"}),
+    "needs-user": ({"needs:user", "status:deferred"},
+                   {"status:ready", "status:in-progress", "status:in-progress-review"}),
+    "complete": (set(), {"status:in-progress", "status:in-progress-review", "status:deferred"}),
+}
 
 
 class WorkerIssueError(RuntimeError):
@@ -106,6 +120,33 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer, current_r
         if is_human_maintainer(login):
             return comment
     return None
+
+
+def holds_live_claim(comments, bot_login, current_run_key):
+    """True iff the NEWEST bot attempt receipt on the issue is THIS run's own (issue #144 r2).
+
+    The pre-publish re-check cannot demand `status:ready` — the workflow itself moved the issue
+    to `status:in-progress` at claim time — so the accepted in-progress state must instead be
+    bound to an immutable per-run receipt: the record-attempt marker comment the bot posted with
+    this run's unique run-key before the model ran. `status:in-progress` alone proves only that
+    SOME run claimed the issue; the newest receipt proves WHICH. A newer receipt from any other
+    run means the claim was superseded (redispatch after deferral, a concurrent worker) and this
+    run must not publish over it. Ties fail closed: an equal-timestamp foreign receipt rejects.
+    Only bot-authored comments count, so a human quoting the marker text cannot steal the claim.
+    """
+    marker = f"{ATTEMPT_MARKER} run={current_run_key} -->"
+    bot = bot_login.casefold()
+    receipts = [
+        comment for comment in comments
+        if str(comment.get("user", {}).get("login", "")).casefold() == bot
+        and ATTEMPT_MARKER in str(comment.get("body", ""))
+    ]
+    ours = [str(c.get("created_at", "")) for c in receipts if marker in str(c.get("body", ""))]
+    if not ours:
+        return False
+    newest_own = max(ours)
+    return all(str(c.get("created_at", "")) < newest_own
+               for c in receipts if marker not in str(c.get("body", "")))
 
 
 def _is_human_maintainer(repo, login):
@@ -199,7 +240,7 @@ def record_attempt(repo, issue, max_attempts, bot_login, run_key):
 
 
 def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_login, issue_file,
-             current_run_key=None):
+             current_run_key=None, mode="dispatch"):
     item = _gh_json(["api", f"repos/{repo}/issues/{issue}"])
     if not isinstance(item, dict) or "pull_request" in item:
         raise WorkerIssueError("target number is not an issue")
@@ -215,11 +256,37 @@ def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_lo
         for label in item.get("labels", [])
         if isinstance(label, dict) and isinstance(label.get("name"), str)
     }
-    if "status:ready" not in labels:
-        raise WorkerIssueError("target issue lost its positive status:ready attestation")
-    blockers = sorted(label for label in labels if label in BUSY_OR_GATED or label.startswith("needs:"))
-    if blockers:
-        raise WorkerIssueError(f"target issue became gated or busy: {', '.join(blockers)}")
+    gating = sorted(label for label in labels
+                    if label in BUSY_OR_GATED or label.startswith("needs:"))
+    if mode == "pre-publish":
+        # Pre-publish re-check (issue #144 review r2): by publish time the workflow has ITSELF
+        # moved the issue ready -> in-progress, so demanding status:ready here would reject every
+        # legitimate run and make publication non-functional. The accepted state is exactly the
+        # one this run wrote, bound to THIS run's immutable record-attempt receipt:
+        # status:in-progress with no other gate, no returned status:ready (that means the issue
+        # re-entered the dispatch pool), and the newest attempt receipt being this run's own.
+        # Anything else — another run's claim, human parking (needs:*/status:blocked), deferral,
+        # a review hand-off — fails closed, same as dispatch mode.
+        if not current_run_key:
+            raise WorkerIssueError("pre-publish reverify requires the current run key")
+        if "status:ready" in labels:
+            raise WorkerIssueError(
+                "target issue returned to the dispatch pool (status:ready) — this run's claim "
+                "is no longer exclusive")
+        if "status:in-progress" not in labels:
+            raise WorkerIssueError("target issue lost this run's status:in-progress claim")
+        blockers = [label for label in gating if label != "status:in-progress"]
+        if blockers:
+            raise WorkerIssueError(f"target issue became gated or busy: {', '.join(blockers)}")
+        if not holds_live_claim(_paginated(repo, issue, "comments"), bot_login, current_run_key):
+            raise WorkerIssueError(
+                "the newest attempt receipt is not this run's own — another run holds or has "
+                "superseded the claim")
+    else:
+        if "status:ready" not in labels:
+            raise WorkerIssueError("target issue lost its positive status:ready attestation")
+        if gating:
+            raise WorkerIssueError(f"target issue became gated or busy: {', '.join(gating)}")
 
     command = [
         sys.executable,
@@ -290,18 +357,7 @@ def set_status(repo, issue, status):
     # — status:deferred is stripped and status:ready restored so the worker's reverify passes.
     # NOTE (issue #31): status:ready written here is dispatchability only, never maintainer
     # approval — the reverify third-party path demands separate human evidence.
-    transitions = {
-        "in-progress": ({"status:in-progress"}, {"status:ready", "status:deferred"}),
-        "in-progress-review": ({"status:in-progress-review"},
-                               {"status:ready", "status:in-progress", "status:deferred"}),
-        "retry": ({"status:ready"}, {"status:deferred"}),
-        "deferred": ({"status:deferred"},
-                     {"status:ready", "status:in-progress", "status:in-progress-review"}),
-        "needs-user": ({"needs:user", "status:deferred"},
-                       {"status:ready", "status:in-progress", "status:in-progress-review"}),
-        "complete": (set(), {"status:in-progress", "status:in-progress-review", "status:deferred"}),
-    }
-    add, remove = transitions[status]
+    add, remove = STATUS_TRANSITIONS[status]
     for label in sorted(add):
         _ensure_label(repo, label)
     if add:
@@ -533,6 +589,97 @@ def _self_test():
             assert json.loads(issue_file.read_text(encoding="utf-8")) == item
         finally:
             globals().update(saved)
+
+    # (x) issue #144 review r2 — pre-publish reverify and the live label LIFECYCLE. The workflow
+    # itself moves the issue ready -> in-progress at claim time, so the pre-publish re-check must
+    # accept exactly that state when bound to THIS run's record-attempt receipt — and nothing
+    # else. First the pure claim binding:
+    own_rcpt = {"user": {"login": "sparq[bot]", "type": "Bot"},
+                "body": f"x {ATTEMPT_MARKER} run=77.1 -->",
+                "created_at": "2026-07-19T01:00:00Z"}
+    foreign_rcpt = {"user": {"login": "sparq[bot]", "type": "Bot"},
+                    "body": f"x {ATTEMPT_MARKER} run=88.1 -->",
+                    "created_at": "2026-07-19T02:00:00Z"}
+    older_foreign = {**foreign_rcpt, "created_at": "2026-07-19T00:00:00Z"}
+    tied_foreign = {**foreign_rcpt, "created_at": own_rcpt["created_at"]}
+    assert holds_live_claim([own_rcpt], "sparq[bot]", "77.1")
+    # Ours newest over an older attempt's receipt: a retried issue this run legitimately claimed.
+    assert holds_live_claim([older_foreign, own_rcpt], "sparq[bot]", "77.1")
+    # A NEWER foreign receipt means the claim was superseded — refuse.
+    assert not holds_live_claim([own_rcpt, foreign_rcpt], "sparq[bot]", "77.1")
+    # Timestamp ties fail closed.
+    assert not holds_live_claim([own_rcpt, tied_foreign], "sparq[bot]", "77.1")
+    # in-progress with no receipt of ours at all (unbound claim) — refuse.
+    assert not holds_live_claim([foreign_rcpt], "sparq[bot]", "77.1")
+    assert not holds_live_claim([], "sparq[bot]", "77.1")
+    # A human quoting the marker text is not a bot receipt and cannot steal the claim.
+    human_quote = {"user": {"login": "jeswr", "type": "User"},
+                   "body": f"x {ATTEMPT_MARKER} run=88.1 -->",
+                   "created_at": "2026-07-19T03:00:00Z"}
+    assert holds_live_claim([own_rcpt, human_quote], "sparq[bot]", "77.1")
+
+    # Then the WIRED path: reverify in pre-publish mode over the label state the workflow's own
+    # ready -> in-progress transition produces — derived from STATUS_TRANSITIONS (the very table
+    # set_status applies), not hand-written, so this test tracks the real lifecycle. Real
+    # subprocess trust-gate; only the GitHub API seams are patched.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate_ok = Path(tmp) / "gate-ok.py"
+        gate_ok.write_text("print('trusted')\n", encoding="utf-8")
+        gate_dead = Path(tmp) / "gate-dead.py"
+        gate_dead.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+        add, remove = STATUS_TRANSITIONS["in-progress"]
+        live_labels = ({"status:ready", "role:impl"} | add) - (remove - add)
+        assert live_labels == {"status:in-progress", "role:impl"}
+        item = {"state": "open", "user": {"login": "jeswr"}, "body": "task",
+                "labels": [{"name": name} for name in sorted(live_labels)]}
+        comments = [own_rcpt]
+        issue_file = Path(tmp) / "issue.json"
+        seams = {"_gh_json": lambda args, *, input_doc=None: json.loads(json.dumps(item)),
+                 "_paginated": lambda repo, issue, resource: list(comments)}
+        saved = {name: globals()[name] for name in seams}
+        globals().update(seams)
+        try:
+            def prepub(gate=gate_ok, key="77.1", mode="pre-publish"):
+                try:
+                    reverify("o/r", 1, "jeswr", body_sha("task"), str(gate),
+                             "sparq[bot]", str(issue_file), key, mode)
+                    return "accepted"
+                except WorkerIssueError as exc:
+                    return f"refused: {exc}"
+            # The normal live path: this run's bound in-progress claim passes and re-freshens
+            # the issue snapshot.
+            assert prepub() == "accepted"
+            assert json.loads(issue_file.read_text(encoding="utf-8")) == item
+            # The SAME state still fails dispatch mode — the r2 regression stays visible, and the
+            # fix stays a dedicated bound mode, never a loosened dispatch check.
+            assert "status:ready" in prepub(mode="dispatch")
+            # Superseded claim: a NEWER foreign receipt refuses and leaves the snapshot untouched.
+            snapshot_before = issue_file.read_text(encoding="utf-8")
+            comments.append(foreign_rcpt)
+            assert "another run" in prepub()
+            assert issue_file.read_text(encoding="utf-8") == snapshot_before
+            # Unbound claim: status:in-progress with only a foreign receipt refuses.
+            comments[:] = [foreign_rcpt]
+            assert "another run" in prepub()
+            comments[:] = [own_rcpt]
+            # The run key is mandatory in pre-publish mode — no key, no claim binding.
+            assert "run key" in prepub(key=None)
+            # Human parking or any other gate still fails closed on the pre-publish path.
+            item["labels"] = [{"name": n} for n in sorted(live_labels | {"needs:user"})]
+            assert "needs:user" in prepub()
+            item["labels"] = [{"name": n} for n in sorted(live_labels | {"status:blocked"})]
+            assert "status:blocked" in prepub()
+            # status:ready RE-appearing means the issue re-entered the dispatch pool — refuse.
+            item["labels"] = [{"name": n} for n in sorted(live_labels | {"status:ready"})]
+            assert "dispatch pool" in prepub()
+            # The claim label itself vanished (deferred/completed by someone else) — refuse.
+            item["labels"] = [{"name": n} for n in sorted(live_labels - {"status:in-progress"})]
+            assert "status:in-progress claim" in prepub()
+            # The trust gate stays load-bearing in pre-publish mode: valid claim, dead gate.
+            item["labels"] = [{"name": n} for n in sorted(live_labels)]
+            assert "trust gate" in prepub(gate=gate_dead)
+        finally:
+            globals().update(saved)
     print("worker-issue self-test PASSED")
 
 
@@ -562,6 +709,10 @@ def main():
     # is THIS run's record-attempt run-key, so the run's own "starting attempt" receipt is not
     # mistaken for a failure that would stale a third-party issue's maintainer approval.
     trust.add_argument("--current-run-key", default=None)
+    # issue #144 review r2: `pre-publish` accepts the workflow's OWN ready -> in-progress claim —
+    # bound to this run's record-attempt receipt via --current-run-key — instead of status:ready,
+    # which the workflow itself removed at claim time (dispatch mode would reject every publish).
+    trust.add_argument("--mode", choices=("dispatch", "pre-publish"), default="dispatch")
 
     status = subparsers.add_parser("status", parents=[common])
     status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
@@ -590,7 +741,8 @@ def main():
             record_attempt(args.repo, args.issue, args.max_attempts, args.bot_login, args.run_key)
         elif args.command == "reverify":
             reverify(args.repo, args.issue, args.expected_author, args.expected_body_sha,
-                     args.trust_gate, args.bot_login, args.issue_file, args.current_run_key)
+                     args.trust_gate, args.bot_login, args.issue_file, args.current_run_key,
+                     args.mode)
         elif args.command == "status":
             set_status(args.repo, args.issue, args.status)
         elif args.command == "claim-receipt":

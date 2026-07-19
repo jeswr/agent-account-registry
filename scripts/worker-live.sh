@@ -2214,6 +2214,80 @@ YAML
     "$([[ -n "$pin_at" && -n "$model_at" && "$pin_at" -lt "$model_at" ]] \
        && echo before || echo after-or-missing)" "before"
 
+  # --- [issue #144 review r2] the re-check must accept the workflow's OWN label lifecycle. The
+  # claim step moves the issue ready -> in-progress before the model runs, so a dispatch-mode
+  # reverify (which demands status:ready) would deterministically reject EVERY legitimate publish
+  # — the re-check must run in pre-publish mode, bound to this run's record-attempt receipt via
+  # the SAME run key the attempt step posted. Wiring first (text of the real workflow: the mode
+  # flag, both ends of the run-key binding, and the pre-model trust step as the dispatch-mode
+  # negative control), then behaviour: a driver runs the REAL reverify pre-publish path over the
+  # label state produced by the module's own STATUS_TRANSITIONS table, with only the GitHub API
+  # seams stubbed. Non-vacuous in both directions: this run's bound claim must be ACCEPTED (the
+  # r2 always-reject regression flips it red), while a superseded claim, an unbound in-progress
+  # state, and dispatch mode over the same state must all be REFUSED. ---
+  chk "pre-publish re-check runs reverify in pre-publish mode (issue #144 r2)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Fc -- '--mode pre-publish' || true)" "1"
+  chk "pre-publish re-check binds the claim to this run's key" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc -- '--current-run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"' || true)" "1"
+  chk "record-attempt posts the receipt under the SAME run key (the binding's other end)" \
+    "$(_workflow_step_body "$wf" attempt \
+       | grep -Fc -- '--run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"' || true)" "1"
+  chk "pre-model trust step stays in dispatch mode (still demands status:ready)" \
+    "$(_workflow_step_body "$wf" trust | grep -c -- '--mode' || true)" "0"
+  cat > "$tmp/prepub-driver.py" <<'PY'
+"""[issue #144 r2] Drive the REAL worker-issue reverify pre-publish path over the label state the
+workflow's own ready -> in-progress transition produces (taken from STATUS_TRANSITIONS, not
+hand-written). Only the GitHub API seams are stubbed; the trust-gate subprocess is real.
+argv: <worker-issue.py path> <scenario: own|foreign|unbound|dispatch> <tmpdir>"""
+import contextlib
+import importlib.util
+import io
+import json
+import pathlib
+import sys
+
+path, scenario, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("worker_issue", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+gate = pathlib.Path(tmp) / "prepub-gate.py"
+gate.write_text("print('trusted')\n", encoding="utf-8")
+add, remove = module.STATUS_TRANSITIONS["in-progress"]
+live = ({"status:ready", "role:impl"} | add) - (remove - add)
+item = {"state": "open", "user": {"login": "jeswr"}, "body": "task",
+        "labels": [{"name": name} for name in sorted(live)]}
+own = {"user": {"login": "sparq[bot]"},
+       "body": f"x {module.ATTEMPT_MARKER} run=77.1 -->",
+       "created_at": "2026-07-19T01:00:00Z"}
+foreign = {"user": {"login": "sparq[bot]"},
+           "body": f"x {module.ATTEMPT_MARKER} run=88.1 -->",
+           "created_at": "2026-07-19T02:00:00Z"}
+comments = {"own": [own], "dispatch": [own],
+            "foreign": [own, foreign], "unbound": [foreign]}[scenario]
+module._gh_json = lambda args, *, input_doc=None: json.loads(json.dumps(item))
+module._paginated = lambda repo, issue, resource: list(comments)
+try:
+    # reverify prints its own receipt line; the chk contract is the bare verdict word only.
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.reverify("o/r", 1, "jeswr", module.body_sha("task"), str(gate), "sparq[bot]",
+                        str(pathlib.Path(tmp) / f"prepub-issue-{scenario}.json"),
+                        "77.1", "dispatch" if scenario == "dispatch" else "pre-publish")
+    print("accepted")
+except module.WorkerIssueError:
+    print("refused")
+PY
+  local wisrc="$SCRIPT_DIR/worker-issue.py"
+  chk "pre-publish reverify ACCEPTS this run's own ready->in-progress claim (lifecycle)" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" own "$tmp" 2>/dev/null || true)" "accepted"
+  chk "pre-publish reverify REFUSES an in-progress claim superseded by ANOTHER run" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" foreign "$tmp" 2>/dev/null || true)" "refused"
+  chk "pre-publish reverify REFUSES status:in-progress with NO matching claim receipt" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" unbound "$tmp" 2>/dev/null || true)" "refused"
+  chk "dispatch-mode reverify still REFUSES the in-progress state (mode is load-bearing)" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" dispatch "$tmp" 2>/dev/null || true)" "refused"
+
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
   # REAL membership semantics: sparq's root workspace excludes gui/src-tauri (a standalone

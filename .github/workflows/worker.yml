@@ -1098,6 +1098,14 @@ jobs:
       # revalidation against the LIVE issue and re-freshens verified-issue.json, so publish only
       # ever runs from a snapshot re-attested seconds earlier. On ANY drift it fails (continue-on-
       # error, mirroring the pre-model `trust` step) which gates the publish step below OFF.
+      # [review r2] The status-label check runs in `--mode pre-publish`: the claim step above
+      # ITSELF moved the issue ready -> in-progress, so dispatch mode's status:ready demand would
+      # reject every legitimate run and publication would never fire. Pre-publish mode instead
+      # accepts exactly this run's still-live claim — status:in-progress with no other gate, no
+      # returned status:ready, and the issue's NEWEST record-attempt receipt bound to this run's
+      # $GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT key (the immutable receipt the `attempt` step posted).
+      # A foreign or unbound claim, human parking, deferral, or a re-opened pool state still
+      # fails closed exactly as before.
       # reverify changes NO human-owned issue state — it only READS the issue and runs the
       # read-only trust gate — so an aborted publish leaves the maintainer's action intact and the
       # separate final_state job converges the issue to `deferred` (back into the redispatch pool).
@@ -1131,7 +1139,8 @@ jobs:
             --trust-gate "$verifier" \
             --bot-login "${{ steps.target.outputs.bot_login }}" \
             --issue-file "$RUNNER_TEMP/verified-issue.json" \
-            --current-run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+            --current-run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --mode pre-publish
 
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
