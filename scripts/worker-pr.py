@@ -1396,6 +1396,70 @@ def disarm(repo, pr_number, when):
     print(f"disarm applied ({when}): {','.join(actions)}")
 
 
+# [P1 arm regression — review-fix runs 29674274380 (#326) / 29674657458 (#332)] the error
+# families `gh pr merge --auto` returns when the latch is REFUSED because the PR is ALREADY
+# fully mergeable ("clean"): pr-gate.yml re-runs `gate` on ready_for_review, but GitHub takes
+# seconds to REGISTER that queued run after `pr ready`, so an immediate enable sees every
+# requirement satisfied and errors "Pull request is in clean status". A clean PR is by
+# definition immediately mergeable, so this exact refusal falls back to a DIRECT sha-bound
+# merge; anything else retries with backoff (once the queued gate registers, the latch is
+# accepted again).
+ARM_ALREADY_MERGEABLE_MARKERS = ("clean status", "unstable status")
+ARM_ATTEMPTS = 4
+
+
+def _arm_backoff_ceiling(attempt, base=2.0, cap=8.0):
+    """Upper bound (seconds) for the sleep before arm retry `attempt` (1-based)."""
+    return min(cap, base * (2 ** (attempt - 1)))
+
+
+def _arm_sleep_backoff(attempt):
+    # Floor of 1s ON PURPOSE (unlike the registry CAS jitter): the retry exists to give
+    # Actions time to register the ready_for_review-triggered gate run; a 0s retry would
+    # re-lose the same race. Module-level so --self-test patches it instead of sleeping.
+    time.sleep(random.uniform(1.0, max(1.0, _arm_backoff_ceiling(attempt))))
+
+
+def _arm_error_text(result):
+    """One sanitized single-line string from a failed gh call (stderr wins, stdout appended)."""
+    return " ".join(f"{result.stderr or ''} {result.stdout or ''}".split())[:300]
+
+
+def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS):
+    """Latch the sha-bound auto-merge, surviving the post-`pr ready` CLEAN-STATUS race
+    (P1, runs 29674274380/29674657458: every failed arm's ready_for_review `gate` run
+    STARTED 1-14s AFTER the enable call failed — the arm raced GitHub's check-run
+    registration and lost, and GitHub refuses enablePullRequestAutoMerge on a PR whose
+    requirements are all satisfied). Strategy per attempt: try the latch; on the
+    already-mergeable refusal fall through to a DIRECT merge under the SAME
+    --match-head-commit CAS (behaviourally identical to the latch firing seconds later —
+    branch protection still enforces the required `gate`, so this can never merge past a
+    red check); on any other failure back off and retry (transient read-lag / the queued
+    gate registering). Every gh failure is PRINTED — the pre-fix path swallowed stderr,
+    leaving runs with only the generic 'arm failed' line. Returns (ok, mode, last_error)
+    with mode in {'auto', 'direct'}."""
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            _arm_sleep_backoff(attempt - 1)
+        merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto",
+                         "--match-head-commit", reviewed_sha], check=False)
+        if merge.returncode == 0:
+            return True, "auto", ""
+        last_error = _arm_error_text(merge) or "unknown gh error"
+        print(f"arm attempt {attempt}/{attempts}: enable auto-merge failed: {last_error}",
+              file=sys.stderr)
+        if any(marker in last_error.lower() for marker in ARM_ALREADY_MERGEABLE_MARKERS):
+            direct = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash",
+                              "--match-head-commit", reviewed_sha], check=False)
+            if direct.returncode == 0:
+                return True, "direct", ""
+            last_error = _arm_error_text(direct) or "unknown gh error"
+            print(f"arm attempt {attempt}/{attempts}: direct clean-status merge failed: "
+                  f"{last_error}", file=sys.stderr)
+    return False, "", last_error
+
+
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
                   reviewed_base="", security_keywords=None):
@@ -1515,32 +1579,42 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         _apply_trust_surface_audit(repo, pr_number, trust_hits, reviewed_sha,
                                    bot_login=bot_login)
     _run_gh(["pr", "ready", str(pr_number), "-R", repo])
+    arm_mode = ""
     if arm:
         # Atomic SHA-bound arm (sol r2): GitHub's own CAS — the latch only sets if the head
         # still equals the reviewed sha at mutation time, closing the read-to-arm race.
-        merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto",
-                         "--match-head-commit", reviewed_sha],
-                        check=False)
-        if merge.returncode != 0:
+        # [P1 arm regression] the latch is retried through the post-ready clean-status race
+        # (see _arm_auto_merge), and the REAL gh error rides every failure message — the
+        # pre-fix single-shot attempt swallowed stderr and lost to the race deterministically
+        # on any PR whose draft-time `gate` was already green (#326 lost 3 rounds -> parked).
+        armed_ok, arm_mode, arm_error = _arm_auto_merge(repo, pr_number, reviewed_sha)
+        if not armed_ok:
             undo = _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
             if undo.returncode == 0:
                 # Back to draft with review:needs and NO reviewed-sha bind (the bind runs after
                 # this step) — the sweep re-reviews next tick, bounded by max_review_rounds.
                 raise WorkerPrError(
-                    "auto-merge arm failed; draft restored for the sweep to retry")
+                    "auto-merge arm failed; draft restored for the sweep to retry "
+                    f"(last gh error: {arm_error})")
             alert_repo, alert_token = _alert_route()
             needs_user(repo, pr_number,
                        "arming failed AFTER the PR left draft and the draft state could not be "
                        "restored; a human must re-arm or re-draft this PR",
                        issue=issue, alert_repo=alert_repo, alert_token=alert_token)
-            raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated")
+            raise WorkerPrError("auto-merge arm failed and the draft undo failed; escalated "
+                                f"(last gh error: {arm_error})")
     set_review_state(repo, pr_number, "pass")
     if issue:
         # Deferred issue completion (locked decision 16): complete only on arm, not on publish.
         _load_worker_issue().set_status(repo, issue, "complete")
     _write_outputs({"armed": bool(arm), "head_moved": False,
-                    "trust_surface": bool(trust_hits), "arm_complete": True})
-    print(f"pull request marked ready{' and armed (auto-merge)' if arm else ''}")
+                    "trust_surface": bool(trust_hits), "arm_complete": True,
+                    "arm_mode": arm_mode})
+    if arm and arm_mode == "direct":
+        print("pull request marked ready and merged directly "
+              "(already clean; the auto-merge latch was refused)")
+    else:
+        print(f"pull request marked ready{' and armed (auto-merge)' if arm else ''}")
 
 
 TRUST_AUDIT_MARKER_PREFIX = "<!-- sparq-trust-audit:v1 sha="
@@ -2670,7 +2744,7 @@ def _self_test():
     raa_state = {}
     real_raa = {name: globals()[name] for name in (
         "_gh_json", "_run_gh", "_pr_changed_files", "set_review_state",
-        "_paginated_comments", "needs_user", "_write_outputs")}
+        "_paginated_comments", "needs_user", "_write_outputs", "_arm_sleep_backoff")}
 
     def raa_gh_json(args, **_kw):
         path = args[1] if len(args) > 1 else ""
@@ -2695,27 +2769,35 @@ def _self_test():
 
     def raa_run_gh(args, **kw):
         raa_calls.append(" ".join(args))
-        if "merge" in args and raa_state.get("merge_fails"):
-            if kw.get("check", True):
-                raise WorkerPrError("GitHub API request failed for merge")
-            return argparse.Namespace(returncode=1, stdout="", stderr="")
+        if "merge" in args:
+            # [P1 arm regression] scripted per-merge-call results: a list of (rc, stderr)
+            # rows consumed in order, so the retry/fallback shape is pinned exactly.
+            script = raa_state.get("merge_script")
+            if script is not None:
+                rc, err = script.pop(0) if script else (0, "")
+                return argparse.Namespace(returncode=rc, stdout="", stderr=err)
+            if raa_state.get("merge_fails"):
+                if kw.get("check", True):
+                    raise WorkerPrError("GitHub API request failed for merge")
+                return argparse.Namespace(returncode=1, stdout="", stderr="")
         return argparse.Namespace(returncode=0, stdout="", stderr="")
 
     def run_raa(head_ok=True, merge_fails=False, comments=(), labels=(),
                 issue_labels=(), issue=None, probe_garbage=False, labels_payload=None,
-                benign_diff=False, security_keywords=()):
+                benign_diff=False, security_keywords=(), merge_script=None):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
         raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
                          labels=labels, issue_labels=issue_labels,
                          issue_probe_garbage=probe_garbage, labels_payload=labels_payload,
-                         benign_diff=benign_diff)
+                         benign_diff=benign_diff, merge_script=merge_script)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
         globals()["set_review_state"] = lambda repo, pr, s: raa_calls.append(f"state:{s}")
         globals()["_paginated_comments"] = lambda repo, pr: list(comments)
         globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
+        globals()["_arm_sleep_backoff"] = lambda attempt: raa_calls.append(f"sleep:{attempt}")
         globals()["_write_outputs"] = raa_outputs.update
         ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
                       issue=issue, bot_login="sparq[bot]",
@@ -2797,6 +2879,53 @@ def _self_test():
             check("arm failure raises (draft restored path)", "raised", "raised")
         check("the pre-arm audit survives an arm failure (re-review re-audits per sha)",
               any(TRUST_AUDIT_MARKER_PREFIX in c for c in raa_calls), True)
+        # ---- [P1 arm regression — review-fix runs 29674274380 (#326) / 29674657458 (#332)]
+        # the post-`pr ready` CLEAN-STATUS race: pr-gate re-runs `gate` on ready_for_review,
+        # but until GitHub registers that queued run the PR reads CLEAN and the auto-merge
+        # latch is REFUSED ("Pull request is in clean status"). The arm must (a) mark ready
+        # STRICTLY before any merge call, (b) fall back to a DIRECT sha-bound merge on the
+        # already-mergeable refusal, (c) retry other refusals with backoff, and (d) surface
+        # the REAL gh error on terminal failure (the pre-fix path swallowed stderr). ----
+        run_raa()
+        ready_i = next(i for i, c in enumerate(raa_calls) if c.startswith("pr ready"))
+        merge_i = next(i for i, c in enumerate(raa_calls) if "pr merge" in c)
+        check("mark-ready STRICTLY precedes the arm (ready->arm ordering pinned)",
+              ready_i < merge_i, True)
+        clean_err = "GraphQL: Pull request is in clean status (enablePullRequestAutoMerge)"
+        run_raa(merge_script=[(1, clean_err), (0, "")])
+        merges = [c for c in raa_calls if "pr merge" in c]
+        check("clean-status latch refusal falls back to ONE direct sha-bound merge",
+              (len(merges),
+               "--auto" in merges[0] if merges else None,
+               "--auto" in merges[1] if len(merges) > 1 else None,
+               "--match-head-commit" in merges[1] and sha in merges[1]
+               if len(merges) > 1 else None),
+              (2, True, False, True))
+        check("the clean-status fallback ARMS: no draft undo, no needs-user, arm_complete",
+              (raa_outputs.get("armed"), raa_outputs.get("arm_complete"),
+               raa_outputs.get("arm_mode"),
+               any("--undo" in c for c in raa_calls), "needs-user" in raa_calls),
+              (True, True, "direct", False, False))
+        lag_err = "GraphQL: Draft pull requests cannot be merged (enablePullRequestAutoMerge)"
+        run_raa(merge_script=[(1, lag_err), (0, "")])
+        merges = [c for c in raa_calls if "pr merge" in c]
+        check("a transient non-clean refusal RETRIES the latch with backoff (never direct)",
+              (len(merges), all("--auto" in c for c in merges),
+               any(c.startswith("sleep:") for c in raa_calls),
+               raa_outputs.get("armed"), raa_outputs.get("arm_mode")),
+              (2, True, True, True, "auto"))
+        try:
+            run_raa(merge_script=[(1, "boom: base branch was modified")] * (ARM_ATTEMPTS + 1))
+            check("persistent arm failure raises with the REAL gh error surfaced",
+                  "no error", "raised")
+        except WorkerPrError as exc:
+            check("persistent arm failure raises with the REAL gh error surfaced",
+                  ("draft restored for the sweep to retry" in str(exc),
+                   "boom: base branch was modified" in str(exc),
+                   sum(1 for c in raa_calls if "pr merge" in c and "--auto" in c),
+                   any("pr merge" in c and "--auto" not in c for c in raa_calls),
+                   any("--undo" in c for c in raa_calls)),
+                  (True, True, ARM_ATTEMPTS, False, True))
         # ---- [round-4 P1] PARKED-BUT-ARMING RACE: a human/groom park that landed while
         # this review run was in flight WINS — the pre-arm hold recheck aborts with the
         # valid-exit shape and NO ready/arm/audit/review-state mutation at all ----
