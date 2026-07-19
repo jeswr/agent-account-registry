@@ -1,0 +1,29 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The design record restricts IN/NOT IN to public constant lists, and the new public documentation repeats that restriction. However, the Expression::In arm calls extract_expr on every list item, so queries such as FILTER(?a IN (?b, ?c + 1)) are accepted and emitted as an in-fragment tree. A downstream composer relying on this extractor could attempt to bind a tree for which the stated constant-list proof construction does not apply. This violates the fail-closed invariant on the real parsed-query path.",
+   "file": "crates/sparq-zk/src/verify.rs",
+   "fix_hint": "Require every RHS list item to be a constant term accepted by the estate (or precisely document and implement a broader proven construction), reject variables/operator nodes with UnsupportedFragment, and add negative tests for variable and computed RHS items plus a positive constant-list test.",
+   "severity": "major",
+   "title": "IN accepts arbitrary expressions instead of a constant list"
+  },
+  {
+   "body": "const_string returns Some for every RDF literal, not only literals valid as string operands. Consequently REGEX(?a, 123) and similarly typed non-string patterns/flags/replacements pass the query-side bounded-subset gate and become Const leaves, despite the comments and skill claiming constant string literals. This admits type-error expressions into an estate whose later circuit semantics are described as bounded string matching, creating an acceptance-set mismatch rather than failing closed.",
+   "file": "crates/sparq-zk/src/verify.rs",
+   "fix_hint": "Validate the literal's datatype/language category according to the exact SPARQL string-argument contract supported by the circuit (at minimum reject numeric, boolean, date/time, and other non-string typed literals). Add rejection tests for a numeric pattern, non-string flags, and non-string replacement, and positive tests for each intentionally supported string-literal category.",
+   "severity": "major",
+   "title": "Regex constant validation ignores literal datatype"
+  },
+  {
+   "body": "collect_expr_obligations_gp pushes a Filter or Extend obligation before traversing its inner pattern. Spargebra's graph algebra nests later operations outside earlier ones, so a sequence such as BIND(... AS ?x) followed by FILTER(?x ...) is emitted as Filter then Bind, contrary to the API's 'in query order' guarantee. Nested FILTER/BIND chains are likewise reversed, which can break target/leaf dependency binding in the compose verifier. The only BIND test has one obligation and cannot detect this.",
+   "file": "crates/sparq-zk/src/verify.rs",
+   "fix_hint": "Traverse the inner pattern before appending the enclosing Filter/Extend obligation (while preserving left-to-right Join traversal), or explicitly define and consume a different order everywhere. Add a mixed multi-step BIND/FILTER test that asserts textual/evaluation order and variable dependency order.",
+   "severity": "major",
+   "title": "FILTER and BIND obligations are emitted in reverse evaluation order"
+  }
+ ],
+ "progress": null,
+ "summary": "The extractor is directionally fail-closed, but it accepts expressions outside the documented and designed proof estate and does not actually return obligations in query/evaluation order. The positive/negative table misses these boundary cases, so the change is not yet safe as the query-side source of truth for later circuit composition.",
+ "verdict": "request_changes"
+}
