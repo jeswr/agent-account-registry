@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 397,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f2ef4b3be43dcae1f21e91308bcbde10176ec91b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly collects all unique repository names per owner and passes each owner's complete comma-separated repository list to the corresponding App-token mint. Repository names are validated before interpolation, commas/newlines cannot enter the line-based output, the exact known-owner assertion remains fail-closed, and token ownership/permissions are unchanged. This fixes the additional-repository authorization gap without weakening a trust check or introducing a permissive fallback.",
+  "verdict": "approve"
+ }
+}
