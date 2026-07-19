@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 423,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d5d9c8d84644e1f801c124a2cf84297158fbfa66",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "VALID_RECORD_PROVIDERS includes `fleet`, but `_cmd_record` does not enforce the documented provider/class pairing. Thus a catalog-controlled worker provider of `fleet` with an ordinary exit class such as `auth` passes the new guard. The subsequent `if args.exit_class == CLASS_ZERO_DISPATCH or args.provider == \"fleet\"` also replaces the account with the fleet sentinel and writes the record. `fleet` is documented here as the pseudo-provider for the single fleet-wide zero-dispatch signal, not a valid account provider; admitting other fleet records can corrupt health classification and violates the intended fail-closed catalog backstop. The self-test covers unknown, anthropic, and injection-shaped values but misses this boundary case.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Enforce the invariant as a pair: accept `fleet` only when the raw exit class is `zero-dispatch`, reject `zero-dispatch` for non-fleet providers, and keep catalog-backed per-account calls restricted to `anthropic` or `openai`. Add assertions that `fleet` + ordinary class and real-provider + `zero-dispatch` both return nonzero without touching the ledger, while `fleet` + `zero-dispatch` writes exactly once.",
+    "severity": "major",
+    "title": "Provider guard permits catalog-controlled fleet records with non-fleet exit classes"
+   }
+  ],
+  "progress": null,
+  "summary": "The shell-source interpolation fixes are sound, and the new provider-guard test is non-vacuous for unknown values. However, the guard admits the fleet pseudo-provider for ordinary per-account records even though the code documents fleet as reserved for the zero-dispatch signal. Because workflow input is catalog-controlled, a catalog row can now pass validation as fleet and write semantically invalid fleet health records. This must fail closed before approval.",
+  "verdict": "request_changes"
+ }
+}
