@@ -1534,9 +1534,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
 
     `lanes` is the tick's per-lane accumulator (issue #108). Each item's plan state selects its lane
     (review vs fix via _review_item_lane); a launch folds into that lane's `launched` and a hard
-    failure (lease error, revalidation DispatchError) into its `error`. This keeps a review/fix lane
-    that launched NOTHING visible to the tick-health recorder even when the worker lane launched —
-    the exact masking this loop's bare launched-count return used to allow."""
+    failure (lease error, revalidation DispatchError, failed workflow launch) into its `error`. This
+    keeps a review/fix lane that launched NOTHING visible to the tick-health recorder even when the
+    worker lane launched — the exact masking this loop's bare launched-count return used to allow."""
     if lanes is None:
         lanes = _new_lane_counts()
     launched = 0
@@ -1913,6 +1913,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             released = _release_failed_dispatch(allocator, registry_repo, claim_id)
             if not released:
                 print("::error::review-fix dispatch failed and its lease could not be released")
+            # A failed workflow launch is a HARD dispatch error, not capacity contention: fold it
+            # into the lane's error tally (issue #108) so an all-launch-failed review/fix lane
+            # reads planned>0/launched=0/error>0 (stalled) instead of deriving as `deferred` and
+            # dodging the tick-health recorder while another lane launched.
+            defer_reasons["dispatch-launch-failed"] += 1
+            lanes[lane]["error"] += 1
             print(f"defer review {repo}#{number}: {mode} dispatch failed; skipped")
             continue
         launched += 1
@@ -2292,6 +2298,9 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 if not released:
                     print("::error::worker dispatch failed and its lease could not be released")
                 defer_reasons["dispatch-launch-failed"] += 1
+                # Same hard-error classification as the review/fix lanes: a failed launch must
+                # not derive as `deferred` in the lane summary.
+                lanes["worker"]["error"] += 1
                 print(f"defer {repo}#{number}: worker dispatch failed; skipped")
                 continue
             dispatched += 1
@@ -3594,6 +3603,59 @@ def _self_test():
             assert errored["fix"] == {
                 "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
             assert errored["review"]["planned"] == 0, run_items.lanes
+
+            # ---- review/fix workflow-launch failure is a LANE ERROR (PR #321 review): a
+            # nonzero `gh workflow run` is a hard dispatch failure, not capacity contention.
+            # It must fold into the lane's error tally + the shared dispatch-launch-failed
+            # histogram, so an all-launch-failed fix lane reads stalled (planned>0,
+            # launched=0, error>0) instead of deriving as `deferred` and dodging the
+            # tick-health recorder while another lane launched. ----
+            class ClaimingAllocator:
+                def __init__(self):
+                    self.released = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    return {"account": "acct01", "claim_id": "ab" * 16,
+                            "model": chain[0], "provider": "anthropic"}
+
+                def release(self, _repo, claim_id, _now):
+                    self.released.append(claim_id)
+                    return True
+
+            gh_runs = []
+            real_run_gh = _run_gh
+
+            def fake_run_gh(args, *, check=True):
+                gh_runs.append(list(args))
+                return subprocess.CompletedProcess(args, fake_run_gh.returncode)
+
+            try:
+                globals()["_run_gh"] = fake_run_gh
+                fake_run_gh.returncode = 1
+                alloc = ClaimingAllocator()
+                launched, reasons = run_items([fix_item], allocator=alloc,
+                                              routing=routing_ok)
+                assert gh_runs and gh_runs[0][:3] == [
+                    "workflow", "run", "review-fix.yml"], gh_runs
+                assert launched == 0 and reasons["dispatch-launch-failed"] == 1, \
+                    (launched, reasons)
+                assert alloc.released == ["ab" * 16], alloc.released  # lease not leaked
+                assert _lane_summary(run_items.lanes)["fix"] == {
+                    "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+                # flip-goes-green: the SAME posture with a zero-exit launch is a lane launch,
+                # not an error, and the lease stays held for the launched workflow
+                gh_runs.clear()
+                fake_run_gh.returncode = 0
+                alloc = ClaimingAllocator()
+                launched, reasons = run_items([fix_item], allocator=alloc,
+                                              routing=routing_ok)
+                assert launched == 1 and reasons["dispatch-launch-failed"] == 0, \
+                    (launched, reasons)
+                assert alloc.released == [], alloc.released
+                assert _lane_summary(run_items.lanes)["fix"] == {
+                    "planned": 1, "launched": 1, "deferred": 0, "error": 0}, run_items.lanes
+            finally:
+                globals()["_run_gh"] = real_run_gh
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"]) = real_io
