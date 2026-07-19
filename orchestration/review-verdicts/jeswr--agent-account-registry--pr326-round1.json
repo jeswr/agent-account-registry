@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly fails closed for per-account records when either the account handle or PROVENANCE_SALT is unavailable, while preserving the fleet/zero-dispatch sentinel path that legitimately has no account. It returns before constructing or calling the ledger API, so it cannot emit an unsalted/raw identifier or attempt a partial write. The added self-tests are non-vacuous: they assert the new nonzero exit status for each missing input and replace GitHubAPI with a stub that raises on any request, proving the guard short-circuits ledger access. Environment and global state are restored in the existing finally block. No trust check is weakened and no reviewer-directed prompt injection appears in the diff.",
+ "verdict": "approve"
+}
