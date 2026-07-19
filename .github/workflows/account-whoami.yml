@@ -19,7 +19,10 @@ jobs:
     # refused server-side.
     environment: dispatch-secrets
     steps:
-      - name: Resolve acct02 identity (salted email hash only — the raw email is NEVER printed)
+      # Step NAME kept GENERIC (sol round 20 of #275): step names render in the public Actions
+      # run UI, so no raw account handle appears here — the secret reference below is the only
+      # place the slot name necessarily occurs, and secret NAMES are repo metadata, not output.
+      - name: Probe the configured account (salted-hash identity only — no raw handle or email)
         env:
           TOK: ${{ secrets.ACCT02_TOKEN }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
@@ -51,10 +54,24 @@ jobs:
           # Response FORMAT (key names only — field names carry no PII, values are never dumped).
           echo "response_keys=$(jq -r 'try (keys | join(",")) catch "<non-object>"' /tmp/p.json 2>/dev/null || echo -)"
           # usage fingerprint (per-account rate-limit window): identifies the account even when
-          # /api/oauth/profile is 403 for a setup-token. Same account => same 5h/7d reset timestamps.
+          # /api/oauth/profile is 403 for a setup-token — same account => same 5h/7d reset
+          # timestamps, which is exactly why the RAW values are account-identifying and (sol
+          # round 20 of #275) never reach this PUBLIC log. Each value is logged only as the
+          # registry's salted-hash convention sha256(value:PROVENANCE_SALT)[:16] (same as
+          # email_hash above): the maintainer probes their candidate account privately and
+          # hashes the same way to match. No salt => a header COUNT only (fail closed, never
+          # raw). `status` is a generic non-identifying enum (allowed/rejected) and stays raw.
           curl -s -D /tmp/rl.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
             -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
             -H "anthropic-beta: oauth-2025-04-20" \
             -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' || true
           rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/rl.txt | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r'; }
-          echo "usage_5h_reset=$(rl 5h-reset) usage_7d_reset=$(rl 7d-reset) usage_5h_util=$(rl 5h-utilization) usage_7d_util=$(rl 7d-utilization) status=$(rl status)"
+          rlh() {
+            v=$(rl "$1")
+            if [ -z "$v" ]; then echo "<absent>"; else printf '%s:%s' "$v" "$PROVENANCE_SALT" | sha256sum | cut -c1-16; fi
+          }
+          if [ -z "$PROVENANCE_SALT" ]; then
+            echo "usage_fingerprint=<no-salt-refusing-to-derive> ratelimit_headers_present=$(grep -ci '^anthropic-ratelimit-unified-' /tmp/rl.txt || true)"
+          else
+            echo "usage_5h_reset_hash=$(rlh 5h-reset) usage_7d_reset_hash=$(rlh 7d-reset) usage_5h_util_hash=$(rlh 5h-utilization) usage_7d_util_hash=$(rlh 7d-utilization) status=$(rl status)"
+          fi

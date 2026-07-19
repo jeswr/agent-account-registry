@@ -903,9 +903,58 @@ phase_resume() {
 # INDENTATION now, not proximity — the round-18 scan still counted any permission-* line
 # anywhere inside the mint step until the next step marker, so relocating the lines under a
 # step-level `env:` mapping kept every grant listing green while the action, receiving zero
-# permission-* inputs, again inherited the full installation grants. When the workflow is
-# deleted after the migration succeeds, this script is deleted with it (see header), taking
-# the contract along.
+# permission-* inputs, again inherited the full installation grants. Round 20 (sol —
+# COMMENT-AS-EVIDENCE, the same class the guard's round-19 strip_shell_comments closed for
+# shell text): every contract line-match here ran over RAW workflow text, so a YAML comment
+# tail quoting the genuine line satisfied the matcher while the code said something else —
+# `uses: attacker/exfiltrate@main # uses: actions/create-github-app-token@<sha>` still
+# counted as the mint (and received the exact-grants green tick), and the actor / phase-route
+# / cleanup-invocation greps were satisfiable by comment tails the same way. EVERY contract
+# helper below therefore reads the workflow through _yaml_code (the ONE shared quote-aware
+# YAML-comment stripper) BEFORE matching, and the mint is identified by the EXACT SHA-pinned
+# `uses:` scalar (MINT_USES) — a retargeted action, an unpinned floating tag, and
+# comment-planted evidence each go red. When the workflow is deleted after the migration
+# succeeds, this script is deleted with it (see header), taking the contract along.
+
+# Round 20 (sol): the ONE shared YAML-comment stripper EVERY workflow-contract line-match in
+# this script runs BEFORE matching — the shell-side twin of the guard's round-19
+# strip_shell_comments (scripts/dispatch-secrets-guard.py), closing the same
+# comment-as-evidence class for the awk/grep contract checks here. YAML rules: an unquoted
+# `#` at line start or preceded by whitespace starts a comment cut to end of line; a `#`
+# inside a single- or double-quoted scalar (or mid-word in a plain scalar) is content and
+# preserved; backslashes escape inside double-quoted scalars only. Trailing whitespace is
+# dropped so exact-scalar comparisons see the value alone. Line-at-a-time; block-scalar
+# interiors are over-stripped by design — losing a comment-shaped tail there only makes the
+# matchers STRICTER, it can never let a comment stand in for code.
+_yaml_code() {  # _yaml_code < workflow-yaml -> the same lines with YAML comments stripped QUOTE-AWARELY
+  awk -v q="'" '{
+    out = ""; insq = 0; indq = 0; n = length($0)
+    for (i = 1; i <= n; i++) {
+      c = substr($0, i, 1)
+      if (insq) { if (c == q) insq = 0; out = out c; continue }
+      if (indq) {
+        if (c == "\\" && i < n) { out = out c substr($0, i + 1, 1); i++; continue }
+        if (c == "\"") indq = 0
+        out = out c; continue
+      }
+      if (c == q)    { insq = 1; out = out c; continue }
+      if (c == "\"") { indq = 1; out = out c; continue }
+      if (c == "#" && (i == 1 || substr($0, i - 1, 1) ~ /[ \t]/)) break
+      out = out c
+    }
+    sub(/[ \t]+$/, "", out)
+    print out
+  }'
+}
+
+# Round 20 (sol): the mint step is identified by this EXACT SHA-pinned `uses:` scalar,
+# compared AFTER _yaml_code stripping (so the workflow's ` # v3.2.0` tail never
+# participates). The old substring match accepted
+# `uses: attacker/exfiltrate@main # uses: actions/create-github-app-token@<sha>` — a comment
+# tail counted as the mint while an ATTACKER action received the exact-pinned grants under a
+# green tick. Exact comparison also means an unpinned floating tag (@v3, @main) is NOT the
+# mint: pin drift goes red instead of silently green.
+readonly MINT_USES='actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1'
 
 _mint_grants() {  # _mint_grants WORKFLOW_FILE JOB_KEY -> the permission-* lines of that job's mint step's OWN `with:` mapping, sorted
   # Round 19 (sol): INDENTATION-ANCHORED to the mint step's `with:` block. The old "any
@@ -916,24 +965,31 @@ _mint_grants() {  # _mint_grants WORKFLOW_FILE JOB_KEY -> the permission-* lines
   # App installation"). Only the ten-space children of the eight-space `with:` key of the
   # mint step count now; any other eight-space step key (`env:`, `id:`, ...) closes the
   # `with:` block. Same narrow two-space-indentation discipline as every parser here —
-  # reshaping the step goes red (empty grant set), never silently green.
-  awk -v job="$2" '
-    /^[ \t]*#/ { next }
+  # reshaping the step goes red (empty grant set), never silently green. Round 20 (sol): the
+  # file is read through _yaml_code and the mint is the EXACT MINT_USES scalar — comment
+  # tails are gone before any rule fires, and a retargeted `uses:` is not a mint.
+  _yaml_code < "$1" | awk -v job="$2" -v mint="$MINT_USES" '
     /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
     injob && /^      - / { inmint = 0; inwith = 0 }
-    injob && /uses:[ \t]*actions\/create-github-app-token/ { inmint = 1; next }
-    injob && inmint && /^        [A-Za-z_-]+:/ { inwith = ($0 ~ /^        with:[ \t]*$/) }
-    injob && inmint && inwith && /^          permission-[a-z-]+:/ { sub(/^ +/, ""); sub(/[ \t]+$/, ""); print }
-  ' "$1" | sort
+    injob && /^ +(- )?uses:/ {
+      val = $0; sub(/^ +(- )?uses:[ \t]*/, "", val)
+      if (val == mint) { inmint = 1; next }
+      inmint = 0
+    }
+    injob && inmint && /^        [A-Za-z_-]+:/ { inwith = ($0 ~ /^        with:$/) }
+    injob && inmint && inwith && /^          permission-[a-z-]+:/ { sub(/^ +/, ""); print }
+  ' | sort
 }
 
-_mint_step_count() {  # _mint_step_count WORKFLOW_FILE JOB_KEY -> how many create-github-app-token steps that job holds
-  awk -v job="$2" '
-    /^[ \t]*#/ { next }
+_mint_step_count() {  # _mint_step_count WORKFLOW_FILE JOB_KEY -> how many EXACT SHA-pinned mint steps that job holds (round 20: comment-stripped, exact MINT_USES scalar)
+  _yaml_code < "$1" | awk -v job="$2" -v mint="$MINT_USES" '
     /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
-    injob && /uses:[ \t]*actions\/create-github-app-token/ { count++ }
+    injob && /^ +(- )?uses:/ {
+      val = $0; sub(/^ +(- )?uses:[ \t]*/, "", val)
+      if (val == mint) count++
+    }
     END { print count + 0 }
-  ' "$1"
+  '
 }
 
 check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
@@ -947,10 +1003,15 @@ check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
   # permission-* inputs contributes nothing to any grant listing while minting a token that
   # inherits EVERY permission of the App installation. Exactly ONE mint per phase job, and
   # exactly the FIVE phase mints in the whole file: an extra mint ANYWHERE (inside a covered
-  # job or smuggled into a new job) is a refusal.
-  total=$(grep -vE '^[[:space:]]*#' "$wf" | grep -c 'uses:[[:space:]]*actions/create-github-app-token' || true)
+  # job or smuggled into a new job) is a refusal. Round 20 (sol): the count is over
+  # comment-STRIPPED lines matching the exact MINT_USES scalar — a comment tail is never a
+  # mint, and a mint whose uses: was retargeted (real pin quoted in the tail) stops counting.
+  total=$(_yaml_code < "$wf" | awk -v mint="$MINT_USES" '
+    /^ +(- )?uses:/ { val = $0; sub(/^ +(- )?uses:[ \t]*/, "", val); if (val == mint) count++ }
+    END { print count + 0 }
+  ')
   if [[ "$total" -ne 5 ]]; then
-    printf '::error::migrate-secrets: workflow contract violated — %s must hold EXACTLY FIVE create-github-app-token mint steps (one per phase job), found %s: an additional mint step with no permission-* inputs silently inherits EVERY permission of the App installation (round 18)\n' "$wf" "$total" >&2
+    printf '::error::migrate-secrets: workflow contract violated — %s must hold EXACTLY FIVE create-github-app-token mint steps (one per phase job, each the exact SHA-pinned uses: scalar after YAML-comment stripping — round 20), found %s: an additional mint step with no permission-* inputs silently inherits EVERY permission of the App installation (round 18)\n' "$wf" "$total" >&2
     rc=1
   fi
   for job in quiesce migrate cleanup-bootstrap cleanup-standalone reenable-writers; do
@@ -998,12 +1059,16 @@ check_workflow_mint_contract() {  # check_workflow_mint_contract WORKFLOW_FILE
 # write-access user re-run a jeswr-initiated run while it holds the secret-admin mint. The
 # workflow requires BOTH fields on all five phase jobs' `if:` (round 13 enrolled
 # cleanup-standalone); this pin (same anchored-awk job-block extraction as the mint contract)
-# goes red in --self-test if either clause is dropped from any job.
-_job_block() {  # _job_block WORKFLOW_FILE JOB_KEY -> that job's lines (same anchor as _mint_grants)
-  awk -v job="$2" '
+# goes red in --self-test if either clause is dropped from any job. Round 20 (sol): the block
+# is YAML-comment-STRIPPED before extraction, so every grep over it (actor clauses, phase
+# route, env binding, needs:, cleanup invocation) inspects the actual field values — a
+# neutered `if: github.actor != 'nobody' # <the genuine clauses>` no longer satisfies the
+# pins via its comment tail.
+_job_block() {  # _job_block WORKFLOW_FILE JOB_KEY -> that job's YAML-comment-stripped lines (same anchor as _mint_grants)
+  _yaml_code < "$1" | awk -v job="$2" '
     /^  [A-Za-z0-9_-]+:/ { injob = ($0 == "  " job ":") }
     injob { print }
-  ' "$1"
+  '
 }
 
 check_workflow_actor_contract() {  # check_workflow_actor_contract WORKFLOW_FILE
@@ -1040,12 +1105,12 @@ check_workflow_actor_contract() {  # check_workflow_actor_contract WORKFLOW_FILE
 #      (a retargeted invocation would dispatch the wrong state machine under cleanup grants).
 # The standalone job's mint grants + actor pins are enrolled in the two contracts above.
 
-_phase_options() {  # _phase_options WORKFLOW_FILE -> the phase input's sorted choice list
-  awk '
+_phase_options() {  # _phase_options WORKFLOW_FILE -> the phase input's sorted choice list (round 20: YAML-comment-stripped first)
+  _yaml_code < "$1" | awk '
     /^        options:/ { inopt = 1; next }
-    inopt && /^          - / { sub(/^          - /, ""); sub(/[ \t]+$/, ""); print; next }
+    inopt && /^          - / { sub(/^          - /, ""); print; next }
     inopt { exit }
-  ' "$1" | sort
+  ' | sort
 }
 
 check_workflow_reachability_contract() {  # check_workflow_reachability_contract WORKFLOW_FILE
@@ -2022,6 +2087,22 @@ FAKE
   chk "contract goes RED when the migrate mint's permission-* lines are RELOCATED under a step-level env: mapping (round 19: the action would receive no permission inputs and inherit EVERY installation grant)" "$rc" 1
   chk "contract names the under-granted MAIN mint on the env: relocation" \
     "$(grep -c 'the MAIN mint' "$tmp/s18s.out")" 1
+  # Round 20 (sol — COMMENT-AS-EVIDENCE): retarget the FIRST mint (the quiesce job's) to an
+  # attacker action while quoting the genuine SHA-pinned mint line in the YAML comment tail.
+  # The old raw-text substring match counted the tail as the mint — an ATTACKER action ran
+  # under a green exact-grants tick. The quote-aware _yaml_code strip + exact MINT_USES scalar
+  # must see only attacker/exfiltrate@main: the file drops to FOUR mints, quiesce to ZERO.
+  awk '
+    !done && $0 == "        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0" {
+      print "        uses: attacker/exfiltrate@main # uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1"
+      done = 1; next
+    }
+    { print }
+  ' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_mint_contract "$wf_mut" > "$tmp/s18t.out" 2>&1 || rc=$?
+  chk "contract goes RED when a mint uses: is retargeted with the genuine SHA pin hidden in a YAML comment tail (round 20: a comment is never evidence)" "$rc" 1
+  chk "comment-tail mint retarget trips BOTH the five-mint pin and the quiesce one-mint pin" \
+    "$(grep -c 'EXACTLY FIVE create-github-app-token\|job quiesce must hold EXACTLY ONE' "$tmp/s18t.out")" 2
 
   # --- scenario 18h: ACTOR CONTRACT (round-9 finding 2 — the RE-RUN bypass): github.actor
   # stays the ORIGINAL initiator when a run is re-run, while github.triggering_actor is the
@@ -2039,6 +2120,14 @@ FAKE
   sed "s/github\.actor == 'jeswr' && //" "$wf_real" > "$wf_mut"
   rc=0; check_workflow_actor_contract "$wf_mut" > "$tmp/s18j.out" 2>&1 || rc=$?
   chk "actor contract goes RED when the github.actor clause is dropped (both fields are load-bearing)" "$rc" 1
+  # Round 20 (sol — comment-as-evidence): NEUTER the quiesce job's if: to a vacuous condition
+  # with the genuine actor clauses quoted in the YAML comment tail. Raw-text grep over the job
+  # block was satisfied by the tail; the stripped block must fail both clause pins.
+  sed "s|^    if: inputs.phase == 'quiesce' && .*|    if: github.actor != 'nobody' # github.actor == 'jeswr' \&\& github.triggering_actor == 'jeswr'|" "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_actor_contract "$wf_mut" > "$tmp/s18u.out" 2>&1 || rc=$?
+  chk "actor contract goes RED when a job's if: is neutered with the genuine clauses quoted in a YAML comment tail (round 20)" "$rc" 1
+  chk "actor contract names exactly the neutered job on the comment-tail mutation" \
+    "$(grep -c 'workflow contract violated' "$tmp/s18u.out")" 1
 
   # --- scenario 18k: REACHABILITY CONTRACT (sol round 13 — the mid-cleanup-cancellation
   # recovery must stay DISPATCHABLE through the workflow, not just convergent in the script):
@@ -2070,6 +2159,20 @@ FAKE
   chk "reachability contract goes RED when a needs: is re-coupled onto the standalone job (needs-freedom is the recovery property)" "$rc" 1
   chk "reachability contract names the needs re-coupling" \
     "$(grep -c 'must carry NO needs:' "$tmp/s18o.out")" 1
+  # Round 20 (sol — comment-as-evidence): (e) the standalone job ROUTES on a never-phase with
+  # the real route quoted in the YAML comment tail; (f) BOTH cleanup jobs run `echo no-op`
+  # with the real script invocation quoted in theirs. Raw-text greps were satisfied by the
+  # tails; each must go red off the STRIPPED job block.
+  sed "s|^    if: inputs.phase == 'cleanup-bootstrap' && .*|    if: inputs.phase == 'never' # inputs.phase == 'cleanup-bootstrap'|" "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_reachability_contract "$wf_mut" > "$tmp/s18v.out" 2>&1 || rc=$?
+  chk "reachability contract goes RED when the standalone phase route is neutered with the real route in a YAML comment tail (round 20)" "$rc" 1
+  chk "reachability contract names the missing phase route on the comment-tail mutation" \
+    "$(grep -c 'must route on' "$tmp/s18v.out")" 1
+  sed 's|^        run: bash scripts/migrate-secrets.sh --phase cleanup-bootstrap$|        run: echo no-op # run: bash scripts/migrate-secrets.sh --phase cleanup-bootstrap|' "$wf_real" > "$wf_mut"
+  rc=0; check_workflow_reachability_contract "$wf_mut" > "$tmp/s18w.out" 2>&1 || rc=$?
+  chk "reachability contract goes RED when the cleanup invocations are replaced by echo no-op with the real invocation in a YAML comment tail (round 20)" "$rc" 1
+  chk "reachability contract names BOTH no-op'd cleanup jobs" \
+    "$(grep -c 'must invoke exactly' "$tmp/s18w.out")" 2
 
   # --- scenario 19: RESUME-WRITERS happy path (the self-resume after a COMPLETED migrate, or
   # the standalone phase: resume) — round 14 accept direction: the repo scope is EXPLICITLY
