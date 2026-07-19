@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "A successful empty resolution calls `_write_fleet_snapshot`, but that writer catches `HealthError` (including `HealthConflict`) and returns without telling `_cmd_decide` that the authoritative empty state was not persisted. Since `GitHubAPI.request(..., retry_conflict=True)` only converts HTTP 409/422 into `HealthConflict` and does not retry, even an ordinary CAS race leaves the previous non-empty snapshot intact. If the next tick cannot resolve the fleet, `_read_fleet_snapshot` reuses that stale snapshot and `classify_records` may fire `provider-capped` for accounts no longer enabled. This is materially the same stale-membership failure identified in round 2. `_test_fleet_empty_supersedes_decide` only exercises a successful PUT, so it cannot catch this path.",
+   "file": "scripts/model-health.py",
+   "fix_hint": "Make the authoritative transition robust against CAS races (re-read and retry with the current SHA), and do not silently accept inability to persist/invalidate an emptied fleet in a way that permits the old snapshot to be trusted later. Add an end-to-end test seeded with a non-empty snapshot that forces at least one conflict/write failure during the successful empty transition, then simulates resolution failure and asserts stale `provider-capped` cannot fire. If durable invalidation cannot be established, fail closed rather than reporting a clean successful transition while retaining a reusable stale snapshot.",
+   "severity": "major",
+   "title": "Failed empty-snapshot writes still leave stale membership eligible for fallback"
+  }
+ ],
+ "progress": "stagnant",
+ "summary": "The empty-fleet representation and end-to-end test now distinguish a known-good empty snapshot from an absent/corrupt one, but the prior major lifecycle flaw is not fully resolved. `_write_fleet_snapshot` remains best-effort and swallows every write error, including CAS conflicts. Thus a successful transition to an empty enabled fleet can still leave the old non-empty snapshot stored; a later resolution failure will read that stale membership and can fire `provider-capped` for disabled accounts. The new tests use a store whose PUT never conflicts or fails, so they do not cover the remaining failure path. The substantive prior-round finding therefore remains at the same severity.",
+ "verdict": "request_changes"
+}
