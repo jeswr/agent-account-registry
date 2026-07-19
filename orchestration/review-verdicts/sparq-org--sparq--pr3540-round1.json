@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The change drops the stored prev_hashes and rehashes complete term rows on every tick when building/probing the budget map (SipHash default hasher over each Term). For large windows this is a modest CPU cost versus the old precomputed-u64 path. This is an intentional and correctly-documented trade (exactness over speed) and the diff makes no performance claim, so it is not a defect \u2014 just worth being aware of if this path is ever benchmarked as hot.",
+   "file": "crates/sparq-rsp/src/query.rs",
+   "fix_hint": "No action required. If profiling later shows this on a hot path, an FxHashMap keyed on the row slice (still exact) would recover most of the lost speed without reintroducing the collision risk.",
+   "severity": "nit",
+   "title": "Per-tick full-term row hashing replaces precomputed u64 hashes (intentional speed-for-exactness trade)"
+  },
+  {
+   "body": "select_diff_uses_exact_term_rows uses distinct simple literals a/b/c, which never collide, so the assertions would also pass under the old hash-based implementation. The test correctly validates multiset cancellation, retained multiplicity, emission order, and prev-base advance, but does not specifically exercise the collision-elimination benefit the rename advertises. That benefit is essentially untestable via a natural unit test, so this is acceptable.",
+   "file": "crates/sparq-rsp/src/query.rs",
+   "fix_hint": "Optional: no change needed. If desired, a DStream-direction case could be added for symmetry, but the shared multiset_minus path is already covered.",
+   "severity": "nit",
+   "title": "Test validates multiset semantics but not the term-vs-hash distinction it is named for"
+  }
+ ],
+ "progress": null,
+ "summary": "Clean, correct refactor of sparq-rsp's SELECT-result ISTREAM/DSTREAM R2S diff: replaces the 64-bit FxHasher row-hash multiset diff with an exact term-level multiset diff. multiset_minus now keys its cancellation budget on &[Option<Term>] (exact terms) rather than u64 hashes; Term/Option<Term> implement Hash+Eq, and the &mut prev_rows reborrow in diff_rows ends before the *prev_rows = cur_rows assignment, so borrows are sound. Multiset and emission-order semantics are preserved while the documented 64-bit hash-collision caveat is honestly eliminated. Verified locally: crate compiles, the new unit test select_diff_uses_exact_term_rows passes, and the srbench_oracle ISTREAM ratchet integration test still passes with unchanged expected counts. Docs are updated consistently across README.md, multi.rs, query.rs module doc, and the srbench_oracle.rs comment. The Cargo.toml rustc-hash comment relabel to 'CONSTRUCT set differences' is accurate: set_minus still uses FxHashSet<&Triple> and eval.rs uses FxHashMap/FxHashSet, so no dead dependency and no false justification. No dangling references to the removed row_hash/prev_hashes symbols remain. Test is non-vacuous. No ZK/MPC surface, no hard-coded perf numbers, no overclaim. Two non-blocking notes only.",
+ "verdict": "approve"
+}
