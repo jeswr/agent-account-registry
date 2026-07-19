@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`refresh_ok` only requires that the OpenAI JWT contain a readable `exp`; it never requires that `exp` be in the future. `_prove_openai` equates `codex login status` exit 0 with successful proof without requiring a credential rewrite or token rotation. Therefore a status command that exits successfully while leaving an expired access token unchanged produces `ok=True`, and `refresh_ok` returns that expired token as a worker capability. The self-test masks this path by making its mock rewrite the credential; it lacks the critical assertion that status 0 with the old expired JWT left on disk is rejected.",
+   "file": "scripts/broker-refresh.py",
+   "fix_hint": "Require the re-read OpenAI token expiry to exceed the current time by the required worker-job margin (with an injectable clock for testing). Add a test where `codex login status` returns 0 but does not rewrite an expired credential, and assert that the broker rejects it. If rotation itself is part of the claimed contract, also require evidence of a changed token/expiry rather than treating status exit alone as refresh proof.",
+   "severity": "blocker",
+   "title": "OpenAI status success can attest an already-expired unchanged token"
+  },
+  {
+   "body": "The refresh response validation accepts any numeric `expires_in`, including zero or a negative value. It persists `now + expires_in`, validates only that the token currently gets HTTP 200 from `/api/oauth/profile`, and `refresh_ok` performs no Anthropic expiry check. A malformed or edge-case successful response can therefore be reported as a freshly minted worker capability even though its recorded expiry is already past or too near to cover the configured worker margin. This violates the same fail-closed lifetime invariant used to decide that the old token needed rotation.",
+   "file": "scripts/broker-refresh.py",
+   "fix_hint": "Validate that `expires_in` is finite and positive and that the resulting expiry exceeds `now + ANTHROPIC_REFRESH_SKEW_S` (or the explicit required job lifetime) before persisting or returning it. Make `refresh_ok` independently enforce a usable Anthropic expiry, and add zero/negative/insufficient-lifetime mocked responses that must fail.",
+   "severity": "major",
+   "title": "Anthropic refresh accepts a minted token with no usable lifetime"
+  }
+ ],
+ "progress": "regressing",
+ "summary": "The prior Anthropic no-refresh defect is substantially addressed, and the new mocked tests exercise credential rotation and re-reading. However, the broker still does not prove that the capability it returns is live for either provider. OpenAI accepts any parseable JWT expiry, including an already-expired token after a successful status command, while the test only programs its mock to rewrite the file and omits the status-success/no-rewrite case. Anthropic likewise accepts a successful refresh response with zero, negative, or otherwise insufficient lifetime as long as the profile request returns 200. These are fail-open outcomes for a component whose contract is to mint a short-lived worker capability. Because these are new findings relative to round 1, progress is graded regressing under the required scale even though the earlier findings were addressed.",
+ "verdict": "request_changes"
+}
