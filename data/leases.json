@@ -19,16 +19,6 @@
    "model": "opus",
    "issued_at": 1784456163,
    "expires_at": 1784458863
-  },
-  {
-   "account": "acct01",
-   "claim_id": "18343579744d41aa9e75fde9d66e7ca6",
-   "holder": "review:jeswr/agent-account-registry#395@dispatch-29682894064.1",
-   "package": "review-loop",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1784456150,
-   "expires_at": 1784457350
   }
  ]
 }
