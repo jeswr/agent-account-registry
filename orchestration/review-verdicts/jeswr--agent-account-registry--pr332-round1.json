@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly makes snapshot-skip-only ticks fail loud as the existing zero-dispatch health class while preserving recordless genuinely empty ticks, claim-abort classification, productive-tick success, and lane-unhealthy precedence. The defer histogram is type-checked before use, and the new self-test executes the workflow's actual classification block with non-vacuous assertions covering the defect and key regressions. No trust check, audit binding, permission boundary, or sensitive-data handling is weakened.",
+ "verdict": "approve"
+}
