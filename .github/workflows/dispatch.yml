@@ -812,15 +812,24 @@ jobs:
               if not safe.fullmatch(repo):
                   raise SystemExit("unsafe target repo in the manifest")
               owner, name = repo.split("/", 1)
-              owners.setdefault(owner, name)   # one representative repo per owner is enough
+              # Collect EVERY repository per owner (defect #120): keeping only one representative
+              # name scoped each owner's App token to a single repo, so any additional enabled
+              # repo under that owner passed the owner-set assertion but had all its mutations
+              # 404/unauthorized and deferred forever. The App-token action's `repositories`
+              # input accepts the full comma-separated list.
+              names = owners.setdefault(owner, [])
+              if name not in names:
+                  names.append(name)
           # The mint steps below are static (two known owners); assert the manifest owners are
           # exactly {sparq-org, jeswr} so a manifest change fails LOUD here instead of silently
           # dropping a new owner's token (which would reintroduce the wrong-owner-token bug).
           if set(owners) != {"sparq-org", "jeswr"}:
               raise SystemExit(f"unexpected target owners {sorted(owners)}; add a mint step")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"sparq_name={owners['sparq-org']}\n")
-              output.write(f"jeswr_name={owners['jeswr']}\n")
+              # Comma-separated repo list per owner (GITHUB_OUTPUT is line-based; each name is
+              # already `safe`-validated so it can never contain a comma).
+              output.write(f"sparq_name={','.join(owners['sparq-org'])}\n")
+              output.write(f"jeswr_name={','.join(owners['jeswr'])}\n")
           PY
 
       - name: Mint sparq-org target-scoped App token (issue/PR mutations only)
