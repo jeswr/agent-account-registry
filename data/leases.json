@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct01",
-   "claim_id": "a64b847071bf4f2c87fc1d518417314a",
-   "holder": "review:sparq-org/sparq#3601@dispatch-29686732896.1",
-   "package": "site",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1784463807,
-   "expires_at": 1784468007
-  },
-  {
-   "account": "acct01",
    "claim_id": "0d701a733ccf497e82c1d16a8011eedc",
    "holder": "review:jeswr/agent-account-registry#412@dispatch-29686732896.1",
    "package": "worker",
