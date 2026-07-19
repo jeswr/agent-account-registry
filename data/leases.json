@@ -72,16 +72,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "11f9c97ee5994d6abb2e75c839f72790",
-   "holder": "sparq-org/sparq#2688@dispatch-29673047194.1",
-   "package": "sparq-crdt",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784434885,
-   "expires_at": 1784441185
-  },
-  {
-   "account": "acct01",
    "claim_id": "2b6c494d87c04250a8668fabeef2161f",
    "holder": "review:jeswr/agent-account-registry#318@dispatch-29673047194.1",
    "package": "review-loop",
