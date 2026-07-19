@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 383,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8c9a834c82d3e916a1b71a10226fdb0f188fd2c1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-2 exact-target ambiguity is fixed: merge-driven activation now gathers every exact-title account issue and requires exactly one match before reading labels or mutating state, so zero or duplicate matches fail closed. This matches the inline activation invariant and removes the arbitrary first-match behavior. The surrounding two-phase flow remains sound: the account stays pending and non-allocatable until the checked account-pool PR merges, activation re-validates the branch-derived handle against the merged policy, and permissions and action pinning remain appropriately constrained. I found no blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
