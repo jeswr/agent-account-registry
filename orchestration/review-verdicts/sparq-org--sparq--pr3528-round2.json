@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves the prior major finding. The check now derives GUI and CLI contracts through paired structural views, requires exact agreement, and the PR-time hermetic test pins the full current nine-alias golden set. The test also exercises the real component, a genuinely missing staged secondary alias (exit 1), five non-vacuous partial-extraction mutations (exit 2), and a benign quote-style reformat. The release workflow stages the aliases before checking them and before generating SHA256SUMS, consistent with the normative alias record. No correctness, soundness, test-validity, or security issue remains in the reviewed diff.",
+ "verdict": "approve"
+}
