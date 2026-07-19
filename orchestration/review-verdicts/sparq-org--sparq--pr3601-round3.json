@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3601,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b2e7f5dfabbf2a9058c5b6572eb723245311d8c4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "isGraphShaped scans all terms without applying MAX_GRAPH_NODES, while deriveGraph only creates edges whose endpoints entered its first 24 nodes. A result can bind 24 distinct terms first (for example, in single-bound rows), then contain its only qualifying edge between two new terms. isGraphShaped returns true, but deriveGraph drops both endpoints, produces zero edges, and returns null. HeroQueryRunner therefore offers and selects Graph, after which ResultGraphView renders null. The module comment explicitly acknowledges this disagreement, while the component state comment promises a stale graph choice can never render an empty picture and the test claims the two functions agree. This is a real uncovered boundary case, not merely defensive behavior.",
+    "file": "site/src/lib/result-graph-shape.ts",
+    "fix_hint": "Make the cheap predicate exactly model the capped derivation without building the full graph (track at most the first MAX_GRAPH_NODES injective term keys and recognize only edges whose endpoints are admitted), or change derivation/truncation so any qualifying edge remains drawable. Add a regression fixture with 24 earlier distinct terms followed by the only edge between cap-excluded terms and assert both predicate/derivation agreement and a non-empty graph whenever the toggle is offered. Keep the eligibility module lightweight and invocation-policy compliant.",
+    "severity": "major",
+    "title": "Eligibility can offer a Graph toggle that renders blank"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior eager-loading finding is resolved: the full derivation and renderer now sit behind the literal invocation-path import. However, the replacement eligibility predicate knowingly diverges from deriveGraph at the node cap, allowing the UI to offer a Graph view whose renderer returns null. This violates the stated no-empty-picture invariant and is not covered by the agreement test.",
+  "verdict": "request_changes"
+ }
+}
