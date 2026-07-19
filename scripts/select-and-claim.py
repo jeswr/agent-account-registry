@@ -15,6 +15,7 @@ and heartbeat are keyed by the unique claim_id.
 """
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -428,18 +429,41 @@ def _parse_account(body):
 # applies to the in-memory catalog inside read_accounts — the single catalog read every membership
 # consumer shares (claim selection via claim()/choose_account, dynamic-concurrency accounting in
 # dispatch-claim.py, claim adoption via inspect_claim, usage probing via account-usage.py) — and
-# each expansion is logged to stderr so it stays visible in dispatch/worker logs.
+# each expansion is logged to stderr so it stays visible in dispatch/worker logs. PRIVACY (sol r4,
+# locked decision 22a/22b): the registry is PUBLIC and the claim workflows redirect only stdout,
+# so this stderr diagnostic lands in public Actions logs — and it runs BEFORE account_pool
+# filtering, so a raw handle here could enumerate every legacy account. The diagnostic therefore
+# NEVER carries a raw handle: with PROVENANCE_SALT present (every runtime path that reaches
+# read_accounts exports it — the review-fix.yml claim/adopt steps, the dispatch.yml claim +
+# usage-probe steps, the worker.yml claim step) it emits the provenance-record fingerprint
+# sha256(handle + ':' + PROVENANCE_SALT)[:16], the exact worker-pr.py account_hash convention, so
+# operators can correlate the line with provenance records; without the salt (self-test, ad-hoc
+# CLI — `--reclaim` never reads the catalog) it emits a handle-free count-only line. Either way
+# one line fires per expansion, so the expansion count stays visible.
 LEGACY_OPENAI_SHAPE = ["terra"]              # the retired broker's exact fingerprint
 CODEX_ALIAS_SET = ["sol", "luna", "terra"]   # catalog-derived: routing.toml provider=openai aliases
+
+
+def _diag_account_ref(handle):
+    """Public-log-safe account reference for the normalization diagnostic (locked decision 22a):
+    the salted provenance fingerprint sha256(handle + ':' + PROVENANCE_SALT)[:16] — the same
+    convention as worker-pr.py account_hash / the provenance records — or a handle-free marker
+    when the salt is not in-context. NEVER the raw handle."""
+    salt = os.environ.get("PROVENANCE_SALT", "")
+    if salt and handle:
+        return "hash=" + hashlib.sha256(f"{handle}:{salt}".encode()).hexdigest()[:16]
+    return "[account ref withheld: PROVENANCE_SALT unset]"
 
 
 def normalize_legacy_models(account):
     """Legacy-shape normalization, READ-TIME only: expand an openai record whose models list is
     EXACTLY the legacy `[terra]` broker fingerprint to the full codex alias set. Every other list
     passes through verbatim (operator customization wins). Returns a new dict on expansion and
-    never mutates the input; each expansion is logged to stderr (visible, not silent)."""
+    never mutates the input; each expansion logs one SALTED-HASH-ONLY line to stderr (visible,
+    not silent, never the raw handle — stderr reaches public Actions logs)."""
     if account.get("provider") == "openai" and account.get("models") == LEGACY_OPENAI_SHAPE:
-        print(f"legacy-shape normalization: openai account '{account.get('handle', '?')}' "
+        print(f"legacy-shape normalization: 1 legacy openai record "
+              f"{_diag_account_ref(account.get('handle'))} "
               f"models {LEGACY_OPENAI_SHAPE} -> {CODEX_ALIAS_SET} (read-time only; the stored "
               "record is unchanged)", file=sys.stderr)
         return {**account, "models": list(CODEX_ALIAS_SET)}
@@ -633,7 +657,12 @@ def _self_test():
                                    "models": ["terra"]})["models"], ["terra"])
 
     # End-to-end through the REAL read_accounts (gh issue list stubbed): the expansion is applied
-    # at the single catalog read EVERY membership consumer shares, and it is LOGGED (visible).
+    # at the single catalog read EVERY membership consumer shares, and it is LOGGED (visible) —
+    # but SALTED-HASH-ONLY (sol r4, locked decision 22a/22b): stderr reaches public Actions logs
+    # and normalization runs before account_pool filtering, so a raw handle here would enumerate
+    # every legacy account. Both salt states are exercised, and a NEGATIVE sweep asserts no
+    # fixture handle ever reaches the captured stderr/stdout.
+    FIXTURE_HANDLES = ("acctL", "acctC")
     issue_rows = json.dumps([
         {"title": "acctL", "body": "provider: openai\nmodels: [terra]\nsecret_ref: L_TOKEN",
          "labels": [{"name": "status:available"}]},
@@ -642,20 +671,48 @@ def _self_test():
     ])
     real_run_fn = globals()["_run"]
     globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
-    log_buf = io.StringIO()
+    saved_salt = os.environ.pop("PROVENANCE_SALT", None)
+    os.environ["PROVENANCE_SALT"] = "selftest-salt"
+    log_buf, out_buf = io.StringIO(), io.StringIO()
     try:
-        with contextlib.redirect_stderr(log_buf):
+        with contextlib.redirect_stderr(log_buf), contextlib.redirect_stdout(out_buf):
             norm_cat = read_accounts("o/r")
     finally:
         globals()["_run"] = real_run_fn
+        os.environ.pop("PROVENANCE_SALT", None)
     check("read_accounts expands ONLY the exact legacy shape",
           {a["handle"]: a["models"] for a in norm_cat},
           {"acctL": ["sol", "luna", "terra"], "acctC": ["terra", "luna"]})
-    check("normalization is logged, naming the account (no silent expansion)",
-          "legacy-shape normalization" in log_buf.getvalue() and "acctL" in log_buf.getvalue(),
-          True)
-    check("the customized record's pass-through is NOT logged as normalized",
-          "acctC" in log_buf.getvalue(), False)
+    # (a) the diagnostic still fires, referencing the account ONLY by its salted provenance
+    # fingerprint (the exact worker-pr.py account_hash convention: sha256(h + ':' + salt)[:16]).
+    expected_hash = hashlib.sha256(b"acctL:selftest-salt").hexdigest()[:16]
+    check("normalization diagnostic fires with the salted hash (no silent expansion)",
+          "legacy-shape normalization" in log_buf.getvalue()
+          and f"hash={expected_hash}" in log_buf.getvalue(), True)
+    check("exactly one expansion line fires (count stays visible)",
+          log_buf.getvalue().count("legacy-shape normalization"), 1)
+    # (b) NEGATIVE (locked decision 22a): no raw fixture handle — expanded OR pass-through —
+    # appears anywhere in the captured stderr/stdout.
+    check("NEGATIVE: no raw fixture handle leaks into stderr/stdout",
+          [h for h in FIXTURE_HANDLES
+           if h in log_buf.getvalue() or h in out_buf.getvalue()], [])
+    # Salt-less fallback (self-test / ad-hoc CLI context): the diagnostic still fires as a
+    # handle-free count-only line — never falls back to the raw handle.
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
+    log_buf2, out_buf2 = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stderr(log_buf2), contextlib.redirect_stdout(out_buf2):
+            read_accounts("o/r")
+    finally:
+        globals()["_run"] = real_run_fn
+        if saved_salt is not None:
+            os.environ["PROVENANCE_SALT"] = saved_salt
+    check("salt-less diagnostic still fires, handle-free (count-only)",
+          "legacy-shape normalization" in log_buf2.getvalue()
+          and "PROVENANCE_SALT unset" in log_buf2.getvalue(), True)
+    check("NEGATIVE: salt-less path leaks no raw fixture handle either",
+          [h for h in FIXTURE_HANDLES
+           if h in log_buf2.getvalue() or h in out_buf2.getvalue()], [])
 
     # CLAIM SELECTION: a legacy [terra] record now serves a sol-led claim end-to-end (claim()
     # reads the catalog through read_accounts), while a customized [terra, luna] record still
