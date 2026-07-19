@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The new script begins with `[OPUS-4.8]`, and the new workflow carries the same marker. The review contract explicitly requires model-agnostic SPARQ identity and says not to hard-code any model marker anywhere. Baking a provider/model marker into trust-plane code creates false provenance once the code is maintained or run by another model/provider.",
+   "file": "scripts/retriage.py",
+   "fix_hint": "Remove the `[OPUS-4.8]` markers from all newly added content. If provenance text is needed, use only the model-agnostic `SPARQ agent` identity; do not add a model name or Co-Authored-By marker.",
+   "severity": "major",
+   "title": "New files hard-code a model identity marker"
+  },
+  {
+   "body": "The alert step uses `continue-on-error: true`, while `run_alert()` returns nonzero when listing, creating, editing, commenting, or closing the rolling alert fails. GitHub therefore converts precisely those fail-loud return codes into a successful job conclusion. This contradicts the stated fail-loud design and leaves an alerting outage visible only as a warning inside an otherwise green scheduled run\u2014the same silent-cron failure mode this job is intended to address.",
+   "file": ".github/workflows/retriage.yml",
+   "fix_hint": "Remove `continue-on-error: true` from the standalone alert step (the separate job already isolates it from the retriage job), and add a workflow-level assertion/test that a nonzero `--alert` exit produces a failed alert job.",
+   "severity": "major",
+   "title": "Alert failures are masked as successful workflow execution"
+  }
+ ],
+ "progress": null,
+ "summary": "The sweep's core triage behavior and self-tests are substantive, but the change violates the required model-agnostic provenance rule and its alert path is not actually fail-loud. These are trust-plane and operational-soundness issues that must be corrected before approval.",
+ "verdict": "request_changes"
+}
