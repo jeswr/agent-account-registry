@@ -799,8 +799,11 @@ def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_logi
 
 
 def set_reviewed_sha(repo, pr_number, sha):
-    """Bind the canonical reviewed-sha marker into the PR body under optimistic concurrency, so a
-    maintainer/automation body edit racing this write is never silently clobbered (issue #158).
+    """Bind the canonical reviewed-sha marker into the PR body, NARROWING (not closing) the window
+    in which a concurrent maintainer/automation body edit could be clobbered (issue #158). This is
+    NOT full optimistic concurrency: the GitHub REST PR-body PATCH has no write precondition (no
+    If-Match / CAS), so a whole-body write cannot be made conditional — the read->PATCH TOCTOU below
+    remains open. Do not describe this as a race-free bind.
 
     The body stays the store — every reader resolves the binding via reviewed_sha_of on the LIVE
     body — so the write must touch ONLY the marker: read the live body, splice in only the marker,
@@ -811,10 +814,12 @@ def set_reviewed_sha(repo, pr_number, sha):
     the clobber window entirely for the idempotent rebind / re-run path (the common case). Fails
     CLOSED (raises) rather than reporting a bind it could not confirm within the deadline.
 
-    Residual: a body edit landing inside the single read->PATCH gap is still overwritten — the
-    unavoidable REST-body TOCTOU shared by every body/label write here (tracked in issue #294); the
-    durable close is to move the binding off the mutable body onto immutable commit-specific
-    metadata (issue #158 option 1), out of scope for this minimal fix."""
+    Residual (self-test case 5 PINS it): a body edit landing inside the single read->PATCH gap is
+    still SILENTLY overwritten AND the bind still reports success — the read-back VERIFY only catches
+    a write that lands AFTER our PATCH, so it cannot detect one lost inside the read->PATCH gap. This
+    is the unavoidable REST-body TOCTOU shared by every body/label write here (tracked in issue
+    #294). The durable close is to move the binding off the mutable body onto immutable
+    commit-specific metadata (issue #158 option 1), out of scope for this minimal fix."""
     deadline = _registry_now() + _REGISTRY_CAS_DEADLINE_S
     attempts = 0
     while True:
@@ -3055,12 +3060,14 @@ def _self_test():
         wiring_globals["_alert_route"] = real_alert_route
         wiring_globals["_registry_now"] = real_registry_now
 
-    # ---- set_reviewed_sha optimistic-concurrency wiring (issue #158): the reviewed-sha bind must
-    # never silently clobber a concurrent PR-body edit. Drive the read-merge-VERIFY-retry loop with
-    # a fake body-store + stubbed clock/backoff so contention is exercised without a real clock ----
+    # ---- set_reviewed_sha concurrency wiring (issue #158): the reviewed-sha bind NARROWS the
+    # clobber window (idempotent no-op + post-PATCH verify-and-retry) but does NOT close the
+    # read->PATCH gap TOCTOU — case 5 pins that residual honestly. Drive the read-merge-VERIFY-retry
+    # loop with a fake body-store + stubbed clock/backoff so contention is exercised w/o a real clock
     sr_srv = {"body": ""}
     sr_patches = []          # bodies THIS function PATCHed (concurrent edits are injected directly)
     sr_after_patch = []      # one-shot concurrent edits: applied to the store right after a PATCH
+    sr_before_patch = []     # one-shot edits landing INSIDE the read->PATCH gap (after the base read)
     sr_steal = {"fn": None}  # a persistent rival writer: re-applied after EVERY PATCH
     sr_backoffs = []
     real_sr_json = wiring_globals["_gh_json"]
@@ -3079,7 +3086,10 @@ def _self_test():
                 sr_srv["body"] = sr_steal["fn"](sr_srv["body"])
             return {}
         if path.startswith("repos/o/r/pulls/"):
-            return {"body": sr_srv["body"]}
+            body = sr_srv["body"]
+            if sr_before_patch:  # a maintainer edit lands AFTER this read but before our PATCH
+                sr_srv["body"] = sr_before_patch.pop(0)(sr_srv["body"])
+            return {"body": body}
         raise WorkerPrError(f"unexpected API path {path}")
 
     try:
@@ -3117,6 +3127,25 @@ def _self_test():
               reviewed_sha_of(sr_srv["body"]), sha_a)
         check("the raced bind issues NO second clobbering PATCH of the stale body",
               len(sr_patches), 1)
+
+        # 5) DOCUMENTED RESIDUAL (issue #294): a maintainer edit landing INSIDE the single
+        # read->PATCH gap is NOT preserved. The REST PR-body PATCH has no write precondition, so the
+        # whole-body write (computed from the pre-edit base) overwrites it, and the read-back verify
+        # — which only observes writes AFTER our PATCH — reports success anyway. This case PINS the
+        # known limitation so it stays honest and visible: it goes RED if the pre-PATCH edit ever
+        # survives (e.g. once the binding moves to immutable commit metadata, #158 option 1) OR if
+        # the loop is ever weakened, and it refutes any claim that verify-and-retry closes the
+        # PRE-PATCH window. A survives-assertion is impossible under the current API (as the finding
+        # notes), so we assert the real, current behaviour rather than a property we do not deliver.
+        sr_srv["body"] = "desc-A\n\n<!-- sparq-reviewed-sha:none -->\n"
+        sr_patches.clear()
+        sr_before_patch[:] = [lambda b: b.replace("desc-A", "desc-EDITED-IN-GAP")]
+        set_reviewed_sha("o/r", 5, sha_a)
+        check("a read->PATCH-gap edit is LOST, not preserved (documented residual #294)",
+              "desc-EDITED-IN-GAP" in sr_srv["body"], False)
+        check("the lost-edit bind still reports the marker bound in ONE PATCH — the unclosed TOCTOU",
+              (reviewed_sha_of(sr_srv["body"]), len(sr_patches)), (sha_a, 1))
+        sr_before_patch[:] = []
 
         # 4) a persistent rival that keeps rebinding a DIFFERENT sha never yields a false success:
         # the loop fails CLOSED once the CAS deadline elapses (advancing clock, no real sleep).
