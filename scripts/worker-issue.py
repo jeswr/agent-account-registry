@@ -56,7 +56,7 @@ def count_attempts(comments, bot_login):
     )
 
 
-def find_maintainer_approval(comments, bot_login, is_human_maintainer):
+def find_maintainer_approval(comments, bot_login, is_human_maintainer, current_run_key=None):
     """Return the approving comment, or None when the retry must fail closed.
 
     Evidence of maintainer approval (issue #31) is a comment by a HUMAN maintainer whose body
@@ -69,13 +69,23 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
     collaborator probe all pass; only the App attribution field betrays that no human typed it.
     `is_human_maintainer(login)` supplies the trusted-set probe so this stays pure and
     self-testable.
+
+    `current_run_key` (issue #144) excludes THIS run's own "starting attempt" receipt from the
+    staleness boundary. record-attempt posts that receipt at the start of a run — long BEFORE the
+    pre-publish re-check — so without the exclusion the re-check would treat the run's own start
+    marker as the last failure and reject the very approval that authorised this run. The receipt
+    marks a start, not a failure; the staleness rule (an approval must postdate the last FAILED
+    attempt) concerns FUTURE retries, so dropping only the current run's marker cannot mask a
+    genuine later failure from a different run.
     """
     bot = bot_login.casefold()
+    ignore_marker = f"run={current_run_key} -->" if current_run_key else None
     last_failure = max(
         (str(comment.get("created_at", ""))
          for comment in comments
          if str(comment.get("user", {}).get("login", "")).casefold() == bot
-         and ATTEMPT_MARKER in str(comment.get("body", ""))),
+         and ATTEMPT_MARKER in str(comment.get("body", ""))
+         and not (ignore_marker and ignore_marker in str(comment.get("body", "")))),
         default="",
     )
     for comment in comments:
@@ -188,7 +198,8 @@ def record_attempt(repo, issue, max_attempts, bot_login, run_key):
     print(f"worker attempt recorded: {number}/{max_attempts}")
 
 
-def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_login, issue_file):
+def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_login, issue_file,
+             current_run_key=None):
     item = _gh_json(["api", f"repos/{repo}/issues/{issue}"])
     if not isinstance(item, dict) or "pull_request" in item:
         raise WorkerIssueError("target number is not an issue")
@@ -230,6 +241,7 @@ def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_lo
             _paginated(repo, issue, "comments"),
             bot_login,
             lambda login: _is_human_maintainer(repo, login),
+            current_run_key,
         )
         if approval is None:
             raise WorkerIssueError(
@@ -456,6 +468,32 @@ def _self_test():
     assert find_maintainer_approval(
         [failure, human_after, failure2, after_both], "sparq[bot]", maintainers) is after_both
 
+    # (ix-a) issue #144 — the pre-publish re-check must NOT treat THIS run's own "starting attempt"
+    # receipt as the staleness boundary. A run posts its start receipt (record-attempt) before the
+    # long model+gate steps, so at publish time that receipt is the newest bot attempt marker; the
+    # approval that authorised this run legitimately predates it. Excluding the current run-key
+    # restores the approval's freshness, while a DIFFERENT run's receipt still bounds staleness.
+    this_start = {"user": {"login": "sparq[bot]", "type": "Bot"},
+                  "body": f"starting {ATTEMPT_MARKER} run=99.1 -->",
+                  "created_at": "2026-07-11T18:00:00Z"}
+    approval_pre_run = {"user": {"login": "jeswr", "type": "User"},
+                        "body": "approved", "created_at": "2026-07-11T00:00:00Z"}
+    # Without the exclusion, this run's own start receipt makes the earlier approval look stale.
+    assert find_maintainer_approval(
+        [failure, approval_pre_run, this_start], "sparq[bot]", maintainers) is None
+    # Excluding this run's own start receipt, the approval postdates the prior failure and stands.
+    assert find_maintainer_approval(
+        [failure, approval_pre_run, this_start], "sparq[bot]", maintainers,
+        current_run_key="99.1") is approval_pre_run
+    # The exclusion is scoped to the current run ONLY: a genuine later failure from a DIFFERENT run
+    # still bounds staleness even when the current run-key is supplied (no masking of real failures).
+    other_start = {"user": {"login": "sparq[bot]", "type": "Bot"},
+                   "body": f"starting {ATTEMPT_MARKER} run=98.1 -->",
+                   "created_at": "2026-07-12T00:00:00Z"}
+    assert find_maintainer_approval(
+        [failure, approval_pre_run, other_start], "sparq[bot]", maintainers,
+        current_run_key="99.1") is None
+
     # (ix) reverify exit-3 wiring (review r1): the fail-closed guard itself, not just the pure
     # helper. A stub trust-gate exits 3 (third-party author); real subprocess wiring, with only
     # the GitHub API seams patched. Without fresh approval reverify must raise the approval
@@ -520,6 +558,10 @@ def main():
     trust.add_argument("--trust-gate", required=True)
     trust.add_argument("--bot-login", required=True)
     trust.add_argument("--issue-file", required=True)
+    # issue #144: when the fresh publisher re-runs reverify after the long model+gate steps, this
+    # is THIS run's record-attempt run-key, so the run's own "starting attempt" receipt is not
+    # mistaken for a failure that would stale a third-party issue's maintainer approval.
+    trust.add_argument("--current-run-key", default=None)
 
     status = subparsers.add_parser("status", parents=[common])
     status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
@@ -548,7 +590,7 @@ def main():
             record_attempt(args.repo, args.issue, args.max_attempts, args.bot_login, args.run_key)
         elif args.command == "reverify":
             reverify(args.repo, args.issue, args.expected_author, args.expected_body_sha,
-                     args.trust_gate, args.bot_login, args.issue_file)
+                     args.trust_gate, args.bot_login, args.issue_file, args.current_run_key)
         elif args.command == "status":
             set_status(args.repo, args.issue, args.status)
         elif args.command == "claim-receipt":

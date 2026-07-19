@@ -1063,9 +1063,39 @@ jobs:
           # branches touching .github/workflows/* (role:ci issues were structurally blocked).
           permission-workflows: write
 
+      # Last-step trust is validated ONCE MORE here — in the fresh publisher, immediately before
+      # push/PR creation (issue #144). The pre-model `trust` step ran BEFORE the model and the
+      # host-side cargo gate, i.e. potentially tens of minutes ago; a maintainer who has since
+      # closed, rewritten, or human-parked the issue would otherwise be published over from that
+      # stale snapshot. This repeats the FULL live author / body-SHA / status-label / trust-gate
+      # revalidation against the LIVE issue and re-freshens verified-issue.json, so publish only
+      # ever runs from a snapshot re-attested seconds earlier. On ANY drift it fails (continue-on-
+      # error, mirroring the pre-model `trust` step) which gates the publish step below OFF.
+      # reverify changes NO human-owned issue state — it only READS the issue and runs the
+      # read-only trust gate — so an aborted publish leaves the maintainer's action intact and the
+      # separate final_state job converges the issue to `deferred` (back into the redispatch pool).
+      # --current-run-key excludes THIS run's own record-attempt receipt from the third-party
+      # maintainer-approval staleness check (that receipt is a start, not a failure to be re-blessed).
+      - name: Re-verify live trust immediately before publish (drift → abort, no state change)
+        id: republish-trust
+        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
+        run: |
+          python3 registry/scripts/worker-issue.py reverify \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --expected-author "${{ needs.resolve.outputs.issue_author }}" \
+            --expected-body-sha "${{ needs.resolve.outputs.issue_body_sha }}" \
+            --trust-gate "$GITHUB_WORKSPACE/target/scripts/trust-gate.py" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --issue-file "$RUNNER_TEMP/verified-issue.json" \
+            --current-run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
-        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' && steps.republish-trust.outcome == 'success' }}
         working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}

@@ -2131,6 +2131,15 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(_workflow_step_if "$wf" pr | grep -c 'always()' || true)" "0"
   chk "the publish/PR step is guarded by gate success" \
     "$(_workflow_step_if "$wf" pr | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
+  # [issue #144] publish only ever runs from a snapshot re-attested in the fresh publisher: the
+  # pre-model `trust` step ran BEFORE the (tens-of-minutes) model + gate, so the publish/PR step
+  # additionally gates on a `republish-trust` re-check that runs on the SAME gate-success publish
+  # path. Non-vacuous: dropping the extra gate flips the first assertion red; dropping the re-check
+  # step's own gate flips the second. Both use the per-step extractor already proven above.
+  chk "the publish/PR step is ALSO gated on the pre-publish trust re-check (issue #144)" \
+    "$(_workflow_step_if "$wf" pr | grep -Fc "steps.republish-trust.outcome == 'success'" || true)" "1"
+  chk "the pre-publish trust re-check runs on the gate-success publish path (issue #144)" \
+    "$(_workflow_step_if "$wf" republish-trust | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
