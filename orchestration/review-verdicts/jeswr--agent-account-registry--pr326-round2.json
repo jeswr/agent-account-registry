@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "stagnant",
+ "summary": "The change remains correct and fail-closed. Per-account recording now returns nonzero when either the account handle or PROVENANCE_SALT is unavailable, before constructing a record or instantiating/calling the ledger API, while preserving the intentional fleet/zero-dispatch sentinel path. The tests are non-vacuous: each missing-input case asserts exit status 1, and the raising API stub proves the guard prevents ledger access. Test environment and global API state are restored in the existing finally block. No trust check is weakened, no token-shaped value is emitted, and the diff contains no reviewer-directed prompt injection.",
+ "verdict": "approve"
+}
