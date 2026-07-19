@@ -847,34 +847,76 @@ def _comments(api: GitHubAPI, repo: str, number: int) -> list[dict[str, Any]]:
     return comments
 
 
+# A single newest-100 worker-run page is NOT enough to correlate every live lease (issue #173):
+# once >100 newer worker runs exist, an active claim's run ages off page 1. A dispatcher-style
+# holder carries no worker run_id, so it has NO other correlation path — the aged-off claim then
+# reads as uncorrelated and, past its issuance timeout, classify_lease calls the lease dead even
+# though its worker is merely queued or still running, resetting the issue, releasing the slot,
+# and permitting a duplicate run. So the walk pages back through worker.yml's history.
+WORKER_RUN_PAGE_CEILING = 50  # 50 x 100 = 5000 runs; matches GitHubAPI.paginate's runaway guard.
+
+
+def _correlate_claim_runs(
+    api: GitHubAPI, leases: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Match every ledger claim to its worker run by paging worker.yml's run history.
+
+    GitHub returns runs newest-first, and a claim's worker run is created at/after the lease that
+    holds it is written, so no run older than the OLDEST live lease's issuance can correlate a
+    still-unmatched claim. The walk therefore stops as soon as EITHER every claim is matched OR a
+    page's oldest run predates that issuance (the whole relevant time window is then covered). If
+    neither holds within the page ceiling the snapshot is TRUNCATED and this fails CLOSED, rather
+    than silently reading an aged-off live claim as an uncorrelated — and, past its timeout, dead
+    — lease.
+    """
+    pending = {lease["claim_id"] for lease in leases}
+    oldest_issued = min(lease["issued_at"] for lease in leases)
+    registry_repo = _registry_repo(api)
+    claim_runs: dict[str, dict[str, Any]] = {}
+    for page in range(1, WORKER_RUN_PAGE_CEILING + 1):
+        runs_doc = api.request(
+            "GET",
+            f"/repos/{registry_repo}/actions/workflows/worker.yml/runs"
+            f"?per_page=100&page={page}",
+        )
+        if not isinstance(runs_doc, dict) or not isinstance(
+            runs_doc.get("workflow_runs"), list
+        ):
+            raise GroomError("registry worker-run snapshot is malformed")
+        runs = runs_doc["workflow_runs"]
+        page_oldest: int | None = None
+        for run in runs:
+            if not isinstance(run, dict):
+                raise GroomError("registry worker-run entry is malformed")
+            _run_status(run)
+            created = _epoch(run.get("created_at"), "worker run created_at")
+            page_oldest = created if page_oldest is None else min(page_oldest, created)
+            display = run.get("display_title")
+            if isinstance(display, str):
+                match = WORKER_RUN_NAME.fullmatch(display)
+                if match and match.group("claim") != "self":
+                    claim = match.group("claim")
+                    if claim in claim_runs:
+                        raise GroomError("multiple worker runs claim the same lease id")
+                    claim_runs[claim] = run
+                    pending.discard(claim)
+        if not pending:
+            return claim_runs  # every live lease correlated — stop paging.
+        if len(runs) < 100:
+            return claim_runs  # worker-run history exhausted; remaining claims have no run.
+        if page_oldest is not None and page_oldest < oldest_issued:
+            return claim_runs  # relevant time window covered; remaining claims have no run.
+    raise GroomError(
+        "registry worker-run snapshot is truncated before every live lease was correlated"
+    )
+
+
 def _worker_runs(
     api: GitHubAPI, leases: list[dict[str, Any]]
 ) -> tuple[dict[str, dict[str, Any]], dict[int, dict[str, Any] | None]]:
     if not leases:
         return {}, {}
-    runs_doc = api.request(
-        "GET",
-        "/repos/"
-        + _registry_repo(api)
-        + "/actions/workflows/worker.yml/runs?per_page=100",
-    )
-    if not isinstance(runs_doc, dict) or not isinstance(
-        runs_doc.get("workflow_runs"), list
-    ):
-        raise GroomError("registry worker-run snapshot is malformed")
-    claim_runs: dict[str, dict[str, Any]] = {}
-    for run in runs_doc["workflow_runs"]:
-        if not isinstance(run, dict):
-            raise GroomError("registry worker-run entry is malformed")
-        _run_status(run)
-        display = run.get("display_title")
-        if isinstance(display, str):
-            match = WORKER_RUN_NAME.fullmatch(display)
-            if match and match.group("claim") != "self":
-                claim = match.group("claim")
-                if claim in claim_runs:
-                    raise GroomError("multiple worker runs claim the same lease id")
-                claim_runs[claim] = run
+    claim_runs = _correlate_claim_runs(api, leases)
 
     holder_runs: dict[int, dict[str, Any] | None] = {}
     for lease in leases:
@@ -1486,6 +1528,96 @@ def _self_test() -> int:
         classify_lease(direct, limits, now, {}, {456: active}).state,
         "live",
     )
+
+    # ---- _correlate_claim_runs: page the worker-run history, never just newest-100 (issue #173) ----
+    # A dispatcher-held live lease whose worker run has aged off page 1 must still be correlated;
+    # reading only the newest page would classify it dead on its timeout and reset a live worker.
+    def _iso(epoch: int) -> str:
+        return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+    def _worker_run(claim: str, created: int, status: str = "in_progress") -> dict[str, Any]:
+        return {"status": status, "created_at": _iso(created),
+                "display_title": f"worker claim={claim}"}
+
+    # Fillers newer than the live lease's issuance, filling page 1 exactly (100) so the walk must
+    # continue; none of them is the target claim.
+    live_lease = {**base, "claim_id": "a" * 32, "holder": "owner/repo#7@dispatch-123.1",
+                  "issued_at": now - 100}
+    page1 = [_worker_run(f"{i:032x}", now + 50) for i in range(100)]
+    target_run = _worker_run("a" * 32, now - 40)  # created AFTER the lease was issued
+    page2 = [target_run] + [_worker_run(f"{i:032x}", now - 60) for i in range(1000, 1099)]
+
+    class _RunsAPI:
+        def __init__(self, pages):
+            self.pages, self.registry_repo = pages, "owner/registry"
+            self.requested_pages: list[int] = []
+
+        def request(self, method, path, **_kwargs):
+            page = int(re.search(r"[?&]page=(\d+)", path).group(1))
+            self.requested_pages.append(page)
+            runs = self.pages[page - 1] if page - 1 < len(self.pages) else []
+            return {"workflow_runs": runs}
+
+    def _newest_page_only(runs):  # models the reverted single-snapshot behaviour
+        out: dict[str, Any] = {}
+        for run in runs:
+            m = WORKER_RUN_NAME.fullmatch(run["display_title"])
+            if m and m.group("claim") != "self":
+                out[m.group("claim")] = run
+        return out
+
+    check(
+        "MUTATION: the newest-100 snapshot alone MISSES the aged-off live claim (non-vacuous)",
+        ("a" * 32) in _newest_page_only(page1),
+        False,
+    )
+    found_api = _RunsAPI([page1, page2])
+    check(
+        "paginated correlation finds the aged-off live claim on page 2 (issue #173)",
+        _correlate_claim_runs(found_api, [live_lease]).get("a" * 32) is target_run,
+        True,
+    )
+    check(
+        "correlation stops as soon as every claim is matched (no needless paging)",
+        found_api.requested_pages,
+        [1, 2],
+    )
+    # Time-window stop: a claim with NO run anywhere is not chased to the ceiling — once a page's
+    # oldest run predates the oldest live issuance the window is covered and the walk returns.
+    windowed = _RunsAPI([
+        [_worker_run(f"{i:032x}", now + 50) for i in range(100)],   # all newer than issuance
+        [_worker_run(f"{i:032x}", now - 500) for i in range(1000, 1100)],  # oldest < issuance
+    ])
+    check(
+        "an uncorrelated claim yields no run once the time window is covered",
+        ("a" * 32) in _correlate_claim_runs(windowed, [live_lease]),
+        False,
+    )
+    check("time-window stop pages only until the window is covered", windowed.requested_pages, [1, 2])
+
+    # Fail-closed on truncation: full pages that never reach the window and never match the claim
+    # must raise, never silently return an empty (→ eventually "dead") correlation.
+    class _TruncAPI:
+        def __init__(self):
+            self.registry_repo, self.calls = "owner/registry", 0
+
+        def request(self, method, path, **_kwargs):
+            page = int(re.search(r"[?&]page=(\d+)", path).group(1))
+            self.calls += 1
+            # 100 distinct runs per page, all newer than issuance → never exhausts, never covers.
+            return {"workflow_runs": [
+                _worker_run(f"{page * 100 + j:032x}", now + 50) for j in range(100)
+            ]}
+
+    trunc = _TruncAPI()
+    truncated_loud = False
+    try:
+        _correlate_claim_runs(trunc, [live_lease])
+    except GroomError as exc:
+        truncated_loud = "truncated" in str(exc)
+    check("truncated worker-run history fails closed (never a silent dead lease)", truncated_loud, True)
+    check("truncation walks the full page ceiling before failing", trunc.calls, WORKER_RUN_PAGE_CEILING)
+
     comments = [
         {"user": {"login": "app[bot]"}, "body": ATTEMPT_MARKER + " run=1 -->"},
         {"user": {"login": "APP[bot]"}, "body": ATTEMPT_MARKER + " run=2 -->"},
