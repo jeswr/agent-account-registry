@@ -1,4 +1,4 @@
-# [OPUS-4.8] Scheduled RE-TRIAGE sweep for jeswr/agent-account-registry (issue #178).
+# Scheduled RE-TRIAGE sweep for jeswr/agent-account-registry (issue #178).
 # triage-issue.yml fires ONLY on issues.{opened,edited,reopened}; a bare LABEL change never re-runs
 # triage, so an issue that becomes complete via a label edit (missing priority/area/role supplied,
 # or the `needs:design` design-hold cleared) — or one that lost `status:ready` — stays outside the
@@ -73,8 +73,12 @@ jobs:
       - name: Self-test the alert before trusting it
         run: python3 scripts/retriage.py --self-test
 
+      # NO continue-on-error here (review round 1): run_alert() exits nonzero exactly when
+      # alerting itself broke, and masking that exit would turn an alerting outage into a green
+      # scheduled run — the silent-cron failure mode this job exists to close. The alert job is
+      # already isolated from the retriage job, so a red here never blocks the sweep, and the
+      # script's --self-test statically asserts this step stays unmasked.
       - name: Upsert/close the rolling retriage-failure alert
-        continue-on-error: true
         env:
           REGISTRY_REPO: ${{ github.repository }}
           RETRIAGE_RESULT: ${{ needs.retriage.result }}

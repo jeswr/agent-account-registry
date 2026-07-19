@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Registry self-management: the SCHEDULED re-triage sweep + its rolling failure alert for
+# Registry self-management: the SCHEDULED re-triage sweep + its rolling failure alert for
 # jeswr/agent-account-registry (issue #178). Applied by .github/workflows/retriage.yml.
 """retriage.py — re-run static triage on open issues that label-only events missed.
 
@@ -151,6 +151,44 @@ def _alert_route(alert_repo, alert_token, registry_repo):
     if alert_repo and alert_token:
         return alert_repo, alert_token
     return registry_repo, None
+
+
+def alert_step_fails_loud(workflow_text):
+    """Pure fail-CLOSED workflow assertion (review round 1): True iff the retriage workflow's
+    `alert` job has a step invoking `--alert` and NO such step carries a `continue-on-error`
+    other than an explicit false — GitHub would otherwise convert run_alert()'s fail-loud
+    nonzero exits into a green scheduled run, the exact silent-cron failure mode this job
+    closes. Deliberately dependency-free (same rationale as dispatch-secrets-guard.py's
+    workflow parser — the gate host and runner image need not share a PyYAML install): a
+    NARROW line parser over the two/six-space-indented block this repo controls, not a general
+    YAML reader. Any failure to locate the job or an --alert step returns False."""
+    lines = workflow_text.splitlines()
+    try:
+        start = lines.index("  alert:")
+    except ValueError:
+        return False
+    steps, current = [], None
+    for line in lines[start + 1:]:
+        stripped = line.split("#", 1)[0].rstrip()
+        if not stripped.strip():
+            continue
+        if not line.startswith("    "):
+            break  # dedented out of the alert job
+        if line.startswith("      - "):  # a new step (exact step-list indent)
+            current = []
+            steps.append(current)
+        if current is not None:
+            entry = stripped.strip()
+            current.append(entry[2:] if entry.startswith("- ") else entry)
+    alert_steps = [s for s in steps if any("--alert" in ln for ln in s)]
+    if not alert_steps:
+        return False
+    for step in alert_steps:
+        for ln in step:
+            key, sep, value = ln.partition(":")
+            if sep and key.strip() == "continue-on-error" and value.strip() != "false":
+                return False
+    return True
 
 
 def decide(result, has_open_alert):
@@ -308,6 +346,31 @@ def _self_test():
     chk("apply: a failed edit forces rc=1 (fail loud)", rc_apply, 1)
     calls.clear()
     chk("apply: empty plan makes no gh call + rc=0", (apply("o/r", [], gh=fake_gh), calls), (0, []))
+
+    # Workflow fail-loud assertion — both directions on synthetic YAML, then the LIVE file (same
+    # discipline as dispatch-secrets-guard.py's static permission check): re-masking the --alert
+    # step with continue-on-error must go red HERE, not silently green the alerting outage.
+    def wf(extra=""):
+        return ("jobs:\n  alert:\n    steps:\n"
+                "      - name: self-test\n        run: python3 scripts/retriage.py --self-test\n"
+                "      - name: alert\n" + extra +
+                "        run: python3 scripts/retriage.py --alert\n")
+
+    chk("workflow: unmasked --alert step accepted", alert_step_fails_loud(wf()), True)
+    chk("workflow: continue-on-error on the --alert step rejected",
+        alert_step_fails_loud(wf("        continue-on-error: true\n")), False)
+    chk("workflow: explicit continue-on-error false still accepted",
+        alert_step_fails_loud(wf("        continue-on-error: false\n")), True)
+    chk("workflow: missing --alert step rejected (fail closed)",
+        alert_step_fails_loud("jobs:\n  alert:\n    steps:\n      - run: 'true'\n"), False)
+    chk("workflow: no alert job at all rejected (fail closed)", alert_step_fails_loud("{"), False)
+    workflow_path = (Path(__file__).resolve().parent.parent
+                     / ".github" / "workflows" / "retriage.yml")
+    try:
+        live_text = workflow_path.read_text(encoding="utf-8")
+    except OSError:
+        live_text = ""
+    chk("workflow: LIVE retriage.yml alert step fails loud", alert_step_fails_loud(live_text), True)
 
     # decide()/route() — same audited matrix as plan-alert.py.
     chk("route: repo+token -> private", _alert_route("o/p", "t", "o/r"), ("o/p", "t"))
