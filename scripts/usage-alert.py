@@ -13,14 +13,15 @@
 # UNAVAILABLE, never "0% used". A wholesale probe failure (empty usage with a configured pool) therefore
 # classifies EVERY account UNAVAILABLE and always fires the alert — the exact case that used to no-op.
 #
-# Privacy (locked decision 22): account handles appear ONLY in the alert-issue body, never in workflow
-# logs; ALERT_REPO/ALERT_TOKEN route that body to a private repo (fallback: the registry repo). A
-# HALF-configured deployment (ALERT_REPO set, ALERT_TOKEN missing) falls back to the registry repo
-# rather than writing to the private repo under the ambient token that can't reach it — a write that
-# would fail silently and drop the alert (issue #39) — and REDACTS account handles from that fallback
-# body (the registry is public and the maintainer signalled privacy intent; counts only). Writes go
-# through _gh(check=True), which surfaces a non-zero gh returncode as a sanitized ::warning:: (op +
-# returncode only — never gh stderr, which can echo request bodies under GH_DEBUG=api).
+# Privacy (locked decision 22, issue #107): raw account handles are emitted ONLY over a VERIFIED
+# private route — ALERT_REPO together with an ALERT_TOKEN that can write to it. EVERY fallback to the
+# public registry repo carries aggregate counts only, never a handle (decision 22a): both the
+# half-configured case (ALERT_REPO set, ALERT_TOKEN missing — writing to the private repo under the
+# ambient token that can't reach it would fail silently and drop the alert, issue #39) AND the
+# fully-unconfigured case (no ALERT_REPO) redact. Account handles never appear in workflow logs.
+# Writes go through _gh(check=True), which surfaces a non-zero gh returncode as a sanitized
+# ::warning:: (op + returncode only — never gh stderr, which can echo request bodies under
+# GH_DEBUG=api).
 #
 # Pure classify()/_policy_pool_margin() are unit-tested (--self-test); the CLI wraps them over the
 # usage file + `gh`.
@@ -77,17 +78,18 @@ def _util(value):
 
 
 def _alert_route(alert_repo, alert_token, registry_repo):
-    """(repo, token) for the alert issue (issue #39, privacy d22c). ALERT_REPO is the PRIMARY
-    destination ONLY when ALERT_TOKEN can write there; a half-configured deployment (repo var set,
-    token secret missed) must NOT try to write to the private repo under the ambient registry token
-    (which has no permission there) — that write fails silently and the alert is dropped. So fall
-    back to the registry repo, which the ambient token can always write. token=None means "use the
-    ambient GH_TOKEN". redact_handles=True marks the HALF-configured case (ALERT_REPO set, token
-    missing): the maintainer signalled privacy intent, so the fallback body must carry NO account
-    handles — the registry repo is public (decision 22a) — while still failing loud (review r1)."""
+    """(repo, token, redact_handles) for the alert issue (issue #107/#39, privacy d22c). The
+    account-enumerating body is emitted ONLY over a VERIFIED private route — ALERT_REPO together
+    with an ALERT_TOKEN that can write there. EVERY fallback to the registry repo REDACTS account
+    handles to aggregate counts, because that repo is public (decision 22a): a public alert must
+    never publish raw account identifiers (issue #107). This covers BOTH the half-configured case
+    (ALERT_REPO set, ALERT_TOKEN missing — where writing to the private repo under the ambient
+    registry token would fail silently and drop the alert, issue #39) AND the fully-unconfigured
+    case (no ALERT_REPO at all). token=None means "use the ambient GH_TOKEN"; the write still fails
+    loud via _gh(check=True) (review r1)."""
     if alert_repo and alert_token:
         return alert_repo, alert_token, False
-    return registry_repo, None, bool(alert_repo)
+    return registry_repo, None, True
 
 
 def classify(pool, usage, margin, now=None):
@@ -148,9 +150,11 @@ def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redac
                      "header change, curl outage), not N individually capped accounts.\n")
     lines.append(f"**Usable workers: {eligible}/{len(pool)}**  (degraded below {threshold}).\n")
     if redact_handles:
-        # Half-configured private route (issue #39, review r1): this body lands on the PUBLIC
-        # registry repo even though the maintainer signalled privacy intent via ALERT_REPO, so it
-        # carries counts only — never an account handle (decision 22a).
+        # Public-registry fallback (issue #107, #39, review r1): whenever the alert lands on the
+        # PUBLIC registry repo — because no verified private route is configured, or only a
+        # half-configured one (ALERT_REPO set, ALERT_TOKEN missing) — it carries aggregate counts
+        # only, never an account handle (decision 22a). Per-account detail requires the verified
+        # private ALERT_REPO+ALERT_TOKEN route.
         capped = sum(1 for _h, s, _ok in rows if s.startswith("CAPPED"))
         unavailable = sum(1 for _h, s, _ok in rows if s.startswith("UNAVAILABLE"))
         backed_off = sum(1 for _h, s, _ok in rows if s.startswith("BACKED OFF"))
@@ -160,10 +164,11 @@ def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redac
         ok_count = sum(1 for _h, _s, ok_bool in rows if ok_bool)
         lines.append(f"- ⛔ capped: {capped} · unavailable: {unavailable} · backed off: "
                      f"{backed_off} · ✅ ok: {ok_count}")
-        lines.append("\n⚠️ Per-account detail suppressed: the private alert route is HALF-configured "
-                     "(`ALERT_REPO` is set but the `ALERT_TOKEN` secret is missing), so this alert "
-                     "fell back to the public registry repo. Set `ALERT_TOKEN` to receive per-account "
-                     "detail privately.")
+        lines.append("\n⚠️ Per-account detail suppressed: this alert landed on the **public** "
+                     "registry repo, so it lists aggregate counts only — never account handles. To "
+                     "receive per-account detail privately, configure a private `ALERT_REPO` "
+                     "together with an `ALERT_TOKEN` secret that can write to it (a route is used "
+                     "only when BOTH are set).")
     else:
         for h, s, ok in rows:
             lines.append(f"- {'✅' if ok else '⛔'} `{h}`: {s}")
@@ -305,8 +310,15 @@ def _self_test():
         _alert_route("org/private", "", "org/registry"), ("org/registry", None, True))
     chk("route: repo but None token -> registry fallback, REDACTED",
         _alert_route("org/private", None, "org/registry"), ("org/registry", None, True))
-    chk("route: no repo -> registry, full body (documented d22c fallback)",
-        _alert_route("", "tok", "org/registry"), ("org/registry", None, False))
+    # Issue #107: an UNCONFIGURED route (no ALERT_REPO) must ALSO land redacted on the public
+    # registry — a lone ALERT_TOKEN is not a verified private destination, and no route at all
+    # certainly is not. The public fallback must never enumerate raw account handles.
+    chk("route: token but NO repo -> registry fallback, REDACTED (#107)",
+        _alert_route("", "tok", "org/registry"), ("org/registry", None, True))
+    chk("route: neither repo nor token -> registry fallback, REDACTED (#107)",
+        _alert_route("", "", "org/registry"), ("org/registry", None, True))
+    chk("route: None repo/token -> registry fallback, REDACTED (#107)",
+        _alert_route(None, None, "org/registry"), ("org/registry", None, True))
     # Redacted fallback body (review r1): the half-configured route must never put an account
     # handle on the public registry repo — counts only, plus the fix-it hint.
     rrows = [("acct-priv-h1", "CAPPED — 5h window 95% used, resets t", False),
@@ -390,6 +402,44 @@ def _self_test():
     chk("main() half-configured: alert created on the REGISTRY repo", repo_arg, "org/registry")
     chk("main() half-configured: body is redacted END-TO-END",
         ("acct-wire-h1" in body_arg, "acct-wire-h2" in body_arg, "unavailable: 2" in body_arg),
+        (False, False, True))
+    # END-TO-END #107 guard: the FULLY-UNCONFIGURED case (no ALERT_REPO at all) must ALSO land on
+    # the public registry repo with account handles redacted. This is the exact defect issue #107
+    # names — the old `redact_handles = bool(alert_repo)` published raw handles here. Reverting the
+    # fix to that expression must go RED on this assertion, not just the pure-helper ones above.
+    calls2 = []
+
+    def _capture_run2(args, **_kw):
+        calls2.append(list(args))
+        return _OkRun()
+
+    unconfigured_env = {"REGISTRY_REPO": "org/registry",
+                        "ACCOUNT_POOL": '["acct-wire-h1", "acct-wire-h2"]',
+                        "POLICY_FILE": "/nonexistent/policy.toml"}
+    saved_env2 = {k: os.environ.get(k)
+                  for k in list(unconfigured_env) + ["ALERT_REPO", "ALERT_TOKEN", "WORKER_USAGE_FILE"]}
+    os.environ.update(unconfigured_env)
+    os.environ.pop("ALERT_REPO", None)
+    os.environ.pop("ALERT_TOKEN", None)
+    os.environ.pop("WORKER_USAGE_FILE", None)
+    real_run = subprocess.run
+    subprocess.run = _capture_run2
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            main()
+    finally:
+        subprocess.run = real_run
+        for k, v in saved_env2.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    created2 = next((c for c in calls2 if c[:3] == ["gh", "issue", "create"]), None)
+    body2 = created2[created2.index("--body") + 1] if created2 and "--body" in created2 else ""
+    repo2 = created2[created2.index("-R") + 1] if created2 and "-R" in created2 else ""
+    chk("main() unconfigured (#107): alert created on the public REGISTRY repo", repo2, "org/registry")
+    chk("main() unconfigured (#107): body is redacted END-TO-END (no raw handles)",
+        ("acct-wire-h1" in body2, "acct-wire-h2" in body2, "unavailable: 2" in body2),
         (False, False, True))
     # Probe-exempt backoff surfacing (decision 2026-07-17, registry issue #29): an exempt account
     # is `ok` by design (never probe-missing), but an ACTIVE backoff is surfaced + not eligible,

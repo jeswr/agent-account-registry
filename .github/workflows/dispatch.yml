@@ -985,8 +985,10 @@ jobs:
           WORKER_USAGE_FILE: ${{ runner.temp }}/usage.json
           POLICY_FILE: registry/policy/repos.toml
           MAINTAINER_HANDLE: jeswr
-          # Privacy routing (locked decision 22c): the alert body enumerates account handles, so a
-          # maintainer-set ALERT_REPO (+ ALERT_TOKEN) sends it to a PRIVATE repo instead.
+          # Privacy routing (locked decision 22c, issue #107): the per-account alert body enumerates
+          # account handles, so it is emitted ONLY over a VERIFIED private route — a maintainer-set
+          # ALERT_REPO together with an ALERT_TOKEN that can write there. Any fallback to this PUBLIC
+          # registry repo (route unset OR half-configured) redacts handles to aggregate counts.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
         run: |
