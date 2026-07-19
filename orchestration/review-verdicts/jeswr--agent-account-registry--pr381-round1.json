@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 381,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f88f1dbaa079a967c5880172a3b9a30b520c67d5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly converts a failed durable missed-fix marker write on the no-claim path from a silent healthy defer into a counted fix-lane error and an explicit defer reason, while preserving retry behavior and the successful-marker contention path. This makes the existing lane-health/rolling-alert machinery observe the failure without weakening lease, routing, provenance, or escalation checks. The added self-test is non-vacuous: it forces the helper failure, proves the marker attempt occurred, asserts the new reason and exact lane classification, and includes a successful-write regression control.",
+  "verdict": "approve"
+ }
+}
