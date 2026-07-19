@@ -120,6 +120,43 @@ jobs:
           python3 registry-snapshot/scripts/plan-snapshot.py \
             "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP"
 
+      # Extract the policy-controlled trusted-bot allowlist (issue #111) from the registry policy
+      # using REGISTRY code, BEFORE any target planner code runs (the clone/self-test step below is
+      # the first to execute target code). The hostile planner step consumes only this pure-data
+      # JSON — it never reads the policy itself. CLAIM re-derives the SAME allowlist authoritatively
+      # (exact App-bot login + policy trusted_bots) before any launch; this map only tightens PLAN's
+      # advisory author filter so it stops proposing arbitrary "<x>[bot]" issue authors.
+      - name: Extract the policy trusted-bot allowlist (registry code, pre-target)
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/dispatch-targets/repos.txt" \
+                    registry-snapshot/policy/repos.toml \
+                    "$RUNNER_TEMP/trusted-bots.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          import tomllib
+
+          repos_path, policy_path, out_path = sys.argv[1:]
+          repos = Path(repos_path).read_text(encoding="utf-8").splitlines()
+          with open(policy_path, "rb") as handle:
+              policy = tomllib.load(handle)
+          rows = policy.get("repos")
+          if not isinstance(rows, dict):
+              raise SystemExit("registry policy has no repos table")
+          allowlist = {}
+          for repo in repos:
+              if not repo:
+                  continue
+              row = rows.get(repo, {})
+              bots = row.get("trusted_bots", []) if isinstance(row, dict) else []
+              if (not isinstance(bots, list)
+                      or any(not isinstance(bot, str) or not bot.strip() for bot in bots)):
+                  raise SystemExit(f"trusted_bots for {repo} must be a list of non-empty strings")
+              allowlist[repo] = sorted(set(bots))
+          Path(out_path).write_text(json.dumps(allowlist), encoding="utf-8")
+          PY
+
       - name: Clone protected public targets without credentials
         run: |
           set -euo pipefail
@@ -153,6 +190,11 @@ jobs:
           root = Path(os.environ["TARGET_ROOT"])
           repos = Path(repos_path).read_text(encoding="utf-8").splitlines()
           trusted_associations = {"OWNER", "MEMBER", "COLLABORATOR"}
+          # Policy-controlled per-repo trusted-bot allowlist (issue #111), extracted from the
+          # registry policy by a registry-code step that ran BEFORE any target planner code — so
+          # this is pure registry data, never influenced by the target repo being planned.
+          trusted_bots_map = json.loads(
+              Path(out_dir, "trusted-bots.json").read_text(encoding="utf-8"))
 
           def snapshot(kind, index):
               # Written by the authenticated registry-inline snapshot step (this step deliberately
@@ -184,13 +226,25 @@ jobs:
                   names.append(name)
               return sorted(set(names))
 
-          def trusted(issue):
+          def trusted(issue, trusted_bots):
+              # Fail-closed author trust (registry issue #111). Collaborator associations
+              # (OWNER/MEMBER/COLLABORATOR) are trusted; a bot is trusted ONLY by EXACT membership
+              # in the policy-controlled `trusted_bots` allowlist — never by a bare "[bot]" suffix,
+              # which admits any unrelated or compromised GitHub App. When the allowlist is empty
+              # (none configured) PLAN keeps an ADVISORY suffix pass: PLAN is the unprivileged,
+              # hostile-data half (see file header) and cannot resolve the App bot login (no token),
+              # while CLAIM re-derives trust EXACTLY against the resolved App bot login + policy
+              # allowlist before any worker launches — so an empty list only over-proposes rows
+              # CLAIM then rejects, never fails OPEN here.
               author = issue.get("user", {}).get("login")
               association = str(issue.get("author_association", "")).upper()
-              return (
-                  isinstance(author, str)
-                  and (author.endswith("[bot]") or association in trusted_associations)
-              )
+              if not isinstance(author, str):
+                  return False
+              if association in trusted_associations:
+                  return True
+              if trusted_bots:
+                  return author in trusted_bots
+              return author.endswith("[bot]")
 
           def linked_issue_numbers(pulls):
               linked = set()
@@ -212,6 +266,7 @@ jobs:
           repositories = []
           for index, repo in enumerate(repos):
               target = root / str(index)
+              repo_trusted_bots = set(trusted_bots_map.get(repo, []))
               dispatch = load_dispatch(target / "scripts" / "dispatch-plan.py")
               raw = [
                   issue for issue in snapshot("issues", index)
@@ -243,7 +298,8 @@ jobs:
               ready = dispatch.compute_ready(readiness_input)
               ready = [
                   issue for issue in ready
-                  if issue["number"] not in linked and trusted(details[issue["number"]][0])
+                  if issue["number"] not in linked
+                  and trusted(details[issue["number"]][0], repo_trusted_bots)
               ]
               # Deferred-retry candidates (registry decision: a status:deferred issue with no
               # live lease and no linked open PR is retryable). The ready-engine gate is reused
@@ -263,7 +319,7 @@ jobs:
                       continue
                   if labels & retry_gated or any(l.startswith("needs:") for l in labels):
                       continue
-                  if number in linked or not trusted(details[number][0]):
+                  if number in linked or not trusted(details[number][0], repo_trusted_bots):
                       continue
                   deferred_input.append({
                       **row,

@@ -66,8 +66,16 @@ POLICY_FIELDS = {
 # HUMAN even for a benign-labelled PR — CONSUMED by review-fix.yml (review-outcome + ready-and-arm
 # pass it to worker-pr.trust_surface_paths_touched). NOT a dead tier: an empty/absent list simply
 # means the worker-pr.py DEFAULT_TRUST_SURFACE_PATHS applies (the guard is never silently off).
+# trusted_bots (registry issue #111): the EXACT, policy-controlled allowlist of trusted App bot
+# logins (or App-derived login strings) that the dispatcher admits as issue authors ALONGSIDE the
+# `trust = "collaborators"` associations (OWNER/MEMBER/COLLABORATOR). It exists to give the declared
+# `trust` field teeth: without it the dispatcher suffix-matched any "<x>[bot]" login and admitted
+# unrelated or compromised GitHub Apps. CLAIM unions this list with the RUNTIME-resolved worker App
+# bot login (dispatch-claim `bot_login`) so an empty/absent list still trusts our own App bot; it is
+# for ADDITIONAL known bots. Absent => empty (fail-closed: no bot is trusted by suffix).
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
-                          "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths"}
+                          "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
+                          "trusted_bots"}
 
 
 class PolicyError(ValueError):
@@ -142,6 +150,15 @@ def _policy_row(target_repo, policy_doc):
                 f"security_paths for {target_repo!r} must be a list of non-empty strings")
         if len(set(paths)) != len(paths):
             raise PolicyError(f"security_paths for {target_repo!r} contains duplicates")
+    if "trusted_bots" in row:
+        bots = row["trusted_bots"]
+        if (not isinstance(bots, list)
+                or any(not isinstance(b, str) or not b.strip() or "\n" in b or "\r" in b
+                       for b in bots)):
+            raise PolicyError(
+                f"trusted_bots for {target_repo!r} must be a list of non-empty login strings")
+        if len(set(bots)) != len(bots):
+            raise PolicyError(f"trusted_bots for {target_repo!r} contains duplicates")
     return row
 
 
@@ -279,6 +296,7 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "review_queue_ttl_minutes": int(policy.get("review_queue_ttl_minutes", 30)),
         "cross_provider_fallback": bool(policy.get("cross_provider_fallback", False)),
         "security_paths": list(policy.get("security_paths", [])),
+        "trusted_bots": list(policy.get("trusted_bots", [])),
         "worker_timeout_minutes": policy["worker_timeout_minutes"],
         "max_attempts": policy["max_attempts"],
         "trust": policy["trust"],
@@ -416,6 +434,26 @@ agent = "docs-agent"
                               'security_paths=["ok", ""]\n')
     rejects("security_paths rejects empty entry", "security_paths",
             lambda: resolve("o/r", "impl", bad_paths, routing))
+    # trusted_bots (issue #111): validated exact-login allowlist, default empty, surfaced.
+    check("trusted_bots default empty", impl["trusted_bots"], [])
+    tb = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                       'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                       'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+                       'trusted_bots=["reg-app[bot]", "groom[bot]"]\n')
+    check("trusted_bots surfaced", resolve("o/r", "impl", tb, routing)["trusted_bots"],
+          ["reg-app[bot]", "groom[bot]"])
+    bad_bots = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                             'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                             'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+                             'trusted_bots=["ok", ""]\n')
+    rejects("trusted_bots rejects empty entry", "trusted_bots",
+            lambda: resolve("o/r", "impl", bad_bots, routing))
+    dup_bots = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                             'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                             'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+                             'trusted_bots=["dup[bot]", "dup[bot]"]\n')
+    rejects("trusted_bots rejects duplicates", "trusted_bots",
+            lambda: resolve("o/r", "impl", dup_bots, routing))
     bad_rounds = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                                'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                                'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'

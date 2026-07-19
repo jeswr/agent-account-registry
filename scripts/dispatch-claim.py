@@ -1266,12 +1266,20 @@ def _labels(issue):
     return sorted(set(result))
 
 
-def _issue_is_trusted(issue):
-    author = issue.get("user", {}).get("login") if isinstance(issue, dict) else None
-    association = str(issue.get("author_association", "")).upper() if isinstance(issue, dict) else ""
+def _issue_is_trusted(issue, trusted_bots):
+    """Fail-closed issue-author trust (registry issue #111). Honours the declared
+    `trust = "collaborators"` policy mode: an author is trusted iff its association is
+    OWNER/MEMBER/COLLABORATOR, OR its login is an EXACT member of `trusted_bots` — the
+    policy-controlled allowlist (policy `trusted_bots` unioned with the runtime-resolved worker App
+    `bot_login` at the call site). A bare "[bot]" suffix is NEVER trusted: suffix-matching admitted
+    any unrelated or compromised GitHub App into the dispatch pipeline (the defect this closes)."""
+    if not isinstance(issue, dict):
+        return False
+    author = (issue.get("user") or {}).get("login")
+    association = str(issue.get("author_association", "")).upper()
     return (
         isinstance(author, str)
-        and (author.endswith("[bot]") or association in TRUSTED_ASSOCIATIONS)
+        and (association in TRUSTED_ASSOCIATIONS or author in trusted_bots)
     )
 
 
@@ -1331,7 +1339,7 @@ def _open_blockers(repo, body):
     return still_open
 
 
-def _current_issue_matches(repo, item):
+def _current_issue_matches(repo, item, trusted_bots):
     issue = _gh_json(["api", f"repos/{repo}/issues/{item['number']}"])
     if not isinstance(issue, dict) or "pull_request" in issue or issue.get("state") != "open":
         return False, "issue is no longer an open issue"
@@ -1344,8 +1352,8 @@ def _current_issue_matches(repo, item):
     body = issue.get("body") or ""
     if not isinstance(body, str) or hashlib.sha256(body.encode()).hexdigest() != item["body_sha"]:
         return False, "issue body changed after planning"
-    if not _issue_is_trusted(issue):
-        return False, "issue is not maintainer/collaborator/bot authored"
+    if not _issue_is_trusted(issue, trusted_bots):
+        return False, "issue is not maintainer/collaborator/allowlisted-bot authored"
     # Issue #102: re-prove the readiness predicate in registry-owned CLAIM code rather than trusting
     # the hostile planner's frontier. `kind:epic` is a non-dispatchable tracking umbrella, and any
     # still-open `Blocked-by: #N` gates the row. Both legs apply on the normal AND deferred paths —
@@ -2105,6 +2113,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             policy = policy_module._policy_row(repo, policy_doc)
         except ValueError as exc:
             raise DispatchError(f"registry policy is invalid for {repo}") from exc
+        # [issue #111] The exact issue-author bot allowlist: the policy-declared `trusted_bots`
+        # unioned with the RUNTIME-resolved worker App login. `bot_login` is our own orchestration
+        # App (it opens the pipeline's follow-up/groom issues), so an empty policy list still trusts
+        # it; every OTHER bot must be listed exactly. No suffix match — a stray "<x>[bot]" is denied.
+        trusted_bots = set(policy.get("trusted_bots", []))
+        if bot_login:
+            trusted_bots.add(bot_login)
         routing = _routing_at_plan_sha(repo, policy["routing"], repository["target_sha"])
         pull_pages = _gh_json([
             "api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100"
@@ -2149,7 +2164,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             # must SKIP that item, not abort the whole dispatch (which would strand the other ready
             # issues and mark the run failed). Global setup errors above still abort as before.
             try:
-                current, reason = _current_issue_matches(repo, item)
+                current, reason = _current_issue_matches(repo, item, trusted_bots)
                 if not current:
                     defer_reasons["stale-issue"] += 1
                     print(f"defer {repo}#{number}: {reason}")
@@ -2590,9 +2605,20 @@ def _self_test():
     assert _ledger_rot_zeroed_dispatch(0, Counter()) is False
     assert _ledger_rot_zeroed_dispatch(0, Counter({"no-eligible-account": 3})) is False
     assert _ledger_rot_zeroed_dispatch(3, Counter({"lease-error": 2})) is False
-    assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"})
-    assert _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"})
-    assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"})
+    # issue #111: EXACT allowlist trust, no "[bot]" suffix match. Every assertion flips red if the
+    # suffix shortcut is reintroduced or a trust leg is dropped.
+    allow = {"reg-app[bot]"}
+    assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"}, allow)
+    assert _issue_is_trusted({"user": {"login": "owner"}, "author_association": "OWNER"}, set())
+    assert _issue_is_trusted({"user": {"login": "reg-app[bot]"}, "author_association": "NONE"}, allow)
+    # an arbitrary bot login is DENIED even though it ends in "[bot]" (the closed defect) ...
+    assert not _issue_is_trusted({"user": {"login": "evil[bot]"}, "author_association": "NONE"}, allow)
+    # ... and with an empty allowlist NO bot is trusted by suffix
+    assert not _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"}, set())
+    # a non-collaborator human is never trusted; malformed shapes fail closed
+    assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"}, allow)
+    assert not _issue_is_trusted({"user": None, "author_association": "MEMBER"}, allow)
+    assert not _issue_is_trusted("nope", allow)
 
     # ---- issue #102: CLAIM independently RE-PROVES the readiness predicate (non-dispatchable
     # epic + live blocker state) from registry-owned code, never trusting the hostile planner's
@@ -2604,7 +2630,7 @@ def _self_test():
                 "author_association": "MEMBER",
                 "labels": [{"name": name} for name in labels], "body": body}
 
-    def match_with(main_issue, blockers, item):
+    def match_with(main_issue, blockers, item, trusted_bots=frozenset()):
         def fake(args):
             found = re.search(r"/issues/(\d+)$", args[-1])
             if not found:
@@ -2617,7 +2643,7 @@ def _self_test():
             raise DispatchError(f"blocker #{number} unreadable")
         globals()["_gh_json"] = fake
         try:
-            return _current_issue_matches("example/repo", item)
+            return _current_issue_matches("example/repo", item, trusted_bots)
         finally:
             globals()["_gh_json"] = prev_gh_json
 
@@ -2628,6 +2654,18 @@ def _self_test():
     # baseline: a ready, non-epic, unblocked issue passes every leg
     passed, _ = match_with(ready_issue(ready_labels, plain_body), {}, item102)
     assert passed, "ready unblocked non-epic issue must claim"
+    # issue #111: the author-trust allowlist is THREADED through _current_issue_matches. An
+    # otherwise-ready issue authored by a "[bot]" login claims ONLY when that exact login is in the
+    # allowlist — an empty allowlist fails it closed (no suffix trust reaches the CLAIM gate).
+    bot_body = "bot-authored work"
+    bot_issue = {"state": "open", "user": {"login": "reg-app[bot]"}, "author_association": "NONE",
+                 "labels": [{"name": name} for name in ready_labels], "body": bot_body}
+    bot_item = dict(item102, author="reg-app[bot]",
+                    body_sha=hashlib.sha256(bot_body.encode()).hexdigest())
+    ok_bot, _ = match_with(bot_issue, {}, bot_item, {"reg-app[bot]"})
+    assert ok_bot, "allowlisted bot author must claim"
+    denied_bot, denied_reason = match_with(bot_issue, {}, bot_item, frozenset())
+    assert not denied_bot and "authored" in denied_reason, denied_reason
     # kind:epic is independently rejected even though the plan emitted it (and its labels match)
     epic_labels = sorted(ready_labels + [NON_DISPATCHABLE])
     epic_item = dict(item102, labels=epic_labels)
