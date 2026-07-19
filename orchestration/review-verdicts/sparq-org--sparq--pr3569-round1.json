@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change is documentation-only and accurately preserves the implemented scope: general fractional/scientific xsd:double parsing remains deferred, the existing integer-valued fragment is explicitly identified, and no affordability or external-audit claim is made. The proposed future approach acknowledges the required lexical binding, exact round-to-nearest-even interval verification, constraint measurement, and pending external audit. No executable behavior, test logic, dependency state, or security boundary changes in this diff.",
+ "verdict": "approve"
+}
