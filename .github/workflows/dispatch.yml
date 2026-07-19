@@ -1117,6 +1117,11 @@ jobs:
                     encoding="utf-8") as flag:
               flag.write(state)
           PY
+          # This step runs IN the job that produced the tick outcome, so its own
+          # $GITHUB_RUN_ATTEMPT IS the producing attempt the recorder's idempotency key expects
+          # (review round 1 of #425): a re-run of this job re-evaluates the tick — a genuinely
+          # new outcome under the same GITHUB_RUN_ID that must append, and does, because the
+          # fresh attempt changes the key.
           state="$(cat "$RUNNER_TEMP/dispatch-tick-state" 2>/dev/null || echo none)"
           case "$state" in
             zero)

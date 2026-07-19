@@ -572,6 +572,12 @@ jobs:
       # The sanitized session-limit reset time worker-live.sh extracts (review defect #9); empty
       # for every other class. Feeds the provider-capped alert's "earliest known reset".
       reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
+      # THIS job's run attempt, stamped beside the class (review round 1 of #425): the recorder's
+      # idempotency key must track the attempt that PRODUCED the outcome, not the recorder's own.
+      # A recorder-only retry replays this preserved output (same attempt -> dedup no-op); a full
+      # re-run re-executes this job and stamps a fresh attempt, so its genuinely new outcome
+      # still counts toward backoff/outage thresholds.
+      outcome_attempt: ${{ steps.exit-class.outputs.outcome_attempt }}
       # Final-state inputs (issue #127): surfaced so the SEPARATE always() `final_state` job can
       # converge the issue status even when THIS job is killed by its `worker_timeout_minutes`
       # timeout or a cancellation (which stops even an in-job always() step from running). On a
@@ -898,8 +904,13 @@ jobs:
             # got far enough to write one; otherwise unknown.
             cls="${WORKER_EXIT_CLASS:-unknown}"
           fi
-          echo "class=$cls" >> "$GITHUB_OUTPUT"
-          echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
+          # outcome_attempt: the attempt that produced this outcome — the recorder's dedup key
+          # (review r1 of #425). Grouped redirect (SC2129): one append, three keys.
+          {
+            echo "class=$cls"
+            echo "reset_hint=${WORKER_RESET_HINT:-}"
+            echo "outcome_attempt=${GITHUB_RUN_ATTEMPT:-}"
+          } >> "$GITHUB_OUTPUT"
 
       # TTL guard (audit-2026-07-17): App installation tokens live 60 minutes and app-token-live is
       # minted BEFORE the heavy checkout + toolchain + model run, so with worker_timeout_minutes=90
@@ -1307,13 +1318,20 @@ jobs:
           MODEL_ALIAS: ${{ needs.claim.outputs.model }}
           EXIT_CLASS: ${{ needs.worker.outputs.exit_class }}
           RESET_HINT: ${{ needs.worker.outputs.reset_hint }}
+          # The attempt of the worker job that PRODUCED the outcome — never this recorder job's
+          # own $GITHUB_RUN_ATTEMPT (review round 1 of #425): a recorder-only retry replays the
+          # worker's preserved output (same attempt -> the script dedups the replay), while a
+          # full re-run re-executes the worker, whose fresh attempt keeps the genuinely new
+          # outcome countable. The empty-output fallback below fails toward RECORDING (a rare
+          # duplicate beats a silently dropped outcome).
+          OUTCOME_ATTEMPT: ${{ needs.worker.outputs.outcome_attempt }}
         run: |
           python3 registry/scripts/model-health.py record \
             --provider "$PROVIDER" \
             --model-alias "$MODEL_ALIAS" \
             --exit-class "$EXIT_CLASS" \
             --reset-hint "$RESET_HINT" \
-            --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+            --run-id "$GITHUB_RUN_ID.${OUTCOME_ATTEMPT:-$GITHUB_RUN_ATTEMPT}"
 
   release:
     name: Always release live account lease
