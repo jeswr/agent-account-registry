@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The fix depends on a subtle invariant (compare.py always writes a valid json_out before its parity-fail exit, so the stub is only used for crash/timeout). This is verified by reading, but nothing guards against a future refactor of compare.py that adds a non-zero exit path AFTER a partial json_out write, or that moves the json_out write, which would silently reintroduce the masking bug or preserve a stale summary. This is bench infra where shell-harness tests are not an established pattern in this repo, so it does not block the change.",
+   "file": "scripts/bench/update-same-box.sh",
+   "fix_hint": "Optional follow-up (bead, not this PR): a tiny shell test that stubs compare.py to (a) write a valid JSON then exit 1 -> assert harness exits 1 AND the envelope carries the real latency rows, and (b) exit 1 writing no/invalid JSON -> assert the error stub is used and harness still exits non-zero.",
+   "severity": "minor",
+   "title": "No automated regression test pins the exit-code-propagation / preserve-real-JSON behavior"
+  }
+ ],
+ "progress": null,
+ "summary": "Correct, honest bench-harness bugfix. Previously scripts/bench/update-same-box.sh swallowed any non-zero exit from compare.py: it overwrote the real measurements with an empty stub AND exited 0, masking a legitimate parity-gate FAILURE. The change captures COMPARE_EXIT, preserves the real JSON summary (writing the stub only when the file is genuinely missing/invalid, e.g. crash/timeout), and propagates the exit code via `exit \"${COMPARE_EXIT}\"`. The compare.py hunk is comment-only \u2014 the `if parity_gate == \"fail\": sys.exit(parity_note)` is pre-existing context, so no Python behavior changes. Soundness verified: compare.py writes json_out (416-418) immediately before its only non-zero exit (422-423) with nothing but a comment between, so `valid-JSON + non-zero-exit` uniquely implies a measured parity fail and the preserved summary is always accurate; a crash/timeout leaves invalid/missing JSON -> stub + honest non-zero exit. The only in-repo caller, multi-axis-box.sh:315-316, runs the harness with `|| rc=$?`, logs status/rc, and pulls the envelope from OUT_DIR regardless \u2014 so it ingests honest measurements while still surfacing the failed gate, matching the code comments. No CI workflow invokes the script, so exit-code propagation breaks nothing. The `set +e`/`$?`/`set -e` idiom is correct and the EXIT trap preserves the intended exit code. No injection; comments are legitimate.",
+ "verdict": "approve"
+}
