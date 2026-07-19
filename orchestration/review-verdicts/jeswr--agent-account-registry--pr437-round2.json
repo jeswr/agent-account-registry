@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 437,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5a65b874d642492e3ca21edb8cf4cce1af70d69c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved. The added self-test extracts and executes all three real embedded workflow heredocs, fails if extraction breaks, and includes meaningful success and failure controls: both claim paths reject missing and empty values for every routing metadata field, while the live selected-model path accepts exact matches and rejects empty and mismatched values for provider, harness, and credential format without writing the secret reference. The workflow changes themselves fail closed and preserve exact routing equality before secret exposure. No new correctness, soundness, test-validity, or security issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
