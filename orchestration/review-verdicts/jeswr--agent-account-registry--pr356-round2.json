@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 356,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2bec9d92e30d22ebb477114836e7ac830049870a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 defects are resolved. Sub-threshold network-unknown streaks are now persisted in a repository variable and the tests explicitly verify that the first two unknowns perform no issue mutation; the alert issue is created or reopened only at the threshold. This also removes the create-output parsing path that could strand a newly created issue open. The implementation keeps probe-health paging distinct from the credential verdict, fails red on state/alert read or write failures, resets only on definitive probe results, preserves exact-title issue matching, and exercises the meaningful transition and failure paths with non-vacuous assertions. The workflow permission expansion is explained and scoped to the repository-variable API used by the change.",
+  "verdict": "approve"
+ }
+}
