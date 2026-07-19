@@ -850,6 +850,47 @@ jobs:
           echo "class=$cls" >> "$GITHUB_OUTPUT"
           echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
 
+      # TTL guard (audit-2026-07-17, tightened for target issue #126): App installation tokens
+      # live 60 minutes and app-token-live is minted BEFORE the heavy checkout + toolchain +
+      # model run, so with worker_timeout_minutes up to 90 a long model run used to reach
+      # publish/followups/final-state with an EXPIRED token — the model's completed work was
+      # discarded AND the deferral write failed, stranding the issue at status:in-progress. This
+      # fresh mint immediately after the model step keeps all post-model writes inside a new
+      # 60-minute window. `always()` is load-bearing: final-state also runs on the model/gate
+      # failure path (to write status:deferred instead of stranding the issue). continue-on-error
+      # + the `|| app-token-live` fallbacks below keep a transient mint hiccup from being worse
+      # than the old single-mint behavior — a stale fallback just fails the publish CLOSED (git/gh
+      # reject an expired token); it never grants stale access.
+      #
+      # CREDENTIAL BOUNDARY (PR #310 review round 1, blocker): this mint MUST stay BEFORE the
+      # gate. The gate executes target-CONTROLLED cargo build scripts/tests host-side; code run
+      # there can outlive its step (e.g. a detached process) and observe later processes on this
+      # shared runner, so the Registry Admin App PRIVATE KEY must never be handed to any step
+      # that runs after the gate. Do NOT move this mint later to widen the TTL window. The #126
+      # failure mode (a long gate expiring this token before publish/final-state) is instead
+      # closed by BOUNDING the post-mint window: the toolchain and gate steps below carry hard
+      # step timeouts (10 + 40 minutes), so publish/followups/final-state always start within
+      # ~50 minutes of this mint. An overlong gate now fails CLOSED — publish is skipped and
+      # final-state still holds a VALID token to write status:deferred (instead of the pre-fix
+      # stranding). Lifting the gate cap safely requires publishing from an isolated job on a
+      # fresh runner that executes no target code — filed as a back-linked follow-up issue.
+      - name: Mint post-model target-scoped App token (publish/final-state TTL guard)
+        id: app-token-post
+        if: ${{ always() && !inputs.dry_run }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
+          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
+          permission-workflows: write
+
       - name: Write back a rotated full account credential
         id: writeback
         if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' && steps.model.outcome != 'skipped' }}
@@ -867,6 +908,9 @@ jobs:
         # which fails the gate with "rustup could not choose a version of cargo". Set one up in the target
         # dir so a rust-toolchain.toml pin is honoured; harmless for non-cargo gate profiles.
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        # Post-mint TTL arithmetic (target issue #126): this step erodes the app-token-post
+        # window, so it carries a hard cap. See the credential-boundary comment on that mint.
+        timeout-minutes: 10
         working-directory: target
         run: |
           set -uo pipefail
@@ -879,6 +923,14 @@ jobs:
       - name: Run policy-selected local gate
         id: gate
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        # Hard cap (target issue #126): bounds the post-mint window so app-token-post is still
+        # valid at publish/followups/final-state (60-minute installation-token TTL). A gate that
+        # exceeds the cap fails CLOSED — publish is skipped and final-state writes status:deferred
+        # with a valid token. Do NOT lift this cap by moving the token mint after this step: the
+        # gate runs target-controlled cargo code, and the App private key must never reach a step
+        # that executes after it (PR #310 review round 1 blocker). The safe way to lift it is an
+        # isolated publisher job on a fresh runner (follow-up issue).
+        timeout-minutes: 40
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
@@ -892,38 +944,6 @@ jobs:
           # GitHub job log (streamed off-runner, not a local file), which is a sufficient and safe
           # crash signal. The failure-class annotation below reads only host-derived step outcomes.
         run: bash ../registry/scripts/worker-live.sh gate
-
-      # TTL guard (audit-2026-07-19, target issue #126): App installation tokens live 60 minutes.
-      # app-token-live is minted BEFORE the heavy checkout + model run + toolchain setup + the
-      # potentially long cargo gate, so with worker_timeout_minutes up to 90 a long gate used to
-      # reach publish/followups/final-state with an EXPIRED token — the model's completed work was
-      # discarded AND the deferral write failed, stranding the issue at status:in-progress. This
-      # mint is placed AFTER the gate (the last long, target-code step) and immediately before the
-      # only steps that spend it, so publish/followups/final-state always run inside a fresh
-      # 60-minute window no matter how long the model + gate ran. `always()` is load-bearing:
-      # final-state also runs on the model/gate failure path (to write status:deferred instead of
-      # stranding the issue), so a fresh token must exist there too. continue-on-error + the
-      # `|| app-token-live` fallbacks below keep a transient mint hiccup from being worse than the
-      # old single-mint behavior — a stale fallback just fails the publish CLOSED (git/gh reject an
-      # expired token); it never grants stale access. NOTE: the mint still runs on a runner that
-      # executed the hostile cargo gate; the audit's stronger prescription (a separate publisher
-      # job with no target code) is tracked as a back-linked follow-up.
-      - name: Mint post-model target-scoped App token (publish/final-state TTL guard)
-        id: app-token-post
-        if: ${{ always() && !inputs.dry_run }}
-        continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
-          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
-          owner: ${{ needs.resolve.outputs.target_owner }}
-          repositories: ${{ needs.resolve.outputs.target_name }}
-          permission-contents: write
-          permission-issues: write
-          permission-pull-requests: write
-          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
-          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
-          permission-workflows: write
 
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
