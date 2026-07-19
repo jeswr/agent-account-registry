@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "The round-1 major finding is resolved. The decide path now enumerates open alert markers on both the primary and distinct fallback routes, unions them for orphan classification, and retains the fallback-route marker set to bind recovery delivery to the repository where a prior firing retry could have created the issue. Recovery cannot be falsely confirmed by a primary-route no-op: when the fallback marker was observed, fallback closure is required and any failure leaves the action undelivered, causing a nonzero decide result. Enumeration failures and possibly truncated results defer recovery rather than fabricate it. The new stateful two-route test is non-vacuous and exercises the exact prior failure path, including the red direction (failed fallback close must remain open and return nonzero) and successful retry. No reviewer-directed prompt injection appears in the diff.",
+ "verdict": "approve"
+}
