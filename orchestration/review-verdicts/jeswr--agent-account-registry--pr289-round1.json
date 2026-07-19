@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_current_links` first verifies the PR identity, but then iterates over `linked_issue_numbers(pull)`, which returns both the branch-encoded issue and every `Fixes`/closing reference found in the body. Thus an App-authored same-repository PR on `sparq-agent/issue-9-...` whose marker-bearing body also says `Fixes #25` is entered in the links map for both 9 and 25. `_plan_actions` will then skip stale/orphan recovery for issue 25 even though the authenticated worker branch is not bound to it. This violates the function's claimed source-issue semantics and the trust plane's exact-match requirement. The new tests only exercise matching branch/body values and outsider identities, so they do not detect this case.",
+   "file": "scripts/groom.py",
+   "fix_hint": "For recovery suppression, derive the sole linked source issue from the `re.Match` returned by `_worker_pr_identity` (the branch's `issue` group), rather than from all body closing references. Add a non-vacuous test with a valid App-authored worker PR whose branch encodes one issue and whose body references another, asserting that only the branch issue is linked and only its recovery is suppressed.",
+   "severity": "major",
+   "title": "Authenticated worker PR can suppress recovery for unrelated body-linked issues"
+  }
+ ],
+ "progress": null,
+ "summary": "The new identity gate closes the outsider/fork linkage hole, and the added positive and negative tests are meaningful. However, recovery suppression still lacks an exact source-issue binding: after authenticating a worker PR, `_current_links` trusts every closing reference in its body, not just the issue encoded in the authenticated worker branch. A single genuine bot PR can therefore suppress repair for unrelated issues. This is a major trust-plane correctness gap, and the tests do not cover it.",
+ "verdict": "request_changes"
+}
