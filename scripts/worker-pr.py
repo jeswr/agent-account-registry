@@ -1425,7 +1425,23 @@ def _arm_error_text(result):
     return " ".join(f"{result.stderr or ''} {result.stdout or ''}".split())[:300]
 
 
-def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS):
+def _arm_hold_recheck(repo, pr_number, issue):
+    """(sol r2 on #334) LIVE hold revalidation INSIDE the arm retry window — the SAME
+    live_human_holds probe the pre-arm recheck runs, re-read fresh. Returns
+    ('hold', labels) when a human/groom park is live, ('unreadable', error) when the hold
+    surface cannot be read (fail CLOSED — the caller treats it as a failed attempt so the
+    draft-restore liveness path still runs, instead of raising past the undo), and
+    (None, '') when clear."""
+    try:
+        holds = live_human_holds(repo, pr_number, issue=issue)
+    except WorkerPrError as exc:
+        return "unreadable", str(exc)
+    if holds:
+        return "hold", ", ".join(holds)
+    return None, ""
+
+
+def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=None):
     """Latch the sha-bound auto-merge, surviving the post-`pr ready` CLEAN-STATUS race
     (P1, runs 29674274380/29674657458: every failed arm's ready_for_review `gate` run
     STARTED 1-14s AFTER the enable call failed — the arm raced GitHub's check-run
@@ -1436,12 +1452,34 @@ def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS):
     branch protection still enforces the required `gate`, so this can never merge past a
     red check); on any other failure back off and retry (transient read-lag / the queued
     gate registering). Every gh failure is PRINTED — the pre-fix path swallowed stderr,
-    leaving runs with only the generic 'arm failed' line. Returns (ok, mode, last_error)
-    with mode in {'auto', 'direct'}."""
+    leaving runs with only the generic 'arm failed' line.
+
+    (sol r2 on #334) HOLD REVALIDATION PER ATTEMPT: this retry/backoff loop (~14s worst
+    case) runs AFTER ready_and_arm's single pre-arm hold probe, and a park that lands
+    during backoff (review:needs-user / needs:user on the PR, needs:* on the source
+    issue) does NOT move the head — --match-head-commit cannot refuse it, so without a
+    re-probe the retry (or the direct-merge fallback, the point of no return) would
+    arm/merge straight past the park. The live hold probe re-runs immediately BEFORE
+    every retry attempt AND before the direct-merge fallback; any hold aborts with mode
+    'human_hold' (the caller restores the draft and exits with the valid human_hold
+    shape); an unreadable hold surface aborts as a plain failure (fail closed, draft
+    restored, the sweep retries). Returns (ok, mode, last_error) with mode in
+    {'auto', 'direct', 'human_hold'}."""
     last_error = ""
     for attempt in range(1, attempts + 1):
         if attempt > 1:
             _arm_sleep_backoff(attempt - 1)
+            # (sol r2 on #334) re-probe immediately before the retry: the backoff window
+            # is exactly where a mid-arm park lands without moving the head.
+            verdict, detail = _arm_hold_recheck(repo, pr_number, issue)
+            if verdict == "hold":
+                print(f"arm attempt {attempt}/{attempts}: ABORTED — human hold live "
+                      f"({detail}); the park wins over the retry", file=sys.stderr)
+                return False, "human_hold", f"human hold live mid-arm: {detail}"
+            if verdict == "unreadable":
+                print(f"arm attempt {attempt}/{attempts}: hold revalidation unreadable; "
+                      f"refusing to retry (fail closed): {detail}", file=sys.stderr)
+                return False, "", f"hold revalidation unreadable (fail closed): {detail}"
         merge = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash", "--auto",
                          "--match-head-commit", reviewed_sha], check=False)
         if merge.returncode == 0:
@@ -1450,6 +1488,19 @@ def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS):
         print(f"arm attempt {attempt}/{attempts}: enable auto-merge failed: {last_error}",
               file=sys.stderr)
         if any(marker in last_error.lower() for marker in ARM_ALREADY_MERGEABLE_MARKERS):
+            # (sol r2 on #334) the DIRECT merge is the point of no return (no latch to
+            # disarm afterwards) — revalidate the hold surfaces immediately before it.
+            verdict, detail = _arm_hold_recheck(repo, pr_number, issue)
+            if verdict == "hold":
+                print(f"arm attempt {attempt}/{attempts}: ABORTED — human hold live "
+                      f"({detail}); refusing the direct clean-status merge",
+                      file=sys.stderr)
+                return False, "human_hold", f"human hold live mid-arm: {detail}"
+            if verdict == "unreadable":
+                print(f"arm attempt {attempt}/{attempts}: hold revalidation unreadable; "
+                      f"refusing the direct merge (fail closed): {detail}",
+                      file=sys.stderr)
+                return False, "", f"hold revalidation unreadable (fail closed): {detail}"
             direct = _run_gh(["pr", "merge", str(pr_number), "-R", repo, "--squash",
                               "--match-head-commit", reviewed_sha], check=False)
             if direct.returncode == 0:
@@ -1468,7 +1519,11 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:* on the source issue) are re-read
     live immediately before the first mutation: a park that landed mid-review-run aborts the
     ready+arm untouched (arm_complete=false), so an in-flight run can never arm past a
-    human/groom park the busy-partition carve-out relies on.
+    human/groom park the busy-partition carve-out relies on. (sol r2 on #334) the same probe
+    re-runs INSIDE the arm retry window — before every retry attempt and before the
+    direct-merge fallback (see _arm_auto_merge) — because a park landing during backoff does
+    not move the head and the --match-head-commit CAS alone cannot refuse it; a mid-arm hold
+    exits with the same human_hold shape after the draft restore.
 
     Account disjointness is asserted on SALTED HASHES (locked decision 22a): the registry
     provenance record stores impl_account_h, and the live reviewer handle is hashed here with the
@@ -1587,10 +1642,27 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # (see _arm_auto_merge), and the REAL gh error rides every failure message — the
         # pre-fix single-shot attempt swallowed stderr and lost to the race deterministically
         # on any PR whose draft-time `gate` was already green (#326 lost 3 rounds -> parked).
-        armed_ok, arm_mode, arm_error = _arm_auto_merge(repo, pr_number, reviewed_sha)
+        # (sol r2 on #334) _arm_auto_merge re-runs the live hold probe before every retry
+        # attempt and before the direct-merge fallback — a park landing during the backoff
+        # window (~14s worst case) does not move the head, so the head CAS alone cannot
+        # refuse it; a mid-arm hold comes back as mode 'human_hold'.
+        armed_ok, arm_mode, arm_error = _arm_auto_merge(repo, pr_number, reviewed_sha,
+                                                        issue=issue)
         if not armed_ok:
             undo = _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
             if undo.returncode == 0:
+                if arm_mode == "human_hold":
+                    # (sol r2 on #334) a park landed MID-ARM (during backoff / before the
+                    # direct-merge fallback): same valid-exit shape as the pre-arm hold
+                    # abort (arm_complete=false — review-fix.yml never binds reviewed-sha)
+                    # with the draft restored (undo above — semantics unchanged) and NO
+                    # review-state/comment churn: the PR is human-owned, the sweep's
+                    # enumerator excludes it while the park stands.
+                    _write_outputs({"armed": False, "head_moved": False,
+                                    "human_hold": True, "arm_complete": False})
+                    print(f"ready+arm ABORTED mid-arm: {arm_error} — the park stands; "
+                          "draft restored, no review-state mutation was applied")
+                    return
                 # Back to draft with review:needs and NO reviewed-sha bind (the bind runs after
                 # this step) — the sweep re-reviews next tick, bounded by max_review_rounds.
                 raise WorkerPrError(
@@ -2775,6 +2847,11 @@ def _self_test():
             script = raa_state.get("merge_script")
             if script is not None:
                 rc, err = script.pop(0) if script else (0, "")
+                if rc != 0 and raa_state.get("hold_after_fail"):
+                    # (sol r2 on #334) mid-arm park injection: the hold labels land on the
+                    # live PR only AFTER a failed merge attempt — simulating a human/groom
+                    # park arriving during the retry backoff window, with the head unmoved.
+                    raa_state["labels"] = raa_state.pop("hold_after_fail")
                 return argparse.Namespace(returncode=rc, stdout="", stderr=err)
             if raa_state.get("merge_fails"):
                 if kw.get("check", True):
@@ -2784,13 +2861,15 @@ def _self_test():
 
     def run_raa(head_ok=True, merge_fails=False, comments=(), labels=(),
                 issue_labels=(), issue=None, probe_garbage=False, labels_payload=None,
-                benign_diff=False, security_keywords=(), merge_script=None):
+                benign_diff=False, security_keywords=(), merge_script=None,
+                hold_after_fail=None):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
         raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
                          labels=labels, issue_labels=issue_labels,
                          issue_probe_garbage=probe_garbage, labels_payload=labels_payload,
-                         benign_diff=benign_diff, merge_script=merge_script)
+                         benign_diff=benign_diff, merge_script=merge_script,
+                         hold_after_fail=hold_after_fail)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -2926,6 +3005,27 @@ def _self_test():
                    any("pr merge" in c and "--auto" not in c for c in raa_calls),
                    any("--undo" in c for c in raa_calls)),
                   (True, True, ARM_ATTEMPTS, False, True))
+        # ---- (sol r2 on #334) HOLD REVALIDATION INSIDE THE ARM RETRY WINDOW: the
+        # retry/backoff (~14s worst case) runs AFTER the single pre-arm hold probe, and a
+        # park landing during backoff does NOT move the head — --match-head-commit cannot
+        # refuse it. The live hold probe must re-run before EVERY retry attempt and before
+        # the direct-merge fallback; any hold refuses with the valid-exit human_hold shape
+        # and the draft restored (no needs-user, no review-state churn). ----
+        run_raa(merge_script=[(1, lag_err)], hold_after_fail=("needs:user",))
+        merges = [c for c in raa_calls if "pr merge" in c]
+        check("a hold injected during backoff REFUSES the retry (zero further merge argv)",
+              (len(merges), raa_outputs.get("human_hold"), raa_outputs.get("arm_complete"),
+               raa_outputs.get("armed"), any("--undo" in c for c in raa_calls),
+               "needs-user" in raa_calls, "state:pass" in raa_calls),
+              (1, True, False, False, True, False, False))
+        run_raa(merge_script=[(1, clean_err)], hold_after_fail=("review:needs-user",))
+        merges = [c for c in raa_calls if "pr merge" in c]
+        check("a hold live at the direct-merge fallback REFUSES the direct merge",
+              (len(merges), any("pr merge" in c and "--auto" not in c for c in raa_calls),
+               raa_outputs.get("human_hold"), raa_outputs.get("arm_complete"),
+               raa_outputs.get("armed"), any("--undo" in c for c in raa_calls),
+               "needs-user" in raa_calls, "state:pass" in raa_calls),
+              (1, False, True, False, False, True, False, False))
         # ---- [round-4 P1] PARKED-BUT-ARMING RACE: a human/groom park that landed while
         # this review run was in flight WINS — the pre-arm hold recheck aborts with the
         # valid-exit shape and NO ready/arm/audit/review-state mutation at all ----
