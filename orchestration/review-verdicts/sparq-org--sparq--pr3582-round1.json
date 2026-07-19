@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3582,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ebd7ac6628a4c6236e49b8e90e5e4c8dcc20fe56",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added snapshot comment accurately documents the repository structure and existing coverage model. `zk/compose/Nargo.toml` is a workspace-only manifest, the root has no `main.nr`, each proving package is a workspace member, and the existing tests separately require baselines for every compose member and discover bin-type circuits elsewhere under `zk/`. The wording also preserves the required not-yet-sound/external-audit caveat and makes no new implementation or soundness claim. This documentation-only change is correct and complete as scoped.",
+  "verdict": "approve"
+ }
+}
