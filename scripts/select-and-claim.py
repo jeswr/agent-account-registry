@@ -226,6 +226,44 @@ def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, ma
     return total
 
 
+def available_account_slots(accounts, leases, model_chain, now, account_pool=None, usage=None,
+                            margin=SAFETY_MARGIN):
+    """Return the live remaining worker slots able to serve ``model_chain``.
+
+    This is the account-slot bound used by the review/fix dispatcher.  Unlike the historical
+    shared ``review:`` / ``fix:`` lease-row caps, it counts each admitted account's configured
+    ``max_concurrent_workers`` and subtracts that account's live leases.  Availability, policy
+    pool membership, exact model membership, and the usage/backoff gate are all applied before an
+    account contributes capacity.  Unknown usage therefore fails closed whenever a usage map is
+    supplied, exactly like ``choose_account``; callers that deliberately allow the static path
+    pass ``usage=None``.
+    """
+    live = reclaim_expired(leases, now)
+    allowed = set(account_pool) if account_pool is not None else None
+    slots = 0
+    for account in accounts:
+        handle = account.get("handle")
+        if not isinstance(handle, str) or not handle:
+            continue
+        if allowed is not None and handle not in allowed:
+            continue
+        if not account.get("available", True):
+            continue
+        servable = [model for model in model_chain if model in account.get("models", [])]
+        if not servable:
+            continue
+        if usage is not None and not any(
+                usage_eligible(usage.get(handle), margin, model=model, now=now)
+                for model in servable):
+            continue
+        try:
+            cap = int(account.get("max_concurrent_workers", 4))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        slots += max(0, cap - active_for(live, handle))
+    return slots
+
+
 def make_lease(account, holder, package, role, model, now, ttl):
     return {"account": account, "claim_id": None, "holder": holder, "package": package,
             "role": role, "model": model, "issued_at": now, "expires_at": now + ttl}
@@ -518,13 +556,25 @@ def read_accounts(repo):
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
           account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None,
-          margin=SAFETY_MARGIN):
+          margin=SAFETY_MARGIN, account_slot_bound=False, return_reason=False):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free).
     Raises LeaseIOError when an account WAS eligible but the ledger write kept failing — that is an
     infrastructure failure (persistent CAS contention, or the contents-API PUT rejected outright,
     e.g. by a required-status-check branch protection on the ledger's branch), NOT a capacity
-    signal, and must not be reported as 'no eligible account' (issue #28)."""
+    signal, and must not be reported as 'no eligible account' (issue #28).
+
+    ``account_slot_bound`` makes the live sum of remaining per-account slots the aggregate bound.
+    It is used by dispatch fan-out instead of a coarse fleet-wide lease-row constant.  Every item
+    still takes its own CAS lease, so the account cap, holder-key duplicate check, and package
+    partition remain first-writer-wins.  ``return_reason`` is an observability-only extension:
+    existing callers retain the historical claim-or-None return, while the dispatcher receives
+    ``(claim, reason)`` and can distinguish capacity from single-flight deferral.
+    """
     import uuid
+
+    def result(value, reason=""):
+        return (value, reason) if return_reason else value
+
     accounts = read_accounts(repo)
     if account_pool is not None:
         allowed = set(account_pool)
@@ -536,20 +586,23 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         live = reclaim_expired(leases, now)
         key = holder_key(holder)
         if key and any(holder_key(lease.get("holder")) == key for lease in live):
-            return None
+            return result(None, "pr-single-flight")
         if holder_prefix and not partition_available(live, holder_prefix, package):
-            return None
+            return result(None, "package-single-flight")
         if max_holder_concurrent is not None:
             if max_holder_concurrent <= 0 or not holder_prefix:
-                return None
+                return result(None, "lane-cap")
             active_holders = sum(
                 1 for lease in live if str(lease.get("holder", "")).startswith(holder_prefix)
             )
             if active_holders >= max_holder_concurrent:
-                return None
+                return result(None, "lane-cap")
+        if account_slot_bound and available_account_slots(
+                accounts, live, model_chain, now, usage=usage, margin=margin) <= 0:
+            return result(None, "no-account-slots")
         acct = choose_account(accounts, live, model_chain, package, role, now, usage=usage, margin=margin)
         if acct is None:
-            return None
+            return result(None, "no-account-slots")
         a = next(x for x in accounts if x["handle"] == acct)
         # [FABLE-5] Assign the model CONSISTENTLY with the eligibility that admitted this account. Picking
         # the first chain-model the account merely SERVES would route fable onto an account whose fable
@@ -561,13 +614,13 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
                           if m in a["models"] and usage_eligible(usage.get(acct), margin, model=m,
                                                                  now=now)), None)
             if model is None:
-                return None  # no chain model is eligible for the admitted account (defensive; shouldn't happen)
+                return result(None, "no-account-slots")  # defensive; should match the slot gate
         else:
             model = next((m for m in model_chain if m in a["models"]), model_chain[0])
         cid = uuid.uuid4().hex
         live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
         if _write_ledger(repo, live, sha, f"claim {cid[:8]} {acct} {package}/{role}"):
-            return {
+            return result({
                 "account": acct,
                 "secret_ref": a.get("secret_ref"),
                 "provider": a.get("provider"),
@@ -575,7 +628,7 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
                 "credential_format": a.get("credential_format"),
                 "model": model,
                 "claim_id": cid,
-            }
+            })
     # Every retry found an eligible account yet the write never landed: an infra failure, not
     # a capacity condition. Raising (vs returning None) keeps the dispatcher's defer reason
     # honest — live incident 2026-07-17: a required `gate` status check added to the default
@@ -1185,6 +1238,55 @@ def _self_test():
           partition_available([mixed[1]], "owner/repo#", "crate-a"), True)
     check("same-crate reviews still serialize under the shared review: prefix",
           partition_available(mixed, "review:", "crate-a"), False)
+
+    # ---- issue #448: review/fix fan-out is bounded by LIVE per-account slots ----
+    # The production sol account advertises its parallelism through this exact catalog field;
+    # model the measured 12-slot shape and prove active leases are subtracted rather than merely
+    # counting one "available account".  Foreign accounts/providers never consume sol capacity.
+    sol12 = [{"handle": "acctsol", "models": ["sol", "luna"],
+              "max_concurrent_workers": 12, "available": True,
+              "secret_ref": "ACCTSOL_TOKEN", "provider": "openai"}]
+    four_sol = [
+        make_lease("acctsol", f"fix:o/r#{number}@r.1", f"crate-{number}", "fix", "sol",
+                   now, 100)
+        for number in range(4)
+    ]
+    check("12-slot sol account exposes 8 remaining slots",
+          available_account_slots(sol12, four_sol, ["sol", "luna"], now,
+                                  account_pool=["acctsol"]), 8)
+    check("fully occupied sol account exposes zero slots (fail closed)",
+          available_account_slots(sol12, four_sol + [
+              make_lease("acctsol", f"fix:o/r#{number}@r.1", f"crate-{number}", "fix",
+                         "sol", now, 100)
+              for number in range(4, 12)
+          ], ["sol"], now, account_pool=["acctsol"]), 0)
+    check("unavailable sol account contributes no slots",
+          available_account_slots([{**sol12[0], "available": False}], [], ["sol"], now), 0)
+    check("active reactive backoff contributes no sol slots",
+          available_account_slots(sol12, [], ["sol"], now,
+                                  usage={"acctsol": {"exempt": True,
+                                                       "backoff_until": now + 60}}), 0)
+
+    # Reasoned claims make the telemetry's lease-conflict bucket testable without weakening the
+    # historical claim-or-None API.  Same-repo package single-flight still wins before capacity.
+    with _StubLedger(sol12, [
+            make_lease("acctsol", "fix:o/r#40@r.1", "crate-a", "fix", "sol", now, 100)]):
+        conflict, why = claim(
+            "r", "crate-a", "fix", ["sol"], "fix:o/r#41@r.1", now,
+            account_pool=["acctsol"], holder_prefix="fix:o/r#",
+            account_slot_bound=True, return_reason=True)
+    check("reasoned claim defers a package lease conflict", (conflict, why),
+          (None, "package-single-flight"))
+    with _StubLedger(sol12, [
+            make_lease("acctsol", f"fix:o/r#{number}@r.1", f"crate-{number}", "fix", "sol",
+                       now, 100)
+            for number in range(12)]):
+        no_slot, why = claim(
+            "r", "fresh-crate", "fix", ["sol"], "fix:o/r#99@r.1", now,
+            account_pool=["acctsol"], holder_prefix="fix:o/r#",
+            account_slot_bound=True, return_reason=True)
+    check("reasoned claim fails closed at S=0", (no_slot, why),
+          (None, "no-account-slots"))
 
     # Two live review leases for DISTINCT PRs are bounded by the SHARED `review:` prefix cap
     # (max_holder_concurrent=2 = the static codex slot bound; codex is usage-exempt so the CLI
