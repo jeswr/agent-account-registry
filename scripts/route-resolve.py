@@ -31,10 +31,13 @@ def resolve(labels, doc):
     labels = set(labels)
 
     def role_of(lbs):
-        for lb in sorted(lbs):  # deterministic (mirrors dispatch-plan._role_of)
-            if lb.startswith("role:"):
-                return lb[5:]
-        return None
+        # The SINGLE declared role, else None — for zero role:* OR an AMBIGUOUS set (>1). Never
+        # picks one of several roles. Consistent with policy-resolve.resolve, which REJECTS
+        # multiple roles, and the planner (dispatch-plan.plan_dispatch), which rejects an ambiguous
+        # issue before plan construction (#122): a multi-role set here skips the Phase-2 role route
+        # and falls to security/defaults, never a silently-chosen (nondeterministic) role chain.
+        roles = {lb[5:] for lb in lbs if lb.startswith("role:")}
+        return next(iter(roles)) if len(roles) == 1 else None
 
     role = role_of(labels)
     routes = doc.get("route", [])
@@ -82,6 +85,12 @@ def _self_test():
     chk("ci chain has no sub-frontier tier", sorted(set(mc) & {"sonnet", "haiku"}), [])
     # no role -> defaults (sol-led, 2026-07-18).
     chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "sol")
+    # [#122] an AMBIGUOUS multi-role set is NOT resolved to an arbitrarily-picked role route:
+    # role_of returns None, so a non-security multi-role set falls to DEFAULTS (sol-led), not the
+    # docs (haiku) route the pre-fix alphabetically-first pick would have chosen. Mirrors
+    # policy-resolve.resolve, which REJECTS multiple roles. Non-vacuous: flips red on pre-fix code.
+    chk("ambiguous roles -> defaults, not an arbitrary role route",
+        resolve(["role:impl", "role:docs", "area:usage"], doc)[0][0], "sol")
     # review role -> opus + escalate.
     chk("review -> opus/escalate", resolve(["role:review"], doc)[1:], ("registry-reviewer", True))
 
