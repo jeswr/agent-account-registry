@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_cmd_decide` calls `_open_alert_markers` only for `_alert_target()`. However, `_deliver_alerts` can create a firing alert in `_registry_fallback()` when delivery to a distinct private primary route fails. If that provider subsequently disappears from the record window, the primary marker enumeration is empty, `classify_records` emits no recovery, and the public fallback issue remains open forever. Even while records remain, recovery actions are deliberately not retried cross-repo, so route-local state must be accounted for explicitly. The self-tests cover marker enumeration and pure classification but do not exercise this existing fallback-created-alert path.",
+   "file": "scripts/model-health.py",
+   "fix_hint": "Enumerate and recover open markers on every repository where this system may have delivered an alert, while preserving route binding so a recovery closes the marker on the repository where it was found. Fail closed on unreadable/truncated enumeration. Add a delivery-level test in which primary firing delivery fails, fallback creation succeeds, records age out, and the next decide closes the fallback issue without treating a no-op on the primary as confirmation.",
+   "severity": "major",
+   "title": "Orphan recovery ignores alerts created on the fallback route"
+  }
+ ],
+ "progress": null,
+ "summary": "The new stale-alert recovery is incomplete across the existing two-route delivery contract. It enumerates open markers only on `_alert_target()` (the primary route), while firing alerts may be created successfully on `_registry_fallback()` after the primary route fails. Once such an alert's provider records age out, this implementation sees no marker, emits no recovery action, and leaves the fallback alert open indefinitely\u2014the exact failure mode this PR intends to eliminate. Round 1, so progress is null.",
+ "verdict": "request_changes"
+}
