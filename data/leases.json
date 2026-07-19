@@ -62,16 +62,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "0ead7699a6994934baa4aaa8006f2719",
-   "holder": "review:jeswr/agent-account-registry#325@dispatch-29674402323.1",
-   "package": "review-loop",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1784438076,
-   "expires_at": 1784439276
-  },
-  {
-   "account": "acct01",
    "claim_id": "cdc89710fe994a09897ee47e1ede69a6",
    "holder": "review:jeswr/agent-account-registry#330@dispatch-29674402323.1",
    "package": "groom",
