@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "The change correctly adds an isolated, least-privilege alert job that runs regardless of the groom result, routes private alerts only when both destination and token are configured, falls back safely to the registry for a non-sensitive body, upserts on failure/cancellation, and closes only after explicit success. The implementation sanitizes command failures, avoids echoing remote payloads, uses a stable marker with legacy-title fallback, and checks all consequential issue mutations. The self-test is substantive: it covers the decision matrix, routing, private/fallback token wiring, deduplication including renamed and legacy alerts, malformed responses, and failure propagation. The action is SHA-pinned and the new script is enrolled in the required PR-gate self-test suite. No blocking correctness, trust-plane, test-validity, or security issue is supported by the diff.",
+ "verdict": "approve"
+}
