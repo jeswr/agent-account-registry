@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 391,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "112282d754901eca449fcb42c6aa679384084390",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "set_review_state reads live_review once, posts the requested label, and then calls _remove_label for every other member of REVIEW_LABELS, including review:needs-user even when that label was absent from live_review. If a human applies review:needs-user after _live_review_labels returns but before that removal, an automated transition to needs/changes/pass deletes the newly landed hold. This is exactly the residual read-to-write race the new primitive is supposed to defend against, so the claimed never-erase invariant remains false. The self-test is non-vacuous for snapshot behavior but misses the decisive interleaving: its POST mock should simulate a concurrent hold becoming live, and it must assert that review:needs-user is not removed.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Do not remove review labels that were absent from the validated live snapshot; in particular, an away transition must never issue a deletion for review:needs-user unless it was observed and handled under an explicitly authorized human action. Add a test whose POST hook simulates review:needs-user arriving after the GET and assert that the removal calls preserve it. Also ensure ambiguous-state convergence still removes only the stale labels it actually observed.",
+    "severity": "blocker",
+    "title": "A hold arriving after the live read is still erased"
+   }
+  ],
+  "progress": null,
+  "summary": "The fresh-read guard protects a review:needs-user label only when it is present in the initial snapshot, but set_review_state still unconditionally removes every other review label. A human hold applied after that read can therefore be deleted by the subsequent removal loop. This contradicts the stated invariant that automated stamps never erase a human terminal hold, and the self-test does not model the read-to-write interleaving. The change is not yet sound for its trust-plane purpose.",
+  "verdict": "request_changes"
+ }
+}
