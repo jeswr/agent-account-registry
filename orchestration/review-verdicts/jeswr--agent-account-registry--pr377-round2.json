@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 377,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e78e42771c4972d5c83db8b5e068b17ecaf1c4e3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. Live recovery for an escalate-tier route now writes a bot-authenticated durable reset receipt whenever an active starvation alert exists, before allocation or launch can fail, and both persistence evaluation and recovery detection discard alerts at or before the newest reset or worker attempt. The new self-tests directly exercise the previously missing old-alert -> recovery-without-attempt -> fresh-alert counterexample, verify that a genuinely persistent post-reset streak still escalates, and cover one-reset-per-streak behavior. The route remains fail-closed while starved: it stays deferred, never degrades to a weaker model, and only reaches needs:user after the bounded continuous-starvation interval. No new correctness, soundness, test-validity, or security issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
