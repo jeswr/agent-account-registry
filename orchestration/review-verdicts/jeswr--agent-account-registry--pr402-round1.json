@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 402,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8fc65f22e8f462e705856848b8e598026206ee2c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_assert_dockerfile_pinned` only tests `[[ \"$img\" != *@sha256:* ]]`. A Dockerfile such as `ARG BASE` followed by `FROM ${BASE}@sha256:${DIGEST}` therefore passes, even though neither the repository nor this check binds the registry/repository or digest to a concrete value; build arguments can select them later. The same issue permits an arbitrary or empty literal suffix. This makes the added supply-chain check syntactic rather than sound and allows the exact base-image choice to escape review.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Require each external FROM token to be a fully literal image reference ending in `@sha256:` plus exactly 64 hexadecimal characters (while retaining the explicit prior-stage-alias exception), and reject variable expansion in external image references. Add negative self-tests for `${IMAGE}@sha256:${DIGEST}`, a short/non-hex digest, and an empty digest so the bypass flips the suite red.",
+    "severity": "major",
+    "title": "Variable-expanded FROM references bypass the digest-pin assertion"
+   }
+  ],
+  "progress": null,
+  "summary": "The directory-prefix expansion closes the identified trust-surface classification gaps, and the added tests are non-vacuous for a simple mutable tag. However, the new Dockerfile assertion is not a sound source-level digest-pin check: it accepts variable-expanded image names or digests merely because the unexpanded token contains `@sha256:`. That leaves a direct bypass in the new trust check, so this needs changes before approval.",
+  "verdict": "request_changes"
+ }
+}
