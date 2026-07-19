@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3594,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "60241ef38f599204cbe2b09267b459e6027795f1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The page and data-layer contract now accurately narrow the promise to tracked future work, explicitly disclose deferred/untracked rows, and add a data-level test covering every PARTIAL/GAP row. The previously cited query-time rewriting, SWRL ingestion, and ontology/shape-editor rows now satisfy that contract through explicit deferred/not-beaded language, consistent with the relevant design-record entries. The test also validates bead syntax and per-row uniqueness; its real-path import is wired through the site's existing TypeScript test loader. No correctness, soundness, security, or honesty defect remains in the diff.",
+  "verdict": "approve"
+ }
+}
