@@ -326,12 +326,65 @@ def _upsert_limits_line(body, line):
     return "\n".join(out), changed
 
 
-def persist_limits(usage_path):
+PERSIST_ATTEMPTS = 3  # optimistic-concurrency retries per account issue (issue #198)
+
+
+def _issue_view(number, registry_repo, run):
+    """(doc, ok) for one `gh issue view --json body,updatedAt`. ok=False on a non-zero gh
+    returncode or unparseable JSON so the caller PROPAGATES the failure rather than mistaking a
+    failed read for an empty body (issue #198). `doc` is the parsed dict on success."""
+    proc = run(["gh", "issue", "view", str(number), "-R", registry_repo,
+                "--json", "body,updatedAt"],
+               capture_output=True, text=True, timeout=60, check=False)
+    if proc.returncode != 0:
+        return None, False
+    try:
+        doc = json.loads(proc.stdout or "null")
+    except json.JSONDecodeError:
+        return None, False
+    return (doc, True) if isinstance(doc, dict) else (None, False)
+
+
+def _persist_one(number, line, registry_repo, run):
+    """Merge the single `limits:` line into ONE account issue under optimistic concurrency (issue
+    #198). `gh issue edit --body` REPLACES the whole body, so the old code — which rewrote a body
+    snapshot captured in the earlier bulk `issue list` — silently clobbered any concurrent
+    provider / credential-format / secret-reference / notes edit made between the list and the write.
+    Instead re-read the CURRENT body immediately before the write and merge only the limits line onto
+    THAT fresh body; then confirm the merge is live, and if a concurrent writer raced our edit,
+    re-read its body and retry the merge. Returns True on success (incl. an idempotent no-op), False
+    on any gh failure or exhausted retries — the caller PROPAGATES it. NOTE: gh has no conditional
+    (If-Match) write, so a tiny read->write window remains; workflow-level serialization against the
+    other catalog writers (set-up-account) is the belt-and-braces close (see follow-up)."""
+    for _ in range(PERSIST_ATTEMPTS):
+        doc, ok = _issue_view(number, registry_repo, run)
+        if not ok:
+            return False
+        new_body, changed = _upsert_limits_line(doc.get("body") or "", line)
+        if not changed:
+            return True  # the live body already carries this exact limits line — nothing to write
+        edit = run(["gh", "issue", "edit", str(number), "-R", registry_repo, "--body", new_body],
+                   capture_output=True, text=True, timeout=60, check=False)
+        if edit.returncode != 0:
+            return False
+        confirm, ok = _issue_view(number, registry_repo, run)
+        if not ok:
+            return False
+        if (confirm.get("body") or "") == new_body:
+            return True  # our merge is the live body
+        # a concurrent writer changed the issue under us -> re-read its body and re-merge the line
+    return False
+
+
+def persist_limits(usage_path, run=None):
     """Write probed tier limits into the account issues' front-matter (title == handle) so the
-    capacity model stops flying blind. Best-effort: never fails the caller; per-account errors are
-    swallowed. select-and-claim's _parse_account ignores unknown keys, so the extra line is inert
-    for the allocator. Privacy: prints carry no handles or counts (locked decision 22b); the
-    account issues themselves already enumerate the catalog (task #325 seam: they move private)."""
+    capacity model stops flying blind. Best-effort but HONEST (issue #198): every gh failure is
+    PROPAGATED as a non-zero return (the step is continue-on-error, so this surfaces the failure as a
+    red annotation instead of a false 'refreshed'), and each per-issue write goes through _persist_one
+    so a concurrent metadata edit is not silently overwritten. select-and-claim's _parse_account
+    ignores unknown keys, so the extra line is inert for the allocator. Privacy: prints carry no
+    handles or counts (locked decision 22b). `run` is injectable for the self-test ONLY."""
+    run = run or subprocess.run
     registry_repo = os.environ["REGISTRY_REPO"]
     try:
         with open(usage_path, encoding="utf-8") as handle:
@@ -339,27 +392,36 @@ def persist_limits(usage_path):
     except (OSError, json.JSONDecodeError):
         print("account-usage: no usage snapshot; tier-limit persistence skipped")
         return 0
-    try:
-        raw = subprocess.run(
-            ["gh", "issue", "list", "-R", registry_repo, "--state", "open", "--limit", "500",
-             "--json", "number,title,body"],
-            capture_output=True, text=True, timeout=60, check=False).stdout
-        issues = json.loads(raw or "[]")
-    except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
-        print("account-usage: account catalog read failed; tier-limit persistence skipped")
+    if not isinstance(usage, dict):
+        print("account-usage: usage snapshot is not a map; tier-limit persistence skipped")
         return 0
+    listing = run(["gh", "issue", "list", "-R", registry_repo, "--state", "open", "--limit", "500",
+                   "--json", "number,title"],
+                  capture_output=True, text=True, timeout=60, check=False)
+    if listing.returncode != 0:
+        # PROPAGATE (issue #198): the old code swallowed a failed catalog read and still printed
+        # 'refreshed'. A non-zero return makes the (continue-on-error) step surface the failure.
+        print("::warning::account-usage: account catalog read failed; tier-limit persistence skipped")
+        return 1
+    try:
+        issues = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError:
+        print("::warning::account-usage: account catalog read unparseable; tier-limit persistence "
+              "skipped")
+        return 1
+    failures = 0
     for issue in issues:
         handle = str(issue.get("title", "")).strip()
-        line = _limits_line(usage.get(handle)) if isinstance(usage, dict) else None
+        line = _limits_line(usage.get(handle))
         if not line:
             continue
-        new_body, changed = _upsert_limits_line(issue.get("body") or "", line)
-        if not changed:
-            continue
-        subprocess.run(
-            ["gh", "issue", "edit", str(issue.get("number")), "-R", registry_repo,
-             "--body", new_body],
-            capture_output=True, text=True, timeout=60, check=False)
+        if not _persist_one(issue.get("number"), line, registry_repo, run):
+            failures += 1
+    if failures:
+        # No count (locked decision 22b) — only that at least one write did not land.
+        print("::warning::account-usage: one or more tier-limit writes failed (gh returncode "
+              "surfaced) — capacity model may be stale for those accounts")
+        return 1
     print("account-usage: tier-limit lines refreshed")
     return 0
 
@@ -685,6 +747,123 @@ def _self_test():
         (_probe_account({"provider": "anthropic", "secret_ref": "ACCT01_TOKEN", "models": ["haiku"]},
                         {"ACCT01_TOKEN": "tok"}, probe=_rec_probe, fable_probe=_rec_probe)), None)
     probe_calls.clear()
+    # ---- tier-limit persistence: honest failure propagation + no silent overwrite (issue #198) ----
+    class _R:  # a tiny CompletedProcess stand-in for the fake gh runner
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def _fake_gh(script):
+        """(run, edits). `script` keys:
+          'list': (rc, stdout_json)              -> the bulk `issue list` response
+          'view': {num: [body_or_None, ...]}     -> successive `issue view` bodies (None = rc!=0)
+          'edit': {num: [rc, ...]}               -> successive `issue edit` returncodes (default 0)
+        Every `issue edit` records (num, body) into the returned `edits` list."""
+        edits = []
+
+        def run(args, **_kw):
+            sub = args[2]  # ["gh", "issue", <sub>, <num?>, ...]
+            if sub == "list":
+                rc, out = script.get("list", (0, "[]"))
+                return _R(rc, out)
+            if sub == "view":
+                num = args[3]
+                queue = script.get("view", {}).get(num, [])
+                body = queue.pop(0) if queue else ""
+                if body is None:
+                    return _R(1, "")               # simulate a failed read
+                return _R(0, json.dumps({"body": body, "updatedAt": "t"}))
+            if sub == "edit":
+                num = args[3]
+                body = args[args.index("--body") + 1]
+                edits.append((num, body))
+                queue = script.get("edit", {}).get(num, [])
+                return _R(queue.pop(0) if queue else 0)
+            return _R(0, "")
+        return run, edits
+
+    def _usage_file(obj):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(obj, fh)
+        fh.close()
+        return fh.name
+
+    saved_repo = os.environ.get("REGISTRY_REPO")
+    os.environ["REGISTRY_REPO"] = "o/r"
+    limits_usage = {"acct01": {"5h_limit": "100", "7d_limit": "700"}}
+    upath = _usage_file(limits_usage)
+    limits_line = "limits: 5h_limit=100 7d_limit=700"
+
+    #   (i) the concurrent-overwrite regression: a provider edit lands between the bulk `list` and the
+    #   mutation. The write MUST merge onto the FRESH view body (preserving `provider: anthropic-eu`),
+    #   never the stale snapshot. This is the core #198 assertion — it flips red if the merge reads a
+    #   stale body or drops the concurrent field.
+    fresh = "provider: anthropic-eu\nmodels: [haiku]\n"
+    merged = _upsert_limits_line(fresh, limits_line)[0]
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [fresh, merged]}})
+    rc = persist_limits(upath, run=run)
+    chk("persist: success returns 0", rc, 0)
+    chk("persist: merges limits onto the FRESH body (no stale overwrite)",
+        (len(edits), "provider: anthropic-eu" in edits[0][1], limits_line in edits[0][1]),
+        (1, True, True))
+
+    #   (ii) idempotent no-op: the live body already carries the exact line -> zero edits, still 0
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": ["provider: anthropic\n" + limits_line + "\n"]}})
+    chk("persist: idempotent live body writes nothing", (persist_limits(upath, run=run), edits),
+        (0, []))
+
+    #   (iii) a failed bulk catalog read is PROPAGATED (was swallowed with a false 'refreshed')
+    run, edits = _fake_gh({"list": (1, "")})
+    chk("persist: list failure propagates (rc=1, no edits)", (persist_limits(upath, run=run), edits),
+        (1, []))
+
+    #   (iv) an `issue edit` failure is PROPAGATED as a non-zero return, BEFORE the confirm read.
+    #   The confirm view is queued to MATCH new_body, so swallowing the edit returncode would
+    #   confirm-match and wrongly return 0 — this asserts the returncode is honoured immediately.
+    edit_body0 = "provider: anthropic\n"
+    edit_merged = _upsert_limits_line(edit_body0, limits_line)[0]
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [edit_body0, edit_merged]},
+                           "edit": {"7": [1]}})
+    chk("persist: edit failure propagates (rc=1, no confirm swallow)",
+        (persist_limits(upath, run=run), len(edits)), (1, 1))
+
+    #   (v) a failed re-read (view rc!=0) is PROPAGATED, not treated as an empty body
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [None]}})
+    chk("persist: view failure propagates (rc=1)", persist_limits(upath, run=run), 1)
+
+    #   (vi) retry-merges-on-change: a concurrent writer clobbers our edit; the confirm re-read
+    #   detects the mismatch and the merge is re-applied onto the writer's NEW body, then confirmed.
+    body0 = "provider: anthropic\n"
+    clob = "provider: anthropic\nnotes: touched-by-other\n"           # concurrent notes edit
+    merged2 = _upsert_limits_line(clob, limits_line)[0]
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [body0, clob, clob, merged2]}})
+    rc = persist_limits(upath, run=run)
+    chk("persist: retries the merge after a concurrent clobber, then succeeds",
+        (rc, len(edits), "notes: touched-by-other" in edits[-1][1], limits_line in edits[-1][1]),
+        (0, 2, True, True))
+
+    #   (vii) an unrecoverable writer that keeps reverting our line: retries are BOUNDED and the
+    #   exhausted state PROPAGATES as failure (never a false 'refreshed')
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [body0] * (2 * PERSIST_ATTEMPTS)}})
+    chk("persist: exhausted retries propagate as failure, bounded edit attempts",
+        (persist_limits(upath, run=run), len(edits)), (1, PERSIST_ATTEMPTS))
+
+    #   (viii) a non-dict usage snapshot is handled (no probed limits) without touching the catalog
+    lpath = _usage_file(["not", "a", "map"])
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}]))})
+    chk("persist: non-map usage snapshot skips cleanly", (persist_limits(lpath, run=run), edits),
+        (0, []))
+    os.unlink(lpath)
+    os.unlink(upath)
+    if saved_repo is None:
+        os.environ.pop("REGISTRY_REPO", None)
+    else:
+        os.environ["REGISTRY_REPO"] = saved_repo
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
