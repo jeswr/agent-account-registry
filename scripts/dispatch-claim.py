@@ -24,8 +24,10 @@ import tomllib
 # v2 adds top-level `review_items` (the cross-provider review/fix loop) and a per-item `deferred`
 # flag (the deferred-retry path). v3 adds the zero-manual repair surface: review-item states
 # `needs-ci-fix` (red ci-summary gate on the current head) and `needs-rebase` (conflicting base)
-# with an advisory `context` field, the `stranded` escalation state ({drafted, unarmed, reviewed
-# head, green gate} has no other autonomous exit — CLAIM hands it loudly to a human), plus
+# with an advisory `context` field, the `stranded` recovery state ({drafted, unarmed, reviewed
+# head, green gate} is the residue of an interrupted defuse/disarm — CLAIM re-reviews the head
+# under the round budget, escalating to a human only after repeated failed recovery; issue #161),
+# plus
 # top-level `disarm_items` (armed-SHA-mismatch safety invariant, registry issue #42). Both
 # validators — this one and the dispatch.yml PLAN inline check — are bumped in the same commit;
 # the TARGET repo's dispatch-plan.py is untouched.
@@ -87,9 +89,11 @@ SNAPSHOT_SKIP_REASONS = {
 }
 # needs-ci-fix / needs-rebase are the zero-manual repair states: same-provider fix runs (reuse
 # mode=fix) that target red full-matrix CI legs / a conflicting base instead of review findings.
-# stranded is the loud terminal escalation for {drafted, unarmed, reviewed-sha == head, green
-# gate}: nothing else re-admits that posture (no re-review without a head advance, no ci-fix
-# without a red gate), so CLAIM re-derives it live and applies the needs-user hand-off.
+# stranded is the recovery state for {drafted, unarmed, reviewed-sha == head, green gate} — the
+# residue of an interrupted defuse/disarm that no other state re-admits (no re-review without a
+# head advance, no ci-fix without a red gate). CLAIM re-derives it live and RE-REVIEWS the head
+# under the bounded round budget, handing it to a human only after repeated failed recovery
+# (issue #161).
 REVIEW_STATES = {"needs-review", "needs-fix", "needs-ci-fix", "needs-rebase", "stranded"}
 FIX_KIND_OF_STATE = {"needs-fix": "verdict", "needs-ci-fix": "ci", "needs-rebase": "rebase"}
 # Independent per-lane tick accounting (issue #108): a productive worker launch must NEVER mask a
@@ -97,14 +101,14 @@ FIX_KIND_OF_STATE = {"needs-fix": "verdict", "needs-ci-fix": "ci", "needs-rebase
 # its own planned/launched/deferred/error tally so the tick-health recorder can surface a stalled
 # lane (and a safety-critical disarm error) regardless of activity in the other lanes.
 DISPATCH_LANES = ("worker", "review", "fix", "disarm")
-# The review-loop lane owns needs-review re-reviews and the stranded terminal escalation; every
+# The review-loop lane owns needs-review re-reviews and the stranded recovery re-review; every
 # other REVIEW_STATE (needs-fix / needs-ci-fix / needs-rebase) is a fix-loop launch.
 REVIEW_LANE_STATES = {"needs-review", "stranded"}
 
 
 def _review_item_lane(state):
     """The dispatch lane a review-plan item belongs to (issue #108): the review loop (needs-review
-    plus the stranded escalation) vs the fix loop (needs-fix / needs-ci-fix / needs-rebase). Used so
+    plus the stranded recovery) vs the fix loop (needs-fix / needs-ci-fix / needs-rebase). Used so
     a stalled review lane is counted apart from the fix lane and from worker launches — a worker
     launch can otherwise mark the whole tick healthy while every review item fails forever."""
     return "review" if state in REVIEW_LANE_STATES else "fix"
@@ -1157,9 +1161,11 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
       still in progress is NOT enumerated (no churn). A status whose head_sha disagrees with the
       live listing is stale and ignored (unknown never acts),
     - stranded: a DRAFTED, unarmed PR whose reviewed head has a concluded-GREEN gate on a clean
-      base — no other state can re-admit it, so CLAIM escalates it to a human (needs-user)
-      after its own live re-derivation. A READY (non-draft) unarmed PR in the same posture is
-      deliberately NOT stranded: that is the valid arm=false-policy terminal (human merges)."""
+      base — the residue of an interrupted defuse/disarm that no other state can re-admit. After
+      its own live re-derivation CLAIM RE-REVIEWS the current head (issue #161) under the bounded
+      round budget, escalating to a human (needs-user) only once that budget is spent by repeated
+      failed recovery. A READY (non-draft) unarmed PR in the same posture is deliberately NOT
+      stranded: that is the valid arm=false-policy terminal (human merges)."""
     live_keys = _live_holder_keys(leases, now)
     items = []
     for pull in pulls:
@@ -1293,7 +1299,8 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             # head has a concluded-GREEN gate has no other autonomous exit (re-review requires a
             # head advance, ci-fix a red gate, rebase a conflict, arm a review outcome). It is
             # the residue of a defused arm whose repair trigger evaporated, or of a crashed
-            # disarm — CLAIM re-derives it live and hands it loudly to a human.
+            # disarm — CLAIM re-derives it live and RE-REVIEWS the current head under the bounded
+            # round budget (issue #161), escalating to a human only after repeated failed recovery.
             emit("stranded")
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
     return items
@@ -1825,10 +1832,17 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 if fix_kind == "ci":
                     fix_context = item["context"][:CI_CONTEXT_MAX]
             elif item["state"] == "stranded":
-                # Loud escape from the absorbing {drafted, unarmed, reviewed head, green gate}
-                # state — re-derived LIVE before the terminal hand-off; any drift (armed again,
-                # head moved, gate red/pending, base conflicting) defers to the path that owns
-                # the new posture instead.
+                # Issue #161: the stranded posture — {drafted, unarmed, reviewed head, green
+                # gate} — is the RESIDUE of an interrupted defuse/disarm (a pipeline-owned
+                # crash), not a review verdict. Terminally parking it on a human made a
+                # pipeline crash into permanent manual work. The pipeline instead RECOVERS with
+                # its own trusted provenance: it re-reviews the current head (despite the
+                # matching reviewed-sha marker) under the SAME bounded round budget as any
+                # review, and reserves the terminal human hand-off for REPEATED failed recovery
+                # — decide_budget below escalates to needs-user only once that budget is spent.
+                # Re-derived LIVE first: any drift (armed again, head moved, gate red/pending,
+                # base conflicting) means some other path owns the new posture, so defer with NO
+                # mutation and let that path re-admit it.
                 checks = _gh_json([
                     "api",
                     f"repos/{repo}/commits/{head_sha}/check-runs"
@@ -1847,13 +1861,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     print(f"defer review {repo}#{number}: the stranded posture did not "
                           "re-derive on live data")
                     continue
-                _pr_needs_user(script_dir, repo, number, issue_number,
-                               "the PR's reviewed head has a green gate but the PR is drafted "
-                               "and unarmed with nothing left for the loop to do (the residue "
-                               "of an interrupted defuse/disarm); a human must re-arm it (mark "
-                               "ready + enable auto-merge) or restart the review")
-                print(f"escalated {repo}#{number}: stranded reviewed head handed to a human")
-                continue
+                print(f"recover review {repo}#{number}: stranded residue of an interrupted "
+                      "defuse/disarm — re-reviewing the current head under the round budget")
+                # Fall through to the shared round-budget + review dispatch below.
             comments = _pr_comments(repo, number)
             rounds = worker_pr.count_rounds(comments, bot_login)
             impl_provider = record["impl_provider"]
@@ -1927,9 +1937,15 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # raw-handle/missing hash already deferred above (provenance_admission_error).
             impl_account_h = record["impl_account_h"]
-            if item["state"] == "needs-review":
+            if item["state"] in {"needs-review", "stranded"}:
                 reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
-                if reviewed and reviewed.group(1) == head_sha:
+                # A needs-review head that already equals its reviewed-sha marker has nothing to
+                # re-review (no head advance) and defers. The stranded RECOVERY (issue #161) is
+                # the sole, deliberate exception: it re-reviews the MATCHING head to escape the
+                # residue of an interrupted defuse/disarm — the reviewed-sha guard is bypassed
+                # for it, and the round budget above bounds how often it may retry.
+                if (item["state"] == "needs-review"
+                        and reviewed and reviewed.group(1) == head_sha):
                     print(f"defer review {repo}#{number}: head already reviewed")
                     continue
                 base_branch = str((pull.get("base") or {}).get("repo", {}).get(
@@ -3967,18 +3983,54 @@ def _self_test():
                         issue_labels=["area:crate-a"])
             run_items([ci_item])
             assert helper_calls == [], helper_calls
-            # stranded ACT: {draft, unarmed, reviewed head, green gate} -> loud needs-user
+            # stranded RECOVERY (issue #161): {draft, unarmed, reviewed head, green gate} is the
+            # residue of an interrupted defuse/disarm, so CLAIM RE-REVIEWS the current head under
+            # the bounded round budget instead of a terminal hand-off — the reviewed-sha marker
+            # matching the head (which DEFERS a plain needs-review) is bypassed for the recovery.
             stranded_item = dict(ci_item, state="stranded", context="")
             fake.update(pull=live_pull(
                 draft=True, labels=["review:needs"],
-                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"), check_runs=gate_green)
-            run_items([stranded_item])
+                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                check_runs=gate_green, comments=[])
+            strand_routing = {"models": {
+                "sol": {"provider_model": "TBD", "harness": "codex"},
+                "luna": {"provider_model": "TBD", "harness": "codex"}}}
+
+            class StrandAllocator:
+                def __init__(self):
+                    self.calls = []
+
+                def claim(self, _repo, _package, role, chain, *_args, **_kwargs):
+                    self.calls.append((role, list(chain)))
+                    return None      # no account free: the recovery review DEFERS, no hand-off
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            # budget remaining (0 recorded rounds): the cross-provider REVIEW chain is offered and
+            # NO needs-user is applied (recovery, not escalation)
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
+            assert helper_calls == [], helper_calls
+            assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
+            # repeated failed recovery: the round budget is spent (hard cap) -> loud needs-user,
+            # and no review is dispatched — terminal escalation is RESERVED for this case
+            fake["comments"] = [
+                {"user": {"login": bot},
+                 "body": f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->"}
+                for i in range(1, wiring_worker_pr.HARD_CAP_ROUNDS + 1)]
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
-            # stranded DO-NOTHING: the posture failed to re-derive (gate red again) -> defer
-            fake["check_runs"] = gate_red
-            run_items([stranded_item])
+            assert alloc.calls == [], alloc.calls
+            # stranded DO-NOTHING: the posture failed to re-derive (gate red again) -> defer,
+            # neither a review dispatch nor a hand-off
+            fake.update(check_runs=gate_red, comments=[])
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
             assert helper_calls == [], helper_calls
+            assert alloc.calls == [], alloc.calls
 
             # ---- round-budget escalation (directive 2026-07-17): decide_budget replaces the
             # flat rounds>=max needs-user at CLAIM, the fix chain honours the pinned floor, and
