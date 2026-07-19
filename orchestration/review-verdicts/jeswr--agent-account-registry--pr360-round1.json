@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 360,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "168e904bcef39214b2481760c8b8470f678a8f1f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`live_leases = _ledger_leases(ledger_root)` runs once before iterating, and the code itself notes that allocator claims land remotely rather than updating this checkout. Consequently, after the snapshot is read, a worker or another dispatcher can acquire the same crate and still pass this check. There is also a deterministic same-loop case: with an initially empty snapshot, an earlier `review:` item can claim a crate remotely, then a later `fix:` item for the same crate sees the same empty snapshot; because `allocator.claim` only compares same-prefix leases, both claims can succeed. Calling the predicate immediately before each claim does not make its underlying data live. The wiring test only rewrites the local file between separate `run_items` calls, so it cannot expose snapshot staleness or mixed-lane claims within one call.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Enforce repository/package cross-lane exclusion inside the allocator's SHA-bound CAS transaction using the remote ledger state used for the claim. Add a non-vacuous test with review and fix (or worker and review) contenders for one crate where the second claim observes/rejects the first claim committed after the initial plan/checkout snapshot. If a preflight remains as defense in depth, do not describe it as closing the claim-time race.",
+    "severity": "major",
+    "title": "Stale per-tick snapshot does not enforce cross-lane exclusion at claim time"
+   }
+  ],
+  "progress": null,
+  "summary": "The added predicate is locally fail-closed and its unit cases are meaningful, but the wiring does not provide the claimed immediately-before-claim cross-lane exclusion. `_dispatch_review_items` reads one checkout snapshot before the loop and reuses it for every review/fix item, while claims are committed to the remote ledger. A lease created after that read\u2014including by an earlier item in the same loop\u2014remains invisible, and the allocator's same-prefix predicate cannot serialize a review claim against a fix/worker claim. This leaves the exact cross-lane co-run the change is intended to prevent, so the change is not sound or complete.",
+  "verdict": "request_changes"
+ }
+}
