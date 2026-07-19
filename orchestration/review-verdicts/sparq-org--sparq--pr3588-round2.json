@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3588,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "34fe1f16c73a8cc4cfc9fd5d9f44dd7049724df4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `SPARQ_ZK_REQUIRE_TOOLCHAIN` switch correctly turns a missing nargo/bb installation into failure when explicitly set, but no CI configuration in the diff sets it. Consequently default test runs still return normally when the tools are absent, and the real `CircuitProver -> capture` seam remains optional coverage rather than a continuously enforced contract.",
+    "file": "crates/sparq-zk-compose/tests/capture_car_hire.rs",
+    "fix_hint": "Add or update a toolchain-equipped CI lane to run this test with `SPARQ_ZK_REQUIRE_TOOLCHAIN=1`, so absence of the tools or breakage in bb's emitted artifacts cannot silently pass.",
+    "severity": "minor",
+    "title": "Required-toolchain mode is not exercised by CI in this change"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major compatibility defect: the TypeScript consumer, shipped fixture, generator, and Rust serializer now consistently use the plural `subProofs` schema, and the site fixture test exercises the same age-gate selection used by the real consumer. The ZK claims remain explicitly research-grade and pending external audit. The native prove/capture test now supports a fail-required mode, but this diff does not wire that mode into a toolchain-equipped CI lane, so ordinary runs can still report success without exercising the native seam. That residual coverage issue is minor and does not invalidate the serialization change.",
+  "verdict": "approve"
+ }
+}
