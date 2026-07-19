@@ -238,10 +238,13 @@ def run_alert():
             raise ValueError("expected a JSON array")
     except ValueError:  # json.JSONDecodeError is a ValueError
         # A successful gh call can still hand back malformed JSON (truncation, an HTML error page).
-        # Degrade — never crash the alert or echo the remote payload — and retry next tick.
-        print("::warning::retriage-alert: gh issue list returned unparseable JSON — skipping this "
-              "tick (no dedupe/recovery data; next tick retries)")
-        return 0
+        # Same missing-data state as a nonzero gh exit — without the list we can neither dedupe an
+        # upsert nor prove recovery — so fail LOUD too (review round 2): a green job here would mask
+        # the alerting outage, the exact silent-alerting class this job closes. The sanitized
+        # warning never echoes the remote payload; the next scheduled tick retries.
+        print("::warning::retriage-alert: gh issue list returned unparseable JSON (no "
+              "dedupe/recovery data) — failing loud; next tick retries")
+        return 1
     num = next((i["number"] for i in found if ALERT_MARKER in (i.get("body") or "")), None)
     if num is None:
         num = next((i["number"] for i in found if i.get("title") == ALERT_TITLE), None)
@@ -441,9 +444,13 @@ def _self_test():
         chk("alert: list failure -> rc=1 + sanitized warning (no stderr echoed)",
             (rc_e, "::warning::" in out_e, "SENTINEL-STDERR" in out_e), (1, True, False))
         rc_f, out_f = run_alert_with("failure", "NOT-JSON {")
-        chk("alert: malformed list JSON -> graceful skip, payload not echoed",
+        chk("alert: malformed list JSON -> rc=1 (fail loud), no mutation, payload not echoed",
             (rc_f, "::warning::" in out_f, "NOT-JSON" in out_f,
-             [s for s in subs() if s != ("issue", "list")]), (0, True, False, []))
+             [s for s in subs() if s != ("issue", "list")]), (1, True, False, []))
+        rc_h, out_h = run_alert_with("failure", "{\"SENTINEL\": 1}")
+        chk("alert: non-array list JSON -> rc=1 (fail loud), no mutation, payload not echoed",
+            (rc_h, "SENTINEL" in out_h,
+             [s for s in subs() if s != ("issue", "list")]), (1, False, []))
         rc_g, _ = run_alert_with("failure", open_json, fail=(("issue", "edit"),))
         chk("alert: upsert edit failure -> rc=1", rc_g, 1)
     finally:
