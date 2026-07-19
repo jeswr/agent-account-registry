@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 422,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4fe6f3f2dc84a3cade083bf915a3d5ace980a3af",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "model_started is derived from steps.attempt.outcome == 'success', but record-attempt completes before the model step. The workflow can be cancelled or hit its job timeout after that step completes but before worker-live.sh actually launches the provider CLI. In that path the model step is cancelled/skipped, exit_class is empty or uncaptured, and the downstream always() job sees model_started == 'true' and appends an 'unknown' health record even though no provider call occurred. Thus the marker does not establish the claimed genuine-provider-attempt invariant and retains a non-attempt pollution path.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Set a durable launch marker at the point immediately before the provider CLI is invoked (and expose that completed marker to the downstream job), rather than using completion of the earlier accounting step. Add coverage for cancellation between record-attempt and provider launch, asserting that no health record is written, while retaining a started model-step timeout as unknown.",
+    "severity": "major",
+    "title": "Pre-launch cancellations are misclassified as provider attempts"
+   }
+  ],
+  "progress": null,
+  "summary": "The new gate removes ordinary prep/trust/budget non-attempts from the health ledger, but its marker is not actually tied to provider launch. A cancellation or job timeout after the record-attempt step succeeds and before the model process starts will still be recorded as an unknown provider attempt. That contradicts the change's stated invariant and can still pollute provider health. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
