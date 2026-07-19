@@ -1021,6 +1021,111 @@ def _self_test():
           [s for s in ("stdout", "stderr")
            if "acctlegacy" in {"stdout": dryrun_out, "stderr": dryrun_err}[s]], [])
 
+    # ---- WORKER.YML FAIL-CLOSED ROUTING METADATA (issue #142): the three embedded heredocs
+    # that gate account routing metadata are trust checks with no script of their own, so the
+    # enrolled suite executes the REAL workflow text. (a) The self-claim and adopt output
+    # heredocs must reject a claim whose provider/harness/credential_format is missing or
+    # empty instead of defaulting it to "" (the old `claim.get(...) or ""`). (b) The live
+    # selected-model heredoc must require EXACT equality with protected routing — the old
+    # `if claimed_provider and ...` guard skipped the comparison for an EMPTY claimed value
+    # and would expose a secret on metadata the account never declared. Every EMPTY/MISSING
+    # rejection below goes red if either permissive form returns; the fully-populated success
+    # and mismatched-value failure controls prove the fixtures drive the real code path.
+    # Fail closed: extraction or fixture failure is a FAIL, never a skip.
+    try:
+        wf_all = wf_path.read_text(encoding="utf-8")
+
+        def _wf_heredoc(step_marker):
+            step_at = wf_all.index(step_marker)
+            start = wf_all.index("<<'PY'\n", step_at) + len("<<'PY'\n")
+            end = wf_all.index("\n          PY\n", start)
+            return textwrap.dedent(wf_all[start:end])
+
+        claim_hd = _wf_heredoc("CAS claim from the policy-filtered account pool")
+        adopt_hd = _wf_heredoc("Adopt dispatcher-owned CAS claim (ownership transfer)")
+        selected_hd = _wf_heredoc("Resolve claimed account to concrete target model")
+
+        def _run_hd(script, argv, extra_env, td):
+            gh_out = Path(td) / "github_output"
+            if gh_out.exists():
+                gh_out.unlink()
+            env = {k: v for k, v in os.environ.items() if k != "PROVENANCE_SALT"}
+            env["GITHUB_OUTPUT"] = str(gh_out)
+            env.update(extra_env)
+            proc = subprocess.run([sys.executable, "-", *argv], input=script,
+                                  capture_output=True, text=True, env=env, check=False)
+            out = gh_out.read_text(encoding="utf-8") if gh_out.exists() else ""
+            return proc.returncode, proc.stderr, out
+
+        def _tail(err):
+            return err.strip().splitlines()[-1] if err.strip() else ""
+
+        cid = "ab" * 16
+        base_claim = {"account": "acct01", "model": "sol", "claim_id": cid,
+                      "secret_ref": "ACCT01_TOKEN", "provider": "openai",
+                      "harness": "codex", "credential_format": "codex-auth-json"}
+        adopt_env = {"ACCOUNT_POOL": "acct01,acct02", "MODELS": "sol,luna",
+                     "EXPECTED_ACCOUNT": "acct01", "CLAIM_ID": cid, "ROLE": "impl",
+                     "PACKAGES": "crate-a"}
+        with tempfile.TemporaryDirectory() as hd_td:
+            hd_tdp = Path(hd_td)
+            fixture = hd_tdp / "claim.json"
+
+            def _claim_case(record):
+                fixture.write_text(json.dumps(record), encoding="utf-8")
+                return _run_hd(claim_hd, [str(fixture), "acct01,acct02", "sol,luna"],
+                               {}, hd_td)
+
+            def _adopt_case(record):
+                fixture.write_text(json.dumps(record), encoding="utf-8")
+                return _run_hd(adopt_hd, [str(fixture)], adopt_env, hd_td)
+
+            for label, case, record, reject_word in (
+                    ("claim", _claim_case, base_claim, "allocator"),
+                    ("adopt", _adopt_case,
+                     {**base_claim, "role": "impl", "package": "crate-a"}, "dispatcher claim")):
+                rc, err, out = case(record)
+                check(f"worker.yml {label} heredoc accepts fully declared routing metadata "
+                      f"(stderr tail: {_tail(err)!r})",
+                      (rc, "acquired=true" in out, "provider=openai" in out), (0, True, True))
+                for field in ("provider", "harness", "credential_format"):
+                    rc, err, out = case({k: v for k, v in record.items() if k != field})
+                    check(f"worker.yml {label} heredoc rejects MISSING {field}",
+                          (rc != 0, f"{reject_word} returned an empty or missing {field}" in err,
+                           "acquired=true" in out), (True, True, False))
+                    rc, err, out = case({**record, field: ""})
+                    check(f"worker.yml {label} heredoc rejects EMPTY {field}",
+                          (rc != 0, f"{reject_word} returned an empty or missing {field}" in err,
+                           "acquired=true" in out), (True, True, False))
+
+            # Live (DRY_RUN=false) selected-model gate against a fake protected target routing.
+            (hd_tdp / "target").mkdir()
+            (hd_tdp / "target" / "routing.toml").write_text(
+                '[models.sol]\nprovider = "openai"\nharness = "codex"\n'
+                'provider_model = "gpt-5.6-sol"\ncredential_format = "codex-auth-json"\n',
+                encoding="utf-8")
+            live_env = {"DRY_RUN": "false", "GITHUB_WORKSPACE": hd_td,
+                        "ROUTING_PATH": "routing.toml", "LIVE_ACCOUNT": "acct01",
+                        "LIVE_MODEL": "sol", "LIVE_SECRET_REF": "ACCT01_TOKEN",
+                        "LIVE_PROVIDER": "openai", "LIVE_HARNESS": "codex",
+                        "LIVE_CREDENTIAL_FORMAT": "codex-auth-json"}
+            rc, err, out = _run_hd(selected_hd, [], live_env, hd_td)
+            check(f"worker.yml selected-model heredoc accepts matching live routing metadata "
+                  f"(stderr tail: {_tail(err)!r})",
+                  (rc, "provider=openai" in out, "secret_ref=ACCT01_TOKEN" in out),
+                  (0, True, True))
+            for var, wrong in (("LIVE_PROVIDER", "anthropic"), ("LIVE_HARNESS", "claude"),
+                               ("LIVE_CREDENTIAL_FORMAT", "claude-oauth-token")):
+                for tag, value in (("EMPTY", ""), ("mismatched", wrong)):
+                    rc, err, out = _run_hd(selected_hd, [], {**live_env, var: value}, hd_td)
+                    check(f"worker.yml selected-model heredoc rejects {tag} {var} "
+                          f"(no output written)",
+                          (rc != 0, "conflicts with protected routing" in err,
+                           "secret_ref=" in out), (True, True, False))
+    except (OSError, ValueError, IndexError) as exc:
+        print(f"  FAIL worker.yml fail-closed routing heredoc round: {exc}")
+        ok = False
+
     full1 = [make_lease("acct01", "h", "p", "r", "terra", now, 100)]
     check("cap fallthrough", choose_account(A, full1, ["terra", "fable"], "p", "r", now), "acct02")
     exp = [make_lease("acct01", "h", "p", "r", "terra", 0, 10)]  # expires_at=10 < now → reclaimed
