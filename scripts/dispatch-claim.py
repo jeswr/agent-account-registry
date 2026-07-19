@@ -364,11 +364,64 @@ def _security_flagged(labels):
 
 
 def _live_holder_keys(leases, now):
-    return {
-        str(lease.get("holder", "")).split("@", 1)[0]
-        for lease in leases
-        if isinstance(lease, dict) and lease.get("expires_at", 0) > now
-    }
+    live = set()
+    for lease in leases:
+        if not isinstance(lease, dict):
+            continue
+        expires = lease.get("expires_at", 0)
+        if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+            # [round-5] unparseable expiry: not PROVABLY live, so it never suppresses a
+            # re-emit here — while sibling_lease_conflict reads the same row as ambiguity
+            # and EXCLUDES (both directions fail safe; a bare > comparison used to raise).
+            continue
+        if expires > now:
+            live.add(str(lease.get("holder", "")).split("@", 1)[0])
+    return live
+
+
+def sibling_lease_conflict(own_keys, packages, leases, now):
+    """[round-5 P1] The ONE cross-lane crate-ownership view over the lease ledger. True when
+    ANY live lease whose holder key is NOT in `own_keys` holds one of `packages` — regardless
+    of lane prefix: impl leases key `<repo>#<issue>`, review/fix leases key
+    `review:<repo>#<pr>` / `fix:<repo>#<pr>`, and the allocator's partition_available checks
+    only SAME-prefix leases by design, so without this view the lanes cannot see each other.
+    That is the park -> sibling-launch -> UNPARK hole: parking a provably-inert draft frees
+    its crate, an impl sibling claims an impl lease there (invisible to the review lane), and
+    the moment a human unparks the PR both same-crate lanes progress at once.
+
+    Package semantics mirror partition_available / the busy union: `__global__` serializes in
+    both directions (a global lease conflicts with everything; a global-packaged candidate
+    conflicts with any live sibling lease). An empty `packages` set means the candidate's
+    crate is unknown and collapses to `__global__` (fail closed).
+
+    FAIL TOWARD EXCLUSION ON AMBIGUITY: a non-list ledger, a malformed row, an unparseable
+    expiry, or a missing/invalid holder or package all read as a live colliding sibling — the
+    caller defers/excludes and retries next tick rather than launching into a crate whose
+    ownership cannot be proven."""
+    mine = {package for package in packages if isinstance(package, str) and package} \
+        or {GLOBAL_PACKAGE}
+    if not isinstance(leases, list):
+        return True                       # no provable lease view — cannot prove the crate free
+    for lease in leases:
+        if not isinstance(lease, dict):
+            return True                   # unreadable row — cannot prove it is not a sibling
+        expires = lease.get("expires_at")
+        if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+            return True                   # unparseable expiry — cannot prove the lease dead
+        if expires <= now:
+            continue                      # provably expired — reclaimable, never a conflict
+        holder = lease.get("holder")
+        key = holder.split("@", 1)[0] if isinstance(holder, str) else ""
+        if not key:
+            return True                   # cannot prove the lease is one of OUR own
+        if key in own_keys:
+            continue                      # the candidate's own lease never supersedes it
+        package = lease.get("package")
+        if not isinstance(package, str) or not package:
+            return True                   # unknown crate — cannot prove disjointness
+        if package == GLOBAL_PACKAGE or GLOBAL_PACKAGE in mine or package in mine:
+            return True
+    return False
 
 
 def _sanitize_leg(name):
@@ -424,11 +477,19 @@ def pr_ci_status(record):
         return {}
     mergeable = record.get("mergeable")
     draft = record.get("draft")
+    auto_merge = record.get("auto_merge")
     status = {
         "head_sha": head_sha,
         # REST tri-state: False = conflicting, True = clean, null = still computing (unknown).
         "conflicting": True if mergeable is False else (False if mergeable is True else None),
-        "armed": isinstance(record.get("auto_merge"), dict),
+        # [round-5 P2] STRICT tri-state arm bit: a dict is armed, an explicit null is
+        # unarmed, and ANY other shape (a garbage string in a hostile/degraded snapshot) is
+        # UNKNOWN (None). The old isinstance() read collapsed garbage to False = unarmed —
+        # fail OPEN: the busy-partition carve-out would free a crate whose latch state was
+        # unprovable. Unknown never frees (_pull_provably_inactive requires armed exactly
+        # False) and never proves the stranded posture.
+        "armed": (True if isinstance(auto_merge, dict)
+                  else False if auto_merge is None else None),
         # [round-4 P1] the detail read's OWN draft bit (the pulls/N REST response carries
         # `draft`): the busy-partition carve-out frees a parked draft ONLY when this NEWER
         # read confirms the listing's stale draft flag on the same head. Strict bool;
@@ -486,8 +547,10 @@ def stranded_live(draft, armed, reviewed_match, mergeable, gate):
     loop has no autonomous exit from that state (re-review is bound to a head advance, ci-fix to
     a red gate, rebase to a conflict, arm to a review outcome), so it is handed loudly to a
     human. Anything else — armed, ready, unreviewed, red/pending/unknown gate, conflicting or
-    still-computing base — is some other path's job and must NOT be escalated."""
-    return (draft is True and not armed and reviewed_match
+    still-computing base — is some other path's job and must NOT be escalated. [round-5 P2]
+    the arm bit is tri-state (see pr_ci_status): only an EXPLICIT armed=False proves the
+    stranded posture — an unknown/garbage latch shape never acts."""
+    return (draft is True and armed is False and reviewed_match
             and mergeable is True and gate == "success")
 
 
@@ -674,20 +737,36 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     return busy
 
 
-def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_status=None):
+def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_status=None,
+                           leases=None, now=0):
     """Drop plan items whose package has an in-flight worker PR (registry issue #27: the review
     loop's PRs were invisible to the busy-area partition, double-dispatching onto a busy crate).
     Global semantics mirror the target ready-engine: a global reservation blocks everything, and
     a global item cannot co-run with ANY reserved package. `provenance`/`pr_status` are the same
     maps handed to enumerate_review_items — the busy partition and the enumerator must read the
-    same linkage and the same arm state (round-2 P1/P2)."""
+    same linkage and the same arm state (round-2 P1/P2).
+
+    [round-5 P1] ONE crate-ownership view across lanes: beyond the open-PR busy union, an item
+    is ALSO excluded when the lease ledger holds ANY live lease — impl, review, or fix lane —
+    on its package (its own impl lease excepted; duplicate-work suppression stays the
+    allocator partition's job). This closes the impl-side half of the park -> sibling-launch
+    -> unpark hole: a parked provably-inert draft frees its crate in the busy union, but a
+    review/fix run on it (or any sibling) may still hold a live lease there — launching an
+    impl worker into that crate would put two lanes on one crate the moment the park lifts.
+    `leases=None` (no ledger view supplied) fails toward exclusion, mirroring
+    sibling_lease_conflict's ambiguity rule — callers must pass the real ledger list."""
     busy = busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status)
-    if not busy:
-        return items
     kept = []
     for item in items:
         package = item.get("package")
-        if GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy:
+        if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
+            continue
+        if sibling_lease_conflict(
+                {f"{repo}#{item.get('number')}"},
+                {package} if isinstance(package, str) else set(),
+                leases, now):
+            print(f"exclude {repo}#{item.get('number')}: superseded-until-sibling-resolves — "
+                  "a live sibling lease (any lane) holds its package")
             continue
         kept.append(item)
     return kept
@@ -709,12 +788,18 @@ def live_pull_detail_stub(pull):
     if not SAFE_SHA.fullmatch(head_sha):
         return None
     draft = pull.get("draft")
+    auto_merge = pull.get("auto_merge")
     return {"head_sha": head_sha,
-            "armed": isinstance(pull.get("auto_merge"), dict),
+            # [round-5 P2] same STRICT tri-state as pr_ci_status: a garbage auto_merge shape
+            # is UNKNOWN (None), never unarmed — the carve-out then reads BUSY (fail closed)
+            # instead of freeing a crate whose latch state was unprovable.
+            "armed": (True if isinstance(auto_merge, dict)
+                      else False if auto_merge is None else None),
             "draft": draft if isinstance(draft, bool) else None}
 
 
-def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, provenance):
+def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, provenance,
+                                        leases=None, now=0):
     """[round-4 P1] PURE CLAIM-side re-check of the PLAN busy partition against the LIVE
     pull listing CLAIM already fetches: the PLAN artifact's freeing decisions are minutes
     old by the time an item launches, so a parked draft that went ready (or a brand-new
@@ -723,7 +808,10 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
     the live raw rows — same linkage (provenance), same hold surfaces (issue labels),
     with each row serving as its own coherent detail via live_pull_detail_stub — and
     returns the set of item numbers still dispatchable; the caller DEFERS the rest to
-    the next tick (the fail-closed direction: a busy re-read never launches)."""
+    the next tick (the fail-closed direction: a busy re-read never launches).
+    [round-5 P1] `leases`/`now` feed the cross-lane lease partition inside
+    filter_busy_area_items (the CLAIM caller reads the ledger-branch checkout);
+    leases=None fails toward exclusion."""
     rows = []
     for page in pull_pages if isinstance(pull_pages, list) else []:
         if isinstance(page, list):
@@ -735,7 +823,8 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
             stub = live_pull_detail_stub(row)
             if stub is not None:
                 live_status[number] = stub
-    kept = filter_busy_area_items(items, repo, rows, issue_labels, provenance, live_status)
+    kept = filter_busy_area_items(items, repo, rows, issue_labels, provenance, live_status,
+                                  leases, now)
     return {item["number"] for item in kept}
 
 
@@ -791,6 +880,24 @@ def _claim_provenance_map(repo, registry_root, ledger_root=""):
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 continue
     return provenance
+
+
+def _ledger_leases(ledger_root):
+    """[round-5 P1] The CLAIM-side lease view for the cross-lane package partition, read from
+    the data-plane ledger checkout (the same branch PLAN read its lease state from). Returns
+    the lease list, or None when no ledger checkout is wired or the file is
+    missing/unreadable/malformed — the partition then FAILS TOWARD EXCLUSION
+    (sibling_lease_conflict treats a None ledger as ambiguity), deferring items rather than
+    launching into a crate whose ownership cannot be proven."""
+    if not ledger_root:
+        return None
+    try:
+        document = json.loads((Path(ledger_root) / "data" / "leases.json")
+                              .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    leases = document.get("leases") if isinstance(document, dict) else None
+    return leases if isinstance(leases, list) else None
 
 
 def provenance_admission_error(record, pr_number):
@@ -932,6 +1039,26 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         if any(isinstance(label, str) and label.startswith("needs:") for label in source_labels):
             continue                      # the SOURCE issue is human-parked (groom/escalation) —
                                           # the whole PR surface is human-owned too
+        # [round-5 P1] CROSS-LANE SUPERSESSION: an (un)parked PR that reaches this point may
+        # sit in a crate a SIBLING lease already owns — the park -> sibling-launch -> UNPARK
+        # hole: the park freed the crate (busy-partition carve-out), an impl sibling claimed
+        # an impl lease there (`<repo>#<issue>` — a prefix the review lane's own
+        # partition_available never checks), and the human's unpark would otherwise re-admit
+        # this PR immediately, letting both same-crate lanes progress at once. The ledger is
+        # the ONE crate-ownership view across lanes: ANY live lease (any prefix) on this PR's
+        # package(s) that is not the PR's OWN (its review:/fix: lease, its source issue's
+        # impl lease) keeps it EXCLUDED until the sibling resolves (release/expiry) — then it
+        # re-enters here on a later tick. Ambiguity fails toward exclusion.
+        pr_areas = {label[5:] for label in labels if label.startswith("area:")}
+        issue_areas = {label[5:] for label in source_labels
+                       if isinstance(label, str) and label.startswith("area:")}
+        if sibling_lease_conflict(
+                {f"review:{repo}#{number}", f"fix:{repo}#{number}", f"{repo}#{issue_number}"},
+                pr_areas | issue_areas, leases, now):
+            print(f"exclude {repo}#{number}: superseded-until-sibling-resolves — a live "
+                  "sibling lease (any lane) still holds this PR's package(s); it re-enters "
+                  "when that lease releases or expires")
+            continue
         draft = pull.get("draft") is True
         status = pr_status.get(number) if isinstance(pr_status, dict) else None
         if not isinstance(status, dict) or status.get("head_sha") != sha:
@@ -994,7 +1121,9 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         elif (draft and reviewed_match and lease_free
                 and status.get("gate") == "success"
                 and status.get("conflicting") is False
-                and status.get("armed") is not True):
+                and status.get("armed") is False):
+            # [round-5 P2] armed is tri-state: only an EXPLICIT False admits the stranded
+            # escalation — an unknown/garbage latch shape (None) never acts.
             # Absorbing-state escape (never-silent-stall): a DRAFTED, unarmed PR whose reviewed
             # head has a concluded-GREEN gate has no other autonomous exit (re-review requires a
             # head advance, ci-fix a red gate, rebase a conflict, arm a review outcome). It is
@@ -1439,7 +1568,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 live_ci = interpret_check_runs(
                     (checks or {}).get("check_runs") if isinstance(checks, dict) else None)
                 reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
-                if not stranded_live(draft, isinstance(pull.get("auto_merge"), dict),
+                # [round-5 P2] tri-state live arm bit: garbage auto_merge shapes are UNKNOWN
+                # (None) and stranded_live then refuses to act — never "unarmed".
+                live_auto = pull.get("auto_merge")
+                live_armed = (True if isinstance(live_auto, dict)
+                              else False if live_auto is None else None)
+                if not stranded_live(draft, live_armed,
                                      bool(reviewed and reviewed.group(1) == head_sha),
                                      pull.get("mergeable"), live_ci["gate"]):
                     print(f"defer review {repo}#{number}: the stranded posture did not "
@@ -1847,7 +1981,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # defers to the next tick instead of racing a PR that can now merge into it.
         live_dispatchable = revalidate_items_against_live_pulls(
             repository["items"], repo, pull_pages, _live_issue_labels(repo),
-            _claim_provenance_map(repo, registry_root, ledger_root))
+            _claim_provenance_map(repo, registry_root, ledger_root),
+            # [round-5 P1] the cross-lane lease partition reads the ledger-branch checkout;
+            # an unreadable ledger view yields None and the partition fails toward exclusion.
+            leases=_ledger_leases(ledger_root), now=int(time.time()))
 
         # Safety invariant FIRST (issue #42): stale arm latches are retracted before any fix or
         # review admission can push onto (or re-review past) an armed, mutated head.
@@ -2435,6 +2572,59 @@ def _self_test():
                                         issue_labels, now)
     assert reconciled and reconciled[0]["state"] == "needs-fix"
 
+    # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
+    # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
+    # lease — a prefix the review lane's partition never checks). The moment the human
+    # unparks, the enumerator must keep the PR EXCLUDED until the sibling lease resolves. ----
+    unparked = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"])
+    sibling_impl = {"holder": f"{repo}#12@dispatch-9.1", "package": "crate-a",
+                    "expires_at": now + 600}
+    assert enumerate_review_items(repo, [unparked], provenance, [sibling_impl],
+                                  issue_labels, now) == []
+    # a sibling REVIEW/FIX-lane lease on the same crate supersedes the same way
+    assert enumerate_review_items(
+        repo, [unparked], provenance,
+        [{"holder": f"fix:{repo}#88@run.1", "package": "crate-a", "expires_at": now + 600}],
+        issue_labels, now) == []
+    # sibling resolves (released/expired) -> the unparked PR re-enters
+    assert [item["pr_number"] for item in enumerate_review_items(
+        repo, [unparked], provenance, [dict(sibling_impl, expires_at=now - 1)],
+        issue_labels, now)] == [41]
+    # the PR's OWN source-issue impl lease never supersedes it (same work item, not a sibling)
+    assert [item["pr_number"] for item in enumerate_review_items(
+        repo, [unparked], provenance,
+        [{"holder": f"{repo}#7@dispatch-9.1", "package": "crate-a", "expires_at": now + 600}],
+        issue_labels, now)] == [41]
+    # a live sibling lease in a DISJOINT crate does not exclude
+    assert [item["pr_number"] for item in enumerate_review_items(
+        repo, [unparked], provenance,
+        [{"holder": f"{repo}#12@dispatch-9.1", "package": "crate-z",
+          "expires_at": now + 600}],
+        issue_labels, now)] == [41]
+    # a GLOBAL sibling lease serializes against every crate
+    assert enumerate_review_items(
+        repo, [unparked], provenance,
+        [{"holder": f"{repo}#12@dispatch-9.1", "package": GLOBAL_PACKAGE,
+          "expires_at": now + 600}],
+        issue_labels, now) == []
+    # ambiguity fails toward exclusion: malformed row / holder / package / expiry
+    for bad_lease in ("junk",
+                      {"holder": None, "package": "crate-a", "expires_at": now + 600},
+                      {"holder": f"{repo}#12@d.1", "package": None, "expires_at": now + 600},
+                      {"holder": f"{repo}#12@d.1", "package": "crate-a",
+                       "expires_at": "soon"}):
+        assert enumerate_review_items(repo, [unparked], provenance, [bad_lease],
+                                      issue_labels, now) == [], bad_lease
+    # sibling_lease_conflict unit facets: a non-list ledger is ambiguity; empty packages
+    # collapse to the serializing global partition; a bool expiry is unparseable
+    assert sibling_lease_conflict(set(), {"crate-a"}, None, now) is True
+    assert sibling_lease_conflict(set(), set(), [sibling_impl], now) is True
+    assert sibling_lease_conflict(
+        set(), {"crate-z"},
+        [{"holder": "x#1@r.1", "package": "crate-a", "expires_at": True}], now) is True
+    assert sibling_lease_conflict({f"{repo}#12"}, {"crate-a"}, [sibling_impl], now) is False
+    assert sibling_lease_conflict(set(), {"crate-a"}, [], now) is False
+
     # non-draft (armed/ready) PRs leave the loop
     assert enumerate_review_items(repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a,
                                               draft=False)],
@@ -2540,6 +2730,12 @@ def _self_test():
     assert pr_ci_status({**record, "mergeable": None})["conflicting"] is None
     assert pr_ci_status({**record, "mergeable": True})["conflicting"] is False
     assert pr_ci_status({**record, "auto_merge": None})["armed"] is False
+    # [round-5 P2] the arm bit is STRICT tri-state: a malformed auto_merge shape (a garbage
+    # string, a list, a bool) is UNKNOWN (None), never "unarmed" — unknown never frees a
+    # crate and never proves the stranded posture (the old isinstance read failed OPEN).
+    assert pr_ci_status({**record, "auto_merge": "garbage"})["armed"] is None
+    assert pr_ci_status({**record, "auto_merge": []})["armed"] is None
+    assert pr_ci_status({**record, "auto_merge": True})["armed"] is None
     assert pr_ci_status({**record, "head_sha": "zz"}) == {}
     assert pr_ci_status("junk") == {}
     # [round-4 P1] the detail draft bit is STRICT-bool tri-state: absent (the pre-round-4
@@ -2582,6 +2778,11 @@ def _self_test():
                                             pr_status=green)
     assert [(item["state"], item["context"]) for item in stranded_items] == [
         ("stranded", "")], stranded_items
+    # [round-5 P2] an UNKNOWN arm bit (garbage auto_merge -> armed=None) never proves the
+    # stranded posture: only an EXPLICIT armed=False acts
+    assert enumerate_review_items(
+        repo, [starved], provenance, [], issue_labels, now,
+        pr_status={41: dict(status_of(sha_a), armed=None)}) == []
     # DO-NOTHING sides of stranded: an UNREVIEWED draft head re-reviews instead; a READY
     # (non-draft) unarmed green reviewed head is the valid arm=false-policy terminal; an
     # unknown (still-computing) base or a live lease never acts
@@ -2758,6 +2959,9 @@ def _self_test():
     assert stranded_live(True, False, False, True, "success") is False  # unreviewed: re-review
     assert stranded_live(True, False, True, False, "success") is False  # conflicting: rebase
     assert stranded_live(True, False, True, None, "success") is False   # base still computing
+    # [round-5 P2] tri-state arm bit: unknown (None) never proves stranded — only an
+    # explicit False does
+    assert stranded_live(True, None, True, True, "success") is False
     for live_gate in ("failure", "pending", "missing", "unknown"):
         assert stranded_live(True, False, True, True, live_gate) is False
 
@@ -3108,20 +3312,23 @@ def _self_test():
     plan_items = [{"number": 7, "package": "crate-a", "deferred": False},
                   {"number": 9, "package": "crate-b", "deferred": False}]
     in_review = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"])
-    kept = filter_busy_area_items(plan_items, repo, [in_review], issue_labels, busy_prov)
+    kept = filter_busy_area_items(plan_items, repo, [in_review], issue_labels, busy_prov,
+                                  leases=[], now=now)
     assert [item["number"] for item in kept] == [9], kept  # crate-a busy via issue 7's area
-    assert filter_busy_area_items(plan_items, repo, [], issue_labels, busy_prov) == plan_items
+    assert filter_busy_area_items(plan_items, repo, [], issue_labels, busy_prov,
+                                  leases=[], now=now) == plan_items
     # draft-agnostic, review-state-agnostic: a non-draft review:pass PR still reserves its area
     ready_pr = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False, labels=["review:pass"])
     assert [item["number"] for item in filter_busy_area_items(
-        plan_items, repo, [ready_pr], issue_labels, busy_prov)] == [9]
+        plan_items, repo, [ready_pr], issue_labels, busy_prov, leases=[], now=now)] == [9]
     # area:* labels on the PR itself union in as well
     labelled = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["area:crate-b"])
-    assert filter_busy_area_items(plan_items, repo, [labelled], issue_labels, busy_prov) == []
+    assert filter_busy_area_items(plan_items, repo, [labelled], issue_labels, busy_prov,
+                                  leases=[], now=now) == []
     # a known source issue with NO areas reserves the serializing global partition
     assert filter_busy_area_items(plan_items, repo,
                                   [pull(60, "sparq-agent/issue-8-1-1", sha_a)],
-                                  {8: ["role:impl"]}, busy_prov) == []
+                                  {8: ["role:impl"]}, busy_prov, leases=[], now=now) == []
     # [round-2 P2] a VALID provenance record whose source issue is closed/unlisted mirrors
     # the enumerator — which still emits that PR as `__global__` — with a global reservation
     # (the old "reserves nothing" rule freed a crate the loop was still driving into)
@@ -3143,12 +3350,35 @@ def _self_test():
         {61: {**busy_record(61, 999), "issue": True}}) == {GLOBAL_PACKAGE}
     # a global plan item never co-runs with ANY in-flight worker PR
     assert filter_busy_area_items([{"number": 3, "package": "__global__", "deferred": False}],
-                                  repo, [in_review], issue_labels, busy_prov) == []
+                                  repo, [in_review], issue_labels, busy_prov,
+                                  leases=[], now=now) == []
+    # ---- [round-5 P1] the impl lane shares the SAME crate-ownership view: a live
+    # review/fix-lane lease on a crate defers that crate's impl items even with NO open PR
+    # reserving it (the parked-inert-draft carve-out freed the crate while a review/fix run
+    # could still hold a live lease there) ----
+    assert filter_busy_area_items(
+        plan_items, repo, [], issue_labels, busy_prov,
+        leases=[{"holder": f"review:{repo}#41@run.1", "package": "crate-a",
+                 "expires_at": now + 600}], now=now) == [plan_items[1]]
+    # an expired cross-lane lease frees the crate again
+    assert filter_busy_area_items(
+        plan_items, repo, [], issue_labels, busy_prov,
+        leases=[{"holder": f"review:{repo}#41@run.1", "package": "crate-a",
+                 "expires_at": now - 1}], now=now) == plan_items
+    # the item's OWN impl lease does not self-exclude (duplicate-work suppression stays the
+    # allocator partition's job)
+    assert filter_busy_area_items(
+        plan_items, repo, [], issue_labels, busy_prov,
+        leases=[{"holder": f"{repo}#7@run.1", "package": "crate-a",
+                 "expires_at": now + 600}], now=now) == plan_items
+    # an ABSENT/unreadable ledger view is ambiguity: everything defers (fail closed)
+    assert filter_busy_area_items(plan_items, repo, [], issue_labels, busy_prov,
+                                  leases=None, now=now) == []
     # fork-headed imposters do not reserve (filtered BEFORE the fail-closed linkage read)
     assert filter_busy_area_items(plan_items, repo,
                                   [pull(62, "sparq-agent/issue-7-1-1", sha_a,
                                         head_repo="mallory/fork")],
-                                  issue_labels, busy_prov) == plan_items
+                                  issue_labels, busy_prov, leases=[], now=now) == plan_items
 
     # ---- P1 frontier-collapse regression (2026-07-18): HUMAN-PARKED worker PRs must NOT
     # reserve their crates. Reproduction shape (dispatch runs 29664401328/29665207000): a
@@ -3182,26 +3412,27 @@ def _self_test():
     assert busy_packages_of_pulls(repo, collapse_pulls, collapse_labels,
                                   busy_prov, collapse_status) == {"crate-c"}
     kept = filter_busy_area_items(frontier, repo, collapse_pulls, collapse_labels, busy_prov,
-                                  collapse_status)
+                                  collapse_status, leases=[], now=now)
     assert [item["number"] for item in kept] == [70, 71, 73], kept
     # a needs:user PR label parks just as terminally as review:needs-user
     assert filter_busy_area_items(
         frontier, repo, [pull(78, "sparq-agent/issue-81-1-1", sha_a, labels=["needs:user"])],
-        collapse_labels, busy_prov, {78: confirmed_draft()}) == frontier
+        collapse_labels, busy_prov, {78: confirmed_draft()}, leases=[], now=now) == frontier
     # the GLOBAL-freeze slice of the same bug: a PARKED PR whose known source issue has no
     # area labels must not reserve the serializing global partition (pre-fix it froze the
     # ENTIRE repo frontier); the unparked twin still does.
     assert filter_busy_area_items(
         frontier, repo, [pull(79, "sparq-agent/issue-84-1-1", sha_a)],
-        {84: ["needs:user", "role:impl"]}, busy_prov, {79: confirmed_draft()}) == frontier
+        {84: ["needs:user", "role:impl"]}, busy_prov, {79: confirmed_draft()},
+        leases=[], now=now) == frontier
     assert filter_busy_area_items(
         frontier, repo, [pull(79, "sparq-agent/issue-84-1-1", sha_a)],
-        {84: ["role:impl"]}, busy_prov, {79: confirmed_draft()}) == []
+        {84: ["role:impl"]}, busy_prov, {79: confirmed_draft()}, leases=[], now=now) == []
     # a parked PR's own area:* labels are discarded with it (the whole PR is terminal)
     assert filter_busy_area_items(
         frontier, repo, [pull(78, "sparq-agent/issue-81-1-1", sha_a,
                               labels=["needs:user", "area:crate-d"])],
-        collapse_labels, busy_prov, {78: confirmed_draft()}) == frontier
+        collapse_labels, busy_prov, {78: confirmed_draft()}, leases=[], now=now) == frontier
 
     # ---- [round-3 P1, drafts-only] HELD != INACTIVE: a human-parked PR frees its crates
     # ONLY when it is a provably-inert DRAFT. Round 2 also freed a parked NON-draft on an
@@ -3304,6 +3535,13 @@ def _self_test():
     assert busy_packages_of_pulls(
         repo, [parked_draft()], collapse_labels, busy_prov,
         {76: {"head_sha": sha_a, "armed": None, "draft": True}}) == {"crate-b"}
+    # [round-5 P2] the production record shape end-to-end: a GARBAGE auto_merge string in
+    # the raw detail is UNKNOWN through pr_ci_status (armed=None), so the parked draft
+    # stays BUSY — the old isinstance read collapsed it to unarmed and FREED the crate
+    assert busy_packages_of_pulls(
+        repo, [parked_draft()], collapse_labels, busy_prov,
+        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": "garbage",
+                           "draft": True, "check_runs": []})}) == {"crate-b"}
     # parked DRAFT with a synthetic auto_merge dict (raw-REST defense in depth, NOT a
     # snapshot field): same crashed-disarm artifact — busy
     assert busy_packages_of_pulls(repo, [parked_draft(auto_merge=latched)],
@@ -3382,6 +3620,9 @@ def _self_test():
         {"head_sha": sha_a, "armed": False, "draft": True}
     assert live_pull_detail_stub(dict(parked_live, auto_merge=latched))["armed"] is True
     assert live_pull_detail_stub(dict(parked_live, draft="yes"))["draft"] is None
+    # [round-5 P2] a garbage auto_merge shape on the live row is UNKNOWN (armed=None) —
+    # the carve-out then reads BUSY instead of freeing on an unprovable latch state
+    assert live_pull_detail_stub(dict(parked_live, auto_merge="garbage"))["armed"] is None
     # ...but a partial/projected row never self-confirms (missing latch or draft surface,
     # or a malformed head sha -> None -> the carve-out fails closed to BUSY)
     assert live_pull_detail_stub(pull(76, "sparq-agent/issue-81-1-1", sha_a)) is None
@@ -3393,27 +3634,32 @@ def _self_test():
     # the revalidation recomputes the SAME partition over the live rows: a parked draft
     # (unlatched, single-read-confirmed) still frees its crate at CLAIM time...
     assert revalidate_items_against_live_pulls(
-        frontier, repo, [[parked_live]], collapse_labels, busy_prov) \
+        frontier, repo, [[parked_live]], collapse_labels, busy_prov, leases=[], now=now) \
         == {70, 71, 72, 73}
     # ...the EXACT round-4 window race — the same PR re-read NON-draft (went ready
     # between PLAN and CLAIM) — re-reserves crate-b and defers item 71...
     assert revalidate_items_against_live_pulls(
         frontier, repo, [[dict(parked_live, draft=False)]], collapse_labels,
-        busy_prov) == {70, 72, 73}
+        busy_prov, leases=[], now=now) == {70, 72, 73}
     # ...a re-latched arm on the live row re-reserves the same way...
     assert revalidate_items_against_live_pulls(
         frontier, repo, [[dict(parked_live, auto_merge=latched)]], collapse_labels,
-        busy_prov) == {70, 72, 73}
+        busy_prov, leases=[], now=now) == {70, 72, 73}
+    # ...[round-5 P2] a GARBAGE auto_merge shape on the live row is UNKNOWN — busy, exactly
+    # like the latched row (the old isinstance read collapsed it to unarmed and freed)...
+    assert revalidate_items_against_live_pulls(
+        frontier, repo, [[dict(parked_live, auto_merge="garbage")]], collapse_labels,
+        busy_prov, leases=[], now=now) == {70, 72, 73}
     # ...a brand-new LIVE worker PR invisible to the PLAN reserves its crate...
     assert revalidate_items_against_live_pulls(
         frontier, repo,
         [[parked_live], [live_row(77, "sparq-agent/issue-82-1-1", draft=False)]],
-        collapse_labels, busy_prov) == {70, 71, 73}
+        collapse_labels, busy_prov, leases=[], now=now) == {70, 71, 73}
     # ...and non-list pages / non-dict rows are skipped (the listing was already
     # shape-validated by _linked_open_pr_issues before this runs)
     assert revalidate_items_against_live_pulls(
-        frontier, repo, [None, ["junk"], [parked_live]], collapse_labels, busy_prov) \
-        == {70, 71, 72, 73}
+        frontier, repo, [None, ["junk"], [parked_live]], collapse_labels, busy_prov,
+        leases=[], now=now) == {70, 71, 72, 73}
 
     # the local provenance map mirrors the PLAN precedence: legacy-first, ledger wins
     with tempfile.TemporaryDirectory() as prov_tmp:

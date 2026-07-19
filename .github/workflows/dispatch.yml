@@ -495,9 +495,13 @@ jobs:
               # divergent linkage reserves fail-closed. CLAIM re-proves each item's crate
               # against the LIVE pull listing again right before launch (dispatch-claim.py
               # revalidate_items_against_live_pulls closes the PLAN->CLAIM window).
+              # [round-5 P1] `leases`/`now` feed the CROSS-LANE lease partition: any live
+              # sibling lease (impl `<repo>#<issue>`, `review:`/`fix:`) on an item's package
+              # defers it — the lanes share ONE crate-ownership view (the same ledger the
+              # enumerator's superseded-until-sibling-resolves exclusion reads).
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
-                  repo, pulls, issue_labels, provenance, pr_status)
+                  repo, pulls, issue_labels, provenance, pr_status, leases, now)
 
           snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
           document = {
