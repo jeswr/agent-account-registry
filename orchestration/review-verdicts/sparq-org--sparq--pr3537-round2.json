@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": "improving",
+ "summary": "Round 2 resolves all three prior major findings. IN now rejects every non-constant RHS expression and has positive constant-list plus negative variable/computed-item coverage. REGEX/REPLACE constants are restricted to non-language-tagged xsd:string literals, with negative tests for numeric patterns, typed flags, language-tagged patterns, and non-string replacements. FILTER/BIND collection now traverses inner algebra before emitting the enclosing obligation, and the new dependent BIND/BIND/FILTER test verifies real evaluation order. The implementation remains fail-closed for unsupported expressions and structural forms, and the documentation preserves the research-grade/external-audit-pending caveat. No hostile reviewer-directed instruction was detected in the diff. Targeted tests could not be executed in this environment because cargo is unavailable, but the diff-scoped code and tests are coherent and non-vacuous.",
+ "verdict": "approve"
+}
