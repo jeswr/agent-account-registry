@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 395,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aae506677244ee00bc30aee277abfd1b1725a061",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_self_test()` derives `_lease_ttl()` exclusively from `_WF_*` constants declared in this same module and then compares the results to hard-coded totals. It neither reads `.github/workflows/review-fix.yml` nor otherwise asserts that the workflow still has resolve/claim/release timeouts of 10 minutes, run timeouts of 25/60 minutes, and claim TTL literals of 4200/6300. Consequently, raising a workflow timeout\u2014the exact regression the new comment says will flip red\u2014leaves this test green, as does changing only the workflow's local claim TTL. Since that silent drift can again expire a live credential lease and permit concurrent use, the regression guard is incomplete for this trust-plane fix.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Add a non-vacuous synchronization check that extracts or imports the authoritative values used by `review-fix.yml` and asserts both its job timeout expressions and its local-claim TTLs agree with the dispatcher calculation. Prefer one generated/shared source of truth if the workflow can consume it; otherwise make the self-test parse and validate the relevant workflow values explicitly.",
+    "severity": "major",
+    "title": "TTL self-test does not validate the workflow values it claims to pin"
+   }
+  ],
+  "progress": null,
+  "summary": "The TTL increase addresses the immediate under-length leases, but the claimed synchronization with the workflow is not actually enforced. The new self-test only checks Python constants against values derived from those same Python constants; it never validates the workflow job timeouts or the workflow's separately hard-coded claim TTLs. That leaves the issue #159 race able to return silently when either side changes, despite the comments stating such a change would flip the test red.",
+  "verdict": "request_changes"
+ }
+}
