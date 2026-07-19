@@ -403,6 +403,7 @@ jobs:
           review_items = []
           disarm_items = []
           snapshot_skips = []
+          provenance_orphans = []
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
@@ -480,6 +481,13 @@ jobs:
               # sweep, re-deriving every precondition live (matching SHAs are never disarmed).
               disarm_items.extend(claim_mod.enumerate_disarm_items(
                   repo, pulls, pr_status, provenance))
+              # Provenance orphans (issue #104): worker-shaped PRs with inadmissible provenance
+              # are invisible to the review enumerator yet reserve their crate via busy-area
+              # logic. Emit them as EXPLICIT outstanding-work rows so a fleet of provenance-write
+              # failures can no longer read as an empty, apparently-healthy tick (CLAIM counts
+              # them + raises the rolling alert; reconciliation is backfill-provenance.py).
+              provenance_orphans.extend(claim_mod.enumerate_provenance_orphans(
+                  repo, pulls, provenance))
               # Deferred-retry items with a still-live lease are dropped registry-side, then the
               # busy-area union over ALL open worker PRs (issue #27) keeps impl items out of any
               # crate with an in-flight review-loop PR. The busy partition reads the SAME
@@ -505,12 +513,13 @@ jobs:
 
           snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
           document = {
-              "schema": "registry-dispatch-plan/v4",
+              "schema": "registry-dispatch-plan/v5",
               "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "repositories": intermediate["repositories"],
               "review_items": review_items,
               "disarm_items": disarm_items,
               "snapshot_skips": snapshot_skips,
+              "provenance_orphans": provenance_orphans,
           }
           # GLOBAL (repo, pr_number) order via the SHARED, self-tested helper (sol r2 on
           # #233): per-repo policy-order assembly inverts lexicographically with a second
@@ -519,9 +528,9 @@ jobs:
           # PLAN-side inline set-equality checks (CLAIM repeats a stricter independent
           # re-validation of the artifact as hostile data before any mutation).
           if set(document) != {"schema", "generated_at", "repositories", "review_items",
-                               "disarm_items", "snapshot_skips"}:
+                               "disarm_items", "snapshot_skips", "provenance_orphans"}:
               raise SystemExit("plan schema top-level fields are invalid")
-          if document["schema"] != "registry-dispatch-plan/v4":
+          if document["schema"] != "registry-dispatch-plan/v5":
               raise SystemExit("plan schema version is invalid")
           expected_item_fields = {"number", "priority", "package", "role", "model_chain",
                                   "agent", "escalate", "labels", "author", "body_sha", "deferred"}
@@ -544,6 +553,10 @@ jobs:
           for item in document["snapshot_skips"]:
               if set(item) != expected_skip_fields:
                   raise SystemExit("plan snapshot skip fields are invalid")
+          expected_orphan_fields = {"repo", "pr_number", "head_sha", "reason"}
+          for item in document["provenance_orphans"]:
+              if set(item) != expected_orphan_fields:
+                  raise SystemExit("plan provenance orphan fields are invalid")
           # Full structural validation with the same validator CLAIM uses (strictly stronger
           # than a hand-rolled inline copy, and available here because the registry is local).
           claim_mod.validate_plan(document)
@@ -552,7 +565,8 @@ jobs:
           print(f"PLAN complete: "
                 f"{sum(len(repo['items']) for repo in document['repositories'])} issue item(s), "
                 f"{len(review_items)} review item(s), {len(disarm_items)} disarm item(s), "
-                f"{len(snapshot_skips)} snapshot skip(s)")
+                f"{len(snapshot_skips)} snapshot skip(s), "
+                f"{len(provenance_orphans)} provenance orphan(s)")
           PY
 
       - name: Upload immutable plan artifact (pinned)
@@ -940,6 +954,17 @@ jobs:
                       out.write(f"- `{reason}`: {count}\n")
                   if not reasons:
                       out.write("- (no per-item defer reason captured)\n")
+          # Issue #104: provenance orphans (worker-shaped PRs that reserve a crate but are
+          # fail-closed invisible to review) surface on EVERY tick, not just zero-dispatch ones
+          # — a productive tick can still be silently stranding orphaned crates. Re-record via
+          # scripts/backfill-provenance.py.
+          orphan_count = reasons.get("provenance-orphan", 0)
+          if orphan_count and step_summary:
+              with open(step_summary, "a", encoding="utf-8") as out:
+                  out.write("### ⚠️ Provenance orphans\n\n")
+                  out.write(f"**{orphan_count}** worker-shaped PR(s) reserve a crate but lack "
+                            "admissible provenance, so they receive neither review nor "
+                            "replacement work. Re-record via `scripts/backfill-provenance.py`.\n\n")
           # Emit a marker file the record step reads (keeps the record invocation out of this
           # inline python so the salted-hash discipline stays in model-health.py).
           state = "zero" if zero else "abort" if abort else "ok" if productive else "none"
