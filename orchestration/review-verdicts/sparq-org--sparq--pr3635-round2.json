@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3635,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "61e236225889dabb591f4a00866248e3ec36bc11",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For neighboring counts m and m+Delta, the higher-count distribution never outputs below m+Delta. The lower-count distribution therefore has a one-sided support-mismatch event whenever noise < Delta, i.e. G <= Delta-1-Gamma. But shift() calibrates only Pr[G <= -Gamma] <= delta/2, which is merely the noise==0 event. For Delta>1, Pr[G <= Delta-1-Gamma] is larger (approximately exp(epsilon*(Delta-1)/Delta) times the calibrated tail) and can exceed the available delta. The join_fanout_sensitivity_witness checks only that the shift grows; it does not test this privacy-loss/support condition. Thus the documentation's claim that the exact-arithmetic mechanism is calibrated to (epsilon, delta), with clamp and truncation consuming delta/2 each, is false even apart from the acknowledged floating-point error.",
+    "file": "crates/sparq-mpc/src/dp_output.rs",
+    "fix_hint": "Derive Gamma against the actual neighboring-support event, requiring Pr[G <= Delta-1-Gamma] to fit the clamp share of delta (and check both DP directions), then enforce that corrected shift in DpParams::new. Add a deterministic probability-bound test for Delta>1, including the fan-out witness parameters, that sums the exact discrete-geometric mass of every output possible under one neighboring count but impossible under the other. Keep the achieved-DP disclaimer until the exact sampler and external audit land.",
+    "severity": "blocker",
+    "title": "The shift bounds only a zero-noise clamp, not the support gap for sensitivity greater than one"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the three prior findings: degenerate floating-point parameters and cap-tail mass are rejected, unrestricted join sensitivity is documented correctly, and budget charging is committed only after success. However, the exact-arithmetic calibration still does not meet its stated (epsilon, delta) target when sensitivity exceeds one. Because this is a newly exposed soundness defect in the load-bearing privacy calculation, progress is regressing under the required comparison rubric.",
+  "verdict": "request_changes"
+ }
+}
