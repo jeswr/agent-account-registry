@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 415,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "22ab3b5b2edc83a16155ebf2cd6e863ec924088b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "plan() calls classify(labels, \"task\", trusted=True) with a fixed type, discarding the issue's real GitHub type. In triage._role, an explicit role:*, a kind:* label, a SEC_KEYWORDS area (soundness), and UI/INFRA area labels all take precedence, so the fixed 'task' only matters for an issue with none of those signals. For such issues ROLE_BY_TYPE['task']='impl', whereas the event-driven triage-issue.yml would pass the true type: a 'spike' would derive role:research and a 'chore' role:ci. So the two triage entry points can assign different roles (and thus route to different provider chains) for the same issue. This is not a fail-open trust hole \u2014 the soundness lane is still forced by area via SEC_KEYWORDS regardless of type, and ready still requires an area label + non-epic \u2014 so it does not block, but it is a real behavioral divergence between the scheduled and event-driven paths and was not addressed since round 1.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Either add `type` to the workflow's `gh issue list --json` fields and forward the issue's real type through to classify() (mirroring how triage-issue.yml passes --type), or add a short comment on the classify() call documenting why 'task' is a safe fixed default for the scheduled sweep (e.g. that ready-eligible retriage candidates always carry an explicit role:/kind:/area signal that wins over the type map).",
+    "severity": "minor",
+    "title": "issue_type hard-coded to 'task' in classify() can diverge role vs the event-driven triage path (carried from round 1)"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round-1 blocker resolved. retriage.py:29 now guards `if \"status:untriaged\" not in labels or \"status:deferred\" in labels: skip`, so the planner requires status:untriaged present AND status:deferred absent \u2014 it no longer consumes the dispatcher-owned status:deferred state (locked decision 20). The bounded deferred-retry budget and starvation-persistence escalation are preserved because retriage never flips a deferred issue to status:ready. The change is documented (lines 27-28) and covered by two non-vacuous self-tests ('dispatcher-owned deferred rejected', 'mixed untriaged and deferred rejected') that assert the exact skip verdict and go red on a wrong answer. Cross-checked against triage.py: classify() only yields ready (add status:ready / remove status:untriaged) with a valid single priority + role + area, non-gated, non-epic; retriage's own gate additionally skips any needs:* / trust:untrusted and an explicit hold marker, and requires a trusted author (maintainer/app-bot or admin/maintain/write) \u2014 fail-closed on missing permission or classifier exception. The workflow is least-privilege (contents:read, issues:write), SHA-pins checkout, runs --self-test before the sweep, and applies only fixed-vocabulary triage labels (never issue-body text), so there is no shell/label injection surface; permission-API failure resolves to 'none' -> untrusted -> skip. The status:untriaged domain is triage-owned and safe to sweep. Only the round-1 MINOR remains unaddressed (issue_type hard-coded to 'task' in the classify call), which can diverge role assignment for spike/chore issues lacking an explicit role:/kind: signal versus the event-driven triage path \u2014 but it is not a trust hole (SEC_KEYWORDS still forces the soundness lane by area) and does not block. No new findings; the sole blocker is fixed and only a lower-severity item remains.",
+  "verdict": "approve"
+ }
+}
