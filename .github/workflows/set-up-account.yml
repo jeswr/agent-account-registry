@@ -36,23 +36,47 @@
 # BEFORE any login starts (fail closed, like the secrets preflight), then delivers the challenge
 # ENCRYPTED to that key — only the holder of the matching private key can recover the code, and the
 # plaintext challenge never leaves the runner.
+#
+# PENDING-THEN-ACTIVATE fix (#185): `master` carries required-status-check (`gate`) branch
+# protection that REJECTS every github-actions[bot] contents-API PUT (data/README.md), so the old
+# direct account_pool PUT to `master` could NEVER land — after six retries the job aborted, leaving
+# a stored credential + a `status:available` account issue that was absent from policy, with the
+# close/failure steps skipped. That is an account the allocator's available-gate treats as live but
+# which no lease can use, plus a burned slot and a request issue stuck on the sign-in message. So
+# enrollment is now TWO-PHASE and fail closed: (1) the account issue is created `status:pending`
+# (read_accounts still catalogs it, but choose_account's available-gate skips it AND it is not yet
+# in account_pool — doubly non-allocatable), and the account_pool change goes out as a CHECKED PR on
+# a feature branch (never a `master` PUT); (2) the account is ACTIVATED (status:pending ->
+# status:available, request issue closed) only AFTER that PR merges — by the `activate` job in this
+# file, on `pull_request: closed`(merged) for an `account-pool/*` head branch, which re-verifies the
+# handle is genuinely in MERGED `master` account_pool before it flips anything. An `always()` alarm
+# reports every partial enrollment state with explicit recovery (the credential capture is
+# irreversible — claims are never released, #186 — so recovery is forward, never a silent abort).
 name: set-up-account
 on:
   issues:
     types: [labeled]
+  # #185 phase 2: the `activate` job fires when an account_pool PR merges. `pull_request` (NOT
+  # `push` — no workflow in this repo triggers on push; that non-execution property is load-bearing
+  # for the ledger branch, data/README.md) runs the base-ref (master) copy of this file.
+  pull_request:
+    types: [closed]
 
-permissions:
-  issues: write
-  contents: write   # policy/repos.toml account_pool append (contents-API CAS)
-
-concurrency:
-  group: set-up-account
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
   login:
-    if: github.event.label.name == 'set-up-account'
+    if: github.event_name == 'issues' && github.event.label.name == 'set-up-account'
     runs-on: ubuntu-latest
+    # Serialize enrollments (a header-level hardening) without also serializing activations.
+    concurrency:
+      group: set-up-account-login
+      cancel-in-progress: false
+    permissions:
+      issues: write     # register the pending account issue, comment/close the request issue
+      contents: read    # checkout only — the account_pool PR branch/PUT/PR use the scoped App token
+      # (pull-requests write is NOT granted to github.token: a GITHUB_TOKEN-authored PR would not
+      #  trigger pr-gate. The App token minted below carries contents+pull-requests write instead.)
     # REGISTRY_SECRETS_PAT's canonical home is the dispatch-secrets environment (post-#101 the
     # repo scope must stay EMPTY — the secrets-guard fails dispatch closed otherwise), so the
     # broker job must be env-bound to resolve it. `issues: labeled` events run on the default
@@ -290,13 +314,11 @@ jobs:
           print(f"credential format {captured!r} is compatible with every declared alias: {aliases}")
           PY
 
-      - name: Claim slot atomically (acct-claims ref) + store token + register — fail closed
+      - name: Claim slot atomically (acct-claims ref) + store token — fail closed
         id: store
         if: steps.login.outputs.status == 'ok'
         env:
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
-          PROVIDER: ${{ steps.meta.outputs.provider }}
-          MODELS: ${{ steps.meta.outputs.models }}
           RESERVED_HANDLE: ${{ steps.meta.outputs.handle }}
         run: |
           set -euo pipefail
@@ -391,20 +413,45 @@ jobs:
           # jobs, and the rotation write-back targets the same environment. A repo-scope write
           # would re-trip the secrets-guard. Never echo the token — gh reads the file.
           GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" -R "${{ github.repository }}" --env dispatch-secrets < "$LOGIN_DIR/token"
-          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
-          harness=$([ "$PROVIDER" = openai ] && echo codex || echo claude)
-          # registry issue + comment use the workflow's own github.token (same-owner)
-          gh issue create -R "${{ github.repository }}" \
-            --title "$HANDLE" \
-            --label "provider:$PROVIDER" --label status:available \
-            --body "$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nnotes: registered via set-up-account broker\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME")"
-          # Publish the CLAIMED slot so every downstream step uses it, not the stale pre-login snapshot.
+          # #185: the `gh secret set` above is the IRREVERSIBLE capture. The account issue is NOT
+          # created here and is NEVER marked available in this job — the next step registers it
+          # `status:pending`, and activation waits for the account_pool PR to merge (fail closed: an
+          # account absent from account_pool must never be allocatable). Publish the CLAIMED slot so
+          # every downstream step uses it, not the stale pre-login snapshot.
           {
             printf 'handle=%s\n' "$HANDLE"
             printf 'secret=%s\n' "$SECRET_NAME"
           } >> "$GITHUB_OUTPUT"
 
+      # #185: register the account in a NON-available pending state. read_accounts still catalogs it
+      # (title + body parse), but choose_account's available-gate skips it (no status:available) AND
+      # it is not yet in account_pool — doubly non-allocatable until the policy PR merges. The
+      # `request_issue:` line links back so the `activate` job can close the request on merge (the
+      # account body parser ignores unknown keys, so this is safe to add).
+      - name: Register the account issue in a status:pending state (#185)
+        id: register
+        if: steps.login.outputs.status == 'ok'
+        env:
+          PROVIDER: ${{ steps.meta.outputs.provider }}
+          MODELS: ${{ steps.meta.outputs.models }}
+          HANDLE: ${{ steps.store.outputs.handle }}
+          SECRET_NAME: ${{ steps.store.outputs.secret }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
+          harness=$([ "$PROVIDER" = openai ] && echo codex || echo claude)
+          # gh issue create needs the label to pre-exist; ensure it idempotently.
+          gh label create status:pending -R "${{ github.repository }}" \
+            -c EBECA4 -d "account captured, awaiting account_pool PR merge before activation" 2>/dev/null || true
+          # registry issue + comment use the workflow's own github.token (same-owner)
+          gh issue create -R "${{ github.repository }}" \
+            --title "$HANDLE" \
+            --label "provider:$PROVIDER" --label status:pending \
+            --body "$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nrequest_issue: %s\nnotes: registered via set-up-account broker; pending account_pool PR merge\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME" "$ISSUE")"
+
       - name: Validate the registration through the real allocator parser
+        id: validate
         if: steps.login.outputs.status == 'ok'
         env:
           NEW_HANDLE: ${{ steps.store.outputs.handle }}
@@ -428,14 +475,41 @@ jobs:
           print(f"registration validated: {handle} models={account['models']}")
           PY
 
+      # #185: the account_pool PR must be opened by a NON-GITHUB_TOKEN identity — a PR opened with
+      # the workflow's own GITHUB_TOKEN does NOT trigger `pull_request` workflows (GitHub's recursion
+      # guard), so `pr-gate` would never run, the required `gate` check would never post, and the PR
+      # could never merge (nor would activation ever fire). Mint the SAME scoped GitHub App token the
+      # review lane uses (REGISTRY_ADMIN_APP_ID/KEY live in the dispatch-secrets environment this job
+      # is bound to), scoped to THIS repo with only contents+PR write.
+      - name: Mint an App token for the account_pool PR (this repo; contents+PR write) (#185)
+        id: app-token-pool
+        if: steps.login.outputs.status == 'ok'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
       # SEAM(#325): the account-pool list is slated to move to a PRIVATE location; until then
       # policy/repos.toml account_pool is the single allow-list every enforcement point checks
-      # (policy-resolve validation, claim()'s pool filter, worker.yml's independent re-check), so
-      # the broker appends the new handle there via a contents-API compare-and-swap.
-      - name: Append the handle to policy account_pool (contents-API CAS, rebase-retry)
+      # (policy-resolve validation, claim()'s pool filter, worker.yml's independent re-check). #185:
+      # a direct contents-API PUT to `master` is REJECTED by required-status-check branch protection
+      # (data/README.md), so the append goes out as a CHECKED PR on an `account-pool/<handle>`
+      # feature branch (branches other than master are unprotected). The App-authored PR runs the
+      # `gate` check; on merge the `activate` job flips the account status:pending ->
+      # status:available. The handle is appended to EVERY account_pool row (each protected repo
+      # shares the pool), and the edited policy is re-parsed with tomllib before the PR is opened
+      # (never propose an unparseable policy).
+      - name: Open a checked account_pool PR (never a master PUT) (#185)
+        id: policy_pr
         if: steps.login.outputs.status == 'ok'
         env:
+          GH_TOKEN: ${{ steps.app-token-pool.outputs.token }}
           NEW_HANDLE: ${{ steps.store.outputs.handle }}
+          REQUEST_ISSUE: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -444,66 +518,123 @@ jobs:
           import os
           import re
           import subprocess
-          import time
           import tomllib
 
           repo = os.environ["GITHUB_REPOSITORY"]
           handle = os.environ["NEW_HANDLE"]
+          request_issue = os.environ["REQUEST_ISSUE"]
           if not re.fullmatch(r"acct[0-9a-z]{2,}", handle):
               raise SystemExit("unsafe handle")
           path = "policy/repos.toml"
+          branch = f"account-pool/{handle}"
 
-          def gh_api(args, input_doc=None):
-              result = subprocess.run(
-                  ["gh", "api", *args], capture_output=True, text=True, check=False,
-                  input=json.dumps(input_doc) if input_doc is not None else None)
+          def run(args, input_str=None, check=True):
+              result = subprocess.run(args, capture_output=True, text=True, input=input_str)
+              if check and result.returncode != 0:
+                  raise SystemExit(f"{args[:3]} failed: {result.stderr.strip()}")
               return result
 
-          for attempt in range(6):
-              meta = gh_api([f"repos/{repo}/contents/{path}"])
-              if meta.returncode != 0:
-                  raise SystemExit("policy file read failed")
-              document = json.loads(meta.stdout)
-              text = base64.b64decode("".join(document["content"].split())).decode()
-              pattern = re.compile(r"(?m)^(account_pool\s*=\s*\[)([^\]]*)(\])")
-              def append(match):
-                  entries = match.group(2)
-                  if f'"{handle}"' in entries:
-                      return match.group(0)
-                  separator = ", " if entries.strip() else ""
-                  return f"{match.group(1)}{entries}{separator}\"{handle}\"{match.group(3)}"
-              new_text, count = pattern.subn(append, text)
-              if count == 0:
-                  raise SystemExit("no account_pool line found in policy/repos.toml")
-              if new_text == text:
-                  print(f"{handle} already present in account_pool")
-                  break
-              parsed = tomllib.loads(new_text)  # refuse to commit a policy the resolver can't parse
-              if not any(handle in (row.get("account_pool") or [])
-                         for row in parsed.get("repos", {}).values()):
-                  raise SystemExit("edited policy does not contain the new handle; refusing")
-              put = gh_api(
-                  [f"repos/{repo}/contents/{path}", "-X", "PUT", "--input", "-"],
-                  input_doc={
-                      "message": f"register {handle} in account_pool (set-up-account broker)",
-                      "content": base64.b64encode(new_text.encode()).decode(),
-                      "sha": document["sha"],
-                  })
-              if put.returncode == 0:
-                  print(f"appended {handle} to account_pool")
-                  break
-              time.sleep(2 * (attempt + 1))   # CAS conflict -> re-read and retry
+          def gh_api(args, input_doc=None, check=True):
+              return run(["gh", "api", *args],
+                         input_str=json.dumps(input_doc) if input_doc is not None else None,
+                         check=check)
+
+          def set_output(key, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write(f"{key}={value}\n")
+
+          # Compute the appended policy from master's current content (the PR merge base).
+          document = json.loads(gh_api([f"repos/{repo}/contents/{path}?ref=master"]).stdout)
+          text = base64.b64decode("".join(document["content"].split())).decode()
+          pattern = re.compile(r"(?m)^(account_pool\s*=\s*\[)([^\]]*)(\])")
+          def append(match):
+              entries = match.group(2)
+              if f'"{handle}"' in entries:
+                  return match.group(0)
+              separator = ", " if entries.strip() else ""
+              return f'{match.group(1)}{entries}{separator}"{handle}"{match.group(3)}'
+          new_text, count = pattern.subn(append, text)
+          if count == 0:
+              raise SystemExit("no account_pool line found in policy/repos.toml")
+          if new_text == text:
+              # Already in master account_pool (a prior run merged it) — safe to activate now; no PR.
+              print(f"{handle} already present in master account_pool — no PR needed")
+              set_output("pr", "none")
+              raise SystemExit(0)
+          parsed = tomllib.loads(new_text)  # refuse to propose a policy the resolver can't parse
+          if not any(handle in (row.get("account_pool") or [])
+                     for row in parsed.get("repos", {}).values()):
+              raise SystemExit("edited policy does not contain the new handle; refusing")
+
+          # Create the feature branch at master HEAD and PUT the edit on THAT branch. Feature
+          # branches are unprotected, so this never touches master directly. Both are idempotent so
+          # a retried job converges rather than erroring.
+          base_sha = json.loads(gh_api([f"repos/{repo}/git/ref/heads/master"]).stdout)["object"]["sha"]
+          mk = gh_api([f"repos/{repo}/git/refs", "-f", f"ref=refs/heads/{branch}",
+                       "-f", f"sha={base_sha}"], check=False)
+          if mk.returncode != 0 and "already exists" not in mk.stderr.lower():
+              raise SystemExit(f"could not create branch {branch}: {mk.stderr.strip()}")
+          # PUT against the branch tip; re-read the branch's blob sha (a reused branch already holds
+          # the edit or a stale sha), and skip if the branch already carries the change.
+          bmeta = json.loads(gh_api([f"repos/{repo}/contents/{path}?ref={branch}"]).stdout)
+          branch_text = base64.b64decode("".join(bmeta["content"].split())).decode()
+          if branch_text != new_text:
+              gh_api([f"repos/{repo}/contents/{path}", "-X", "PUT", "--input", "-"],
+                     input_doc={
+                         "message": f"register {handle} in account_pool (set-up-account broker)",
+                         "content": base64.b64encode(new_text.encode()).decode(),
+                         "sha": bmeta["sha"],
+                         "branch": branch,
+                     })
+
+          # Reuse an open PR for this branch on a retry; otherwise open one.
+          owner = repo.split("/")[0]
+          existing = json.loads(gh_api(
+              [f"repos/{repo}/pulls?head={owner}:{branch}&state=open"]).stdout)
+          if existing:
+              number = existing[0]["number"]
           else:
-              raise SystemExit("account_pool append did not settle after 6 CAS attempts")
+              body = (f"Adds `{handle}` to `policy/repos.toml` account_pool (set-up-account broker).\n\n"
+                      f"account_handle: {handle}\nrequest_issue: {request_issue}\n\n"
+                      f"On merge, the `activate` job flips `{handle}` status:pending -> "
+                      f"status:available and closes #{request_issue}. This is a trust-surface change "
+                      f"(account_pool is the allocator allow-list) — it merges only when `gate` is green.")
+              created = json.loads(gh_api(
+                  [f"repos/{repo}/pulls", "-X", "POST", "--input", "-"],
+                  input_doc={"title": f"Register {handle} in account_pool",
+                             "head": branch, "base": "master", "body": body}).stdout)
+              number = created["number"]
+          set_output("pr", str(number))
+          print(f"account_pool PR #{number} open for {handle}")
           PY
 
-      - name: Close the request issue (registration complete)
+      - name: Comment PENDING on the request issue — activation waits for merge (#185)
         if: steps.login.outputs.status == 'ok'
+        env:
+          HANDLE: ${{ steps.store.outputs.handle }}
+          SECRET: ${{ steps.store.outputs.secret }}
+          MODELS: ${{ steps.meta.outputs.models }}
+          PR: ${{ steps.policy_pr.outputs.pr }}
+          ISSUE: ${{ github.event.issue.number }}
         run: |
+          set -euo pipefail
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
-          gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-            --body "✅ Account **${{ steps.store.outputs.handle }}** registered: secret \`${{ steps.store.outputs.secret }}\` on \`${{ github.repository }}\` (format \`$fmt\`), \`models: ${{ steps.meta.outputs.models }}\`, appended to \`policy/repos.toml\` account_pool, validated via read_accounts. Closing." || true
-          gh issue close "${{ github.event.issue.number }}" -R "${{ github.repository }}" || true
+          if [ "${PR:-none}" = none ] || [ -z "${PR:-}" ]; then
+            # Handle already in master account_pool (prior merge) — policy is in place, so activate
+            # now: flip the pending account issue to available and close this request.
+            num=$(gh issue list -R "${{ github.repository }}" --state open --search "\"$HANDLE\" in:title" \
+                    --json number,title --jq "([.[]|select(.title==\"$HANDLE\")][0]).number // empty")
+            if [ -n "$num" ]; then
+              gh issue edit "$num" -R "${{ github.repository }}" \
+                --remove-label status:pending --add-label status:available || true
+            fi
+            gh issue comment "$ISSUE" -R "${{ github.repository }}" \
+              --body "✅ Account **$HANDLE** registered and activated: secret \`$SECRET\` (format \`$fmt\`), \`models: $MODELS\`, already present in \`policy/repos.toml\` account_pool — flipped to \`status:available\`. Closing." || true
+            gh issue close "$ISSUE" -R "${{ github.repository }}" || true
+          else
+            gh issue comment "$ISSUE" -R "${{ github.repository }}" \
+              --body "⏳ Account **$HANDLE** captured (secret \`$SECRET\` stored, format \`$fmt\`, \`models: $MODELS\`) and registered **status:pending** — NOT yet allocatable. Policy PR #$PR adds \`$HANDLE\` to \`policy/repos.toml\` account_pool; **merge #$PR to activate** — the \`activate\` job then flips it to \`status:available\` and closes this request. This stays open until then." || true
+          fi
 
       - name: Report failure
         if: steps.login.outputs.status != 'ok'
@@ -511,9 +642,115 @@ jobs:
           gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
             --body "⚠️ Sign-in did not complete in time (device code expires ~15 min). Re-apply \`set-up-account\` to retry." || true
 
+      # #185: after a captured credential (login ok), report EVERY partial enrollment state so a
+      # human can recover — never a silent abort. Ordered by how far the pipeline got; the first
+      # incomplete stage wins. A fully-consistent enrollment (secret + pending issue + validated +
+      # PR) is quiet. The capture is irreversible (claims are never released, #186), so every
+      # recovery is forward.
+      - name: Alarm on partial enrollment state (always) (#185)
+        if: always() && steps.login.outputs.status == 'ok'
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+          HANDLE: ${{ steps.store.outputs.handle }}
+          SECRET: ${{ steps.store.outputs.secret }}
+          STORE: ${{ steps.store.outcome }}
+          REGISTER: ${{ steps.register.outcome }}
+          VALIDATE: ${{ steps.validate.outcome }}
+          POLICY_PR: ${{ steps.policy_pr.outcome }}
+        run: |
+          set -uo pipefail
+          comment() { gh issue comment "$ISSUE" -R "${{ github.repository }}" --body "$1" || true; }
+          if [ "$STORE" != success ]; then
+            comment "🚨 Enrollment aborted while claiming/storing the credential (store: \`$STORE\`). No usable account was registered; a slot claim ref may have been burned (claims are never released, by design). **Recovery:** re-apply \`set-up-account\` to retry on a fresh slot."
+          elif [ "$REGISTER" != success ]; then
+            comment "🚨 Credential for **$HANDLE** was STORED (secret \`$SECRET\`) but the \`status:pending\` account issue was not created (register: \`$REGISTER\`). The credential is captured with no account record. **Recovery:** create the \`$HANDLE\` issue (status:pending, \`secret_ref: $SECRET\`) or delete the orphaned \`dispatch-secrets\` secret \`$SECRET\`, then re-apply \`set-up-account\`."
+          elif [ "$VALIDATE" != success ]; then
+            comment "🚨 **$HANDLE** was stored and the pending issue created, but read_accounts validation failed (\`$VALIDATE\`) — the account body may be malformed, so no policy PR was opened. **Recovery:** fix the \`$HANDLE\` issue body (models / secret_ref), then open the account_pool PR manually (branch \`account-pool/$HANDLE\`)."
+          elif [ "$POLICY_PR" != success ]; then
+            comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** open a PR adding \`$HANDLE\` to account_pool (head branch \`account-pool/$HANDLE\`); on merge it activates automatically."
+          else
+            echo "enrollment consistent: $HANDLE pending; activation awaits account_pool PR merge"
+          fi
+
       - name: Cleanup auth state (always)
         if: always()
         run: |
           pkill -f 'codex login' 2>/dev/null || true
           pkill -f 'claude setup-token' 2>/dev/null || true
           rm -rf "$LOGIN_DIR" 2>/dev/null || true
+
+  # #185 phase 2: activate an account ONLY after its account_pool PR merges. Fires on
+  # pull_request closed(merged) for an `account-pool/*` head branch, and re-verifies the handle is
+  # genuinely in MERGED master account_pool before flipping anything (fail closed) — a merged PR
+  # that does not actually add the handle, or has no matching status:pending account issue, activates
+  # nothing. Least privilege: issues:write + contents:read only, github.token (no PAT, no secrets,
+  # no environment — activation only relabels/closes issues and reads the merged policy).
+  activate:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'account-pool/')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: set-up-account-activate-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      issues: write
+      contents: read
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Checkout the merged commit (the post-merge policy) (pinned)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Activate the pending account now that account_pool merged (fail closed)
+        run: |
+          set -euo pipefail
+          handle="${HEAD_REF#account-pool/}"
+          if ! printf '%s' "$handle" | grep -qE '^acct[0-9a-z]{2,}$'; then
+            echo "::error::head ref '$HEAD_REF' does not encode a valid account handle — refusing"; exit 1
+          fi
+          # Re-verify the handle is genuinely in the MERGED account_pool. The checkout IS the merge
+          # commit; parse policy/repos.toml with tomllib — never trust the PR title/diff.
+          HANDLE="$handle" python3 - <<'PY'
+          import os, sys, tomllib
+          handle = os.environ["HANDLE"]
+          with open("policy/repos.toml", "rb") as fh:
+              policy = tomllib.load(fh)
+          if not any(handle in (row.get("account_pool") or [])
+                     for row in policy.get("repos", {}).values()):
+              print(f"::error::{handle} is not in merged master account_pool — refusing to activate",
+                    file=sys.stderr)
+              sys.exit(1)
+          print(f"{handle} confirmed present in merged account_pool")
+          PY
+          # Resolve the account issue by EXACT title. It must exist (only the trust-gated broker
+          # creates acctNN issues); if already available this is an idempotent re-trigger (no-op).
+          num=$(gh issue list -R "$REPO" --state all --search "\"$handle\" in:title" \
+                  --json number,title --jq "([.[]|select(.title==\"$handle\")][0]).number // empty")
+          if [ -z "$num" ]; then
+            echo "::error::no account issue titled '$handle' — nothing to activate (fail closed)"; exit 1
+          fi
+          labels=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
+          case " $labels " in
+            *" status:available "*) echo "$handle (issue #$num) already status:available — nothing to do"; exit 0 ;;
+            *" status:pending "*) : ;;
+            *) echo "::error::issue #$num for $handle is neither pending nor available (labels: $labels) — refusing"; exit 1 ;;
+          esac
+          gh issue edit "$num" -R "$REPO" --remove-label status:pending --add-label status:available
+          gh issue comment "$num" -R "$REPO" \
+            --body "✅ Activated: \`$handle\` is now \`status:available\` (account_pool PR #$PR_NUMBER merged)." || true
+          # Close the linked request issue (request_issue: <n> in the account issue body).
+          req=$(gh issue view "$num" -R "$REPO" --json body --jq '.body' \
+                  | sed -n 's/^request_issue:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+          if [ -n "$req" ]; then
+            gh issue comment "$req" -R "$REPO" \
+              --body "✅ Account **$handle** activated: added to \`policy/repos.toml\` account_pool (PR #$PR_NUMBER merged) and flipped to \`status:available\`. Closing." || true
+            gh issue close "$req" -R "$REPO" || true
+          fi
