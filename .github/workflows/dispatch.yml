@@ -484,7 +484,10 @@ jobs:
               # busy-area union over ALL open worker PRs (issue #27) keeps impl items out of any
               # crate with an in-flight review-loop PR. The busy partition reads the SAME
               # provenance linkage and the SAME per-PR arm state as the enumerator above
-              # (round-2 P1/P2): a human-parked PR frees its crate only when provably inactive,
+              # (round-2 P1/P2, drafts-only since round 3): a human-parked PR frees its crate
+              # only when it is a provably-inert DRAFT — pr_status supplies the fresher armed
+              # bit that keeps a crashed-disarm draft busy; parked NON-drafts stay busy
+              # unconditionally (queue state is GraphQL-only, unprovable from this snapshot) —
               # and a PR with missing/divergent linkage reserves fail-closed.
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),

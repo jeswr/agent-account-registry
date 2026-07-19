@@ -549,31 +549,30 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
 
 
 def _pull_provably_inactive(pull, status):
-    """True iff a HUMAN-PARKED worker PR provably cannot reach main on its own — the round-2
-    P1 carve-out guard (HELD != INACTIVE): groom's stale paths park NON-draft PRs WITHOUT
-    disarming, so a parked PR with GitHub auto-merge still latched can merge mid-air into a
-    crate the busy partition just freed for a sibling. Provably inactive means:
-    - DRAFT with no latched arm visible anywhere (draft is the loop's own defused state —
-      the disarm path converts to draft, and GitHub cancels/refuses auto-merge on drafts;
-      a draft that still SHOWS a latched arm is a crashed-disarm artifact and reads ACTIVE,
-      fail closed), or
-    - NON-draft with an EXPLICIT `auto_merge: null` in the listing row and no disagreeing
-      detail record. The REST auto-merge request is also the vehicle by which a PR enters a
-      merge queue (merge-when-ready), so a null listing read covers the queue state the
-      snapshot carries no independent field for.
-    `status` is the PLAN detail-read record (pr_ci_status) when one exists — fresher than
-    the listing, so `armed: True` there overrides a stale listing null. A missing draft
-    field, a missing `auto_merge` field, a non-null/garbage `auto_merge`, or a detail
-    record whose armed bit reads True all return False: UNKNOWN is ACTIVE (busy)."""
+    """True iff a HUMAN-PARKED worker PR provably cannot reach main on its own — the busy-
+    partition carve-out guard (round-2 P1 HELD != INACTIVE, restricted to DRAFTS ONLY in
+    round 3). Provably inactive means exactly one thing: a DRAFT with no latched arm
+    visible anywhere. Draft is the loop's own defused state — the disarm path converts to
+    draft, and GitHub cancels/refuses auto-merge on drafts — and the measured
+    frontier-collapse population is exactly parked drafts (26/27 open sparq worker PRs,
+    2026-07-18). A draft that still SHOWS a latched arm — an `auto_merge` dict on a
+    raw-REST row (defense in depth; the PLAN snapshot projection drops the field), or a
+    fresher PLAN detail record (pr_ci_status) whose armed bit reads True — is a
+    crashed-disarm artifact and reads ACTIVE, fail closed.
+
+    EVERY parked NON-draft stays busy unconditionally: non-draft queue/arm state is NOT
+    provable from the REST snapshot. The dispatch.yml PLAN `pr_snapshot` projection
+    carries no `auto_merge` field at all, and even a full REST row cannot prove a
+    non-draft inert — merge-queue membership is GraphQL-only (worker-pr.py
+    `_merge_queue_state`, issue #69: a directly-queued PR can show NO REST latch), so a
+    null/absent `auto_merge` may still be a queued PR about to merge. Round 2's non-draft
+    `auto_merge: null` branch was therefore unsound AND unreachable in production
+    (round-3 P1s); it is gone. A missing/garbage `draft` field reads ACTIVE (busy)."""
     if isinstance(pull.get("auto_merge"), dict):
-        return False                      # latched arm in the listing row — it may merge
+        return False                      # latched arm on a raw-REST row — it may merge
     if isinstance(status, dict) and status.get("armed") is True:
-        return False                      # fresher detail read says latched — fail closed
-    if pull.get("draft") is True:
-        return True                       # defused state: nothing latched, nothing queued
-    if pull.get("draft") is not False:
-        return False                      # unknown draft state — fail closed
-    return "auto_merge" in pull and pull["auto_merge"] is None
+        return False                      # detail read says latched — crashed-disarm artifact
+    return pull.get("draft") is True      # non-draft/unknown: never provably inactive
 
 
 def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None):
@@ -596,18 +595,21 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     record whose source issue is absent from the open-issue map mirrors the enumerator,
     which still emits that PR as `__global__`.
 
-    HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse): a human-parked PR —
-    `review:needs-user`/`needs:user` on the PR, or `needs:*` on the provenance-linked source
-    issue — frees its packages ONLY when it is provably inactive (_pull_provably_inactive:
-    draft, or non-draft with an explicitly un-latched auto-merge and no disagreeing detail
-    record). groom parks stale NON-draft PRs WITHOUT disarming, so a parked PR with
-    auto-merge still latched can merge mid-air into a crate this partition just freed for a
-    sibling — armed/unknown-arm parked PRs stay BUSY. The measured collapse (26 of 27 open
-    sparq worker PRs source-parked, ~1 plan item/tick against a 13-row frontier, dispatch
-    runs 29664401328/29665207000) is still fixed: groom's parks are drafts or unarmed in the
-    common case, and those free. The parked SOURCE issue itself stays `needs:*`-gated out of
-    the target ready engine, so freeing an inert PR's crate can never re-dispatch the parked
-    issue — only siblings in the same crate."""
+    HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse, DRAFTS-ONLY since
+    round 3): a human-parked PR — `review:needs-user`/`needs:user` on the PR, or `needs:*`
+    on the provenance-linked source issue — frees its packages ONLY when it is a
+    provably-inert DRAFT (_pull_provably_inactive: draft with no visible latch; a latched
+    draft is a crashed-disarm artifact and stays busy). EVERY parked NON-draft stays BUSY
+    unconditionally: groom parks stale non-draft PRs WITHOUT disarming, and non-draft
+    queue/arm state is not provable from the REST snapshot (the PLAN projection carries no
+    auto_merge field, and merge-queue membership is GraphQL-only per worker-pr.py's own
+    doctrine — a directly-queued PR shows no REST latch), so an unprovable park could merge
+    mid-air into a crate this partition just freed for a sibling. The measured collapse
+    (26 of 27 open sparq worker PRs source-parked, ~1 plan item/tick against a 13-row
+    frontier, dispatch runs 29664401328/29665207000) is still fixed: the collapse
+    population is parked DRAFTS, and those free. The parked SOURCE issue itself stays
+    `needs:*`-gated out of the target ready engine, so freeing an inert PR's crate can
+    never re-dispatch the parked issue — only siblings in the same crate."""
     busy = set()
     for pull in pulls:
         if not isinstance(pull, dict) or pull.get("state") != "open":
@@ -3045,54 +3047,94 @@ def _self_test():
                               labels=["needs:user", "area:crate-d"])],
         collapse_labels, busy_prov) == frontier
 
-    # ---- [round-2 P1] HELD != INACTIVE: groom parks stale NON-draft PRs WITHOUT disarming,
-    # and a parked PR with auto-merge still latched can merge mid-air into a crate the
-    # partition just freed for a sibling. A parked PR frees its crates ONLY when provably
-    # inactive; a latched or UNKNOWN arm state stays busy (fail closed). ----
-    def parked_ready(**extra):
-        base = pull(76, "sparq-agent/issue-81-1-1", sha_a, draft=False,
-                    labels=["review:needs-user"])
-        base.update(extra)
-        return base
+    # ---- [round-3 P1, drafts-only] HELD != INACTIVE: a human-parked PR frees its crates
+    # ONLY when it is a provably-inert DRAFT. Round 2 also freed a parked NON-draft on an
+    # explicit `auto_merge: null` listing read — unsound twice over (round-3 P1s):
+    # (1) the PLAN snapshot projection DROPS auto_merge, so that branch was UNREACHABLE in
+    # production and its fixtures were synthetic; (2) REST `auto_merge: null` cannot prove
+    # a non-draft inert anyway — merge-queue membership is GraphQL-only (worker-pr.py
+    # _merge_queue_state, issue #69: a directly-queued PR shows NO REST latch).
+    # SNAPSHOT-SHAPE PARITY: the fixtures below are built in the workflow's EXACT
+    # field-selected row shape, with the projection key set read from dispatch.yml itself
+    # so fixture and projection cannot silently drift apart again. Rows carrying a
+    # synthetic latch field are explicitly labeled as such and exist to prove a non-draft
+    # stays busy EVEN IF a latch field were present. ----
+    workflow = (Path(__file__).resolve().parent.parent
+                / ".github" / "workflows" / "dispatch.yml").read_text(encoding="utf-8")
+    projection = re.search(r"pr_snapshot\.append\(\{\n(.*?)\n\s*\}\)", workflow, re.DOTALL)
+    assert projection, "dispatch.yml lost the pr_snapshot.append projection block"
+    key_lines = [line for line in projection.group(1).splitlines()
+                 if re.match(r'\s*"[a-z_]+": ', line)]
+    key_indent = min(len(line) - len(line.lstrip()) for line in key_lines)
+    snapshot_fields = {re.match(r'\s*"([a-z_]+)"', line).group(1) for line in key_lines
+                       if len(line) - len(line.lstrip()) == key_indent}
+    assert snapshot_fields == {"number", "state", "draft", "body", "labels",
+                               "head", "user"}, snapshot_fields
+
+    def snapshot_row(number, ref, *, draft, labels=()):
+        # EXACTLY the dispatch.yml projection: top-level keys pinned to the workflow read
+        # above; labels are plain STRINGS (not {"name": ...} dicts); head/user sub-shapes
+        # mirror the projection's nested selections.
+        row = {"number": number, "state": "open", "draft": draft, "body": "",
+               "labels": list(labels),
+               "head": {"ref": ref, "sha": sha_a, "repo": {"full_name": repo}},
+               "user": {"login": bot, "type": "Bot"}}
+        assert set(row) == snapshot_fields, "fixture drifted from the workflow projection"
+        return row
+
+    def parked_draft(**synthetic):
+        return dict(snapshot_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                                 labels=["review:needs-user"]), **synthetic)
+
+    def parked_ready(**synthetic):
+        return dict(snapshot_row(76, "sparq-agent/issue-81-1-1", draft=False,
+                                 labels=["review:needs-user"]), **synthetic)
 
     latched = {"enabled_by": {"login": bot}, "merge_method": "squash"}
-    # armed-non-draft-parked: the latch survives the park — its crate stays busy
-    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=latched)],
+    # parked DRAFT, no visible latch — the production frontier-collapse population
+    # (26/27 open sparq worker PRs on 2026-07-18): provably inert, frees its crate
+    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
+                                  busy_prov) == set()
+    # parked DRAFT whose fresher PLAN detail record says the arm is still latched: a
+    # crashed-disarm artifact — busy (pr_status is the production-visible latch signal;
+    # the snapshot row itself carries no auto_merge field)
+    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels, busy_prov,
+                                  {76: {"head_sha": sha_a, "armed": True}}) == {"crate-b"}
+    # parked DRAFT with a synthetic auto_merge dict (raw-REST defense in depth, NOT a
+    # snapshot field): same crashed-disarm artifact — busy
+    assert busy_packages_of_pulls(repo, [parked_draft(auto_merge=latched)],
                                   collapse_labels, busy_prov) == {"crate-b"}
-    # unarmed-non-draft-parked (explicit `auto_merge: null` in the listing row): provably
-    # inert — frees the crate (the round-1 draft carve-out, extended beyond drafts)
-    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)],
-                                  collapse_labels, busy_prov) == set()
-    # unknown arm state (no auto_merge field in the row at all): fail closed — busy
+    # parked NON-draft in the production row shape (no auto_merge field exists): busy
     assert busy_packages_of_pulls(repo, [parked_ready()],
                                   collapse_labels, busy_prov) == {"crate-b"}
-    # garbage arm state is unknown too
+    # parked NON-draft with a synthetic latch field — armed, explicitly-null, garbage:
+    # ALL busy (round 2 freed the null one; non-draft is now unconditional)
+    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=latched)],
+                                  collapse_labels, busy_prov) == {"crate-b"}
+    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)],
+                                  collapse_labels, busy_prov) == {"crate-b"}
     assert busy_packages_of_pulls(repo, [parked_ready(auto_merge="yes")],
                                   collapse_labels, busy_prov) == {"crate-b"}
-    # unknown DRAFT state: fail closed — busy
-    no_draft = parked_ready(auto_merge=None)
-    del no_draft["draft"]
-    assert busy_packages_of_pulls(repo, [no_draft],
-                                  collapse_labels, busy_prov) == {"crate-b"}
-    # a fresher detail record (pr_status) with the arm latched overrides a stale listing null
+    # directly-queued-shaped NON-draft: NO REST latch visible ANYWHERE — synthetic
+    # auto_merge:null AND an agreeing unarmed detail record, exactly how a merge-queue
+    # member can present over REST (membership is GraphQL-only): busy
     assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)], collapse_labels,
                                   busy_prov,
-                                  {76: {"head_sha": sha_a, "armed": True}}) == {"crate-b"}
-    # ... while an agreeing unarmed detail record keeps the inert park free
-    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)], collapse_labels,
-                                  busy_prov,
-                                  {76: {"head_sha": sha_a, "armed": False}}) == set()
-    # a DRAFT that still SHOWS a latched arm is a crashed-disarm artifact — busy, not inert
-    armed_draft = pull(76, "sparq-agent/issue-81-1-1", sha_a, labels=["review:needs-user"])
-    armed_draft["auto_merge"] = latched
-    assert busy_packages_of_pulls(repo, [armed_draft],
-                                  collapse_labels, busy_prov) == {"crate-b"}
-    # source-issue parks obey the same inactivity rule: issue 80 is needs:user-parked, but
-    # an ARMED non-draft worker PR on it still reserves crate-a
+                                  {76: {"head_sha": sha_a, "armed": False}}) == {"crate-b"}
+    # unknown DRAFT state (the projection carries the key; the API returned garbage): busy
+    assert busy_packages_of_pulls(repo, [parked_ready(draft=None)], collapse_labels,
+                                  busy_prov) == {"crate-b"}
+    # source-issue parks compose the same way: issue 80 is needs:user-parked; its
+    # NON-draft worker PR still reserves crate-a...
     assert busy_packages_of_pulls(
-        repo, [dict(pull(75, "sparq-agent/issue-80-1-1", sha_a, draft=False,
-                         labels=["review:needs"]), auto_merge=latched)],
+        repo, [snapshot_row(75, "sparq-agent/issue-80-1-1", draft=False,
+                            labels=["review:needs"])],
         collapse_labels, busy_prov) == {"crate-a"}
+    # ...while its parked-DRAFT twin frees it
+    assert busy_packages_of_pulls(
+        repo, [snapshot_row(75, "sparq-agent/issue-80-1-1", draft=True,
+                            labels=["review:needs"])],
+        collapse_labels, busy_prov) == set()
 
     # ---- [round-2 P2] LINKAGE PARITY: when the branch-derived and provenance-derived
     # source issues differ, the busy result must mirror the enumerator's classification in
