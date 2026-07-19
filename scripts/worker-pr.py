@@ -1173,12 +1173,18 @@ def _queue_disarm_mutation(mutation, node_id):
         raise WorkerPrError(f"GraphQL {mutation} failed for the queued pull request")
 
 
-def disarm(repo, pr_number, when):
+def disarm(repo, pr_number, when, bot_login=""):
     """Defuse a worker PR's GitHub-side arm/ready state, fail-closed on LIVE data only (the plan
     row that requested this is hostile — every precondition is re-derived from the API here).
 
     Trust surface mirrors the review enumerator: only an open, same-repo, bot-authored
-    `sparq-agent/*` PR is ever touched. A PR labelled review:needs-user OR needs:user is
+    `sparq-agent/*` PR authored by the EXACT App identity `bot_login` is ever touched (issue
+    #152: accepting any login ending in `[bot]` let a forged plan row redraft/disable-auto/
+    relabel an UNRELATED same-repo PR authored by ANOTHER App that happens to use the worker
+    branch pattern and carries no reviewed-sha marker). `bot_login` is CLAIM's own trusted App
+    login (never the plan's); a missing identity or any authorship mismatch fails closed.
+
+    A PR labelled review:needs-user OR needs:user is
     human-owned, and when=always (the autonomous-fix defuse) stands down on it entirely — as it
     does on a `needs:*`-parked head-ref-linked SOURCE issue, which it additionally consults so a
     fix push never rides into that human's territory. But when=mismatch — the issue #42 safety
@@ -1216,9 +1222,12 @@ def disarm(repo, pr_number, when):
     labels = {label.get("name") for label in (live.get("labels") or [])
               if isinstance(label, dict)}
     head_match = WORKER_HEAD_RE.fullmatch(str(head.get("ref", "")))
-    if head_repo != repo or not head_match or not login.endswith("[bot]"):
+    # Issue #152: exact App authorship, not merely any `[bot]`. A missing expected identity or
+    # a live author that is not this App's bot fails closed — never touch another App's PR.
+    if (head_repo != repo or not head_match or not login.endswith("[bot]")
+            or not bot_login or login != bot_login):
         _write_outputs({"disarmed": False})
-        print("disarm skipped: not a same-repo bot worker PR")
+        print("disarm skipped: not this App's same-repo bot worker PR")
         return
     held = human_owned(labels)
     if when == "always" and held:
@@ -2337,7 +2346,7 @@ def _self_test():
         return argparse.Namespace(returncode=code, stdout="", stderr="")
 
     def run_disarm(base_ref="main", draft=False, armed=True, labels=(), when="mismatch",
-                   **overrides):
+                   login="sparq[bot]", bot_login="sparq[bot]", **overrides):
         disarm_calls.clear()
         compare_paths.clear()
         fake_outputs.clear()
@@ -2345,7 +2354,7 @@ def _self_test():
         net.update({
             "live": {"state": "open", "draft": draft,
                      "auto_merge": {"merge_method": "squash"} if armed else None,
-                     "user": {"login": "sparq[bot]"},
+                     "user": {"login": login},
                      "labels": [{"name": name} for name in labels],
                      "body": f"pr body\n\n<!-- sparq-reviewed-sha:{rev_sha} -->\n",
                      "head": {"sha": head_69, "ref": "sparq-agent/issue-7-fix",
@@ -2355,7 +2364,7 @@ def _self_test():
             "compare": {key: json.loads(json.dumps(doc))
                         for key, doc in identical_compares.items()},
         }, **overrides)
-        disarm("o/r", 41, when)
+        disarm("o/r", 41, when, bot_login=bot_login)
 
     try:
         wiring_globals["_gh_json"] = fake_gh_json
@@ -2562,6 +2571,33 @@ def _self_test():
             run_disarm(labels=(hold,), when="always")
             check(f"held always-defuse ({hold}) stands down untouched",
                   (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+
+        # ---- Issue #152: exact App authorship — a forged plan row must never disarm a PR
+        # authored by ANOTHER App, even when it is a same-repo worker-branch PR with a real
+        # armed-SHA mismatch. Any-[bot] no longer suffices; the live author must equal the
+        # expected identity CLAIM passes in. ----
+        foreign = json.loads(json.dumps(evil))  # a genuine content-change mismatch to retract
+        # (a) live author is a DIFFERENT App bot -> stand down entirely (no mutation at all).
+        #     Red if the gate reverts to accepting any login ending in [bot].
+        run_disarm(compare=json.loads(json.dumps(foreign)), login="other-app[bot]")
+        check("foreign-App worker PR is never disarmed (#152 authorship)",
+              (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+        # (b) the SAME live PR + mismatch IS disarmed when the author is this App's bot — proves
+        #     (a) is the authorship gate, not some unrelated precondition failing.
+        run_disarm(compare=json.loads(json.dumps(foreign)), login="sparq[bot]")
+        check("this App's worker PR with a real mismatch still disarms (#152 control)",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls,
+               fake_outputs.get("disarmed")), (True, True))
+        # (c) an empty expected identity fails closed — never disarm without knowing whose PR
+        #     it is (the CLAIM token-gate already blocks this, defence in depth in the helper).
+        run_disarm(compare=json.loads(json.dumps(foreign)), bot_login="")
+        check("empty expected App identity fails closed (#152)",
+              (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+        # (d) both logins are [bot] but DIFFER — exact match required, endswith([bot]) is not it.
+        run_disarm(compare=json.loads(json.dumps(foreign)),
+                   login="sneaky[bot]", bot_login="sparq[bot]")
+        check("any-[bot] no longer suffices; exact login required (#152)",
+              (disarm_calls, fake_outputs.get("disarmed")), ([], False))
     finally:
         wiring_globals.update(real_disarm_io)
 
@@ -2961,6 +2997,9 @@ def main():
 
     dis = subparsers.add_parser("disarm", parents=[common])
     dis.add_argument("--when", choices=("mismatch", "always"), required=True)
+    # Issue #152: the exact App identity CLAIM re-read live; disarm enforces the live PR author
+    # matches it, so a forged plan row cannot defuse another App's same-repo worker PR.
+    dis.add_argument("--bot-login", required=True)
 
     # The live reviewer handle arrives via env WORKER_REVIEWER_ACCOUNT (not argv — argv is echoed
     # into public logs) and is compared against the recorded hash under PROVENANCE_SALT.
@@ -3071,7 +3110,7 @@ def main():
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
                        alert_repo=alert_repo, alert_token=alert_token)
         elif args.command == "disarm":
-            disarm(args.repo, args.pr, args.when)
+            disarm(args.repo, args.pr, args.when, bot_login=args.bot_login)
         elif args.command == "ready-and-arm":
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,
