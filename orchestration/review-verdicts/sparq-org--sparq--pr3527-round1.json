@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "Test-only change in crates/sparq-vectors/tests/verbalize.rs: renames verbalize_precision_at_k_fixture_is_not_worse_than_labels_only -> ..._beats_labels_only and strengthens the final assertion from `full_precision >= labels_precision` to `full_precision > labels_precision`. The strengthened claim is correct and non-vacuous: the preceding assertions (lines 207-208) already pin full_hits.first()==correct and labels_hits.first()==ambiguous, so full_precision==1 and labels_precision==0 deterministically, making 1>0 hold whenever the test reaches the assertion. Determinism of the labels-only tie-break is itself guaranteed by the ambiguous_id < correct_id assertion (lines 173-176), and HashEmbedder is deterministic, so this is not flaky. The rename matches the new stricter semantics and the added comment. No correctness, soundness, or security concerns; the diff carries no honesty overclaim (comment explicitly scopes it as a fixture-scale demonstration, not a benchmark). Minor: the strict `>` is logically redundant given the two prior equality assertions already fix the outcome, but it makes the retrieval-quality intent explicit and is harmless.",
+ "verdict": "approve"
+}
