@@ -161,6 +161,12 @@ REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
 # ASCENDING (weakest first, terminal strongest LAST; opus < luna < fable < sol) and govern
 # exhaustion escalation + pinned floors (sol r2 f2 fixed the previously inverted ladders).
 FIX_CHAIN = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
+# Probe-exempt PROVIDERS for the require_usage hold (issue #115). Mirrors account-usage.py's
+# EXEMPT_PROVIDERS allowlist (the maintainer decision names openai): codex/openai accounts report
+# no rate-limit-header usage and are governed by reactive backoff, so a usage=None probe outage is
+# their EXPECTED steady state, not a failure. Kept as an explicit allowlist, never "any non-
+# anthropic": a missing/typo provider stays on the fail-closed hold path (never silently exempted).
+PROBE_EXEMPT_PROVIDERS = frozenset({"openai"})
 # Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
 # 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
 # earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
@@ -1569,6 +1575,24 @@ def _resolvable_chain(chain, routing):
     return usable
 
 
+def _chain_probe_exempt(chain, routing):
+    """True iff EVERY alias in `chain` maps to a POSITIVELY probe-exempt provider in the target
+    routing catalog (issue #115) — so a wholesale usage-probe outage (usage=None) does NOT gate a
+    claim served entirely by codex/openai accounts, whose absent usage is the expected steady
+    state. Fail-closed: an empty chain, a missing routing catalog, or ANY alias whose provider is
+    absent / unknown / non-exempt makes the whole chain non-exempt, and the require_usage hold then
+    applies (a probe-gated anthropic review/fix never rides an unavailable probe)."""
+    models = routing.get("models") if isinstance(routing, dict) else None
+    if not isinstance(models, dict) or not chain:
+        return False
+    for alias in chain:
+        meta = models.get(alias)
+        provider = meta.get("provider") if isinstance(meta, dict) else None
+        if str(provider or "").strip().lower() not in PROBE_EXEMPT_PROVIDERS:
+            return False
+    return True
+
+
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
                            defer_reasons, lanes=None, ledger_root=""):
@@ -1589,6 +1613,10 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     launched = 0
     script_dir = Path(__file__).resolve().parent
     max_rounds = int(policy.get("max_review_rounds", 3))
+    # Issue #115: the same fail-closed usage gate the worker loop applies (a require_usage repo
+    # HOLDS on a wholesale usage-probe outage rather than dispatching ungated). Enforced per-claim
+    # below, with an explicit carve-out for a chain served entirely by probe-exempt accounts.
+    require_usage = bool(policy.get("require_usage", False))
     for item in review_items:
         number = item["pr_number"]
         lane = _review_item_lane(item["state"])
@@ -1877,6 +1905,16 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         except DispatchError as exc:
             lanes[lane]["error"] += 1
             print(f"defer review {repo}#{number}: revalidation failed ({exc}); skipped")
+            continue
+        # Issue #115 fail-closed usage hold: the worker loop already HOLDS a require_usage repo when
+        # a TOTAL usage-probe failure leaves `usage` unavailable; the review/fix loop must apply the
+        # SAME hold before its claim or a probe-gated (anthropic) review/fix silently falls to the
+        # allocator's ungated static selection during the outage. The ONLY exception is a chain
+        # served entirely by probe-exempt (codex/openai) accounts, for which usage=None is expected.
+        if usage is None and require_usage and not _chain_probe_exempt(chain, routing):
+            defer_reasons["usage-probe-unavailable"] += 1
+            print(f"defer review {repo}#{number}: require_usage set but live usage is unavailable "
+                  f"(probe failed) — holding the {mode} claim fail-closed")
             continue
         now = int(time.time())
         holder = f"{holder_prefix}{repo}#{number}@dispatch-" \
@@ -3420,16 +3458,16 @@ def _self_test():
                 "user": {"login": bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
-    def run_items(items, allocator=None, routing=None):
+    def run_items(items, allocator=None, routing=None, policy=None, usage=None):
         helper_calls.clear()
         reasons = Counter()
         # Issue #108: a fresh per-lane accumulator each call; run_items.lanes exposes it for the
         # review/fix stall assertions below without changing the (launched, reasons) return arity.
         lanes = _new_lane_counts()
         launched = _dispatch_review_items(
-            items, repo, {"max_review_rounds": 3, "account_pool": []},
+            items, repo, policy or {"max_review_rounds": 3, "account_pool": []},
             routing or {}, allocator, wiring_worker_pr, "reg/repo",
-            wiring_root, "main", bot, None, 0.10, reasons, lanes=lanes,
+            wiring_root, "main", bot, usage, 0.10, reasons, lanes=lanes,
             ledger_root=wiring_ledger_root)
         run_items.lanes = lanes
         return launched, reasons
@@ -3720,6 +3758,73 @@ def _self_test():
             # health recorder does NOT read it as a hard stall while accounts are simply busy.
             assert _lane_summary(run_items.lanes)["fix"] == {
                 "planned": 1, "launched": 0, "deferred": 1, "error": 0}, run_items.lanes
+
+            # ---- issue #115: require_usage HOLDS a review/fix claim during a WHOLESALE usage-
+            # probe outage (usage=None), matching the worker loop's fail-closed hold, with an
+            # explicit carve-out for a chain served entirely by probe-exempt (codex/openai)
+            # accounts. Before the fix the review/fix loop passed usage=None straight to the
+            # allocator's UNGATED static selection, so anthropic review/fix work could start
+            # despite require_usage=true and a total probe failure. ----
+            usage_gated = {"max_review_rounds": 3, "account_pool": [], "require_usage": True}
+            # A routing catalog carrying the model `provider` field (as the live routing.toml
+            # does): anthropic models are probe-GATED, openai/codex models are probe-EXEMPT.
+            routing_prov = {"models": {
+                "fable": {"provider": "anthropic", "provider_model": "claude-fable-5",
+                          "harness": "claude"},
+                "opus": {"provider": "anthropic", "provider_model": "claude-opus-4-8",
+                         "harness": "claude"},
+                "sol": {"provider": "openai", "provider_model": "TBD", "harness": "codex"},
+                "luna": {"provider": "openai", "provider_model": "TBD", "harness": "codex"},
+            }}
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            fake["comments"] = round_markers(2)
+            write_verdict(2, None)
+            # (a) an anthropic (probe-GATED) FIX chain + usage=None + require_usage HOLDS: the
+            # claim is NEVER offered and the outage is counted, exactly like the worker loop.
+            alloc = FakeAllocator()
+            _, reasons = run_items([fix_item], allocator=alloc, routing=routing_prov,
+                                   policy=usage_gated, usage=None)
+            assert alloc.chains == [], alloc.chains
+            assert reasons["usage-probe-unavailable"] == 1, reasons
+            # (b) the hold is CONDITIONED on require_usage: the SAME outage under the default
+            # policy (require_usage unset) still dispatches — a non-opted-in repo is unchanged.
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_prov, usage=None)
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            # (c) the hold is CONDITIONED on the OUTAGE: require_usage with a LIVE usage map
+            # dispatches (usage!=None is not a probe failure).
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_prov,
+                      policy=usage_gated, usage={"acct01": {"ok": True}})
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            # (d) a probe-EXEMPT (codex/openai) REVIEW chain PROCEEDS despite usage=None: absent
+            # usage is its expected steady state (reactive backoff), so the hold must NOT gate it.
+            exempt_review = dict(fix_item, state="needs-review")
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            fake["comments"] = round_markers(1)
+            alloc = FakeAllocator()
+            _, reasons = run_items([exempt_review], allocator=alloc, routing=routing_prov,
+                                   policy=usage_gated, usage=None)
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
+            assert reasons["usage-probe-unavailable"] == 0, reasons
+            # (e) fail-closed on an UNKNOWN provider: a chain whose alias carries no exempt
+            # provider is treated as probe-gated (never silently exempted) and HOLDS.
+            routing_unknown = {"models": {
+                "fable": {"provider": "mystery", "provider_model": "x", "harness": "claude"},
+                "opus": {"provider": "mystery", "provider_model": "y", "harness": "claude"},
+            }}
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            fake["comments"] = round_markers(2)
+            write_verdict(2, None)
+            alloc = FakeAllocator()
+            _, reasons = run_items([fix_item], allocator=alloc, routing=routing_unknown,
+                                   policy=usage_gated, usage=None)
+            assert alloc.chains == [], alloc.chains
+            assert reasons["usage-probe-unavailable"] == 1, reasons
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
 
             # ---- review/fix lease-error propagation (PR #258 review defect): an allocator
             # that RAISES inside the review/fix loop must land in the tick's SHARED
@@ -4328,6 +4433,25 @@ def _self_test():
     assert _resolvable_chain(["sol"], routing) == ["sol"]
     routing["models"]["sol"]["provider_model"] = "gpt-5.6-codex"
     assert _resolvable_chain(["sol"], routing) == ["sol"]
+
+    # Probe-exempt chain classification (issue #115): exempt ONLY when EVERY alias maps to a
+    # positively probe-exempt provider; anything else (mixed, unknown/missing provider, empty
+    # chain, no catalog) is non-exempt so the require_usage hold applies. Fail-closed.
+    prov_routing = {"models": {
+        "sol": {"provider": "openai", "harness": "codex"},
+        "luna": {"provider": "openai", "harness": "codex"},
+        "opus": {"provider": "anthropic", "harness": "claude"},
+        "fable": {"provider": "anthropic", "harness": "claude"},
+        "mystery": {"harness": "codex"},                 # no provider field
+        "typo": {"provider": "openia", "harness": "codex"},  # misspelled provider
+    }}
+    assert _chain_probe_exempt(["sol", "luna"], prov_routing) is True
+    assert _chain_probe_exempt(["opus", "fable"], prov_routing) is False   # anthropic gated
+    assert _chain_probe_exempt(["sol", "opus"], prov_routing) is False     # mixed -> gated
+    assert _chain_probe_exempt(["sol", "mystery"], prov_routing) is False  # missing provider
+    assert _chain_probe_exempt(["sol", "typo"], prov_routing) is False     # unknown provider
+    assert _chain_probe_exempt([], prov_routing) is False                  # empty chain
+    assert _chain_probe_exempt(["sol"], {}) is False                       # no catalog
 
     # ---- CLAIM disarm application (issue #42): runs per-item-resilient and token-gated; the
     # live precondition re-derivation itself lives in worker-pr.py disarm (tested there) ----
