@@ -41,6 +41,17 @@ LABEL_COLOURS = {
 # re-run of the same phase is idempotent (mirror worker-issue record_attempt) and stop conditions
 # are computed from ordered, run-keyed markers — never raw comment counts.
 ROUND_MARKER = "<!-- sparq-review-round:v1"
+# [issue #162 — sol-audit review-lane] The round marker binds the HEAD SHA it reviewed (`sha=`),
+# so a charged round is tied to concrete content, not just an ordinal. A round whose review
+# OUTCOME deferred as stale (the live head moved off the reviewed commit before the outcome could
+# apply — legitimate head churn, a stale workflow, or a review voided by a moving head) is VOIDED:
+# review_outcome records this marker for the SAME (round, run) the pre-model round marker used, and
+# count_rounds SUBTRACTS voided (round, run) attempts so a stale-head outcome is never charged as a
+# substantive review round. A crash records NO void (the outcome step never runs) and stays
+# charged, preserving the bounded-crash accounting. Bot-authored + reserved-namespace like every
+# other durable marker: a model cannot forge one to un-charge rounds (post_findings defangs the
+# whole `<!-- sparq-` namespace in republished verdict text).
+ROUND_VOID_MARKER = "<!-- sparq-review-void:v1"
 MARKER_KINDS = {
     "nochange": "<!-- sparq-fix-nochange:v1",
     "gatefail": "<!-- sparq-fix-gatefail:v1",
@@ -187,14 +198,36 @@ def _bot_comments(comments, bot_login):
             if str(c.get("user", {}).get("login", "")).casefold() == bot]
 
 
+def _round_voids(comments, bot_login):
+    """Set of (round, run) pairs whose review outcome deferred as stale (issue #162) and so must
+    NOT be charged as a substantive review round. Bot-authored only, like every marker parser."""
+    voided = set()
+    pattern = re.escape(ROUND_VOID_MARKER) + r" n=([1-9][0-9]*) run=(\S+) -->"
+    for comment in _bot_comments(comments, bot_login):
+        for match in re.finditer(pattern, str(comment.get("body", ""))):
+            voided.add((int(match.group(1)), match.group(2)))
+    return voided
+
+
 def count_rounds(comments, bot_login):
-    """Highest review round recorded by the bot (0 when no review has run)."""
+    """Highest SUBSTANTIVE review round recorded by the bot (0 when no review has run). A round
+    whose review outcome deferred as stale (issue #162: the live head moved off the reviewed commit,
+    so the outcome applied nothing) records a void marker for its (round, run); that attempt is
+    subtracted here so legitimate head churn never burns the global round budget and terminally
+    escalates a head that never received a valid review. A round still counts as soon as ANY of its
+    recorded (round, run) attempts is unvoided — a crash records no void (its outcome step never
+    ran) and stays charged, keeping the bounded-crash accounting intact. The optional trailing
+    `sha=` content key on the marker is ignored for counting (it is the audit binding)."""
+    voided = _round_voids(comments, bot_login)
     best = 0
     for comment in _bot_comments(comments, bot_login):
         for match in re.finditer(
-                re.escape(ROUND_MARKER) + r" n=([1-9][0-9]*) run=\S+ -->",
+                re.escape(ROUND_MARKER)
+                + r" n=([1-9][0-9]*) run=(\S+)(?: sha=(?:[0-9a-f]{40}|none))? -->",
                 str(comment.get("body", ""))):
-            best = max(best, int(match.group(1)))
+            round_n, run_key = int(match.group(1)), match.group(2)
+            if (round_n, run_key) not in voided:
+                best = max(best, round_n)
     return best
 
 
@@ -212,8 +245,13 @@ def marker_runs(comments, bot_login, kind, round_n):
 
 
 def round_recorded(comments, bot_login, round_n, run_key):
-    marker = f"{ROUND_MARKER} n={round_n} run={run_key} -->"
-    return any(marker in str(c.get("body", "")) for c in _bot_comments(comments, bot_login))
+    """True when THIS (round, run) already carries a round marker (idempotent record). Matches
+    regardless of the marker's optional `sha=` content key (issue #162) so a re-run never
+    double-records the same round."""
+    pattern = re.compile(
+        re.escape(ROUND_MARKER) + rf" n={round_n} run={re.escape(str(run_key))}"
+        r"(?: sha=(?:[0-9a-f]{40}|none))? -->")
+    return any(pattern.search(str(c.get("body", ""))) for c in _bot_comments(comments, bot_login))
 
 
 def fix_round_models(comments, bot_login):
@@ -850,15 +888,41 @@ def get_review_state(repo, pr_number):
     print(f"PR review state: {state or '(none)'}")
 
 
-def record_round(repo, pr_number, round_n, run_key, bot_login):
+def record_round(repo, pr_number, round_n, run_key, bot_login, head_sha):
+    """Record the pre-model round marker, BOUND to the head sha this round reviews (issue #162).
+    The `sha=` content key ties the charged round to concrete content so a stale-head outcome can
+    be voided (see record_round_void). The head sha is a trust-plane identity field: a missing or
+    malformed value STOPS the mutation (fail closed) rather than degrading to a weaker unbound
+    marker — no round is ever charged unless it is bound to the concrete 40-hex head it reviewed.
+    (Legacy pre-#162 markers carry no `sha=` key at all; count_rounds still parses those.)"""
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha or ""):
+        raise WorkerPrError("round marker requires a 40-hex head sha (fail closed; issue #162)")
     comments = _paginated_comments(repo, pr_number)
     if round_recorded(comments, bot_login, round_n, run_key):
         print(f"review round already recorded: {round_n}")
         return
     body = (f"> 🤖 SPARQ agent — cross-provider review round {round_n} recorded.\n\n"
-            f"{ROUND_MARKER} n={round_n} run={run_key} -->")
+            f"{ROUND_MARKER} n={round_n} run={run_key} sha={head_sha} -->")
     _comment(repo, pr_number, body)
-    print(f"review round recorded: {round_n}")
+    print(f"review round recorded: {round_n} @ {head_sha[:12]}")
+
+
+def record_round_void(repo, pr_number, round_n, run_key, bot_login):
+    """Void a stale-deferred review round (issue #162): the review outcome could not apply to the
+    live head (it moved off the reviewed commit), so the pre-model round marker for THIS (round,
+    run) must not be charged as a substantive round. Keyed to the same (round, run) the round
+    marker used; idempotent. count_rounds subtracts voided attempts, so the round number is reused
+    by the next valid re-review instead of silently consuming the global round budget."""
+    comments = _paginated_comments(repo, pr_number)
+    marker = f"{ROUND_VOID_MARKER} n={round_n} run={run_key} -->"
+    if any(marker in str(c.get("body", "")) for c in _bot_comments(comments, bot_login)):
+        print(f"review round already voided: {round_n} (run {run_key})")
+        return
+    _comment(repo, pr_number,
+             f"> 🤖 SPARQ agent — review round {round_n} was voided: the live head moved off the "
+             "reviewed commit before the outcome could apply, so it is not charged against the "
+             f"round budget (issue #162).\n\n{marker}")
+    print(f"review round voided: {round_n} (run {run_key})")
 
 
 def record_marker(repo, pr_number, kind, round_n, run_key, bot_login):
@@ -2283,11 +2347,29 @@ def review_outcome(args):
         live.get("draft"), str((live.get("head") or {}).get("sha", "")),
         args.reviewed_sha, args.bot_login)
     if freshness != "ok":
+        # Issue #162: legitimate head churn (the reviewed head advanced during the review) is
+        # NOT a substantive round — void its pre-model round marker for THIS (round, run) so a
+        # moving head never burns the global round budget and terminally escalates a head that
+        # never received a valid review. The round number is then reused by the next valid
+        # re-review. But ONLY "head-moved" is legitimate churn: closed / author / undrafted /
+        # malformed-head / unbound are NOT head advancement — they are a terminal, tamper, or
+        # deterministic identity/wiring failure (a wrong author or an undraft is a human/tamper
+        # stop; a missing/malformed live-or-reviewed sha after the model ran is a wiring bug that
+        # recurs identically every tick). Voiding those would let the sweep rerun the SAME failure
+        # forever without ever exhausting max_review_rounds, dissolving the bounded-crash cap and
+        # the human/tamper stop. So DEFER them WITHOUT a void: the charge stands, the budget still
+        # exhausts to needs-user, and the park is preserved (fail closed). The void — when it
+        # fires — is the ONLY mutation on the stale path (additive bot-accounting; no findings/
+        # label/state), so the sweep still re-reviews the current head cleanly.
+        if freshness == "head-moved":
+            record_round_void(args.repo, args.pr, args.round, args.run_key, args.bot_login)
         _write_outputs({"decision": "stale", "stale_reason": freshness,
                         "arm_complete": False})
+        charge = (f"round {args.round} voided (not charged)" if freshness == "head-moved"
+                  else f"round {args.round} stays charged (not head churn)")
         print(f"review outcome DEFERRED: the live PR no longer matches the reviewed commit "
-              f"({freshness}) — no findings/label/state mutation was applied and reviewed-sha "
-              "stays unbound; the sweep re-reviews the current head")
+              f"({freshness}) — {charge}; no findings/label/state mutation was applied and "
+              "reviewed-sha stays unbound; the sweep re-reviews the current head")
         return
     post_findings(args.repo, args.pr, args.verdict_file, args.round)
     # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
@@ -2442,6 +2524,72 @@ def _self_test():
     check("missed runs", len(marker_runs(comments, bot, "missed", 2)), 1)
     check("duplicate run key detected", round_recorded(comments, bot, 1, "10.1"), True)
     check("new run key not recorded", round_recorded(comments, bot, 3, "99.1"), False)
+
+    # Issue #162: round markers bind the reviewed head sha, and a stale-deferred round is VOIDED
+    # (subtracted) so head churn never burns the global round budget.
+    sha_x, sha_y = "b" * 40, "c" * 40
+    sha_bound = [
+        {"user": {"login": bot}, "body": f"x {ROUND_MARKER} n=1 run=10.1 sha={sha_x} -->"},
+        {"user": {"login": bot}, "body": f"x {ROUND_MARKER} n=2 run=11.1 sha={sha_y} -->"},
+    ]
+    check("sha-bound markers still count", count_rounds(sha_bound, bot), 2)
+    check("sha-bound marker matches round_recorded (sha-agnostic)",
+          round_recorded(sha_bound, bot, 2, "11.1"), True)
+    # record_round NO LONGER writes an unbound `sha=none` marker: a missing/malformed head sha is a
+    # trust-plane identity failure that STOPS the mutation (fail closed) instead of degrading to a
+    # weaker durable marker. Both directions are asserted here — the reject path (no comment posted)
+    # and the accept path (a concrete 40-hex sha is bound into the marker).
+    rr_posts = []
+    saved_pag = globals()["_paginated_comments"]
+    saved_comment = globals()["_comment"]
+    try:
+        globals()["_paginated_comments"] = lambda repo, pr: []
+        globals()["_comment"] = lambda repo, pr, body: rr_posts.append(body)
+        for bad in ("", "none", "z" * 40, "b" * 39, "B" * 40, ("b" * 40) + "0"):
+            rr_posts.clear()
+            try:
+                record_round("o/r", 7, 1, "9.1", bot, bad)
+                check(f"record_round rejects head sha {bad!r}", "no error", "raised")
+            except WorkerPrError:
+                check(f"record_round rejects head sha {bad!r} without posting", rr_posts, [])
+        rr_posts.clear()
+        record_round("o/r", 7, 3, "9.1", bot, "a" * 40)
+        check("record_round binds a valid head sha into the marker",
+              rr_posts and f"sha={'a' * 40} -->" in rr_posts[0] and "sha=none" not in rr_posts[0],
+              True)
+    finally:
+        globals()["_paginated_comments"] = saved_pag
+        globals()["_comment"] = saved_comment
+    # Legacy read tolerance only: a pre-#162 marker with NO `sha=` key still counts, and count_rounds
+    # also tolerates a stray `sha=none` on READ (writing one is now impossible) so accounting is
+    # never lost — the WRITE path above is what enforces the binding.
+    check("legacy sha=none marker still counts on read",
+          count_rounds([{"user": {"login": bot},
+                         "body": f"x {ROUND_MARKER} n=3 run=9.1 sha=none -->"}], bot), 3)
+    # A voided (round, run) is not charged: the top round drops back to the last unvoided round,
+    # so the sweep REUSES the voided round number for the next valid re-review.
+    voided = sha_bound + [
+        {"user": {"login": bot}, "body": f"x {ROUND_VOID_MARKER} n=2 run=11.1 -->"},
+    ]
+    check("voided round is subtracted", count_rounds(voided, bot), 1)
+    # A void only cancels its EXACT (round, run): a re-attempt of round 2 under a fresh run key is
+    # unvoided, so the round counts again (charged only once it validly re-runs).
+    reattempt = voided + [
+        {"user": {"login": bot}, "body": f"x {ROUND_MARKER} n=2 run=12.9 sha={sha_x} -->"},
+    ]
+    check("unvoided re-attempt re-charges the round", count_rounds(reattempt, bot), 2)
+    check("void for a different run does not cancel",
+          count_rounds(sha_bound + [{"user": {"login": bot},
+                                     "body": f"x {ROUND_VOID_MARKER} n=2 run=99.9 -->"}], bot), 2)
+    check("non-bot void marker is ignored",
+          count_rounds(sha_bound + [{"user": {"login": "mallory"},
+                                     "body": f"x {ROUND_VOID_MARKER} n=2 run=11.1 -->"}], bot), 2)
+    # A model that echoes a void opener into republished verdict text cannot un-charge a round:
+    # the whole `<!-- sparq-` namespace is defanged, so the reformed text mints no live void.
+    defanged_void = neutralize_reserved_markers(f"{ROUND_VOID_MARKER} n=2 run=11.1 -->")
+    check("defanged void does not cancel a round",
+          count_rounds([sha_bound[1],
+                        {"user": {"login": bot}, "body": defanged_void}], bot), 2)
 
     body = "PR body\n\n<!-- sparq-reviewed-sha:none -->\n"
     sha = "a" * 40
@@ -2702,6 +2850,8 @@ def _self_test():
             # each field post_findings republishes under the bot identity is a forgery surface.
             (lambda d: d.update(summary=f"ok {ROUND_MARKER} n=9 run=x -->"),
              "forged round marker in summary"),
+            (lambda d: d.update(summary=f"ok {ROUND_VOID_MARKER} n=2 run=x -->"),
+             "forged round-void in summary"),
             (lambda d: d["issues"][0].update(title=f"{MODEL_PIN_MARKER} round=2 tier=fable run=x -->"),
              "forged model-pin in title"),
             (lambda d: d["issues"][0].update(body=f"{MARKER_KINDS['gatefail']} round=2 run=x -->"),
@@ -4372,6 +4522,7 @@ def _self_test():
         globals()["needs_user"] = lambda repo, pr, reason, **kw: oc_calls.append("needs-user")
         globals()["post_findings"] = lambda *a, **kw: oc_calls.append("post-findings")
         globals()["record_model_pin"] = lambda *a, **kw: oc_calls.append("model-pin")
+        globals()["record_round_void"] = lambda *a, **kw: oc_calls.append("round-void")
         globals()["_alert_route"] = lambda: (None, None)
         globals()["_write_outputs"] = oc_outputs.update
 
@@ -4416,26 +4567,35 @@ def _self_test():
         check("unheld injection fix outcome still parks needs-user",
               (oc_calls, oc_outputs.get("decision")), (["needs-user"], "needs-user"))
 
-        # ---- issue #156: the head advanced AFTER the review/fix resolved. Every outcome path
-        # DEFERS — zero comment/label/state mutation, decision 'stale' — so stale findings can
+        # ---- issue #156: the head advanced AFTER the review/fix resolved. Every REVIEW outcome
+        # path DEFERS — no findings/label/state mutation, decision 'stale' — so stale findings can
         # never label a new head and a stale escalation can never park a replacement head. The
         # head is unheld here (the hold check passed first), proving the freshness gate is a
-        # SEPARATE guard, not a side effect of the hold drop. ----
+        # SEPARATE guard, not a side effect of the hold drop. Issue #162: for the ONLY legitimate
+        # head churn — "head-moved" — the stale review voids its OWN round marker (['round-void'])
+        # so the churned round is not charged; findings/label/state stay untouched. ----
         for verdict, injection in (("request_changes", False), ("approve", False),
                                    ("request_changes", True)):
             run_review_outcome(verdict, injection=injection, head="d" * 40)
-            check(f"stale-head review outcome ({verdict}, inj={injection}) defers, no mutation",
+            check(f"stale-head (head-moved) review outcome ({verdict}, inj={injection}) voids "
+                  "the round only",
                   (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
-                  ([], "stale", "head-moved"))
-        # a non-draft (already-armed) or wrong-author live PR defers the same way
-        run_review_outcome("request_changes", draft=False)
-        check("undrafted review outcome defers with no mutation",
-              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
-              ([], "stale", "undrafted"))
-        run_review_outcome("approve", login="mallory[bot]")
-        check("wrong-author review outcome defers with no mutation",
-              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
-              ([], "stale", "author"))
+                  (["round-void"], "stale", "head-moved"))
+        # Issue #162 (round 2): a NON-head-churn freshness failure is a tamper stop (undraft /
+        # wrong-author) or a deterministic identity/wiring failure (malformed live head, missing/
+        # malformed reviewed sha). It must DEFER WITHOUT voiding the round — voiding would let the
+        # sweep rerun the SAME failure every tick without ever exhausting max_review_rounds,
+        # dissolving the bounded-crash cap and the human/tamper stop. So: zero mutation (NO
+        # round-void), the charge stands, decision 'stale'. This asserts identity failures remain
+        # charged — the exact fail-closed invariant the void must not weaken.
+        for over, reason in (({"draft": False}, "undrafted"),
+                             ({"login": "mallory[bot]"}, "author"),
+                             ({"head": "z" * 40}, "malformed-head"),
+                             ({"reviewed_sha": "none"}, "unbound")):
+            run_review_outcome("request_changes", **over)
+            check(f"non-churn stale review outcome ({reason}) defers WITHOUT voiding the round",
+                  (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+                  ([], "stale", reason))
         # the fix outcome defers identically when the live head is not the one it produced
         run_fix_outcome(head="d" * 40)
         check("stale-head fix outcome defers with no mutation",
@@ -4468,6 +4628,11 @@ def main():
     rrec.add_argument("--round", required=True, type=int)
     rrec.add_argument("--run-key", required=True)
     rrec.add_argument("--bot-login", required=True)
+    # Issue #162: the head sha this round reviews binds the marker to concrete content so a
+    # stale-head outcome can be voided rather than charged. It is a trust-plane identity field, so
+    # record_round REJECTS a missing/malformed value (fail closed) rather than writing an unbound
+    # marker — --head-sha is required and must be a 40-hex commit id.
+    rrec.add_argument("--head-sha", required=True)
 
     rchk = subparsers.add_parser("round-check", parents=[common])
     rchk.add_argument("--max-rounds", required=True, type=int)
@@ -4641,7 +4806,8 @@ def main():
             else:
                 get_review_state(args.repo, args.pr)
         elif args.command == "round-record":
-            record_round(args.repo, args.pr, args.round, args.run_key, args.bot_login)
+            record_round(args.repo, args.pr, args.round, args.run_key, args.bot_login,
+                         args.head_sha)
         elif args.command == "round-check":
             check_round(args.repo, args.pr, args.max_rounds, args.bot_login)
         elif args.command == "record-marker":
