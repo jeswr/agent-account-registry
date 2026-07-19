@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "The grammar block (lines 526-530) has three lines: line 1 = BGP | Filter | Join | Project (implemented today), line 2 = Union | Values | Extend, line 3 = Path(s, path, o). The following prose (line 532) says 'the first line is the currently implemented grammar; the second line is the candidate-normative extension', which literally excludes the third line (Path) from the extension description. In practice the next sentence disambiguates by naming R, E, W, and path individually, so no real ambiguity results, but the singular 'the second line' is slightly imprecise.",
+   "file": "site/specs/zksparql.typ",
+   "fix_hint": "Reword to 'the remaining lines are the candidate-normative extension' (or 'lines two and three') so the phrasing covers Path as well as Union/Values/Extend.",
+   "severity": "nit",
+   "title": "Grammar comment says 'the second line is the candidate-normative extension' but the extension spans two lines"
+  }
+ ],
+ "progress": "improving",
+ "summary": "Round 2 resolves all three round-1 findings on site/specs/zksparql.typ. (1) The major projection contradiction is fixed: Project(W, P) now sits on the FIRST grammar line (line 527), which the prose (line 532) declares currently implemented, agreeing with the disposition table's 'IN (today)' (line 399) and the rewritten editor's note point (2) (lines 577-579) which now states projection IS transcribed as restriction of each mapping to W. The three sites are consistent. (2) The BOUND 'static' minor is fixed: line 488 now qualifies boundness as static for BGP-derived variables but dynamically unbound for an Extend-introduced variable when its expression errors, consistent with eval(Extend) at line 554. (3) The eval math-mode nit is fixed: line 455 uses $op(\"eval\")_k(P) subset.eq op(\"eval\")(P)$. No stale contradiction remains: the other 'not transcribed' occurrences (lines 230/647/659/707) concern section-8/10 obligation groups, unrelated to projection. On the ZK-honesty surface the change is sound: property-path, expression, and path extensions are consistently caveated as designed-but-unimplemented ('not a present cryptographic guarantee', 'subject to the external-audit caveat of section 17.1', 'IN (phase N)' = not yet implemented), so no privacy/soundness overclaim and the privacy-claims gate is not tripped. The path bounded semantics still state only the sound direction (eval_k subset.eq eval, existence-only, public bound k, no completeness/reachable-set claim). The eval clauses added (Extend error->unbound, Values UNDEF omission, Union set-union, Project restriction, bounded Path) match SPARQL 1.1 set semantics. One residual nit remains (see issues) but it is non-blocking. The diff is spec/design text only and contains no instructions directed at the reviewer.",
+ "verdict": "approve"
+}
