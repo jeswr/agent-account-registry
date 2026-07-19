@@ -104,13 +104,14 @@ def _self_test():
 
     R = ["status:ready"]
 
-    # a non-trust impl issue (area:usage) -> fable-led chain, no escalate.
+    # a non-trust impl issue (area:usage) -> sol-led chain (sol-first routing, 2026-07-18),
+    # no escalate.
     impl = compute_ready([iss(1, R + ["priority:P1", "role:impl", "area:usage"])])
     p_impl = plan_dispatch(impl, doc)
     chk("impl -> single row", len(p_impl), 1)
     row = p_impl[0]
     chk("impl row", (row["role"], row["model_chain"][0], row["agent"], row["escalate"]),
-        ("impl", "fable", "registry-impl", False))
+        ("impl", "sol", "registry-impl", False))
     chk("impl package", row["package"], "usage")
 
     # a TRUST-SURFACE issue (area:worker) -> opus + escalate (security override beats role).

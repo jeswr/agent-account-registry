@@ -130,6 +130,11 @@ BLOCKED_BY_RE = re.compile(r"[Bb]locked-by:\s*#([0-9]+)")
 # sonnet are DOCS-ONLY models and must NEVER appear in a review/fix chain (asserted in
 # _self_test; review-fix.yml + worker-pr.py ESCALATION_LADDERS enforce the same).
 REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
+# FIX_CHAIN is the UNPINNED allocator PREFERENCE walk (strongest tier FIRST — choose_account
+# takes the first serving account, and the frontier tier leads per the sol-first doctrine).
+# It is deliberately the REVERSE of worker_pr.ESCALATION_LADDERS, which are capability-
+# ASCENDING (weakest first, terminal strongest LAST; opus < luna < fable < sol) and govern
+# exhaustion escalation + pinned floors (sol r2 f2 fixed the previously inverted ladders).
 FIX_CHAIN = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
 # Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
 # 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
@@ -2696,11 +2701,12 @@ def _self_test():
             fix_model = wiring_worker_pr.FIX_MODEL_MARKER
             pin_marker = wiring_worker_pr.MODEL_PIN_MARKER
 
-            # ACT: base budget spent on fable -> extension, opus pin converged, and a chain
-            # WITHOUT fable; the None claim then defers with a missed marker, NOT needs-user
+            # ACT: base budget spent on OPUS -> extension escalates UP the ladder
+            # (opus < fable, sol r2 f2), fable pin converged, and a chain WITHOUT opus;
+            # the None claim then defers with a missed marker, NOT needs-user
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=2 model=fable run=2.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=2 model=opus run=2.9 -->")]
             write_verdict(3, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -2708,8 +2714,8 @@ def _self_test():
                 ("worker-pr.py", "record-model-pin"),
                 ("worker-pr.py", "record-marker")], helper_calls
             pin_args = helper_calls[0][1]
-            assert pin_args[pin_args.index("--tier") + 1] == "opus", pin_args
-            assert alloc.chains == [["opus"]], alloc.chains
+            assert pin_args[pin_args.index("--tier") + 1] == "fable", pin_args
+            assert alloc.chains == [["fable"]], alloc.chains
 
             # DO-NOTHING flip: under budget -> no pin call, the DEFAULT fix chain is offered
             fake["comments"] = round_markers(2)
@@ -2720,36 +2726,37 @@ def _self_test():
                 ("worker-pr.py", "record-marker")], helper_calls
             assert alloc.chains == [["fable", "opus"]], alloc.chains
 
-            # a recorded bot pin governs the chain even under budget (the floor never lowers) ...
+            # a recorded bot pin governs the chain even under budget (the floor never lowers) —
+            # a fable floor offers ONLY fable (tiers below the floor are never offered) ...
             fake["comments"] = round_markers(2) + [
-                bot_comment(f"z {pin_marker} round=1 tier=opus run=1.5 -->")]
+                bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->")]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["opus"]], alloc.chains
+            assert alloc.chains == [["fable"]], alloc.chains
             # ... while a NON-bot forged pin marker is inert (bot-login trust filter)
             fake["comments"] = round_markers(2) + [
                 {"user": {"login": "mallory"},
-                 "body": f"z {pin_marker} round=1 tier=opus run=6.6 -->"}]
+                 "body": f"z {pin_marker} round=1 tier=fable run=6.6 -->"}]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert alloc.chains == [["fable", "opus"]], alloc.chains
 
             # top tier ran + latest verdict improving -> progress extension (pin floor kept)
             fake["comments"] = round_markers(4) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->"),
-                bot_comment(f"z {pin_marker} round=3 tier=opus run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->"),
+                bot_comment(f"z {pin_marker} round=3 tier=fable run=3.9 -->")]
             write_verdict(4, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["opus"]], alloc.chains
+            assert alloc.chains == [["fable"]], alloc.chains
 
             # flip-goes-red: top tier + stagnant -> the loud terminal needs-user, no claim
             fake["comments"] = round_markers(4) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
             write_verdict(4, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -2759,7 +2766,7 @@ def _self_test():
 
             # hard cap: 6 rounds stop even with a weaker tier + an improving grade
             fake["comments"] = round_markers(6) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->")]
             write_verdict(6, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -2778,33 +2785,33 @@ def _self_test():
                 ("worker-pr.py", "needs-user")], helper_calls
             assert alloc.chains == [], alloc.chains
 
-            # ACT (terminal-grant orphan defect): the pinned opus fix EXECUTED and PUSHED
-            # (state review:needs) must get its re-review — the opus fix-model marker
+            # ACT (terminal-grant orphan defect): the pinned FABLE fix EXECUTED and PUSHED
+            # (state review:needs) must get its re-review — the fable fix-model marker
             # falsifies the top-tier escalation predicate and the recorded round-3 grade
-            # (stagnant) predates the opus fix, so without the pending-fix authorization
+            # (stagnant) predates the fable fix, so without the pending-fix authorization
             # this exact posture went needs-user with the top-tier round burned unreviewed.
             # The allocator is offered the cross-provider REVIEW chain (round 4), no
             # needs-user and no pin mutation.
             review_item = dict(fix_item, state="needs-review")
             fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=2 model=fable run=2.9 -->"),
-                bot_comment(f"z {pin_marker} round=3 tier=opus run=3.5 -->"),
-                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=2 model=opus run=2.9 -->"),
+                bot_comment(f"z {pin_marker} round=3 tier=fable run=3.5 -->"),
+                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
             write_verdict(3, "stagnant")
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert helper_calls == [], helper_calls
             assert alloc.chains == [["sol", "luna"]], alloc.chains
 
-            # flip-goes-red: the same posture whose latest fix ran BELOW the recorded opus
+            # flip-goes-red: the same posture whose latest fix ran BELOW the recorded fable
             # floor (a pin violation / forged marker) mints NO re-review — with the top tier
             # already graded stagnant it is the loud terminal instead
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"z {pin_marker} round=1 tier=opus run=1.5 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
+                bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->"),
+                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [

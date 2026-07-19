@@ -437,14 +437,17 @@ jobs:
           # anthropic-implemented direction. A claude alias still needs a concrete id.
           review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
           fix_chain = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
-          # Escalation ladders in escalation order, terminal tier last — mirrors worker-pr.py
-          # ESCALATION_LADDERS (maintainer directives 2026-07-17/18). A pinned fix-model FLOOR
-          # replaces the default fix chain with the ladder tiers at/above the pin, cheapest
-          # first: tiers below the floor are DELIBERATELY absent (defer-not-fallback — with no
-          # at/above-floor account free, the claim defers to a later tick instead of burning
-          # the extended round budget on the model that already failed; see dispatch-claim.py).
-          # A pin outside the implementer provider's ladder fails closed.
-          ladders = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
+          # Escalation ladders in escalation order — weakest tier FIRST, STRONGEST (terminal)
+          # tier LAST per the maintainer capability order opus < luna < fable < sol — mirrors
+          # worker-pr.py ESCALATION_LADDERS (directives 2026-07-17/18; sol r2 f2 fixed the
+          # previously INVERTED order under which exhaustion pinned the weaker tier). A pinned
+          # fix-model FLOOR replaces the default fix chain with the ladder tiers at/above the
+          # pin, cheapest first: tiers below the floor are DELIBERATELY absent
+          # (defer-not-fallback — with no at/above-floor account free, the claim defers to a
+          # later tick instead of burning the extended round budget on the model that already
+          # failed; see dispatch-claim.py). A pin outside the implementer provider's ladder
+          # fails closed.
+          ladders = {"anthropic": ["opus", "fable"], "openai": ["luna", "sol"]}
           # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are
           # DOCS-ONLY — review-fix has no docs lane, so their appearance in ANY chain here is a
           # policy defect. Fail closed before any claim can run on the wrong model.

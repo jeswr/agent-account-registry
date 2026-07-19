@@ -83,8 +83,11 @@ agent = "registry-reviewer"
 escalate = true
 
 # ---------------------------------------------------------------------------------------------------
-# ROLE ROUTES. Fable is the primary code-writer; terra (GPT) is the cross-provider implementation
-# fallback so an Anthropic outage does not stall implementation. docs -> haiku-led (cheap).
+# ROLE ROUTES. Sol (GPT-5.6, the codex-side frontier model) is the primary code-writer
+# (maintainer directive 2026-07-18, credit abundance); fable/opus are the cross-provider
+# fallback so an OpenAI outage does not stall implementation. docs -> haiku-led (cheap;
+# the ONLY surface where the docs-only aliases terra/sonnet may appear —
+# policy-resolve.py rejects them in any non-docs route).
 [[route]]
 role = "impl"
 model_chain = ["sol", "fable", "opus"]
@@ -93,7 +96,8 @@ agent = "registry-impl"
 # [FABLE-5] STANDING RULE — UI/front-end ownership (maintainer decision 2026-07-17): UI/front-end
 # surfaces route to the openai/codex model chain (original-builder ownership: GPT-5.6 codex built
 # the registry dashboard, e4098b9). Repos onboarded to the registry inherit this default — mirror
-# this route (terra-led site chain) into each target's routing.toml (sparq's already carries it).
+# this route (sol-led site chain; terra is docs-only, 2026-07-18) into each target's routing.toml
+# (sparq's already carries it).
 # Deliberately a ROLE route, not match_labels: the arm-side security classifier (review-fix.yml)
 # unions ALL match_labels keywords, so UI keywords there would human-arm every UI PR.
 [[route]]
@@ -104,8 +108,9 @@ agent = "registry-impl"
 # [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
 # 2026-07-17, same standing-rule pattern as the UI→codex route above): ALL CI/infrastructure work
 # — .github/workflows, gate aggregators, orchestration plumbing, the self-draining pipeline itself
-# — is authored by a FRONTIER-tier model only: fable (Claude Fable) or terra (GPT-5.6 sol/codex).
-# Cheaper tiers (sonnet/haiku) no longer author infra; cross-provider review is unchanged.
+# — is authored by a FRONTIER-tier model only: sol (GPT-5.6 codex) or fable (Claude Fable).
+# Cheaper tiers (sonnet/haiku) no longer author infra — and terra/sonnet are docs-only
+# (2026-07-18); cross-provider review is unchanged.
 # FRONTIER-ONLY chain rather than a floor marker: the routing schema has no floor/pin field (the
 # fix-floor pin is a review-loop concept, dispatch-claim.py), and chain exhaustion at the claim
 # step already DEFERS the item (retried next tick) instead of degrading — see dispatch-claim's

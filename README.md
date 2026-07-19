@@ -20,7 +20,7 @@ front-matter (no secrets):
 
 ```yaml
 provider: anthropic          # anthropic | openai
-models: [opus, sonnet, haiku, fable]   # or [codex, gpt-5.6] for openai; enables model-fallback routing
+models: [opus, sonnet, haiku, fable]   # or [sol, luna, terra] for openai; enables model-fallback routing
 tier:
   weekly_limit: "..."        # human note of the plan's weekly cap
   five_hour_limit: "..."     # the rolling 5h window cap
@@ -46,7 +46,7 @@ code branch never rejects the bot's contents-API writes, and a token that can on
 
 ```json
 {"leases": [{"account": "acct01", "claim_id": "<uuid>", "holder": "<owner/repo@run>",
-             "package": "sparq-core", "role": "impl", "model": "terra",
+             "package": "sparq-core", "role": "impl", "model": "sol",
              "issued_at": 0, "expires_at": 0}]}
 ```
 
@@ -64,7 +64,7 @@ slot automatically — no receipt-guessing).
 `scripts/select-and-claim.py` (added in Phase 3) takes `(package, role, model-chain)` and returns an
 opaque claim (which secret to use) or `none-free`:
 
-1. Walk the **model fallback chain** (e.g. `haiku → terra`) to the first provider/model with a
+1. Walk the **model fallback chain** (e.g. `sol → fable`) to the first provider/model with a
    non-full, non-reset-exhausted account.
 2. Among eligible accounts, prefer the one with **prompt-cache affinity** — most recently used for the
    same `package`+`role` within the provider's cache window (Anthropic prompt cache ≈ 5-min TTL), to
@@ -83,8 +83,9 @@ a rolling `data/cache-affinity.json`), never in the public repos.
 
 - **UI/front-end surfaces route to the openai/codex model chain** (original-builder ownership:
   **GPT-5.6 built the registry dashboard, `e4098b9`**). Repos onboarded to the registry inherit
-  this default. Machine-readable form: the `role = "site"` route (`model_chain = ["terra",
-  "fable", "sonnet"]`) in this repo's `orchestration/routing.toml`; when onboarding a new target
+  this default. Machine-readable form: the `role = "site"` route (`model_chain = ["sol",
+  "fable", "opus"]` — sol-led; terra/sonnet are docs-only, 2026-07-18) in this repo's
+  `orchestration/routing.toml`; when onboarding a new target
   repo in `policy/repos.toml`, mirror that route into the target's own routing table
   (`sparq-org/sparq` already carries it). `scripts/triage.py` derives `role:site` from the exact
   UI-surface labels (`area:dashboard`, `dashboard`, `surface:frontend`). Implement it as a ROLE
@@ -92,11 +93,12 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   `match_labels` keywords, so UI keywords there would security-classify every UI PR (post-Decision-7 revision: an audit trail, not a park).
 
 - **Frontier-tier agents author ALL CI/infrastructure work** (maintainer decision 2026-07-17):
-  Claude Fable (`fable`) or GPT-5.6 sol (openai; wired alias `terra`) — explicitly including the
+  GPT-5.6 sol (openai; alias `sol`) or Claude Fable (`fable`) — explicitly including the
   self-draining pipeline infrastructure itself (dispatch, workers, gate aggregators,
   `.github/workflows`, orchestration scripts). Cheaper tiers (sonnet/haiku) no longer author
-  infra; cross-provider review is unchanged (whichever provider's frontier writes, the other
-  reviews). Machine-readable form: the `role = "ci"` route (`model_chain = ["fable", "terra"]`)
+  infra, and terra/sonnet are docs-only (2026-07-18); cross-provider review is unchanged
+  (whichever provider's frontier writes, the other
+  reviews). Machine-readable form: the `role = "ci"` route (`model_chain = ["sol", "fable"]`)
   in this repo's `orchestration/routing.toml`; mirror a frontier-only ci chain into each
   onboarded target's routing table (`sparq-org/sparq` carries it, sparq PR #3422).
   `scripts/triage.py` derives `role:ci` from the exact infra-surface labels (`area:ci`,
@@ -186,7 +188,8 @@ secret_ref: ACCT05_TOKEN
 notes: "claude setup-token (long-lived, non-rotating). [your-marker]"'
 ```
 For an **OpenAI** account: `provider: openai`, `harness: codex`, `credential_format: codex-auth-json`,
-`models: [terra]` (or the concrete GPT alias), `secret_ref: ACCTNN_TOKEN`.
+`models: [sol, luna, terra]` (the FULL codex alias set — `select-and-claim.py` gates on exact alias
+membership, so a `terra`-only record would defer every sol/luna claim), `secret_ref: ACCTNN_TOKEN`.
 
 ### Step 4 — label the issue (REQUIRED — no label ⇒ not `available` ⇒ never selected)
 

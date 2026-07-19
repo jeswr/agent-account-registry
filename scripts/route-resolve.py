@@ -55,7 +55,7 @@ def _self_test():
     # dispatch is a trust surface too.
     mc, ag, esc = resolve(["role:impl", "area:dispatch"], doc)
     chk("impl+dispatch -> opus/escalate", (mc, esc), (["opus"], True))
-    # a NON-trust area (usage) -> plain impl -> Fable-led chain.
+    # a NON-trust area (usage) -> plain impl -> sol-led chain (sol-first routing, 2026-07-18).
     mc, ag, esc = resolve(["role:impl", "area:usage"], doc)
     chk("impl+usage -> sol-led", (mc[0], ag, esc), ("sol", "registry-impl", False))
     # docs -> haiku-led.

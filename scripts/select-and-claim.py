@@ -559,6 +559,15 @@ def _self_test():
     now = 1000
     check("route fable", choose_account(A, [], ["fable"], "pkg", "impl", now), "acct02")
     check("route terra", choose_account(A, [], ["terra", "fable"], "pkg", "impl", now), "acct01")
+    # Broker-minted openai records (set-up-account.yml) carry the FULL codex alias set
+    # [sol, luna, terra]: exact alias membership is what choose_account gates on, so the full
+    # set satisfies a sol-led claim while a legacy terra-only record DEFERS it (sol r2 f1).
+    BM = [{"handle": "acct09", "models": ["sol", "luna", "terra"], "max_concurrent_workers": 1,
+           "available": True}]
+    check("broker openai record [sol, luna, terra] serves a sol claim",
+          choose_account(BM, [], ["sol", "luna"], "pkg", "impl", now), "acct09")
+    check("terra-only record defers a sol claim (exact alias membership)",
+          choose_account(A, [], ["sol", "luna"], "pkg", "impl", now), None)
     full1 = [make_lease("acct01", "h", "p", "r", "terra", now, 100)]
     check("cap fallthrough", choose_account(A, full1, ["terra", "fable"], "p", "r", now), "acct02")
     exp = [make_lease("acct01", "h", "p", "r", "terra", 0, 10)]  # expires_at=10 < now → reclaimed
