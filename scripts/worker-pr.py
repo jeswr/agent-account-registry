@@ -887,9 +887,27 @@ def _probe_registry_file(registry_repo, path, ref=None):
 # Parallel per-file record writers (the provenance record plus every review round's verdict) all
 # CAS against the SAME `ledger` branch head, so a fixed un-jittered retry keeps them phase-locked:
 # each loser re-reads the same sha, re-collides on the next PUT, and burns the whole budget in
-# lock-step. A FULL-JITTER exponential backoff BETWEEN attempts decorrelates them (issue #148; the
-# lease ledger hit and fixed the identical thundering-herd in #179). Module-level so --self-test
-# patches it instead of sleeping for real.
+# lock-step. GitHub offers no LOSSLESS job-level serialization for them: an Actions `concurrency`
+# group with cancel-in-progress:false keeps only ONE queued writer and CANCELS every other pending
+# one, silently DROPPING distinct provenance/verdict records under a burst (worse than contention),
+# and a self-managed mutex would just relocate the identical ref-CAS onto the lock object. So the
+# writers stay unserialized and are made burst-robust HERE, two ways:
+#   (1) a FULL-JITTER exponential backoff BETWEEN attempts decorrelates them (issue #148; the lease
+#       ledger hit and fixed the identical thundering-herd in #179), and
+#   (2) a genuine CAS conflict (the ref advanced under us — always transient on the UNPROTECTED
+#       ledger branch) retries until a wall-clock DEADLINE rather than a small FIXED count, so a
+#       burst can never exhaust the budget and STRAND a writer (issue #130). A NON-conflict PUT
+#       error is not contention and fails loud AT ONCE (it can never clear by waiting), so the
+#       deadline is never wasted on a permanent auth/validation/branch failure.
+# All module-level so --self-test drives them without sleeping or a real clock.
+_REGISTRY_CAS_DEADLINE_S = 180.0
+
+# GitHub's contents-PUT response when a sha-less (create-if-absent) write hits a file that appeared
+# concurrently: HTTP 422 with message 'Invalid request.\n\n"sha" wasn't supplied.' — the same
+# create-race signature the lease ledger classifies (select-and-claim._is_cas_conflict).
+_REGISTRY_CREATE_RACE_SIGNATURE = "\"sha\" wasn't supplied"
+
+
 def _registry_backoff_ceiling(attempt, base=0.5, cap=8.0):
     """Upper bound (seconds) for the sleep before CAS retry `attempt` (1-based): exponential
     base*2**(attempt-1), clamped to `cap`."""
@@ -900,15 +918,36 @@ def _registry_sleep_backoff(attempt):
     time.sleep(random.uniform(0, _registry_backoff_ceiling(attempt)))
 
 
-def _registry_put_file(registry_repo, path, document, message, retries=6):
+def _registry_now():
+    """Monotonic seconds for the CAS-conflict retry deadline (module-level so --self-test stubs it
+    with an advancing counter instead of a real clock)."""
+    return time.monotonic()
+
+
+def _is_registry_cas_conflict(stderr, create):
+    """True ONLY for a genuine compare-and-swap conflict on the ledger PUT: HTTP 409 is always a
+    lost-head race, and HTTP 422 counts only for a create-if-absent PUT (`create=True`) carrying
+    GitHub's create-race signature. Every other failure — authorization (403), missing branch/file
+    (404), non-race request validation (422), server (5xx) — is NOT contention and must fail loud
+    rather than be retried until the deadline (mirrors select-and-claim._is_cas_conflict, #179)."""
+    text = stderr or ""
+    if "HTTP 409" in text:
+        return True
+    return create and "HTTP 422" in text and _REGISTRY_CREATE_RACE_SIGNATURE in text
+
+
+def _registry_put_file(registry_repo, path, document, message):
     """Create-or-keep a registry data file via the contents API with the same read-SHA CAS retry
     the lease ledger uses. Probe AND write pin the unprotected `ledger` data-plane branch
     (issue #96): master's required `gate` status check permanently rejects every direct
     contents-API PUT, so an unpinned write can never land regardless of retries. Idempotent: an
     existing byte-identical file — on the ledger branch OR the legacy pre-outage master copy —
     is success; an existing DIFFERENT file fails closed (provenance must never be silently
-    rewritten, and a ledger write must never shadow a divergent legacy record). On final failure
-    the REAL last API error is raised, never a generic conflict message."""
+    rewritten, and a ledger write must never shadow a divergent legacy record). A genuine CAS
+    conflict retries under full-jitter backoff until _REGISTRY_CAS_DEADLINE_S (issue #130 — a fixed
+    six-attempt budget let a burst exhaust every attempt and strand its PR); a non-conflict PUT
+    error fails loud immediately. On final failure the REAL last API error is raised, never a
+    generic conflict message."""
     body = json.dumps(document, indent=1, sort_keys=True) + "\n"
     encoded = base64.b64encode(body.encode()).decode()
     # BOTH record locations are probed before any success short-circuit (sol review r1 on
@@ -920,12 +959,15 @@ def _registry_put_file(registry_repo, path, document, message, retries=6):
     if legacy is not None and legacy != body:
         raise WorkerPrError(
             f"registry file {path} already exists with different content on the default branch")
+    deadline = _registry_now() + _REGISTRY_CAS_DEADLINE_S
     last_error = ""
-    for attempt in range(retries):
-        if attempt:
+    attempts = 0
+    conflict = False
+    while True:
+        if attempts:
             # Full-jitter backoff BETWEEN attempts (never before the first read) so parallel
             # per-file writers stop re-colliding in lock-step on the same branch head (#148).
-            _registry_sleep_backoff(attempt)
+            _registry_sleep_backoff(attempts)
         existing, sha = _probe_registry_file(registry_repo, path, ref=LEDGER_REF)
         if existing is not None:
             if existing == body:
@@ -943,19 +985,29 @@ def _registry_put_file(registry_repo, path, document, message, retries=6):
         if put.returncode == 0:
             return True
         last_error = (put.stderr or put.stdout or "").strip()
+        attempts += 1
+        # `existing is None` here (else we already returned/raised above), so this is always a
+        # create-if-absent PUT: classify create=True.
+        conflict = _is_registry_cas_conflict(put.stderr or put.stdout or "", create=True)
+        if not conflict:
+            break  # not contention — retrying can never clear it; fail loud now (#130/#179)
+        if _registry_now() >= deadline:
+            break  # sustained burst outlasted the CAS deadline — page and fail loud
     # Terminal: the record never landed. A silently-lost provenance record makes the PR
     # permanently invisible to enumeration; a lost verdict burns a round without applying the
     # outcome. Page a human with the REAL API error before failing (best-effort — the alert can
     # never mask the raise below).
+    reason = (f"the CAS deadline ({_REGISTRY_CAS_DEADLINE_S:.0f}s) elapsed under sustained "
+              f"contention" if conflict else "a non-conflict PUT error")
     _ops_alert(*_alert_route(),
                f"⚠️ Registry record write failing — {registry_repo}",
                f"> 🤖 SPARQ agent — `{path}` could not be written to the `{LEDGER_REF}` "
-               f"data-plane branch after {retries} attempts. Last API error: "
+               f"data-plane branch: {reason} after {attempts} attempt(s). Last API error: "
                f"{last_error or 'unknown'}. Records are not landing (protection/ref/availability) "
                f"— a maintainer should check branch protection and the `{LEDGER_REF}` ref.")
     raise WorkerPrError(
-        f"registry write for {path} on branch '{LEDGER_REF}' failed after {retries} attempts; "
-        f"last API error: {last_error or 'unknown'}")
+        f"registry write for {path} on branch '{LEDGER_REF}' failed after {attempts} attempt(s) "
+        f"({reason}); last API error: {last_error or 'unknown'}")
 
 
 def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_provider, impl_alias,
@@ -2726,6 +2778,7 @@ def _self_test():
     real_ops_alert = wiring_globals["_ops_alert"]
     real_alert_json = wiring_globals["_gh_json"]
     real_alert_route = wiring_globals["_alert_route"]
+    real_registry_now = wiring_globals["_registry_now"]
 
     real_put_io = wiring_globals["_run_gh"]
     doc = {"pr_number": 7}
@@ -2736,6 +2789,11 @@ def _self_test():
         wiring_globals["_registry_sleep_backoff"] = (
             lambda attempt: backoff_attempts.append(attempt))
         wiring_globals["_ops_alert"] = lambda *a: alert_calls.append(a)
+        # A constant clock keeps the deadline un-reached for the success/idempotent/divergent/
+        # fail-fast sub-tests (they return or fail loud before any deadline check); the conflict-
+        # exhaustion sub-test swaps in an ADVANCING clock so the deadline is crossed without a
+        # real sleep (backoff is stubbed to a no-op recorder).
+        wiring_globals["_registry_now"] = lambda: 0.0
         created = _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
                                      doc, "m")
         check("fresh record write creates", created, True)
@@ -2791,31 +2849,62 @@ def _self_test():
                                   doc, "m"),
                any("-X" in call for call in put_calls)), (False, False))
 
+        # issue #130: a sustained burst of GENUINE CAS conflicts (HTTP 409) retries under
+        # full-jitter backoff until the wall-clock DEADLINE — NOT a fixed six-attempt budget a
+        # burst could exhaust and strand. Drive an ADVANCING clock (0s at the deadline calc, then
+        # in-budget until it jumps past the 180s deadline) so the loop runs many attempts and then
+        # gives up deterministically, without a real sleep (backoff is a no-op recorder).
         put_calls.clear()
         backoff_attempts.clear()
         alert_calls.clear()
         put_state.update(files={}, put_rc=1,
-                         put_stderr="HTTP 409: Required status check \"gate\" is expected.")
+                         put_stderr="HTTP 409: the ledger head advanced under this write.")
+        now_seq = iter([0.0] + [10.0] * 8 + [999.0])
+        wiring_globals["_registry_now"] = lambda: next(now_seq)
         try:
             _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
-            check("exhausted write raises", "no error", "error")
+            check("deadline-exhausted conflict write raises", "no error", "error")
         except WorkerPrError as exc:
-            check("exhausted write surfaces the REAL API error text",
-                  "Required status check \"gate\" is expected" in str(exc), True)
-            check("exhausted write never masks as a generic conflict",
+            check("conflict-exhausted write surfaces the REAL API error text",
+                  "the ledger head advanced under this write" in str(exc), True)
+            check("conflict-exhausted write never masks the real error as a generic conflict",
                   "kept conflicting" in str(exc), False)
-        check("write failure retries the full budget",
-              sum(1 for call in put_calls if "-X" in call), 6)
-        # #148: jittered backoff fires BETWEEN the 6 attempts (never before the first probe),
-        # so exactly attempts 1..5 sleep — decorrelating parallel writers off the shared head.
-        check("exhausted write backs off between every retry (never before the first)",
-              backoff_attempts, [1, 2, 3, 4, 5])
-        # #148: a terminal write failure is not silent — it pages a human once, naming the
+            check("conflict-exhausted write names the deadline as the terminal reason",
+                  "deadline" in str(exc) and "contention" in str(exc), True)
+        # The fixed six-attempt budget is GONE: a conflict burst keeps retrying PAST the old cap
+        # (nine PUTs here) until the deadline elapses, so a late writer cannot be starved out.
+        conflict_puts = sum(1 for call in put_calls if "-X" in call)
+        check("a conflict burst retries past the old fixed six-attempt budget", conflict_puts, 9)
+        check("conflict retries back off between every attempt (never before the first probe)",
+              backoff_attempts, [1, 2, 3, 4, 5, 6, 7, 8])
+        # #148/#130: a terminal write failure is not silent — it pages a human once, naming the
         # unwritten record and the real API error (a lost provenance record is invisible).
-        check("exhausted write raises ONE ops-alert", len(alert_calls), 1)
+        check("conflict-exhausted write raises ONE ops-alert", len(alert_calls), 1)
         check("the ops-alert names the unwritten record and the real API error",
               alert_calls and "o--r--pr7.json" in alert_calls[0][3]
-              and "gate" in alert_calls[0][3], True)
+              and "advanced under this write" in alert_calls[0][3], True)
+
+        # issue #130/#179: a NON-conflict PUT error (auth/validation/missing branch/5xx) can never
+        # clear by waiting, so it fails loud on the FIRST attempt — never burning the conflict
+        # deadline. A constant clock is enough (the break happens before any deadline check).
+        put_calls.clear()
+        backoff_attempts.clear()
+        alert_calls.clear()
+        wiring_globals["_registry_now"] = lambda: 0.0
+        put_state.update(files={}, put_rc=1,
+                         put_stderr="HTTP 403: Resource not accessible by integration.")
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("non-conflict PUT error raises", "no error", "error")
+        except WorkerPrError as exc:
+            check("non-conflict PUT error surfaces the REAL API error text",
+                  "Resource not accessible by integration" in str(exc), True)
+            check("non-conflict PUT error is labelled as such (not contention)",
+                  "non-conflict" in str(exc), True)
+        check("a non-conflict error fails loud on the FIRST attempt (no wasted retries)",
+              sum(1 for call in put_calls if "-X" in call), 1)
+        check("a non-conflict error never backs off (nothing to wait out)", backoff_attempts, [])
+        check("a non-conflict error still pages a human once", len(alert_calls), 1)
 
         # sol review r1 on #295: the terminal alert must be best-effort END TO END, so this
         # runs the REAL _ops_alert (not a stub) with its one raising path — the issue lookup
@@ -2824,8 +2913,10 @@ def _self_test():
         def raising_alert_gh_json(args, **_kwargs):
             raise WorkerPrError("alert issue lookup failed")
 
+        # A non-conflict error reaches the SAME terminal path on the first attempt (constant clock
+        # still set from the fail-fast sub-test above) — no advancing clock needed.
         put_state.update(files={}, put_rc=1,
-                         put_stderr="HTTP 409: Required status check \"gate\" is expected.")
+                         put_stderr="HTTP 403: Resource not accessible by integration.")
         wiring_globals["_ops_alert"] = real_ops_alert
         wiring_globals["_alert_route"] = lambda: ("alerts/private", "alert-token")
         wiring_globals["_gh_json"] = raising_alert_gh_json
@@ -2835,7 +2926,7 @@ def _self_test():
                   "no error", "error")
         except WorkerPrError as exc:
             check("a raising alert lookup never masks the terminal registry-write error",
-                  "Required status check \"gate\" is expected" in str(exc)
+                  "Resource not accessible by integration" in str(exc)
                   and "alert issue lookup" not in str(exc), True)
     finally:
         wiring_globals["_run_gh"] = real_put_io
@@ -2843,6 +2934,7 @@ def _self_test():
         wiring_globals["_ops_alert"] = real_ops_alert
         wiring_globals["_gh_json"] = real_alert_json
         wiring_globals["_alert_route"] = real_alert_route
+        wiring_globals["_registry_now"] = real_registry_now
 
     # #148: the backoff ceiling is a bounded, non-decreasing full-jitter envelope — exponential
     # growth from the base, clamped so a long contention run never sleeps unboundedly.
@@ -2853,6 +2945,28 @@ def _self_test():
     check("backoff ceiling is non-decreasing",
           all(_registry_backoff_ceiling(a) <= _registry_backoff_ceiling(a + 1)
               for a in range(1, 12)), True)
+
+    # #130: the conflict classifier gates which PUT failures are retried until the deadline vs
+    # failed loud at once — HTTP 409 is always a lost-head race; a create-race 422 counts ONLY for
+    # a create-if-absent PUT; every other failure is a hard error the deadline must never absorb.
+    check("409 is always a lost-head CAS conflict",
+          _is_registry_cas_conflict("HTTP 409: head advanced", create=True), True)
+    check("409 is a conflict even on a sha-bound update PUT",
+          _is_registry_cas_conflict("HTTP 409: head advanced", create=False), True)
+    check("the create-race 422 signature is a conflict for a create-if-absent PUT",
+          _is_registry_cas_conflict('HTTP 422: Invalid request.\n\n"sha" wasn\'t supplied.',
+                                     create=True), True)
+    check("a non-signature 422 is NOT contention (fails loud)",
+          _is_registry_cas_conflict("HTTP 422: Invalid request. branch does not exist",
+                                     create=True), False)
+    check("the create-race 422 is never a conflict on a sha-bound update",
+          _is_registry_cas_conflict('HTTP 422: "sha" wasn\'t supplied', create=False), False)
+    check("a 403 auth failure is NOT contention",
+          _is_registry_cas_conflict("HTTP 403: Resource not accessible", create=True), False)
+    check("a 5xx server error is NOT contention",
+          _is_registry_cas_conflict("HTTP 502: Bad gateway", create=True), False)
+    check("an empty/clean stderr is NOT contention",
+          _is_registry_cas_conflict("", create=True), False)
 
     # ---- disarm wiring (monkeypatched I/O), issue #69: a merge-only advance carries the
     # binding forward with the arm intact; a real content change still disarms; a QUEUED
