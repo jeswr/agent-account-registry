@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3621,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "27d61f3784f9da14b2d79732e726e5af1c354867",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "build_userdata interpolates branch, cells derived from MPC_PARTIES, WATCHDOG_SECS, and DF_MIN_MB directly into an unquoted heredoc that becomes a root-run cloud-init script. Only MPC_ROWS is partially validated; BRANCH and MPC_PARTIES are unrestricted. For example, a branch containing a quote followed by shell syntax breaks out of `git fetch -q origin \"$branch\"`, while a crafted MPC_PARTIES value is emitted directly beneath the CELLS heredoc and can terminate that heredoc. This turns ordinary launcher inputs into arbitrary root code execution on the instance. The self-test uses fixed benign inputs and cannot detect this.",
+    "file": "scripts/mpc-ec2-ceiling.sh",
+    "fix_hint": "Validate every interpolated value against strict syntax and bounds (including positive integer parties/watchdogs/floor and a conservative Git ref format), or transfer structured/base64-encoded data and decode it without evaluation. Avoid embedding caller data in shell source. Add negative self-tests with quotes, newlines, heredoc terminators, and shell metacharacters and assert rejection before any AWS call.",
+    "severity": "blocker",
+    "title": "Untrusted arguments and environment values enable root command injection in user-data"
+   },
+   {
+    "body": "The generated user-data uses only `set -x`, not fail-fast error handling. Failures from apt, rustup, clone/fetch/checkout, or `cargo build` therefore do not stop execution. Each benchmark failure is converted into a cell-failed JSON, and the script still writes MPC_CEILING_DONE. The orchestrator consequently treats a broken setup/build as a completed ceiling run and pulls apparently valid metadata/results. This violates the stated safety property that a faster-but-wrong or invalid run cannot be reported, and the marker-only self-test is vacuous for this behavior.",
+    "file": "scripts/mpc-ec2-ceiling.sh",
+    "fix_hint": "Make cloud-init fail closed (`set -euo pipefail` with intentional exceptions narrowly handled), write a distinct failure sentinel/status on traps, and create MPC_CEILING_DONE only after prerequisites/build succeed and the intended matrix reaches an explicitly accepted terminal state. Add a hermetic test using stubbed failing commands to prove no success sentinel is produced after clone/build failure.",
+    "severity": "major",
+    "title": "Instance script writes the completion sentinel after setup or build failures"
+   }
+  ],
+  "progress": null,
+  "summary": "The harness has root-level command-injection paths because several caller-controlled values are interpolated verbatim into EC2 user-data, and it can also report a completed run after prerequisite/build failures because the instance script does not fail closed. These are blocking for a credentialed EC2 benchmark launcher. The hermetic self-test checks for marker strings but does not exercise either invariant.",
+  "verdict": "request_changes"
+ }
+}
