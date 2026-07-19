@@ -160,6 +160,115 @@ function renderAccounts(accounts) {
   }
 }
 
+// --- Provider quota (cumulative): per-provider AGGREGATE headroom across that provider's
+// accounts, computed server-side by dashboard-gen._provider_quota from the signals that actually
+// exist — live per-window utilization probes where the provider exposes them (anthropic), and
+// only the availability counts + reactive backoff where it does not (probe-exempt openai).
+// Accounts the fail-closed probe OMITTED surface as `accounts_unknown` ("unreported") and are
+// never rendered free — dispatch treats that omission as unavailable (sol finding 2, PR #281);
+// so do PARTIAL probe entries (status-only / one window without the other), which dispatch and
+// usage-alert equally reject (sol finding 1, PR #281 fix round 3) and which contribute NOTHING
+// to the window sums, limit estimates, or reset stamps (fix round 4: an unknown account never
+// feeds the headroom rendered next to its own "unreported" badge).
+// The honest aggregate unit is "account-windows free" (Σ remaining window fraction over the
+// accounts that reported), with a PARTIAL limit-weighted sum only where limit headers are known;
+// each card states its signal source, and the section header carries the snapshot freshness.
+// An absent `provider_quota` key (older data.json) hides the whole section. Decision 22: rows
+// contain provider names + counts only — no account identifiers of any form. ---------------------
+function quotaWindowRow(windowData) {
+  const wrap = node("div", "window");
+  const head = node("div", "window-head");
+  const remaining = typeof windowData.remaining_account_windows === "number"
+    && Number.isFinite(windowData.remaining_account_windows)
+    ? windowData.remaining_account_windows : null;
+  const reporting = Number.isInteger(windowData.accounts_reporting)
+    ? windowData.accounts_reporting : 0;
+  head.append(
+    node("span", "window-name", windowData.name),
+    node("span", "window-value", remaining === null || !reporting
+      ? "unknown"
+      : `${remaining} of ${reporting} account-window${reporting === 1 ? "" : "s"} free`),
+  );
+  const meter = node("div", "meter");
+  meter.setAttribute("role", "progressbar");
+  meter.setAttribute("aria-label", `${windowData.name} aggregate remaining quota`);
+  if (remaining !== null && reporting > 0) {
+    const fraction = Math.min(1, Math.max(0, remaining / reporting));
+    meter.setAttribute("aria-valuenow", String(Math.round(fraction * 100)));
+    meter.setAttribute("aria-valuemin", "0");
+    meter.setAttribute("aria-valuemax", "100");
+    const fill = node("span", fraction <= 0.15 ? "high" : "");
+    fill.style.width = `${fraction * 100}%`;
+    meter.append(fill);
+  }
+  const notes = [];
+  if (typeof windowData.limit_remaining === "number"
+      && Number.isFinite(windowData.limit_remaining)) {
+    notes.push(`≈${windowData.limit_remaining.toLocaleString()} provider limit-units left`
+      + ` (limits known for ${windowData.limits_known}/${reporting})`);
+  }
+  if (windowData.soonest_reset) {
+    notes.push(`next reset ${relative(windowData.soonest_reset)}`
+      + (windowData.oldest_reset && windowData.oldest_reset !== windowData.soonest_reset
+        ? ` · last ${relative(windowData.oldest_reset)}` : ""));
+  }
+  wrap.append(head, meter, node("p", "reset", notes.length ? notes.join(" · ") : "Reset unknown"));
+  return wrap;
+}
+
+function providerQuotaCard(row) {
+  const card = node("article", "account-card quota-card");
+  const top = node("div", "card-top");
+  top.append(node("h4", "quota-provider", String(row.provider || "unknown")));
+  const badges = node("div", "badges");
+  if (row.single_account) badges.append(node("span", "badge", "single account"));
+  if (Number.isInteger(row.accounts_capped) && row.accounts_capped > 0) {
+    badges.append(node("span", "badge capped", `${row.accounts_capped} capped`));
+  }
+  if (Number.isInteger(row.accounts_unknown) && row.accounts_unknown > 0) {
+    // Distinct neutral badge: an unreported (fail-closed-omitted) account is NOT free — the
+    // muted default badge style separates "no signal" from green/amber/red real states.
+    badges.append(node("span", "badge", `${row.accounts_unknown} unreported`));
+  }
+  top.append(badges);
+  const total = Number.isInteger(row.accounts_total) ? row.accounts_total : 0;
+  let countsText = `${total} account${total === 1 ? "" : "s"}`
+    + ` · ${Number.isInteger(row.accounts_available) ? row.accounts_available : 0} free`
+    + ` · ${Number.isInteger(row.accounts_capped) ? row.accounts_capped : 0} capped`;
+  if (Number.isInteger(row.accounts_unavailable) && row.accounts_unavailable > 0) {
+    countsText += ` · ${row.accounts_unavailable} unavailable`;
+  }
+  if (Number.isInteger(row.accounts_unknown) && row.accounts_unknown > 0) {
+    countsText += ` · ${row.accounts_unknown} unreported — treated unavailable by dispatch`;
+  }
+  const windows = node("div", "window-list");
+  const windowRows = Array.isArray(row.windows) ? row.windows : [];
+  for (const windowData of windowRows) windows.append(quotaWindowRow(windowData));
+  if (!windowRows.length) {
+    windows.append(node("p", "quota-note",
+      "Aggregate remaining quota is not observable for this provider — availability and capped counts above are the only real signal."));
+  }
+  card.append(top, node("p", "quota-counts", countsText), windows);
+  if (row.soonest_reset) {
+    card.append(node("p", "quota-note",
+      `Soonest known reset ${relative(row.soonest_reset)} · all known windows reset by ${utc(row.oldest_reset)}`));
+  }
+  card.append(node("p", "quota-signal", `Signal: ${String(row.signal || "unknown")}`));
+  return card;
+}
+
+function renderProviderQuota(rows, generatedAt) {
+  const section = byId("provider-quota-section");
+  if (!Array.isArray(rows) || !rows.length) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  byId("provider-quota-time").textContent = generatedAt
+    ? `Data as of ${relative(generatedAt)} · ${utc(generatedAt)}` : "Data freshness unknown";
+  byId("provider-quota").replaceChildren(...rows.map(providerQuotaCard));
+}
+
 function renderRepositoryAgents(activity, activeAgents) {
   if (!activity || !Array.isArray(activity.models) || !Array.isArray(activity.repositories)) {
     throw new Error("invalid repository activity snapshot");
@@ -602,6 +711,7 @@ function renderObservability(o) {
 function render(data) {
   renderRepositoryAgents(data.active_by_repository, data.fleet.active_agents);
   renderSummary(data);
+  renderProviderQuota(data.provider_quota, data.generated_at);
   renderAccounts(data.accounts || []);
   renderOutcomes(data.fleet.dispatch_outcomes || []);
   renderHealth(data.model_health);

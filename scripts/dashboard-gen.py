@@ -251,6 +251,204 @@ def _window_rows(account, usage_entry):
     return rows
 
 
+_SELECT_AND_CLAIM_MODULE = None
+
+
+def _select_and_claim_module():
+    """Load scripts/select-and-claim.py (hyphenated name — importlib, the _model_health_module
+    pattern) so the ALLOCATOR'S backoff-stamp parsing semantics are SHARED, not re-implemented
+    here where they would drift (sol finding 3, PR #281 fix round)."""
+    global _SELECT_AND_CLAIM_MODULE
+    if _SELECT_AND_CLAIM_MODULE is None:
+        path = Path(__file__).resolve().with_name("select-and-claim.py")
+        spec = importlib.util.spec_from_file_location("registry_select_and_claim", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SELECT_AND_CLAIM_MODULE = module
+    return _SELECT_AND_CLAIM_MODULE
+
+
+def _backoff_epoch(value):
+    """A backoff_until stamp parsed with the ALLOCATOR'S semantics, or None (fail open):
+    select-and-claim.usage_eligible admits the stamp iff `_usage_num` parses it AND it is
+    finite. This dashboard used to diverge both ways — it accepted Infinity/absurd integers
+    (rendering "capped indefinitely" while the allocator failed open and kept using the
+    account) and ignored parseable string epochs (rendering "available" while the allocator
+    backed off). The self-test's parity vector locks the two scripts to one predicate."""
+    number = _select_and_claim_module()._usage_num(value)
+    if number is None or not math.isfinite(number):
+        return None
+    return number
+
+
+def _quota_state(account, entry, now):
+    """Availability for the CUMULATIVE provider view: the per-account trichotomy from
+    _availability, except that (a) a catalog-available account with NO usage entry — the probe
+    fail-closed OMITS an account whose token is missing or whose probe failed — is "unknown":
+    dispatch (select-and-claim.usage_eligible) and usage-alert treat that omission as
+    UNAVAILABLE, so counting it free here would advertise quota the allocator will never use
+    (sol finding 2, PR #281 fix round); (b) a probe-exempt account under an ACTIVE reactive
+    backoff (its only quota signal — issue #29) counts as capped until the backoff expires,
+    with the stamp parsed by the allocator's shared `_backoff_epoch` semantics; and (c) a
+    non-exempt account counts "available" only with BOTH mandatory windows (5h AND 7d) validly
+    reported — account-usage.py can emit a PARTIAL entry (status-only, or one window without
+    the other), and dispatch (usage_eligible: `util is None` → ineligible) plus usage-alert
+    (classify: `u5 is None or u7 is None` → UNAVAILABLE) both fail closed on that shape, so
+    rendering it free would again advertise quota the allocator will never use (sol finding 1,
+    PR #281 fix round 3); partial ⇒ "unknown". Returns (state, backoff_epoch_or_None).
+    Pure — unit-tested by --self-test."""
+    availability = _availability(account, entry)
+    if availability != "available":
+        return availability, None
+    if not isinstance(entry, dict) or not entry:
+        return "unknown", None
+    if entry.get("exempt") is True:
+        until = _backoff_epoch(entry.get("backoff_until"))
+        if until is not None and until > now:
+            return "capped", until
+        return "available", None
+    if any(_percent(entry.get(f"{prefix}_util")) is None for prefix in ("5h", "7d")):
+        return "unknown", None
+    return "available", None
+
+
+def _provider_quota(accounts, usage, now):
+    """Per-provider CUMULATIVE quota rows (maintainer request 2026-07-18): where a provider has
+    several accounts, the AGGREGATE headroom across them; single-account providers still emit a
+    row, marked `single_account`. HONEST aggregation of the signals that actually exist — no
+    invented precision:
+
+    * Probed (anthropic) accounts expose per-window utilization FRACTIONS (plus a raw unit-less
+      `*-limit` header value when the provider sends one), so the aggregate unit is
+      "account-windows free": Σ over reporting accounts of that account's remaining window
+      fraction (a provider with 2.4 of 3 account-windows free has, e.g., one fresh account, one
+      at 60% and one capped). `limit_remaining` additionally sums limit×remaining, but ONLY over
+      the accounts whose limit header is known — `limits_known`/`accounts_reporting` says how
+      partial that sum is, and its unit is whatever the provider's opaque limit header means.
+    * Probe-exempt providers (openai) have NO usage observability at all (issue #29): the row
+      aggregates only the availability trichotomy + active reactive backoffs, and `signal` says
+      so — `windows` stays empty rather than fabricating a remaining-quota number.
+
+    Accounts fail-closed omitted from the usage snapshot count in `accounts_total` and in
+    `accounts_unknown` ("unreported" — dispatch treats the omission as unavailable, so they are
+    NEVER counted free), and never in `accounts_reporting`. The same holds for PARTIAL probe
+    entries (quota state "unknown"): the whole account is excluded from the aggregation — its
+    parseable window contributes NOTHING to the window sums, `limit_remaining`/`limits_known`,
+    or the reset stamps (sol finding, PR #281 fix round 4: a 5h-only entry used to render
+    "accounts_unknown: 1" NEXT TO headroom summed from that very account). The exclusion is
+    keyed off the SAME `_quota_state` result as the counts — one source of truth, no
+    re-derivation. `soonest_reset`/`oldest_reset` span
+    every known window-reset/backoff stamp for the provider: soonest = the first moment ANY
+    quota refills, oldest = when the last known window has refilled. Pure — unit-tested by
+    --self-test; rows carry provider names + counts only (decision 22: no account identifiers,
+    salted or otherwise, on this surface)."""
+    groups = {}
+    for account in accounts:
+        groups.setdefault(account["provider"], []).append(account)
+    rows = []
+    for provider in sorted(groups):
+        members = groups[provider]
+        counts = {"available": 0, "capped": 0, "unavailable": 0, "unknown": 0}
+        probed = exempt = False
+        stats = {prefix: {"reporting": 0, "remaining": 0.0, "limits_known": 0,
+                          "limit_remaining": 0.0, "resets": []}
+                 for prefix, _ in WINDOWS}
+        provider_resets = []
+        for account in members:
+            entry = usage.get(account["handle"])
+            state, backoff_until = _quota_state(account, entry, now)
+            counts[state] += 1
+            backoff_iso = _utc_iso(backoff_until)
+            if backoff_iso:
+                provider_resets.append(backoff_iso)
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("exempt") is True:
+                exempt = True
+            elif entry:
+                probed = True
+            if state == "unknown":
+                # An "unknown" account (PARTIAL probe entry — e.g. 5h-only) contributes NOTHING
+                # to the aggregate (sol finding, PR #281 fix round 4): its parseable window used
+                # to leak into the sums, rendering "accounts_unknown: 1" next to account-window
+                # headroom from that same account. Keyed off the _quota_state result above —
+                # the single source of truth the counts already use, not a re-derivation.
+                continue
+            for prefix, _name in WINDOWS:
+                used = _percent(entry.get(f"{prefix}_util"))
+                if used is None:
+                    continue
+                window = stats[prefix]
+                window["reporting"] += 1
+                remaining = max(0.0, 100.0 - used) / 100.0
+                window["remaining"] += remaining
+                limit = entry.get(f"{prefix}_limit")
+                if limit is None:
+                    limit = account["limits"].get(f"{prefix}_limit")
+                try:
+                    limit_number = float(limit)
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError (sol finding 2, PR #281 fix round 3): a huge-int limit
+                    # (10**400) is valid JSON but float() of it RAISES rather than returning
+                    # inf — same trap select-and-claim._usage_num already guards.
+                    limit_number = None
+                if limit_number is not None and math.isfinite(limit_number) and limit_number >= 0:
+                    # Individually-finite limits can still overflow the WEIGHTED SUM (two
+                    # "1e308" limits are each finite but their sum is inf), and round(inf) at
+                    # render would crash the whole dashboard build on one malformed account
+                    # record (sol finding 2, PR #281 fix round 3). Validate the product AND
+                    # the running sum; on overflow, reject THIS account's limit contribution
+                    # (its limit stays unknown — not in limits_known) and keep the build alive.
+                    product = limit_number * remaining
+                    if math.isfinite(product) and math.isfinite(window["limit_remaining"] + product):
+                        window["limits_known"] += 1
+                        window["limit_remaining"] += product
+                # _utc_iso emits a fixed-width "...Z" format, so lexicographic min/max below is
+                # chronological.
+                reset_iso = _utc_iso(entry.get(f"{prefix}_reset"))
+                if reset_iso:
+                    window["resets"].append(reset_iso)
+                    provider_resets.append(reset_iso)
+        windows = []
+        for prefix, name in WINDOWS:
+            window = stats[prefix]
+            if not window["reporting"]:
+                continue  # nothing measured for this window (e.g. fable on a non-fable provider)
+            windows.append({
+                "name": name,
+                "accounts_reporting": window["reporting"],
+                "remaining_account_windows": round(window["remaining"], 2),
+                "limit_remaining": round(window["limit_remaining"])
+                if window["limits_known"] else None,
+                "limits_known": window["limits_known"],
+                "soonest_reset": min(window["resets"], default=None),
+                "oldest_reset": max(window["resets"], default=None),
+            })
+        if probed and exempt:
+            signal = "mixed: live rate-limit-header probe + probe-exempt accounts"
+        elif probed:
+            signal = "live rate-limit-header probe (per-window utilization)"
+        elif exempt:
+            signal = ("not observable (probe-exempt provider): catalog availability "
+                      "+ reactive rate-limit backoff only")
+        else:
+            signal = "no live usage signal (catalog availability only)"
+        rows.append({
+            "provider": provider,
+            "accounts_total": len(members),
+            "accounts_available": counts["available"],
+            "accounts_capped": counts["capped"],
+            "accounts_unavailable": counts["unavailable"],
+            "accounts_unknown": counts["unknown"],
+            "single_account": len(members) == 1,
+            "signal": signal,
+            "windows": windows,
+            "soonest_reset": min(provider_resets, default=None),
+            "oldest_reset": max(provider_resets, default=None),
+        })
+    return rows
+
+
 def _parse_dispatch_log(log_text):
     complete = DISPATCH_COMPLETE_RE.findall(log_text)
     dispatched = int(complete[-1]) if complete else len(DISPATCHED_RE.findall(log_text))
@@ -757,6 +955,9 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         "schema": SCHEMA,
         "generated_at": _utc_iso(now),
         "accounts": rows,
+        # Cumulative per-provider headroom (maintainer request 2026-07-18) — rendered by the
+        # dashboard's "Provider quota (cumulative)" section, above the per-account cards.
+        "provider_quota": _provider_quota(accounts, usage, now),
         "fleet": {
             "active_agents": len(live),
             "capacity": capacity,
@@ -845,6 +1046,21 @@ def _self_test():
                 {"name": "7 day", "used_percent": 80.0,
                  "reset_at": "2025-06-16T15:06:40Z", "limit": "7000"},
             ],
+        }],
+        "provider_quota": [{
+            "provider": "anthropic", "accounts_total": 1, "accounts_available": 1,
+            "accounts_capped": 0, "accounts_unavailable": 0, "accounts_unknown": 0,
+            "single_account": True,
+            "signal": "live rate-limit-header probe (per-window utilization)",
+            "windows": [
+                {"name": "5 hour", "accounts_reporting": 1, "remaining_account_windows": 0.58,
+                 "limit_remaining": 580, "limits_known": 1,
+                 "soonest_reset": "2025-06-15T16:06:40Z", "oldest_reset": "2025-06-15T16:06:40Z"},
+                {"name": "7 day", "accounts_reporting": 1, "remaining_account_windows": 0.2,
+                 "limit_remaining": 1400, "limits_known": 1,
+                 "soonest_reset": "2025-06-16T15:06:40Z", "oldest_reset": "2025-06-16T15:06:40Z"},
+            ],
+            "soonest_reset": "2025-06-15T16:06:40Z", "oldest_reset": "2025-06-16T15:06:40Z",
         }],
         "fleet": {
             "active_agents": 1,
@@ -965,6 +1181,190 @@ def _self_test():
     }])
     check("expanded fixture preserves private account identities",
           all(account_handle not in json.dumps(ordered) for account_handle in ordered_handles), True)
+
+    # --- provider-cumulative quota (maintainer request 2026-07-18): 2 providers — one
+    # multi-account anthropic with mixed capped/free (+ one fail-closed-omitted account), one
+    # single-account probe-exempt openai under an active backoff. Asserts the aggregation math,
+    # the honest signal labels, and that no raw handle reaches the rows (decision 22). ----------
+    quota_handles = ["multi-a", "multi-b", "multi-c", "solo-openai"]
+    quota_accounts = [
+        {"handle": "multi-a", "provider": "anthropic", "catalog_available": True, "limits": {}},
+        {"handle": "multi-b", "provider": "anthropic", "catalog_available": True,
+         "limits": {"5h_limit": "1000"}},  # overridden by the probe's live 5h_limit below
+        {"handle": "multi-c", "provider": "anthropic", "catalog_available": True, "limits": {}},
+        {"handle": "solo-openai", "provider": "openai", "catalog_available": True, "limits": {}},
+    ]
+    quota_usage = {
+        "multi-a": {"status": "allowed", "5h_util": "0.25", "5h_reset": now + 600,
+                    "7d_util": "0.5", "7d_reset": now + 4000},
+        # multi-b: capped on the 7d window, but with NONZERO 5h headroom (0.1) so the
+        # limit-weighted sum distinguishes limit PRECEDENCE non-vacuously (sol finding 4,
+        # PR #281 fix round): the LIVE 5h_limit header (2000) must beat the persisted catalog
+        # limit (1000) — 2000×0.1=200, not 100. Swapping the precedence turns this red.
+        "multi-b": {"status": "allowed", "5h_util": "0.9", "5h_reset": now + 1200,
+                    "5h_limit": "2000", "7d_util": "1.0", "7d_reset": now + 90000},
+        # multi-c: probe fail-closed omitted — counts in the total and as UNKNOWN/unreported
+        # (dispatch treats the omission as unavailable), never in accounts_reporting and
+        # never as free (sol finding 2, PR #281 fix round)
+        "solo-openai": {"exempt": True, "backoff_until": now + 300},
+    }
+    quota_rows = _provider_quota(quota_accounts, quota_usage, now)
+    check("cumulative quota: multi-account provider aggregates mixed capped/free", quota_rows[0], {
+        "provider": "anthropic", "accounts_total": 3, "accounts_available": 1,
+        "accounts_capped": 1, "accounts_unavailable": 0, "accounts_unknown": 1,
+        "single_account": False,
+        "signal": "live rate-limit-header probe (per-window utilization)",
+        "windows": [
+            # 0.75 free (multi-a) + 0.1 free (7d-capped multi-b); only multi-b's LIVE limit is
+            # known, so the limit-weighted sum is PARTIAL (limits_known 1 of 2) and equals
+            # live 2000 × 0.1 = 200 (the persisted-limit precedence would fabricate 100).
+            {"name": "5 hour", "accounts_reporting": 2, "remaining_account_windows": 0.85,
+             "limit_remaining": 200, "limits_known": 1,
+             "soonest_reset": _utc_iso(now + 600), "oldest_reset": _utc_iso(now + 1200)},
+            # no account exposes a 7d limit -> no limit-weighted sum is fabricated
+            {"name": "7 day", "accounts_reporting": 2, "remaining_account_windows": 0.5,
+             "limit_remaining": None, "limits_known": 0,
+             "soonest_reset": _utc_iso(now + 4000), "oldest_reset": _utc_iso(now + 90000)},
+        ],
+        "soonest_reset": _utc_iso(now + 600), "oldest_reset": _utc_iso(now + 90000),
+    })
+    check("cumulative quota: single-account probe-exempt provider stays honest", quota_rows[1], {
+        "provider": "openai", "accounts_total": 1, "accounts_available": 0,
+        "accounts_capped": 1, "accounts_unavailable": 0, "accounts_unknown": 0,
+        "single_account": True,
+        "signal": ("not observable (probe-exempt provider): catalog availability "
+                   "+ reactive rate-limit backoff only"),
+        "windows": [],  # no usage signal exists -> no remaining-quota number is fabricated
+        "soonest_reset": _utc_iso(now + 300), "oldest_reset": _utc_iso(now + 300),
+    })
+    check("cumulative quota: fail-closed-omitted account is unknown, never free",
+          [(row["accounts_available"], row["accounts_unknown"]) for row in _provider_quota(
+              [{"handle": "ghost", "provider": "anthropic", "catalog_available": True,
+                "limits": {}}], {}, now)],
+          [(0, 1)])
+    # Backoff-stamp parsing PARITY (sol finding 3, PR #281 fix round): the dashboard's "capped"
+    # rendering and the allocator's admission decision must be the same predicate on the same
+    # input — dashboard-gen used to accept Infinity/absurd integers (rendering "capped
+    # indefinitely" while select-and-claim failed open and kept USING the account) and ignored
+    # parseable string epochs (rendering "available" while the allocator backed off). One shared
+    # vector locks both scripts to the allocator's _usage_num + isfinite semantics.
+    allocator = _select_and_claim_module()
+    exempt_account = {"handle": "solo-openai", "provider": "openai",
+                      "catalog_available": True, "limits": {}}
+    for stamp, want_capped in ((now + 300, True), (float(now + 300), True),
+                               (str(now + 300), True),          # parseable string epoch: capped
+                               (f"{now + 300}.5", True),
+                               (now - 1, False),                # expired: free again
+                               (float("inf"), False),           # non-finite: fail OPEN
+                               ("inf", False), ("nan", False),
+                               (10 ** 400, False),              # absurd int: float() overflows
+                               ("garbage", False), (None, False), ([], False), ({}, False),
+                               (True, False)):
+        entry = {"exempt": True, "backoff_until": stamp}
+        state, _until = _quota_state(exempt_account, entry, now)
+        check(f"backoff stamp {str(stamp)[:24]!r}: dashboard capped == allocator excluded",
+              (state == "capped", not allocator.usage_eligible(entry, now=now)),
+              (want_capped, want_capped))
+    check("cumulative quota: expired backoff no longer counts as capped",
+          [(row["accounts_available"], row["accounts_capped"]) for row in _provider_quota(
+              quota_accounts[3:], {"solo-openai": {"exempt": True, "backoff_until": now - 1}},
+              now)],
+          [(1, 0)])
+    # PARTIAL probe entries are never free (sol finding 1, PR #281 fix round 3):
+    # account-usage.py can emit an entry whose mandatory utilization windows are missing
+    # (status-only, or 5h without 7d) — dispatch (usage_eligible) and usage-alert (classify)
+    # both fail closed on that shape, so the dashboard must file it under accounts_unknown
+    # ("unreported — treated unavailable by dispatch"), not "1 free". Each shape is also
+    # parity-checked against the allocator's own admission predicate.
+    partial_account = {"handle": "partial", "provider": "anthropic",
+                       "catalog_available": True, "limits": {}}
+    for shape_name, partial_entry in (
+            ("status-only", {"status": "allowed"}),
+            ("5h-only", {"status": "allowed", "5h_util": "0.2", "5h_reset": now + 600,
+                         "5h_limit": "1000"})):
+        state, _until = _quota_state(partial_account, partial_entry, now)
+        check(f"partial probe entry ({shape_name}) is unknown, never free",
+              (state, allocator.usage_eligible(dict(partial_entry), now=now)),
+              ("unknown", False))
+        # The COMPLETE row (sol finding, PR #281 fix round 4): an unknown account contributes
+        # NOTHING — even though the 5h-only shape carries a fully parseable window (util 0.2 +
+        # reset + limit), the row's windows stay EMPTY and no reset/limit is aggregated. Before
+        # this round it rendered "accounts_unknown: 1" NEXT TO "0.8 of 1 account-window free"
+        # summed from that very account.
+        check(f"partial probe entry ({shape_name}) contributes nothing to the provider row",
+              _provider_quota([partial_account], {"partial": dict(partial_entry)}, now),
+              [{"provider": "anthropic", "accounts_total": 1, "accounts_available": 0,
+                "accounts_capped": 0, "accounts_unavailable": 0, "accounts_unknown": 1,
+                "single_account": True,
+                "signal": "live rate-limit-header probe (per-window utilization)",
+                "windows": [], "soonest_reset": None, "oldest_reset": None}])
+    check("both-windows entry still counts available (not over-rejected)",
+          _quota_state(partial_account,
+                       {"status": "allowed", "5h_util": "0.2", "7d_util": "0.3"}, now),
+          ("available", None))
+    # Mixed complete+partial provider (sol finding, PR #281 fix round 4): the sums must reflect
+    # ONLY the complete account. The partial account's parseable 5h window is a trap on every
+    # aggregate axis — earlier reset (would flip soonest_reset), big known limit (would inflate
+    # limit_remaining + limits_known), 0.9 headroom (would inflate remaining + reporting) — so
+    # reverting the aggregation exclusion turns this red on the first leaked field.
+    mixed_accounts = [
+        {"handle": "mixed-full", "provider": "anthropic", "catalog_available": True,
+         "limits": {}},
+        {"handle": "mixed-partial", "provider": "anthropic", "catalog_available": True,
+         "limits": {}},
+    ]
+    mixed_usage = {
+        "mixed-full": {"status": "allowed", "5h_util": "0.25", "5h_reset": now + 600,
+                       "5h_limit": "1000", "7d_util": "0.5", "7d_reset": now + 4000},
+        "mixed-partial": {"status": "allowed", "5h_util": "0.1", "5h_reset": now + 60,
+                          "5h_limit": "9000"},
+    }
+    check("mixed complete+partial: sums reflect only the complete account",
+          _provider_quota(mixed_accounts, mixed_usage, now),
+          [{"provider": "anthropic", "accounts_total": 2, "accounts_available": 1,
+            "accounts_capped": 0, "accounts_unavailable": 0, "accounts_unknown": 1,
+            "single_account": False,
+            "signal": "live rate-limit-header probe (per-window utilization)",
+            "windows": [
+                {"name": "5 hour", "accounts_reporting": 1, "remaining_account_windows": 0.75,
+                 "limit_remaining": 750, "limits_known": 1,
+                 "soonest_reset": _utc_iso(now + 600), "oldest_reset": _utc_iso(now + 600)},
+                {"name": "7 day", "accounts_reporting": 1, "remaining_account_windows": 0.5,
+                 "limit_remaining": None, "limits_known": 0,
+                 "soonest_reset": _utc_iso(now + 4000), "oldest_reset": _utc_iso(now + 4000)},
+            ],
+            "soonest_reset": _utc_iso(now + 600), "oldest_reset": _utc_iso(now + 4000)}])
+    # Malformed/extreme limit headers must never crash the build (sol finding 2, PR #281 fix
+    # round 3): float() of a huge JSON int RAISES OverflowError, and two individually-FINITE
+    # "1e308" limits overflow the weighted SUM to inf — round(inf) at render then raised and
+    # one malformed account record killed the whole dashboard. The offending contribution is
+    # rejected (limit stays unknown — outside limits_known) and the build stays alive.
+    def _limit_window(limits_map):
+        rows_ = _provider_quota(
+            [{"handle": f"lim-{i}", "provider": "anthropic", "catalog_available": True,
+              "limits": {}} for i in range(len(limits_map))],
+            {f"lim-{i}": {"status": "allowed", "5h_util": "0.0", "5h_limit": limit_value,
+                          "7d_util": "0.0"}
+             for i, limit_value in enumerate(limits_map)}, now)
+        window = rows_[0]["windows"][0]
+        return (window["limits_known"], window["limit_remaining"],
+                window["limit_remaining"] is None
+                or isinstance(window["limit_remaining"], int))
+    check("single 1e308 limit: finite, counted, round() survives",
+          _limit_window(["1e308"]), (1, round(1e308), True))
+    check("two 1e308 limits: finite each, infinite sum -> second rejected, build alive",
+          _limit_window(["1e308", "1e308"]), (1, round(1e308), True))
+    check("huge-int limit (10**400): float() OverflowError caught, limit unknown",
+          _limit_window([10 ** 400]), (0, None, True))
+    check("'inf'/'nan'/negative limit strings rejected, never summed",
+          _limit_window(["inf", "nan", "-5"]), (0, None, True))
+    check("cumulative quota rows carry no raw account identifier (decision 22)",
+          all(h not in json.dumps(quota_rows) for h in quota_handles), True)
+    check("ordered fixture publishes one cumulative row per provider, single-account marked",
+          [(row["provider"], row["accounts_total"], row["single_account"])
+           for row in ordered["provider_quota"]],
+          [("anthropic", 3, False), ("future-provider", 1, True), ("openai", 1, True)])
+
     health = _normalize_model_health({
         "generated_at": now,
         "models": [{"model": "fable", "provider": "anthropic", "status": "ok"}],

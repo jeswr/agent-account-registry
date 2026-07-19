@@ -93,6 +93,13 @@ main > section { padding-top: 42px; }
 .badge.capped, .badge.degraded { border-color: rgba(243, 189, 88, .32); color: var(--warn); background: rgba(243, 189, 88, .08); }
 .badge.unavailable, .badge.unhealthy, .badge.failure { border-color: rgba(255, 114, 125, .32); color: var(--bad); background: rgba(255, 114, 125, .08); }
 
+/* --- Provider quota (cumulative): aggregate headroom per provider --- */
+.quota-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.quota-provider { margin: 3px 0 0; font-size: .82rem; font-weight: 760; letter-spacing: .13em; text-transform: uppercase; color: var(--accent-2); }
+.quota-counts { margin: 0 0 14px; padding-bottom: 13px; border-bottom: 1px solid var(--line); font-size: .9rem; font-weight: 650; }
+.quota-note { margin: 10px 0 0; color: var(--muted); font-size: .72rem; line-height: 1.4; }
+.quota-signal { margin: 12px 0 0; color: var(--muted); font-size: .68rem; font-style: italic; line-height: 1.4; }
+
 .weekly-reset { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 4px 12px; margin-bottom: 16px; padding: 13px 14px; border: 1px solid rgba(98, 216, 198, .2); border-radius: 11px; background: rgba(98, 216, 198, .055); }
 .weekly-reset-label { color: var(--accent); font-size: .67rem; font-weight: 760; letter-spacing: .1em; text-transform: uppercase; }
 .weekly-reset-relative { font-size: 1rem; text-align: right; }
@@ -185,7 +192,7 @@ footer { margin-top: 50px; padding: 24px 0 40px; border-top: 1px solid var(--lin
 @media (max-width: 900px) {
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .account-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .obs-grid { grid-template-columns: 1fr; }
+  .obs-grid, .quota-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 620px) {
