@@ -1,0 +1,15 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`_registry_put_file` calls `_ops_alert` before raising its intended `WorkerPrError`, but `_ops_alert` is not fully best-effort: its `_gh_json(...)` call invokes `_run_gh` with the default `check=True`. If the alert repository is unavailable, the token lacks issue-list permission, or GitHub returns malformed JSON, `_ops_alert` raises and the final registry-write exception (including the real PUT error) is never reached. This contradicts the new invariant that alert failure must never mask the operational error. The self-test monkeypatches `_ops_alert`, so it cannot detect this failure mode.",
+   "file": "scripts/worker-pr.py",
+   "fix_hint": "Make the entire alert helper non-throwing (including issue lookup/JSON parsing and unexpected response shapes), or catch alert exceptions at the terminal call site before raising the original registry-write error. Add a self-test where alert lookup fails and assert that `_registry_put_file` still raises the registry-write error containing the final PUT stderr.",
+   "severity": "major",
+   "title": "Ops-alert failure can mask the terminal registry-write error"
+  }
+ ],
+ "progress": null,
+ "summary": "The jittered retry behavior is bounded and the new retry assertions are meaningful, but the terminal alert path is not actually best-effort. A failure while listing alert issues can replace the registry-write failure that the change promises to preserve. Because this is provenance/verdict persistence in the trust plane, masking that primary failure is a major correctness and operational-diagnostics regression in the new path.",
+ "verdict": "request_changes"
+}
