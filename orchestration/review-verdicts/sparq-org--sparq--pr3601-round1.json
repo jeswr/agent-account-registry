@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3601,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6b4e581e6f3a75892c4aa3c1b3a50223bb2b704c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "termKey concatenates attacker/result-controlled lexical value, datatype, and language fields with raw NUL delimiters. Those fields are not escaped or length-prefixed, so distinct literals such as value `a\\u0000b` with datatype `c` and value `a` with datatype `b\\u0000c` produce the same key. deriveGraph then merges their nodes and may aggregate edges, violating the stated guarantee that every displayed node preserves a distinct real term. The raw NULs also make Git classify this TypeScript source as binary, hiding the implementation from normal textual diff review.",
+    "file": "site/src/lib/result-graph.ts",
+    "fix_hint": "Use an injective structural encoding, for example JSON.stringify of a fixed tuple `[type, value, datatype ?? \"\", xmlLang ?? \"\"]` or a length-prefixed encoding, and add a unit test with delimiter-containing lexical/datatype fields proving that the terms remain distinct. Avoid embedding raw NUL bytes in the source file.",
+    "severity": "major",
+    "title": "NUL-delimited term keys are collision-prone"
+   },
+   {
+    "body": "ResultGraphView and deriveGraph are static imports, so all graph-rendering and derivation code is bundled whenever the lazy hero runner loads, even for users who never select Graph. This conflicts with the repository's explicit policy that net-new uncertain or rarely used frontend features increasing bundle size load through a literal dynamic import only when invoked. The source comment acknowledges the bundle impact but does not implement invocation-path loading.",
+    "file": "site/src/components/home/hero-runner.tsx",
+    "fix_hint": "Move the optional renderer behind next/dynamic or React.lazy and load its graph-specific implementation with a literal import() when the user invokes the Graph view. Keep only the minimum cheap eligibility logic in the core hero chunk, and update the relevant bundle check if this creates a material optional chunk.",
+    "severity": "major",
+    "title": "Optional graph feature is eagerly included in the hero chunk"
+   }
+  ],
+  "progress": null,
+  "summary": "The graph derivation can merge distinct RDF terms because its identity encoding is not injective, which can invent node/edge coalescing contrary to the feature's load-bearing honesty claim. The optional graph renderer is also statically imported into the hero chunk instead of being loaded on invocation as required by the repository's frontend optional-code policy. The supplied tests do not cover the identity collision.",
+  "verdict": "request_changes"
+ }
+}
