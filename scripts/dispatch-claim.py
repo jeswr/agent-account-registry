@@ -1975,9 +1975,26 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         and reviewed and reviewed.group(1) == head_sha):
                     print(f"defer review {repo}#{number}: head already reviewed")
                     continue
-                base_branch = str((pull.get("base") or {}).get("repo", {}).get(
-                    "default_branch", "")) or "main"
-                diff = _gh_json(["api", f"repos/{repo}/compare/{base_branch}...{head_sha}"])
+                # The empty-diff / no-op-rebase probe must compare against the PR's ACTUAL base
+                # ref, never the repo default branch (issue #164; the #81 precedent in
+                # worker-pr._merge_only_carry_forward): a PR retargeted off the default is diffed
+                # against one base yet reviewed/armed/merged against another, so a wrong-base
+                # probe reads either empty (a silent forever-defer) or non-empty vs a base the arm
+                # can never merge. The worker-PR invariant is base == protected default branch
+                # (review-fix.yml resolve rejects a retarget LOUDLY; a human retarget is an
+                # explicit act that removes the PR from the loop). Enforce that same invariant
+                # HERE so the two admission points cannot drift, failing closed on a missing,
+                # unsafe, or retargeted base rather than probing/dispatching the wrong comparison.
+                base = pull.get("base") or {}
+                base_ref = str(base.get("ref", ""))
+                default_branch = str((base.get("repo") or {}).get("default_branch", ""))
+                if (not SAFE_ATOM.fullmatch(base_ref) or not default_branch
+                        or base_ref != default_branch):
+                    print(f"defer review {repo}#{number}: PR base {base_ref!r} is not the "
+                          "protected default branch (retargeted/unresolved) — refusing to "
+                          "review against the wrong base")
+                    continue
+                diff = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{head_sha}"])
                 if not diff.get("files"):
                     print(f"defer review {repo}#{number}: empty diff vs merge base (no-op rebase)")
                     continue
@@ -3996,12 +4013,16 @@ def _self_test():
     def fake_helper(script_dir, target_repo, script, args):
         helper_calls.append((script, args))
 
-    def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True):
+    def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True,
+                  base_ref="main"):
+        # base.ref defaults to the repo default branch ("main"): the review-lane invariant
+        # (issue #164) is base == protected default; a test passes base_ref!="main" to exercise
+        # the retargeted-PR exclusion.
         return {"number": 41, "state": "open", "draft": draft, "body": body,
                 "mergeable": mergeable, "auto_merge": auto_merge,
                 "head": {"ref": "sparq-agent/issue-7-1-1", "sha": sha_a,
                          "repo": {"full_name": repo}},
-                "base": {"repo": {"default_branch": "main"}},
+                "base": {"ref": base_ref, "repo": {"default_branch": "main"}},
                 "user": {"login": bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
@@ -4258,6 +4279,19 @@ def _self_test():
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert helper_calls == [], helper_calls
             assert alloc.chains == [["sol", "luna"]], alloc.chains
+
+            # issue #164: the SAME needs-review posture whose worker PR is RETARGETED off the
+            # protected default branch is EXCLUDED here (the review-lane invariant: base ==
+            # default). The wrong-base empty-diff probe never runs and no reviewer slot is spent
+            # on a PR the arm could never merge. Contrast the dispatch immediately above:
+            # identical comments/verdict, only base.ref differs ("release" != default "main"),
+            # yet this one defers with no claim and no mutation.
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"], base_ref="release"))
+            alloc = FakeAllocator()
+            run_items([review_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [], alloc.chains
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
 
             # flip-goes-red: the same posture whose latest fix ran BELOW the recorded fable
             # floor (a pin violation / forged marker) mints NO re-review — with the top tier
