@@ -1,0 +1,7 @@
+{
+ "injection_detected": false,
+ "issues": [],
+ "progress": null,
+ "summary": "Documentation-only change: adds a 'Node instantiation attribution (sq-3ul2n.10)' subsection to bench/wasm-compare/browser/README.md explaining that the Node instantiate_wasm outlier lives at the host/glue instantiation boundary rather than in wasm compilation or query execution, and records a 'wontfix in sparq' rationale. Verified every technical claim against the referenced node-baseline.mjs: the code does readFile (disk read) -> WebAssembly.compile -> import() of sparq_wasm.js glue + index.js wrapper -> then times glue.default({module_or_path: module}) as instantiate_wasm. So the doc's claims are accurate: the compiled module is passed in, so the timed window contains only wasm-bindgen import-table construction + V8 instantiation + wasm-bindgen finalisation (__wbindgen_start), and no TextDecoder result marshalling runs before the timed section closes. The --target nodejs reasoning (same wasm module/imports/start, not a fix for the post-compile phase) is sound. No hard-coded performance numbers are introduced \u2014 the change is compliant with the repo's 'no perf numbers in markdown' rule, and the embedded comment explicitly notes advisory timings remain in the result envelopes. No code, tests, or public API touched; no test validity concern applies to a doc-only change. No security or injection content \u2014 the 'Verdict: wontfix' text is documentation about an engineering decision, not an instruction. Change is correct, honest, and complete.",
+ "verdict": "approve"
+}
