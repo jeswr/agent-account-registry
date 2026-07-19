@@ -1,0 +1,22 @@
+{
+ "injection_detected": false,
+ "issues": [
+  {
+   "body": "`Cell` deserializes only `legal` and `reason`, and serde ignores unknown JSON fields by default. Therefore an illegal cell containing `circuit_size`, `gate_count`, or any other fabricated per-cell cost still passes `illegal_cells_carry_a_reason_not_a_cost()`. This contradicts the test and README claim that the committed JSON is gated against illegal cells carrying a fabricated cost.",
+   "file": "crates/sparq-zk-compose/tests/bb_gates_matrix.rs",
+   "fix_hint": "Model the prohibited cost field(s) explicitly and assert they are absent, or add `#[serde(deny_unknown_fields)]` to `Cell` so the only accepted cell fields are `legal` and optional `reason`. Add a mutation-style test/fixture containing an illegal cell with a cost and show that validation rejects it.",
+   "severity": "major",
+   "title": "Illegal-cell cost check is vacuous"
+  },
+  {
+   "body": "The new section defines `legal` as \"provable\" and says the matrix records every configuration's legality, while the matrix itself says dual-leaf host leaf encoding is not implemented and the existing dispatch documentation says the resolver is not wired into `verify_manifest`. Thus a `legal: true` cell currently means compatibility under a design-level resolver rule, not an end-to-end configuration that can actually be committed, proved, and verified. On a ZK surface this distinction is load-bearing, despite the otherwise good external-audit and INV-VL caveats.",
+   "file": "bench/zk-compose/README.md",
+   "fix_hint": "Rename/define the field and prose as `dispatch_compatible` or \"structurally legal under the unwired resolver\", explicitly state that it does not imply an end-to-end provable configuration, and avoid `production_selectable: true` terminology until the host encoding and verifier dispatch are wired; alternatively implement and test the full real path before retaining the current claims.",
+   "severity": "major",
+   "title": "Design legality is overstated as currently provable configuration"
+  }
+ ],
+ "progress": null,
+ "summary": "The matrix generation is deterministic and the external-audit/INV-VL caveats are explicit, but the load-bearing test does not enforce one of its central honesty claims: per-cell gate costs are silently accepted. The prose also describes design-level resolver compatibility as configurations being provable even though the same change acknowledges that host encoding is not implemented and the resolver is not wired into verification. These issues make the comparison surface insufficiently honest and gated for a ZK-critical artifact.",
+ "verdict": "request_changes"
+}
