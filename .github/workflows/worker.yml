@@ -430,14 +430,28 @@ jobs:
               raise SystemExit("allocator returned an unsafe or mismatched secret_ref")
           if not re.fullmatch(r"[0-9a-f]{32}", str(claim_id)):
               raise SystemExit("allocator returned an unsafe claim_id")
+          # Fail-closed on a malformed catalog entry (issue #142): a claimed account MUST declare
+          # every routing-relevant metadata field. An empty/missing provider, harness, or credential
+          # format never rides through as "" — the strict routing equality below only fires on
+          # NON-empty claimed values, so a blank field would let an account be routed on metadata it
+          # never declared. Reject here so it never reaches the outputs or the secret.
+          provider = claim.get("provider")
+          harness = claim.get("harness")
+          credential_format = claim.get("credential_format")
+          for field_name, field_value in (
+                  ("provider", provider),
+                  ("harness", harness),
+                  ("credential_format", credential_format)):
+              if not isinstance(field_value, str) or not field_value:
+                  raise SystemExit(f"allocator returned an empty or missing {field_name}")
           values = {
               "acquired": "true",
               "account": account,
               "claim_id": claim_id,
               "model": model,
-              "provider": claim.get("provider") or "",
-              "harness": claim.get("harness") or "",
-              "credential_format": claim.get("credential_format") or "",
+              "provider": provider,
+              "harness": harness,
+              "credential_format": credential_format,
               "secret_ref": secret_ref,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -515,14 +529,27 @@ jobs:
           if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(
                   r"[A-Z][A-Z0-9_]*", str(secret_ref)):
               raise SystemExit("dispatcher claim secret_ref is unsafe")
+          # Fail-closed on a malformed catalog entry (issue #142): mirror the self-claim path — a
+          # dispatcher-minted claim MUST declare every routing-relevant metadata field. An empty
+          # provider/harness/credential format would be skipped by the routing equality check below
+          # and route the account on undeclared metadata; reject before it reaches outputs/secret.
+          provider = claim.get("provider")
+          harness = claim.get("harness")
+          credential_format = claim.get("credential_format")
+          for field_name, field_value in (
+                  ("provider", provider),
+                  ("harness", harness),
+                  ("credential_format", credential_format)):
+              if not isinstance(field_value, str) or not field_value:
+                  raise SystemExit(f"dispatcher claim returned an empty or missing {field_name}")
           values = {
               "acquired": "true",
               "account": account,
               "claim_id": claim_id,
               "model": model,
-              "provider": claim.get("provider") or "",
-              "harness": claim.get("harness") or "",
-              "credential_format": claim.get("credential_format") or "",
+              "provider": provider,
+              "harness": harness,
+              "credential_format": credential_format,
               "secret_ref": secret_ref,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -754,14 +781,19 @@ jobs:
           }:
               raise SystemExit("claimed model has an unsupported credential format")
           if not dry:
+              # Strict routing equality (issue #142): require EXACT equality, not the old
+              # "compare only when the claimed value is non-empty" guard. The claim/adopt jobs now
+              # reject empty metadata, but the selected-model step is the last gate before a secret
+              # is exposed, so it enforces the same non-empty exact-match contract the dry-run branch
+              # applies below — an empty or drifted provider/harness/format fails closed here too.
               claimed_provider = os.environ["LIVE_PROVIDER"]
               claimed_harness = os.environ["LIVE_HARNESS"]
               claimed_format = os.environ["LIVE_CREDENTIAL_FORMAT"]
-              if claimed_provider and claimed_provider != values["provider"]:
+              if claimed_provider != values["provider"]:
                   raise SystemExit("claimed account provider conflicts with protected routing")
-              if claimed_harness and claimed_harness != values["harness"]:
+              if claimed_harness != values["harness"]:
                   raise SystemExit("claimed account harness conflicts with protected routing")
-              if claimed_format and claimed_format != values["credential_format"]:
+              if claimed_format != values["credential_format"]:
                   raise SystemExit("claimed account credential format conflicts with protected routing")
           elif any(values[key] != value for key, value in expected.items()):
               raise SystemExit("dry-run account metadata drifted from protected routing")
