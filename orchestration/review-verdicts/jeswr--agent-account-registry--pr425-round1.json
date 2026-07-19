@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 425,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "54363e6d40f667ffeaf7d955de5f860fc3b48e6b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_record_identity deliberately removes GITHUB_RUN_ATTEMPT, but that attempt changes not only when the failed recorder job alone is retried; it also changes when an operator re-runs all jobs or otherwise re-executes the model work under the same GITHUB_RUN_ID. If that fresh execution reaches the same provider/account/model/folded class, append_record treats it as the old outcome and returns without writing. A second real rate-limit or launch failure can therefore be omitted, weakening consecutive-failure backoff and outage/alert thresholds. The self-test covers only the recorder-only replay interpretation and has no assertion that a genuinely re-executed outcome under the same run ID remains countable.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Use an idempotency identifier that uniquely identifies the immutable produced outcome/recording event rather than collapsing every run attempt, or carry an explicit stable outcome ID that is reused only by recorder retries. Add a non-vacuous test representing a full workflow re-run with the same GITHUB_RUN_ID and a new execution, asserting that its outcome is appended, while a retry of only the recorder remains a no-op.",
+    "severity": "major",
+    "title": "Run-level deduplication drops genuine outcomes from full workflow re-runs"
+   }
+  ],
+  "progress": null,
+  "summary": "The jittered CAS retry is bounded and its tests exercise the retry timing and RNG bounds, but the new idempotency key conflates two materially different cases: retrying only the recorder and re-running the actual workflow work. GitHub preserves GITHUB_RUN_ID across both, so a genuine repeated failure can be discarded. Because the ledger drives account backoff and outage alert thresholds, this creates a fail-open undercount and is a major soundness issue.",
+  "verdict": "request_changes"
+ }
+}
