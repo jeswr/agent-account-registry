@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 457,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "60ef354cfdcf2b764c354c32b6d8c42486f97c0a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change closes the unbounded missed-fix path fail-closed: when the sole durable budget marker cannot be recorded, it attempts the existing human-stop transition immediately, retains the counted lane error, and keeps retrying if both mutations fail. The new self-tests are non-vacuous and cover successful escalation, failure of both target mutations, and the normal successful-marker path without spurious escalation. No trust check is weakened and no hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
