@@ -27,6 +27,15 @@
 # slot); if any listing fails, freeness cannot be proven and the run fails closed. The claim-ref namespace is the canonical allocation record every
 # automated account writer must claim in BEFORE writing; downstream steps consume the claimed slot
 # via steps.store.outputs, not the stale snapshot.
+#
+# CONFIDENTIAL-CHALLENGE fix (#181): the device code / sign-in URL is a REDEEMABLE authorization
+# challenge — on this PUBLIC repo, posting it in an issue comment (or a run log, or a job summary)
+# lets any observer redeem it FIRST and bind an attacker-controlled provider account, whose captured
+# credential this broker would then trust and store. So the challenge is NEVER surfaced in the clear:
+# the broker proves the requesting maintainer has an encryption-capable GitHub-published GPG key
+# BEFORE any login starts (fail closed, like the secrets preflight), then delivers the challenge
+# ENCRYPTED to that key — only the holder of the matching private key can recover the code, and the
+# plaintext challenge never leaves the runner.
 name: set-up-account
 on:
   issues:
@@ -159,17 +168,81 @@ jobs:
             npm i -g @anthropic-ai/claude-code@2.1.177
           fi
 
-      - name: Device login + post sign-in, capture token
-        id: login
+      # #181: the device code / sign-in URL is a REDEEMABLE authorization challenge — anyone who reads
+      # it before the maintainer does can complete the device flow against an attacker-controlled
+      # provider account, whose credential this broker would then capture, trust and store. On a PUBLIC
+      # repo an issue comment (and the run log, and the job summary) is world-readable, so the challenge
+      # must never appear there in the clear. Deliver it through a maintainer-only channel: encrypt it
+      # to the requesting maintainer's own GitHub-published GPG key (the requester is already trust-gated
+      # to admin/maintain above), so only the holder of the matching private key can read it. Prove a
+      # usable, encryption-capable key exists HERE, before any login starts (fail closed, mirroring the
+      # secrets preflight) — a login whose challenge we cannot deliver confidentially must never run.
+      - name: Preflight — requester has a confidential-delivery key, before any login
+        env:
+          REQUESTER: ${{ github.event.issue.user.login }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          mkdir -p "$LOGIN_DIR"; chmod 700 "$LOGIN_DIR"
+          keyfile="$LOGIN_DIR/recipient.asc"
+          # Fetch the requester's PUBLIC GPG keys (armored) via the API — never any private material.
+          # Zero keys, an API error, or an empty body all fail closed (no challenge is ever surfaced).
+          if ! gh api "users/$REQUESTER/gpg_keys" \
+                 --jq '.[].raw_key | select(. != null and . != "")' > "$keyfile" 2>/dev/null \
+             || ! [ -s "$keyfile" ]; then
+            gh issue comment "$ISSUE" -R "$REPO" \
+              --body "❌ Cannot deliver the sign-in challenge confidentially: \`@$REQUESTER\` has no public GPG key on GitHub. On a public repository the device code / sign-in URL is a redeemable authorization challenge and must never be posted in the clear (any observer could redeem it first and bind an attacker-controlled account), so no login was started. **Fix:** add a GPG key to your GitHub account (Settings → SSH and GPG keys), then re-apply the \`set-up-account\` label — the challenge will be encrypted to that key and you decrypt it locally with \`gpg -d\`." || true
+            echo "::error::requester has no GPG key — cannot deliver challenge confidentially, refusing (fail closed)"; exit 1
+          fi
+          # Import into an isolated, disposable keyring under LOGIN_DIR (shredded by the always() step).
+          export GNUPGHOME="$LOGIN_DIR/gnupg"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+          if ! gpg --batch --import "$keyfile" >/dev/null 2>&1; then
+            gh issue comment "$ISSUE" -R "$REPO" \
+              --body "❌ \`@$REQUESTER\`'s published GPG key could not be imported, so the sign-in challenge cannot be encrypted to it. No login was started (fail closed). **Fix:** ensure a valid GPG public key is on your GitHub account, then re-apply \`set-up-account\`." || true
+            echo "::error::requester GPG key failed to import — refusing (fail closed)"; exit 1
+          fi
+          # Prove at least one imported key can actually ENCRYPT (a sign-only / malformed key would
+          # otherwise fail only AFTER the login started and the challenge was already in hand). Persist
+          # the exact fingerprint that works so the login step encrypts to that same recipient.
+          for fpr in $(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10}'); do
+            if printf 'probe' | gpg --batch --yes --trust-model always -a -e -r "$fpr" >/dev/null 2>&1; then
+              printf '%s' "$fpr" > "$LOGIN_DIR/recipient.fpr"; break
+            fi
+          done
+          if ! [ -s "$LOGIN_DIR/recipient.fpr" ]; then
+            gh issue comment "$ISSUE" -R "$REPO" \
+              --body "❌ \`@$REQUESTER\`'s published GPG key cannot be used to encrypt (no encryption-capable key/subkey). The sign-in challenge cannot be delivered confidentially, so no login was started (fail closed). **Fix:** publish an encryption-capable GPG key on GitHub, then re-apply \`set-up-account\`." || true
+            echo "::error::no encryption-capable GPG key for requester — refusing (fail closed)"; exit 1
+          fi
+          echo "preflight: challenge will be delivered encrypted to @$REQUESTER's GPG key"
+
+      - name: Device login + deliver encrypted sign-in, capture token
+        id: login
+        env:
+          REQUESTER: ${{ github.event.issue.user.login }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$LOGIN_DIR/gnupg"   # the keyring the preflight imported the recipient into
           bash scripts/account-login.sh "${{ steps.meta.outputs.provider }}" "$LOGIN_DIR" 780 &
           BR=$!
           for _ in $(seq 1 40); do [ -s "$LOGIN_DIR/signin.txt" ] && break; sleep 2; done
           if [ -s "$LOGIN_DIR/signin.txt" ]; then
+            # #181: NEVER post the raw challenge — on a public repo it is world-readable and redeemable.
+            # Encrypt it to the requester's GPG key (proven present + encryption-capable by the preflight)
+            # and post only the ASCII-armored ciphertext. gpg reads the plaintext from a file and writes
+            # ciphertext to a file, so the challenge is never an argv, a pipe echoed to the log, or a summary.
+            recipient=$(cat "$LOGIN_DIR/recipient.fpr" 2>/dev/null || true)
+            if [ -z "$recipient" ]; then
+              echo "::error::no imported GPG recipient at login time — refusing to surface challenge (fail closed)"
+              kill "$BR" 2>/dev/null || true
+              echo "status=fail" >> "$GITHUB_OUTPUT"; exit 1
+            fi
+            gpg --batch --yes --trust-model always -a -e -r "$recipient" \
+              -o "$LOGIN_DIR/signin.asc" "$LOGIN_DIR/signin.txt"
             # shellcheck disable=SC2016  # single-quoted printf FORMAT (markdown backticks) is deliberate
             gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "$(printf '### Sign in to register this account\n\n```\n%s\n```\n\n_Only continue if you started this. The token is captured and stored as a secret; it is never printed._' "$(cat "$LOGIN_DIR/signin.txt")")"
+              --body "$(printf '### Sign in to register this account (challenge encrypted to @%s)\n\nThe device code / sign-in URL is a redeemable authorization challenge; on a public repo it is never posted in the clear (any observer could redeem it first and bind an attacker-controlled account). It is encrypted to your GitHub GPG key — save the block below to a file and run `gpg -d`, then complete the sign-in:\n\n```\n%s\n```\n\n_Only continue if you started this. The token is captured and stored as a secret; it is never printed._' "$REQUESTER" "$(cat "$LOGIN_DIR/signin.asc")")"
           fi
           if wait "$BR"; then echo "status=ok" >> "$GITHUB_OUTPUT"; else echo "status=fail" >> "$GITHUB_OUTPUT"; fi
 
