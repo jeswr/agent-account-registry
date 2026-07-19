@@ -1286,7 +1286,20 @@ def _issue_is_trusted(issue, trusted_bots):
     )
 
 
-def _linked_open_pr_issues(pages):
+def _linked_open_pr_issues(pages, repo):
+    """Issue numbers an OPEN pull request provably deduplicates, so dispatch skips relaunching a
+    worker for them. Fail-closed provenance (issue #110): a fork contributor's PR must NEVER
+    suppress an issue. Two admission paths, never "every open PR":
+      - a same-repository worker branch (`head.repo.full_name == repo` AND a
+        `sparq-agent/issue-N-*` head) is pipeline-owned provenance — only an actor with push
+        access to the target repo can create that branch ON the repo itself (a fork PR's head
+        lives on the fork, so its `head.repo` is the fork), so its worker-shaped branch ref AND
+        its closing keywords are admissible; and
+      - a trusted-collaborator PR (author_association OWNER/MEMBER/COLLABORATOR) — its body
+        closing keywords are admissible after that explicit author-association check, the same
+        gate `_issue_is_trusted` applies to issue authors.
+    Any OTHER open PR (a fork / CONTRIBUTOR / NONE author) contributes NOTHING: its branch text
+    and `Fixes #N` body are attacker-controlled and must not park an issue indefinitely."""
     if not isinstance(pages, list):
         raise DispatchError("target pull-request listing is malformed")
     linked = set()
@@ -1296,16 +1309,23 @@ def _linked_open_pr_issues(pages):
         for pull in page:
             if not isinstance(pull, dict):
                 raise DispatchError("target pull-request entry is malformed")
-            head = pull.get("head", {}).get("ref", "")
+            head = pull.get("head") or {}
+            ref = head.get("ref", "")
             body = pull.get("body") or ""
-            if not isinstance(head, str) or not isinstance(body, str):
+            if not isinstance(ref, str) or not isinstance(body, str):
                 raise DispatchError("target pull-request fields are malformed")
-            linked.update(int(number) for number in re.findall(
-                r"(?:^|/)issue-([1-9][0-9]*)-", head
-            ))
-            linked.update(int(number) for number in re.findall(
-                r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9][0-9]*)\b", body
-            ))
+            head_repo = (head.get("repo") or {}).get("full_name")
+            association = str(pull.get("author_association", "")).upper()
+            # A same-repo `sparq-agent/issue-N-*` head is App provenance; a fork head is not.
+            app_pr = head_repo == repo and HEAD_REF_RE.match(ref) is not None
+            if app_pr:
+                linked.update(int(number) for number in re.findall(
+                    r"(?:^|/)issue-([1-9][0-9]*)-", ref
+                ))
+            if app_pr or association in TRUSTED_ASSOCIATIONS:
+                linked.update(int(number) for number in re.findall(
+                    r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9][0-9]*)\b", body
+                ))
     return linked
 
 
@@ -2128,7 +2148,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         pull_pages = _gh_json([
             "api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100"
         ])
-        linked_open_prs = _linked_open_pr_issues(pull_pages)
+        linked_open_prs = _linked_open_pr_issues(pull_pages, repo)
         # [round-4 P1] PLAN->CLAIM busy-window revalidation: the PLAN partition's freeing
         # decisions are minutes stale by launch time. Re-prove every item's crate against
         # the LIVE pull listing just fetched (zero extra pulls-API cost), the live issue
@@ -2720,13 +2740,35 @@ def _self_test():
     assert BLOCKED_BY_RE.findall("Blocked-by: #7 and blocked-by:#8") == ["7", "8"]
     # A DRAFT worker PR must land in linked_open_prs (dedupes issue re-dispatch) while the SAME PR
     # is separately enumerated as a review_item — the two enumerations must not fight (the issue
-    # stays busy in status:in-progress-review while the PR cycles). Linking is head-ref/body based
-    # and draft-agnostic, so this is structural; asserted here against regression.
+    # stays busy in status:in-progress-review while the PR cycles). Linking is draft-agnostic, so
+    # this is structural; asserted here against regression.
+    linked_repo = "example/repo"
     linked = _linked_open_pr_issues([[
-        {"head": {"ref": "sparq-agent/issue-7-1-1"}, "body": "", "draft": True},
-        {"head": {"ref": "topic"}, "body": "Fixes #9"},
-    ]])
-    assert linked == {7, 9}
+        # (1) same-repo App worker branch: pipeline-owned provenance, ref AND body admissible
+        # even though its author association is NONE (the App's own dedup must not need it).
+        {"head": {"ref": "sparq-agent/issue-7-1-1", "repo": {"full_name": linked_repo}},
+         "author_association": "NONE", "body": "Fixes #8", "draft": True},
+        # (2) trusted collaborator PR (from a fork): body closing keyword admissible after the
+        # explicit author-association check; its non-worker branch text contributes nothing.
+        {"head": {"ref": "topic", "repo": {"full_name": "collab/fork"}},
+         "author_association": "MEMBER", "body": "Fixes #9"},
+    ]], linked_repo)
+    assert linked == {7, 8, 9}, linked
+    # issue #110: a FORK contributor's `Fixes #N` (and a worker-SHAPED head ref on the fork) must
+    # NOT suppress any issue — deleting the head-repo/author gates flips each of these red.
+    assert _linked_open_pr_issues([[
+        {"head": {"ref": "topic", "repo": {"full_name": "mallory/fork"}},
+         "author_association": "CONTRIBUTOR", "body": "Fixes #9 closes #10"},
+    ]], linked_repo) == set()
+    assert _linked_open_pr_issues([[
+        {"head": {"ref": "sparq-agent/issue-7-1-1", "repo": {"full_name": "mallory/fork"}},
+         "author_association": "NONE", "body": ""},
+    ]], linked_repo) == set()
+    # a same-repo branch that is NOT worker-shaped, from an untrusted author, links nothing
+    assert _linked_open_pr_issues([[
+        {"head": {"ref": "issue-7-oops", "repo": {"full_name": linked_repo}},
+         "author_association": "NONE", "body": "fixes #7"},
+    ]], linked_repo) == set()
     for mutate, name in (
             (lambda d: d["repositories"][0]["items"][0].update(unknown=True), "unknown item field"),
             (lambda d: d["repositories"][0]["items"][0].pop("deferred"), "missing deferred flag"),
