@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 376,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "754f45a8ce043659887c0450adee9390da28f5da",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Changing only the success `printf` does not protect the failure path. `gh secret set \"$secret_ref\" ...` is an external command whose stderr is inherited by the public workflow log. On an API/auth/validation failure, `gh` is free to echo the secret name from its argv in its diagnostic; that name reverses directly to the account handle. The new assertion uses an always-successful fake and therefore cannot detect this leak. This violates the change's own never-cross-public-logs invariant.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Capture/suppress `gh secret set` stdout and stderr, check its status explicitly, and emit only a fixed identifier-free failure diagnostic. Extend the self-test with a fake `gh` that fails while printing `ACCTEXAMPLE_TOKEN`/`acctexample` to stderr, then assert the public wrapper log contains neither identifier and that write-back fails without reporting `rotated=true`.",
+    "severity": "major",
+    "title": "Write-back failures can still expose the account-derived secret reference"
+   }
+  ],
+  "progress": null,
+  "summary": "The privacy change closes the explicit success-log leak and adds useful success-path assertions, but it does not fail closed on the credential write's error path. The external `gh secret set` process still receives the account-derived secret reference on argv and may include it in stderr when the API call fails; that stderr is currently emitted directly into the public Actions log. Because the stated invariant is that the raw/reversible account identifier must never cross a public log sink, this incomplete sink handling requires changes. Round 1 has no progress comparison.",
+  "verdict": "request_changes"
+ }
+}
