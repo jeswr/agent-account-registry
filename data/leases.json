@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "acct4css",
-   "claim_id": "f7b132ce113c4b0d8e301ff3012e4cc3",
-   "holder": "sparq-org/sparq#3328@29716919940.1",
-   "package": "sparq-zk-compose",
-   "role": "impl",
-   "model": "opus",
-   "issued_at": 1784521647,
-   "expires_at": 1784527947
-  }
- ]
+ "leases": []
 }
