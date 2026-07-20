@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3662,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dfabb2b9672aa1291eab6fb6f8f27eea0fc2f4e1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The remote invocation is `bash scripts/ci-bench.sh \"$SCALE\" /tmp/out.json >/dev/null 2>&1`, which discards stderr. When run-ec2.sh fails closed on a result-size drift it emits a precise diagnostic to stderr (`ERROR: sp2b scale=X query=Y rows=A expected=B`), and on timeout/gen failure likewise. Because both streams go to /dev/null and /tmp/out.json is only cat'd on the success path, the nightly will fail (correctly) but with no visible reason, undercutting the whole point of the self-asserting oracle. This is inherited from the pre-existing redirect (all suite output already goes to /dev/null), so it does not block, but the new fail-closed path's diagnostic value is lost.",
+    "file": "scripts/ec2-bench.sh",
+    "fix_hint": "Capture stderr to a file and echo it on failure, e.g. `bash scripts/ci-bench.sh \"$SCALE\" /tmp/out.json >/dev/null 2>/tmp/bench.err || { cat /tmp/bench.err >&2; exit 1; }`, or at least drop `2>&1` so the drift line reaches the ssh stderr the driver sees.",
+    "severity": "minor",
+    "title": "run-ec2.sh drift diagnostics are discarded (ci-bench invoked with >/dev/null 2>&1)"
+   },
+   {
+    "body": "gen.sh caches each corpus at /tmp/sp2b/sp2b-<triples>.ttl and never deletes it; run-ec2.sh iterates 5M, 25M, 100M so all three Turtle corpora (plus the 250k one and the built generator) coexist for the duration of the run. The 100M-triple Turtle file alone is on the order of ~10-20 GB, so the EC2/nightly instance must be provisioned for the sum of all scales or the 100M `$($GEN 100000000)` will fail (which does fail closed, but only after wasting the earlier scales' work). Operational sizing concern rather than a code bug.",
+    "file": "bench/sp2b/run-ec2.sh",
+    "fix_hint": "Consider removing the previous scale's cached corpus before generating the next (e.g. after each scale's queries complete, `rm -f \"$SP2B_CACHE/sp2b-<prev>.ttl\"`), or document the required free-disk headroom in bench/sp2b/README.md alongside the runner description.",
+    "severity": "minor",
+    "title": "Full-scale corpora accumulate on disk with no cleanup between scales"
+   },
+   {
+    "body": "The new SP2B_EC2_ENV assignment introduces a second, immediately-following `if [ -n \"$BENCH_FULL_SUITE\" ]; then ... else ... fi` identical in condition to the preceding SUITE_* block. Purely cosmetic; folding SP2B_EC2_ENV into the existing conditional would reduce duplication.",
+    "file": "scripts/ec2-bench.sh",
+    "fix_hint": "Move `SP2B_EC2_ENV='export SP2B_EC2=1'` / `SP2B_EC2_ENV='true'` into the existing SUITE_APT/SUITE_WASM/SUITE_REF if/else.",
+    "severity": "nit",
+    "title": "Duplicate `if [ -n \"$BENCH_FULL_SUITE\" ]` block"
+   }
+  ],
+  "progress": null,
+  "summary": "Adds an EC2/nightly-only SP2Bench heavy/full-scale runner (bench/sp2b/run-ec2.sh), its correctness oracle (expected-rows-ec2.tsv), and opt-in wiring into ci-bench.sh (SP2B_EC2=1) and ec2-bench.sh (BENCH_FULL_SUITE). The change is correct and complete. Fail-closed is sound end-to-end: run_query returns 1 on timeout/malformed-output/row-count drift, set -e propagates through run-ec2.sh -> ci-bench.sh (set -euo pipefail, line 26, aborts before emitting partial metrics) -> the remote 'set -e' heredoc -> ec2-bench.sh (set -euo pipefail). The TSV column contract matches the engine: run_query_suite prints name\\trows\\tus and name\\tERROR\\t<msg> (main.rs:1898-1900); the script reads $2=rows/$3=us and guards got==ERROR/empty. bench arg order (corpus turtle dir 1 count) matches cmd_bench (main.rs:1782-1790). Oracle values are validated against SP2Bench saturation behavior and the existing per-commit oracle: q05a=6933 == existing q05b=6933 (same query, two formulations); q08 358->493 and q10 452->656 are the known saturated (>=5M) cardinalities; ASK q12b=1/q12c=0 match the committed count-mode semantics. queries-heavy/ = exactly {q05a,q06,q12a}, matching the three 250000 rows, so no spurious expected=MISSING failure. The existing expected-rows.tsv header already promised these three heavy queries are checked in the EC2/nightly tier; this PR fulfills that. bash -n clean on all three scripts; BENCH_FULL_SUITE is safely defaulted under set -u. Remaining observations are minor/operational, not correctness blockers.",
+  "verdict": "approve"
+ }
+}
