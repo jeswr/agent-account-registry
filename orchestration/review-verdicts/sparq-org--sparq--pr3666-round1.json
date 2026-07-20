@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3666,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7329bac2a36a2db4a339ddbc69e77593a9a784d9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Documentation-only change adding an honest scoping note to bench/CATALOG.md clarifying that FedBench / LargeRDFBench federation suites are roadmap-only (require SPARQL SERVICE execution + a source-selection planner across 9+ endpoints), and that the existing federation-fedshop entry is a smaller local FedShop-shaped comparison that does not claim FedBench/LargeRDFBench coverage. Claims verified against the repo: federation-fedshop is a real registered suite (bench/benchmarks.toml:1806, bench/service-fed-loopback/README.md, bench/federation/) and is described as a local FedShop-shaped SERVICE comparison vs Comunica, consistent with the note. No hard-coded performance numbers, no ZK/MPC/privacy claims, no overclaim; the note correctly narrows scope rather than expanding it. Prose is well-formed and slots cleanly into the existing 'Notes on a few that need care' bullet list. No correctness, soundness, test-validity, or security concerns for a markdown-only diff.",
+  "verdict": "approve"
+ }
+}
