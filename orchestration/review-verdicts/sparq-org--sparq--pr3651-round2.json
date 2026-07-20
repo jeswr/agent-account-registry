@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3651,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "301a14ab5e7014f58917964798ed17da56ca4647",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. The test comment now limits its claim to the demonstrated Merkle root/path consistency property and explicitly states that the overall hidden-issuer ZK construction remains research-grade with external cryptographer audit pending sq-qhy4. The audit record is also synchronized to name key_set_root_sparse and document its dense-root equivalence. The regression test exercises the real KeySet::hidden_issuer_root path, compares sparse and dense roots at feasible depths, reconstructs every real member's deep sparse authentication path against the verifier-derived anchor, and retains the fail-closed depth check. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
