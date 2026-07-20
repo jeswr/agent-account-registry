@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3640,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "079c9ae85f7edbf26998888010037f0e30868a99",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The record says private inputs are shared t-of-n with t=floor((n-1)/2), and later defines F_share as distributing a t-of-n sharing. But the same document uses t as the maximum corrupt coalition / polynomial degree (any t shares reveal nothing, n=2t+1). Such a Shamir sharing reconstructs from t+1 shares, not t. This conflates the privacy threshold with the reconstruction threshold in the load-bearing per-stage ideal functionality and can invalidate subsequent threshold reasoning.",
+    "file": "research/mpc-composition-uc-posture.md",
+    "fix_hint": "Replace both t-of-n descriptions with unambiguous degree-t Shamir terminology, explicitly stating that any t shares reveal no information and t+1 valid shares reconstruct, with t=floor((n-1)/2). Check nearby uses of threshold open/reconstruct for the same convention.",
+    "severity": "major",
+    "title": "Shamir reconstruction threshold is misstated as t-of-n"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The UC/composition caveats remain appropriately conditional and preserve the external-audit and semi-honest limitations, but the new posture record materially misstates the Shamir access structure as t-of-n while simultaneously defining t as the corruption/privacy threshold. In the stated degree-t scheme, reconstruction requires t+1 shares. Because this error appears in the ideal functionality for the sharing stage of a security-model document, the change is not yet correct as scoped. Round 3 reported no findings, so this newly identified security-model error makes round 4 regressing.",
+  "verdict": "request_changes"
+ }
+}
