@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3662,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c446006e67293f658ceb35a9c21ec2f9c77f52dc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The remote invocation `bash scripts/ci-bench.sh \"$SCALE\" /tmp/out.json >/dev/null 2>&1` discards stderr. run-ec2.sh emits its precise fail-closed diagnostics to stderr (`ERROR: sp2b scale=X query=Y rows=A expected=B`, timeout, malformed-output) and those propagate up through ci-bench.sh's stderr, but ec2-bench.sh sends that stream to /dev/null. The nightly will still fail (correctly, via set -e) but with no visible reason, undercutting the self-asserting oracle. Pre-existing (all suite output was already redirected), so non-blocking, but the new fail-closed path's diagnostic value is lost on the EC2 path. Unchanged since round 1.",
+    "file": "scripts/ec2-bench.sh",
+    "fix_hint": "Capture stderr and echo it on failure, e.g. `... >/dev/null 2>/tmp/bench.err || { cat /tmp/bench.err >&2; exit 1; }`, or drop `2>&1` so the drift line reaches the ssh stderr the driver sees.",
+    "severity": "minor",
+    "title": "run-ec2.sh drift diagnostics are discarded (ci-bench invoked with >/dev/null 2>&1)"
+   },
+   {
+    "body": "gen.sh caches each corpus (e.g. /tmp/sp2b/sp2b-<triples>.ttl) and run-ec2.sh iterates 5M, 25M, 100M with no rm between scales, so all corpora (plus the 250k one) coexist. The 100M Turtle file alone is on the order of ~10-20 GB, so the nightly instance must be provisioned for the sum of all scales or the 100M `$($GEN 100000000)` fails (fail-closed, but only after wasting earlier scales). Operational sizing concern rather than a code bug. Unchanged since round 1.",
+    "file": "bench/sp2b/run-ec2.sh",
+    "fix_hint": "Remove the previous scale's cached corpus before generating the next (rm -f the prior `$SP2B_CACHE/sp2b-<prev>.ttl` after its queries complete), or document required free-disk headroom in bench/sp2b/README.md.",
+    "severity": "minor",
+    "title": "Full-scale corpora accumulate on disk with no cleanup between scales"
+   },
+   {
+    "body": "The new SP2B_EC2_ENV assignment adds a second `if [ -n \"$BENCH_FULL_SUITE\" ]; then ... else ... fi` identical in condition to the immediately-preceding SUITE_* block. Purely cosmetic; folding SP2B_EC2_ENV into the existing conditional would reduce duplication. Unchanged since round 1.",
+    "file": "scripts/ec2-bench.sh",
+    "fix_hint": "Move `SP2B_EC2_ENV='export SP2B_EC2=1'` / `SP2B_EC2_ENV='true'` into the existing SUITE_APT/SUITE_WASM/SUITE_REF if/else.",
+    "severity": "nit",
+    "title": "Duplicate `if [ -n \"$BENCH_FULL_SUITE\" ]` block"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round-2 change over round-1 is a single shellcheck fix in scripts/ci-bench.sh (rename unused `rows` -> `_rows`) that repairs the failing lint leg; the runner logic, oracle, and wiring are otherwise identical to round 1. Re-verified against the checkout: (1) every query the scale loop references exists \u2014 q01/q03c/q08/q09/q10/q11/q12b/q12c in queries/, q12a via the queries-heavy/ fallback, and the 250k heavy loop = {q05a,q06,q12a} matching the three 250000 oracle rows, so no spurious expected=MISSING. (2) The bench count-mode output contract holds: run_query_suite prints `name\\trows\\tbest_us` on success and `name\\tERROR\\t<e>` on failure (main.rs:1896-1897); run_query reads $2=rows/$3=us and returns 1 on got=ERROR/empty/drift, so set -euo pipefail propagates the failure through run-ec2.sh -> ci-bench.sh -> the remote heredoc -> ec2-bench.sh. Fail-closed is sound. (3) Oracle saturation values (q05a=6933, q08=493, q10=656, q12a=1, q12b=1, q12c=0) match the committed per-commit oracle and SP2Bench >=5M saturation; 100M omits the two expensive saturating queries (q08/q10) as a cost choice, not a correctness gap. Correct and complete. The three round-1 observations (drift diagnostics discarded on the EC2 path via ec2-bench.sh's `>/dev/null 2>&1`; full-scale corpora accumulating with no inter-scale cleanup; a duplicate BENCH_FULL_SUITE if-block) remain unaddressed but are all minor/nit operational/cosmetic items, not blockers.",
+  "verdict": "approve"
+ }
+}
