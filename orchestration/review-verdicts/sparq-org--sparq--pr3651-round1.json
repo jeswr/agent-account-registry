@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3651,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "da489437689372f2d024c170e4681fcb82e8da0f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added test commentary calls the path/root equality \"the soundness tie between a real member's proof and the RP's trust anchor\" without stating that the ZK construction remains research-grade and is not externally audited pending sq-qhy4. On this ZK surface, the repository's live claims gate treats an uncaveated soundness claim as dishonest even when the narrower Merkle equality tested here is correct. In addition, research/zk-membership-pok-reaudit.md section 2 still records KeySet::hidden_issuer_root as calling issuer::key_set_root, so the load-bearing audit trail is stale after this change.",
+    "file": "crates/sparq-zk-compose/src/verifier.rs",
+    "fix_hint": "Rephrase the comment as the narrower, demonstrated Merkle root/path consistency property, or add the required research-grade/not-externally-audited (sq-qhy4) caveat. Update the hidden-issuer root section of research/zk-membership-pok-reaudit.md in the same PR to name key_set_root_sparse and record that it is bit-identical to the dense construction.",
+    "severity": "major",
+    "title": "New hidden-issuer soundness wording is not caveated"
+   }
+  ],
+  "progress": null,
+  "summary": "The sparse-root substitution and its regression test appear value-preserving and exercise the real KeySet path, including a deep authentication-path refold. However, the new ZK-facing comments introduce an uncaveated soundness claim, which violates the repository's live privacy/soundness-claims rule while external review sq-qhy4 remains pending. The load-bearing audit record also still names the dense builder and should be kept synchronized with this trust-anchor implementation change.",
+  "verdict": "request_changes"
+ }
+}
