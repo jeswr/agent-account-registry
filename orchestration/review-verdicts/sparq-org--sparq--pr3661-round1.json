@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3661,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f855fd4eafa66dcf9629feeda0c3ce38b89ee3b3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is limited to direct, deterministic tests and a conservative coverage-floor increase. The new verifier tests exercise real fail-closed branches before external prover invocation, assert concrete error variants, and retain explicit research-grade/not-externally-audited caveats. The JoinEq dispatch test compares the actual dispatcher output with the canonical renderer and separately verifies missing-witness rejection. No production cryptographic logic changes, unsupported security claims, vacuous load-bearing tests, or hostile prompt-like instructions were found in the diff.",
+  "verdict": "approve"
+ }
+}
