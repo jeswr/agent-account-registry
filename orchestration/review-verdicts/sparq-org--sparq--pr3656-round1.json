@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3656,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2f8d290a085678600d99c551d87ea346a1a0858c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_bench_suite_needs_dashboard_follow_on iterates blocks in registry order and returns on the first block whose ref fields match `bench/<suite>/`. Other benchmark blocks can legitimately reference a suite's path in their `dataset`/`source` fields (e.g. bytes-per-triple and compressed-query-delta both reference bench/watdiv/gen.sh). If such an unrelated block precedes the suite's own registration block and carries a different `featured` disposition, the follow-on can be mis-dispositioned (spuriously suppressed or spuriously fired). For the current registry the suite-owned block happens to appear first in each case, so behavior is correct today, but the heuristic is order-dependent. Impact is low because this follow-on is an advisory, explicitly un-gateable reminder.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Prefer keying off the block that declares `id = \"<suite>\"` (or an `invoke`/`records_to` field pointing at bench/<suite>/), rather than the first block that mentions the path anywhere. Alternatively, scan all matching blocks and treat the suite as featured only if its own registration block omits `featured = false`.",
+    "severity": "minor",
+    "title": "featured disposition taken from the FIRST block referencing the suite path, not necessarily the suite's own registration block"
+   },
+   {
+    "body": "test_new_bench_suite_triggers_dashboard_row and the unfeatured-harness test depend on watdiv being registered-and-featured and pkg-dogfood/terse being registered-with-featured=false in bench/benchmarks.toml. This is deliberate (it makes the tests non-vacuous), but a future edit to those registry entries would break the tests for reasons unrelated to flow-on logic.",
+    "file": "scripts/tests/test_flow_on.py",
+    "fix_hint": "Optional: for the pure unit behavior, consider a hermetic fixture registry (temp file assigned to BENCH_REGISTRY) alongside the live-registry integration tests, so the unit-level assertions do not break when the real catalog changes.",
+    "severity": "nit",
+    "title": "New tests are coupled to live registry contents"
+   }
+  ],
+  "progress": null,
+  "summary": "Adds a registry gate to the flow-on 'new-bench-dashboard-row' rule: a new bench/<suite>/ directory only mints a dashboard follow-on when the suite is registered in bench/benchmarks.toml AND is not marked `featured = false`. This correctly suppresses spurious dashboard-card reminders for unregistered research harnesses and intentionally-unfeatured agent-token suites (pkg-dogfood, terse). Verified against the live registry: _bench_suite_needs_dashboard_follow_on resolves watdiv -> True (fires), pkg-dogfood/terse -> False (featured=false), token-research-spike -> False (unregistered). The suite name is re.escape-d before regex use. All 36 tests in scripts/tests/test_flow_on.py pass. The updated/added tests are non-vacuous: the watdiv 'fires' test is coupled to a real featured entry (would fail if the function always returned False), and the pkg-dogfood/terse suppression test genuinely exercises the featured=false path (would fail if suppression regressed). Leftover 'widgets' references in test_marker_round_trips and the hermetic-no-added-files test are intentionally harmless (neither reaches the registration path). No blocker/major issues; a couple of minor observations noted.",
+  "verdict": "approve"
+ }
+}
