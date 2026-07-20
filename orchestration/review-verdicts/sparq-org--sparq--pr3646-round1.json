@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3646,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8db883bb873d8fdfcff1034829834afe484830c3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "With the archive now configurable, bench_oracle still emits snikmeta_triples/snikmeta_terms/snikmeta_decode_s etc. (lines 94-119). For a LUBM(N) gather the envelope's 'snikmeta_triples' actually holds the LUBM triple count. The python crosscheck relies on this fixed key (hdt-same-box.sh:263 reads sparq_data.get('snikmeta_triples')), so it is functionally correct, but a reader of a committed canonical envelope sees a 'snikmeta_*' metric describing a non-snikmeta corpus. This is a naming/honesty-of-labeling nit, not a bug \u2014 the scale field already carries the real archive name.",
+    "file": "crates/sparq-hdt/examples/bench_oracle.rs",
+    "fix_hint": "Consider renaming the deterministic rows to an archive-neutral prefix (e.g. hdt_triples/hdt_terms/hdt_decode_s) and updating the two consumers (hdt-same-box.sh's sparq_data.get(...) key and ingest-canonical-competitors.mjs normalizeHdt's sm.snikmeta_decode_s fallback, which can keep snikmeta_decode_s as a legacy alias). Purely cosmetic; safe to defer to a follow-up bead if you prefer to keep this diff minimal.",
+    "severity": "minor",
+    "title": "Metric keys keep the 'snikmeta_' prefix for arbitrary archives, making LUBM envelopes self-mislabeling"
+   },
+   {
+    "body": "expected is now sparq_triples (line 273). If sparq itself errors (sparq_triples in {n/a, ERROR}) all_agree is forced False (lines 275-278), and when hdt-cpp produced valid output the status becomes 'count-mismatch' (line 361) and the scale string reads 'ERROR triples' (line 298). That attributes a sparq-side failure to an hdt-cpp count disagreement, which could mislead someone triaging an envelope. No fabricated number is published (timing is correctly withheld), so this is cosmetic.",
+    "file": "scripts/bench/hdt-same-box.sh",
+    "fix_hint": "Distinguish the sparq-failed case from a genuine engine-vs-engine mismatch: e.g. set statuses['hdt-cpp'] = 'count-mismatch' only when both counts are present and differ, else 'blocked-on-sparq' (or leave hdt-cpp 'ok' and mark sparq 'failed'). Optionally guard normalizeHdt's rows: cc.expected against non-numeric expected so it renders null rather than NaN when sparq errored.",
+    "severity": "minor",
+    "title": "hdt-cpp status is labeled 'count-mismatch' even when the mismatch is actually a sparq decode failure"
+   }
+  ],
+  "progress": null,
+  "summary": "Benchmark-harness change that lets the HDT decode gather run against a scale-representative LUBM archive instead of only the tiny 328-triple snikmeta fixture. Three coordinated edits: (1) bench_oracle.rs now resolves the archive from argv[1] or $HDT_ARCHIVE, defaulting to the vendored fixture \u2014 backward-compatible, and the deterministic count-gate keeps the fixture. (2) canonical-materialize-gather-instance.sh generates LUBM(N) via gen.sh (data+ontology, seed 0) and rdf2hdt in the same hdt-cpp image, then feeds the archive to hdt-same-box.sh; failure paths degrade to an honest WARN+skip. (3) hdt-same-box.sh stops pinning expected=328 and instead derives the oracle from sparq's decoded store.len(), gating hdt-cpp's decode_us emission and the 'ok' status on count agreement. Verified: the metric name emitted by bench_oracle stays 'snikmeta_triples' for any archive, so the python crosscheck key still matches; envelopes are discovered by directory scan + grouped by the 'suite' field (not filename), so the hdt-snikmeta-* -> hdt-<stem>-* rename is safe for ingest-canonical-competitors.mjs; gen.sh emits data path then ontology path on stdout (info to stderr), matching HDT_ARTS[0]/[1]; and decode_us can only be set when hdt-cpp.nt is populated, so the new all_agree gate never suppresses nor falsely publishes a number. This is strictly MORE honest (no fabricated/pinned count, timing withheld on count mismatch), respects the non-canonical/canonical timing discipline, and introduces no hard-coded perf numbers. No soundness or security concerns; docker rdf2hdt writes into an ephemeral /tmp dir on a self-terminating gather box. Only minor labeling nits remain.",
+  "verdict": "approve"
+ }
+}
