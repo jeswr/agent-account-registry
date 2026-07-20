@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3666,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "87b5e2418605784102b068deb51314aa4c3268f4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Documentation-only change to research/coverage-and-benchmark-plan.md (\u00a71.3, Well-known suites). It replaces the parenthetical 'FedBench/LargeRDFBench are federation, out of single-engine scope' aside with an explicit, honest scoping note: FedBench and LargeRDFBench remain roadmap-only until SPARQL SERVICE execution + source selection can support their multi-endpoint workloads reproducibly, and the existing federation-fedshop suite is a smaller, local FedShop-shaped comparison that does not claim coverage of either suite. Verified against the repo: federation-fedshop is a real registered suite (bench/benchmarks.toml, bench/federation/, bench/service-fed-loopback/README.md, bench/CATALOG.md), described consistently as a local FedShop-shaped SERVICE comparison. The inline [SONNET-4.6] attribution marker is an established repo convention (314 occurrences across 188 research/*.md files), not stray/injection text. The note narrows scope rather than overclaiming; no hard-coded performance numbers, no ZK/MPC/privacy claims, no correctness/soundness/test-validity/security surface for a markdown-only diff. Nothing instruction-like was embedded in the diff.",
+  "verdict": "approve"
+ }
+}
