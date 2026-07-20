@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3660,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "386735f232870bd82ef13b4e54a8ea42daa1b098",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new faiss entry sets \"dashboard_engine_id\": \"faiss\", but gather_ann_pareto.py emits engine keys 'faiss-flat-l2', 'faiss-ivfflat', 'faiss-ivfsq8' (and 'hnswlib') \u2014 never a bare 'faiss'. Since faiss is intentionally not dispatched by gather-competitors.sh and its results come only via the gather_ann_pareto.py comprehensive harness, any dashboard that keys a column off dashboard_engine_id may find no matching result rows. This is descriptive metadata that is not consumed by the code paths in this diff, so it is non-blocking, but worth reconciling if/when a faiss dashboard column is wired up.",
+    "file": "bench/competitors.json",
+    "fix_hint": "Either set dashboard_engine_id to the specific variant intended for the HNSW-comparable dashboard row (e.g. 'faiss-ivfflat'), or document that faiss produces multiple variant keys and no single dashboard column, mirroring the run_recipe note.",
+    "severity": "nit",
+    "title": "faiss dashboard_engine_id \"faiss\" does not match any engine key emitted by gather_ann_pareto.py"
+   }
+  ],
+  "progress": null,
+  "summary": "Registry/doc/script-metadata change (sq-5o5.4) that splits the aspirational multi-lib `ann-benchmarks` competitor entry into a focused `hnswlib` (kind vector-lib, actively gathered) and a new `faiss` (kind reference, inert in the generic dispatcher, gathered via gather_ann_pareto.py) entry, updates the README `--only` id, and fixes gather-competitors.sh to record the ACTUAL installed hnswlib distribution version (importlib.metadata) instead of the registry's version-agnostic placeholder. Correct and complete for its scope. Verified: competitors.json parses, no duplicate ids, ids {hnswlib,faiss} present and ann-benchmarks removed; the shared-adapter dispatch (gather-competitors.sh:658) selects only report-cli/js-lib/http-sparql/vector-lib/python-lib, so faiss (kind `reference`, an already-existing kind \u2014 4 in registry) is correctly NOT dispatched, matching its documented \"intentionally inert\" note; run_vector_lib_engine is therefore only ever invoked for hnswlib (the sole vector-lib entry) and the adapter is hardcoded `--hnswlib`, so unconditionally resolving the hnswlib version is sound; the resolution is guarded by the prior `import numpy, hnswlib` check and fails closed (`die`) if metadata is unresolvable rather than recording bad data. The faiss run_recipe accurately describes gather_ann_pareto.py (exists; argv[1]=dataset sift/glove, argv[2]=results.json; measures FAISS Flat + IVFFlat + IVFSq8 alongside hnswlib against shared corpus ground truth). Overclaiming role prose was trimmed and privacy/perf claims are unaffected (vector-kernel recall-QPS, no ZK/MPC surface). No vacuous tests introduced; no tests needed for this metadata scope.",
+  "verdict": "approve"
+ }
+}
