@@ -1169,7 +1169,11 @@ jobs:
   final_state:
     name: Converge final target issue state (no target code runs here)
     if: ${{ always() && !inputs.dry_run && needs.resolve.result == 'success' && needs.claim.result == 'success' }}
-    needs: [resolve, claim, worker]
+    # #500: do not put a no_change issue back in the deferred frontier until its typed health
+    # record is durably attempted. The next dispatcher tick reads that validated ledger record;
+    # without this edge it could race the recorder and launch the old route a third time.
+    # always() above still converges to ordinary deferred state when telemetry itself fails.
+    needs: [resolve, claim, worker, model_health]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
