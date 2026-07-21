@@ -3,12 +3,12 @@
   {
    "account": "acct01",
    "claim_id": "6e626228ef574e988eea4ae72ef3739d",
-   "holder": "sparq-org/sparq#55@dispatch-29843666200.1",
+   "holder": "sparq-org/sparq#55@29844522773.1",
    "package": "sparq-solid",
    "role": "impl",
    "model": "sol",
-   "issued_at": 1784648001,
-   "expires_at": 1784654301
+   "issued_at": 1784648028,
+   "expires_at": 1784654328
   },
   {
    "account": "acct01",
