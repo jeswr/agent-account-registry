@@ -170,6 +170,23 @@ def _fetch_check_runs(fetch, repo, sha, check_name=None):
     raise SnapshotItemError("check-runs-overflow")
 
 
+def resolve_mergeable_detail(fetch, detail_url):
+    """Read one PR detail, boundedly re-polling GitHub's asynchronous mergeability.
+
+    Kept here as the single implementation for every registry sweep that classifies a
+    conflicting PR.  GitHub commonly returns ``mergeable: null`` immediately after the
+    base advances; treating that first response as final makes exactly the DIRTY PRs the
+    sweeps are meant to repair disappear for a tick.
+    """
+    for attempt in range(MERGEABLE_POLL_ATTEMPTS):
+        detail = fetch(detail_url)
+        if not isinstance(detail, dict) or detail.get("mergeable") is not None:
+            return detail
+        if attempt + 1 < MERGEABLE_POLL_ATTEMPTS:
+            time.sleep(MERGEABLE_POLL_INTERVAL_SECONDS)
+    return detail
+
+
 def _pr_status_record(fetch, claim, repo, number):
     """One worker PR's CI/merge status: detail read (mergeable + auto_merge + fresh head)
     plus the gate-filtered check-run read; the unfiltered listing (advisory failing-leg
@@ -182,20 +199,12 @@ def _pr_status_record(fetch, claim, repo, number):
     what the #42 armed-SHA-mismatch disarm needs, and dropping them on check-run VOLUME
     would let an armed PR defeat its own safety net by churning past the ceiling."""
     detail_url = f"https://api.github.com/repos/{repo}/pulls/{number}"
-    for attempt in range(MERGEABLE_POLL_ATTEMPTS):
-        try:
-            detail = fetch(detail_url)
-        except FetchError as exc:
-            raise SnapshotItemError("pr-detail-read-failed") from exc
-        if not isinstance(detail, dict):
-            raise SnapshotItemError("pr-detail-malformed")
-        if detail.get("mergeable") is not None:
-            break
-        # Issue #464: REST computes mergeability asynchronously. A pipeline restart/base
-        # advance can make the first detail read null even for an old DIRTY PR; without a
-        # bounded re-poll it stays unknown for the sweep and never reaches needs-rebase.
-        if attempt + 1 < MERGEABLE_POLL_ATTEMPTS:
-            time.sleep(MERGEABLE_POLL_INTERVAL_SECONDS)
+    try:
+        detail = resolve_mergeable_detail(fetch, detail_url)
+    except FetchError as exc:
+        raise SnapshotItemError("pr-detail-read-failed") from exc
+    if not isinstance(detail, dict):
+        raise SnapshotItemError("pr-detail-malformed")
     sha = str((detail.get("head") or {}).get("sha", ""))
     record = {
         "head_sha": sha,
