@@ -75,13 +75,18 @@ POLICY_FIELDS = {
 # unrelated or compromised GitHub Apps. CLAIM unions this list with the RUNTIME-resolved worker App
 # bot login (dispatch-claim `bot_login`) so an empty/absent list still trusts our own App bot; it is
 # for ADDITIONAL known bots. Absent => empty (fail-closed: no bot is trusted by suffix).
+# allow_actions_bot_issues (registry issue #487): per-repo opt-in for ONLY the exact
+# `github-actions[bot]` issue-author login. It defaults false. Fork-PR workflows receive read-only
+# tokens and cannot create issues, so that login can author an issue in one of our own repositories
+# only through a workflow controlled by that repository; this does not broaden any other bot or
+# author class.
 # [FABLE-5] Observability-only sub-tables consumed by scripts/metrics.py (throughput alert
 # thresholds + the per-target readiness-engine selector). policy-resolve accepts-and-ignores them
 # so the dispatch/groom resolver never rejects a policy augmented for the metrics collector; the
 # collector does its own strict validation of their contents.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
                           "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
-                          "trusted_bots", "throughput", "readiness"}
+                          "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness"}
 
 
 class PolicyError(ValueError):
@@ -147,6 +152,9 @@ def _policy_row(target_repo, policy_doc):
             raise PolicyError(f"{field} for {target_repo!r} must be a positive integer")
     if "cross_provider_fallback" in row and not isinstance(row["cross_provider_fallback"], bool):
         raise PolicyError(f"cross_provider_fallback for {target_repo!r} must be boolean")
+    if ("allow_actions_bot_issues" in row
+            and not isinstance(row["allow_actions_bot_issues"], bool)):
+        raise PolicyError(f"allow_actions_bot_issues for {target_repo!r} must be boolean")
     if "security_paths" in row:
         paths = row["security_paths"]
         if (not isinstance(paths, list)
@@ -165,7 +173,12 @@ def _policy_row(target_repo, policy_doc):
                 f"trusted_bots for {target_repo!r} must be a list of non-empty login strings")
         if len(set(bots)) != len(bots):
             raise PolicyError(f"trusted_bots for {target_repo!r} contains duplicates")
-    return row
+    # Return the same validated policy shape every consumer sees. In particular, CLAIM reads this
+    # row directly before route resolution, so the security-sensitive #487 default must live in
+    # this shared loader rather than be independently guessed at each call site.
+    normalized = dict(row)
+    normalized.setdefault("allow_actions_bot_issues", False)
+    return normalized
 
 
 def _normalise_labels(role_or_labels):
@@ -303,6 +316,7 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "cross_provider_fallback": bool(policy.get("cross_provider_fallback", False)),
         "security_paths": list(policy.get("security_paths", [])),
         "trusted_bots": list(policy.get("trusted_bots", [])),
+        "allow_actions_bot_issues": policy["allow_actions_bot_issues"],
         "worker_timeout_minutes": policy["worker_timeout_minutes"],
         "max_attempts": policy["max_attempts"],
         "trust": policy["trust"],
@@ -460,6 +474,23 @@ agent = "docs-agent"
                              'trusted_bots=["dup[bot]", "dup[bot]"]\n')
     rejects("trusted_bots rejects duplicates", "trusted_bots",
             lambda: resolve("o/r", "impl", dup_bots, routing))
+    # Issue #487: the exact actions-bot exception is a validated, per-repo opt-in. Missing means
+    # false so a newly onboarded repository cannot inherit this author class accidentally.
+    check("allow_actions_bot_issues defaults false", impl["allow_actions_bot_issues"], False)
+    actions_opt_in = tomllib.loads(
+        '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+        'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+        'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+        'allow_actions_bot_issues=true\n')
+    check("allow_actions_bot_issues surfaced",
+          resolve("o/r", "impl", actions_opt_in, routing)["allow_actions_bot_issues"], True)
+    bad_actions_opt_in = tomllib.loads(
+        '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+        'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+        'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+        'allow_actions_bot_issues="yes"\n')
+    rejects("allow_actions_bot_issues requires a boolean", "allow_actions_bot_issues",
+            lambda: resolve("o/r", "impl", bad_actions_opt_in, routing))
     bad_rounds = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                                'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                                'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
