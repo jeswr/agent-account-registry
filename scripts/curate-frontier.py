@@ -78,6 +78,20 @@ _ACCEPTANCE_SECTION = re.compile(
     r"^#+\s*(?:acceptance|deliverable|spec)", re.IGNORECASE | re.MULTILINE
 )
 _DELIVERABLE_MARKER = re.compile(r"\*\*Deliverable:\*\*", re.IGNORECASE)
+_CONDITIONAL_EVIDENCE = re.compile(
+    r"\b(?:if\s+profiling|if\s+benchmarks\s+show|if\s+benchmarking\s+shows"
+    r"|measure\s+first)\b"
+    r"|\bif\s+[^\r\n]*?\bproves?\s+hot\b"
+    r"|\bshould\s+[^\r\n]*?\bprove\s+hot\b"
+    r"|\bonly\s+if\s+[^\r\n]*?\bshows\b",
+    re.IGNORECASE,
+)
+_STEERING_QUESTION = re.compile(
+    r"\bopen\s+question\s+for\s+steering\b"
+    r"|\bfor\s+the\s+maintainer\s+to\s+steer\b"
+    r"|^##[ \t]+open[ \t]+question[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 class CuratorError(RuntimeError):
@@ -174,6 +188,23 @@ def has_explicit_deliverable(issue: dict[str, Any]) -> bool:
     if not isinstance(body, str):
         raise CuratorError("issue body is malformed")
     return bool(_ACCEPTANCE_SECTION.search(body) or _DELIVERABLE_MARKER.search(body))
+
+
+def has_conditional_evidence(issue: dict[str, Any]) -> bool:
+    """Whether the body carries one of the narrow measurement-before-work signatures."""
+    body = issue.get("body") or ""
+    if not isinstance(body, str):
+        raise CuratorError("issue body is malformed")
+    return bool(_CONDITIONAL_EVIDENCE.search(body))
+
+
+def is_steering_question(issue: dict[str, Any]) -> bool:
+    """Whether the issue has an explicitly question-shaped title or steering body."""
+    title = issue.get("title")
+    body = issue.get("body") or ""
+    if not isinstance(title, str) or not isinstance(body, str):
+        raise CuratorError("issue title/body are malformed")
+    return title.endswith("?") or bool(_STEERING_QUESTION.search(body))
 
 
 def is_trust_surface(issue: dict[str, Any], labels: set[str]) -> bool:
@@ -312,7 +343,7 @@ def plan_repository(
     open_issues = sorted((issue for issue in issues if is_open_issue(issue)),
                          key=lambda issue: issue["number"])
     logs: list[str] = []
-    ec2_actions: list[Mutation] = []
+    gate_actions: list[Mutation] = []
     safe_candidates: dict[int, dict[str, Any]] = {}
 
     for issue in open_issues:
@@ -330,10 +361,36 @@ def plan_repository(
         if is_trust_surface(issue, labels):
             logs.append(f"skip #{number}: trust-surface content")
             continue
+        if has_conditional_evidence(issue):
+            needs_label = "needs:ec2" if "needs:ec2" in repo_labels else "needs:user"
+            desired = (needs_label, "status:blocked")
+            missing = sorted(set(desired) - repo_labels)
+            if missing:
+                raise CuratorError(
+                    "target repository is missing conditional-evidence labels: "
+                    + ", ".join(missing)
+                )
+            gate_actions.append(Mutation(
+                "conditional-evidence", number, issue, desired
+            ))
+            logs.append(
+                f"FENCE #{number}: CONDITIONAL-EVIDENCE -> {','.join(desired)}; never admit"
+            )
+            continue
+        if is_steering_question(issue):
+            if "needs:user" not in repo_labels:
+                raise CuratorError("target repository is missing required label needs:user")
+            gate_actions.append(Mutation(
+                "steering-question", number, issue, ("needs:user",)
+            ))
+            logs.append(
+                f"FENCE #{number}: QUESTION-SHAPED/steering -> needs:user; never admit"
+            )
+            continue
         if is_ec2_measurement(issue):
             if "needs:ec2" not in repo_labels:
                 raise CuratorError("target repository is missing required label needs:ec2")
-            ec2_actions.append(Mutation("needs-ec2", number, issue, ("needs:ec2",)))
+            gate_actions.append(Mutation("needs-ec2", number, issue, ("needs:ec2",)))
             logs.append(f"gate #{number}: EC2 measurement work -> needs:ec2")
             continue
         safe_candidates[number] = issue
@@ -466,7 +523,7 @@ def plan_repository(
             f"({busy_areas} areas busy)"
         )
 
-    return ec2_actions + close_actions + stage_actions, logs
+    return gate_actions + close_actions + stage_actions, logs
 
 
 def _flatten_pages(document: Any, kind: str) -> list[dict[str, Any]]:
@@ -674,7 +731,7 @@ def load_tokens() -> tuple[dict[str, str], str]:
 
 def _self_test() -> int:
     all_labels = {
-        "status:ready", "status:in-progress", "needs:ec2",
+        "status:ready", "status:in-progress", "status:blocked", "needs:ec2", "needs:user",
         "priority:P2", "priority:P3", "role:impl", "role:docs", "role:perf",
         "role:ci", "role:site", "role:research",
         "area:alpha", "area:beta", "area:gamma", "area:delta", "area:bench",
@@ -713,6 +770,131 @@ def _self_test() -> int:
     planned, _ = plan_repository(trust_work, all_labels, automation)
     checks.append(("zk/mpc keyword candidates are never staged",
                    not any(m.kind == "stage" for m in planned)))
+
+    # Admission fences run before ready-depth selection: the two lower-numbered misses are fenced,
+    # then the ordinary imperative candidate tops the frontier up. Removing either fence steals the
+    # sole ready slot from #52 and flips these checks red.
+    fence_fixture = [
+        issue(
+            50, "Implement alpha parser", ("area:alpha",),
+            body=long_body + "\nMeasure first before changing the parser.",
+        ),
+        issue(51, "Should we implement gamma parser?", ("area:gamma",)),
+        issue(52, "Implement beta parser", ("area:beta",)),
+    ]
+    planned, logs = plan_repository(
+        fence_fixture, all_labels, automation, target_ready=1
+    )
+    checks.append((
+        "measure-first body is loudly fenced as conditional evidence",
+        any(
+            m.kind == "conditional-evidence"
+            and m.number == 50
+            and m.labels == ("needs:ec2", "status:blocked")
+            for m in planned
+        )
+        and not any(m.kind == "stage" and m.number == 50 for m in planned)
+        and any("FENCE #50: CONDITIONAL-EVIDENCE" in line for line in logs),
+    ))
+    checks.append((
+        "terminal-question title is loudly fenced for user steering",
+        any(
+            m.kind == "steering-question"
+            and m.number == 51
+            and m.labels == ("needs:user",)
+            for m in planned
+        )
+        and not any(m.kind == "stage" and m.number == 51 for m in planned)
+        and any("FENCE #51: QUESTION-SHAPED/steering" in line for line in logs),
+    ))
+    checks.append((
+        "ordinary imperative fixture is not fenced and tops up ready depth",
+        any(m.kind == "stage" and m.number == 52 for m in planned)
+        and not any(
+            m.number == 52 and m.kind in {"conditional-evidence", "steering-question"}
+            for m in planned
+        ),
+    ))
+
+    conditional_bodies = (
+        "If profiling identifies a regression, implement the cache.",
+        "If benchmarks show a regression, implement the cache.",
+        "If benchmarking shows a regression, implement the cache.",
+        "Measure first, then implement the cache.",
+        "If the parser proves hot, implement the cache.",
+        "If the parser prove hot, implement the cache.",
+        "Should the parser prove hot, implement the cache.",
+        "Only if the trace shows a regression, implement the cache.",
+    )
+    checks.append((
+        "every conditional-evidence signature is recognized case-insensitively",
+        all(has_conditional_evidence(issue(53, "Implement cache", body=body.swapcase()))
+            for body in conditional_bodies),
+    ))
+    checks.append((
+        "conditional-evidence matching stays body-only and word-bounded",
+        not has_conditional_evidence(issue(54, "Measure first before implementing cache"))
+        and not has_conditional_evidence(issue(
+            55, "Implement cache", body=long_body + "\nMeasurement firstly guides the change."
+        )),
+    ))
+
+    steering_bodies = (
+        "This is an open question for steering before implementation.",
+        "This is for the maintainer to steer before implementation.",
+        "## Open question\nWhich implementation should be used?",
+    )
+    checks.append((
+        "every steering-body signature is recognized case-insensitively",
+        all(is_steering_question(issue(56, "Implement cache", body=body.swapcase()))
+            for body in steering_bodies),
+    ))
+    checks.append((
+        "an internal question mark and a level-three heading do not trip the fence",
+        not is_steering_question(issue(57, "Explain why? then implement the cache"))
+        and not is_steering_question(issue(
+            58, "Implement cache", body=long_body + "\n### Open question\nDocumented context."
+        )),
+    ))
+
+    fallback_labels = all_labels - {"needs:ec2"}
+    fallback_candidate = issue(
+        59, "Implement delta parser", ("area:delta",),
+        body=long_body + "\nIf profiling identifies a regression, implement the change.",
+    )
+    planned, _ = plan_repository([fallback_candidate], fallback_labels, automation)
+    checks.append((
+        "conditional evidence falls back to needs:user when needs:ec2 is unavailable",
+        any(
+            m.kind == "conditional-evidence"
+            and m.labels == ("needs:user", "status:blocked")
+            for m in planned
+        ),
+    ))
+
+    already_fenced = issue(
+        60, "Should we implement delta parser?", ("area:delta", "needs:user")
+    )
+    planned, _ = plan_repository([already_fenced], all_labels, automation)
+    label_calls: list[list[str]] = []
+    original_run = subprocess.run
+
+    def capture_label_calls(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if command[1:3] == ["issue", "edit"]:
+            label_calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(already_fenced), stderr=""
+        )
+
+    try:
+        subprocess.run = capture_label_calls
+        execute_plan("o/r", planned, "self-test-token", True)
+    finally:
+        subprocess.run = original_run
+    checks.append((
+        "already-fenced fixture produces zero label calls",
+        not planned and not label_calls,
+    ))
 
     # Every open-ended operative word independently forces impl/ci work into research unless the
     # body owns an explicit acceptance shape. Keeping the fixtures separate makes deleting any one
