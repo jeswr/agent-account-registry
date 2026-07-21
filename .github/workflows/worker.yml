@@ -4,7 +4,11 @@
 # identity in the registry (orchestration/provenance/) and stops; its lease releases immediately,
 # and the dispatch sweep drives the review-fix loop that alone may arm the PR.
 name: worker
-run-name: worker claim=${{ inputs.claim_id || 'self' }}
+# The target_repo is embedded in the run-name so the throughput-metrics collector (scripts/
+# metrics.py) can attribute a registry-hosted worker run to its TARGET — sparq's worker/review
+# orchestration runs here in the registry, not in a sparq-hosted workflow, so per-target health
+# must be filtered off these run names. Mirrors review-fix.yml's run-name convention.
+run-name: worker ${{ inputs.target_repo }} claim=${{ inputs.claim_id || 'self' }}
 
 on:
   workflow_dispatch:

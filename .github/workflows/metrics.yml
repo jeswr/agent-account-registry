@@ -1,0 +1,116 @@
+# [FABLE-5] Throughput observability + backlog-vs-drain alerting for EVERY maintained target
+# (policy/repos.toml [repos.*]: sparq-org/sparq + jeswr/agent-account-registry itself). Runs
+# scripts/metrics.py on a cron: collects the maintainer's 6 asks per target (issues open / ready to
+# drain / drained-last-hour, PRs open, PR open-rate, PR close-rate) plus derived net_pr_flow +
+# review-lane health, APPENDS the snapshot to a bounded ring on the `ledger` data-plane branch
+# (LEDGER_REF, data/metrics-history.json) so rates over time are real, evaluates the SUSTAINED
+# backlog-growth-vs-drain alert rules, and upserts ONE deduped `throughput-alert` issue per
+# (target, classification). CAS-publishes the current snapshot to ledger:`data/metrics.json`; the
+# dashboard build copies it to `site/metrics.json` in its sole Pages artifact. The offset avoids
+# same-minute ledger CAS contention with dashboard.yml (*/15) and groom.yml (7-59/15).
+name: metrics
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '11-59/15 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: registry-metrics
+  cancel-in-progress: false
+
+jobs:
+  metrics:
+    name: Collect throughput metrics + evaluate backlog-vs-drain alerts
+    runs-on: ubuntu-latest
+    environment: dispatch-secrets  # post-#101: App secrets live ONLY in this environment
+    timeout-minutes: 15
+    permissions:
+      actions: read       # read review-fix / worker run outcomes (review-lane + worker health)
+      contents: write     # CAS-append data/metrics-history.json on the `ledger` branch
+      issues: write       # upsert/close the deduped throughput-alert issue(s)
+      pull-requests: read # authoritative PR lists + immutable-window event searches
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Least-privilege cross-owner READ tokens: metrics list/search + actions reads for the sparq
+      # target run on an App token scoped to sparq-org/sparq (issues/PRs/actions READ only), and the
+      # jeswr-owned registry reads on a jeswr-scoped App token. Both mints are best-effort
+      # (continue-on-error): a missing owner token means that target is SKIPPED this tick (never
+      # counted as a silent zero), not the whole run failing. The registry's own `github.token`
+      # (contents:write, issues:write) does the ledger append + alert upsert.
+      - name: Mint sparq-org read token (issues/PRs/actions read)
+        id: token-sparq
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: sparq-org
+          repositories: sparq
+          permission-issues: read
+          permission-pull-requests: read
+          permission-actions: read
+
+      - name: Mint jeswr read token (issues/PRs/actions read)
+        id: token-jeswr
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: agent-account-registry
+          permission-issues: read
+          permission-pull-requests: read
+          permission-actions: read
+
+      - name: Assemble the per-owner read-token map
+        id: token-map
+        env:
+          SPARQ_TOKEN: ${{ steps.token-sparq.outputs.token }}
+          JESWR_TOKEN: ${{ steps.token-jeswr.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ -z "${SPARQ_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$SPARQ_TOKEN"
+          [[ -z "${JESWR_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$JESWR_TOKEN"
+          python3 - <<'PY'
+          import json
+          import os
+
+          tokens = {}
+          if os.environ.get("SPARQ_TOKEN"):
+              tokens["sparq-org"] = os.environ["SPARQ_TOKEN"]
+          if os.environ.get("JESWR_TOKEN"):
+              tokens["jeswr"] = os.environ["JESWR_TOKEN"]
+          # Compact single-line JSON — GITHUB_OUTPUT is line-based; the tokens are masked above.
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"tokens={json.dumps(tokens, separators=(',', ':'))}\n")
+          PY
+
+      - name: Collect metrics, append the ledger time-series, evaluate + upsert alerts
+        env:
+          # Registry token: ledger append (contents:write) + alert-issue upsert (issues:write).
+          REGISTRY_GH_TOKEN: ${{ github.token }}
+          # Per-owner READ tokens for cross-target list/window-search/actions reads (masked above).
+          TARGET_TOKENS: ${{ steps.token-map.outputs.tokens }}
+          REGISTRY_REPO: ${{ github.repository }}
+          MAINTAINER_HANDLE: jeswr
+        run: |
+          set -uo pipefail
+          printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
+          # Self-test the PURE core (metric computation, rate derivation, every alert rule, dedupe,
+          # ledger CAS) before any live call — a broken collector must fail here, not mis-alert.
+          python3 scripts/metrics.py --self-test
+          # The ring append, dashboard-snapshot CAS, and alert upsert target the LIVE ledger branch
+          # and issue tracker; a missing ledger branch fails LOUD (issue #28).
+          python3 scripts/metrics.py \
+            --policy-file policy/repos.toml \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --alert \
+            --publish

@@ -75,9 +75,13 @@ POLICY_FIELDS = {
 # unrelated or compromised GitHub Apps. CLAIM unions this list with the RUNTIME-resolved worker App
 # bot login (dispatch-claim `bot_login`) so an empty/absent list still trusts our own App bot; it is
 # for ADDITIONAL known bots. Absent => empty (fail-closed: no bot is trusted by suffix).
+# [FABLE-5] Observability-only sub-tables consumed by scripts/metrics.py (throughput alert
+# thresholds + the per-target readiness-engine selector). policy-resolve accepts-and-ignores them
+# so the dispatch/groom resolver never rejects a policy augmented for the metrics collector; the
+# collector does its own strict validation of their contents.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
                           "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
-                          "trusted_bots"}
+                          "trusted_bots", "throughput", "readiness"}
 
 
 class PolicyError(ValueError):
