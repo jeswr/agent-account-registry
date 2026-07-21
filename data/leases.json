@@ -11,16 +11,6 @@
    "expires_at": 1784658793
   },
   {
-   "account": "acct01",
-   "claim_id": "26ca167a90394907a0a687c8e32a9bfc",
-   "holder": "fix:sparq-org/sparq#3679@dispatch-29848858193.1",
-   "package": "sparq-substrate",
-   "role": "fix",
-   "model": "sol",
-   "issued_at": 1784652485,
-   "expires_at": 1784658785
-  },
-  {
    "account": "acct07",
    "claim_id": "a0bcaa6bb3084dbbb6602ccc9fe83d45",
    "holder": "review:sparq-org/sparq#3680@dispatch-29848858193.1",
