@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3670,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "34ecc5e20ab8a69bcde2abb5ccdfe23fbf7c9a32",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round-3 diff is the clean dedup: isNumericLiteral is extracted to site/src/lib/numeric-literal.ts and both renderers import it, with the orphaned imports already removed. Verified end-to-end: (1) `import { XSD } from './curie'` resolves to XSD = 'http://www.w3.org/2001/XMLSchema#' (curie.ts:10), identical to the old local const, so datatype-URI construction is unchanged; (2) SparqlTerm type is re-exported from @/lib/sparq-wasm (line 43); (3) the 13-entry NUMERIC_XSD set is the superset \u2014 repl's set unchanged, hero's widened 9->13 (byte/unsignedInt/unsignedLong/etc.), all numeric and still gated by Number.isFinite, non-regressing; (4) signature SparqlTerm | undefined with the `term?.type` optional-chaining guard is correct for both callers (hero passes a defined t after a !t continue; repl passes possibly-undefined term) and the &&-chain returns a proper boolean; (5) no orphaned imports \u2014 hero-runner references none of SparqlTerm/XSD/NUMERIC_XSD/isNumericTerm, while repl-result-cells still uses SparqlTerm (line 30), XSD (line 54), and isNumericLiteral (lines 49, 97). The new test is non-vacuous: it exercises accept cases (integer/decimal/double/byte/unsignedLong) and reject cases (undefined, uri, literal with no datatype, xsd:string, and xsd:double 'NaN'); importing a .ts module from a .test.mjs is an established pattern (22 other site tests do the same). Change is correct and complete.",
+  "verdict": "approve"
+ }
+}
