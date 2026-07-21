@@ -12,16 +12,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "c2456bc428a54ebead6528fcac117c84",
-   "holder": "fix:sparq-org/sparq#3669@dispatch-29836326681.1",
-   "package": "sparq-sim",
-   "role": "fix",
-   "model": "sol",
-   "issued_at": 1784642848,
-   "expires_at": 1784649148
-  },
-  {
-   "account": "acct01",
    "claim_id": "8fdf7d708bb544b3a26660f5dd5383dc",
    "holder": "fix:sparq-org/sparq#3671@dispatch-29836326681.1",
    "package": "bench",
