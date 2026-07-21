@@ -1,3 +1,14 @@
 {
- "leases": []
+ "leases": [
+  {
+   "account": "acct01",
+   "claim_id": "85a8fa2c88864a8087392d3a15cd5718",
+   "holder": "sparq-org/sparq#3557@dispatch-29871888409.1",
+   "package": "site",
+   "role": "site",
+   "model": "sol",
+   "issued_at": 1784671851,
+   "expires_at": 1784678151
+  }
+ ]
 }
