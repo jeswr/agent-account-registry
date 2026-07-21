@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3669,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c7a47fc2e23f5461384f270c1fdfb39a10c3573e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Correct and complete integer-overflow fix in sparq-sim. The two non-sketch candidate-budget computations `(4 * k).max(64)` are replaced with `k.saturating_mul(4).max(64)` at lib.rs:392 (primary rescore budget `m`) and lib.rs:448 (profile-fallback `budget`). Previously, a caller passing a very large `k` (e.g. `usize::MAX`) would overflow `4 * k` \u2014 a panic in debug builds and a wrap to a near-zero/large value in release. Saturating multiplication yields `usize::MAX`, and downstream `.max(64)`, `Vec::truncate`, and the `acc.len() >= budget` guard all behave correctly at that value (truncate/keep-all semantics). The fix is consistent with the pre-existing sketch path at lib.rs:903, which already used `k.saturating_mul(4).max(64)`. The added test `huge_k_does_not_overflow_non_sketch_candidate_budgets` is non-vacuous: with graph `:a :plays :chess . :b :plays :tennis .`, primary (predicate,neighbor) generation starves (only `a` shares `(plays, chess)`, which is excluded), so the profile-fallback path fires; `b` shares the `(OUT, plays)` role and profile weighted-Jaccard = 1.0, giving the asserted `vec![(iri(\"b\"), 1.0)]`. The test exercises both fixed sites (rescore budget then fallback budget) and would panic under the old code in debug, so it genuinely guards the regression. No overclaim, no soundness or security concern, no honesty issue. Approve.",
+  "verdict": "approve"
+ }
+}
