@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,51 @@ DEFAULT_REBASE_CAP = 5
 
 class ResolverError(RuntimeError):
     """A credential-free operational failure suitable for an Actions log."""
+
+
+def _cleanup_tempdir(path):
+    """Best-effort removal for runner-local clones; cleanup cannot change the outcome."""
+    path = Path(path)
+    cleanup_error = None
+
+    def retry_remove(function, failed_path, exc):
+        nonlocal cleanup_error
+        cleanup_error = exc
+        try:
+            if not os.path.islink(failed_path):
+                os.chmod(failed_path, 0o700)
+            function(failed_path)
+        except FileNotFoundError:
+            pass
+        except Exception as retry_exc:
+            cleanup_error = retry_exc
+
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=retry_remove)
+        else:
+            shutil.rmtree(
+                path,
+                onerror=lambda function, failed_path, exc_info: retry_remove(
+                    function, failed_path, exc_info[1]
+                ),
+            )
+    except Exception as exc:
+        cleanup_error = exc
+
+    if path.exists():
+        time.sleep(0.1)
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception as exc:
+            cleanup_error = exc
+    if path.exists():
+        detail = str(cleanup_error) if cleanup_error else "directory still exists after retries"
+        print(
+            f"::warning::conflict-resolver cleanup left temporary directory debris "
+            f"at {path}: {detail}",
+            file=sys.stderr,
+        )
 
 
 def _load_helper(name, filename):
@@ -344,7 +390,8 @@ class MechanicalRebaser:
             raise ResolverError(f"unsafe head SHA on {repo}#{pr.get('number')}")
         self.workspace.mkdir(parents=True, exist_ok=True)
         env = self._safe_git_env()
-        with tempfile.TemporaryDirectory(prefix="conflict-resolver-", dir=self.workspace) as tmp:
+        tmp = tempfile.mkdtemp(prefix="conflict-resolver-", dir=self.workspace)
+        try:
             checkout = Path(tmp, "target")
             self._git(
                 tmp,
@@ -429,6 +476,8 @@ class MechanicalRebaser:
                     push_env,
                 )
             return RebaseResult("clean", old_head, new_head)
+        finally:
+            _cleanup_tempdir(tmp)
 
 
 class ConflictResolver:
@@ -874,6 +923,144 @@ def _self_test():
     check("clean two-repository scan reaches both repositories", api.scanned, [repo_a, repo_b])
     check("clean two-repository scan exits zero", clean_rc, 0)
     check("clean two-repository scan emits no error annotation", stderr.getvalue(), "")
+
+    # (h) An ENOTEMPTY raised only by teardown cannot replace a completed rebase+push result.
+    # The real rebaser is used with Git stubbed so this pins the cleanup/work accounting boundary.
+    def mechanical_git(old_head, new_head, fail_rebase=False):
+        calls = []
+
+        def run(_cwd, args, _env, check=True):
+            calls.append(tuple(args))
+            stdout = b""
+            stderr = b""
+            returncode = 0
+            if args[0] == "rev-parse":
+                stdout = (new_head if args[1] == "HEAD" else old_head).encode("ascii") + b"\n"
+            elif args[:2] == ["rebase", "origin/main"] and fail_rebase:
+                returncode = 1
+                stderr = b"fatal: simulated rebase failure\n"
+            return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+        return run, calls
+
+    cleanup_api = FakeAPI([pull(70, "7" * 40)])
+    cleanup_workspace = Path(tempfile.mkdtemp(prefix="conflict-resolver-self-test-"))
+    cleanup_rebaser = MechanicalRebaser(
+        cleanup_api, cleanup_workspace, bot_login, "123", True
+    )
+    fake_git, git_calls = mechanical_git("7" * 40, "8" * 40)
+    real_rmtree = shutil.rmtree
+    cleanup_calls = []
+
+    def errno39_once(path, *args, **kwargs):
+        cleanup_calls.append((os.fspath(path), kwargs.get("ignore_errors", False)))
+        if len(cleanup_calls) == 1:
+            raise OSError(39, "Directory not empty", os.fspath(path))
+        return real_rmtree(path, *args, **kwargs)
+
+    cleanup_resolver = ConflictResolver(
+        cleanup_api, snapshot, claim, [repo], bot_login, True, 5, cleanup_rebaser
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+    with (
+        patch.object(cleanup_rebaser, "_git", side_effect=fake_git),
+        patch.object(shutil, "rmtree", side_effect=errno39_once),
+        patch.object(time, "sleep"),
+        redirect_stdout(stdout),
+        redirect_stderr(stderr),
+    ):
+        cleanup_rc = cleanup_resolver.run()
+    real_rmtree(cleanup_workspace, ignore_errors=True)
+    check(
+        "cleanup ENOTEMPTY after push preserves the successful rebase outcome",
+        (
+            cleanup_rc,
+            cleanup_resolver.rebases,
+            cleanup_resolver.budget_used,
+            len(cleanup_resolver.errors),
+            [action[0] for action in cleanup_resolver.actions],
+            any(call and call[0] == "push" for call in git_calls),
+        ),
+        (0, 1, 1, 0, ["mechanical-rebase"], True),
+    )
+    check("cleanup ENOTEMPTY uses the delayed final pass", len(cleanup_calls), 2)
+    check("recovered cleanup emits no error annotation", "::error::" in stderr.getvalue(), False)
+
+    # (i) The exception boundary remains narrow: a failure from the rebase itself is loud,
+    # counted, and fatal even though teardown is best-effort.
+    failure_api = FakeAPI([pull(71, "9" * 40)])
+    failure_workspace = Path(tempfile.mkdtemp(prefix="conflict-resolver-self-test-"))
+    failure_rebaser = MechanicalRebaser(
+        failure_api, failure_workspace, bot_login, "123", True
+    )
+    fake_git, git_calls = mechanical_git("9" * 40, "a" * 40, fail_rebase=True)
+    failure_resolver = ConflictResolver(
+        failure_api, snapshot, claim, [repo], bot_login, True, 5, failure_rebaser
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+    with (
+        patch.object(failure_rebaser, "_git", side_effect=fake_git),
+        redirect_stdout(stdout),
+        redirect_stderr(stderr),
+    ):
+        failure_rc = failure_resolver.run()
+    real_rmtree(failure_workspace, ignore_errors=True)
+    check(
+        "rebase-phase failure remains counted, loud, and fatal",
+        (
+            failure_rc,
+            len(failure_resolver.errors),
+            "::error::conflict-resolver example/repo#71: rebase failed" in stderr.getvalue(),
+            any(call and call[0] == "push" for call in git_calls),
+        ),
+        (1, 1, True, False),
+    )
+
+    # (j) Persistent debris exercises the callback's chmod+single retry, delayed final pass,
+    # and operator-visible warning. Removing any part makes this assertion fail.
+    debris_workspace = Path(tempfile.mkdtemp(prefix="conflict-resolver-self-test-"))
+    debris = debris_workspace / "debris"
+    debris.mkdir()
+    cleanup_steps = []
+
+    def leave_debris(path, *args, **kwargs):
+        if kwargs.get("ignore_errors"):
+            cleanup_steps.append("final-pass")
+            return
+        cleanup_steps.append("callback")
+
+        def still_busy(_failed_path):
+            cleanup_steps.append("retry")
+            raise OSError(39, "Directory not empty", os.fspath(path))
+
+        exc = OSError(39, "Directory not empty", os.fspath(path))
+        if kwargs.get("onexc"):
+            kwargs["onexc"](still_busy, os.fspath(path), exc)
+        else:
+            kwargs["onerror"](still_busy, os.fspath(path), (OSError, exc, None))
+
+    stderr = StringIO()
+    with (
+        patch.object(shutil, "rmtree", side_effect=leave_debris),
+        patch.object(os, "chmod") as chmod,
+        patch.object(time, "sleep") as cleanup_sleep,
+        redirect_stderr(stderr),
+    ):
+        _cleanup_tempdir(debris)
+    debris_warning = stderr.getvalue()
+    real_rmtree(debris_workspace, ignore_errors=True)
+    check(
+        "persistent cleanup debris retries once then emits a warning",
+        (
+            cleanup_steps,
+            chmod.call_count,
+            cleanup_sleep.call_args_list,
+            "::warning::conflict-resolver cleanup left temporary directory debris" in debris_warning,
+        ),
+        (["callback", "retry", "final-pass"], 1, [((0.1,), {})], True),
+    )
 
     # Syntax-only validators are direct and non-executing.
     validate_syntax_blob("ok.py", b"value = 1\n")
