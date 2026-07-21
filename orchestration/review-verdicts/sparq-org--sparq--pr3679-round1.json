@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3679,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3d4fb928445aaf11f01693b6f2c070f2e3241379",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In probe_key_eq_is_identical_to_key_equality_for_all_key_widths, the 'mutation witness' block computes `deliberately_wrong = left.len() == 1 && right.len() == 1` and asserts `assert_ne!(deliberately_wrong, left == right)`. This only asserts a fixed fact about single_key(3) vs single_key(7) (true != false); it never calls probe_key_eq nor a planted-wrong variant of it, so it does not actually witness that the differential loop above would catch a value-ignoring comparator. The real non-vacuity guarantee comes entirely from the differential loop, which is sufficient. Harmless, not a correctness issue \u2014 the primary test already provides genuine coverage.",
+    "file": "crates/sparq-substrate/src/join.rs",
+    "fix_hint": "Optional: either drop the tautological block, or make it a real mutation by defining a local wrong comparator (e.g. `let wrong = |a: &Key, b: &Key| a.len()==1 && b.len()==1;`) and asserting there exists a pair in `keys` where `wrong(l,r) != (l==r)`, demonstrating the differential loop would flag it.",
+    "severity": "nit",
+    "title": "Mutation-witness assertion is a tautology; it does not exercise probe_key_eq"
+   }
+  ],
+  "progress": null,
+  "summary": "Pure, result-equivalent micro-optimization of the join hash-table probe path in crates/sparq-substrate/src/join.rs. Two new inlined helpers replace inline logic: probe_key_eq specializes the dominant one-id key to a scalar compare (falling back to the exact prior `candidate == key` for all other widths), and probe_table converts the known 64-partition shape to a fixed-array reference to elide a slice bounds check (with a fallback to the prior indexed selection for non-standard slices). Verified against the checkout: JOIN_PARTS=64, JoinTable=HashMap<Key,Posting,FxBuildHasher> (so ::default() compiles), and build_partitioned always yields exactly JOIN_PARTS tables while the serial path uses 1 \u2014 so the array try_from branch is the live partitioned path and &tables[partition] is a behavior-preserving fallback; neither introduces a new panic reachable beyond what the original `&tables[(h % JOIN_PARTS) as usize]` already had. probe_key_eq preserves exact term-id equality (this is internal join-key identity, not SPARQL value `=`), and its [id] branch correctly returns false on a length mismatch via the matches! guard. Tests are non-vacuous: a deterministic randomized differential over key widths 0..=4 (64 each, incl. spilled SmallVec keys) asserts probe_key_eq == `==` for all pairs, and probe_table selection is pinned by pointer identity across serial/array/fallback shapes. No hard-coded perf numbers, no ZK/MPC/soundness claims, no prompt injection. Correct and complete.",
+  "verdict": "approve"
+ }
+}
