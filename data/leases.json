@@ -12,16 +12,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "0092868b6bc44e59bccb47dbcaabc3b7",
-   "holder": "sparq-org/sparq#3455@29852068342.1",
-   "package": "sparq-canon",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784654069,
-   "expires_at": 1784660369
-  },
-  {
-   "account": "acct01",
    "claim_id": "c1b61c3b7417476f81b183821e4dc773",
    "holder": "sparq-org/sparq#3517@29852075704.1",
    "package": "sparq-hdt",
