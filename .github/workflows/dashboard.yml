@@ -156,6 +156,9 @@ jobs:
     name: Re-dispatch stale scheduled workflows (cron-delivery fallback)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # dispatch-secrets binding: the cross-repo leg mints from REGISTRY_ADMIN_APP_ID/KEY,
+    # which post-#101 live ONLY in this environment (guard-enforced repo-wide).
+    environment: dispatch-secrets
     permissions:
       actions: write
     steps:
