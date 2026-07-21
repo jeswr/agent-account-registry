@@ -1,0 +1,89 @@
+# Issue #471: keep each enabled target's deterministic, conflict-free ready frontier fed. Target
+# repositories come from policy/repos.toml, and target mutations use the same per-owner maintenance
+# App credentials as dispatch/groom. The default-branch-only environment protects those secrets.
+name: curate-frontier
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Explicit minutes mirror dispatch/retriage and avoid GitHub's degraded */N scheduling.
+    - cron: '17,47 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: registry-frontier-curator
+  cancel-in-progress: false
+
+jobs:
+  curate:
+    name: Curate enabled target frontiers
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verify deterministic curator
+        run: python3 scripts/curate-frontier.py --self-test
+
+      # Reuse groom's validated policy resolver: every enabled repo name for each statically
+      # supported owner reaches the corresponding App-token mint, with no target repo hardcoded.
+      - name: Resolve enabled target repos per owner from policy
+        id: owners
+        run: |
+          set -euo pipefail
+          python3 scripts/groom.py --print-owner-repos --policy-file policy/repos.toml \
+            | tee -a "$GITHUB_OUTPUT"
+
+      - name: Mint sparq-org target-scoped curator App token (pinned)
+        id: target-token-sparq
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: sparq-org
+          repositories: ${{ steps.owners.outputs.sparq_names }}
+          permission-issues: write
+
+      - name: Mint jeswr target-scoped curator App token (pinned)
+        id: target-token-jeswr
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: ${{ steps.owners.outputs.jeswr_names }}
+          permission-issues: write
+
+      # Assemble the secret map only inside the mutation step. Child gh processes receive one
+      # owner token as GH_TOKEN; curate-frontier.py strips the full map from their environments.
+      - name: Curate unstaged work into disjoint ready waves
+        env:
+          SPARQ_TOKEN: ${{ steps.target-token-sparq.outputs.token }}
+          JESWR_TOKEN: ${{ steps.target-token-jeswr.outputs.token }}
+          BOT_LOGIN: ${{ (steps.target-token-sparq.outputs.app-slug || steps.target-token-jeswr.outputs.app-slug) && format('{0}[bot]', steps.target-token-sparq.outputs.app-slug || steps.target-token-jeswr.outputs.app-slug) || '' }}
+        run: |
+          set -euo pipefail
+          printf '::add-mask::%s\n' "$SPARQ_TOKEN"
+          printf '::add-mask::%s\n' "$JESWR_TOKEN"
+          [[ -n "$SPARQ_TOKEN" && -n "$JESWR_TOKEN" && -n "$BOT_LOGIN" ]]
+          TARGET_GH_TOKENS="$(python3 - <<'PY'
+          import json
+          import os
+
+          print(json.dumps({
+              "sparq-org": os.environ["SPARQ_TOKEN"],
+              "jeswr": os.environ["JESWR_TOKEN"],
+          }, separators=(",", ":")))
+          PY
+          )"
+          export TARGET_GH_TOKENS
+          unset SPARQ_TOKEN JESWR_TOKEN
+          python3 scripts/curate-frontier.py \
+            --apply --policy-file policy/repos.toml --bot-login "$BOT_LOGIN"
