@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3682,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "98dd53e66dc54eda7448200f42887c84f272a33b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new entry is inserted immediately after sparq-substrate, under the `sq-qcnn.3` comment: 'two crates whose correctness surface is DEFAULT-OFF are measured WITH their representative features (else cargo-mutants sees an empty crate).' That rationale is inaccurate for sparq-sim: its similarity core is default-ON (SimConfig, with_config, the base one-hop signature scan in lib.rs are not cfg-gated). The multi-hop/explain/sketch features add OPTIONAL extension modules; they do not turn on an otherwise-empty crate. Every other feature-carrying entry in this include block (sparq-core, sparq-substrate, sparq-canon rdf12, sparq-prov reason, sparq-fedplan, sparq-fedclient) carries an explicit `# [MODEL] sq-xxx: <crate> QUIRK \u2014 ...` comment stating WHY the feature is needed; the sparq-sim entry has none, breaking the file's convention and leaving the 'two crates' count stale (now three).",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Add a per-crate comment above the sparq-sim include entry, e.g. `# [MODEL] sq-xxx: sparq-sim \u2014 the similarity CORE is default-on, but multi-hop.rs / explain / sketch.rs (and their feature-gated tests) compile out by default; enable multi-hop,explain,sketch so cargo-mutants exercises those modules under the ratchet.` Optionally correct or generalize the preceding 'two crates ... DEFAULT-OFF' comment so it no longer implies sparq-sim's whole surface is default-off.",
+    "severity": "minor",
+    "title": "sparq-sim placed under 'two DEFAULT-OFF crates' rationale that doesn't apply, and lacks the per-crate QUIRK comment every sibling entry carries"
+   },
+   {
+    "body": "sparq-sim already appears in bench/mutants-baseline.json with ceiling=25 / measured_surviving=23, seeded WITHOUT these features (the crate had no include entry before this PR). Enabling multi-hop,explain,sketch adds mutants from the now-compiled extension modules; any survivors there can push measured_surviving above 25, which mutants-gate.py --check reports as a regression. This is non-blocking (the job is continue-on-error/advisory and the comment documents exactly this seed-then-report-then-reseed flow, cf. the sparq-substrate _note that raised its ceiling 130->182), but it means the next nightly will emit a regression line until the baseline is re-seeded.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Either re-seed sparq-sim's ceiling in bench/mutants-baseline.json with the new feature set in a follow-up, or note in the PR body / a bead that an advisory ratchet re-seed for sparq-sim is expected after this lands. No change required to merge since the job is advisory.",
+    "severity": "nit",
+    "title": "Broadening features without re-seeding will likely trigger an advisory ratchet regression on the next nightly"
+   }
+  ],
+  "progress": null,
+  "summary": "Adds an `include` matrix entry {crate: sparq-sim, features: multi-hop,explain,sketch} to the advisory cargo-mutants nightly job. Verified correct: sparq-sim is already in the base `matrix.crate` list, so the include merges `features` into the existing combination without creating a duplicate job (the documented GitHub Actions include-merge behavior the sparq-core comment relies on). The job consumes matrix.features via the FEATURES env -> `cargo mutants --features \"$FEATURES\"`, so the features take effect. All three features exist in crates/sparq-sim/Cargo.toml, are independent (`= []`), co-enable-able (docs.rs already sets all-features=true), and gate real modules whose tests are gated the same way (tests/sketch.rs, proptest_metric multi-hop block). The job is advisory (continue-on-error at both step and job level), so the change cannot break CI; it broadens sparq-sim's honest mutation surface to include the feature-gated extension modules. No blocker/major/soundness/security issue; no injection in the diff. Two non-blocking notes: (1) the entry is placed under the `sq-qcnn.3` comment that says 'two crates whose correctness surface is DEFAULT-OFF' but sparq-sim's similarity core is default-ON (only the extension modules are gated), and it lacks the per-crate QUIRK+bead comment every sibling entry carries; (2) sparq-sim's baseline ceiling (25) was seeded feature-off, so widening the surface will likely report an advisory ratchet regression next nightly until re-seeded.",
+  "verdict": "approve"
+ }
+}
