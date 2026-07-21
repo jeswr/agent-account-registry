@@ -33,12 +33,12 @@
   {
    "account": "acct07",
    "claim_id": "10c4039fd9e8410ea1831eb6cb67fb13",
-   "holder": "sparq-org/sparq#3452@dispatch-29843666200.1",
+   "holder": "sparq-org/sparq#3452@29844545771.1",
    "package": "sparq-trust",
    "role": "docs",
    "model": "haiku",
-   "issued_at": 1784648020,
-   "expires_at": 1784654320
+   "issued_at": 1784648047,
+   "expires_at": 1784654347
   },
   {
    "account": "acct01",
