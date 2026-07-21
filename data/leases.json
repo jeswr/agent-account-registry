@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct01",
-   "claim_id": "6b5f4bfcf35843a6bd9ea3696246fb1f",
-   "holder": "sparq-org/sparq#3664@29854030745.1",
-   "package": "sparq-conformance",
-   "role": "ci",
-   "model": "sol",
-   "issued_at": 1784655730,
-   "expires_at": 1784662030
-  },
-  {
-   "account": "acct01",
    "claim_id": "6283870112c948ce8923fdc6c762a93b",
    "holder": "fix:sparq-org/sparq#3679@dispatch-29852823976.1",
    "package": "sparq-substrate",
