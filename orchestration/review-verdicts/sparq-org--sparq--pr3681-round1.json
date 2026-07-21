@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3681,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1733ff1ddf725c5782c7e6f6848e69dd996279d1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added HEAVY_MODULE_SUFFIXES entry passes only if the real `next build` emits a react-loadable-manifest.json key ending in `-> @/components/repl-graph-view`. Unlike the 8 gallery demos and hero-runner (which use next/dynamic) this module is loaded via `React.lazy(() => import(...))` in hero-runner.tsx:60. Existing precedent strongly suggests this is fine \u2014 @aztec/bb.js and fzstd are plain dynamic import() split points already in the list and passing \u2014 so plain import() entries do get recorded. This is not a blocker; it is only a note that CI (`npm run check:bundle` / postbuild) is the true confirmation, and if the manifest key format for a `@/`-aliased local behind React.lazy differs, the guard would false-fail with a PRESENCE error rather than silently pass.",
+    "file": "site/scripts/check-bundle.mjs",
+    "fix_hint": "No change required if the postbuild `check:bundle` run in CI passes for this branch. If it false-fails, confirm the actual react-loadable-manifest.json key for the repl-graph-view import and adjust the suffix to match the emitted specifier.",
+    "severity": "minor",
+    "title": "PRESENCE guard for repl-graph-view relies on the React.lazy plain import() appearing in react-loadable-manifest.json"
+   }
+  ],
+  "progress": null,
+  "summary": "Registers @/components/repl-graph-view as a heavy module in the site bundle guard (check-bundle.mjs) and adds a PRESENCE unit test locking in that the hero's Graph view stays a lazy split point (follow-up to #3606). Verified: (1) the component exists at site/src/components/repl-graph-view.tsx and is loaded via React.lazy(() => import(\"@/components/repl-graph-view\")) in home/hero-runner.tsx:60 \u2014 a genuine dynamic-import split point, matching the comment's claim that its SVG renderer + deriveGraph load only on Graph-view invocation; (2) the new test is non-vacuous \u2014 it asserts membership in HEAVY_MODULE_SUFFIXES, deletes the loadable entry, and requires exactly one PRESENCE error naming the module, mirroring the existing bb.js/fzstd/zk-car-hire PRESENCE tests; (3) healthyInputs() iterates HEAVY_MODULE_SUFFIXES, so adding the module to both list and fixture keeps the healthy-build and heavyReport.length assertions consistent with no drift. Existing plain-import() entries (@aztec/bb.js, fzstd) are already in the list and pass, so the manifest-entry precedent covers this new plain import() too. No security/soundness/injection concerns. Correct and complete.",
+  "verdict": "approve"
+ }
+}
