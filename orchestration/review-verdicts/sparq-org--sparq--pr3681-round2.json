@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3681,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6c3c15c8d4c7e3cef337afb14f1a2301ea9807b5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Every other next/dynamic call site (lazy-demo.tsx's 10 demos, hero-runner-lazy.tsx) passes { ssr: false }; this new call passes only { loading }. It is harmless here \u2014 ResultGraphView is inside a \"use client\" module and is only mounted when the visitor toggles showGraph, so it is never in the static-export prerender tree and ssr:true has no observable effect. But the graph view is a purely-interactive, browser-only SVG renderer with no SSR value, and adding ssr:false would match the established convention and guard against a future change that renders it unconditionally on a component that touches browser globals. Non-blocking.",
+    "file": "site/src/components/home/hero-runner.tsx",
+    "fix_hint": "Add ssr: false to the options object, i.e. { ssr: false, loading: () => (...) }, to match lazy-demo.tsx and hero-runner-lazy.tsx.",
+    "severity": "nit",
+    "title": "next/dynamic for ResultGraphView omits { ssr: false } used by every other dynamic() in the tree"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 converts the hero's Graph view from React.lazy + a React.Suspense boundary to next/dynamic(() => import(\"@/components/repl-graph-view\").then(m => m.ResultGraphView), { loading }), and updates the result-graph-shape.ts doc comment from 'React.lazy' to 'next/dynamic'. Verified correct and complete: (1) the named-export loader form is the documented next/dynamic pattern and ResultGraphView is a genuine named export (repl-graph-view.tsx:56); (2) Suspense/React.lazy are fully removed from hero-runner.tsx (grep clean), Loader2 remains imported, and the loading fallback markup is preserved verbatim; (3) the PRESENCE test is non-vacuous \u2014 deletes the loadable entry and asserts exactly one /^PRESENCE:/ error naming the module, mirroring the bb.js/fzstd tests, and healthyInputs()/heavyReport stay consistent since the module is in HEAVY_MODULE_SUFFIXES. Crucially this RESOLVES round 1's only (minor) concern: it was uncertain whether a plain React.lazy import() would reliably register in react-loadable-manifest.json in the key format the guard matches; next/dynamic is exactly the mechanism that populates that manifest (check-bundle.mjs:19 defines a heavy module as a next/dynamic split point), so the PRESENCE guard is now reliable rather than precedent-dependent. No security/soundness/injection concerns.",
+  "verdict": "approve"
+ }
+}
