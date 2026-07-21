@@ -92,6 +92,7 @@ DEFAULT_THRESHOLDS = {
     "worker_min_samples": 3,         # worker-failing needs at least this many attempts (anti-noise)
     "recover_snapshots": 2,          # hysteresis: condition must be clear this many ticks to recover
 }
+CURATOR_THROUGHPUT_KEYS = {"target_ready"}
 
 # readiness engines per target (declared in policy; falls back by repo below)
 READY_STATUS_ENGINE = "status-ready"   # sparq: the ready-issues.py fail-closed frontier
@@ -341,8 +342,12 @@ def _thresholds_of(repo, row):
     if not isinstance(override, dict):
         raise MetricsError(f"throughput thresholds for {repo!r} must be a table")
     for key, val in override.items():
-        if key not in DEFAULT_THRESHOLDS:
+        if key not in DEFAULT_THRESHOLDS and key not in CURATOR_THROUGHPUT_KEYS:
             raise MetricsError(f"unknown throughput key {key!r} for {repo!r}")
+        if key == "target_ready":
+            if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 100:
+                raise MetricsError(f"{key} for {repo!r} must be an integer in [1, 100]")
+            continue
         if key == "worker_success_floor":
             if not isinstance(val, (int, float)) or isinstance(val, bool) or not (0.0 <= val <= 1.0):
                 raise MetricsError(f"{key} for {repo!r} must be a float in [0, 1]")
@@ -1621,7 +1626,8 @@ def _test_policy_and_readiness(chk):
     policy = (
         '[repos."sparq-org/sparq"]\nenabled = true\n'
         '[repos."jeswr/agent-account-registry"]\nenabled = true\n'
-        '[repos."jeswr/agent-account-registry".throughput]\nopen_pr_alert_threshold = 5\n'
+        '[repos."jeswr/agent-account-registry".throughput]\n'
+        'target_ready = 12\nopen_pr_alert_threshold = 5\n'
         '[repos."disabled/repo"]\nenabled = false\n')
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
         fh.write(policy)
