@@ -393,6 +393,233 @@ function updateFreshness(generatedAt) {
   }
 }
 
+// --- Throughput panel (backlog-vs-drain). Consumes site/metrics.json, emitted by the separate
+// metrics collector workflow (see the observability-metrics PR). It is optional: if the file is
+// absent (metrics workflow not deployed yet) the panel simply stays hidden — it never blocks the
+// rest of the dashboard. --------------------------------------------------------------------------
+
+const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const LANE_STATES = new Set(["ok", "idle", "stalled", "unknown"]);
+const SPARK_KEYS = ["net_pr_flow", "issues_ready", "prs_open"];
+// The published site/metrics.json holds only the CURRENT snapshot (the ring history lives on the
+// ledger branch and is not served). We accumulate our own bounded, per-target trend buffer across
+// refreshes — keyed by the snapshot's generated_at so a repeated poll of an unchanged snapshot is
+// not double-counted.
+const SPARK_HISTORY = 24;
+const trendBuffers = new Map();
+
+function num(value, fallback = null) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function fmtRate(value) {
+  const n = num(value);
+  if (n === null) return "—";
+  return `${n >= 0 ? "" : ""}${n.toFixed(n % 1 ? 1 : 0)}`;
+}
+
+function fmtSigned(value) {
+  const n = num(value);
+  if (n === null) return "—";
+  return `${n > 0 ? "+" : ""}${n.toFixed(n % 1 ? 1 : 0)}`;
+}
+
+function recordTrend(targets, stamp) {
+  const seen = new Set();
+  for (const [repo, metrics] of Object.entries(targets)) {
+    if (!REPO_RE.test(repo)) continue;
+    seen.add(repo);
+    let buffer = trendBuffers.get(repo);
+    if (!buffer) { buffer = { stamp: null, points: [] }; trendBuffers.set(repo, buffer); }
+    if (buffer.stamp === stamp) continue; // same snapshot polled again — do not duplicate
+    buffer.stamp = stamp;
+    const point = {};
+    for (const key of SPARK_KEYS) point[key] = num(metrics[key]);
+    buffer.points.push(point);
+    if (buffer.points.length > SPARK_HISTORY) buffer.points.splice(0, buffer.points.length - SPARK_HISTORY);
+  }
+  for (const repo of [...trendBuffers.keys()]) if (!seen.has(repo)) trendBuffers.delete(repo);
+}
+
+function sparkline(series, { colorForLast } = {}) {
+  const values = series.filter((v) => v !== null && Number.isFinite(v));
+  const wrap = node("div", "spark-wrap");
+  if (values.length < 2) {
+    wrap.append(node("p", "spark-caption", "collecting trend…"));
+    return wrap;
+  }
+  const W = 120;
+  const H = 30;
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 0);
+  const span = max - min || 1;
+  const step = W / (values.length - 1);
+  const y = (v) => H - ((v - min) / span) * H;
+  const points = values.map((v, i) => `${(i * step).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const last = values[values.length - 1];
+  const stroke = colorForLast ? colorForLast(last) : "var(--accent)";
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "spark");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("aria-hidden", "true");
+  if (min < 0 && max > 0) {
+    const zero = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    zero.setAttribute("x1", "0"); zero.setAttribute("x2", String(W));
+    zero.setAttribute("y1", y(0).toFixed(1)); zero.setAttribute("y2", y(0).toFixed(1));
+    zero.setAttribute("stroke", "var(--line)"); zero.setAttribute("stroke-width", "1");
+    svg.append(zero);
+  }
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  path.setAttribute("points", points);
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", stroke);
+  path.setAttribute("stroke-width", "1.5");
+  path.setAttribute("stroke-linejoin", "round");
+  path.setAttribute("stroke-linecap", "round");
+  svg.append(path);
+  const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  dot.setAttribute("cx", ((values.length - 1) * step).toFixed(1));
+  dot.setAttribute("cy", y(last).toFixed(1));
+  dot.setAttribute("r", "2");
+  dot.setAttribute("fill", stroke);
+  svg.append(dot);
+  wrap.append(svg);
+  return wrap;
+}
+
+function metricCell(label, value, opts = {}) {
+  const cell = node("div", "metric");
+  cell.append(node("span", "metric-label", label));
+  const v = node("span", `metric-value${opts.tone ? " " + opts.tone : ""}`, value);
+  if (opts.sub !== undefined) v.append(node("span", "metric-sub", opts.sub));
+  cell.append(v);
+  return cell;
+}
+
+function flowIndicator(net) {
+  const n = num(net);
+  const badge = node("span", "flow-badge");
+  if (n === null) { badge.classList.add("steady"); badge.textContent = "flow unknown"; return badge; }
+  if (n > 0) {
+    badge.classList.add("growing");
+    badge.textContent = `▲ backlog growing +${n.toFixed(n % 1 ? 1 : 0)}/hr`;
+  } else if (n < 0) {
+    badge.classList.add("draining");
+    badge.textContent = `▼ draining ${n.toFixed(n % 1 ? 1 : 0)}/hr`;
+  } else {
+    badge.classList.add("steady");
+    badge.textContent = "● steady 0/hr";
+  }
+  return badge;
+}
+
+function laneLight(health) {
+  const state = LANE_STATES.has(health) ? health : "unknown";
+  const wrap = node("span", "lane-light");
+  wrap.append(node("span", `lane-dot ${state}`));
+  wrap.append(document.createTextNode("Review lane "));
+  wrap.append(node("strong", "", state));
+  return wrap;
+}
+
+function throughputCard(repo, m, trend) {
+  const card = node("article", "throughput-card");
+  const top = node("div", "card-top");
+  top.append(node("h3", "throughput-target", repo));
+  top.append(flowIndicator(m.net_pr_flow));
+  card.append(top);
+
+  const drained = num(m.issues_closed_1h, 0);
+  const grid = node("div", "metric-grid");
+  grid.append(
+    metricCell("Issues open", String(num(m.issues_open, 0))),
+    metricCell("Ready to drain", String(num(m.issues_ready, 0))),
+    metricCell("Drained / 1h", String(drained), { tone: drained > 0 ? "good" : "" }),
+    metricCell("PRs open", String(num(m.prs_open, 0)), { sub: `${num(m.prs_draft, 0)} draft` }),
+    metricCell("review:changes", String(num(m.review_changes_backlog, 0)),
+      { tone: num(m.review_changes_backlog, 0) > 0 ? "bad" : "" }),
+    metricCell("needs:user", String(num(m.needs_user_parked, 0))),
+  );
+  card.append(grid);
+
+  const rate = node("div", "rate-row");
+  const openCell = node("div", "rate-cell");
+  openCell.append(node("span", "rate-label", "PR open-rate /hr"), node("span", "rate-value", fmtRate(m.pr_open_rate)));
+  const closeCell = node("div", "rate-cell close");
+  closeCell.append(node("span", "rate-label", "close+merge /hr"), node("span", "rate-value", fmtRate(m.pr_close_rate)));
+  rate.append(openCell, node("span", "rate-arrow", "vs"), closeCell);
+  card.append(rate);
+
+  const foot = node("div", "throughput-foot");
+  foot.append(laneLight(m.review_lane_health));
+  const merged = num(m.prs_merged_1h, 0);
+  foot.append(node("span", "lane-light", `${merged} merged / 1h · ${num(m.prs_merged_24h, 0)} / 24h`));
+  card.append(foot);
+
+  // Sparkline for net PR flow (the headline backlog-vs-drain signal), colored by direction.
+  if (trend && trend.points.length) {
+    const netSeries = trend.points.map((p) => p.net_pr_flow);
+    const spark = sparkline(netSeries, {
+      colorForLast: (v) => (v > 0 ? "var(--bad)" : v < 0 ? "var(--good)" : "var(--muted)"),
+    });
+    spark.prepend(node("p", "spark-caption", "net PR flow trend"));
+    card.append(spark);
+  }
+  return card;
+}
+
+function renderThroughput(metrics) {
+  const section = byId("throughput-section");
+  if (!metrics || !metrics.targets || typeof metrics.targets !== "object") {
+    section.hidden = true;
+    return;
+  }
+  const entries = Object.entries(metrics.targets).filter(([repo]) => REPO_RE.test(repo));
+  if (!entries.length) { section.hidden = true; return; }
+  section.hidden = false;
+
+  recordTrend(metrics.targets, metrics.generated_at);
+
+  byId("throughput-time").textContent = metrics.generated_at
+    ? `Snapshot ${relative(metrics.generated_at)} · ${utc(metrics.generated_at)}`
+    : "Snapshot time unknown";
+
+  const alertHost = byId("throughput-alerts");
+  alertHost.replaceChildren();
+  const alerts = Array.isArray(metrics.alerts) ? metrics.alerts.filter((a) => a && a.fire !== false) : [];
+  for (const alert of alerts) {
+    const row = node("div", "alert-row");
+    row.setAttribute("role", "alert");
+    row.append(node("span", "alert-class", String(alert.classification || "alert")));
+    row.append(node("span", "alert-summary", String(alert.summary || "")));
+    if (alert.target) row.append(node("span", "alert-target", String(alert.target)));
+    alertHost.append(row);
+  }
+
+  const host = byId("throughput-targets");
+  host.replaceChildren();
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  for (const [repo, m] of entries) {
+    if (!m || typeof m !== "object") continue;
+    host.append(throughputCard(repo, m, trendBuffers.get(repo)));
+  }
+}
+
+async function refreshThroughput() {
+  try {
+    const response = await fetch(`metrics.json?t=${Date.now()}`, { cache: "no-store" });
+    if (!response.ok) { renderThroughput(null); return; }
+    const metrics = await response.json();
+    if (typeof metrics !== "object" || !metrics || !metrics.targets) { renderThroughput(null); return; }
+    renderThroughput(metrics);
+  } catch (error) {
+    // The throughput panel is optional and independently sourced — a fetch/parse failure hides it
+    // rather than tripping the dashboard-wide warning banner.
+    renderThroughput(null);
+  }
+}
+
 // --- Agent-run observability (issue #246): cache effectiveness, per-lane run health + top defer
 // reasons, queue/lease/review flow, and auto-fixer trigger fires. Consumes the OPTIONAL
 // `observability` key of data.json — dashboard-gen validates + salts it server-side from the
@@ -734,4 +961,6 @@ async function refresh() {
 }
 
 refresh();
+refreshThroughput();
 setInterval(refresh, REFRESH_MS);
+setInterval(refreshThroughput, REFRESH_MS);
