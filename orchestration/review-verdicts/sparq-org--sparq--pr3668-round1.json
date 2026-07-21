@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3668,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "21860ef822867291d246b151312d7f9f6d373ede",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Pure documentation-hygiene fix in crates/sparq-core/src/lib.rs. Before this change, the doc comment for `parse_ntriples_parallel` plus a stray `#[cfg(feature = \"parallel\")]` were misplaced directly above `prefetch_read`. Since `///` desugars to `#[doc = ...]`, this attached the parse-ntriples description (and a duplicate cfg) to `prefetch_read`, polluting its rustdoc and leaving `parse_ntriples_parallel` undocumented. The PR removes the misplaced doc+cfg from above `prefetch_read` and relocates the doc comment to its correct position above `parse_ntriples_parallel` (which already has its own single `#[cfg(feature = \"parallel\")]` at the fn). Verified against the PR-head checkout: `prefetch_read` now has exactly one cfg + its own doc; `parse_ntriples_parallel` now carries its correct doc + one cfg. No functional/semantic change, no gating change (the removed cfg was a harmless duplicate; both functions remain parallel-gated in both feature states), and no intra-doc `[link]` so the feature-gated rustdoc-link trap does not apply. No test is warranted for a comment relocation. No injection content in the diff.",
+  "verdict": "approve"
+ }
+}
