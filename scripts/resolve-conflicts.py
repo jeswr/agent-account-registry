@@ -456,6 +456,11 @@ class ConflictResolver:
     def _skip(repo, number, reason):
         print(f"SKIP {repo}#{number}: {reason}")
 
+    def _error(self, target, exc):
+        cause = str(exc) or type(exc).__name__
+        self.errors.append(f"{target}: {cause}")
+        print(f"::error::conflict-resolver {target}: {cause}", file=sys.stderr)
+
     def _post(self, repo, number, body):
         if self.apply:
             self.api.comment(repo, number, body)
@@ -595,10 +600,14 @@ class ConflictResolver:
 
     def run(self):
         for repo in self.repos:
-            if not self.api.has_token(repo):
-                print(f"SKIP {repo}: no target App token was minted for owner")
-                continue
+            action_start = len(self.actions)
+            budget_start = self.budget_used
+            rebase_start = self.rebases
+            error_start = len(self.errors)
             try:
+                if not self.api.has_token(repo):
+                    print(f"SKIP {repo}: no target App token was minted for owner")
+                    continue
                 metadata = self.api.repository(repo)
                 default_branch = metadata.get("default_branch") if isinstance(metadata, dict) else None
                 if not _valid_branch(str(default_branch or "")):
@@ -610,11 +619,20 @@ class ConflictResolver:
                         self._process_pr(repo, default_branch, pr)
                     except ResolverError as exc:
                         number = pr.get("number", "unknown") if isinstance(pr, dict) else "unknown"
-                        self.errors.append(f"{repo}#{number}: {exc}")
-                        print(f"ERROR {repo}#{number}: {exc}", file=sys.stderr)
-            except ResolverError as exc:
-                self.errors.append(f"{repo}: {exc}")
-                print(f"ERROR {repo}: {exc}", file=sys.stderr)
+                        self._error(f"{repo}#{number}", exc)
+            # Repository isolation is deliberately broad: an unexpected client/data error in
+            # one target must be loud and make the final status fail, but must not starve later
+            # policy targets. Process-control exceptions still propagate normally.
+            except Exception as exc:
+                self._error(repo, exc)
+            finally:
+                print(
+                    f"SUMMARY repo={repo} mode={'apply' if self.apply else 'dry-run'} "
+                    f"actions={len(self.actions) - action_start} "
+                    f"rebase-requests={self.budget_used - budget_start} "
+                    f"mechanical-rebases={self.rebases - rebase_start} "
+                    f"errors={len(self.errors) - error_start}"
+                )
         print(
             f"SUMMARY mode={'apply' if self.apply else 'dry-run'} actions={len(self.actions)} "
             f"rebase-requests={self.budget_used}/{self.max_rebases} "
@@ -624,7 +642,9 @@ class ConflictResolver:
 
 
 def _self_test():
+    from contextlib import redirect_stderr, redirect_stdout
     from copy import deepcopy
+    from io import StringIO
     from unittest.mock import patch
 
     snapshot = _load_helper("registry_plan_snapshot_conflict_test", "plan-snapshot.py")
@@ -799,6 +819,61 @@ def _self_test():
     capped.run()
     check("per-run mechanical rebase cap holds", len(rebaser.calls), 5)
     check("cap accounting holds", capped.rebases, 5)
+
+    # (f) Enumeration failures are isolated per repository, annotated loudly, and retained in
+    # the final status. RuntimeError ensures this tests the broad repository boundary rather than
+    # merely the expected ResolverError path.
+    class EnumerationAPI:
+        def __init__(self, failing_repo=None):
+            self.failing_repo = failing_repo
+            self.scanned = []
+
+        def has_token(self, _repo):
+            return True
+
+        def repository(self, repo_name):
+            return {"full_name": repo_name, "default_branch": "main"}
+
+        def pulls(self, repo_name):
+            self.scanned.append(repo_name)
+            if repo_name == self.failing_repo:
+                raise RuntimeError("enumeration exploded")
+            return []
+
+    repo_a = "alpha/one"
+    repo_b = "beta/two"
+    api = EnumerationAPI(repo_a)
+    stdout = StringIO()
+    stderr = StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        isolated_rc = ConflictResolver(
+            api, snapshot, claim, [repo_a, repo_b], bot_login, False, 5, FakeRebaser()
+        ).run()
+    check("enumeration failure does not starve the next repository", api.scanned,
+          [repo_a, repo_b])
+    check("enumeration failure makes the run fail", isolated_rc, 1)
+    check("enumeration failure is a loud repository-scoped annotation",
+          f"::error::conflict-resolver {repo_a}: enumeration exploded" in stderr.getvalue(),
+          True)
+    check("failed zero-action repository always has a summary",
+          f"SUMMARY repo={repo_a} mode=dry-run actions=0 rebase-requests=0 "
+          "mechanical-rebases=0 errors=1" in stdout.getvalue(), True)
+    check("continued zero-action repository always has a summary",
+          f"SUMMARY repo={repo_b} mode=dry-run actions=0 rebase-requests=0 "
+          "mechanical-rebases=0 errors=0" in stdout.getvalue(), True)
+
+    # (g) A clean multi-repository sweep is successful; no aggregate status other than recorded
+    # errors is allowed to turn a clean scan red.
+    api = EnumerationAPI()
+    stdout = StringIO()
+    stderr = StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        clean_rc = ConflictResolver(
+            api, snapshot, claim, [repo_a, repo_b], bot_login, False, 5, FakeRebaser()
+        ).run()
+    check("clean two-repository scan reaches both repositories", api.scanned, [repo_a, repo_b])
+    check("clean two-repository scan exits zero", clean_rc, 0)
+    check("clean two-repository scan emits no error annotation", stderr.getvalue(), "")
 
     # Syntax-only validators are direct and non-executing.
     validate_syntax_blob("ok.py", b"value = 1\n")
