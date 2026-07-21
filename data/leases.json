@@ -9,6 +9,16 @@
    "model": "sol",
    "issued_at": 1784648694,
    "expires_at": 1784654994
+  },
+  {
+   "account": "acct01",
+   "claim_id": "bb9e44021a6742faa7c8b938d9be3e73",
+   "holder": "sparq-org/sparq#1030@dispatch-29844658519.1",
+   "package": "gui",
+   "role": "impl",
+   "model": "sol",
+   "issued_at": 1784648703,
+   "expires_at": 1784655003
   }
  ]
 }
