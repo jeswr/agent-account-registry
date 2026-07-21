@@ -181,3 +181,43 @@ jobs:
               echo "keepalive: ${wf} fresh (${age}s <= ${limit}s)"
             fi
           done
+
+      # Cross-repo leg: sparq's re-arm sweeper is the merge-queue closure backstop and
+      # runs on a 10-minute cron in sparq-org/sparq — cover its cron-delivery gaps too
+      # (same observed unreliability for recently-added workflows). Fail-soft: if the
+      # App is not configured the mint errors, the guarded step is skipped, and the
+      # native schedule remains the only driver.
+      - name: Mint sparq-org keepalive App token (pinned)
+        id: sparq-keepalive-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: sparq-org
+          repositories: sparq
+          permission-actions: write
+
+      - name: Dispatch stale sparq scheduled workflows (cross-repo keepalive)
+        if: steps.sparq-keepalive-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.sparq-keepalive-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          # workflow-file:stale-threshold-seconds (cadence + slack)
+          for spec in rearm-sweeper.yml:1200; do
+            wf="${spec%%:*}"; limit="${spec##*:}"
+            last=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=1" \
+                   --jq '.workflow_runs[0].created_at // empty' || true)
+            prev=0
+            [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
+            age=$(( now - prev ))
+            if [ "$age" -gt "$limit" ]; then
+              echo "keepalive: sparq-org/sparq ${wf} last ran ${age}s ago (limit ${limit}s) — dispatching"
+              gh api -X POST \
+                "repos/sparq-org/sparq/actions/workflows/${wf}/dispatches" -f ref=main
+            else
+              echo "keepalive: sparq-org/sparq ${wf} fresh (${age}s <= ${limit}s)"
+            fi
+          done
