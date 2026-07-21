@@ -7,8 +7,10 @@
 import argparse
 import base64
 from collections import Counter
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -101,6 +103,12 @@ FIX_KIND_OF_STATE = {"needs-fix": "verdict", "needs-ci-fix": "ci", "needs-rebase
 # its own planned/launched/deferred/error tally so the tick-health recorder can surface a stalled
 # lane (and a safety-critical disarm error) regardless of activity in the other lanes.
 DISPATCH_LANES = ("worker", "review", "fix", "disarm")
+# Task-side half of #500: two honest no-change outcomes on one issue are a routing signal, not
+# another reason to spin the same deferred route. The marker is keyed to the two newest validated
+# ledger outcomes, so the impl -> research escalation is idempotent while a LATER research-route
+# no-change can trigger the distinct needs:user escalation.
+DECLINE_ESCALATION_MIN = 2
+DECLINE_ESCALATION_MARKER = "sparq-task-decline-escalation:v1"
 # The review-loop lane owns needs-review re-reviews and the stranded recovery re-review; every
 # other REVIEW_STATE (needs-fix / needs-ci-fix / needs-rebase) is a fix-loop launch.
 REVIEW_LANE_STATES = {"needs-review", "stranded"}
@@ -1679,16 +1687,57 @@ def _pr_needs_user(script_dir, repo, pr_number, issue, reason):
 
 
 def _run_gh_target_comment(repo, issue_or_pr, body):
+    _run_gh_target_api(
+        repo, "POST", f"repos/{repo}/issues/{issue_or_pr}/comments", {"body": body})
+
+
+def _run_gh_target_api(repo, method, path, input_doc=None):
+    """One target-owner issue mutation in the same token-isolated API style as every existing
+    dispatch-side target write. The registry token is never used as a fallback for another
+    owner's issue mutation."""
     token = _target_token(repo)
     if not token:
         raise DispatchError("target-scoped App token is unavailable")
+    command = ["gh", "api", "-X", method, path]
+    if input_doc is not None:
+        command += ["--input", "-"]
     result = subprocess.run(
-        ["gh", "api", "-X", "POST", f"repos/{repo}/issues/{issue_or_pr}/comments", "--input", "-"],
-        input=json.dumps({"body": body}), capture_output=True, text=True, check=False,
+        command, input=json.dumps(input_doc) if input_doc is not None else None,
+        capture_output=True, text=True, check=False,
         env={**os.environ, "GH_TOKEN": token},
     )
     if result.returncode != 0:
-        raise DispatchError("target comment failed")
+        raise DispatchError("target issue mutation failed")
+
+
+def _replace_issue_role_with_research(repo, item):
+    """Atomically replace the revalidated role:impl label with role:research.
+
+    A full labels PATCH is intentional: add-then-remove can strand the issue with two role labels,
+    while remove-then-add can strand it with none; both shapes are rejected by the planner. The
+    caller has just required the live issue labels to exactly equal this plan copy via
+    _current_issue_matches, and stops the cached claim after this mutation, so the old impl route
+    can never launch from the same plan.
+    """
+    labels = set(item["labels"])
+    if item.get("role") != "impl" or "role:impl" not in labels:
+        raise DispatchError("decline reroute no longer has exactly the impl route")
+    # Re-read immediately before the full-label replacement. The earlier claim revalidation
+    # precedes the ledger/comment reads; without this last-step check, a human needs:* label landing
+    # in that interval could be erased by our PATCH.
+    live_result = _run_gh_target_api(
+        repo, "GET", f"repos/{repo}/issues/{item['number']}")
+    try:
+        live_issue = json.loads(live_result.stdout or "null")
+    except json.JSONDecodeError as exc:
+        raise DispatchError("target issue re-read returned malformed JSON") from exc
+    if (not isinstance(live_issue, dict) or "pull_request" in live_issue
+            or live_issue.get("state") != "open"
+            or _labels(live_issue) != item["labels"]):
+        raise DispatchError("target issue changed before decline reroute; leaving it untouched")
+    desired = sorted((labels - {"role:impl"}) | {"role:research"})
+    _run_gh_target_api(
+        repo, "PATCH", f"repos/{repo}/issues/{item['number']}", {"labels": desired})
 
 
 def _pr_comments(repo, pr_number):
@@ -1698,6 +1747,140 @@ def _pr_comments(repo, pr_number):
     if not isinstance(pages, list):
         raise DispatchError("target PR comments are malformed")
     return [item for page in pages if isinstance(page, list) for item in page]
+
+
+def _read_model_health_window(model_health, registry_repo, now, api=None):
+    """Read the task-decline evidence through model-health's authoritative validated reader.
+
+    Dispatch is a read-only consumer: it never calls append_record or writes the health ledger.
+    Invalid contents, a missing data-plane branch, or an unreadable API all return None after a
+    loud diagnostic; callers leave the issue deferred and MUST NOT infer an escalation.
+    """
+    try:
+        api = api or model_health.GitHubAPI(os.environ.get("GH_TOKEN", ""))
+        records, _ = model_health.read_ledger(api, registry_repo)
+        return model_health.prune(records, now)
+    except (model_health.HealthError, ValueError) as exc:
+        print("::error::dispatch decline escalation: validated model-health ledger is "
+              f"unreadable ({exc}); NO task escalation will fire")
+        return None
+
+
+def _issue_no_change_outcomes(model_health, records, issue):
+    """Validated, in-window no_change rows for one target issue, newest last."""
+    rows = [record for record in records
+            if record.get("exit_class") == model_health.CLASS_NO_CHANGE
+            and record.get("issue") == issue]
+    return sorted(
+        rows,
+        key=lambda record: (
+            record["ts"], record.get("run_id", ""), record.get("account", ""),
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        ),
+    )
+
+
+def _decline_escalation_evidence(outcomes):
+    """The two newest rows plus a stable, non-sensitive marker key for exactly that escalation."""
+    evidence = outcomes[-DECLINE_ESCALATION_MIN:]
+    encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    return evidence, hashlib.sha256(encoded.encode()).hexdigest()[:16]
+
+
+def _decline_marker_action(comments, bot_login, key):
+    """Return the bot-authored action already audited for this evidence pair, if any.
+
+    Third parties cannot forge an idempotence marker: as elsewhere in the worker control plane,
+    only the orchestration bot's own durable comments are receipts.
+    """
+    pattern = re.compile(
+        rf"<!-- {re.escape(DECLINE_ESCALATION_MARKER)} key={re.escape(key)} "
+        r"action=(research|needs-user) -->"
+    )
+    actions = {
+        match.group(1)
+        for comment in comments
+        if str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
+        for match in pattern.finditer(str(comment.get("body", "")))
+    }
+    if len(actions) > 1:
+        raise DispatchError("task decline escalation has conflicting audit markers")
+    return next(iter(actions), None)
+
+
+def _decline_outcome_name(record):
+    run_id = record.get("run_id") or f"ledger-ts-{record['ts']}"
+    return f"run `{run_id}` → `no_change`"
+
+
+def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, script_dir,
+                                apply_action=None, post_comment=None):
+    """Apply or reconcile one repeated-decline escalation.
+
+    Returns ``proceed`` below threshold and after a previously completed impl->research reroute;
+    every other result means the caller must stop this cached claim. The audit marker is written
+    BEFORE the label mutation so a mutation failure can be reconciled next tick without a second
+    loud comment. Conversely, a failed comment performs no label mutation and safely retries.
+    Injectable mutation/comment callables keep the --self-test tripwires on the real control flow.
+    """
+    if len(outcomes) < DECLINE_ESCALATION_MIN:
+        return "proceed"
+
+    evidence, key = _decline_escalation_evidence(outcomes)
+    marked_action = _decline_marker_action(comments, bot_login, key)
+    labels = set(item["labels"])
+
+    if apply_action is None:
+        def apply_action(action):
+            if action == "research":
+                _replace_issue_role_with_research(repo, item)
+            else:
+                _run_target_helper(script_dir, repo, "worker-issue.py", [
+                    "status", "--repo", repo, "--issue", str(item["number"]),
+                    "--status", "needs-user",
+                ])
+    if post_comment is None:
+        post_comment = lambda body: _run_gh_target_comment(repo, item["number"], body)
+
+    if marked_action == "research":
+        # The same two impl outcomes have already caused the route swap. Permit ONLY the new
+        # research route; if the label write crashed after its marker, reconcile it and stop this
+        # stale impl claim. This is the cached-claim bypass tripwire.
+        if item.get("role") == "research" and "role:research" in labels \
+                and "role:impl" not in labels:
+            return "proceed"
+        if item.get("role") == "impl" and "role:impl" in labels:
+            apply_action("research")
+            return "rerouted"
+        raise DispatchError("recorded decline reroute conflicts with the issue's current role")
+    if marked_action == "needs-user":
+        if "needs:user" not in labels:
+            apply_action("needs-user")
+        return "parked"
+
+    action = "research" if item.get("role") == "impl" else "needs-user"
+    outcome_lines = "\n".join(
+        f"- Outcome {index}: {_decline_outcome_name(record)}"
+        for index, record in enumerate(evidence, 1)
+    )
+    if action == "research":
+        action_text = ("**Action:** swapped `role:impl` → `role:research` for architect "
+                       "decomposition. The cached implementation claim is cancelled; only the "
+                       "new research route may dispatch.")
+    else:
+        role = item.get("role") or "unknown"
+        action_text = (f"**Action:** parked this issue with `needs:user`. It was already on the "
+                       f"non-implementation route `role:{role}`, so another automated reroute "
+                       "would loop; a human must decide how to proceed.")
+    marker = f"<!-- {DECLINE_ESCALATION_MARKER} key={key} action={action} -->"
+    post_comment(
+        "> 🤖 SPARQ agent — **repeated honest-decline escalation**\n\n"
+        "This issue returned without repository changes twice in the validated model-health "
+        f"window, regardless of which accounts ran it:\n\n{outcome_lines}\n\n"
+        f"{action_text}\n\n{marker}"
+    )
+    apply_action(action)
+    return "rerouted" if action == "research" else "parked"
 
 
 def record_file_path(ledger_root, registry_root, relative):
@@ -2581,8 +2764,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     allocator = _load_module("registry_select_and_claim", script_dir / "select-and-claim.py")
     worker_pr = _load_module("registry_worker_pr", script_dir / "worker-pr.py")
     worker_issue = _load_module("registry_worker_issue", script_dir / "worker-issue.py")
+    model_health = _load_module("registry_model_health", script_dir / "model-health.py")
     usage = _load_usage()
     catalog_cache = {"accounts": None}  # read the account catalog at most once, only if usage-aware
+    # The health ledger is immutable from dispatch and read at most once per tick. None is the
+    # fail-closed unreadable state; the separate flag distinguishes it from an unread cache.
+    health_window = None
+    health_window_loaded = False
     try:
         with open(plan_path, encoding="utf-8") as handle:
             plan = validate_plan(json.load(handle))
@@ -2703,14 +2891,40 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     continue
                 resolved = _route_matches(repo, item, policy_doc, routing, policy_module)
                 if item["deferred"]:
-                    # Deferred-retry budget (locked decision 20): re-dispatch is bounded by the
-                    # SAME durable attempt markers the worker records; exhausted -> needs-user +
-                    # a maintainer-visible comment, never another silent attempt.
+                    # #500 task-side honest-decline escalation. This runs BEFORE the ordinary
+                    # deferred-attempt budget and BEFORE allocator.claim(), so the second
+                    # no_change cannot be swallowed by generic needs-user budgeting or launch the
+                    # cached impl route. The model-health module owns validation/window pruning;
+                    # dispatch consumes its ledger READ-ONLY.
                     if not bot_login or not _target_token(repo):
                         defer_reasons["no-target-token"] += 1
                         print(f"defer {repo}#{number}: deferred retry needs the target App token")
                         continue
-                    comments = _pr_comments(repo, number)
+                    if not health_window_loaded:
+                        health_window = _read_model_health_window(
+                            model_health, registry_repo, int(time.time()))
+                        health_window_loaded = True
+                    if health_window is None:
+                        defer_reasons["decline-ledger-unreadable"] += 1
+                        print(f"::error::defer {repo}#{number}: no_change escalation evidence "
+                              "is unavailable; issue remains deferred with NO escalation")
+                        continue
+                    no_changes = _issue_no_change_outcomes(
+                        model_health, health_window, number)
+                    comments = None
+                    if len(no_changes) >= DECLINE_ESCALATION_MIN:
+                        comments = _pr_comments(repo, number)
+                        decline_result = _escalate_repeated_declines(
+                            repo, item, no_changes, comments, bot_login, script_dir)
+                        if decline_result != "proceed":
+                            defer_reasons[f"decline-{decline_result}"] += 1
+                            print(f"escalated {repo}#{number}: repeated no_change outcomes -> "
+                                  f"{decline_result}; cached {item['role']} claim cancelled")
+                            continue
+                    # Deferred-retry budget (locked decision 20): re-dispatch is bounded by the
+                    # SAME durable attempt markers the worker records; exhausted -> needs-user +
+                    # a maintainer-visible comment, never another silent attempt.
+                    comments = comments if comments is not None else _pr_comments(repo, number)
                     used = worker_issue.count_attempts(comments, bot_login)
                     if used >= resolved["max_attempts"]:
                         _run_target_helper(script_dir, repo, "worker-issue.py", [
@@ -3117,6 +3331,256 @@ def _self_test():
     # would hold the same account for different windows.
     assert _wf["local_review_ttl"] == REVIEW_TTL, _wf["local_review_ttl"]
     assert _wf["local_fix_ttl"] == FIX_TTL, _wf["local_fix_ttl"]
+
+    # #500 round-2: execute the REAL dispatch() call site for every decline-escalation tripwire.
+    # The round-1 helper-only checks could stay green if dispatch stopped calling the helper; this
+    # harness drives a deferred PLAN row through validated model-health ledger reads and captures
+    # the same target API/helper mutations production uses. Each successful assertion prints an
+    # explicit line, making --self-test output prove that all five tripwires actually executed.
+    model_health = _load_module(
+        "registry_model_health_decline_tripwire",
+        Path(__file__).resolve().parent / "model-health.py")
+    decline_now = int(time.time())
+    no_change_a = model_health.make_record(
+        "openai", "a" * 16, "codex", "no_change", "5001.1", decline_now - 20,
+        issue=500, input_tokens=10, output_tokens=2, wall_seconds=5)
+    no_change_b = model_health.make_record(
+        "openai", "b" * 16, "codex", "no_change", "5002.1", decline_now - 10,
+        issue=500, input_tokens=12, output_tokens=3, wall_seconds=6)
+
+    def run_decline_tripwire(records, role="impl", comments=(), malformed=False,
+                             unreadable=False):
+        """One complete deferred dispatch tick with fake GitHub transports and real validators."""
+        labels = sorted([
+            "area:dispatch", "priority:P1", f"role:{role}", "status:deferred",
+        ])
+        body = "Investigate and implement the dispatch boundary."
+        item = {
+            "number": 500, "priority": 1, "package": "dispatch", "role": role,
+            "model_chain": ["sol"], "agent": "registry-impl", "escalate": False,
+            "labels": labels, "author": "maintainer",
+            "body_sha": hashlib.sha256(body.encode()).hexdigest(), "deferred": True,
+        }
+        live_issue = {
+            "number": 500, "state": "open", "user": {"login": "maintainer"},
+            "author_association": "MEMBER", "labels": [{"name": label} for label in labels],
+            "body": body,
+        }
+        plan = {
+            "schema": SCHEMA, "generated_at": "2026-07-21T00:00:00Z",
+            "repositories": [{"target_repo": "example/repo", "target_sha": "a" * 40,
+                              "items": [item]}],
+            "review_items": [], "disarm_items": [], "snapshot_skips": [],
+        }
+        policy = {
+            "trusted_bots": [], "allow_actions_bot_issues": False,
+            "routing": "orchestration/routing.toml", "usage_safety_margin": 0.10,
+        }
+
+        class FakePolicy:
+            @staticmethod
+            def _policy_row(repo, document):
+                assert repo == "example/repo" and document["repos"][repo]["enabled"] is True
+                return policy
+
+            @staticmethod
+            def resolve(repo, issue_labels, policy_doc, routing_doc):
+                assert repo == "example/repo" and issue_labels == labels
+                return {
+                    "model_chain": item["model_chain"], "agent": item["agent"],
+                    "escalate": item["escalate"], "max_attempts": 9,
+                    "worker_timeout_minutes": 10, "usage_safety_margin": 0.10,
+                    "require_usage": False, "max_concurrent": 1, "account_pool": [],
+                }
+
+        class FakeAllocator:
+            def __init__(self):
+                self.claim_calls = 0
+
+            def claim(self, *_args, **_kwargs):
+                self.claim_calls += 1
+                return None
+
+            @staticmethod
+            def release(*_args, **_kwargs):
+                return True
+
+        class FakeWorkerIssue:
+            ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1 -->"
+
+            @staticmethod
+            def count_attempts(_comments, _bot_login):
+                return 0
+
+        class FakeWorkerPr:
+            pass
+
+        class FakeHealthAPI:
+            def request(self, method, path, body=None, allow_404=False,
+                        retry_conflict=False):
+                assert method == "GET" and path == model_health.ledger_read_path(
+                    "example/registry")
+                if unreadable:
+                    raise model_health.HealthError("fixture transport failed")
+                document = ({"records": [{"not": "a typed model-health record"}]}
+                            if malformed else {"records": list(records)})
+                return {
+                    "content": base64.b64encode(json.dumps(document).encode()).decode(),
+                    "sha": "deadbeef",
+                }
+
+        allocator = FakeAllocator()
+        api_calls = []
+        helper_calls = []
+        comment_reads = []
+
+        class FakeResult:
+            def __init__(self, stdout=""):
+                self.stdout = stdout
+                self.returncode = 0
+                self.stderr = ""
+
+        def fake_gh_json(args):
+            path = args[-1]
+            if path == "repos/example/repo":
+                return {"default_branch": "main"}
+            if path == "repos/example/repo/branches/main":
+                return {"protected": True, "commit": {"sha": "b" * 40}}
+            if path.startswith("repos/example/repo/contents/orchestration/routing.toml?ref="):
+                return {"type": "file", "content": base64.b64encode(b"").decode()}
+            if path == "repos/example/repo/pulls?state=open&per_page=100":
+                return [[]]
+            if path == "repos/example/repo/issues?state=open&per_page=100":
+                return [[live_issue]]
+            if path == "repos/example/repo/issues/500":
+                return live_issue
+            if path == "repos/example/repo/issues/500/comments?per_page=100":
+                comment_reads.append(path)
+                return [list(comments)]
+            raise AssertionError(f"unexpected fake gh read: {path}")
+
+        def fake_target_api(repo, method, path, input_doc=None):
+            assert repo == "example/repo"
+            api_calls.append((method, path, input_doc))
+            return FakeResult(json.dumps(live_issue) if method == "GET" else "")
+
+        def fake_target_helper(script_dir, repo, script, args):
+            helper_calls.append((script, list(args)))
+            return FakeResult()
+
+        def fake_load(name, path):
+            return {
+                "registry_policy_resolve": FakePolicy,
+                "registry_select_and_claim": allocator,
+                "registry_worker_pr": FakeWorkerPr,
+                "registry_worker_issue": FakeWorkerIssue,
+                "registry_model_health": model_health,
+            }[name]
+
+        real_globals = (
+            globals()["_load_module"], globals()["_gh_json"],
+            globals()["_run_gh_target_api"], globals()["_run_target_helper"],
+            globals()["_run_gh"], model_health.GitHubAPI,
+        )
+        env_keys = ("TARGET_GH_TOKENS", "TARGET_GH_TOKEN", "TARGET_GH_TOKEN_OWNER",
+                    "WORKER_USAGE_FILE", "DISPATCH_SUMMARY_FILE")
+        prior_env = {key: os.environ.get(key) for key in env_keys}
+        output = io.StringIO()
+        try:
+            globals()["_load_module"] = fake_load
+            globals()["_gh_json"] = fake_gh_json
+            globals()["_run_gh_target_api"] = fake_target_api
+            globals()["_run_target_helper"] = fake_target_helper
+            globals()["_run_gh"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("decline tripwire unexpectedly launched a workflow"))
+            model_health.GitHubAPI = lambda _token: FakeHealthAPI()
+            os.environ["TARGET_GH_TOKENS"] = json.dumps({"example": "test-token"})
+            os.environ.pop("TARGET_GH_TOKEN", None)
+            os.environ.pop("TARGET_GH_TOKEN_OWNER", None)
+            os.environ.pop("WORKER_USAGE_FILE", None)
+            with tempfile.TemporaryDirectory() as root:
+                root_path = Path(root)
+                plan_path = root_path / "plan.json"
+                policy_path = root_path / "repos.toml"
+                leases_path = root_path / "data" / "leases.json"
+                leases_path.parent.mkdir(parents=True)
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                policy_path.write_text(
+                    '[repos."example/repo"]\nenabled = true\n', encoding="utf-8")
+                leases_path.write_text('{"leases": []}\n', encoding="utf-8")
+                os.environ["DISPATCH_SUMMARY_FILE"] = str(root_path / "summary.json")
+                with contextlib.redirect_stdout(output):
+                    dispatch(
+                        plan_path, policy_path, "example/registry", "master", Path("."),
+                        registry_root=root, bot_login="sparq[bot]", ledger_root=root)
+        finally:
+            (globals()["_load_module"], globals()["_gh_json"],
+             globals()["_run_gh_target_api"], globals()["_run_target_helper"],
+             globals()["_run_gh"], model_health.GitHubAPI) = real_globals
+            for key, value in prior_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return {
+            "api_calls": api_calls, "helper_calls": helper_calls,
+            "claim_calls": allocator.claim_calls, "comment_reads": comment_reads,
+            "output": output.getvalue(),
+        }
+
+    # (a) The real dispatch call observes the SECOND validated no_change, posts the marker, swaps
+    # role:impl -> role:research, and cancels the cached impl claim before allocation.
+    trip_a = run_decline_tripwire([no_change_a, no_change_b])
+    assert [call[0] for call in trip_a["api_calls"]] == ["POST", "GET", "PATCH"], trip_a
+    assert DECLINE_ESCALATION_MARKER in trip_a["api_calls"][0][2]["body"], trip_a
+    assert trip_a["api_calls"][-1][2]["labels"] == [
+        "area:dispatch", "priority:P1", "role:research", "status:deferred"], trip_a
+    assert trip_a["helper_calls"] == [] and trip_a["claim_calls"] == 0, trip_a
+    print("  ok   decline tripwire (a): second no_change reroutes impl to research + marker")
+
+    # (b) One validated record is below threshold: no mutation/comment and the ordinary deferred
+    # claim path remains live. Lowering the threshold to one makes this assertion red.
+    trip_b = run_decline_tripwire([no_change_a])
+    assert trip_b["api_calls"] == [] and trip_b["helper_calls"] == [], trip_b
+    assert trip_b["claim_calls"] == 1, trip_b
+    print("  ok   decline tripwire (b): one no_change performs no escalation")
+
+    # (c) A repeated decline already on role:research parks needs:user and must never PATCH another
+    # research reroute. Removing the loop guard turns this red.
+    trip_c = run_decline_tripwire([no_change_a, no_change_b], role="research")
+    assert [call[0] for call in trip_c["api_calls"]] == ["POST"], trip_c
+    assert len(trip_c["helper_calls"]) == 1, trip_c
+    assert trip_c["helper_calls"][0][0] == "worker-issue.py", trip_c
+    assert trip_c["helper_calls"][0][1][-2:] == ["--status", "needs-user"], trip_c
+    assert trip_c["claim_calls"] == 0, trip_c
+    print("  ok   decline tripwire (c): research decline parks needs:user without reroute loop")
+
+    # (d) Poisoned and unreadable ledgers both fail closed: no target action, no cached claim, and
+    # an Actions error annotation that explicitly says escalation did not fire.
+    for bad in (run_decline_tripwire([], malformed=True),
+                run_decline_tripwire([], unreadable=True)):
+        assert bad["api_calls"] == [] and bad["helper_calls"] == [], bad
+        assert bad["claim_calls"] == 0, bad
+        assert "::error::dispatch decline escalation" in bad["output"], bad["output"]
+        assert "NO task escalation will fire" in bad["output"], bad["output"]
+    print("  ok   decline tripwire (d): malformed/unreadable ledger logs loudly and does not escalate")
+
+    # (e) Only the bot's durable marker suppresses duplicate writes. The same marker text from a
+    # third party is ignored, so the research-route escalation still comments and parks.
+    _, marker_key = _decline_escalation_evidence([no_change_a, no_change_b])
+    marker_body = (f"<!-- {DECLINE_ESCALATION_MARKER} key={marker_key} "
+                   "action=research -->")
+    bot_marked = run_decline_tripwire(
+        [no_change_a, no_change_b], role="research",
+        comments=[{"user": {"login": "sparq[bot]"}, "body": marker_body}])
+    assert bot_marked["api_calls"] == [] and bot_marked["helper_calls"] == [], bot_marked
+    assert bot_marked["claim_calls"] == 1, bot_marked
+    forged = run_decline_tripwire(
+        [no_change_a, no_change_b], role="research",
+        comments=[{"user": {"login": "mallory"}, "body": marker_body}])
+    assert [call[0] for call in forged["api_calls"]] == ["POST"], forged
+    assert len(forged["helper_calls"]) == 1 and forged["claim_calls"] == 0, forged
+    print("  ok   decline tripwire (e): bot marker is idempotent; third-party forgery is ignored")
 
     fixture = {
         "schema": SCHEMA,
@@ -3681,8 +4145,6 @@ def _self_test():
     # provenance is representative of an early trust-gate rejection; the valid twin above must
     # remain quiet. Restoring the pre-#456 `if draft:` wrapper makes the READY twin produce zero,
     # which is the mutation check run explicitly by issue #460's gate command.
-    import contextlib
-    import io
     excluded_log = io.StringIO()
     with contextlib.redirect_stdout(excluded_log):
         assert enumerate_review_items(
