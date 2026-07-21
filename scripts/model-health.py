@@ -15,8 +15,9 @@
 #   record  — called from the always()-guarded worker.yml/review-fix.yml outcome jobs (so FAILURES
 #             record too — that is the whole point) and from dispatch.yml on a zero-dispatch tick.
 #             Appends {ts, provider, account (SALTED HASH only — decision 22a), model_alias,
-#             exit_class, run_id, reset_hint?} via the SAME contents-API CAS pattern as the lease
-#             ledger, bounded to a rolling window (last MAX_RECORDS / WINDOW_HOURS; pruned on write).
+#             exit_class, run_id, reset_hint?, no-change usage fields?} via the SAME contents-API
+#             CAS pattern as the lease ledger, bounded to a rolling window (last MAX_RECORDS /
+#             WINDOW_HOURS; pruned on write).
 #   decide  — reads the record window (+ the enabled provider->account fleet) and returns alert
 #             ACTIONS. Idempotent: exactly ONE open alert issue per (condition, provider), updated
 #             not duplicated (a hidden marker in the body keys the upsert). decide also probes the
@@ -64,8 +65,9 @@ WINDOW_SECONDS = WINDOW_HOURS * 3600
 FUTURE_SKEW_SECONDS = 5 * 60
 
 # --- exit-class taxonomy. worker-live.sh emits {session-limit, rate-limit, auth, setup, unknown}
-# (all derived from HOST-observable signals only: the CLI exit code + the CLI's own error lines,
-# never model-authored stdout); a clean run records `success`. We fold those into decision classes.
+# from nonzero HOST-observable signals, plus `no_change` after a clean model exit with no tree edit;
+# never model-authored stdout. A changed-tree run records `success`. We fold those into decision
+# classes.
 # `limit` == the account's usage window is exhausted (maintainer must RESET it, not retry);
 # `transient` == a retryable API blip (429/529/overloaded); `auth`/`billing` == a credential/credit
 # problem (rotate/top up); `unknown` == the host observed a failure but could not attribute it to
@@ -77,6 +79,7 @@ CLASS_AUTH = "auth"          # token invalid/expired/forbidden
 CLASS_BILLING = "billing"    # credits/quota/payment (codex/openai top-up)
 CLASS_SETUP = "setup"        # runner/tooling problem (NOT a provider-access signal)
 CLASS_UNKNOWN = "unknown"    # unattributable failure: counts toward PERSISTENCE, never OUTAGE
+CLASS_NO_CHANGE = "no_change"  # clean model exit that produced no repository change
 CLASS_ZERO_DISPATCH = "zero-dispatch"  # dispatch planned >0 but launched 0 (fleet-wide signal)
 
 # The ONLY providers a health record may carry (issue #199). `provider` is CATALOG-controlled
@@ -94,6 +97,7 @@ _EXIT_CLASS_MAP = {
     "auth": CLASS_AUTH,
     "billing": CLASS_BILLING,
     "setup": CLASS_SETUP,
+    "no_change": CLASS_NO_CHANGE,
     # An unrecognised nonzero exit / timeout / cancellation / pre-launch abort is host-observed
     # but NOT provider-attributable: `unknown` counts toward persistence (a sustained burst of
     # them still degrades throughput) but NEVER toward a provider-outage page (review defect #4 —
@@ -112,6 +116,7 @@ _EXIT_CLASS_MAP = {
     CLASS_BILLING: CLASS_BILLING,
     CLASS_SETUP: CLASS_SETUP,
     CLASS_UNKNOWN: CLASS_UNKNOWN,
+    CLASS_NO_CHANGE: CLASS_NO_CHANGE,
 }
 # The launch-failure classes that count toward a PROVIDER-OUTAGE (a genuine "cannot reach a working
 # model" signal). `setup` is a runner/tooling fault and `unknown` is not provider-attributable
@@ -134,6 +139,12 @@ DECISION_CLASSES = frozenset(_EXIT_CLASS_MAP.values())
 # the ledger (issue #202). The account handle carries its own stricter check (_is_hash).
 RECORD_FIELD_MAX_LEN = 64
 RESET_HINT_MAX_LEN = 256
+# Numeric no-change evidence is public ledger data, so every value is both type-strict and bounded.
+# The ceilings are deliberately generous relative to a 90-minute worker and current context sizes,
+# while preventing a forged record from carrying arbitrary-precision integers.
+MAX_USAGE_TOKENS = 1_000_000_000
+MAX_WALL_SECONDS = 7 * 24 * 3600
+MAX_ISSUE_NUMBER = 2_147_483_647
 
 # --- thresholds (WHY each is what it is). Tuned to page on a real stall, stay quiet on churn.
 # PROVIDER-OUTAGE: >=3 launch failures within 30 min from >= max(2, ceil(enabled-fleet/2)) distinct
@@ -155,6 +166,11 @@ TRANSIENT_WINDOW_SECONDS = 15 * 60
 # ZERO-DISPATCH: >=3 consecutive ticks that planned work but launched nothing — a persistent
 # inability to place ready work (capacity/access), not a single quiet tick.
 ZERO_DISPATCH_MIN = 3
+# CAPPED-ACCOUNT DISCRIMINATOR (#500): one task may honestly yield no edit; three no-change exits
+# by one account across at least two tasks is account-side evidence. The newest qualifying record
+# is derived as limit-class and therefore uses the existing reactive backoff machinery below.
+NO_CHANGE_LIMIT_MIN = 3
+NO_CHANGE_LIMIT_MIN_ISSUES = 2
 # REACTIVE BACKOFF (maintainer decision 2026-07-17, registry issue #29): probe-EXEMPT providers
 # (openai/codex — no usage API) are used until a run hits a rate limit; the health window then
 # yields a per-account backoff DERIVED from the records already CAS-appended here (no separate
@@ -233,11 +249,14 @@ def _decision_class(exit_class):
     return _EXIT_CLASS_MAP.get(exit_class, CLASS_UNKNOWN)
 
 
-def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset_hint=None):
+def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset_hint=None,
+                input_tokens=None, output_tokens=None, wall_seconds=None, issue=None):
     """Build one health record. `account_h` MUST already be the salted hash (a raw handle here is a
     privacy bug — the caller salts). reset_hint (a provider reset time string) is kept ONLY for the
     limit + transient (rate-limit) classes, where it is actionable (maintainer alert body / the
-    reactive-backoff duration for probe-exempt providers).
+    reactive-backoff duration for probe-exempt providers). A no_change record carries its target
+    issue plus optional numeric input/output/wall telemetry; these are evidence fields only, never
+    transcript content.
 
     The FULLY-ASSEMBLED record is fail-closed validated before it is returned (issue #202): the
     account must be a salted hash (never a raw acctNN handle), the provider must be catalog-known,
@@ -255,6 +274,15 @@ def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset
     }
     if rec["exit_class"] in BACKOFF_CLASSES and reset_hint:
         rec["reset_hint"] = str(reset_hint)
+    no_change_fields = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "wall_seconds": wall_seconds,
+        "issue": issue,
+    }
+    for field, value in no_change_fields.items():
+        if value is not None:
+            rec[field] = value
     _validate_record(rec)
     return rec
 
@@ -273,19 +301,21 @@ def prune(records, now):
     therefore never evicted by the cap: for each account whose derived backoff_until > now, the
     tail of its current consecutive chain (the limit/transient records since its last success,
     truncated to BACKOFF_CHAIN_KEEP — past cap-saturation extra records cannot change the
-    derived backoff_until) is preserved. Earlier records cannot affect the derived state (a
-    success resets it), so re-deriving backoff_until on the pruned window is exact.
+    derived backoff_until) is preserved. A derived no_change limit additionally retains its
+    minimal three source observations. Earlier ordinary backoff records cannot affect the derived
+    state (a success resets them), so re-deriving backoff_until on the pruned window is exact.
 
     BOUND CONTRACT (PR #85 finding 1): preserved records spend the MAX_RECORDS budget first and
     the newest non-preserved records fill only the REMAINING budget, so the total is bounded by
     max(len(preserved), MAX_RECORDS) — never live-backoffs PLUS a full 200 of expired filler.
-    When the live-backoff set alone exceeds MAX_RECORDS (> MAX_RECORDS / BACKOFF_CHAIN_KEEP
-    simultaneously live chains), correctness wins over the cap — a live backoff is never
-    evicted — but NEVER silently: every expired/non-preserved record is evicted and a ::warning::
+    When the live-backoff set alone exceeds MAX_RECORDS, correctness wins over the cap — a live
+    backoff is never evicted — but NEVER silently: every expired/non-preserved record is evicted
+    and a ::warning::
     diagnostic surfaces the overshoot (that many simultaneously backed-off accounts is a
     fleet-wide rate-limit saturation signal the maintainer must see, not a bookkeeping detail).
-    len(preserved) itself is bounded by live_accounts * BACKOFF_CHAIN_KEEP, and every backoff
-    expires within BACKOFF_CAP_SECONDS, so the overshoot is transient, not unbounded growth."""
+    len(preserved) itself is bounded by live_accounts * (BACKOFF_CHAIN_KEEP +
+    NO_CHANGE_LIMIT_MIN - 1), and every backoff expires within BACKOFF_CAP_SECONDS, so the
+    overshoot is transient, not unbounded growth."""
     kept = [r for r in records if isinstance(r, dict)
             and isinstance(r.get("ts"), int)
             and (now - r["ts"]) <= WINDOW_SECONDS
@@ -296,15 +326,24 @@ def prune(records, now):
     preserved = set()
     active = account_backoffs(kept, now)
     if active:
+        derived, no_change_evidence = _no_change_limit_view(kept, now)
         chains = {}                 # account -> indices of its current consecutive chain
-        for index, r in enumerate(kept):
+        for index, r in enumerate(derived):
             acct, cls = r.get("account"), r.get("exit_class")
             if cls == SUCCESS:
                 chains.pop(acct, None)      # a success resets the chain — and the derived state
             elif cls in BACKOFF_CLASSES:
                 chains.setdefault(acct, []).append(index)
         for acct in active:
-            preserved.update(chains.get(acct, ())[-BACKOFF_CHAIN_KEEP:])
+            chain = chains.get(acct, ())
+            preserved.update(chain[-BACKOFF_CHAIN_KEEP:])
+            # A derived no_change limit needs all three source observations after pruning; keeping
+            # only the newest (derived) member would erase the discriminator and readmit the capped
+            # account on the next ledger read. Preserve this bounded evidence only when the derived
+            # member is still in the account's live post-success chain.
+            nc_evidence = no_change_evidence.get(acct, set())
+            if any(index in chain for index in nc_evidence):
+                preserved.update(nc_evidence)
     budget = MAX_RECORDS - len(preserved)
     if budget < 0:
         # Live backoffs alone exceed the nominal cap: keep them all (correctness over the cap),
@@ -373,6 +412,11 @@ def _is_safe_field(value, max_len, allow_empty, grammar):
     return not _HANDLE_PATTERN_RE.search(value)
 
 
+def _is_bounded_int(value, minimum, maximum):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and minimum <= value <= maximum)
+
+
 def _validate_record(r):
     """Fail-closed field validation for ONE health record — the single contract shared by
     make_record (construction), validate_ledger (read), and append_record's pre-PUT document check.
@@ -385,8 +429,9 @@ def _validate_record(r):
     blob into the PUBLIC ledger."""
     if not isinstance(r, dict):
         raise ValueError("model-health ledger contains a non-object entry")
-    extra = set(r) - {"ts", "provider", "account", "model_alias", "exit_class", "run_id",
-                      "reset_hint"}
+    no_change_fields = {"input_tokens", "output_tokens", "wall_seconds", "issue"}
+    extra = set(r) - ({"ts", "provider", "account", "model_alias", "exit_class", "run_id",
+                       "reset_hint"} | no_change_fields)
     if extra:
         raise ValueError(f"model-health record has unexpected field(s) {sorted(extra)}")
     if not isinstance(r.get("ts"), int) or isinstance(r.get("ts"), bool):
@@ -409,6 +454,18 @@ def _validate_record(r):
             r.get("reset_hint"), RESET_HINT_MAX_LEN, allow_empty=False,
             grammar=_RESET_HINT_RE):
         raise ValueError("model-health record reset_hint is malformed")
+    present_no_change = set(r) & no_change_fields
+    if r.get("exit_class") != CLASS_NO_CHANGE:
+        if present_no_change:
+            raise ValueError("model-health record has no-change fields on another exit class")
+        return
+    if not _is_bounded_int(r.get("issue"), 1, MAX_ISSUE_NUMBER):
+        raise ValueError("model-health no_change issue is malformed")
+    for field in ("input_tokens", "output_tokens"):
+        if field in r and not _is_bounded_int(r[field], 0, MAX_USAGE_TOKENS):
+            raise ValueError(f"model-health no_change {field} is malformed")
+    if "wall_seconds" in r and not _is_bounded_int(r["wall_seconds"], 0, MAX_WALL_SECONDS):
+        raise ValueError("model-health no_change wall_seconds is malformed")
 
 
 def _per_account_tail_failures(records, window_seconds, now):
@@ -426,7 +483,8 @@ def _per_account_tail_failures(records, window_seconds, now):
             cleared.add(acct)        # clears ITS account only
         elif cls in LAUNCH_FAIL_CLASSES and acct not in cleared:
             tails.setdefault(acct, []).append(r)
-        # a non-launch class (setup / unknown / zero-dispatch) neither counts nor breaks a run
+        # a non-launch class (setup / unknown / raw no_change / zero-dispatch) neither counts nor
+        # breaks a run; only the newest QUALIFIED no_change is derived to limit before this walk
     return tails
 
 
@@ -470,12 +528,55 @@ def parse_reset_hint(hint, record_ts):
     return None
 
 
+def _no_change_limit_view(records, now):
+    """Return (derived_records, evidence_indices_by_account). For each account with at least
+    NO_CHANGE_LIMIT_MIN no_change records across NO_CHANGE_LIMIT_MIN_ISSUES target issues in the
+    rolling window, only its newest qualifying record is viewed as CLASS_LIMIT. The source records
+    remain unchanged; account_backoffs and classify_records consume this derived view, while prune
+    uses the evidence indices to retain the three-record discriminator behind an active backoff."""
+    derived = list(records)
+    candidates = {}
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or record.get("exit_class") != CLASS_NO_CHANGE:
+            continue
+        acct, ts, issue = record.get("account"), record.get("ts"), record.get("issue")
+        if (not isinstance(acct, str)
+                or not isinstance(ts, (int, float)) or isinstance(ts, bool)
+                or ts != ts or ts in (float("inf"), float("-inf"))
+                or (now - ts) > WINDOW_SECONDS or ts > now + FUTURE_SKEW_SECONDS
+                or not _is_bounded_int(issue, 1, MAX_ISSUE_NUMBER)):
+            continue
+        candidates.setdefault(acct, []).append((ts, index, issue))
+
+    evidence = {}
+    for acct, rows in candidates.items():
+        rows.sort()
+        if (len(rows) < NO_CHANGE_LIMIT_MIN
+                or len({issue for _, _, issue in rows}) < NO_CHANGE_LIMIT_MIN_ISSUES):
+            continue
+        newest = rows[-1]
+        different_issue = next(row for row in reversed(rows)
+                               if row[2] != newest[2])
+        chosen = [newest, different_issue]
+        chosen_indices = {newest[1], different_issue[1]}
+        for row in reversed(rows):
+            if len(chosen) >= NO_CHANGE_LIMIT_MIN:
+                break
+            if row[1] not in chosen_indices:
+                chosen.append(row)
+                chosen_indices.add(row[1])
+        evidence[acct] = {row[1] for row in chosen}
+        derived[newest[1]] = dict(derived[newest[1]], exit_class=CLASS_LIMIT)
+    return derived, evidence
+
+
 def account_backoffs(records, now):
     """Reactive per-account backoff for probe-exempt providers (maintainer decision 2026-07-17,
     registry issue #29), DERIVED purely from the pruned health window. Walks records in ts order:
-    a limit/transient (rate-limit) record starts or extends the account's backoff — the provider's
-    parseable reset hint when present, else BACKOFF_BASE_SECONDS doubling per CONSECUTIVE hit —
-    and a SUCCESS record clears the account (multiplier reset). Every duration is clamped to
+    a limit/transient (rate-limit) record, including a derived cross-issue no_change limit, starts
+    or extends the account's backoff — the provider's parseable reset hint when present, else
+    BACKOFF_BASE_SECONDS doubling per CONSECUTIVE hit — and a SUCCESS record clears the account
+    (multiplier reset). Every duration is clamped to
     [record_ts, record_ts + BACKOFF_CAP_SECONDS], and record_ts itself may sit at most
     FUTURE_SKEW_SECONDS ahead of `now` (cross-provider review r2 finding 2: the per-record clamp
     would otherwise let a forged far-future stamp yield a backoff far past the 5 h ceiling —
@@ -501,6 +602,7 @@ def account_backoffs(records, now):
     # Defensive ts-sort (cross-provider review r1): the consecutive/success-reset walk is order-
     # sensitive; the production caller pre-prunes (which sorts), but do not RELY on callers.
     valid.sort(key=lambda r: r["ts"])
+    valid, _ = _no_change_limit_view(valid, now)
     for record in valid:
         acct, cls, ts = record.get("account"), record.get("exit_class"), record.get("ts")
         if cls == SUCCESS:
@@ -522,7 +624,7 @@ def account_backoffs(records, now):
                            # render a saturated count as "x6+", never as an exact "x6".
                            "saturated": consecutive >= BACKOFF_CHAIN_KEEP,
                            "last_signal": cls, "last_ts": int(ts)}
-        # other classes (auth/setup/unknown) neither extend nor clear a backoff
+        # other classes (auth/setup/unknown/raw no_change) neither extend nor clear a backoff
     return {acct: b for acct, b in state.items() if b["backoff_until"] > now}
 
 
@@ -550,6 +652,7 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
       provider-capped    : EVERY enabled account's LATEST limit/success outcome is limit-class.
       zero-dispatch      : >=3 consecutive zero-dispatch ticks (provider == 'fleet').
     """
+    records, _ = _no_change_limit_view(records, now)
     actions = []
     providers = {r["provider"] for r in records if isinstance(r.get("provider"), str)}
 
@@ -1422,6 +1525,33 @@ def _provider_of(body):
 # ---------------------------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------------------------
+_NO_CHANGE_ENVELOPE_PREFIX = "no-change-v1 "
+_NO_CHANGE_ENVELOPE_FIELDS = {
+    "issue": "issue",
+    "input": "input_tokens",
+    "output": "output_tokens",
+    "wall": "wall_seconds",
+}
+
+
+def _parse_no_change_envelope(value):
+    """Decode worker-live.sh's numeric-only handoff through the existing sanitized reset-hint
+    output. The envelope itself is never stored: it is expanded into typed record fields here."""
+    if not isinstance(value, str) or not value.startswith(_NO_CHANGE_ENVELOPE_PREFIX):
+        raise ValueError("model-health no_change telemetry envelope is malformed")
+    pieces = value[len(_NO_CHANGE_ENVELOPE_PREFIX):].split(",")
+    parsed = {}
+    for piece in pieces:
+        key, separator, raw = piece.partition(":")
+        field = _NO_CHANGE_ENVELOPE_FIELDS.get(key)
+        if not separator or field is None or field in parsed or not raw.isascii() or not raw.isdigit():
+            raise ValueError("model-health no_change telemetry envelope is malformed")
+        parsed[field] = int(raw)
+    if "issue" not in parsed:
+        raise ValueError("model-health no_change telemetry envelope has no issue")
+    return parsed
+
+
 def _cmd_record(args):
     # Fail closed on a provider outside the known set (issue #199): the value is catalog-controlled
     # and must never reach the ledger unvalidated. A separate always()-guarded job runs this, so a
@@ -1462,8 +1592,27 @@ def _cmd_record(args):
                   "per-account hash is unsafe; skipping (telemetry must never fail a run)")
             return 0
         account_h = account_hash(handle, salt)
-    record = make_record(args.provider, account_h, args.model_alias, args.exit_class,
-                         args.run_id, time.time(), reset_hint=args.reset_hint)
+    no_change = {field: getattr(args, field, None)
+                 for field in ("input_tokens", "output_tokens", "wall_seconds", "issue")}
+    reset_hint = args.reset_hint
+    if folded_class == CLASS_NO_CHANGE and reset_hint:
+        try:
+            envelope = _parse_no_change_envelope(reset_hint)
+        except ValueError as exc:
+            print(f"::error::model-health record: {exc}")
+            return 1
+        for field, value in envelope.items():
+            if no_change[field] is not None and no_change[field] != value:
+                print(f"::error::model-health record: conflicting no_change {field}")
+                return 1
+            no_change[field] = value
+        reset_hint = None
+    try:
+        record = make_record(args.provider, account_h, args.model_alias, args.exit_class,
+                             args.run_id, time.time(), reset_hint=reset_hint, **no_change)
+    except ValueError as exc:
+        print(f"::error::model-health record: refusing malformed record ({exc})")
+        return 1
     try:
         api = GitHubAPI(os.environ.get("GH_TOKEN") or os.environ.get("REGISTRY_ALERT_TOKEN") or "")
         kept = append_record(api, os.environ["REGISTRY_REPO"], record, time.time())
@@ -1542,6 +1691,10 @@ def main(argv):
     rec.add_argument("--exit-class", required=True)
     rec.add_argument("--run-id", default="")
     rec.add_argument("--reset-hint", default=None)
+    rec.add_argument("--input-tokens", type=int, default=None)
+    rec.add_argument("--output-tokens", type=int, default=None)
+    rec.add_argument("--wall-seconds", type=int, default=None)
+    rec.add_argument("--issue", type=int, default=None)
     rec.set_defaults(func=_cmd_record)
 
     dec = sub.add_parser("decide", help="evaluate the window and upsert/close alerts")
@@ -1568,9 +1721,9 @@ def _self_test():
     salt = "s3cret"
     now = 1_000_000
 
-    def rec(provider, handle, cls, dt=0, model="fable", run="1", reset=None):
+    def rec(provider, handle, cls, dt=0, model="fable", run="1", reset=None, **fields):
         return make_record(provider, account_hash(handle, salt), model, cls, run,
-                           now + dt, reset_hint=reset)
+                           now + dt, reset_hint=reset, **fields)
 
     def fires(actions, condition, provider):
         return any(a["condition"] == condition and a["provider"] == provider and a["fire"]
@@ -1617,12 +1770,37 @@ def _self_test():
     chk("make_record accepts legitimate producer forms",
         make_record("openai", hash_a, "codex", "rate-limit", "16463.2", now,
                     reset_hint="retry-after: 120")["reset_hint"], "retry-after: 120")
+    no_change = make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "16463.2", now,
+                            issue=500, input_tokens=390000, output_tokens=1200,
+                            wall_seconds=78)
+    chk("no_change stores only typed issue + numeric usage/wall evidence",
+        {key: no_change[key] for key in
+         ("exit_class", "issue", "input_tokens", "output_tokens", "wall_seconds")},
+        {"exit_class": CLASS_NO_CHANGE, "issue": 500, "input_tokens": 390000,
+         "output_tokens": 1200, "wall_seconds": 78})
+    chk("no_change rejects non-numeric usage at construction (#500 tripwire)",
+        _raises(lambda: make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                                    issue=500, input_tokens="390000")), True)
+    chk("no_change numeric evidence is bounded and bools are not integers",
+        all((_raises(lambda: make_record(
+                 "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                 issue=500, output_tokens=MAX_USAGE_TOKENS + 1)),
+             _raises(lambda: make_record(
+                 "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                 issue=500, wall_seconds=MAX_WALL_SECONDS + 1)),
+             _raises(lambda: make_record(
+                 "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                 issue=True)))), True)
+    chk("no-change evidence is refused on another exit class",
+        _raises(lambda: make_record("openai", hash_a, "codex", CLASS_LIMIT, "1", now,
+                                    issue=500)), True)
     chk("account_hash needs salt", _raises(lambda: account_hash("acct02", "")), True)
     # exit-class folding
     chk("session-limit -> limit", _decision_class("session-limit"), CLASS_LIMIT)
     chk("rate-limit -> transient", _decision_class("rate-limit"), CLASS_TRANSIENT)
     chk("novel class -> unknown (never outage)", _decision_class("weird"), CLASS_UNKNOWN)
     chk("other -> unknown (not provider-attributable)", _decision_class("other"), CLASS_UNKNOWN)
+    chk("no_change remains distinct until derived", _decision_class("no_change"), CLASS_NO_CHANGE)
     chk("claim-abort counts as a zero-dispatch tick",
         _decision_class("claim-abort"), CLASS_ZERO_DISPATCH)
     chk("success passthrough", _decision_class(SUCCESS), SUCCESS)
@@ -1863,6 +2041,33 @@ def _self_test():
                            rec("openai", "codex01", CLASS_AUTH, dt=50)], now + 100)
     chk("limit class backs off; auth does not clear it",
         (bl.get(ah, {}).get("last_signal"), bl.get(ah, {}).get("consecutive")), (CLASS_LIMIT, 1))
+    # #500: repeated clean exits with no edit become account-side only across task boundaries.
+    # The newest qualifying observation is the ONE derived limit signal fed to this existing
+    # backoff walk; the raw records remain no_change in the ledger.
+    nc_distinct = [rec("openai", "codex01", CLASS_NO_CHANGE, dt=i * 60,
+                       issue=20 + i, input_tokens=300000 + i, output_tokens=1000,
+                       wall_seconds=70) for i in range(3)]
+    ncb = account_backoffs(nc_distinct, now + 180).get(ah, {})
+    chk("3 no_change records on 3 issues back off the account (#500 tripwire)",
+        (ncb.get("last_signal"), ncb.get("last_ts"), ncb.get("backoff_until")),
+        (CLASS_LIMIT, now + 120, now + 120 + BACKOFF_BASE_SECONDS))
+    chk("derived no_change limit reaches normal provider classification",
+        fires(classify_records(nc_distinct, {"openai": {ah}}, now + 180),
+              "provider-capped", "openai"), True)
+    nc_same_issue = [rec("openai", "codex01", CLASS_NO_CHANGE, dt=i * 60,
+                         issue=20, input_tokens=300000, output_tokens=1000,
+                         wall_seconds=70) for i in range(3)]
+    chk("3 no_change records on the SAME issue do not back off (#500 tripwire)",
+        account_backoffs(nc_same_issue, now + 180), {})
+    nc_two = [rec("openai", "codex01", CLASS_NO_CHANGE, dt=i * 60,
+                  issue=20 + i, input_tokens=300000, output_tokens=1000,
+                  wall_seconds=70) for i in range(2)]
+    chk("2 no_change records on distinct issues do not back off (#500 tripwire)",
+        account_backoffs(nc_two, now + 180), {})
+    nc_two_issues = [rec("openai", "codex01", CLASS_NO_CHANGE, dt=i * 60,
+                         issue=(20, 20, 21)[i]) for i in range(3)]
+    chk("3 no_change records across the required 2 issues do back off",
+        account_backoffs(nc_two_issues, now + 180).get(ah, {}).get("last_signal"), CLASS_LIMIT)
     # provider reset hint (machine-safe forms) overrides the exponential default…
     bh = account_backoffs([rec("openai", "codex01", "rate-limit", dt=0, reset="try again in 120 s")],
                           now + 10)
@@ -1956,6 +2161,12 @@ def _self_test():
         account_backoffs(window, now + 1000).get(ah, {}).get("backoff_until"),
         now + BACKOFF_CAP_SECONDS)
     chk("retention keeps the window bounded at MAX_RECORDS", len(window), MAX_RECORDS)
+    nc_window = prune(nc_distinct + flood, now + 500)
+    chk("active derived no_change backoff retains its three-record evidence across the cap",
+        (sum(1 for record in nc_window
+             if record["account"] == ah and record["exit_class"] == CLASS_NO_CHANGE),
+         account_backoffs(nc_window, now + 500).get(ah, {}).get("last_signal")),
+        (3, CLASS_LIMIT))
     # a short consecutive chain is preserved WHOLE, so the doubled multiplier re-derives exactly
     chain = [rec("openai", "codex01", "rate-limit", dt=i * 30) for i in range(3)]
     cb = account_backoffs(prune(chain + flood, now + 500), now + 500)
@@ -2061,6 +2272,14 @@ def _self_test():
     chk("ledger read accepts a producer-shaped reset_hint",
         validate_ledger(_led(exit_class="limit",
                              reset_hint="2026-07-20 14:00 UTC")) is not None, True)
+    chk("ledger read accepts typed no_change evidence",
+        validate_ledger(_led(exit_class=CLASS_NO_CHANGE, issue=500, input_tokens=390000,
+                             output_tokens=1200, wall_seconds=78)) is not None, True)
+    chk("ledger read rejects non-numeric no_change evidence",
+        _raises(lambda: validate_ledger(
+            _led(exit_class=CLASS_NO_CHANGE, issue=500, input_tokens="390000"))), True)
+    chk("ledger read requires issue attribution on no_change",
+        _raises(lambda: validate_ledger(_led(exit_class=CLASS_NO_CHANGE))), True)
 
     # ---- CAS writer against a stub API (create + append + conflict retry) --------------------
     ok = _test_cas(chk) and ok
@@ -2506,9 +2725,9 @@ def _test_record_provider_guard(chk):
             _CountingAPI.put_count += 1
             return {"content": {"sha": "deadbeef"}}
 
-    def _rec(provider, exit_class="auth"):
+    def _rec(provider, exit_class="auth", reset_hint=None):
         return _ap.Namespace(provider=provider, account="", model_alias="fable",
-                             exit_class=exit_class, run_id="1", reset_hint=None)
+                             exit_class=exit_class, run_id="1", reset_hint=reset_hint)
 
     try:
         os.environ.update(REGISTRY_REPO="o/r", WORKER_ACCOUNT_HANDLE="acct01",
@@ -2543,6 +2762,14 @@ def _test_record_provider_guard(chk):
         chk("record accepts fleet claim-abort", _cmd_record(_rec("fleet", "claim-abort")), 0)
         chk("record accepts fleet success", _cmd_record(_rec("fleet", "success")), 0)
         chk("fleet claim-abort+success each write one record", _CountingAPI.put_count, 4)
+        chk("record expands the numeric-only no_change worker handoff",
+            _cmd_record(_rec("openai", "no_change",
+                             "no-change-v1 issue:500,input:390000,output:1200,wall:78")), 0)
+        chk("valid no_change handoff writes one record", _CountingAPI.put_count, 5)
+        chk("record rejects malformed no_change handoff",
+            _cmd_record(_rec("openai", "no_change", "no-change-v1 issue:500,input:not-a-number")),
+            1)
+        chk("malformed no_change handoff writes NO record", _CountingAPI.put_count, 5)
     finally:
         GitHubAPI = real_api
         for k, v in saved.items():

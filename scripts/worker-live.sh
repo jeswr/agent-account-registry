@@ -46,19 +46,25 @@ write_output() {
 # content — tool names come from a fixed allowlist and every value is numeric. Best-effort: a
 # telemetry failure must never fail (or change the exit class of) the model run.
 _extract_usage_telemetry() {
-  local model_log=$1 harness=$2 worker_root=$3
+  local model_log=$1 harness=$2 worker_root=$3 wall_seconds=$4
   local out="$worker_root/usage-telemetry.json"
   [[ -f "$model_log" ]] || return 0
-  python3 - "$model_log" "$harness" "$out" <<'PY' || return 0
+  python3 - "$model_log" "$harness" "$out" "$wall_seconds" <<'PY' || return 0
 import json
 import sys
 
-log_path, harness, out_path = sys.argv[1:]
+log_path, harness, out_path, wall_raw = sys.argv[1:]
 TOOL_ALLOWLIST = ("Read", "Bash", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "Task")
 usage = {}
 cost = None
 turns = None
 tool_counts = {}
+try:
+    wall_seconds = int(wall_raw)
+except ValueError:
+    raise SystemExit(0)
+if wall_seconds < 0:
+    raise SystemExit(0)
 
 
 def take_usage(candidate):
@@ -114,7 +120,8 @@ for line in text.splitlines():
         elif message.get("type") == "token_count":
             take_usage(message)
 
-document = {"harness": harness, "usage": usage, "total_cost_usd": cost,
+document = {"harness": harness, "usage": usage, "wall_seconds": wall_seconds,
+            "total_cost_usd": cost,
             "num_turns": turns, "tool_counts": tool_counts}
 with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(document, handle, sort_keys=True)
@@ -130,6 +137,39 @@ PY
       } >> "$GITHUB_STEP_SUMMARY"
     fi
   fi
+}
+
+# Emit the numeric-only no-change metadata through the existing sanitized reset-hint handoff to
+# the separate no-target-code model_health job. That job expands this envelope into typed ledger
+# fields; the envelope itself is never stored. Missing telemetry stays absent (best effort), while
+# the target issue is always present so same-task repetition cannot masquerade as account capping.
+_no_change_health_envelope() {
+  local telemetry_file=$1 issue_number=$2
+  python3 - "$telemetry_file" "$issue_number" <<'PY'
+import json
+import sys
+
+path, issue_raw = sys.argv[1:]
+if not issue_raw.isascii() or not issue_raw.isdigit() or not 1 <= int(issue_raw) <= 2_147_483_647:
+    raise SystemExit(1)
+try:
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError):
+    document = {}
+
+fields = [("issue", int(issue_raw))]
+usage = document.get("usage") if isinstance(document, dict) else None
+if isinstance(usage, dict):
+    for source, name in (("input_tokens", "input"), ("output_tokens", "output")):
+        value = usage.get(source)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000:
+            fields.append((name, value))
+wall = document.get("wall_seconds") if isinstance(document, dict) else None
+if isinstance(wall, int) and not isinstance(wall, bool) and 0 <= wall <= 7 * 24 * 3600:
+    fields.append(("wall", wall))
+print("no-change-v1 " + ",".join(f"{key}:{value}" for key, value in fields))
+PY
 }
 
 # Shared model launcher for run_model / run_review / run_fix. Builds the hardened container argv
@@ -281,7 +321,8 @@ _run_headless_harness() {
   local claude_tools='Bash,Edit,Read,Write,Glob,Grep'
   [[ "$mutation_mode" == deny ]] && claude_tools='Read,Glob,Grep'
 
-  local rc=0
+  local rc=0 harness_started_at harness_wall_seconds
+  harness_started_at=$(date +%s)
   case "$harness" in
     claude)
       (
@@ -335,7 +376,8 @@ _run_headless_harness() {
       ) || rc=$?
       ;;
   esac
-  _extract_usage_telemetry "$model_log" "$harness" "$worker_root" || true
+  harness_wall_seconds=$(( $(date +%s) - harness_started_at ))
+  _extract_usage_telemetry "$model_log" "$harness" "$worker_root" "$harness_wall_seconds" || true
   if [[ "$rc" -ne 0 ]]; then
     # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
     # model output/credential) so failures are debuggable without leaking secrets.
@@ -466,7 +508,23 @@ run_model() {
   fi
   [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'model created commits; worker requires edits only'
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'model modified forbidden .beads state'
-  [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]] || die 'model produced no repository changes'
+  if [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+    local no_change_envelope
+    no_change_envelope=$(_no_change_health_envelope \
+      "$worker_root/usage-telemetry.json" "$issue_number") ||
+      no_change_envelope="no-change-v1 issue:$issue_number"
+    if [[ -n ${GITHUB_ENV:-} ]]; then
+      {
+        printf 'WORKER_EXIT_CLASS=no_change\n'
+        printf 'WORKER_RESET_HINT=%s\n' "$no_change_envelope"
+      } >> "$GITHUB_ENV"
+    fi
+    { [[ -n ${WORKER_OUTPUT_DIR:-} ]] && printf '%s\n' no_change > "$WORKER_OUTPUT_DIR/exit-class" ; } \
+      2>/dev/null || true
+    { [[ -n ${WORKER_OUTPUT_DIR:-} ]] && printf '%s\n' "$no_change_envelope" > \
+      "$WORKER_OUTPUT_DIR/reset-hint" ; } 2>/dev/null || true
+    die 'model produced no repository changes'
+  fi
   git diff --check
 
   git switch -c "$branch"
@@ -1736,15 +1794,18 @@ non-json noise line
 {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}},{"type":"tool_use","name":"Bash","input":{}},{"type":"tool_use","name":"CustomTool","input":{}}]}}
 {"type":"result","subtype":"success","num_turns":3,"total_cost_usd":0.0421,"usage":{"input_tokens":120,"cache_creation_input_tokens":900,"cache_read_input_tokens":4000,"output_tokens":77}}
 LOG
-  GITHUB_STEP_SUMMARY= _extract_usage_telemetry "$tmp/claude.log" claude "$tmp" >/dev/null
+  GITHUB_STEP_SUMMARY='' _extract_usage_telemetry "$tmp/claude.log" claude "$tmp" 83 >/dev/null
   chk "claude telemetry fields" "$(python3 -c '
 import json
 d = json.load(open("'"$tmp"'/usage-telemetry.json"))
 print(d["usage"]["input_tokens"], d["usage"]["cache_creation_input_tokens"],
       d["usage"]["cache_read_input_tokens"], d["usage"]["output_tokens"],
-      d["total_cost_usd"], d["num_turns"],
+      d["wall_seconds"], d["total_cost_usd"], d["num_turns"],
       d["tool_counts"].get("Read"), d["tool_counts"].get("Bash"), d["tool_counts"].get("other"))')" \
-    "120 900 4000 77 0.0421 3 1 2 1"
+    "120 900 4000 77 83 0.0421 3 1 2 1"
+  chk "no-change handoff contains only issue + numeric usage/wall fields" \
+    "$(_no_change_health_envelope "$tmp/usage-telemetry.json" 503)" \
+    "no-change-v1 issue:503,input:120,output:77,wall:83"
   chk "telemetry withholds transcript" \
     "$(grep -c 'SECRET-TRANSCRIPT-CONTENT' "$tmp/usage-telemetry.json" || true)" "0"
 
@@ -1754,12 +1815,13 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_creation_input_tokens"],
 {"id":"2","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":5}}}}
 {"id":"3","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":22}}}}
 LOG
-  GITHUB_STEP_SUMMARY= _extract_usage_telemetry "$tmp/codex.log" codex "$tmp" >/dev/null
+  GITHUB_STEP_SUMMARY='' _extract_usage_telemetry "$tmp/codex.log" codex "$tmp" 71 >/dev/null
   chk "codex telemetry fields" "$(python3 -c '
 import json
 d = json.load(open("'"$tmp"'/usage-telemetry.json"))
-print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usage"]["output_tokens"])')" \
-    "50 30 22"
+print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"],
+      d["usage"]["output_tokens"], d["wall_seconds"])')" \
+    "50 30 22 71"
 
   # --- reset-hint extraction: CLOSED grammar for every persisted hint (cross-provider r2
   # finding 1) — a time form is kept, but raw tail text (e.g. an account handle echoed by the
