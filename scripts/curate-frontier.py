@@ -270,10 +270,12 @@ def plan_repository(
     repo_labels: set[str],
     automation_logins: set[str],
     close_limit: int = MAX_CLOSES,
+    target_ready: int = TARGET_READY,
 ) -> tuple[list[Mutation], list[str]]:
     """Return a deterministic mutation plan and human-readable skip log for one target."""
     if close_limit < 0:
         raise CuratorError("close limit cannot be negative")
+    _validated_target_ready(target_ready)
     open_issues = sorted((issue for issue in issues if is_open_issue(issue)),
                          key=lambda issue: issue["number"])
     logs: list[str] = []
@@ -344,7 +346,7 @@ def plan_repository(
     current_ready = sum(
         1 for issue in open_issues if "status:ready" in labels_of(issue)
     )
-    depth = max(0, TARGET_READY - current_ready)
+    depth = max(0, target_ready - current_ready)
     in_flight_areas = {
         label
         for issue in open_issues
@@ -392,18 +394,29 @@ def plan_repository(
     stage_options.sort(key=lambda item: (item[0], item[1]))
     selected_areas: set[str] = set()
     stage_actions: list[Mutation] = []
+    area_limited = False
     for _priority, number, area, desired, issue in stage_options:
         if len(stage_actions) >= depth:
             break
         if area in in_flight_areas:
+            area_limited = True
             logs.append(f"skip #{number}: {area} already has in-flight work")
             continue
         if area in selected_areas:
+            area_limited = True
             logs.append(f"skip #{number}: this wave already selected {area}")
             continue
         selected_areas.add(area)
         stage_actions.append(Mutation("stage", number, issue, desired))
         logs.append(f"stage #{number}: {','.join(desired)}")
+
+    if area_limited and len(stage_actions) < depth:
+        resulting_ready = current_ready + len(stage_actions)
+        busy_areas = len(in_flight_areas | selected_areas)
+        logs.append(
+            f"frontier: area-limited at {resulting_ready}/{target_ready} "
+            f"({busy_areas} areas busy)"
+        )
 
     return ec2_actions + close_actions + stage_actions, logs
 
@@ -529,7 +542,27 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
     return closed
 
 
-def load_targets(policy_file: Path, bot_login: str) -> list[tuple[str, set[str]]]:
+def _validated_target_ready(value: Any, repo: str | None = None) -> int:
+    context = f" for {repo}" if repo else ""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 100
+    ):
+        raise CuratorError(f"target_ready{context} must be an integer in [1, 100]")
+    return value
+
+
+def _target_ready_of(repo: str, row: dict[str, Any]) -> int:
+    throughput = row.get("throughput")
+    if throughput is None:
+        return TARGET_READY
+    if not isinstance(throughput, dict):
+        raise CuratorError(f"throughput policy for {repo} must be a table")
+    return _validated_target_ready(throughput.get("target_ready", TARGET_READY), repo)
+
+
+def load_targets(policy_file: Path, bot_login: str) -> list[tuple[str, set[str], int]]:
     try:
         with policy_file.open("rb") as handle:
             document = tomllib.load(handle)
@@ -556,7 +589,7 @@ def load_targets(policy_file: Path, bot_login: str) -> list[tuple[str, set[str]]
         automation = set(bots)
         if bot_login:
             automation.add(bot_login)
-        targets.append((repo, automation))
+        targets.append((repo, automation, _target_ready_of(repo, row)))
     if not targets:
         raise CuratorError("repository policy has no enabled target rows")
     return sorted(targets, key=lambda item: item[0])
@@ -689,6 +722,69 @@ def _self_test() -> int:
                    any(m.kind == "needs-ec2" and m.number == 230 for m in planned)
                    and any(m.kind == "stage" and m.number == 231 for m in planned)))
 
+    # Policy controls the ready-depth target. Thirty distinct eligible areas prove the policy
+    # value reaches the planner instead of leaving the former hard-coded cap of twelve in place.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        policy_file = Path(tmp) / "repos.toml"
+        policy_file.write_text(
+            '[repos."o/scaled"]\n'
+            'enabled = true\n'
+            '[repos."o/scaled".throughput]\n'
+            'target_ready = 30\n'
+            '[repos."o/default"]\n'
+            'enabled = true\n'
+            '[repos."o/default".throughput]\n'
+            'open_pr_alert_threshold = 5\n',
+            encoding="utf-8",
+        )
+        loaded = {
+            repo: (bots, target)
+            for repo, bots, target in load_targets(policy_file, "registry[bot]")
+        }
+        scaled_automation, scaled_target = loaded["o/scaled"]
+        scaled_fixture = []
+        for offset in range(30):
+            area = f"area:scaled{offset}"
+            all_labels.add(area)
+            scaled_fixture.append(issue(
+                300 + offset, f"Improve component{offset} frontier behavior", (area,)
+            ))
+        planned, _ = plan_repository(
+            scaled_fixture, all_labels, scaled_automation, target_ready=scaled_target
+        )
+        checks.append(("policy target_ready=30 stages beyond twelve",
+                       len([m for m in planned if m.kind == "stage"]) == 30))
+        checks.append(("missing target_ready falls back to twelve",
+                       loaded["o/default"][1] == 12))
+
+        for raw, display in (("0", "0"), ('"abc"', '"abc"'), ("250", "250")):
+            policy_file.write_text(
+                '[repos."o/bad"]\n'
+                'enabled = true\n'
+                '[repos."o/bad".throughput]\n'
+                f'target_ready = {raw}\n',
+                encoding="utf-8",
+            )
+            error = ""
+            try:
+                load_targets(policy_file, "registry[bot]")
+            except CuratorError as exc:
+                error = str(exc)
+            checks.append((f"target_ready={display} rejected loudly",
+                           "target_ready" in error and "[1, 100]" in error))
+
+    area_fixture = [
+        issue(400 + offset, f"Improve alpha component{offset} behavior", ("area:alpha",))
+        for offset in range(4)
+    ]
+    planned, logs = plan_repository(
+        area_fixture, all_labels, automation, target_ready=4
+    )
+    checks.append(("area-limited frontier is logged loudly",
+                   len([m for m in planned if m.kind == "stage"]) == 1
+                   and "frontier: area-limited at 1/4 (1 areas busy)" in logs))
+
     ok = all(result for _, result in checks)
     for name, result in checks:
         print(f"  {'ok  ' if result else 'FAIL'} {name}")
@@ -716,17 +812,18 @@ def main() -> int:
     targets = load_targets(Path(args.policy_file), args.bot_login)
     tokens, ambient = load_tokens()
     remaining_closes = MAX_CLOSES
-    for repo, automation_logins in targets:
+    for repo, automation_logins, target_ready in targets:
         owner = repo.split("/", 1)[0]
         token = tokens.get(owner, ambient)
         if not token:
             raise CuratorError(f"no target token for enabled owner {owner}")
         issues, repo_labels = fetch_repository(repo, token)
         mutations, logs = plan_repository(
-            issues, repo_labels, automation_logins, close_limit=remaining_closes
+            issues, repo_labels, automation_logins, close_limit=remaining_closes,
+            target_ready=target_ready,
         )
         print(f"== {repo}: ready={sum('status:ready' in labels_of(i) for i in issues)} "
-              f"target={TARGET_READY} ==")
+              f"target={target_ready} ==")
         for line in logs:
             print(line)
         actual_closes = execute_plan(repo, mutations, token, args.apply)
