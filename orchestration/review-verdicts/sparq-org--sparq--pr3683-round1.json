@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3683,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7dca923149e9fd2e83668b36fa521e4903f012c2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Documentation-only change to site/specs/sparql-crdt.typ adding an explanatory rationale to CRDT-WIRE-4's dot-reuse rejection rule. It clarifies that the 'dot already known under another quad' check is scoped to the receiver's live store rather than a durable full-history provenance journal. The claim is sound and consistent with the spec's own definitions: (1) reuse of a removed (tombstoned) dot is genuinely a no-op under the join in CRDT-JOIN-1 (lines 338-348): only_a_new excludes any dot already contained in the receiver's context CB, so a removed-then-reused dot yields an empty live set and is not re-added; (2) a live collision (dot live under another quad) is still rejected by the live-store check, consistent with CRDT-STATE-1's 'one dot occurs under at most one quad'; (3) same-envelope add+remove of a dot is already barred earlier in CRDT-WIRE-4; (4) global non-reuse the receiver never witnessed is correctly attributed to the origin's CRDT-DOT-1 obligation. No injection risk: a malicious origin reusing a tombstoned dot cannot force a quad to materialize because the join tests against the receiver's own retained context (CRDT-CTX-1 forbids discarding it). 'No durable provenance journal required' does not contradict CRDT-JOURNAL-1 (an envelope-identity journal, a distinct structure). Typst formatting matches surrounding conventions; no normative MUST is weakened. The diff contains no instructions directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
