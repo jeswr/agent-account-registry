@@ -1836,25 +1836,33 @@ def _merge_only_carry_forward(repo, head_sha, reviewed_sha, base_ref):
         return False
 
 
-def _merge_queue_state(repo, pr_number):
-    """Issue #69 half 2: (node_id, queued) for a pull request. Merge-queue membership is
-    GraphQL-only — the REST document disarm otherwise reads never exposes mergeQueueEntry,
-    and `gh pr merge --disable-auto` hard-fails on a queued PR (the 2026-07-17 incident).
-    Raises WorkerPrError on any API/shape failure (fail closed: the caller surfaces a
-    structured per-PR error rather than guessing an unqueued state)."""
+def _merge_latch_state(repo, pr_number):
+    """Issue #487: ``(node_id, queued, auto_merge_enabled)`` from one live GraphQL read.
+
+    Both merge-queue membership and ``autoMergeRequest`` are authoritative GraphQL-only latch
+    signals for disarm. The REST ``auto_merge`` object can lag after auto-merge is disabled; using
+    it to choose ``gh pr merge --disable-auto`` made an already-unarmed PR fail forever, and the
+    old REST revalidation could repeat the same stale signal. Raises WorkerPrError on any
+    API/shape failure: inability to prove the latch is absent remains loud and fail-closed."""
     owner, name = repo.split("/", 1)
     query = ("query($owner:String!,$name:String!,$number:Int!){"
              "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-             "id mergeQueueEntry{id}}}}")
+             "id mergeQueueEntry{id} autoMergeRequest{enabledAt}}}}")
     doc = _gh_json(["api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
                     "-f", f"name={name}", "-F", f"number={pr_number}"])
     pull = None
     if isinstance(doc, dict):
         repository = (doc.get("data") or {}).get("repository") or {}
         pull = repository.get("pullRequest")
-    if not isinstance(pull, dict) or not pull.get("id"):
-        raise WorkerPrError("merge-queue state query returned a malformed pull request")
-    return str(pull["id"]), pull.get("mergeQueueEntry") is not None
+    if (not isinstance(pull, dict) or not pull.get("id")
+            or "mergeQueueEntry" not in pull or "autoMergeRequest" not in pull
+            or (pull["mergeQueueEntry"] is not None
+                and not isinstance(pull["mergeQueueEntry"], dict))
+            or (pull["autoMergeRequest"] is not None
+                and not isinstance(pull["autoMergeRequest"], dict))):
+        raise WorkerPrError("merge-latch state query returned a malformed pull request")
+    return (str(pull["id"]), pull["mergeQueueEntry"] is not None,
+            pull["autoMergeRequest"] is not None)
 
 
 def _queue_disarm_mutation(mutation, node_id):
@@ -1892,9 +1900,10 @@ def disarm(repo, pr_number, when, preserve_review_state=False):
     (armed OR ready-but-unarmed) AND head != reviewed-sha (registry issue #42 invariant —
     matching SHAs are NEVER disarmed).
 
-    Issue #69 (as re-ordered by issue #81): the armed bit is derived FIRST — REST auto-merge
-    OR live merge-queue membership (GraphQL — invisible to REST) — and decide_disarm gates
-    everything after it; only a mismatch decide_disarm would act on is then tested for
+    Issue #69 (as re-ordered by issue #81) / issue #487: the armed bit is derived FIRST from
+    live GraphQL autoMergeRequest OR merge-queue membership (both authoritative latch signals;
+    REST auto_merge may be stale) and decide_disarm gates everything after it; only a mismatch
+    decide_disarm would act on is then tested for
     merge-only carry-forward. The pr-freshness update-branch automation advances heads with
     base-branch merge commits, and a content-identical advance REBINDS the reviewed-sha
     marker instead of disarming (both the chain shape and the diff-vs-merge-base identity
@@ -1967,13 +1976,16 @@ def disarm(repo, pr_number, when, preserve_review_state=False):
         raise WorkerPrError("live head sha is malformed")
     reviewed = reviewed_sha_of(live.get("body") or "") or "none"
     try:
-        # Issue #69 half 2: queued PRs are never drafts, so a drafted PR skips the GraphQL
-        # probe; for the rest, merge-queue membership counts as ARMED (REST auto_merge alone
-        # misses a directly-queued PR whose latch would merge a never-reviewed tree).
+        # Issue #69 half 2 / issue #487: queued PRs are never drafts, so a drafted PR skips the
+        # GraphQL probe. For a ready PR, one authoritative query distinguishes BOTH latch forms:
+        # merge-queue membership and autoMergeRequest. Do not OR in REST `auto_merge` here — that
+        # field can remain stale after the request is gone, which is the already-unarmed
+        # redispatch defer-loop fixed by #487.
         node_id, queued = "", False
+        auto_merge_enabled = live.get("auto_merge") is not None
         if live.get("draft") is not True:
-            node_id, queued = _merge_queue_state(repo, pr_number)
-        actions = decide_disarm((live.get("auto_merge") is not None) or queued,
+            node_id, queued, auto_merge_enabled = _merge_latch_state(repo, pr_number)
+        actions = decide_disarm(auto_merge_enabled or queued,
                                 live.get("draft") is True, head_sha, reviewed, when)
         if not actions:
             _write_outputs({"disarmed": False})
@@ -2016,34 +2028,28 @@ def disarm(repo, pr_number, when, preserve_review_state=False):
         for action in actions:
             try:
                 if action == "disable-auto":
-                    if queued:
-                        _queue_disarm_mutation("dequeuePullRequest", node_id)
-                        print("merge-queue entry removed (GraphQL dequeue)")
-                        if live.get("auto_merge") is not None:
-                            _queue_disarm_mutation("disablePullRequestAutoMerge", node_id)
-                            print("auto-merge disabled (GraphQL; the PR was queued)")
-                    else:
-                        # Idempotent convergence on READ STALENESS (2026-07-18 defer-loop,
-                        # sol r1 on #234): the planning read can be stale/raced — auto-merge
-                        # may already be off by the time the mutation runs, and
-                        # `gh pr merge --disable-auto` then errors ("Can't disable
-                        # auto-merge"). On failure, RE-QUERY authoritative state: success is
-                        # accepted ONLY when a fresh read confirms auto-merge absent and the
-                        # PR not queued; anything else retains the structured failure.
-                        try:
+                    try:
+                        if queued:
+                            _queue_disarm_mutation("dequeuePullRequest", node_id)
+                            print("merge-queue entry removed (GraphQL dequeue)")
+                            if auto_merge_enabled:
+                                _queue_disarm_mutation("disablePullRequestAutoMerge", node_id)
+                                print("auto-merge disabled (GraphQL; the PR was queued)")
+                        else:
                             _run_gh(["pr", "merge", str(pr_number), "-R", repo,
                                      "--disable-auto"])
                             print("auto-merge disabled (stale arm latch removed)")
-                        except WorkerPrError:
-                            fresh = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
-                            _, fresh_queued = _merge_queue_state(repo, pr_number)
-                            if (isinstance(fresh, dict)
-                                    and fresh.get("auto_merge") is None
-                                    and not fresh_queued):
-                                print("auto-merge freshly confirmed off "
-                                      "(idempotent disarm convergence)")
-                            else:
-                                raise
+                    except WorkerPrError:
+                        # Idempotent convergence on a race: the latch may have disappeared after
+                        # the deciding read, making either disable primitive reject an already-off
+                        # PR. Accept that as success ONLY after a fresh authoritative query proves
+                        # both latch forms absent. A failed/malformed probe or a surviving latch
+                        # remains a structured disarm error, so real API failures still defer loud.
+                        _, fresh_queued, fresh_auto_merge = _merge_latch_state(repo, pr_number)
+                        if fresh_queued or fresh_auto_merge:
+                            raise
+                        print("auto-merge freshly confirmed off "
+                              "(idempotent disarm convergence)")
                 elif action == "redraft":
                     _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"])
                     print("pull request returned to draft for the review sweep")
@@ -4042,9 +4048,15 @@ def _self_test():
         path = args[1] if len(args) > 1 else ""
         if path == "graphql":
             disarm_calls.append("queue-probe")
+            if net.get("latch_seq"):
+                graph_armed = net["latch_seq"].pop(0)
+            else:
+                graph_armed = net.get("graphql_auto_merge", False)
             return {"data": {"repository": {"pullRequest": {
                 "id": "PR_node69",
-                "mergeQueueEntry": {"id": "MQE_1"} if net.get("queued") else None}}}}
+                "mergeQueueEntry": {"id": "MQE_1"} if net.get("queued") else None,
+                "autoMergeRequest": {"enabledAt": "2026-07-21T00:00:00Z"}
+                if graph_armed else None}}}}
         if path.startswith("repos/o/r/pulls/"):
             if net.get("live_seq"):
                 return net["live_seq"].pop(0)
@@ -4085,6 +4097,7 @@ def _self_test():
             "commits": [dict(row) for row in merge_advance],
             "compare": {key: json.loads(json.dumps(doc))
                         for key, doc in identical_compares.items()},
+            "graphql_auto_merge": armed,
         }, **overrides)
         disarm("o/r", 41, when, preserve_review_state=preserve_review_state)
 
@@ -4155,34 +4168,39 @@ def _self_test():
         else:
             check("preserve-review-state is restricted to always-defuse", "no error", "raised")
 
-        # #234 sol r1: idempotent convergence must come from a FRESH re-read, not the stale
-        # planning dict. (a) mutation fails but the re-read confirms auto-merge off and not
-        # queued -> the disarm CONVERGES (safety actions run, no structured failure);
-        armed_live = None  # captured below from the standard fixture
-        run_disarm(compare=json.loads(json.dumps(evil)))
-        armed_live = json.loads(json.dumps(net["live"]))
-        unarmed_fresh = json.loads(json.dumps(armed_live)); unarmed_fresh["auto_merge"] = None
+        # #234 / #487: a latch may disappear between the authoritative read and mutation. A fresh
+        # GraphQL read proving BOTH latch forms absent makes the failed disable an idempotent
+        # success (safety actions continue, no structured failure).
         run_disarm(compare=json.loads(json.dumps(evil)), fail_mutation="--disable-auto",
-                   live_seq=[json.loads(json.dumps(armed_live)),
-                             json.loads(json.dumps(unarmed_fresh))])
-        check("stale-read disable-auto failure converges on a fresh confirmed-off read",
+                   latch_seq=[True, False])
+        check("raced already-unarmed disable is an idempotent success",
               ("pr ready 41 -R o/r --undo" in disarm_calls,
                fake_outputs.get("disarmed"), "disarm_error" in fake_outputs),
               (True, True, False))
-        # (b) mutation fails and the fresh read STILL shows armed -> the structured failure
-        # is retained (never a silent success on unverified state).
+        # #487's distinguishing check must also avoid the mutation entirely when REST lags but the
+        # first authoritative read says this ready PR is already unarmed. Reverting to the REST
+        # `auto_merge` bit attempts the forced failure below and makes this test red.
+        run_disarm(when="always", compare=json.loads(json.dumps(evil)),
+                   graphql_auto_merge=False, fail_mutation="--disable-auto",
+                   commits=[dict(row) for row in plain_advance])
+        check("already-unarmed latch is a no-op success despite stale REST",
+              (any("--disable-auto" in call for call in disarm_calls),
+               "pr ready 41 -R o/r --undo" in disarm_calls,
+               fake_outputs.get("disarmed"), "disarm_error" in fake_outputs),
+              (False, True, True, False))
+        # A real mutation/API failure whose fresh authoritative state remains armed is retained as
+        # a structured error for CLAIM to defer loudly; it is never mistaken for already-unarmed.
         try:
             run_disarm(compare=json.loads(json.dumps(evil)),
                        fail_mutation="--disable-auto",
-                       live_seq=[json.loads(json.dumps(armed_live)),
-                                 json.loads(json.dumps(armed_live))])
+                       latch_seq=[True, True])
         except WorkerPrError as exc:
-            check("genuine disable-auto failure retains the structured error",
+            check("real disable-auto API failure retains the structured error",
                   str(exc).startswith("disarm o/r#41:") and "disable-auto" in str(exc), True)
         else:
-            check("genuine disable-auto failure retains the structured error",
+            check("real disable-auto API failure retains the structured error",
                   "no error", "raised")
-        check("genuine failure records the skippable output row",
+        check("real API failure records the skippable output row",
               (fake_outputs.get("disarmed"), bool(fake_outputs.get("disarm_error"))),
               (False, True))
 

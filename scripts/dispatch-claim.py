@@ -1431,13 +1431,17 @@ def _labels(issue):
     return sorted(set(result))
 
 
-def _issue_is_trusted(issue, trusted_bots):
+def _issue_is_trusted(issue, trusted_bots, allow_actions_bot_issues=False):
     """Fail-closed issue-author trust (registry issue #111). Honours the declared
     `trust = "collaborators"` policy mode: an author is trusted iff its association is
     OWNER/MEMBER/COLLABORATOR, OR its login is an EXACT member of `trusted_bots` — the
     policy-controlled allowlist (policy `trusted_bots` unioned with the runtime-resolved worker App
-    `bot_login` at the call site). A bare "[bot]" suffix is NEVER trusted: suffix-matching admitted
-    any unrelated or compromised GitHub App into the dispatch pipeline (the defect this closes)."""
+    `bot_login` at the call site). Issue #487 adds one narrow per-repo opt-in: when
+    `allow_actions_bot_issues` is true, ONLY the exact `github-actions[bot]` login is also trusted.
+    Fork-PR workflows receive read-only tokens and cannot create issues, so that login can author
+    an issue in one of our own repositories only through a workflow controlled by that repository.
+    A bare "[bot]" suffix is NEVER trusted: suffix-matching admitted any unrelated or compromised
+    GitHub App into the dispatch pipeline (the defect this closes)."""
     if not isinstance(issue, dict):
         return False
     # A truthy non-dict `user` (string/list) must DENY, not raise AttributeError — the CLAIM loop
@@ -1447,7 +1451,9 @@ def _issue_is_trusted(issue, trusted_bots):
     association = str(issue.get("author_association", "")).upper()
     return (
         isinstance(author, str)
-        and (association in TRUSTED_ASSOCIATIONS or author in trusted_bots)
+        and (association in TRUSTED_ASSOCIATIONS
+             or author in trusted_bots
+             or (allow_actions_bot_issues and author == "github-actions[bot]"))
     )
 
 
@@ -1564,7 +1570,7 @@ def _open_blockers(repo, body):
     return still_open
 
 
-def _current_issue_matches(repo, item, trusted_bots):
+def _current_issue_matches(repo, item, trusted_bots, allow_actions_bot_issues=False):
     issue = _gh_json(["api", f"repos/{repo}/issues/{item['number']}"])
     if not isinstance(issue, dict) or "pull_request" in issue or issue.get("state") != "open":
         return False, "issue is no longer an open issue"
@@ -1578,7 +1584,7 @@ def _current_issue_matches(repo, item, trusted_bots):
     body = issue.get("body") or ""
     if not isinstance(body, str) or hashlib.sha256(body.encode()).hexdigest() != item["body_sha"]:
         return False, "issue body changed after planning"
-    if not _issue_is_trusted(issue, trusted_bots):
+    if not _issue_is_trusted(issue, trusted_bots, allow_actions_bot_issues):
         return False, "issue is not maintainer/collaborator/allowlisted-bot authored"
     # Issue #102: re-prove the readiness predicate in registry-owned CLAIM code rather than trusting
     # the hostile planner's frontier. `kind:epic` is a non-dispatchable tracking umbrella, and any
@@ -2640,6 +2646,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         trusted_bots = set(policy.get("trusted_bots", []))
         if bot_login:
             trusted_bots.add(bot_login)
+        allow_actions_bot_issues = policy["allow_actions_bot_issues"]
         # [issue #119] Read the routing catalog from the protected default-branch tip CLAIM
         # resolves ITSELF, NOT from repository["target_sha"]: that sha is `git rev-parse HEAD` of
         # the checkout that ran the hostile target planner, so trusting it let target-controlled
@@ -2688,7 +2695,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             # must SKIP that item, not abort the whole dispatch (which would strand the other ready
             # issues and mark the run failed). Global setup errors above still abort as before.
             try:
-                current, reason = _current_issue_matches(repo, item, trusted_bots)
+                current, reason = _current_issue_matches(
+                    repo, item, trusted_bots, allow_actions_bot_issues)
                 if not current:
                     defer_reasons["stale-issue"] += 1
                     print(f"defer {repo}#{number}: {reason}")
@@ -3411,7 +3419,8 @@ def _self_test():
                 "author_association": "MEMBER",
                 "labels": [{"name": name} for name in labels], "body": body}
 
-    def match_with(main_issue, blockers, item, trusted_bots=frozenset()):
+    def match_with(main_issue, blockers, item, trusted_bots=frozenset(),
+                   allow_actions_bot_issues=False):
         def fake(args):
             found = re.search(r"/issues/(\d+)$", args[-1])
             if not found:
@@ -3424,7 +3433,8 @@ def _self_test():
             raise DispatchError(f"blocker #{number} unreadable")
         globals()["_gh_json"] = fake
         try:
-            return _current_issue_matches("example/repo", item, trusted_bots)
+            return _current_issue_matches(
+                "example/repo", item, trusted_bots, allow_actions_bot_issues)
         finally:
             globals()["_gh_json"] = prev_gh_json
 
@@ -3447,6 +3457,37 @@ def _self_test():
     assert ok_bot, "allowlisted bot author must claim"
     denied_bot, denied_reason = match_with(bot_issue, {}, bot_item, frozenset())
     assert not denied_bot and "authored" in denied_reason, denied_reason
+    # Issue #487: an own-workflow issue is admitted ONLY behind this repository's explicit flag.
+    # These go red if the flag leg is removed, defaults permissive, or the exception is widened to
+    # unrelated bots/authors. `github-actions[bot]` is intentionally NOT in trusted_bots here, so
+    # the test exercises the new policy leg rather than the older exact allowlist.
+    actions_body = "drift scanner finding"
+    actions_issue = {
+        "state": "open", "user": {"login": "github-actions[bot]"},
+        "author_association": "NONE",
+        "labels": [{"name": name} for name in ready_labels], "body": actions_body,
+    }
+    actions_item = dict(item102, author="github-actions[bot]",
+                        body_sha=hashlib.sha256(actions_body.encode()).hexdigest())
+    actions_ok, _ = match_with(
+        actions_issue, {}, actions_item, allow_actions_bot_issues=True)
+    assert actions_ok, "actions-bot issue must claim when its repository opts in"
+    actions_off, actions_off_reason = match_with(
+        actions_issue, {}, actions_item, allow_actions_bot_issues=False)
+    assert not actions_off and "authored" in actions_off_reason, actions_off_reason
+    actions_default, actions_default_reason = match_with(actions_issue, {}, actions_item)
+    assert not actions_default and "authored" in actions_default_reason, actions_default_reason
+    outsider_body = "untrusted automation"
+    outsider_issue = {
+        "state": "open", "user": {"login": "third-party[bot]"},
+        "author_association": "NONE",
+        "labels": [{"name": name} for name in ready_labels], "body": outsider_body,
+    }
+    outsider_item = dict(item102, author="third-party[bot]",
+                         body_sha=hashlib.sha256(outsider_body.encode()).hexdigest())
+    outsider_ok, outsider_reason = match_with(
+        outsider_issue, {}, outsider_item, allow_actions_bot_issues=True)
+    assert not outsider_ok and "authored" in outsider_reason, outsider_reason
     # a malformed nested `user` shape DENIES the item on the author leg — it must never surface as
     # an AttributeError, which the per-item DispatchError handler would not catch (whole-run abort)
     mal_issue = {"state": "open", "user": "malformed", "author_association": "MEMBER",
