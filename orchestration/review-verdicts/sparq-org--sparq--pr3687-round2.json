@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3687,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8d5b9b639b7d575422d0f01c5445e375b0b344ec",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The detached fixture declares serde_json = \"1\" and a path dep on sparq-policy with no committed Cargo.lock, so each cold build (PR branches never save the rust-cache since save-if is main-only) resolves semver-compatible transitive deps afresh \u2014 non-deterministic dependency selection under a gate that advertises 'verbatim' evaluator equivalence. Practical impact is low: the compared Decision is produced by the path-pinned sparq-policy and serde_json's object serialization is stable, so a patch bump is very unlikely to change output. Carried over from round 1 where it was flagged as optional; noting it remains open, not blocking.",
+    "file": "site/test/fixtures/policy-evaluator/Cargo.toml",
+    "fix_hint": "Optionally `cargo generate-lockfile` in site/test/fixtures/policy-evaluator and commit the resulting Cargo.lock so the parity gate builds against a pinned dependency set. This also lets Swatinem/rust-cache key its cache on the lock hash.",
+    "severity": "minor",
+    "title": "Parity fixture still commits no Cargo.lock, so serde_json/sparq-policy transitive deps resolve fresh each run"
+   },
+   {
+    "body": "A developer running `npm run test:unit` without a Rust toolchain gets a red suite (spawnSync returns status null, the assert.equal(result.status, 0) fires). This is now documented (README 'needs cargo'), which is acceptable for an equivalence gate, so it is not a blocker. A small DX improvement would preserve the previously pure-JS local run for contributors who only touch site JS while keeping CI (which now provisions cargo) as the authoritative equivalence gate.",
+    "file": "site/test/policy.test.mjs",
+    "fix_hint": "Optionally detect cargo availability (e.g. spawnSync('cargo', ['--version']).status === 0) and, when absent, test.skip the native-equivalence test with a loud skip reason ('cargo not found \u2014 native sparq-policy parity gate skipped; CI enforces it'), while leaving the pure-JS consistency tests running.",
+    "severity": "nit",
+    "title": "Native-equivalence test hard-fails locally when cargo is absent rather than skipping with a loud reason"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves the round-1 blocker and both minors. (1) The prior MAJOR \u2014 npm run test:unit hard-depending on cargo inside the site-e2e 'lint + unit' lane that was documented as toolchain-free with no caching \u2014 is fixed the way the prior fix_hint option (a) prescribed: site-e2e.yml now provisions Rust explicitly (dtolnay/rust-toolchain@sha # stable) and caches the detached fixture workspace (Swatinem/rust-cache, workspaces: site/test/fixtures/policy-evaluator -> target, shared-key site-policy-fixture, save-if main). Both actions are SHA-pinned. (2) The README-vs-yml contradiction is reconciled: the yml comment no longer claims the lane 'needs no Rust toolchain' and instead states Rust is provisioned separately for the parity fixture; README's 'needs cargo' line now agrees. (3) The stdout JSON.parse is wrapped in try/catch surfacing stdout+stderr on failure. Core correctness re-verified: variant.decision is exactly {allow, matched, unmet} \u2014 the same keys main.rs emits via decision.allow/matched_rules/unmet_constraints \u2014 so the native deepEqual (strict, from node:assert/strict) is a genuine evaluator-equivalence comparison, not vacuous; named <urn:rule/...> ids match parse.rs bracketed printing; expandIri is applied identically in the TS request builder and the test harness; value-kind mapping mirrors valueExpr. The policy.ts honesty comment de-caveating ('cannot re-run the Rust evaluator' removed; 'compares allow, rule ids, explanations verbatim') is now accurate because the fixture does re-run sparq_policy::evaluate. The privacy-claims-allow NEGATIVE marker (sq-qhy4) is intact \u2014 no ZK/MPC guarantee claimed. Residual: still no committed Cargo.lock for the parity fixture (low practical impact \u2014 Decision output is deterministic regardless of a serde_json patch bump), and local devs without cargo get a red (now documented) test rather than a skip. Neither blocks.",
+  "verdict": "approve"
+ }
+}
