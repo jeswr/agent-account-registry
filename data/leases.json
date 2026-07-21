@@ -12,16 +12,6 @@
   },
   {
    "account": "acct07",
-   "claim_id": "dca32ab5741e46ffbf4fff210cabb96a",
-   "holder": "review:sparq-org/sparq#3679@dispatch-29851207242.1",
-   "package": "sparq-substrate",
-   "role": "review",
-   "model": "opus",
-   "issued_at": 1784654063,
-   "expires_at": 1784658263
-  },
-  {
-   "account": "acct07",
    "claim_id": "86efe343cb484438a54c3ff7dba1ae39",
    "holder": "review:sparq-org/sparq#3682@dispatch-29851207242.1",
    "package": "sparq-sim",
