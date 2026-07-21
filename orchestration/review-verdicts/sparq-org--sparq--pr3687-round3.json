@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3687,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "37d083b712e4c5ef81365a7d428a35da4485f652",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new detached fixture declares serde_json = \"1\" and a path dep on sparq-policy with no committed Cargo.lock. PR branches never save the Swatinem/rust-cache (save-if is main-only), so each cold CI build resolves semver-compatible transitive deps afresh \u2014 non-deterministic dependency selection under a gate that now advertises verbatim evaluator equivalence. Practical impact is low: the compared Decision is produced by the path-pinned sparq-policy, and serde_json's object serialization is stable, so a patch bump is very unlikely to change the JSON output. Carried over unchanged from round 2 where it was flagged optional; not blocking.",
+    "file": "site/test/fixtures/policy-evaluator/Cargo.toml",
+    "fix_hint": "Optionally `cargo generate-lockfile` in site/test/fixtures/policy-evaluator and commit the resulting Cargo.lock so the parity gate builds against a pinned dependency set, and so Swatinem/rust-cache can key on the lock hash.",
+    "severity": "minor",
+    "title": "Parity fixture commits no Cargo.lock, so serde_json/sparq-policy transitive deps resolve fresh each cold build"
+   },
+   {
+    "body": "A developer running `npm run test:unit` without a Rust toolchain gets a red suite: spawnSync returns status null and the `assert.equal(result.status, 0, ...)` fires. This is documented (README 'needs cargo') and acceptable for an equivalence gate that CI now provisions Rust for, so it is not a blocker. A small DX improvement would preserve a pure-JS local run for contributors who only touch site JS while leaving CI as the authoritative gate. Carried over unchanged from round 2.",
+    "file": "site/test/policy.test.mjs",
+    "fix_hint": "Optionally detect cargo availability (spawnSync('cargo', ['--version']).status === 0) and, when absent, test.skip the native-equivalence test with a loud reason ('cargo not found \u2014 native sparq-policy parity gate skipped; CI enforces it') while leaving the pure-JS consistency tests running.",
+    "severity": "nit",
+    "title": "Native-equivalence test hard-fails locally when cargo is absent instead of skipping with a loud reason"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 upgrades the site policy gate from shape/anchoring-only to a REAL evaluator-equivalence test and corrects a latent representation bug. Verified against the actual crate: (1) parse.rs:128 term_str returns the BARE IRI for a NamedNode, and evaluate() prints rule.id verbatim (eval.rs:427/450/456), so removing the angle brackets from every `matched` id and from the caveat strings (`prohibition urn:rule/deny-mallory matches the request`, `rule urn:rule/... constraint (...) unsatisfied`, `permission urn:rule/... requires undischarged duty ...`) is exactly what the evaluator emits. (2) The caveat is `rule {} constraint ({} {:?} {}) unsatisfied` with rule.id (bare), c.left (String, bare), c.operator (Debug \u2192 Eq/Lteq/IsPartOf), and c.right via Value Display where Iri\u2192`<{s}>` (bracketed) and Str/DateTime\u2192`{s:?}` (quoted) \u2014 so the retained `<urn:purpose/research>` operand and quoted `\"nodeB|nodeC\"`/datetime literals are byte-exact. (3) The new native harness (site/test/fixtures/policy-evaluator + policy.test.mjs) builds the request the walkthrough documents EXACTLY: action/context-left/duty expandIri'd, target/party raw \u2014 one-for-one with requestLine()/expandIri() in policy.ts and with main.rs's value-kind decode \u2014 then assert.deepEqual against the imported variant.decision. This is a genuine, non-vacuous equivalence gate, not a mock. Honesty comments now accurately describe it (the round-2 'cannot re-run the Rust evaluator' caveat is correctly removed); no ZK/MPC/privacy claim is made (sq-qhy4 N/A). Security is clean: array-arg spawnSync (no shell), temp dir removed in finally, workspace-detached fixture. Two round-2 residuals remain and are non-blocking: the fixture commits no Cargo.lock (deterministic Decision output makes drift very unlikely), and the native test hard-fails locally when cargo is absent rather than skipping loudly (documented). Approve.",
+  "verdict": "approve"
+ }
+}
