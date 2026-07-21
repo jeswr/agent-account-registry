@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3674,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a5ae07e29ede2b3ef2bd2899d9ca7cc663af4220",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only update accurately reflects the implemented home-hero graph view: the toggle is gated by graph-shaped completed results, switches between Table and Graph, and lazily renders the node-link view. No correctness, soundness, security, or test-validity issue is introduced by this change.",
+  "verdict": "approve"
+ }
+}
