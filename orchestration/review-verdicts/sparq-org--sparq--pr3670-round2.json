@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3670,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fd626c19acd54aea75941e20ca60beee67ebcdf0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round-2 resolves the sole prior finding: hero-runner.tsx now drops the orphaned `type SparqlTerm` import (verified: SparqlTerm has zero remaining references in that file, and the removed local `XSD` const is likewise unreferenced). The dedup is complete and correct. isNumericLiteral is extracted to site/src/lib/numeric-literal.ts; its imports resolve \u2014 SparqlTerm is re-exported from @/lib/sparq-wasm and XSD = 'http://www.w3.org/2001/XMLSchema#' from @/lib/curie, exactly matching hero-runner's old local const, so URI construction is unchanged. The 13-type NUMERIC_XSD set equals repl-result-cells' prior set; hero-runner's set widens 9->13 (adds byte/unsignedInt/unsignedLong/...), an intentional non-regressing consolidation (all added datatypes are numeric, still gated by Number.isFinite). The `SparqlTerm | undefined` param with `term?.type === 'literal'` guard is safe for all callers (hero-runner passes possibly-undefined row[v]; repl passes term/t) and returns a proper boolean. No orphaned imports remain: repl-result-cells still uses SparqlTerm (line 30) and XSD (line 54); hero-runner uses neither. Change is correct and complete.",
+  "verdict": "approve"
+ }
+}
