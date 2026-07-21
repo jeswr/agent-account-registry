@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "acct01",
-   "claim_id": "ce220cba37ef4bc69ce9ff4f3c5c5edc",
-   "holder": "sparq-org/sparq#3455@29850869587.1",
-   "package": "sparq-canon",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784653060,
-   "expires_at": 1784659360
-  },
-  {
-   "account": "acct01",
    "claim_id": "e334a5416265459d8036c2689ae1171d",
    "holder": "sparq-org/sparq#3460@29850874781.1",
    "package": "sparq-sim",
