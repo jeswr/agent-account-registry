@@ -12,16 +12,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "03a8f153a287406da9ca0c9acf9eba06",
-   "holder": "sparq-org/sparq#3462@29844552511.1",
-   "package": "sparq-crdt",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1784648051,
-   "expires_at": 1784654351
-  },
-  {
-   "account": "acct01",
    "claim_id": "b1595e057d1d442c815213911e200217",
    "holder": "sparq-org/sparq#3644@29844565711.1",
    "package": "sparq-substrate",
