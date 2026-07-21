@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3678,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f755a3cc6dd7ffccb598c25a0453068d247a99db",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new section says an opt-in `expression` module parses contracts, rewrites and evaluates queries, verifies signatures, assembles provenance, and bridges status attestations. However, `crates/sparq-trust/src/expression.rs`, a `pub mod expression`, and an `expression` Cargo feature are absent. The relevant design record identifies sq-6syab.4 as a future module and test target, while this PR adds neither implementation nor tests. Users therefore cannot follow this skill, and the strong claim that response provenance is sufficient for independent verifier re-check has no executable evidence.",
+    "file": "skills/trust-graph/SKILL.md",
+    "fix_hint": "Either remove or clearly label the entire holder-side evaluation subsection as planned/unimplemented design work, avoiding behavioral and sufficiency claims, or include the actual opt-in module/feature plus a non-vacuous real-path test covering fail-closed evaluation and verifier re-check before documenting it as available.",
+    "severity": "major",
+    "title": "Skill documents a nonexistent holder-side evaluation surface as implemented"
+   },
+   {
+    "body": "The module overview adds `expression` as an opt-in holder-side evaluator even though the crate exposes no such module or feature. This is a public surface claim that does not trace to code and makes the README's capability inventory incorrect.",
+    "file": "crates/sparq-trust/README.md",
+    "fix_hint": "Remove this bullet or explicitly mark it as planned under sq-6syab.4 until the feature and implementation land; if implementation is intended in this PR, add the feature/module and corresponding real-path tests.",
+    "severity": "major",
+    "title": "README advertises an unavailable `expression` capability"
+   }
+  ],
+  "progress": null,
+  "summary": "The documentation presents the holder-side trust-expression evaluator as an available opt-in surface, but the PR contains only documentation and the checkout has no expression module or Cargo feature. The cited design record itself lists this implementation as future work in sq-6syab.4. This makes the public usage skill and crate README materially inaccurate and unsupported by any real-path test.",
+  "verdict": "request_changes"
+ }
+}
