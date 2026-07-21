@@ -12,16 +12,6 @@
   },
   {
    "account": "acct01",
-   "claim_id": "2b07e6bd50cb4c939318a1dfb7562881",
-   "holder": "sparq-org/sparq#3664@29850191427.1",
-   "package": "sparq-conformance",
-   "role": "ci",
-   "model": "sol",
-   "issued_at": 1784652501,
-   "expires_at": 1784658801
-  },
-  {
-   "account": "acct01",
    "claim_id": "26ca167a90394907a0a687c8e32a9bfc",
    "holder": "fix:sparq-org/sparq#3679@dispatch-29848858193.1",
    "package": "sparq-substrate",
