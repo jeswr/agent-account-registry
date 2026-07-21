@@ -145,3 +145,39 @@ jobs:
       - name: Deploy GitHub Pages (pinned)
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+
+  # KEEP-ALIVE for the newest scheduled workflows: GitHub's cron registration/delivery for
+  # recently-added workflows is unreliable (observed 2026-07-21: metrics missed 3 consecutive
+  # 15-min slots; curate/conflict-resolver intermittent). This job piggybacks on dashboard's
+  # PROVEN */15 schedule and re-dispatches a listed workflow ONLY when its last run is older
+  # than its own cadence + slack (no-op when the native schedule works — self-retiring).
+  # No secrets, no environment; actions:write scoped to this job for the dispatch POST only.
+  cron-keepalive:
+    name: Re-dispatch stale scheduled workflows (cron-delivery fallback)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch any listed workflow whose last run is stale
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          # workflow-file:stale-threshold-seconds (cadence + slack)
+          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400; do
+            wf="${spec%%:*}"; limit="${spec##*:}"
+            last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
+                   --jq '.workflow_runs[0].created_at // empty' || true)
+            prev=0
+            [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
+            age=$(( now - prev ))
+            if [ "$age" -gt "$limit" ]; then
+              echo "keepalive: ${wf} last ran ${age}s ago (limit ${limit}s) — dispatching"
+              gh api -X POST \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/dispatches" -f ref=master
+            else
+              echo "keepalive: ${wf} fresh (${age}s <= ${limit}s)"
+            fi
+          done
