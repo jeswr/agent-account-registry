@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3672,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6476b47ce0aa813623117dbe08439c6f4fd26a5c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "deriveSelectResultGraph creates an edge between each adjacent pair of bound variables in head-var order (label = target variable name). This adjacency has no SPARQL/RDF semantics: for SELECT ?a ?b ?c the graph is ?a->?b->?c purely because of projection order, and reordering the SELECT clause changes the drawn 'relationships'. The SVG summary calls these 'relationships' and the footer counts them, which could lead a user to read them as RDF predicates. This is a UX/honesty concern for a heuristic visualization, not a correctness bug \u2014 the labels do use the actual variable names, and the view is opt-in.",
+    "file": "gui/app/src/lib/select-result-graph.ts",
+    "fix_hint": "Add a short caption/tooltip (or aria description) stating the graph sketches co-occurrence between adjacent projected columns of the SELECT result, not RDF triples/predicates. Optionally document the projection-order dependence in the module doc-comment so future readers do not mistake it for triple-derived structure.",
+    "severity": "minor",
+    "title": "Edges are projection-column adjacency, not RDF relationships \u2014 order-dependent and potentially misleading"
+   }
+  ],
+  "progress": null,
+  "summary": "Adds a node-link Graph view for entity-shaped SELECT results in the /app workbench, replacing the prior placeholder message. Verified against the real @sparq/client types: SparqlTerm ('uri'|'literal'|'bnode') and SparqlResults match usage; KIND_FILL covers all three kinds; COMMON_PREFIXES maps ex->example.org (so the test's example.com IRIs correctly do NOT abbreviate, making the label assertions accurate). The pure derivation (deriveSelectResultGraph) is correct and its two node:test cases are non-vacuous: entity-shaped rows yield 2 nodes, edge label 'knows', count 2 (bag multiplicity preserved via edge.count); the literal-only aggregate row is correctly declined to null via the 'no non-literal node' guard. Node cap (MAX=24) + allNodes/truncated accounting is consistent, and edges to capped-out (null-id) terms are skipped. Wiring is sound: React.lazy + Suspense in a 'use client' component, outcome.results is the same SparqlResults SelectTable consumes, React is imported. package.json test:unit was updated to include the new test, and a Playwright e2e was added. No security concern: values render as React/SVG text nodes (escaped), no dangerouslySetInnerHTML. No engine/soundness surface touched. One non-blocking minor: edges are derived from SELECT projection-column adjacency (no SPARQL semantics), so reordering projected vars changes the graph; labels honestly use variable names but a caption clarifying it is a column-adjacency sketch (not RDF predicates) would avoid misleading users.",
+  "verdict": "approve"
+ }
+}
