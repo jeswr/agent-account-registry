@@ -1,0 +1,123 @@
+# Issue #472: bounded mechanical repair for fleet PRs whose default-branch mergeability is DIRTY.
+# PR trees are untrusted: the resolver never runs target code, tests, or hooks while holding this
+# push-capable token. It parses only changed Python/YAML syntax; normal target CI owns semantics.
+name: conflict-resolver
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Explicit off-peak minutes mirror dispatch's throttling-resistant cron convention. The :01
+    # offset avoids dispatch (:03/:13/...) and groom (:07/:22/...) maintenance contention.
+    - cron: '1,21,41 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: registry-conflict-resolver
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Rebase merge-conflicting fleet PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # REGISTRY_ADMIN_APP_ID/KEY live in the default-branch-restricted environment used by the
+    # existing dispatch/groom privileged crons. That server-side policy rejects a manual dispatch
+    # of a modified non-default-branch workflow before either mint can read the secrets.
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the syntax-only YAML parser
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      # Reuse the same authoritative policy-derived per-owner target scopes as groom.yml. Static
+      # mint steps fail loudly if policy gains an owner before this workflow gains its mint.
+      - name: Resolve enabled target repos per owner from policy
+        id: owners
+        run: |
+          set -euo pipefail
+          python3 scripts/groom.py --print-owner-repos --policy-file policy/repos.toml \
+            | tee -a "$GITHUB_OUTPUT"
+
+      # A missing installation for one owner skips that owner's repositories without starving the
+      # other owner. The resolver reports every such repository skip in its final summary.
+      - name: Mint sparq-org conflict-resolver App token (pinned)
+        id: target-token-sparq
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: sparq-org
+          repositories: ${{ steps.owners.outputs.sparq_names }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Mint jeswr conflict-resolver App token (pinned)
+        id: target-token-jeswr
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: ${{ steps.owners.outputs.jeswr_names }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Self-test, scan, and repair at most five PRs
+        env:
+          SPARQ_TOKEN: ${{ steps.target-token-sparq.outputs.token }}
+          JESWR_TOKEN: ${{ steps.target-token-jeswr.outputs.token }}
+          SPARQ_MINT_OUTCOME: ${{ steps.target-token-sparq.outcome }}
+          JESWR_MINT_OUTCOME: ${{ steps.target-token-jeswr.outcome }}
+          APP_SLUG: ${{ steps.target-token-sparq.outputs.app-slug || steps.target-token-jeswr.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          [[ -z "${SPARQ_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$SPARQ_TOKEN"
+          [[ -z "${JESWR_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$JESWR_TOKEN"
+          if [[ "${SPARQ_MINT_OUTCOME:-}" == "success" && -z "${SPARQ_TOKEN:-}" ]]; then
+            echo "::error::sparq-org token mint succeeded but no token reached this step"
+            exit 1
+          fi
+          if [[ "${JESWR_MINT_OUTCOME:-}" == "success" && -z "${JESWR_TOKEN:-}" ]]; then
+            echo "::error::jeswr token mint succeeded but no token reached this step"
+            exit 1
+          fi
+          [[ -n "${APP_SLUG:-}" ]] || { echo '::error::no target App token was minted'; exit 1; }
+          TARGET_GH_TOKENS="$(python3 - <<'PY'
+          import json
+          import os
+
+          tokens = {}
+          if os.environ.get("SPARQ_TOKEN"):
+              tokens["sparq-org"] = os.environ["SPARQ_TOKEN"]
+          if os.environ.get("JESWR_TOKEN"):
+              tokens["jeswr"] = os.environ["JESWR_TOKEN"]
+          print(json.dumps(tokens, separators=(",", ":")))
+          PY
+          )"
+          export TARGET_GH_TOKENS
+          python3 scripts/resolve-conflicts.py --self-test
+          python3 scripts/resolve-conflicts.py \
+            --apply \
+            --policy-file policy/repos.toml \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --bot-slug "$APP_SLUG" \
+            --max-rebases 5 \
+            --workspace "$RUNNER_TEMP/conflict-resolver"
