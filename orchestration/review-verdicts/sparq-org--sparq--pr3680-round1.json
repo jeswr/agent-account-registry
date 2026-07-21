@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3680,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "03f9f3efa47847b5a5f26521ade6e7d8075264cb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "MaterializeStats::strata_facts is a single public field, but its entries no longer count the same thing across systems. materialize_wac still records `vec![closure.len()]` \u2014 the interned closure size AFTER RDF list expansion. materialize_acp_with now records closure.strata_facts, which reason_n3_stratified computes as `f.all.len()` \u2014 the term-level closure size BEFORE list expansion/interning. When a closure contains RDF list values these counts diverge, so a consumer comparing WAC vs ACP strata_facts (or ACP values before/after this PR) is comparing pre- and post-expansion numbers under one field name. The field is documented as purely informational (logging/benchmarking) and the per-stratum note was added, so this is not a correctness bug \u2014 but the cross-system inconsistency is a subtle honesty wrinkle in the public API surface.",
+    "file": "crates/sparq-solid/src/materialize.rs",
+    "fix_hint": "Either make WAC consistent (record the term-level count too, e.g. have materialize_wac go through a single-stratum reason_n3_stratified so both report pre-expansion sizes) or explicitly document on MaterializeStats::strata_facts that WAC entries are post-interning counts while ACP entries are pre-expansion term-level counts, so the two are not directly comparable. No change required to merge; informational field only.",
+    "severity": "minor",
+    "title": "strata_facts now mixes counting semantics across systems (WAC interned vs ACP term-level)"
+   }
+  ],
+  "progress": null,
+  "summary": "Behavior-preserving (and slightly more sound) refactor of materialize_acp_with: replaces three separate reason_n3 calls seeded by serialize/reparse (closure_to_n3) with a single reason_n3_stratified run that carries each stratum's closure forward in memory. Verified equivalence: the cumulative carry (A -> A+B -> A+B+C) matches the old f1/f2 chaining; COMMON_RULES placement is unchanged (stratum A only); intermediate strata run at Term level and only the FINAL closure is interned into `dict`, matching the old isolated d3; install_auth_view still receives the full final closure and filters to auth:* regardless. The in-memory path additionally preserves formula-valued facts a text round-trip would drop, with careful per-stratum blank-node isolation (fresh_carry_prefix + stratum_blanks). Test coverage is strong and non-vacuous: reason_n3_stratified has dedicated tests for the exact ACP-motivating cases (NAF sees earlier strata complete with a single-document counterexample proving why stratification is needed, aggregation over a derived predicate, allOf collapse, per-stratum blank scope, two label-collision regressions) plus a single-stratum == reason_n3 equivalence test; sparq-solid/tests/acp.rs exercises real materialize_acp/accessible/provenance/fail-closed paths. Honesty checks out: intern_closure genuinely expands RDF lists into rdf:first/rest chains, so the new doc note that strata_facts is a term-level count 'before RDF list expansion and interning' is accurate; SKILL.md and the field docs are updated truthfully with no overclaim. Removed closure_to_n3 and the now-unused `std::fmt::Write` import cleanly; reason_n3 remains used by the WAC path. One minor: strata_facts now mixes counting semantics within the same public field (WAC keeps interned post-expansion counts, ACP switches to term-level pre-expansion counts) \u2014 purely informational and documented per-system, not blocking.",
+  "verdict": "approve"
+ }
+}
