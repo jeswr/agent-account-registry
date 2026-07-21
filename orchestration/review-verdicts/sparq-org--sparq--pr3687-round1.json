@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3687,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "97db55551daf5779bf73f09e1fbf2d3eb9af1f44",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new test spawns `cargo run ... test/fixtures/policy-evaluator/Cargo.toml` and asserts `result.status === 0`. If `cargo` is not on PATH, spawnSync returns status null and the entire node:test unit suite goes red, not skipped. This lane is the site-e2e workflow's 'lint + unit' job, whose own comment states it needs no Rust/wasm-pack toolchain, exactly as before \u2014 this PR silently breaks that invariant. It happens to work today only because GitHub's ubuntu-latest image ships stable Rust by default; that is an undocumented implicit the change now relies on. It also converts a previously fast pure-JS unit suite into one that cold-compiles a Rust crate (and, via the root rust-toolchain pin discovered by walking up from the fixture dir, may trigger a rustup toolchain download) with NO cargo build caching in that job, adding minutes on every run toward the 20-minute timeout. Local devs without a Rust toolchain now get a red `npm run test:unit`.",
+    "file": "site/test/policy.test.mjs",
+    "fix_hint": "Either (a) make the CI integration explicit and cached: add a Rust toolchain + cargo cache (e.g. Swatinem/rust-cache) step to the site-e2e 'lint + unit' job and update the now-false 'this lane needs no Rust/wasm-pack toolchain' comment; or (b) preserve the pure-JS-by-default property by detecting cargo availability and `test.skip`-ing the native-equivalence test (with a loud skip reason) when it is absent, while ensuring the CI lane that IS the equivalence gate provisions cargo. Do not leave the suite silently reliant on the default image shipping cargo.",
+    "severity": "major",
+    "title": "Unit suite now hard-depends on `cargo`, hard-fails (not skips) when absent, in a lane documented as toolchain-free"
+   },
+   {
+    "body": "The README now documents `test:unit` as 'node:test helpers + native sparq-policy parity fixture (needs cargo)', but .github/workflows/site-e2e.yml still carries a comment asserting the unit lane 'needs no Rust/wasm-pack toolchain, exactly as before'. Given this repo's honesty-first doc discipline, the two sources of truth about the same job now disagree.",
+    "file": "site/README.md",
+    "fix_hint": "Reconcile the docs: update the site-e2e.yml comment to reflect that the unit lane now requires cargo (and any toolchain/cache step added per the major finding), so the workflow comment and the README agree.",
+    "severity": "minor",
+    "title": "README 'needs cargo' line contradicts the still-standing site-e2e.yml toolchain-free comment"
+   },
+   {
+    "body": "JSON.parse(result.stdout) assumes the only thing on the child's stdout is the fixture's single JSON line. `cargo run --quiet` routes build/compile output to stderr so this holds in practice, but any future non-quiet path or a stray stdout emission would make the parse throw with an opaque error rather than a diagnostic assertion. Separately, the detached fixture workspace commits no Cargo.lock, so serde_json/sparq-policy transitive deps resolve fresh (semver-compatible) on each run \u2014 non-deterministic dependency selection for a gate that claims verbatim equivalence.",
+    "file": "site/test/policy.test.mjs",
+    "fix_hint": "Wrap the JSON.parse in a try/catch that surfaces result.stdout+stderr on failure for diagnosability; optionally commit a Cargo.lock for the fixture (or pin exact deps) so the parity gate builds deterministically.",
+    "severity": "minor",
+    "title": "stdout JSON parse assumes cargo emits nothing to stdout; no committed Cargo.lock for the fixture"
+   }
+  ],
+  "progress": null,
+  "summary": "The PR upgrades the site policy walkthrough test from a JS shape/consistency gate to a real equivalence gate: a new detached native fixture (site/test/fixtures/policy-evaluator) runs the actual sparq_policy::evaluate on each scenario's exact Turtle/request pair and policy.test.mjs deepEquals the emitted Decision against the captured src/lib/policy.ts values. Core correctness is sound: the fixture's Value constructors, Request builder chain (new/on/by/with/discharge), and Decision field reads (allow/matched_rules/unmet_constraints) match the crate API; the JSON keys map to the TS Decision shape; named-IRI rule ids print with <> brackets (parse.rs:118) matching the captured decisions; valueKind in the test mirrors valueExpr in policy.ts; the fixture's empty [workspace] + publish=false detaches it from the root workspace (whose members list is explicit, so no build conflict); and the comment de-caveating is HONEST (the suite now genuinely re-runs Rust, so dropping the 'cannot re-run the evaluator / shape-only' caveat is accurate, not overclaim). The test is not vacuous. The blocking gap is CI/portability integration completeness: the change makes `npm run test:unit` hard-depend on `cargo` compiling sparq-policy, but the site-e2e lane that runs it is explicitly documented as toolchain-free and adds no cargo caching, and the new README line contradicts that standing workflow comment. See issues.",
+  "verdict": "request_changes"
+ }
+}
