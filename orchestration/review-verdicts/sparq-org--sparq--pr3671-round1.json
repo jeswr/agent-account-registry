@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3671,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0d908c5b6445e26eb87c05eb2aea8d9e040584e5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The extractor writes `SKIP unexpected envelope name: ...` to stderr when a recovered name fails the allowlist, but the caller invokes it with `2>/dev/null`, so an operator recovering results from a console dump would never see that an envelope was silently dropped. This mirrors the prior inline behavior and the call is a best-effort backstop guarded by `|| true`, so it is non-blocking.",
+    "file": "scripts/bench/canonical-materialize-bench.sh",
+    "fix_hint": "Consider dropping `2>/dev/null` on this specific call (keeping `|| true`) so the SKIP lines surface, or tee them to the run log, to make silently-skipped envelopes visible during a console recovery.",
+    "severity": "nit",
+    "title": "2>/dev/null on the extractor call swallows the allowlist SKIP diagnostics"
+   }
+  ],
+  "progress": null,
+  "summary": "Refactor extracting the inline awk envelope-extractor from canonical-materialize-bench.sh into a standalone scripts/bench/extract-console-envelopes.sh, plus a filename allowlist. Verified against the producer (canonical-materialize-gather-instance.sh:197) which emits `===ENVELOPE-BEGIN <basename>.json===` with no space before the closing `===` \u2014 the new parsing (strip `.*===ENVELOPE-BEGIN `, then `sub(/===.*$/)`) recovers the exact `foo.json` basename. This also fixes a latent bug: the old `name=$2` produced `foo.json===` names that would not match a downstream `*.json` glob. Security is improved: the added allowlist `^[A-Za-z0-9][A-Za-z0-9._-]*\\.json$` (no slashes, no leading dot/dash) prevents a hostile serial-console dump from steering the awk `> f` redirection outside gather-out/ (path traversal). CR stripping, mkdir -p relocation into the extractor, SCRIPT_DIR via BASH_SOURCE, and executable mode 100755 are all correct; the caller still guards with `|| true`. No behavioral regression. No test is added, but this is a best-effort EC2 recovery shell script not under the test harness \u2014 acceptable. Authorship markers in comments are not injection.",
+  "verdict": "approve"
+ }
+}
