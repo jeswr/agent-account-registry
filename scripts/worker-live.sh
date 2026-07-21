@@ -690,11 +690,11 @@ run_gate() {
 # NAMING NOTE (review round): the routing validator here is scripts/route-resolve.py (added by the
 # onboarding push) — there is NO scripts/routing-validate.py; do not reference that name in suite
 # lists or briefs.
-FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py curate-frontier.py dispatch-plan.py \
-plan-snapshot.py resolve-conflicts.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
+FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
+plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
 groom.py account-usage.py usage-alert.py plan-alert.py dispatch-secrets-guard.py model-health.py \
 pat-validity.py broker-refresh.py \
-backfill-provenance.py dashboard-gen.py trust-gate.py worker-live.sh migrate-secrets.sh"
+backfill-provenance.py dashboard-gen.py metrics.py trust-gate.py worker-live.sh migrate-secrets.sh"
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the

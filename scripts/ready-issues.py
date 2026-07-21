@@ -69,15 +69,15 @@ def is_busy(labels):
     return bool(labels & BUSY_STATUS)
 
 
-def compute_ready(issues, in_progress_packages=None):
-    """Conflict-free, priority-ordered, FAIL-CLOSED ready frontier."""
-    taken = set(in_progress_packages or ())
-    for it in issues:
-        if str(it.get("state", "OPEN")).upper() != "OPEN":
-            continue
-        L = labels_of(it)
-        if "status:in-progress" in L or "status:in-progress-review" in L:
-            taken |= packages_of(L)
+def ready_candidates(issues):
+    """Every issue that passes the FAIL-CLOSED readiness LABEL gate (open + status:ready + exactly
+    one priority + a role + no gate/busy label + zero open blockers), priority-then-number ordered.
+
+    This is the DRAINABLE set — every issue a fleet could work through — BEFORE the conflict-free
+    one-per-package concurrency serialization that compute_ready() layers on top. The two answer
+    different questions: this is 'how much ready work exists'; compute_ready() is 'how many can be
+    claimed RIGHT NOW without a package collision'. Throughput/backlog metrics want THIS count, not
+    the concurrency width (see metrics.py issues_ready)."""
     cands = []
     for it in issues:
         if str(it.get("state", "OPEN")).upper() != "OPEN":
@@ -98,6 +98,20 @@ def compute_ready(issues, in_progress_packages=None):
             continue
         cands.append((p, it.get("number", 0), it, packages_of(L)))
     cands.sort(key=lambda c: (c[0], c[1]))   # priority then number (deterministic)
+    return cands
+
+
+def compute_ready(issues, in_progress_packages=None):
+    """Conflict-free, priority-ordered, FAIL-CLOSED ready frontier (one-per-package concurrency
+    width). This is NOT the count of drainable work — see ready_candidates() for that."""
+    taken = set(in_progress_packages or ())
+    for it in issues:
+        if str(it.get("state", "OPEN")).upper() != "OPEN":
+            continue
+        L = labels_of(it)
+        if "status:in-progress" in L or "status:in-progress-review" in L:
+            taken |= packages_of(L)
+    cands = ready_candidates(issues)
     ready = []
     for _p, _n, it, pkgs in cands:
         if GLOBAL in taken:                  # cross-cutting work in flight -> nothing else co-runs
@@ -143,6 +157,14 @@ def _self_test():
     ready = compute_ready(F)
     # eligible: 2(P0 worker),3(P1 dispatch),12(P1 groom) then 11(P4 global blocked — board taken).
     check("ready order", [i["number"] for i in ready], [2, 3, 12])
+    # DRAINABLE candidates: the label-gate set BEFORE package serialization — includes issue 1
+    # (P2 worker) which compute_ready() drops only because 2 already took the `worker` package,
+    # and 11 (global) which the frontier drops only because the board is taken. This is the count
+    # the throughput metric wants — it must NOT collapse to the concurrency width.
+    check("ready_candidates is the drainable set (not the concurrency width)",
+          sorted(c[2]["number"] for c in ready_candidates(F)), [1, 2, 3, 11, 12])
+    check("ready_candidates >= compute_ready (serialization only shrinks)",
+          len(ready_candidates(F)) >= len(ready), True)
     # B2: a needs:design issue with an otherwise-perfect ready label-set is NEVER ready.
     check("needs:design gated (B2)", 40 in [i["number"] for i in ready], False)
     check("is_gated needs:design (B2)", is_gated({"needs:design", "status:ready"}), True)

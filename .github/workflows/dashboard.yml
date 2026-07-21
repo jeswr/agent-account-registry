@@ -118,6 +118,12 @@ jobs:
           python3 scripts/dashboard-gen.py --usage "$RUNNER_TEMP/usage.json" \
             --leases ledger/data/leases.json --model-health ledger/data/model-health.json \
             --observability ledger/data/observability.json
+          # metrics.yml CAS-publishes the optional snapshot under the ledger's whitelisted data/
+          # plane. This build publishes it at the panel's site-relative path and still owns the one
+          # and only Pages deploy; absence keeps the panel hidden until its first snapshot.
+          if [[ -f ledger/data/metrics.json ]]; then
+            cp ledger/data/metrics.json site/metrics.json
+          fi
 
       - name: Upload GitHub Pages artifact (pinned)
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1

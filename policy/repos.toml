@@ -47,6 +47,30 @@
 #                              it with the runtime-resolved worker App `bot_login`, so the pipeline's
 #                              own App bot needs NO entry here; list ONLY additional trusted bots.
 #                              Suffix-matching "<x>[bot]" is gone — an unlisted bot is never trusted.
+#
+# [FABLE-5] Optional per-target THROUGHPUT alert thresholds (consumed by scripts/metrics.py; the
+# defaults live in metrics.DEFAULT_THRESHOLDS so an omitted [repos.*].throughput table just uses
+# them). metrics.py collects, per ENABLED target, the maintainer's 6 asks — issues open / ready to
+# drain (via each target's REAL readiness definition, NOT a label count) / drained last hour, PRs
+# open, PR open-rate, PR close/merge-rate — plus derived net_pr_flow + review_lane_health, appends
+# each snapshot to a bounded ring on the `ledger` branch (LEDGER_REF, data/metrics-history.json),
+# and upserts ONE deduped `throughput-alert` issue per (target, classification) when a SUSTAINED
+# backlog-growth-vs-drain condition holds. Classifications: backlog-growing | review-lane-stalled |
+# ready-starved | worker-failing. All fields optional; each must be the type shown:
+#   [repos."owner/name".throughput]
+#   open_pr_alert_threshold = positive int (default 20)   # backlog-growing needs prs_open above this
+#   ready_alert_threshold   = positive int (default 40)   # ready-starved needs issues_ready above this
+#   sustain_snapshots       = positive int (default 2)    # K: recent snapshots that must AGREE for
+#                                                         #   ANY of the four rules (all are sustained)
+#   worker_success_floor    = float in [0,1] (default 0.5)# worker-failing below this with attempts
+#   worker_min_samples      = positive int (default 3)    # worker-failing needs >= this many attempts
+#                                                         #   (a single failed run is noise, not a fail)
+#   recover_snapshots       = positive int (default 2)    # hysteresis: auto-close only after the
+#                                                         #   condition is clear this many ticks
+# Optional per-target readiness override (defaults by repo — sparq: status:ready engine via
+# ready-issues.py; registry: its own open `from:agent` backlog):
+#   [repos."owner/name".readiness]
+#   kind = "status-ready" | "from-agent-open"
 
 [repos."sparq-org/sparq"]
 enabled = true
@@ -63,6 +87,16 @@ trust = "collaborators"
 max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total (see header)
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
 cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade
+
+# [FABLE-5] Throughput alert thresholds (scripts/metrics.py). sparq is a large, fast repo, so the
+# backlog bar sits above a healthy steady-state (dozens of open + draft PRs is normal); the alert
+# is for GROWTH-with-no-drain, which the 2026-07-18T09:10Z snapshot already trips (52 open PRs,
+# open-rate 5/hr, close-rate 0/hr, 0 merges this hour despite 51 in 24h => review lane stalled).
+[repos."sparq-org/sparq".throughput]
+open_pr_alert_threshold = 40   # backlog-growing needs open PRs above this AND close-rate < open-rate
+ready_alert_threshold   = 60   # ready-starved needs this many ready issues AND 0 closed in 1h
+sustain_snapshots       = 2    # anti-spike: 2 consecutive */15 ticks must agree (~30 min)
+worker_success_floor    = 0.5  # worker-failing below 50% success with any worker attempts this hour
 
 # [OPUS-4.8] The registry as a SECOND self-managed target — its OWN pipeline drains its own
 # ~19 open from:agent issues (triage -> ready -> worker -> draft PR -> cross-provider review ->
@@ -92,6 +126,19 @@ trust = "collaborators"
 max_review_rounds = 3
 review_queue_ttl_minutes = 30
 cross_provider_fallback = false
+
+# [FABLE-5] Throughput alert thresholds (scripts/metrics.py). The trust plane drains slowly (small
+# max_concurrent) so its healthy backlog is much smaller — a lower open-PR bar. Its readiness is
+# its own open `from:agent` backlog (readiness.kind below), not the sparq status:ready engine.
+[repos."jeswr/agent-account-registry".throughput]
+open_pr_alert_threshold = 12   # a growing PR backlog is abnormal for the slow-drain trust plane
+ready_alert_threshold   = 30   # a large un-drained from:agent frontier with 0 closed in 1h
+sustain_snapshots       = 2
+worker_success_floor    = 0.5
+
+[repos."jeswr/agent-account-registry".readiness]
+kind = "from-agent-open"       # the registry drains its OWN open from:agent issues (its backlog)
+
 # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE, WIRED trust-surface FILE control. A worker PR whose
 # diff touches ANY of these gate-weakening / orchestration-control paths routes its ARM to a HUMAN
 # even for a benign-labelled PR (area:docs/haiku etc.). CONSUMED by review-fix.yml: the review-
