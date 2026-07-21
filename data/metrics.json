@@ -1,38 +1,38 @@
 {
-  "generated_at": "2026-07-21T15:35:00Z",
+  "generated_at": "2026-07-21T16:01:48Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1114,
-      "issues_ready": 20,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 9,
-      "prs_open": 82,
-      "prs_draft": 54,
-      "prs_opened_1h": 1,
+      "issues_open": 1113,
+      "issues_ready": 18,
+      "issues_closed_1h": 1,
+      "issues_closed_24h": 10,
+      "prs_open": 83,
+      "prs_draft": 55,
+      "prs_opened_1h": 3,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 0,
-      "prs_merged_24h": 5,
-      "review_changes_backlog": 23,
+      "prs_merged_1h": 1,
+      "prs_merged_24h": 6,
+      "review_changes_backlog": 24,
       "needs_user_parked": 11,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 1,
-      "worker_attempts_1h": 1,
-      "worker_success_rate_1h": 1.0,
-      "pr_open_rate": 1.0,
-      "pr_close_rate": 0.0,
-      "net_pr_flow": 1.0
+      "review_lane_runs_1h": 4,
+      "worker_attempts_1h": 15,
+      "worker_success_rate_1h": 0.2667,
+      "pr_open_rate": 3.0,
+      "pr_close_rate": 1.0,
+      "net_pr_flow": 2.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 217,
+      "issues_open": 216,
       "issues_ready": 73,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 1,
+      "issues_closed_1h": 1,
+      "issues_closed_24h": 2,
       "prs_open": 21,
       "prs_draft": 20,
-      "prs_opened_1h": 4,
+      "prs_opened_1h": 1,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 5,
+      "prs_merged_1h": 3,
       "prs_merged_24h": 11,
       "review_changes_backlog": 9,
       "needs_user_parked": 9,
@@ -40,20 +40,22 @@
       "review_lane_runs_1h": 0,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
-      "pr_open_rate": 4.0,
-      "pr_close_rate": 5.0,
-      "net_pr_flow": -1.0
+      "pr_open_rate": 1.0,
+      "pr_close_rate": 3.0,
+      "net_pr_flow": -2.0
     }
   },
   "alerts": [
     {
-      "target": "jeswr/agent-account-registry",
-      "classification": "ready-starved",
+      "target": "sparq-org/sparq",
+      "classification": "backlog-growing",
       "fire": true,
-      "summary": "ready frontier 73 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "open PRs 83 > 40 and net PR flow +2.0/hr (open 3.0 > close 1.0) sustained over 2 snapshots",
       "metrics": {
-        "issues_ready": 73,
-        "issues_closed_1h": 0
+        "prs_open": 83,
+        "net_pr_flow": 2.0,
+        "pr_open_rate": 3.0,
+        "pr_close_rate": 1.0
       }
     }
   ]
