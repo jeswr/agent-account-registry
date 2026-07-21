@@ -73,6 +73,9 @@ PUBLISHED_PATH = "data/metrics.json"  # data-only ledger source for dashboard si
 # The rolling ring: enough snapshots (at */15 cron => ~6h) to derive a rate from history and to
 # evaluate a SUSTAINED (K-snapshot) backlog condition without unbounded growth.
 MAX_SNAPSHOTS = int(os.environ.get("REGISTRY_METRICS_RING", "24"))
+# Event windows deliberately read only one newest-first REST page. A burst larger than this is
+# still useful as a lower bound, but MUST trigger the no-silent-caps warning below.
+EVENT_LIST_LIMIT = 100
 
 ALERT_LABEL = "throughput-alert"
 MARKER_PREFIX = "throughput-alert"   # hidden HTML marker keying the idempotent upsert
@@ -124,9 +127,9 @@ def compute_target_metrics(counts):
       review_lane_runs_1h      (int: # of review-fix runs attempted in the last hour),
       worker_success_1h, worker_attempts_1h  (ints: worker run outcomes in the last hour)
 
-    The instantaneous per-hour rates come straight from the 1h search windows (authoritative for
-    the live hour); the REAL rate-OVER-TIME signal is the SUSTAINED (K-snapshot) condition that
-    evaluate_alerts() reads off the ledger ring — so a single spiky hour never alarms. Derived:
+    The instantaneous per-hour rates come straight from authoritative REST list windows; the REAL
+    rate-OVER-TIME signal is the SUSTAINED (K-snapshot) condition that evaluate_alerts() reads off
+    the ledger ring — so a single spiky hour never alarms. Derived:
     pr_open_rate, pr_close_rate (merged+closed), net_pr_flow, review_lane_health,
     worker_success_rate_1h. Pure — no network, no clock beyond what the caller stamps."""
     g = lambda k: int(counts.get(k, 0) or 0)  # noqa: E731 — terse local getter
@@ -395,7 +398,7 @@ def _gh_json(args, token, what):
 
 
 def _search_count(repo, qualifiers, token):
-    """Count an immutable date-window event via search (never current label/state)."""
+    """Count a lag-tolerant 24h date-window event via search (never live-hour/current state)."""
     q = f"repo:{repo} {qualifiers}"
     result = _gh_json(["api", "-X", "GET", "search/issues",
                        "-f", f"q={q}", "-f", "per_page=1"], token, f"search ({qualifiers})")
@@ -430,6 +433,107 @@ def _list_open_rows(repo, resource, token):
                 raise MetricsError(f"open {resource} listing row is malformed")
             rows.append(row)
     return rows
+
+
+def _list_event_rows(repo, resource, state, sort, token):
+    """Return one bounded, newest-first REST page for a trailing event window.
+
+    Unlike current-state lists, event lists MUST NOT paginate without a bound: a sufficiently busy
+    repository could otherwise make a metrics tick chase an unbounded history. The caller checks
+    whether all EVENT_LIST_LIMIT rows are still in-window and warns that the count is a floor."""
+    allowed = {
+        ("pulls", "closed", "updated"),
+        ("pulls", "all", "created"),
+        ("issues", "closed", "updated"),
+    }
+    if (resource, state, sort) not in allowed:
+        raise MetricsError(
+            f"unsupported event-list query {(resource, state, sort)!r}")
+    rows = _gh_json(
+        ["api", "-X", "GET",
+         f"repos/{repo}/{resource}?state={state}&sort={sort}&direction=desc"
+         f"&per_page={EVENT_LIST_LIMIT}&page=1"],
+        token, f"{state} {resource} event list")
+    if not isinstance(rows, list):
+        raise MetricsError(f"{state} {resource} event listing is malformed")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise MetricsError(f"{state} {resource} event listing row is malformed")
+    return rows
+
+
+def _event_stamp(row, field, what, nullable=False):
+    """Return one REST event timestamp, failing closed on a missing/malformed field."""
+    if field not in row:
+        raise MetricsError(f"{what} {field} is missing")
+    stamp = row[field]
+    if nullable and stamp is None:
+        return None
+    if not isinstance(stamp, str) or not stamp:
+        raise MetricsError(f"{what} {field} is malformed")
+    return stamp
+
+
+def _warn_truncated_window(repo, what, rows, stamps, since_iso):
+    """Apply the no-silent-caps rule when the bounded page is entirely inside the window."""
+    if len(rows) >= EVENT_LIST_LIMIT and all(stamp >= since_iso for stamp in stamps):
+        print(f"::warning::metrics: WARNING: {repo} {what} window truncated at {len(rows)} "
+              "— count is a floor", file=sys.stderr)
+
+
+def _list_event_counts_1h(repo, token, since_iso):
+    """Real-time 1h issue/PR event counts from bounded REST LIST snapshots."""
+    closed_pulls = _list_event_rows(repo, "pulls", "closed", "updated", token)
+    pull_closed_stamps = []
+    prs_merged, prs_closed = 0, 0
+    for row in closed_pulls:
+        closed_at = _event_stamp(row, "closed_at", "closed pull request")
+        merged_at = _event_stamp(row, "merged_at", "closed pull request", nullable=True)
+        pull_closed_stamps.append(closed_at)
+        if merged_at is not None and merged_at >= since_iso:
+            prs_merged += 1
+        elif merged_at is None and closed_at >= since_iso:
+            prs_closed += 1
+    _warn_truncated_window(
+        repo, "closed pull-request 1h", closed_pulls, pull_closed_stamps, since_iso)
+
+    # GitHub's REST issues endpoint includes pull requests. They consume part of the explicit bound
+    # but are excluded from the issue count; this preserves the published issue/PR split.
+    closed_items = _list_event_rows(repo, "issues", "closed", "updated", token)
+    item_closed_stamps = []
+    issues_closed = 0
+    for row in closed_items:
+        closed_at = _event_stamp(row, "closed_at", "closed issue-list item")
+        item_closed_stamps.append(closed_at)
+        if "pull_request" not in row and closed_at >= since_iso:
+            issues_closed += 1
+    _warn_truncated_window(
+        repo, "closed issue 1h", closed_items, item_closed_stamps, since_iso)
+
+    opened_pulls = _list_event_rows(repo, "pulls", "all", "created", token)
+    pull_created_stamps = [
+        _event_stamp(row, "created_at", "pull request") for row in opened_pulls
+    ]
+    prs_opened = sum(stamp >= since_iso for stamp in pull_created_stamps)
+    _warn_truncated_window(
+        repo, "opened pull-request 1h", opened_pulls, pull_created_stamps, since_iso)
+    return {
+        "issues_closed_1h": issues_closed,
+        "prs_opened_1h": prs_opened,
+        "prs_closed_1h": prs_closed,
+        "prs_merged_1h": prs_merged,
+    }
+
+
+def _warn_if_one_hour_exceeds_24h(repo, counts):
+    """Trip loudly when real-time LIST sees events the lagging 24h SEARCH index does not yet see."""
+    for one_hour, day in (
+            ("issues_closed_1h", "issues_closed_24h"),
+            ("prs_merged_1h", "prs_merged_24h")):
+        if counts[one_hour] > counts[day]:
+            print(f"::warning::metrics: WARNING: {repo} list-derived {one_hour}="
+                  f"{counts[one_hour]} exceeds search-derived {day}={counts[day]} — "
+                  "search index lag sanity tripwire fired", file=sys.stderr)
 
 
 def _label_names(row, what):
@@ -511,7 +615,7 @@ def _ready_issues_module():
 
 
 def collect_counts(repo, kind, token, now, orchestration=None):
-    """Live raw counts from REST lists, immutable-window search, and the readiness engine.
+    """Live raw counts from REST lists, lag-tolerant 24h search, and the readiness engine.
 
     `orchestration`, when given, is (orchestration_repo, orchestration_token): the repo that HOSTS
     this target's review-fix / worker workflows. sparq's review orchestration is driven cross-repo
@@ -523,13 +627,14 @@ def collect_counts(repo, kind, token, now, orchestration=None):
     c = {
         **current,
         "issues_ready": _ready_count(repo, kind, token, open_issues),
-        "issues_closed_1h": _search_count(repo, f"is:issue is:closed closed:>={h1}", token),
+        **_list_event_counts_1h(repo, token, h1),
+        # INTENTIONAL: the published 24h counters stay on SEARCH. Its minutes-scale indexing lag is
+        # negligible against a full day, while the live 1h alert inputs above MUST use REST LIST.
+        # Do not collapse these back into one search-based collector (issue #501).
         "issues_closed_24h": _search_count(repo, f"is:issue is:closed closed:>={h24}", token),
-        "prs_opened_1h": _search_count(repo, f"is:pr created:>={h1}", token),
-        "prs_closed_1h": _search_count(repo, f"is:pr is:closed is:unmerged closed:>={h1}", token),
-        "prs_merged_1h": _search_count(repo, f"is:pr is:merged merged:>={h1}", token),
         "prs_merged_24h": _search_count(repo, f"is:pr is:merged merged:>={h24}", token),
     }
+    _warn_if_one_hour_exceeds_24h(repo, c)
     if orchestration is not None:
         orch_repo, orch_token = orchestration
         # review-lane health: of the review-fix runs for THIS target that CONCLUDED in the last
@@ -1075,6 +1180,7 @@ def _self_test():
     _test_alert_rules(chk)
     _test_alert_mutation_nonvacuous(chk)
     _test_list_api_contract(chk)
+    _test_event_list_contract(chk)
     _test_collection_contract(chk)
     _test_run_windowing(chk)
     _test_review_lane_states(chk)
@@ -1164,33 +1270,108 @@ def _test_list_api_contract(chk):
         _gh_json = real
 
 
+def _test_event_list_contract(chk):
+    """The 1h reader is bounded REST LIST, with cap and search-lag warnings kept loud."""
+    import contextlib
+    import io
+    global _gh_json
+    real, calls = _gh_json, []
+    now = 1_000_000
+    since = _iso_ago(3600, now)
+
+    def fake(args, token, what):
+        calls.append(args)
+        url = args[-1]
+        if "/pulls?state=closed" in url:
+            return [
+                # Regression fixture for #501: SEARCH may not see this yet, but LIST must count it.
+                {"number": 501, "closed_at": _iso_ago(300, now),
+                 "merged_at": _iso_ago(300, now)},
+                {"number": 502, "closed_at": _iso_ago(240, now), "merged_at": None},
+                {"number": 400, "closed_at": _iso_ago(7200, now),
+                 "merged_at": _iso_ago(7200, now)},
+            ]
+        if "/issues?state=closed" in url:
+            return [
+                {"number": 503, "closed_at": _iso_ago(180, now)},
+                {"number": 504, "closed_at": _iso_ago(120, now), "pull_request": {}},
+                {"number": 401, "closed_at": _iso_ago(7200, now)},
+            ]
+        if "/pulls?state=all" in url:
+            return [
+                {"number": 505, "created_at": _iso_ago(60, now)},
+                {"number": 402, "created_at": _iso_ago(7200, now)},
+            ]
+        raise AssertionError(f"unexpected event LIST URL {url}")
+
+    try:
+        _gh_json = fake
+        got = _list_event_counts_1h("o/r", "tok", since)
+        chk("event LIST: PR merged 5 minutes ago is counted despite SEARCH lag",
+            got["prs_merged_1h"], 1)
+        chk("event LIST: closed-unmerged requires merged_at null",
+            got["prs_closed_1h"], 1)
+        chk("event LIST: issues exclude pull requests", got["issues_closed_1h"], 1)
+        chk("event LIST: opened PR uses created_at window", got["prs_opened_1h"], 1)
+        chk("event LIST: exact bounded newest-first REST queries", calls, [
+            ["api", "-X", "GET",
+             "repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1"],
+            ["api", "-X", "GET",
+             "repos/o/r/issues?state=closed&sort=updated&direction=desc&per_page=100&page=1"],
+            ["api", "-X", "GET",
+             "repos/o/r/pulls?state=all&sort=created&direction=desc&per_page=100&page=1"],
+        ])
+
+        # A full page entirely inside the hour is an honest lower bound, never a silent exact count.
+        recent = _iso_ago(60, now)
+        floor_log = io.StringIO()
+        with contextlib.redirect_stderr(floor_log):
+            _warn_truncated_window(
+                "o/r", "merged PR 1h", [{}] * EVENT_LIST_LIMIT,
+                [recent] * EVENT_LIST_LIMIT, since)
+        chk("event LIST: full in-window page logs no-silent-cap floor warning",
+            f"window truncated at {EVENT_LIST_LIMIT} — count is a floor" in floor_log.getvalue(),
+            True)
+
+        lag_log = io.StringIO()
+        with contextlib.redirect_stderr(lag_log):
+            _warn_if_one_hour_exceeds_24h("o/r", {
+                "issues_closed_1h": 2, "issues_closed_24h": 1,
+                "prs_merged_1h": 4, "prs_merged_24h": 3,
+            })
+        chk("event LIST: 1h > SEARCH 24h sanity tripwire warns for every published sibling",
+            ("issues_closed_1h=2 exceeds search-derived issues_closed_24h=1" in lag_log.getvalue()
+             and "prs_merged_1h=4 exceeds search-derived prs_merged_24h=3"
+             in lag_log.getvalue()), True)
+    finally:
+        _gh_json = real
+
+
 def _test_collection_contract(chk):
     """COLLECTION-LEVEL contract (blocker #3): stub the live reads with SPARQ-SHAPED responses and
     assert what collect_counts -> compute_target_metrics ACTUALLY produces, so the fixture can never
     drift from reality. The real sparq shape: 86 drainable ready issues (NOT the 4-wide concurrency
     frontier), and NO sparq-hosted review-fix/worker workflow — the lane health must be sourced from
     the ORCHESTRATION (registry) runs filtered to the sparq target, not from sparq's own actions."""
-    global _search_count, _ready_count, _paginate_runs, _list_open_rows
-    real_sc, real_rc, real_pr, real_lr = (
-        _search_count, _ready_count, _paginate_runs, _list_open_rows)
+    global _search_count, _ready_count, _paginate_runs, _list_open_rows, _list_event_rows
+    real_sc, real_rc, real_pr, real_lr, real_er = (
+        _search_count, _ready_count, _paginate_runs, _list_open_rows, _list_event_rows)
     now = 1_000_000
     since = _iso_ago(3600, now)
-    # Search is allowed ONLY for immutable time-window events. A regressed current-state search
-    # gets the adversarial lagging-index sentinel, never the authoritative LIST result below.
+    # Search is allowed ONLY for the lag-tolerant 24h siblings. Its live-hour result is deliberately
+    # stale: reverting the 1h fields to search makes the 5-minutes-ago LIST fixture below go red.
     search_calls = []
     search_table = {
-        "is:issue is:closed": 0, "created:": 5, "is:unmerged": 0,
-        "is:merged merged:": 0,
+        "is:issue is:closed": 31,
+        "is:pr is:merged": 51,
     }
 
     def fake_search(repo, qualifiers, token):
         search_calls.append(qualifiers)
-        if not any(window in qualifiers for window in ("created:>=", "closed:>=", "merged:>=")):
-            return 999_999  # deliberately stale/search-index-shaped current-state result
         for needle, val in search_table.items():
             if needle in qualifiers:
                 return val
-        return 0
+        return 0  # deliberately stale for every forbidden 1h query
 
     def fake_list(repo, resource, token):
         if resource == "issues":
@@ -1205,6 +1386,20 @@ def _test_collection_contract(chk):
                 labels.append({"name": "needs:user"})
             pulls.append({"number": n, "draft": n <= 34, "labels": labels})
         return pulls
+
+    def fake_event_list(repo, resource, state, sort, token):
+        if (resource, state, sort) == ("pulls", "closed", "updated"):
+            return [
+                {"number": 501, "closed_at": _iso_ago(300, now),
+                 "merged_at": _iso_ago(300, now)},
+                {"number": 400, "closed_at": _iso_ago(7200, now),
+                 "merged_at": _iso_ago(7200, now)},
+            ]
+        if (resource, state, sort) == ("issues", "closed", "updated"):
+            return [{"number": 399, "closed_at": _iso_ago(7200, now)}]
+        if (resource, state, sort) == ("pulls", "all", "created"):
+            return [{"number": n, "created_at": _iso_ago(60 * n, now)} for n in range(1, 6)]
+        raise AssertionError(f"unexpected event list {(resource, state, sort)!r}")
 
     # sparq orchestration runs live on the REGISTRY, tagged with the sparq target in the run-name.
     # A review-fix run for sparq that CONCLUDED failure, plus a worker run for sparq (2 concluded,
@@ -1245,6 +1440,7 @@ def _test_collection_contract(chk):
     try:
         _search_count = fake_search
         _list_open_rows = fake_list
+        _list_event_rows = fake_event_list
         _ready_count = lambda *args: 86   # drainable candidates, NOT the 4-wide frontier
         _paginate_runs = fake_paginate
         counts = collect_counts("sparq-org/sparq", READY_STATUS_ENGINE, "tok", now,
@@ -1256,9 +1452,12 @@ def _test_collection_contract(chk):
                                           "review_changes_backlog", "needs_user_parked")},
             {"issues_open": 1049, "prs_open": 52, "prs_draft": 34,
              "review_changes_backlog": 10, "needs_user_parked": 23})
-        chk("collect: search index is absent from every current-state metric source",
-            [q for q in search_calls if not any(
-                window in q for window in ("created:>=", "closed:>=", "merged:>="))], [])
+        chk("collect: PR merged 5 minutes ago comes from LIST despite stale SEARCH",
+            counts["prs_merged_1h"], 1)
+        chk("collect: SEARCH is retained only for the two published 24h counters", search_calls, [
+            f"is:issue is:closed closed:>={_iso_ago(86400, now)}",
+            f"is:pr is:merged merged:>={_iso_ago(86400, now)}",
+        ])
         # lane health sourced from the ORCHESTRATION repo, filtered to sparq (blocker #2):
         # review-fix: 1 concluded (failure) => stalled with a review:changes backlog.
         chk("collect: review_lane_runs_1h from orchestration (1 concluded)",
@@ -1272,7 +1471,8 @@ def _test_collection_contract(chk):
         # the derived metrics + alerts that ACTUALLY result from the sparq shape:
         chk("collect->metrics: review lane STALLED (real, off orchestration)",
             m["review_lane_health"], "stalled")
-        chk("collect->metrics: net_pr_flow +5 (5 opened, 0 closed/merged)", m["net_pr_flow"], 5.0)
+        chk("collect->metrics: net_pr_flow +4 (5 opened, 1 fresh LIST merge)",
+            m["net_pr_flow"], 4.0)
         chk("collect->metrics: worker rate 1/2", m["worker_success_rate_1h"], 0.5)
         # sustained over two identical sparq snapshots => the three sparq alerts fire (contract).
         hist = [_snap(now - 900, {"sparq-org/sparq": m}), _snap(now, {"sparq-org/sparq": m})]
@@ -1291,8 +1491,8 @@ def _test_collection_contract(chk):
         chk("collect: no orchestration runs => review_lane_health unknown",
             compute_target_metrics(counts_no_orch)["review_lane_health"], "unknown")
     finally:
-        _search_count, _ready_count, _paginate_runs, _list_open_rows = (
-            real_sc, real_rc, real_pr, real_lr)
+        _search_count, _ready_count, _paginate_runs, _list_open_rows, _list_event_rows = (
+            real_sc, real_rc, real_pr, real_lr, real_er)
     _ = since  # documented window boundary; the fake ignores it
 
 
