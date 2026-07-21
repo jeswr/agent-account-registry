@@ -21,6 +21,7 @@ TARGET_READY = 12
 MAX_CLOSES = 5
 GATE_LABELS = ("needs:", "trust:untrusted")
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+ACTIONS_BOT_LOGIN = "github-actions[bot]"
 IN_FLIGHT_STATUS = {"status:ready", "status:in-progress"}
 TRUST_LABEL_PREFIXES = (
     "area:sparq-zk", "area:sparq-mpc", "area:zk", "area:mpc", "area:trust",
@@ -28,7 +29,8 @@ TRUST_LABEL_PREFIXES = (
 )
 TRUST_KEYWORDS = (
     "zk", "zkp", "mpc", "noir", "secprop", "nullifier", "e2ee", "crypt",
-    "issuer", "credential", "trust anchor",
+    "issuer", "credential", "trust anchor", "zero-knowledge", "multi-party", "snark",
+    "garbled", "proving key", "witness commitment", "trusted setup",
 )
 EC2_KEYWORDS = (
     "quiet-box", "ec2", "canonical gather", "same-box", "full-scale",
@@ -69,6 +71,13 @@ _P2 = re.compile(
     r"|\bblocks\s+all\b",
     re.IGNORECASE,
 )
+_OPEN_ENDED_VERBS = frozenset({
+    "consider", "maybe", "investigate", "explore", "evaluate", "decide",
+})
+_ACCEPTANCE_SECTION = re.compile(
+    r"^#+\s*(?:acceptance|deliverable|spec)", re.IGNORECASE | re.MULTILINE
+)
+_DELIVERABLE_MARKER = re.compile(r"\*\*Deliverable:\*\*", re.IGNORECASE)
 
 
 class CuratorError(RuntimeError):
@@ -123,12 +132,17 @@ def author_login(issue: dict[str, Any]) -> str:
     return login if isinstance(login, str) else ""
 
 
-def trusted_author(issue: dict[str, Any], automation_logins: set[str]) -> bool:
-    """Mirror dispatch CLAIM: collaborator association or exact allowlisted automation login."""
+def trusted_author(
+    issue: dict[str, Any],
+    automation_logins: set[str],
+    allow_actions_bot_issues: bool = False,
+) -> bool:
+    """Mirror dispatch CLAIM's collaborator/allowlisted-bot author predicate exactly."""
     login = author_login(issue)
     association = str(issue.get("author_association", "")).upper()
     return bool(login) and (
         association in TRUSTED_ASSOCIATIONS or login in automation_logins
+        or (allow_actions_bot_issues and login == ACTIONS_BOT_LOGIN)
     )
 
 
@@ -142,6 +156,24 @@ def issue_text(issue: dict[str, Any]) -> str:
     if not isinstance(title, str) or not isinstance(body, (str, type(None))):
         raise CuratorError("issue title/body are malformed")
     return f"{title}\n{body or ''}"
+
+
+def open_ended_first_sentence(issue: dict[str, Any]) -> str | None:
+    """Return the disallowed opening word when the title's first sentence is open-ended."""
+    title = issue.get("title")
+    if not isinstance(title, str):
+        raise CuratorError("issue title is malformed")
+    first_sentence = re.split(r"[.!?](?:\s|$)", title, maxsplit=1)[0]
+    match = re.match(r"\s*([A-Za-z]+)", first_sentence)
+    verb = match.group(1).casefold() if match else ""
+    return verb if verb in _OPEN_ENDED_VERBS else None
+
+
+def has_explicit_deliverable(issue: dict[str, Any]) -> bool:
+    body = issue.get("body") or ""
+    if not isinstance(body, str):
+        raise CuratorError("issue body is malformed")
+    return bool(_ACCEPTANCE_SECTION.search(body) or _DELIVERABLE_MARKER.search(body))
 
 
 def is_trust_surface(issue: dict[str, Any], labels: set[str]) -> bool:
@@ -271,6 +303,7 @@ def plan_repository(
     automation_logins: set[str],
     close_limit: int = MAX_CLOSES,
     target_ready: int = TARGET_READY,
+    allow_actions_bot_issues: bool = False,
 ) -> tuple[list[Mutation], list[str]]:
     """Return a deterministic mutation plan and human-readable skip log for one target."""
     if close_limit < 0:
@@ -287,8 +320,12 @@ def plan_repository(
         number = issue["number"]
         if has_status(labels) or has_gate(labels):
             continue
-        if not trusted_author(issue, automation_logins):
-            logs.append(f"skip #{number}: untrusted author")
+        if not trusted_author(issue, automation_logins, allow_actions_bot_issues):
+            login = author_login(issue) or "<malformed>"
+            logs.append(
+                f"skip #{number}: undispatchable author {login!r} "
+                "(not maintainer/collaborator/allowlisted bot)"
+            )
             continue
         if is_trust_surface(issue, labels):
             logs.append(f"skip #{number}: trust-surface content")
@@ -378,6 +415,17 @@ def plan_repository(
             logs.append(f"skip #{number}: no confident area ({area_reason})")
             continue
         role = role_for(labels, area)
+        opening = open_ended_first_sentence(issue)
+        if (
+            role in {"role:impl", "role:ci"}
+            and opening is not None
+            and not has_explicit_deliverable(issue)
+        ):
+            logs.append(
+                f"reroute #{number}: {role} rejected — first sentence starts with "
+                f"{opening!r} and has no acceptance/deliverable/spec; use role:research"
+            )
+            role = "role:research"
         priority = priority_for(issue)
         if _conflicting_label(labels, "priority:", priority):
             logs.append(f"skip #{number}: existing priority conflicts with {priority}")
@@ -562,7 +610,14 @@ def _target_ready_of(repo: str, row: dict[str, Any]) -> int:
     return _validated_target_ready(throughput.get("target_ready", TARGET_READY), repo)
 
 
-def load_targets(policy_file: Path, bot_login: str) -> list[tuple[str, set[str], int]]:
+def _allow_actions_bot_issues_of(repo: str, row: dict[str, Any]) -> bool:
+    value = row.get("allow_actions_bot_issues", False)
+    if not isinstance(value, bool):
+        raise CuratorError(f"allow_actions_bot_issues for {repo} must be boolean")
+    return value
+
+
+def load_targets(policy_file: Path, bot_login: str) -> list[tuple[str, set[str], bool, int]]:
     try:
         with policy_file.open("rb") as handle:
             document = tomllib.load(handle)
@@ -589,7 +644,12 @@ def load_targets(policy_file: Path, bot_login: str) -> list[tuple[str, set[str],
         automation = set(bots)
         if bot_login:
             automation.add(bot_login)
-        targets.append((repo, automation, _target_ready_of(repo, row)))
+        targets.append((
+            repo,
+            automation,
+            _allow_actions_bot_issues_of(repo, row),
+            _target_ready_of(repo, row),
+        ))
     if not targets:
         raise CuratorError("repository policy has no enabled target rows")
     return sorted(targets, key=lambda item: item[0])
@@ -616,7 +676,7 @@ def _self_test() -> int:
     all_labels = {
         "status:ready", "status:in-progress", "needs:ec2",
         "priority:P2", "priority:P3", "role:impl", "role:docs", "role:perf",
-        "role:ci", "role:site",
+        "role:ci", "role:site", "role:research",
         "area:alpha", "area:beta", "area:gamma", "area:delta", "area:bench",
         "area:ci", "area:site",
     }
@@ -653,6 +713,63 @@ def _self_test() -> int:
     planned, _ = plan_repository(trust_work, all_labels, automation)
     checks.append(("zk/mpc keyword candidates are never staged",
                    not any(m.kind == "stage" for m in planned)))
+
+    # Every open-ended operative word independently forces impl/ci work into research unless the
+    # body owns an explicit acceptance shape. Keeping the fixtures separate makes deleting any one
+    # word from _OPEN_ENDED_VERBS mutation-visible.
+    for offset, verb in enumerate((
+        "consider", "maybe", "investigate", "explore", "evaluate", "decide",
+    )):
+        candidate = issue(12 + offset, f"{verb.title()} alpha parser", ("area:alpha",))
+        planned, logs = plan_repository([candidate], all_labels, automation)
+        stages = [m for m in planned if m.kind == "stage"]
+        checks.append((
+            f"{verb} impl candidate is loudly rerouted to research",
+            len(stages) == 1
+            and "role:research" in stages[0].labels
+            and "role:impl" not in stages[0].labels
+            and any(f"reroute #{candidate['number']}: role:impl rejected" in line for line in logs),
+        ))
+
+    deliverable_body = long_body + "\n\n## Deliverable\nShip the parser change and tests."
+    deliverable = issue(
+        18, "Consider alpha parser", ("area:alpha",), body=deliverable_body
+    )
+    planned, _ = plan_repository([deliverable], all_labels, automation)
+    checks.append(("consider candidate with Deliverable section remains impl",
+                   any(m.kind == "stage" and "role:impl" in m.labels for m in planned)))
+
+    bold_deliverable = issue(
+        19, "Explore gamma parser", ("area:gamma",),
+        body=long_body + "\n\n**Deliverable:** Ship the parser change and tests.",
+    )
+    planned, _ = plan_repository([bold_deliverable], all_labels, automation)
+    checks.append(("bold Deliverable marker also preserves impl staging",
+                   any(m.kind == "stage" and "role:impl" in m.labels for m in planned)))
+
+    ci_candidate = issue(29, "Decide CI cache strategy", ("area:ci",))
+    planned, _ = plan_repository([ci_candidate], all_labels, automation)
+    checks.append(("open-ended CI candidate is rerouted to research",
+                   any(m.kind == "stage" and "role:research" in m.labels
+                       and "role:ci" not in m.labels for m in planned)))
+
+    docs_candidate = issue(
+        30, "Consider documenting parser behavior", ("area:alpha", "kind:docs")
+    )
+    planned, _ = plan_repository([docs_candidate], all_labels, automation)
+    checks.append(("open-ended filter is limited to impl/ci",
+                   any(m.kind == "stage" and "role:docs" in m.labels for m in planned)))
+
+    for offset, keyword in enumerate((
+        "zero-knowledge", "multi-party", "snark", "garbled", "proving key",
+        "witness commitment", "trusted setup",
+    )):
+        candidate = issue(
+            31 + offset, f"Implement {keyword} protocol cache", ("area:alpha",)
+        )
+        planned, _ = plan_repository([candidate], all_labels, automation)
+        checks.append((f"trust keyword {keyword!r} excludes its fixture",
+                       not any(m.kind == "stage" for m in planned)))
 
     # (c) Seven bot-authored copies form one cluster: lowest survives and only five close.
     duplicate_fixture = [
@@ -701,8 +818,18 @@ def _self_test() -> int:
 
     # (f) A non-collaborator, non-allowlisted author cannot be staged or dedupe-closed.
     untrusted = [issue(210, "Improve gamma parser", ("area:gamma",), author="outsider")]
-    planned, _ = plan_repository(untrusted, all_labels, automation)
-    checks.append(("untrusted-author candidate is skipped", not planned))
+    planned, logs = plan_repository(untrusted, all_labels, automation)
+    checks.append(("undispatchable-author candidate is skipped loudly",
+                   not planned and any(
+                       "skip #210: undispatchable author 'outsider'" in line for line in logs
+                   )))
+
+    actions_issue = issue(
+        211, "Improve actions parser", ("area:alpha",), author=ACTIONS_BOT_LOGIN
+    )
+    planned, _ = plan_repository([actions_issue], all_labels, set())
+    checks.append(("actions bot is denied by default",
+                   not any(m.kind == "stage" for m in planned)))
 
     human_duplicates = [
         issue(220, "Repair deterministic wave selector", ("area:alpha",)),
@@ -735,14 +862,18 @@ def _self_test() -> int:
             '[repos."o/default"]\n'
             'enabled = true\n'
             '[repos."o/default".throughput]\n'
-            'open_pr_alert_threshold = 5\n',
+            'open_pr_alert_threshold = 5\n'
+            '[repos."o/actions"]\n'
+            'enabled = true\n'
+            'allow_actions_bot_issues = true\n',
             encoding="utf-8",
         )
         loaded = {
-            repo: (bots, target)
-            for repo, bots, target in load_targets(policy_file, "registry[bot]")
+            repo: (bots, allow_actions, target)
+            for repo, bots, allow_actions, target
+            in load_targets(policy_file, "registry[bot]")
         }
-        scaled_automation, scaled_target = loaded["o/scaled"]
+        scaled_automation, _, scaled_target = loaded["o/scaled"]
         scaled_fixture = []
         for offset in range(30):
             area = f"area:scaled{offset}"
@@ -756,7 +887,15 @@ def _self_test() -> int:
         checks.append(("policy target_ready=30 stages beyond twelve",
                        len([m for m in planned if m.kind == "stage"]) == 30))
         checks.append(("missing target_ready falls back to twelve",
-                       loaded["o/default"][1] == 12))
+                       loaded["o/default"][2] == 12))
+
+        actions_automation, actions_allowed, _ = loaded["o/actions"]
+        planned, _ = plan_repository(
+            [actions_issue], all_labels, actions_automation,
+            allow_actions_bot_issues=actions_allowed,
+        )
+        checks.append(("policy-allowed actions bot is staged",
+                       any(m.kind == "stage" and m.number == 211 for m in planned)))
 
         for raw, display in (("0", "0"), ('"abc"', '"abc"'), ("250", "250")):
             policy_file.write_text(
@@ -773,6 +912,20 @@ def _self_test() -> int:
                 error = str(exc)
             checks.append((f"target_ready={display} rejected loudly",
                            "target_ready" in error and "[1, 100]" in error))
+
+        policy_file.write_text(
+            '[repos."o/bad"]\n'
+            'enabled = true\n'
+            'allow_actions_bot_issues = "yes"\n',
+            encoding="utf-8",
+        )
+        error = ""
+        try:
+            load_targets(policy_file, "registry[bot]")
+        except CuratorError as exc:
+            error = str(exc)
+        checks.append(("non-boolean allow_actions_bot_issues is rejected loudly",
+                       "allow_actions_bot_issues" in error and "boolean" in error))
 
     area_fixture = [
         issue(400 + offset, f"Improve alpha component{offset} behavior", ("area:alpha",))
@@ -812,7 +965,7 @@ def main() -> int:
     targets = load_targets(Path(args.policy_file), args.bot_login)
     tokens, ambient = load_tokens()
     remaining_closes = MAX_CLOSES
-    for repo, automation_logins, target_ready in targets:
+    for repo, automation_logins, allow_actions_bot_issues, target_ready in targets:
         owner = repo.split("/", 1)[0]
         token = tokens.get(owner, ambient)
         if not token:
@@ -821,6 +974,7 @@ def main() -> int:
         mutations, logs = plan_repository(
             issues, repo_labels, automation_logins, close_limit=remaining_closes,
             target_ready=target_ready,
+            allow_actions_bot_issues=allow_actions_bot_issues,
         )
         print(f"== {repo}: ready={sum('status:ready' in labels_of(i) for i in issues)} "
               f"target={target_ready} ==")
