@@ -19,6 +19,16 @@
    "model": "sol",
    "issued_at": 1784651779,
    "expires_at": 1784658079
+  },
+  {
+   "account": "acct01",
+   "claim_id": "88d6e5dc435c402583d9752f297f19f3",
+   "holder": "sparq-org/sparq#3550@dispatch-29848419300.1",
+   "package": "sparq-crdt",
+   "role": "impl",
+   "model": "sol",
+   "issued_at": 1784651783,
+   "expires_at": 1784658083
   }
  ]
 }
