@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3679,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ec9b43b3bf1e3335b95fb4a58b472a7524b98a2a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In probe_key_eq_is_identical_to_key_equality_for_all_key_widths, the trailing 'mutation witness' block computes `deliberately_wrong = left.len() == 1 && right.len() == 1` (== true for single_key(3)/single_key(7)) and asserts `assert_ne!(deliberately_wrong, left == right)`, i.e. `assert_ne!(true, false)`. This is a fixed tautology: it never calls probe_key_eq nor any planted-wrong variant of it, so it does not actually witness that the differential loop above would flag a value-ignoring comparator. The comment claiming it demonstrates the differential is 'non-vacuous' overstates what the block does. Harmless \u2014 the primary differential loop (widths 0..=4, incl. spilled keys, asserted against `==`) already provides genuine, non-vacuous coverage of the real function. This is the same finding recorded in round 1 and was not addressed.",
+    "file": "crates/sparq-substrate/src/join.rs",
+    "fix_hint": "Optional: either drop the tautological block, or make it a real mutation by defining a local value-ignoring comparator (e.g. `let wrong = |a: &Key, b: &Key| a.len()==1 && b.len()==1;`) and asserting there EXISTS a pair in `keys` where `wrong(l,r) != (l==r)` (e.g. single_key(3) vs single_key(7)), which actually demonstrates the differential loop would catch such a mutant.",
+    "severity": "nit",
+    "title": "Mutation-witness block is a tautology; it does not exercise probe_key_eq"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Pure, result-equivalent micro-optimization of the sparq-substrate hash-join probe path (crates/sparq-substrate/src/join.rs), plus a bench/feature-off-declarations/3679.json justifying the always-compiled hot-path change reaching the wasm default bundle. Two inlined helpers replace inline logic: probe_key_eq specializes the dominant one-id key to a scalar compare (matches! guard returns false on length mismatch) and falls back to the verbatim `candidate == key` for every other width; probe_table returns tables[0] for the serial (len==1) case, else masks partition = hash % JOIN_PARTS and, when the slice is exactly JOIN_PARTS long, converts to &[JoinTable; 64] via try_from to elide the bounds check, falling back to &tables[partition] for non-standard slices. Verified against the checkout: JOIN_PARTS=64, JoinTable=HashMap<Key,Posting,FxBuildHasher>, build_partitioned always yields exactly 64 tables (array branch is live) while the serial path uses 1. Behavior-preserving: the fallback carries the identical panic surface to the original `&tables[(h % JOIN_PARTS)]`; no new reachable panic. probe_key_eq preserves exact term-id identity (internal join-key equality, not SPARQL value `=`). Tests are non-vacuous: a deterministic randomized differential over key widths 0..=4 (64 each, incl. spilled SmallVec keys) asserts probe_key_eq == `==` for all pairs, and probe_table is pinned by std::ptr::eq across serial/array/fallback shapes. No hard-coded perf numbers, no ZK/MPC/soundness claims, no injection. Correct and complete. Sole finding is an unchanged harmless test nit carried from round 1.",
+  "verdict": "approve"
+ }
+}
