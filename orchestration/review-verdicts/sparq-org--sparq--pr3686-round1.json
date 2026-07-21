@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3686,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0c084dae9ea71923159fb78a65c0efe2086a7112",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "CRDT-WIRE-4 now mandates that a receiver MUST reject any envelope whose `epoch` is not its current membership epoch. This is a new admission gate that can drop a delta that is otherwise valid (correct format, invariants, canonical bytes). The SEC assumptions in CRDT-SEC-1 were not touched: assumption (a) still scopes convergence to 'the same dataset identifier and format version' and (d) still asserts 'every generated valid delta is eventually incorporated'. With epoch admission, 'valid delta' becomes receiver-relative (a delta valid at same-epoch receivers is rejected at others), so the practical SEC guarantee now holds only within a single membership epoch \u2014 a qualification the assumptions no longer state. The convergence theorem (CRDT-SEC-2) itself is unaffected because epoch is not part of state and is never joined, so this is a consistency/clarity gap rather than a soundness break, and it is partly mitigated by the explicit out-of-scope note ('no protocol for establishing or advancing membership epochs ... is standardised here').",
+    "file": "site/specs/sparql-crdt.typ",
+    "fix_hint": "Add a clause to CRDT-SEC-1 scoping the SEC claim to replicas sharing the same current membership epoch (e.g. extend assumption (a) to 'same dataset identifier, format version, and current membership epoch'), or add a sentence to the CRDT-SEC-2 discussion noting that cross-epoch envelopes are rejected by CRDT-WIRE-4 and therefore fall outside the eventual-incorporation assumption (d).",
+    "severity": "minor",
+    "title": "SEC assumptions (CRDT-SEC-1) not updated to scope the new epoch admission rule"
+   },
+   {
+    "body": "CRDT-JOURNAL-2 enumerates the fields a full snapshot MUST carry (dataset identifier, complete dot store, complete data causal context, journal frontier) but does not mention the membership epoch. Since epoch is a per-envelope admission discriminator and the advancement protocol is explicitly out of scope, omitting it from the snapshot is defensible, but a reader may wonder whether a snapshot recovered by a peer implies anything about the epoch to admit subsequent envelopes under.",
+    "file": "site/specs/sparql-crdt.typ",
+    "fix_hint": "Optionally note in CRDT-JOURNAL-2 or the closing epoch paragraph whether a snapshot conveys/asserts a membership epoch, or state explicitly that epoch is envelope-scoped and not part of snapshot state.",
+    "severity": "nit",
+    "title": "Snapshot record (CRDT-JOURNAL-2) does not mention epoch"
+   }
+  ],
+  "progress": null,
+  "summary": "Spec-only change to a greenfield, explicitly-labelled Proposal draft (site/specs/sparql-crdt.typ). It introduces a `epoch` (membership epoch) field to the version-1 JSON delta envelope: adds it to the JSON example, documents its encoding (unsigned decimal integer as a JSON string, distinct from the non-zero sequence/dot counters), extends the shortest-decimal MUST clause (CRDT-WIRE-2), adds epoch validation with a MUST-reject-on-mismatch admission rule (CRDT-WIRE-4), and reframes the closing note so the epoch-advancement/membership protocol is explicitly out of scope. The change is internally consistent and preserves the document's honesty posture. `epoch` does not participate in the join or in delta.store/delta.context derivation, so the convergence math (CRDT-SEC-2) and the semilattice argument are untouched. The zero/non-zero distinction is deliberate and consistently applied (epoch may be \"0\"; sequence and dot counters remain non-zero). 'exactly the fields shown above' (CRDT-WIRE-2) stays consistent because the JSON example was updated to include epoch, and JCS canonicalisation makes example field order illustrative only. Typst/#cite/#strong usage matches surrounding style. No blocker or major defect found; the notes below are consistency recommendations, not correctness failures.",
+  "verdict": "approve"
+ }
+}
