@@ -364,7 +364,10 @@ def _readiness_kind_of(repo, row):
     r = row["readiness"]
     if not isinstance(r, dict):
         raise MetricsError(f"readiness for {repo!r} must be a table")
-    unknown = set(r) - {"kind"}
+    # security_paths lives in this table for the arm-side trust-surface audit (policy line
+    # "security_paths below feeds the audit"); metrics does not consume it but must not
+    # reject the live policy that carries it.
+    unknown = set(r) - {"kind", "security_paths"}
     if unknown:
         raise MetricsError(f"unknown readiness key {sorted(unknown)[0]!r} for {repo!r}")
     kind = r.get("kind")
@@ -1670,6 +1673,24 @@ def _test_policy_and_readiness(chk):
         zero_error = str(exc)
     chk("sustain_snapshots=0 rejected loudly (anti-spike cannot be disabled)",
         "sustain_snapshots" in zero_error and "positive integer" in zero_error, True)
+
+    # The live registry policy nests security_paths under readiness (arm-side audit input);
+    # metrics must ACCEPT it (regression: run 29838473663 rejected the live policy) while
+    # still rejecting genuinely unknown keys.
+    secpaths_readiness = ('[repos."o/r"]\nenabled = true\n'
+                          '[repos."o/r".readiness]\nkind = "from-agent-open"\n'
+                          'security_paths = ["scripts/"]\n')
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write(secpaths_readiness)
+        secpath = fh.name
+    secpaths_error = ""
+    try:
+        load_targets(secpath)
+    except MetricsError as exc:
+        secpaths_error = str(exc)
+    chk("readiness.security_paths accepted (live arm-audit key, run-29838473663 regression)",
+        secpaths_error, "")
+    os.unlink(secpath)
 
     malformed_readiness = ('[repos."o/r"]\nenabled = true\n'
                            '[repos."o/r".readiness]\nunrelated = "silently-defaulted-before"\n')
