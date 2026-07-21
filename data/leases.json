@@ -1,3 +1,14 @@
 {
- "leases": []
+ "leases": [
+  {
+   "account": "acct01",
+   "claim_id": "7cfba3aa5342474e82f06434ae4ea64c",
+   "holder": "sparq-org/sparq#3455@dispatch-29848419300.1",
+   "package": "sparq-canon",
+   "role": "impl",
+   "model": "sol",
+   "issued_at": 1784651773,
+   "expires_at": 1784658073
+  }
+ ]
 }
