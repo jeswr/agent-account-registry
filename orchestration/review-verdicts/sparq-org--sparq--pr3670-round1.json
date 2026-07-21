@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3670,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1bed0f0c2810ce57d0ea76ab84024fbd2927c22a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff deletes isNumericTerm from hero-runner.tsx, which was the only consumer of the `SparqlTerm` type in this file. After the change `SparqlTerm` appears exactly once \u2014 on the import line (`type SparqlTerm,` in the @/lib/sparq-wasm import block, ~line 39) \u2014 and is never referenced again (verified: 1 total occurrence; SparqlResults is still used 4x). This is an incomplete refactor. eslint-config-next's `next/typescript` layer surfaces unused imports via @typescript-eslint/no-unused-vars; depending on whether that rule resolves to error or warn, `npm run lint` (next lint) \u2014 run as a gate in site-e2e.yml:91 and gui.yml:186 \u2014 either fails outright or emits a warning. Since the entire purpose of this PR is code hygiene/dedup, shipping a dead import is a completeness defect and should be fixed before merge.",
+    "file": "site/src/components/home/hero-runner.tsx",
+    "fix_hint": "Remove the now-unused `type SparqlTerm,` line from the `@/lib/sparq-wasm` import in hero-runner.tsx, keeping `type SparqlResults` (still used). Confirm with `cd site && npm run lint && npm run typecheck` that both are clean.",
+    "severity": "major",
+    "title": "Unused `type SparqlTerm` import left behind after removing isNumericTerm"
+   }
+  ],
+  "progress": null,
+  "summary": "Clean dedup refactor: isNumericLiteral is extracted to site/src/lib/numeric-literal.ts and both renderers (hero-runner.tsx, repl-result-cells.tsx) import it. Correctness is sound \u2014 the shared XSD base from @/lib/curie equals hero-runner's old local const ('http://www.w3.org/2001/XMLSchema#'), so URI construction is unchanged; the 13-type NUMERIC_XSD set matches the old repl-result-cells set exactly, and hero-runner's set widens 9->13 (adds byte/unsignedInt/unsignedLong/...) which is an intentional, non-regressing consolidation. Widening the param to `SparqlTerm | undefined` is safe for all callers (hero-runner passes possibly-undefined row[v]; repl passes term/t). No dangling isNumericTerm/NUMERIC_XSD references remain. However, removing isNumericTerm from hero-runner.tsx orphaned its `type SparqlTerm` import: SparqlTerm is now imported but unused (only textual occurrence is the import; SparqlResults is still used). That is an incomplete refactor that emits a no-unused-vars lint diagnostic and risks failing the `npm run lint` (next lint) CI gate that gates the site (site-e2e.yml, gui.yml). Otherwise the change is correct.",
+  "verdict": "request_changes"
+ }
+}
