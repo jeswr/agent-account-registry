@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "acct07",
-   "claim_id": "10c4039fd9e8410ea1831eb6cb67fb13",
-   "holder": "sparq-org/sparq#3452@29844545771.1",
-   "package": "sparq-trust",
-   "role": "docs",
-   "model": "haiku",
-   "issued_at": 1784648047,
-   "expires_at": 1784654347
-  }
- ]
+ "leases": []
 }
