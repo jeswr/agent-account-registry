@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 535,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "27579c3cd493e57f3d5cc3d872e34ba66eea5396",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round-1's sole blocker is resolved. The hard-fail-the-whole-ledger behavior is replaced by a bounded migration exactly as the prior fix_hint endorsed: select-and-claim.validate_lease_account_identities (called in _read_ledger) and groom.validate_ledger now DROP only non-fingerprint (legacy raw-handle) rows and CAS-write the validated remainder, so live/expired legacy leases drain naturally and groom keeps its self-heal instead of aborting every read. Critically, the migration does NOT weaken any trust check: in groom only rows failing the 16-hex account gate `continue`; canonical rows still run every fail-closed shape check (claim-id safety, duplicate detection, holder parse, issued<expires ordering, non-empty fields). This is proven non-vacuously by the added self-tests: 'canonical lease shape still fails closed' (canonical account + unsafe claim_id still raises GroomError), 'canonical lease survives mixed-ledger migration' ([base] retained), 'raw account handle is dropped' ([] returned), and the allocator-side '_read_ledger drops legacy identity and retains canonical lease'. Hash algorithm sha256(handle:salt)[:16] is verified identical across select-and-claim.account_fingerprint, model-health.account_hash (used by dashboard _salted_labels) and worker-pr.account_hash. Dashboard active_agents now matches labels[handle] against the salted lease account, with self-test salt consistent between lease_account and labels. Fail-closed holds: missing PROVENANCE_SALT raises everywhere; both claim and adopt steps sit in the one claim: job that declares environment: dispatch-secrets (line 360), so secrets.PROVENANCE_SALT resolves for both; release/dry-run paths need no salt. Privacy improved: claim_commit_message omits the raw handle (negative test asserts '[redacted-account]' not in subject) while the raw handle is correctly retained only in the claim RESULT for secret resolution. The temporary single-account double-allocation during cutover (a live legacy lease is\u2026 [truncated 165 chars]",
+  "verdict": "approve"
+ }
+}
