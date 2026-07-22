@@ -5844,7 +5844,7 @@ def _self_test():
         # above; labels are plain STRINGS (not {"name": ...} dicts); head/user sub-shapes
         # mirror the projection's nested selections.
         row = {"number": number, "state": "open", "draft": draft, "body": "",
-               "labels": list(labels),
+               "labels": list(labels), "auto_merge": None,
                "head": {"ref": ref, "sha": sha_a, "repo": {"full_name": repo}},
                "user": {"login": bot, "type": "Bot"}}
         assert set(row) == snapshot_fields, "fixture drifted from the workflow projection"
