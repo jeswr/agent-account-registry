@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 525,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ede5e72fe7a8c048c0e84b014c05dd7862e62b5d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Replaces the weak inline ledger trust-guards (readers' `test ! -e ledger/.github` blacklist and groom's `gh api` remote-tree whitelist) with a single canonical validator scripts/ledger-invariant.py that runs `git ls-tree -r -t -z HEAD` over the checked-out ledger tree and enforces a per-entry mode/type/path WHITELIST. This is a strengthening, not a weakening: ALLOWED_ENTRIES is an exact port of groom's prior awk whitelist, and it now additionally catches executable blobs (100755), symlinks (120000), submodules (160000), and nested paths that `test ! -e` never could. Verified all five call sites source the validator from the registry/master checkout (scripts/... at root, or registry/scripts/... when registry is at path: registry), never from the ledger checkout, so ledger-branch content cannot influence the validator that judges it. Each checkout-path/argument pairing was confirmed against the actual workflow files (dashboard root+ledger; dispatch plan registry+registry-ledger; dispatch claim + review-fix x2 registry+ledger; groom root+ledger). The step runs immediately after each ledger checkout, before consumption. Fail-closed behavior is sound: git error -> ValueError -> exit 1; empty tree, non-UTF-8/unparseable entries, and missing checkout all fail closed; fullmatch anchoring rejects subdirs and slash tricks. The self-test is non-vacuous and wired into FULL_SELFTEST_SUITE (worker-live.sh runs `--self-test`): it asserts a valid tree returns [] AND that payload/executable/symlink/submodule/nested/missing-checkout are each rejected, so a validator broken in either direction fails. Removing groom's gh-api out-of-band check loses truncation-detection but local ls-tree has no truncation limit and validates exactly the checkout that is consumed, which is tighter. data/README.md prose accurately describes the new invariant. No blocker/major/minor findings; the diff contains no instructions directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
