@@ -1597,9 +1597,9 @@ def _cmd_record(args):
     else:
         handle = os.environ.get("WORKER_ACCOUNT_HANDLE", args.account or "")
         if not handle or not salt:
-            print("::warning::model-health record: no account handle/salt — recording without a "
-                  "per-account hash is unsafe; skipping (telemetry must never fail a run)")
-            return 0
+            print("::error::model-health record: no account handle/salt — refusing to drop "
+                  "per-account health telemetry")
+            return 1
         account_h = account_hash(handle, salt)
     no_change = {field: getattr(args, field, None)
                  for field in ("input_tokens", "output_tokens", "wall_seconds", "issue")}
@@ -2304,6 +2304,9 @@ def _self_test():
     # ---- record exits NONZERO on CAS exhaustion (defect #8) ----------------------------------
     ok = _test_record_exit(chk) and ok
 
+    # ---- #215: record exits NONZERO when per-account salting configuration is absent ---------
+    ok = _test_record_salting_config(chk) and ok
+
     # ---- #199: record REFUSES a catalog-controlled provider outside the known set ------------
     ok = _test_record_provider_guard(chk) and ok
 
@@ -2698,6 +2701,54 @@ def _test_record_exit(chk):
     finally:
         GitHubAPI = real_api
         globals()["_sleep_backoff"] = real_sleep
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_record_salting_config(chk):
+    """#215: missing salting inputs fail visibly and write NOTHING; complete configuration still
+    records. The record call sites isolate this nonzero exit, preserving pipeline liveness."""
+    import argparse as _ap
+    global GitHubAPI
+    real_api = GitHubAPI
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "WORKER_ACCOUNT_HANDLE", "PROVENANCE_SALT",
+              "GH_TOKEN", "REGISTRY_ALERT_TOKEN")}
+
+    class _CountingAPI:
+        put_count = 0
+
+        def __init__(self, token):
+            pass
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            if method == "GET":
+                return {"object": {"sha": "b"}} if "git/ref/heads" in path else None
+            _CountingAPI.put_count += 1
+            return {"content": {"sha": "deadbeef"}}
+
+    args = _ap.Namespace(provider="anthropic", account="", model_alias="fable",
+                         exit_class="auth", run_id="1", reset_hint=None)
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", GH_TOKEN="tok")
+        GitHubAPI = _CountingAPI
+        os.environ.pop("WORKER_ACCOUNT_HANDLE", None)
+        os.environ["PROVENANCE_SALT"] = "s3cret"
+        chk("record exits nonzero without account handle", _cmd_record(args), 1)
+        chk("missing account handle writes NO record", _CountingAPI.put_count, 0)
+        os.environ["WORKER_ACCOUNT_HANDLE"] = "acct01"
+        os.environ.pop("PROVENANCE_SALT", None)
+        chk("record exits nonzero without provenance salt", _cmd_record(args), 1)
+        chk("missing provenance salt writes NO record", _CountingAPI.put_count, 0)
+        os.environ["PROVENANCE_SALT"] = "s3cret"
+        chk("record accepts complete salting configuration", _cmd_record(args), 0)
+        chk("complete salting configuration writes one record", _CountingAPI.put_count, 1)
+    finally:
+        GitHubAPI = real_api
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
