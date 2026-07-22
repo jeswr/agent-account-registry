@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3736,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8db1768fffa6eef3df6efc25f221520d8fb2635a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Small, correct maintenance PR. It hardens the MSRV gate by adding --all-targets to the MSRV `cargo check` so test targets must also compile at the declared floor, then fixes the two test-only sites that relied on temporary-lifetime-extension: `TransportAsReader(&Canned(body))` in sparq-engine-service and `WidgetContext { value: Some(&lit(\"a\")), .. }` in sparq-forms. Both are fixed the same, robust way \u2014 bind the temporary to a named local (`let transport = ...` / `let value = ...`) so its lifetime is explicit and version-independent rather than relying on extension through a constructor. Tests are behavior-preserving (identical assertions, exercise the real path, not vacuous). No hard-coded perf numbers, no honesty/soundness surface, no ZK/MPC claims, no security concern. The only residual risk is that --all-targets at MSRV could surface further test-only breakages elsewhere in the workspace, but that is exactly what the gate is meant to catch and CI is authoritative here; the two fixes are self-contained and complete.",
+  "verdict": "approve"
+ }
+}
