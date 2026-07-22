@@ -124,6 +124,7 @@ SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # gate, the other consumer of this manifest.
 DEFAULT_TRUST_SURFACE_PATHS = (
     "scripts/",          # every orchestration/credential/health/provenance control script
+    "dashboard/",        # public dashboard source consumed by the privileged generator
     "containers/",       # the model-isolation sandbox (worker-model.Dockerfile)
     ".github/workflows/",
     "policy/",
@@ -2855,6 +2856,9 @@ def _self_test():
     check("trust-surface flags the model-health CAS (issue #145)",
           trust_surface_paths_touched(["scripts/model-health.py"]),
           ["scripts/model-health.py"])
+    check("trust-surface flags dashboard source (issue #208)",
+          trust_surface_paths_touched(["dashboard/app.js", "dashboard/index.html"]),
+          ["dashboard/app.js", "dashboard/index.html"])
     # trust_surface_paths_touched itself honours EXACTLY the list it is handed (a pure matcher);
     # a custom-only list flags only its own paths.
     check("trust-surface honours the exact supplied path list",

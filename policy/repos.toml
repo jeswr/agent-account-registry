@@ -169,6 +169,7 @@ kind = "from-agent-open"       # the registry drains its OWN open from:agent iss
 # mechanism. Aligns with the worker-live.sh registry-selftest gate.
 security_paths = [
   "scripts/",           # every orchestration/credential/health/provenance control script
+  "dashboard/",         # public dashboard source consumed by the privileged generator
   "containers/",        # the model-isolation sandbox (worker-model.Dockerfile)
   "policy/",
   "orchestration/",

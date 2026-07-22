@@ -12,14 +12,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build privacy-safe Pages artifact
+  probe:
+    name: Probe private account usage
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # SECRET-EXFIL GUARD (issue #101): reads toJSON(secrets) (ACCT_* probe subset) and
     # PROVENANCE_SALT, which live in the `dispatch-secrets` environment (deployment-branch
     # policy: default branch only) — full rationale on the `claim` job in dispatch.yml.
-    # The `deploy` job below keeps its own `github-pages` environment (no secrets there).
+    # This job emits only account-usage.py's privacy-safe aggregate artifact. The public
+    # generator runs in a separate job/runner and can never inherit this runner's raw tokens.
     environment: dispatch-secrets
     permissions:
       actions: read
@@ -93,6 +94,47 @@ jobs:
           # exactly what hid this step's missing-salt gap in production.
           python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" || printf '{}' > "$RUNNER_TEMP/usage.json"
           echo 'usage-probe: snapshot written'
+
+      - name: Upload privacy-safe usage snapshot (pinned)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dashboard-usage-${{ github.run_id }}
+          path: ${{ runner.temp }}/usage.json
+          retention-days: 1
+          if-no-files-found: error
+
+  build:
+    name: Build privacy-safe Pages artifact
+    needs: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The generator needs the privacy salt to label already-sanitized ledger records, but this
+    # fresh runner never receives ACCT*_TOKEN values or the probe's secret file.
+    environment: dispatch-secrets
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          persist-credentials: false
+
+      - name: Ledger checkout is data-only (trust guard)
+        run: python3 scripts/ledger-invariant.py ledger
+
+      - name: Download privacy-safe usage snapshot (pinned)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dashboard-usage-${{ github.run_id }}
+          path: ${{ runner.temp }}
 
       - name: Generate privacy-safe dashboard
         env:
