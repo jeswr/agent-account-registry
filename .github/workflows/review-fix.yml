@@ -200,12 +200,9 @@ jobs:
           ref: ledger
           persist-credentials: false
 
-      # Trust guard (issue #28 review round 1): the ledger branch is DATA-ONLY by design.
+      # Validate paths, object types, and modes against the canonical data-only allowlist.
       - name: Ledger checkout is data-only (trust guard)
-        run: |
-          set -euo pipefail
-          test ! -e ledger/.github
-          test ! -e ledger/scripts
+        run: python3 registry/scripts/ledger-invariant.py ledger
 
       - name: Checkout public target for protected routing data (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -833,12 +830,9 @@ jobs:
           ref: ledger
           persist-credentials: false
 
-      # Trust guard (issue #28 review round 1): the ledger branch is DATA-ONLY by design.
+      # Validate paths, object types, and modes against the canonical data-only allowlist.
       - name: Ledger checkout is data-only (trust guard)
-        run: |
-          set -euo pipefail
-          test ! -e ledger/.github
-          test ! -e ledger/scripts
+        run: python3 registry/scripts/ledger-invariant.py ledger
 
       # Per-phase least-privilege App tokens. The REVIEW token cannot write target contents (the
       # reviewer never pushes); the FIX token can (it pushes the fix commit). The ARM path mints

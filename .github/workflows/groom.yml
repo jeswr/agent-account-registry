@@ -48,44 +48,10 @@ jobs:
           ref: ledger
           persist-credentials: false
 
-      # Out-of-band DATA-ONLY invariant sweep (review round 2): this step runs from MASTER's
-      # copy of this workflow on every scheduled tick, so it cannot be bypassed by content on
-      # the ledger branch itself. The platform already blocks the confined actor (Actions'
-      # GITHUB_TOKEN cannot create/update .github/workflows/** — it never holds the `workflows`
-      # permission); this sweep detects and fails LOUD if anything beyond the documented data
-      # plane ever appears on `ledger` regardless of how it got there.
-      #
-      # WHITELIST, not blacklist (review round 3): every tree entry must be one of
-      #   100644 blob README.md            (the branch's tombstone/pointer doc)
-      #   040000 tree data                 (the data directory itself)
-      #   100644 blob data/<name>.json     (regular, non-executable JSON blobs, no subdirs)
-      #   040000 tree orchestration[/provenance|/review-verdicts]   (issue #96 record dirs)
-      #   100644 blob orchestration/{provenance,review-verdicts}/<name>.json
-      # so executable-mode blobs (100755), symlinks (120000), submodules (160000),
-      # extensionless files, and data/evil.py all fail regardless of naming tricks. A
-      # truncated tree listing also fails: unverified means violated.
+      # This runs master's checked-in validator against the checked-out ledger Git tree, so content
+      # on the unprotected branch cannot weaken or bypass the canonical path/type/mode allowlist.
       - name: Assert the ledger branch is still data-only
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          resp=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/ledger?recursive=1")
-          if [ "$(jq -r '.truncated' <<<"$resp")" != "false" ]; then
-            echo "::error::ledger tree listing is truncated — data-only invariant cannot be verified"
-            exit 1
-          fi
-          bad=$(jq -r '.tree[] | [.mode, .type, .path] | @tsv' <<<"$resp" | awk -F'\t' '
-            !(($1 == "100644" && $2 == "blob" && $3 == "README.md") ||
-              ($1 == "040000" && $2 == "tree" && $3 == "data") ||
-              ($1 == "100644" && $2 == "blob" && $3 ~ /^data\/[^\/]+\.json$/) ||
-              ($1 == "040000" && $2 == "tree" && ($3 == "orchestration" ||
-                 $3 == "orchestration/provenance" || $3 == "orchestration/review-verdicts")) ||
-              ($1 == "100644" && $2 == "blob" &&
-                 $3 ~ /^orchestration\/(provenance|review-verdicts)\/[^\/]+\.json$/))')
-          if [ -n "$bad" ]; then
-            printf '::error::ledger branch carries non-whitelisted content (data-only invariant violated):\n%s\n' "$bad"
-            exit 1
-          fi
+        run: python3 scripts/ledger-invariant.py ledger
 
       # Per-owner target token mint (issue #168): policy enables targets under TWO distinct owners
       # (sparq-org, jeswr), so a SINGLE App token scoped to one owner 404s every read and fails

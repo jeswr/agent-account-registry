@@ -16,9 +16,11 @@ separate branch:
 - Granting the bot a protection bypass instead would let a compromised workflow push **code**
   to `master`. Confining bot writes to a branch from which no workflow executes keeps master's
   protection fully intact.
-- The `ledger` branch is an **orphan, DATA-ONLY branch** (only `data/*.json`,
-  `orchestration/{provenance,review-verdicts}/*.json` + a README — no `.github/`, no
-  `scripts/`). This is load-bearing, not cosmetic (review rounds 1–2): a
+- The `ledger` branch is an **orphan, DATA-ONLY branch**. The single canonical allowlist lives in
+  `scripts/ledger-invariant.py`: mode `100644` blobs may be only `README.md`, flat
+  `data/*.json`, or flat `orchestration/{provenance,review-verdicts}/*.json`; only the parent
+  directories may be mode `040000` trees. Every other path, mode, or Git object type is refused.
+  This is load-bearing, not cosmetic (review rounds 1–2): a
   `workflow_dispatch` at `ref: ledger` executes the **ledger's** copy of a workflow file, so
   the non-execution property requires no workflow file at that ref (a dispatch against it
   404s; no workflow in this repo triggers on `push`).
@@ -28,9 +30,8 @@ separate branch:
   — which `GITHUB_TOKEN` never has** (platform-enforced, on every branch). An actor with a
   workflow-scoped PAT (the repo owner) can already push arbitrary workflows to any unprotected
   branch repo-wide, so `ledger` adds zero net-new execution surface. Defense-in-depth on top:
-  master's reader workflows assert their ledger checkout is data-only, and the scheduled
-  `groom.yml` (running master's copy — outside anything ledger-controlled) sweeps the ledger
-  tree and fails LOUD if executable content ever appears. (A path-restriction push ruleset
+  every master's reader workflow and scheduled `groom.yml` run that same validator immediately
+  after checkout, before consuming ledger content. (A path-restriction push ruleset
   would be stronger still, but push rulesets are not available on a user-owned repo plan.)
 
 Every reader/writer pins the ref via the `LEDGER_REF` constant
