@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 535,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6c516ca5b3160e0b03c87eb8fc1f8d4a9cd27048",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "validate_lease_account_identities is called in _read_ledger right after the leases-is-a-list check and BEFORE reclaim_expired, and raises ValueError if ANY lease account is not a 16-hex fingerprint. Because this PR is the change that introduces fingerprinting, the currently-live data/leases.json (on the ledger branch) necessarily contains raw handles like '[redacted-account]'. At deploy every claim/adopt/release read therefore aborts with 'lease account identities must be canonical fingerprints' until the ledger is manually rewritten. Since validation precedes reclamation, even already-expired legacy leases keep the read failing. The same unconditional rejection is duplicated in groom.validate_ledger (scripts/groom.py:216), so the groom sweep \u2014 the system's self-heal \u2014 also refuses to read the mixed ledger and cannot auto-purge the offending entries. Net effect: a self-inflicted total dispatch-starvation outage of exactly the class the allocator header calls out (issue #28), recoverable only by hand-editing the ledger branch. The 'refuse legacy identities' intent is clear from the comment, but as written there is no in-code migration and no coordination artifact in the diff.",
+    "file": "scripts/select-and-claim.py",
+    "fix_hint": "Give the read path a bounded migration instead of an unconditional abort: on read, DROP (or reclaim) leases whose account is non-fingerprint rather than raising on the whole document, so live/expired legacy leases drain naturally and groom retains its self-heal; keep the hard-fail only for the shape you actively write. Alternatively, gate the hard cutover behind a confirmed one-time ledger purge/migration executed in the same deploy operation, and document that ordering. Ensure groom.validate_ledger uses the same tolerance so it can still process (and clear) a mixed ledger.",
+    "severity": "major",
+    "title": "Hard-failing the whole ledger on any legacy raw-handle lease bricks claim/adopt/release at cutover with no migration path"
+   }
+  ],
+  "progress": null,
+  "summary": "The salted-fingerprint change is internally correct and non-vacuously tested. The hash algorithm sha256(handle:salt)[:16] is identical across select-and-claim.account_fingerprint, dashboard._salted_labels/account_hash, and groom's shape check; every ledger comparison in select-and-claim now routes through account_fingerprint (active_for, affinity, inspect_claim, adopt, make_lease), while the raw-handle reads in claim results are correctly retained for secret resolution. Dropping lease accounts from the dashboard privacy deny-set is both safe (the raw value never enters the emitted document) and necessary (they now equal the rendered salted labels). Salt is wired into exactly the claim/adopt jobs that need it, gated behind environment: dispatch-secrets; the dry-run parse path and release paths correctly need no salt; missing salt fails closed. Self-tests assert real behavior: dashboard's active_agents:1 in a full-document equality, select-and-claim's fingerprint storage + raw-identity ValueError + commit-subject omission (with negative check), groom's raw-account fail-closed, and four_sol slot counts built via make_lease. No reviewer-directed instructions appear in the diff. The one blocking gap is rollout soundness: both validate_lease_account_identities (allocator _read_ledger) and validate_ledger (groom) unconditionally reject the ENTIRE ledger on any single non-fingerprint account, evaluated on every read BEFORE reclaim_expired, with no migration or tolerance path. Since this PR is what introduces fingerprinting, the live data/leases.json necessarily still holds raw handles at cutover, so deploying hard-fails every allocator claim/adopt/release AND every groom sweep read until the ledger is manually rewritten \u2014 and because groom itself refuses to read a mixed ledger, it cannot auto-purge the offending leases, removing the system's self-heal. This is the dispatch-starvation class the allocator header documents (issue #28). Provide an in-code\u2026 [truncated 222 chars]",
+  "verdict": "request_changes"
+ }
+}
