@@ -752,17 +752,37 @@ run_gate() {
 # advertised --self-test entrypoint enrolls it automatically instead of requiring a conflict-prone
 # edit here. Keep exclusions explicit and exceptional: a denylisted self-test gets no trust credit.
 SELFTEST_DENYLIST=""
+EXPECTED_SELFTEST_SUITE="account-usage.py backfill-provenance.py broker-refresh.py \
+curate-frontier.py dashboard-gen.py dispatch-claim.py dispatch-plan.py dispatch-secrets-guard.py \
+groom-alert.py groom.py ledger-invariant.py ledger_retry.py metrics.py migrate-secrets.sh \
+model-health.py pat-validity.py plan-alert.py plan-snapshot.py policy-resolve.py ready-issues.py \
+resolve-conflicts.py retriage.py route-resolve.py select-and-claim.py triage.py trust-gate.py \
+usage-alert.py worker-issue.py worker-live.sh worker-pr.py"
 
 _derive_full_selftest_suite() {
-  local scripts_dir=$1 denylist=${2:-$SELFTEST_DENYLIST} file base
+  local scripts_dir=$1 denylist=${2:-$SELFTEST_DENYLIST} expected=${3-$EXPECTED_SELFTEST_SUITE}
+  local file base required
   local -a suite=()
   [[ -d "$scripts_dir" ]] || return 1
   for file in "$scripts_dir"/*.py "$scripts_dir"/*.sh; do
     [[ -f "$file" ]] || continue
-    grep -q -- '--self-test' "$file" || continue
+    case "$file" in
+      *.py)
+        grep -Eq '^[[:space:]]*[^#].*(add_argument\("--self-test"|"--self-test"[[:space:]]+in[[:space:]]+sys\.argv|sys\.argv\[[^]]+\][[:space:]]*==[[:space:]]*"--self-test")' "$file" || continue
+        ;;
+      *.sh)
+        grep -Eq '^[[:space:]]*(--self-test[[:space:]]*\|[[:space:]]*)?self-test\)' "$file" || continue
+        ;;
+    esac
     base=${file##*/}
     case " $denylist " in *" $base "*) continue ;; esac
     suite+=("$base")
+  done
+  for required in $expected; do
+    case " ${suite[*]} " in
+      *" $required "*) ;;
+      *) printf 'suite script %s lost its self-test entrypoint\n' "$required" >&2; return 1 ;;
+    esac
   done
   ((${#suite[@]} > 0)) || return 1
   printf '%s\n' "${suite[*]}"
@@ -2294,18 +2314,27 @@ PY
   # vacuous, over-broad, or stops honoring the denylist. ---
   local suite_fixture="$tmp/selftest-suite" derived_fixture
   mkdir -p "$suite_fixture"
-  printf '%s\n' 'if "--self-test" in argv: run_tests()' > "$suite_fixture/advertised.py"
+  printf '%s\n' 'if "--self-test" in sys.argv: run_tests()' > "$suite_fixture/advertised.py"
   printf '%s\n' 'print("ordinary helper")' > "$suite_fixture/helper.py"
-  printf '%s\n' '# supports --self-test' > "$suite_fixture/denied.sh"
-  derived_fixture=$(_derive_full_selftest_suite "$suite_fixture" "denied.sh")
+  printf '%s\n' '# supports --self-test' > "$suite_fixture/comment-only.py"
+  printf '%s\n' 'case "$1" in' '  self-test) run_tests ;;' 'esac' > "$suite_fixture/advertised.sh"
+  printf '%s\n' 'case "$1" in' '  self-test) run_tests ;;' 'esac' > "$suite_fixture/denied.sh"
+  derived_fixture=$(_derive_full_selftest_suite "$suite_fixture" "denied.sh" "advertised.py")
   chk "derived suite enrolls an advertised self-test" \
     "$(grep -cw 'advertised.py' <<< "$derived_fixture" || true)" "1"
+  chk "derived suite enrolls an advertised shell self-test" \
+    "$(grep -cw 'advertised.sh' <<< "$derived_fixture" || true)" "1"
   chk "derived suite rejects a script without a self-test entrypoint" \
     "$(grep -cw 'helper.py' <<< "$derived_fixture" || true)" "0"
+  chk "derived suite rejects a comment-only self-test mention" \
+    "$(grep -cw 'comment-only.py' <<< "$derived_fixture" || true)" "0"
   chk "derived suite honors its explicit denylist" \
     "$(grep -cw 'denied.sh' <<< "$derived_fixture" || true)" "0"
   chk "derived suite fails closed when no advertised self-test exists" \
-    "$( (_derive_full_selftest_suite "$suite_fixture" "advertised.py denied.sh" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "advertised.py advertised.sh denied.sh" "" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  chk "derived suite fails closed when a baseline script loses its self-test entrypoint" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "" "helper.py" >/dev/null 2>&1 && echo accepted) || echo refused)" \
     "refused"
 
   # --- registry-selftest gate PURE selector (non-vacuous): classify a fixture diff into the
