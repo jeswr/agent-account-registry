@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Lease allocator (review C3): a correct, cross-codebase worker-slot lease over a
+# Lease allocator (review C3): a correct, cross-codebase worker-slot lease over a
 # compare-and-swap ledger — replaces the reaction "mutex" (which cannot count concurrent same-identity
 # claims). Pure allocation logic is unit-tested; GitHub CAS I/O wraps it.
 """select-and-claim — allocate a model-account worker slot as a LEASE.
 
 The ledger is a single JSON file `data/leases.json` in this private registry:
     {"leases": [{"account","claim_id","holder","package","role","model","issued_at","expires_at"}, ...]}
+
+``account`` is the canonical salted 16-hex fingerprint, never the catalog handle.
 
 Claiming is a compare-and-swap: read the file + its blob SHA, reclaim expired leases, if an eligible
 account (serving a model in the chain, under its cap, cache-affinity-preferred) has a free slot append
@@ -21,6 +23,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -52,8 +55,27 @@ def reclaim_expired(leases, now):
     return [x for x in leases if x.get("expires_at", 0) > now]
 
 
+ACCOUNT_FINGERPRINT_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def account_fingerprint(handle, salt=None):
+    """Canonical public identity for an account. Missing salt fails closed."""
+    salt = os.environ.get("PROVENANCE_SALT", "") if salt is None else salt
+    if not isinstance(handle, str) or not handle or not isinstance(salt, str) or not salt:
+        raise LeaseIOError("PROVENANCE_SALT and account handle are required for lease identity")
+    return hashlib.sha256(f"{handle}:{salt}".encode()).hexdigest()[:16]
+
+
+def validate_lease_account_identities(leases):
+    """Drop legacy/raw identities so the next CAS write completes the bounded migration."""
+    return [item for item in leases
+            if isinstance(item.get("account"), str)
+            and ACCOUNT_FINGERPRINT_RE.fullmatch(item["account"]) is not None]
+
+
 def active_for(leases, account):
-    return sum(1 for x in leases if x["account"] == account)
+    fingerprint = account_fingerprint(account)
+    return sum(1 for x in leases if x.get("account") == fingerprint)
 
 
 # ---- usage-aware eligibility + expiry-priority (dynamic backoff) --------------------------------
@@ -163,7 +185,7 @@ def _order_eligible_accounts(accounts, leases, usage, package, role):
     """
     def affinity(account):
         times = [lease.get("issued_at", 0) for lease in leases
-                 if lease["account"] == account["handle"]
+                 if lease.get("account") == account_fingerprint(account["handle"])
                  and lease.get("package") == package and lease.get("role") == role]
         return max(times) if times else -1
 
@@ -287,7 +309,7 @@ def available_account_slots(accounts, leases, model_chain, now, account_pool=Non
 
 
 def make_lease(account, holder, package, role, model, now, ttl):
-    return {"account": account, "claim_id": None, "holder": holder, "package": package,
+    return {"account": account_fingerprint(account), "claim_id": None, "holder": holder, "package": package,
             "role": role, "model": model, "issued_at": now, "expires_at": now + ttl}
 
 
@@ -301,6 +323,11 @@ def apply_claim(leases, account, holder, package, role, model, now, ttl, claim_i
 
 def apply_release(leases, claim_id, now):
     return [x for x in reclaim_expired(leases, now) if x.get("claim_id") != claim_id]
+
+
+def claim_commit_message(claim_id, package, role):
+    """Public ledger subject: operational identifiers only, never account identity."""
+    return f"claim {claim_id[:8]} {package}/{role}"
 
 
 def holder_key(holder):
@@ -400,6 +427,7 @@ def _read_ledger(repo):
         leases = content.get("leases")
         if not isinstance(leases, list) or any(not isinstance(item, dict) for item in leases):
             raise ValueError("leases must be a list of objects")
+        leases = validate_lease_account_identities(leases)
         sha = meta["sha"]
         if not isinstance(sha, str) or not sha:
             raise ValueError("blob sha is missing")
@@ -653,7 +681,7 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         acct = a["handle"]
         cid = uuid.uuid4().hex
         live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
-        if _write_ledger(repo, live, sha, f"claim {cid[:8]} {acct} {package}/{role}"):
+        if _write_ledger(repo, live, sha, claim_commit_message(cid, package, role)):
             return result({
                 "account": acct,
                 "secret_ref": a.get("secret_ref"),
@@ -689,7 +717,8 @@ def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
         return None
     accounts = [
         account for account in read_accounts(repo)
-        if account.get("handle") == lease.get("account") and account.get("available")
+        if account_fingerprint(account.get("handle")) == lease.get("account")
+        and account.get("available")
     ]
     if len(accounts) != 1 or lease.get("model") not in accounts[0].get("models", []):
         return None
@@ -732,7 +761,8 @@ def adopt(repo, claim_id, new_holder, now, ttl, expected_holder_prefix="", retri
             return None
         accounts = [
             account for account in read_accounts(repo)
-            if account.get("handle") == lease.get("account") and account.get("available")
+            if account_fingerprint(account.get("handle")) == lease.get("account")
+            and account.get("available")
         ]
         if len(accounts) != 1 or lease.get("model") not in accounts[0].get("models", []):
             return None
@@ -772,6 +802,10 @@ def release(repo, claim_id, now, retries=6):
 # ---- self-test ----------------------------------------------------------------------------------
 def _self_test():
     ok = True
+    # Lease identity is unusable without the production salt. A fixed test-only salt makes every
+    # allocation assertion exercise the hash-only ledger representation.
+    original_selftest_salt = os.environ.get("PROVENANCE_SALT")
+    os.environ["PROVENANCE_SALT"] = "select-and-claim-self-test"
 
     def check(n, got, want):
         nonlocal ok
@@ -1273,6 +1307,19 @@ def _self_test():
     check("cache affinity", choose_account(A, warm2, ["fable"], "pkg", "impl", now), "acct02")
     live, _lease = apply_claim([], "acct02", "run1", "pkg", "impl", "fable", now, 100, "CID")
     check("claim adds", len(live), 1)
+    check("lease stores only canonical salted account fingerprint",
+          _lease["account"], account_fingerprint("acct02"))
+    check("lease fingerprint is 16 lowercase hex",
+          ACCOUNT_FINGERPRINT_RE.fullmatch(_lease["account"]) is not None, True)
+    check("raw account identity is dropped during bounded ledger migration",
+          validate_lease_account_identities([{"account": "acct02"}]), [])
+    check("canonical fingerprint survives bounded ledger migration",
+          validate_lease_account_identities([{"account": _lease["account"]}]),
+          [{"account": _lease["account"]}])
+    subject = claim_commit_message("abcdef0123456789", "pkg", "impl")
+    check("claim commit subject omits raw account identity",
+          subject, "claim abcdef01 pkg/impl")
+    check("claim commit subject negative: raw account absent", "acct02" in subject, False)
     check("release removes", apply_release(live, "CID", now), [])
     check("holder key ignores run identity", holder_key("owner/repo#7@run.1"), "owner/repo#7")
     scoped = [make_lease("acct01", "owner/repo#1@run", "crate-a", "impl", "terra", now, 100)]
@@ -1815,6 +1862,10 @@ def _self_test():
     finally:
         subprocess.run = real_run
 
+    if original_selftest_salt is None:
+        os.environ.pop("PROVENANCE_SALT", None)
+    else:
+        os.environ["PROVENANCE_SALT"] = original_selftest_salt
     print("select-and-claim self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

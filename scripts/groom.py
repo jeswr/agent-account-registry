@@ -68,6 +68,7 @@ WORKER_PR_MARKER = "> 🤖 SPARQ agent"
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?")
 SAFE_CLAIM = re.compile(r"[0-9a-f]{32}")
+SAFE_ACCOUNT_HASH = re.compile(r"[0-9a-f]{16}")
 HOLDER = re.compile(
     r"(?P<repo>[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)"
     r"#(?P<issue>[1-9][0-9]*)@(?P<run>[^\r\n]+)"
@@ -198,6 +199,12 @@ def validate_ledger(document: Any) -> list[dict[str, Any]]:
     for lease in leases:
         if not isinstance(lease, dict):
             raise GroomError("lease ledger contains a non-object entry")
+        account = lease.get("account")
+        if not isinstance(account, str) or SAFE_ACCOUNT_HASH.fullmatch(account) is None:
+            # Fingerprinting was introduced while the ledger branch still contained raw handles.
+            # Ignore only those legacy rows so this sweep can CAS-write the validated remainder;
+            # canonical rows retain every fail-closed shape check below.
+            continue
         claim = lease.get("claim_id")
         if not isinstance(claim, str) or SAFE_CLAIM.fullmatch(claim) is None:
             raise GroomError("lease ledger contains an unsafe claim id")
@@ -213,7 +220,9 @@ def validate_ledger(document: Any) -> list[dict[str, Any]]:
         for field in ("account", "package", "role", "model"):
             if not isinstance(lease.get(field), str) or not lease[field]:
                 raise GroomError(f"lease {field} is malformed")
-    return leases
+    return [lease for lease in leases
+            if isinstance(lease.get("account"), str)
+            and SAFE_ACCOUNT_HASH.fullmatch(lease["account"]) is not None]
 
 
 def _run_status(run: dict[str, Any]) -> str:
@@ -1745,7 +1754,7 @@ def _self_test() -> int:
     now = 10_000
     limits = Limits(worker_timeout_minutes=10, max_attempts=2)
     base = {
-        "account": "acct01",
+        "account": "0123456789abcdef",
         "claim_id": "a" * 32,
         "holder": "owner/repo#7@dispatch-123.1",
         "package": "crate-a",
@@ -2835,6 +2844,16 @@ def _self_test() -> int:
     except GroomError:
         malformed_failed = True
     check("malformed ledger fails closed", malformed_failed, True)
+    check("raw account handle is dropped during bounded ledger migration",
+          validate_ledger({"leases": [{**base, "account": "acct01"}]}), [])
+    mixed = validate_ledger({"leases": [{**base, "account": "acct01"}, base]})
+    check("canonical lease survives mixed-ledger migration", mixed, [base])
+    canonical_shape_failed = False
+    try:
+        validate_ledger({"leases": [{**base, "claim_id": "unsafe"}]})
+    except GroomError:
+        canonical_shape_failed = True
+    check("canonical lease shape still fails closed", canonical_shape_failed, True)
 
     # Review/fix repair leases: tolerated by validation, never issue-mapped, and a malformed
     # NON-repair holder still fails closed (the skip must not widen into blanket tolerance).
@@ -2982,6 +3001,16 @@ def _self_test() -> int:
         }
     })
     check("ledger read parses at the ledger ref", _read_ledger(seeded, "o/r"), ([], "s1"))
+    mixed_seeded = _StubAPI({
+        ledger_read_path("o/r"): {
+            "content": base64.b64encode(json.dumps({
+                "leases": [{**base, "account": "legacy-handle"}, base],
+            }).encode()).decode(),
+            "sha": "s2",
+        }
+    })
+    check("ledger read drops legacy identity and retains canonical lease",
+          _read_ledger(mixed_seeded, "o/r"), ([base], "s2"))
     missing_ledger_loud = False
     try:
         _read_ledger(_StubAPI({}), "o/r")  # stub 404s every path → branch AND file absent
@@ -3020,7 +3049,8 @@ def _self_test() -> int:
                 self.reads += 1
                 document = {
                     "leases": [{
-                        "account": "a", "claim_id": dead, "holder": "owner/repo#7@run.1",
+                        "account": "aaaaaaaaaaaaaaaa", "claim_id": dead,
+                        "holder": "owner/repo#7@run.1",
                         "package": "p", "role": "impl", "model": "m",
                         "issued_at": 1, "expires_at": 9,
                     }]
