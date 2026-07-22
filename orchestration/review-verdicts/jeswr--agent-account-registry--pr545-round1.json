@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 545,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0858128122fd31760e41ec8209d219cb9bec2e4e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "PR #545 (issue #215) flips _cmd_record's missing account-handle/salt branch in scripts/model-health.py from silent skip (return 0) to fail-loud (return 1), and adds a self-test. VERIFIED sound and fail-closed: the change matches the account_hash 'missing handle/salt fails loud' contract (line 247-250) and the existing sibling guards in the same function (#199 unknown provider, #423 provider/class mismatch, #8 CAS exhaustion all return 1). Liveness is preserved because every record call site is an isolated job: worker.yml (line 1354-1357 'A SEPARATE job') and review-fix.yml run the record step in a distinct dispatch-secrets job, and dispatch.yml's fleet records are always()-guarded, so a nonzero record exit is a VISIBLE integrity signal, never a blocker on the real work pipeline. The #8 branch already returns 1 in this function today, so call sites already tolerate this exit class; no new liveness regression. The new test _test_record_salting_config is NON-VACUOUS and correct: chk(label, actual, expected) ordering matches sibling _test_record_exit; the two negative cases assert return==1 AND put_count==0 (nothing written), and the positive case asserts return==0 AND put_count==1 \u2014 reverting the code to return 0 flips the first assertion red, and an over-broad guard flips the positive one red. The _CountingAPI mock correctly exercises the write path (GET git/ref/heads => branch present; contents GET => None => empty-ledger seed; PUT => {'content':{...}} => append_record returns 1 => _cmd_record returns 0). Env vars saved/restored in finally; test registered in _self_test. No trust check weakened, no token/PII handling changed, no injection-exploitable workflow expansion. Diff is pure code with no instructions directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
