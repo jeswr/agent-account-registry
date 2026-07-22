@@ -5769,7 +5769,7 @@ def _self_test():
     snapshot_fields = {re.match(r'\s*"([a-z_]+)"', line).group(1) for line in key_lines
                        if len(line) - len(line.lstrip()) == key_indent}
     assert snapshot_fields == {"number", "state", "draft", "body", "labels",
-                               "head", "user"}, snapshot_fields
+                               "head", "user", "auto_merge"}, snapshot_fields
 
     # ---- Issue #109: the tick-health recorder must make a snapshot-skip-only tick VISIBLE.
     # Snapshot skips fold into the defer histogram (snapshot_skip_reasons) but are NOT `planned`
