@@ -402,6 +402,10 @@ jobs:
                       "number": pull.get("number"),
                       "state": pull.get("state"),
                       "draft": pull.get("draft"),
+                      # #509/#516: the parked-free coherence gate reads the latch signal; an
+                      # absent auto_merge key is ambiguous and fail-closes to BUSY, so the
+                      # snapshot must carry it for plan-time freeing to ever fire.
+                      "auto_merge": pull.get("auto_merge"),
                       "body": pull.get("body") or "",
                       "labels": [label.get("name") for label in (pull.get("labels") or [])
                                  if isinstance(label, dict)],
