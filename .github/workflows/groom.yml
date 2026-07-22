@@ -171,7 +171,11 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -euo pipefail
-          python3 scripts/model-health.py --self-test
+          # The full registry gate already executes model-health's self-test. Do not replay its
+          # intentional malformed-record/refused-pair fixtures on every live Groom tick: those
+          # expected-negative cases emit GitHub ::error:: annotations and were indistinguishable
+          # from a dropped production relay (#512). Producer/relay integration is covered by
+          # worker-live.sh's stateful contract fixture against this unchanged validator.
           python3 scripts/model-health.py decide --policy-file policy/repos.toml
 
   # FAIL-LOUD alert for a HARD GROOM failure (issue #176). The model-access health decision is the

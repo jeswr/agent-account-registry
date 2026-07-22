@@ -168,7 +168,13 @@ if isinstance(usage, dict):
 wall = document.get("wall_seconds") if isinstance(document, dict) else None
 if isinstance(wall, int) and not isinstance(wall, bool) and 0 <= wall <= 7 * 24 * 3600:
     fields.append(("wall", wall))
-print("no-change-v1 " + ",".join(f"{key}:{value}" for key, value in fields))
+# This is a protocol boundary, not a display string. Keep the producer locked to
+# model-health.py's exact ``no-change-v1 key:value,key:value`` grammar: ASCII-decimal values,
+# comma separators, and no whitespace inside the payload.
+payload = ",".join(f"{key}:{value}" for key, value in fields)
+if any(not str(value).isascii() or not str(value).isdigit() for _, value in fields):
+    raise SystemExit(1)
+print("no-change-v1 " + payload)
 PY
 }
 
@@ -1870,6 +1876,163 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_creation_input_tokens"],
   chk "no-change handoff contains only issue + numeric usage/wall fields" \
     "$(_no_change_health_envelope "$tmp/usage-telemetry.json" 503)" \
     "no-change-v1 issue:503,input:120,output:77,wall:83"
+
+  # --- health-record producer/relay contract (#512 escalation): exercise the THREE live
+  # producer shapes against model-health.py itself, not a parallel grammar. The stateful fake
+  # Contents API retains every PUT, so three no_change outcomes (across two issues) must survive
+  # the real _cmd_record relay and derive a backoff. A stateless/drop-on-relay fake leaves this at
+  # one record and turns the backoff assertion red. Expected-negative calls are captured so the
+  # registry self-test proves fail-closed refusal without emitting misleading GitHub ::error::
+  # annotations in this producer test.
+  local envelope_503 envelope_504 health_contract
+  envelope_503=$(_no_change_health_envelope "$tmp/usage-telemetry.json" 503)
+  envelope_504=$(_no_change_health_envelope "$tmp/usage-telemetry.json" 504)
+  health_contract=$(python3 - "$SCRIPT_DIR/model-health.py" "$SCRIPT_DIR/../.github/workflows" \
+    "$envelope_503" "$envelope_504" <<'PY'
+import argparse
+import base64
+from contextlib import redirect_stdout
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+model_path = Path(sys.argv[1])
+workflow_dir = Path(sys.argv[2])
+envelope_503, envelope_504 = sys.argv[3:]
+spec = importlib.util.spec_from_file_location("health_record_contract", model_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load model-health contract")
+health = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(health)
+
+
+class MemoryAPI:
+    """Stateful model-health Contents API: every successful relay is readable by the next."""
+
+    document = None
+    puts = 0
+
+    def __init__(self, _token):
+        pass
+
+    def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+        if method == "GET":
+            if "/git/ref/heads/" in path:
+                return {"object": {"sha": "ledger-tip"}}
+            if self.__class__.document is None:
+                return None
+            encoded = base64.b64encode(
+                (json.dumps(self.__class__.document) + "\n").encode()).decode()
+            return {"content": encoded, "sha": f"sha-{self.__class__.puts}"}
+        if method != "PUT" or not isinstance(body, dict):
+            raise AssertionError((method, path))
+        document = json.loads(base64.b64decode(body["content"], validate=True).decode())
+        # Tripwire (a): every actual call-site fixture passes the canonical read validator.
+        health.validate_ledger(document)
+        self.__class__.document = document
+        self.__class__.puts += 1
+        return {"content": {"sha": f"sha-{self.__class__.puts}"}}
+
+
+def args(provider, exit_class, run_id, reset_hint=None):
+    return argparse.Namespace(
+        provider=provider,
+        account="",
+        model_alias="" if provider == "fleet" else "sol",
+        exit_class=exit_class,
+        run_id=run_id,
+        reset_hint=reset_hint,
+    )
+
+
+def relay(record_args):
+    output = io.StringIO()
+    with redirect_stdout(output):
+        result = health._cmd_record(record_args)
+    return result, output.getvalue()
+
+
+# Pin the three workflow producers too: worker + review/fix relay account-scoped classes through
+# the selected real provider, while dispatcher claim abort is fleet-scoped.
+for name in ("worker.yml", "review-fix.yml"):
+    workflow = (workflow_dir / name).read_text(encoding="utf-8")
+    if re.search(r'--provider "\$PROVIDER"\s+\\\s+--model-alias "\$MODEL_ALIAS"\s+\\\s+'
+                 r'--exit-class "\$EXIT_CLASS"', workflow) is None:
+        raise AssertionError(f"{name} health relay lost its real-provider/class mapping")
+dispatch = (workflow_dir / "dispatch.yml").read_text(encoding="utf-8")
+if re.search(r'--provider fleet\s+\\\s+--exit-class claim-abort', dispatch) is None:
+    raise AssertionError("dispatch claim-abort lost its fleet provider mapping")
+
+saved_api = health.GitHubAPI
+saved_env = {key: os.environ.get(key) for key in (
+    "REGISTRY_REPO", "WORKER_ACCOUNT_HANDLE", "PROVENANCE_SALT", "GH_TOKEN",
+    "REGISTRY_ALERT_TOKEN",
+)}
+try:
+    os.environ.update(
+        REGISTRY_REPO="owner/registry",
+        WORKER_ACCOUNT_HANDLE="acct01",
+        PROVENANCE_SALT="health-contract-salt",
+        GH_TOKEN="fixture-token",
+    )
+    health.GitHubAPI = MemoryAPI
+
+    # Account-scoped auth and fleet-scoped claim-abort are the taxonomy-legal pairs.
+    assert relay(args("openai", "auth", "auth.1"))[0] == 0
+    assert relay(args("fleet", "claim-abort", "abort.1"))[0] == 0
+
+    # The exact producer envelope is expanded to typed fields, retained across relays, and read
+    # back through validate_ledger before account_backoffs consumes it.
+    assert relay(args("openai", "no_change", "no-change.1", envelope_503))[0] == 0
+    assert relay(args("openai", "no_change", "no-change.2", envelope_504))[0] == 0
+    assert relay(args("openai", "no_change", "no-change.3", envelope_503))[0] == 0
+    records = health.validate_ledger(MemoryAPI.document)
+    assert len(records) == 5, len(records)
+    no_changes = [record for record in records if record["exit_class"] == "no_change"]
+    assert len(no_changes) == 3
+    assert {record["issue"] for record in no_changes} == {503, 504}
+    account = health.account_hash("acct01", "health-contract-salt")
+    backoff = health.account_backoffs(no_changes, int(time.time()) + 60).get(account)
+    assert backoff is not None and backoff["last_signal"] == health.CLASS_LIMIT
+
+    # Tripwire (c): genuinely-invalid pairs/envelopes and poisoned ledger rows still fail closed,
+    # and none of those refusals writes a sixth record.
+    puts = MemoryAPI.puts
+    code, output = relay(args("fleet", "auth", "invalid-pair.1"))
+    assert code == 1 and "refusing fleet record" in output
+    code, output = relay(args("openai", "claim-abort", "invalid-pair.2"))
+    assert code == 1 and "zero-dispatch is the fleet" in output
+    code, output = relay(args(
+        "openai", "no_change", "invalid-envelope.1",
+        "no-change-v1 issue:503,input:not-a-number",
+    ))
+    assert code == 1 and "telemetry envelope is malformed" in output
+    assert MemoryAPI.puts == puts
+    poisoned = dict(records[0], exit_class="not-a-taxonomy-class")
+    try:
+        health.validate_ledger({"records": [poisoned]})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("validate_ledger accepted an invalid taxonomy class")
+finally:
+    health.GitHubAPI = saved_api
+    for key, value in saved_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+print("valid-pairs+envelope+accumulation+refusals")
+PY
+) || health_contract=failed
+  chk "health records obey the validator and accumulated no_change derives backoff" \
+    "$health_contract" "valid-pairs+envelope+accumulation+refusals"
   chk "telemetry withholds transcript" \
     "$(grep -c 'SECRET-TRANSCRIPT-CONTENT' "$tmp/usage-telemetry.json" || true)" "0"
 
