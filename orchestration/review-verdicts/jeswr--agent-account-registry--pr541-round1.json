@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 541,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ea249e8018d70cdb4bea0b2e82eab332b36260ce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "_selftest_manifest_issues compares FULL_SELFTEST_SUITE only with markers found in the same PR-head scripts directory. If a PR removes an enrolled script and removes its manifest entry, or removes a script's self-test marker/implementation and its manifest entry, neither loop emits an issue. print_suite succeeds and both consumers omit that test. The deletion fixture is non-probative for this case because it deliberately leaves ghost.py enrolled; there is no assertion for deleting both the file/self-test and its enrollment. This is a major fail-open gap for a manifest intended to ensure deletion cannot produce a green gate and violates the trust-plane requirement that self-tests cannot be silently deleted or weakened.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Add an independent protected baseline or diff-aware policy that rejects removal of previously required suite entries/self-test capability unless an explicit, separately guarded retirement mechanism authorizes it. Add a self-test that removes both an enrolled fixture file (or its self-test marker) and its manifest entry and asserts verification still refuses the change.",
+    "severity": "major",
+    "title": "Current-tree manifest permits atomic removal of a required self-test"
+   }
+  ],
+  "progress": null,
+  "summary": "The consolidated manifest catches accidental one-sided drift, but it does not substantiate the stronger fail-closed deletion guarantee claimed by the change. Because both enrollment and discovery are derived solely from the PR-head tree, a change can delete a self-test (or its entire script) and remove the same name from FULL_SELFTEST_SUITE; print-suite then reports a consistent manifest and CI never runs the removed test. The new tests exercise only deletion while the stale enrollment remains, so they do not cover this bypass. The diff also contains reviewer-directed wording (the NAMING NOTE says not to reference a name in lists or briefs), so injection_detected is true; that text was treated only as untrusted review data.",
+  "verdict": "request_changes"
+ }
+}
