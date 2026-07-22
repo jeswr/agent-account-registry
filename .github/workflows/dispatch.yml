@@ -402,10 +402,11 @@ jobs:
                       "number": pull.get("number"),
                       "state": pull.get("state"),
                       "draft": pull.get("draft"),
-                      # #509/#516: the parked-free coherence gate reads the latch signal; an
-                      # absent auto_merge key is ambiguous and fail-closes to BUSY, so the
-                      # snapshot must carry it for plan-time freeing to ever fire.
-                      "auto_merge": pull.get("auto_merge"),
+                      # #509/#516: the parked-free coherence gate reads the latch signal; the
+                      # snapshot must carry it for plan-time freeing to ever fire. ABSENCE != NULL
+                      # (round-6): an upstream row without the key stays keyless here — a plain
+                      # .get() would fabricate a "proven unlatched" null from an absent field.
+                      **({"auto_merge": pull["auto_merge"]} if "auto_merge" in pull else {}),
                       "body": pull.get("body") or "",
                       "labels": [label.get("name") for label in (pull.get("labels") or [])
                                  if isinstance(label, dict)],
