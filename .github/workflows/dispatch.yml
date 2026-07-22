@@ -446,15 +446,9 @@ jobs:
           ref: ledger
           persist-credentials: false
 
-      # Trust guard (review round 1): the ledger branch is DATA-ONLY by design — a
-      # `workflow_dispatch` at `ref: ledger` would execute the LEDGER copy of a workflow file,
-      # so its non-execution property holds only while no executable content exists at that ref.
-      # Fail LOUD if that ever erodes.
+      # Validate paths, object types, and modes against the canonical data-only allowlist.
       - name: Ledger checkout is data-only (trust guard)
-        run: |
-          set -euo pipefail
-          test ! -e registry-ledger/.github
-          test ! -e registry-ledger/scripts
+        run: python3 registry/scripts/ledger-invariant.py registry-ledger
 
       - name: Assemble and validate the v2 plan (registry code only, no tokens, local data)
         run: |
@@ -782,12 +776,9 @@ jobs:
           ref: ledger
           persist-credentials: false
 
-      # Trust guard (issue #28 review round 1): the ledger branch is DATA-ONLY by design.
+      # Validate paths, object types, and modes against the canonical data-only allowlist.
       - name: Ledger checkout is data-only (trust guard)
-        run: |
-          set -euo pipefail
-          test ! -e ledger/.github
-          test ! -e ledger/scripts
+        run: python3 registry/scripts/ledger-invariant.py ledger
 
       # The deferred-retry label flips, review needs-user escalations, missed-fix markers, and the
       # armed-SHA-mismatch DISARMS (issue #42) are TARGET mutations, so CLAIM mints its own
