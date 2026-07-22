@@ -807,6 +807,7 @@ def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
     account = accounts[0]
     return {
         **lease,
+        "account": account.get("handle"),
         "secret_ref": account.get("secret_ref"),
         "provider": account.get("provider"),
         "harness": account.get("harness"),
@@ -857,6 +858,7 @@ def adopt(repo, claim_id, new_holder, now, ttl, expected_holder_prefix="", retri
         if _write_ledger(repo, next_leases, sha, f"adopt {claim_id[:8]} -> worker run"):
             return {
                 **transferred,
+                "account": account.get("handle"),
                 "secret_ref": account.get("secret_ref"),
                 "provider": account.get("provider"),
                 "harness": account.get("harness"),
@@ -1151,6 +1153,8 @@ def _self_test():
     check("legacy [terra] record serves a sol claim (read-time expansion)",
           (legacy_claim and legacy_claim["account"], legacy_claim and legacy_claim["model"]),
           ("acctL", "sol"))
+    check("fresh claim returns the plain account handle",
+          legacy_claim and legacy_claim["account"], "acctL")
     check("customized [terra, luna] does NOT serve a sol-only claim", customized_claim, None)
 
     # DYNAMIC-CONCURRENCY ACCOUNTING: dispatch-claim.py feeds read_accounts output straight into
@@ -1174,6 +1178,8 @@ def _self_test():
         globals()["_read_ledger"] = saved_rl
     check("sol lease on a legacy [terra] record is adoptable (adoption path normalized)",
           adopted and adopted.get("secret_ref"), "L_TOKEN")
+    check("inspect_claim returns the plain account handle",
+          adopted and adopted.get("account"), "acctL")
 
     # ---- CAS adopt: ownership TRANSFER, not a read-only inspect (issue #132) ----
     # adoptable_holder pure gate: a dispatcher-marked holder transfers; a DIFFERENT worker run is
@@ -1219,8 +1225,17 @@ def _self_test():
           adopted_lease and adopted_lease["expires_at"], now + 3600)
     check("adopt returns the account secret_ref (metadata shape like inspect_claim)",
           adopted_lease and adopted_lease.get("secret_ref"), "L_TOKEN")
+    check("adopt returns the plain account handle",
+          adopted_lease and adopted_lease.get("account"), "acctL")
+    expected_handle, account_pool = "acctL", ["acctL", "acctC"]
+    check("adopted claim passes the worker's exact account policy check",
+          (adopted_lease and adopted_lease.get("account") == expected_handle
+           and adopted_lease.get("account") in account_pool), True)
     check("adopt persisted exactly the transferred holder to the ledger",
           [row["holder"] for row in adopt_writes.get("leases", [])], [WORKER_HOLDER])
+    check("adopt keeps the salted account fingerprint in the persisted ledger",
+          [row["account"] for row in adopt_writes.get("leases", [])],
+          [account_fingerprint("acctL")])
     check("adopt preserves the stable holder_key (same target issue across the transfer)",
           holder_key(adopted_lease["holder"]), "o/r#7")
 
