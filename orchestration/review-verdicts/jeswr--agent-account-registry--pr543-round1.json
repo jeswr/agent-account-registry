@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 543,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d361d5357f2aee1f34f2bf765d8d0fd0eb389905",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "FULL_SELFTEST_SUITE is now derived by grepping scripts for the '--self-test' marker. The touched-file classifier _registry_selftest_targets (lines 794 and 799, unchanged context) emits a 'self:<base>' run ONLY when the script is a member of $suite. So suite membership \u2014 and therefore whether a touched script's --self-test is executed \u2014 now tracks the presence of the marker itself.\n\nConsequence: a future PR that deletes or neuters a script's --self-test entrypoint (the classic 'weaken a self-test' attack) drops that script from the derived set. It is then excluded from BOTH the always-run regression suite (section 2, lines 1032-1042) and from touched-classification (section 1, only 'py:' compile remains). The registry-selftest gate stays green with its self-test coverage silently gone. Under the previous hard-coded list the script was still named, so 'python3 scripts/<x>.py --self-test' ran and, with the argument removed, argparse would exit non-zero -> die -> gate red. The static list acted as a tamper-EVIDENT anchor; the derivation makes marker removal self-consistent and undetectable at this gate. No committed manifest/baseline pins expected membership (confirmed by search), so nothing else re-establishes the invariant. For a trust plane whose charter is 'self-tests are the gate / never weaken a trust check', converting the gate from tamper-evident to self-consistent is a soundness regression, not merely a refactor.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Preserve auto-enrollment AND tamper-evidence: keep a committed baseline set of scripts that MUST be self-tested (e.g. a checked-in expected-suite manifest, or the prior explicit list) and, after derivation, fail closed if any baseline member is absent from the derived suite (die: 'suite script <x> lost its --self-test'). That way new scripts still auto-enroll, but removing a known self-test marker turns the gate red instead of silently shrinking coverage. Add a fixture asserting that a baseline member whose marker was removed causes a fail-closed refusal.",
+    "severity": "major",
+    "title": "Deriving the suite from --self-test markers removes the static list's tamper-evidence: neutering a script's self-test now passes the gate silently"
+   },
+   {
+    "body": "_derive_full_selftest_suite uses 'grep -q -- \\'--self-test\\'', which matches the string anywhere in the file, including comments/docstrings. The added denylist fixture itself demonstrates this: denied.sh is enrolled solely because of the comment '# supports --self-test'. A script that merely documents --self-test in prose but does not implement the entrypoint would be enrolled and then invoked as 'python3 scripts/<x>.py --self-test' (or 'bash <x>.sh self-test'). Best case it fails closed (a legitimate PR unexpectedly red); worst case a script that tolerates unknown args runs its real main() under the self-test harness or increments the suite counter without asserting anything (a vacuous suite run). Not a security bypass, but a fragile heuristic for a trust-critical selector.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Match an actual entrypoint pattern rather than any occurrence, e.g. require a dispatch line such as '\\\"--self-test\\\" in sys.argv', 'add_argument(\\\"--self-test\\\"', or the shell 'self-test' case \u2014 or grep for the invocation guard specifically \u2014 so a mere mention in a comment does not enroll a non-self-testing script.",
+    "severity": "minor",
+    "title": "Marker match is purely textual, so a comment-only mention of --self-test enrolls (and then runs) a script"
+   }
+  ],
+  "progress": null,
+  "summary": "The change replaces the hard-coded FULL_SELFTEST_SUITE with _derive_full_selftest_suite(), which greps scripts/*.py|*.sh for the literal '--self-test' and enrolls each match (minus an explicit, currently-empty denylist). Verified strengths: all 26 previously-listed scripts still contain the marker and stay enrolled (no silent drop today); four genuine self-tests are auto-enrolled (groom-alert.py, resolve-conflicts.py, retriage.py, curate-frontier.py) \u2014 a real coverage gain; the top-level call fails closed via die (defined at line 13) when the derived set is empty; the added fixtures are non-vacuous. Blocking concern (MAJOR): this is THE registry-selftest trust gate, and the touched-file classifier at lines 794/799 (unchanged context) emits a 'self:<script>' run ONLY for scripts that are members of the suite. Because membership is now derived from the '--self-test' marker itself, a future PR that removes/neuters a script's --self-test entrypoint silently drops it from BOTH the always-run suite (section 2, lines 1032-1042) AND touched-classification (section 1) \u2014 the gate stays green. Under the previous static list the same removal forced 'python3 scripts/<x>.py --self-test' to run and error (argparse exit 2) -> die -> gate red. No committed manifest pins expected membership, so the derivation is self-consistent and the automated 'self-tests are the gate' tamper-evidence for self-test neutering is lost. That erosion is exactly the never-weaken-a-trust-check property this cross-provider gate exists to protect, so I fail toward the maintainer. A secondary minor: the marker match is purely textual (the fixture's denied.sh matches on a bare comment), so a script that merely mentions --self-test in prose is enrolled and then run with --self-test.",
+  "verdict": "request_changes"
+ }
+}
