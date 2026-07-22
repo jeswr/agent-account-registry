@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 546,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "656a21afe83ff8c5f07c28f85c6f3e1c4ef775fd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new module correctly auto-enrolls in the derived suite via worker-live.sh _derive_full_selftest_suite because it advertises a --self-test entrypoint, so its self-test does gate. However, it is not added to the EXPECTED_SELFTEST_SUITE required floor (worker-live.sh:755-760), unlike the sibling shared helper ledger_retry.py which is listed there. Without a floor entry, a future edit that silently drops lease_schema.py's --self-test would not be flagged by the derivation's 'lost its self-test entrypoint' guard. This is defence-in-depth only and does not affect current gating.",
+    "file": "scripts/lease_schema.py",
+    "fix_hint": "For belt-and-suspenders consistency with ledger_retry.py, add lease_schema.py to EXPECTED_SELFTEST_SUITE in scripts/worker-live.sh. Not required for correctness of this PR.",
+    "severity": "nit",
+    "title": "lease_schema.py not added to EXPECTED_SELFTEST_SUITE floor (consistency with ledger_retry.py)"
+   },
+   {
+    "body": "The updated fixture at the build_dashboard malformed-lease case uses account 'a'*16 (canonical) with holder 'malformed' but omits claim_id/package/role/issued_at. validate_ledger raises on the claim_id check before ever reaching the holder check, so the assertion still fires (DashboardError) and remains non-vacuous \u2014 but it no longer exercises the holder-shape rejection its surrounding intent suggests. Purely a test-precision nit; fail-closed behaviour is still asserted.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "If you want this case to specifically prove the holder check, populate claim_id/package/role/issued_at with canonical values and keep only holder malformed. Optional.",
+    "severity": "nit",
+    "title": "Malformed-lease self-test now trips on missing claim_id rather than the 'malformed' holder its context implies"
+   }
+  ],
+  "progress": null,
+  "summary": "Consolidates lease-ledger validation into new scripts/lease_schema.py, consumed by groom.py, select-and-claim.py, and dashboard-gen.py. Every replaced validator is semantically equal-or-STRONGER, and all changes are fail-closed. ACCOUNT/CLAIM regexes are byte-identical to the old SAFE_ACCOUNT_HASH/SAFE_CLAIM; HOLDER is equivalent to groom's prior pattern. is_repair_holder tightens from startswith() to a full REPAIR_HOLDER regex \u2014 a strengthening; I verified all minted repair holders are review:/fix:owner/repo#N@... (dispatch-claim.py:2485/5545) so they still match, and groom's self-test (2840-2851) covers it, so the 2026-07-17 sweep-abort incident is not reintroduced. select-and-claim._read_ledger and dashboard-gen previously did lenient list-only checks and now enforce the full canonical schema; the errors propagate fail-closed (LeaseSchemaError is a ValueError -> caught at select-and-claim.py:439 -> LeaseIOError aborts the claim; DashboardError in dashboard-gen), never a default-allow empty ledger. The legacy raw-handle migration continue is preserved. Tests are non-vacuous: lease_schema._self_test has 7 discriminating checks, and consumer fixtures were updated to canonical shape (dashboard-gen's malformed-lease case now uses a canonical account so validation actually fires). The new module auto-enrolls via worker-live.sh _derive_full_selftest_suite (a required-floor derivation, so a newly self-test-advertising script is added, not rejected). Imports (importlib.util, Path) are present in both new call sites. No trust check is weakened, deleted, or skipped; no security-label/route/gate touched; no token/PII exposure. No injected instructions in the diff.",
+  "verdict": "approve"
+ }
+}
