@@ -169,6 +169,10 @@ def _claim_defer_category(reason):
 # groom's parked-PR marker ("Human attention required"). EITHER parks the whole autonomous
 # surface for the PR — enumeration, repair admission, and worker-pr.py disarm all stand down.
 HUMAN_HOLD_PR_LABELS = {"review:needs-user", "needs:user"}
+# CLAIM's live busy-window revalidation also sees curator's terminal artifact posture.  Keep
+# this narrower than HUMAN_HOLD_PR_LABELS: status:blocked is an occupancy carve-out only after
+# the raw listing row proves the PR inert; it does not redefine review-loop admission globally.
+CLAIM_REVALIDATION_PARK_LABELS = HUMAN_HOLD_PR_LABELS | {"status:blocked"}
 IMPL_PROVIDERS = {"anthropic", "openai"}
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_ATOM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -871,7 +875,8 @@ def _pull_provably_inactive(pull, status):
     return True
 
 
-def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None):
+def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None,
+                           parked_pr_labels=None, occupancy=None):
     """PURE busy-area union for the PLAN conflict partition (registry issue #27): every open
     same-repo `sparq-agent/*` PR that can still LAND in a crate — because the review loop
     still owns it, or because a latched/unknown arm means it may merge regardless — reserves
@@ -909,6 +914,8 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     `needs:*`-gated out of the target ready engine, so freeing an inert PR's crate can
     never re-dispatch the parked issue — only siblings in the same crate."""
     busy = set()
+    hold_labels = (HUMAN_HOLD_PR_LABELS if parked_pr_labels is None
+                   else set(parked_pr_labels))
     for pull in pulls:
         if not isinstance(pull, dict) or pull.get("state") != "open":
             continue
@@ -924,7 +931,7 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
         }
         areas = {label[5:] for label in pr_labels
                  if isinstance(label, str) and label.startswith("area:")}
-        parked = bool(pr_labels & HUMAN_HOLD_PR_LABELS)
+        parked = bool(pr_labels & hold_labels)
         record = provenance.get(number) if isinstance(provenance, dict) else None
         if is_enumerable_provenance(record, number):
             source = (issue_labels.get(record["issue"])
@@ -943,7 +950,11 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
             areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage — fail closed
         status = pr_status.get(number) if isinstance(pr_status, dict) else None
         if parked and _pull_provably_inactive(pull, status):
+            if isinstance(occupancy, list):
+                occupancy.append(("parked-free", number, frozenset(areas)))
             continue                      # provably inert human-parked PR — frees its crates
+        if isinstance(occupancy, list):
+            occupancy.append(("busy", number, frozenset(areas)))
         busy |= areas
     return busy
 
@@ -1017,9 +1028,13 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
     worker PR) inside the PLAN->CLAIM window could get a sibling dispatched into a crate
     it can still merge into. Recomputes the SAME filter_busy_area_items partition over
     the live raw rows — same linkage (provenance), same hold surfaces (issue labels),
-    with each row serving as its own coherent detail via live_pull_detail_stub — and
-    returns the set of item numbers still dispatchable; the caller DEFERS the rest to
-    the next tick (the fail-closed direction: a busy re-read never launches).
+    with each row serving as its own coherent detail via live_pull_detail_stub. A raw row
+    carrying needs:user, review:needs-user, or status:blocked is ignored ONLY when that
+    same row proves a draft with an explicitly absent latch through
+    _pull_provably_inactive; non-draft, latched, partial, and malformed rows stay busy.
+    Returns the set of item numbers still dispatchable; the caller DEFERS the rest to the
+    next tick (the fail-closed direction: a busy re-read never launches). Every parked-free
+    decision and every deferred item names its live blocking artifact in the claim log.
     [round-5 P1] `leases`/`now` feed the cross-lane lease partition inside
     filter_busy_area_items (the CLAIM caller reads the ledger-branch checkout);
     leases=None fails toward exclusion."""
@@ -1034,9 +1049,35 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
             stub = live_pull_detail_stub(row)
             if stub is not None:
                 live_status[number] = stub
-    kept = filter_busy_area_items(items, repo, rows, issue_labels, provenance, live_status,
-                                  leases, now)
-    return {item["number"] for item in kept}
+    occupancy = []
+    busy = busy_packages_of_pulls(
+        repo, rows, issue_labels, provenance, live_status,
+        parked_pr_labels=CLAIM_REVALIDATION_PARK_LABELS, occupancy=occupancy)
+
+    for decision, pr_number, packages in occupancy:
+        if decision == "parked-free":
+            for package in sorted(packages):
+                print(f"claim-revalidation free: crate {package} freed via parked pr#{pr_number}")
+
+    dispatchable = set()
+    for item in items:
+        number = item["number"]
+        package = item.get("package")
+        if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
+            blocker = next(
+                (pr_number for decision, pr_number, packages in occupancy
+                 if decision == "busy" and
+                 (GLOBAL_PACKAGE in packages or package == GLOBAL_PACKAGE or package in packages)),
+                "unknown")
+            print(f"claim-revalidation defer #{number}: crate {package} busy via pr#{blocker}")
+            continue
+        if sibling_lease_conflict(
+                repo, {f"{repo}#{number}"},
+                {package} if isinstance(package, str) else set(), leases, now):
+            print(f"claim-revalidation defer #{number}: crate {package} busy via sibling lease")
+            continue
+        dispatchable.add(number)
+    return dispatchable
 
 
 def _live_issue_labels(repo):
@@ -2875,9 +2916,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             if number not in live_dispatchable:
                 # [round-4 P1] the crate freed at PLAN time re-read BUSY on the live pull
                 # state — a worker PR went active (or appeared) in the PLAN->CLAIM window.
+                # revalidate_items_against_live_pulls already emitted the single per-item
+                # artifact line naming the blocking PR/lease; do not bury it under a second,
+                # generic defer line here.
                 defer_reasons["live-busy-crate"] += 1
-                print(f"defer {repo}#{number}: its crate re-read busy on the live pull "
-                      "state (PLAN->CLAIM window)")
                 continue
             # [OPUS-4.8] Per-item resilience: a single item's trust/route/policy resolution failure
             # must SKIP that item, not abort the whole dispatch (which would strand the other ready
@@ -5984,6 +6026,49 @@ def _self_test():
     assert live_pull_detail_stub(live_row(76, "x", draft=True, sha="zz")) is None
     assert live_pull_detail_stub("junk") is None
 
+    # ---- [issue #509] CLAIM must apply the parked carve-out to its OWN live occupancy
+    # read, including curator's status:blocked terminal posture, without weakening the
+    # round-4/round-5 coherence guard. These are explicit mutation tripwires: deleting the
+    # carve-out makes (a) red; skipping _pull_provably_inactive makes (b)/(c) red. ----
+    expected_free_log = "claim-revalidation free: crate crate-b freed via parked pr#76"
+    for parked_label in ("needs:user", "review:needs-user", "status:blocked"):
+        parked_output = io.StringIO()
+        with contextlib.redirect_stdout(parked_output):
+            parked_result = revalidate_items_against_live_pulls(
+                frontier, repo,
+                [[live_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                           labels=[parked_label])]],
+                collapse_labels, busy_prov, leases=[], now=now)
+        assert parked_result == {70, 71, 72, 73}, (parked_label, parked_result)
+        assert expected_free_log in parked_output.getvalue(), parked_output.getvalue()
+    print("  ok   claim-revalidation tripwire (a): parked draft labels free the live crate")
+
+    needs_user_live = live_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                               labels=["needs:user"])
+    expected_defer_log = "claim-revalidation defer #71: crate crate-b busy via pr#76"
+    for coherent_busy in (dict(needs_user_live, draft=False),
+                          dict(needs_user_live, auto_merge=latched)):
+        busy_output = io.StringIO()
+        with contextlib.redirect_stdout(busy_output):
+            busy_result = revalidate_items_against_live_pulls(
+                frontier, repo, [[coherent_busy]], collapse_labels, busy_prov,
+                leases=[], now=now)
+        assert busy_result == {70, 72, 73}, busy_result
+        assert expected_defer_log in busy_output.getvalue(), busy_output.getvalue()
+    print("  ok   claim-revalidation tripwire (b): non-draft or latch-visible parks stay busy")
+
+    unparked_output = io.StringIO()
+    with contextlib.redirect_stdout(unparked_output):
+        unparked_result = revalidate_items_against_live_pulls(
+            frontier, repo,
+            [[live_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                       labels=["review:needs"])]],
+            collapse_labels, busy_prov, leases=[], now=now)
+    assert unparked_result == {70, 72, 73}, unparked_result
+    print("  ok   claim-revalidation tripwire (c): live unparked draft stays busy")
+    assert expected_defer_log in unparked_output.getvalue(), unparked_output.getvalue()
+    print("  ok   claim-revalidation tripwire (d): defer log names crate and blocking PR")
+
     # the revalidation recomputes the SAME partition over the live rows: a parked draft
     # (unlatched, single-read-confirmed) still frees its crate at CLAIM time...
     assert revalidate_items_against_live_pulls(
@@ -6013,6 +6098,7 @@ def _self_test():
     assert revalidate_items_against_live_pulls(
         frontier, repo, [None, ["junk"], [parked_live]], collapse_labels, busy_prov,
         leases=[], now=now) == {70, 71, 72, 73}
+    print("  ok   claim-revalidation tripwire (e): round-4/round-5 fixtures remain green")
 
     # the local provenance map mirrors the PLAN precedence: legacy-first, ledger wins
     with tempfile.TemporaryDirectory() as prov_tmp:
