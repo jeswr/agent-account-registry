@@ -1161,6 +1161,48 @@ def _current_links(
     return links
 
 
+def _area_terminally_parked(labels: set[str]) -> bool:
+    """Issue labels that remove an artifact from every autonomous area lane."""
+    return any(isinstance(label, str) and label.startswith("needs:") for label in labels)
+
+
+def _terminal_non_pr_claims(
+    issues: dict[str, dict[int, dict[str, Any]]],
+    pulls: dict[str, dict[int, dict[str, Any]]],
+    leases: list[dict[str, Any]],
+    bot_login: str,
+) -> set[str]:
+    """Claims whose issue-only/orphan artifact provably cannot occupy an area.
+
+    An open authenticated worker PR makes the claim PR-backed; label-only reaping then stands
+    down because dispatch-claim owns the stricter head/latch coherence proof for that PR.  With
+    no such PR, a ``needs:*`` issue is terminally parked and an issue absent from the open-issue
+    snapshot is orphaned, so either claim can be reaped without trusting a split PR snapshot.
+    Revalidation immediately before the CAS release repeats this predicate on fresh target reads.
+    """
+    links = {
+        repo: _current_links(repo, pulls.get(repo, {}), bot_login)
+        for repo in issues
+    }
+    reap = set()
+    for lease in leases:
+        if not isinstance(lease, dict) or is_repair_holder(lease.get("holder")):
+            continue
+        holder = parse_holder(lease.get("holder"))
+        if holder.repo not in issues:
+            continue                      # no target view: never infer orphaned
+        if holder.issue in links[holder.repo]:
+            continue                      # PR-backed: dispatch's coherent proof owns it
+        issue = issues[holder.repo].get(holder.issue)
+        if issue is None:
+            reap.add(lease["claim_id"])   # absent from a complete open-issue listing: orphan
+            continue
+        labels = _labels(issue, f"target issue {holder.repo}#{holder.issue}")
+        if _area_terminally_parked(labels):
+            reap.add(lease["claim_id"])
+    return reap
+
+
 def _plan_actions(
     limits: dict[str, Limits],
     issues: dict[str, dict[int, dict[str, Any]]],
@@ -1173,6 +1215,7 @@ def _plan_actions(
     now: int,
     bot_login: str,
 ) -> tuple[list[IssueAction], list[PullAction], set[str]]:
+    terminal_non_pr = _terminal_non_pr_claims(issues, pulls, leases, bot_login)
     live_by_issue: set[tuple[str, int]] = set()
     dead_claims: set[str] = set()
     dead_by_issue: set[tuple[str, int]] = set()
@@ -1180,7 +1223,11 @@ def _plan_actions(
         holder = parse_holder(lease["holder"])
         key = (holder.repo, holder.issue)
         decision = lease_states[lease["claim_id"]]
-        if decision.state == "dead":
+        if lease["claim_id"] in terminal_non_pr:
+            # Reap the now-ownerless claim, but do not convert its intentional needs:* park
+            # into a dead-worker reset. The terminal artifact remains human-owned.
+            dead_claims.add(lease["claim_id"])
+        elif decision.state == "dead":
             dead_claims.add(lease["claim_id"])
             dead_by_issue.add(key)
         else:  # Unknown is deliberately treated as live for issue-state mutation.
@@ -1402,6 +1449,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         limits, issues, pulls, admitted, attempts, lease_states, leases, stale_prs, now,
         bot_login,
     )
+    terminal_reap_candidates = _terminal_non_pr_claims(issues, pulls, leases, bot_login)
 
     # Re-read the mutex before issue mutation. A newly claimed lease suppresses repair; claims
     # already proven dead do not. The remaining cross-repository gap is safe: a retained lease
@@ -1418,6 +1466,28 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         repo: _current_links(repo, repo_pulls, bot_login)
         for repo, repo_pulls in current_pulls.items()
     }
+    # #509 mutation-boundary guard for label/orphan reaping.  A claim selected from the earlier
+    # target snapshots is released only if a fresh issue read still says terminal/absent and the
+    # fresh pull listing still has no worker PR for it.  An unpark or newly opened PR wins the
+    # race and retains the claim; ordinary run-proven dead claims are unaffected.
+    if terminal_reap_candidates:
+        candidate_leases = [
+            lease for lease in leases if lease["claim_id"] in terminal_reap_candidates
+        ]
+        fresh_reap_issues: dict[str, dict[int, dict[str, Any]]] = {
+            repo: {} for repo in issues
+        }
+        for lease in candidate_leases:
+            holder = parse_holder(lease["holder"])
+            issue = _fresh_issue(groomable[holder.repo], holder.repo, holder.issue)
+            if issue is not None and issue.get("state") == "open":
+                fresh_reap_issues[holder.repo][holder.issue] = issue
+        confirmed_terminal = _terminal_non_pr_claims(
+            fresh_reap_issues, current_pulls, candidate_leases, bot_login
+        )
+        for claim in sorted(terminal_reap_candidates - confirmed_terminal):
+            print(f"SKIP lease release claim={claim[:8]}: artifact re-entered or gained an open PR")
+        dead_claims.difference_update(terminal_reap_candidates - confirmed_terminal)
 
     reset = 0
     deferred = 0
@@ -2181,6 +2251,53 @@ def _self_test() -> int:
     )
     check("fixture reclaims dead claim", dead, {"a" * 32})
     check("fixture has no PR writes", prs, [])
+
+    # ---- issue #509: non-PR terminal/orphan claims are immediate groom candidates. ----
+    live_state = {"a" * 32: LeaseDecision("live", "fixture worker still reported live")}
+    terminal_issue = {
+        "owner/repo": {
+            7: {"labels": [{"name": "area:crate-a"}, {"name": "needs:user"}],
+                "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat()}
+        }
+    }
+    terminal_actions, _terminal_prs, terminal_dead = _plan_actions(
+        {"owner/repo": limits}, terminal_issue, {"owner/repo": {}},
+        {"owner/repo": set()}, {("owner/repo", 7): 0}, live_state, [base], {}, now,
+        "app[bot]",
+    )
+    check("#509 terminal issue-only claim is reaped despite lease liveness",
+          terminal_dead, {"a" * 32})
+    check("#509 terminal issue-only reaping does not relabel the parked issue",
+          terminal_actions, [])
+
+    orphan_issues = {"owner/repo": {}}
+    check("#509 orphaned non-PR claim is reaped",
+          _terminal_non_pr_claims(
+              orphan_issues, {"owner/repo": {}}, [base], "app[bot]"),
+          {"a" * 32})
+
+    backed_pull = {
+        92: {
+            "number": 92,
+            "state": "open",
+            "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat(),
+            "head": {"ref": "sparq-agent/issue-7-92-1",
+                     "repo": {"full_name": "owner/repo"}},
+            "user": {"login": "app[bot]"},
+            "body": WORKER_PR_MARKER + "\n\nFixes #7",
+        }
+    }
+    check("#509 PR-backed terminal claim is not label-reaped by groom",
+          _terminal_non_pr_claims(
+              terminal_issue, {"owner/repo": backed_pull}, [base], "app[bot]"),
+          set())
+    check("#509 live nonterminal issue-only claim remains",
+          _terminal_non_pr_claims(
+              {"owner/repo": {7: {
+                  "labels": [{"name": "area:crate-a"}, {"name": "status:in-progress"}],
+                  "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat(),
+              }}}, {"owner/repo": {}}, [base], "app[bot]"),
+          set())
     # NEGATIVE (review round 1): the SAME open PR #91 — which still loose-links issue #9 via its
     # branch and `Fixes #9` body — must NOT suppress the exhaustion defer when it is not in the
     # ADMITTED set (no proven worker identity/provenance). Reverting the exhaustion guard back to
