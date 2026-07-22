@@ -87,6 +87,7 @@ LINKED_ISSUE = re.compile(
     r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(?P<issue>[1-9][0-9]*)\b"
 )
 ACTIVE_RUN_STATUSES = {"queued", "in_progress", "requested", "waiting", "pending"}
+MAX_TERMINAL_REAPS_PER_TICK = 20
 BAD_MERGE_STATES = {
     "blocked": "required checks are blocked or pending",
     "dirty": "the branch has merge conflicts",
@@ -131,6 +132,7 @@ class Holder:
 class LeaseDecision:
     state: str  # live | dead | unknown
     reason: str
+    run_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -233,10 +235,14 @@ def classify_lease(
     """Conservatively classify one lease from exact run evidence or its policy timeout."""
     claim = lease["claim_id"]
     if claim in claim_runs:
-        state = _run_status(claim_runs[claim])
-        conclusion = claim_runs[claim].get("conclusion") or "active"
+        run = claim_runs[claim]
+        state = _run_status(run)
+        conclusion = run.get("conclusion") or "active"
+        run_id = run.get("id")
         return LeaseDecision(
-            state, f"claim-correlated worker is {state} ({conclusion})"
+            state,
+            f"claim-correlated worker is {state} ({conclusion})",
+            run_id if isinstance(run_id, int) and not isinstance(run_id, bool) else None,
         )
 
     holder = parse_holder(lease["holder"])
@@ -246,7 +252,9 @@ def classify_lease(
         if not holder.dispatcher_run and path == ".github/workflows/worker.yml":
             state = _run_status(holder_run)
             conclusion = holder_run.get("conclusion") or "active"
-            return LeaseDecision(state, f"holder worker is {state} ({conclusion})")
+            return LeaseDecision(
+                state, f"holder worker is {state} ({conclusion})", holder.run_id
+            )
 
     deadline = lease["issued_at"] + limits.threshold_seconds
     if now >= deadline:
@@ -1223,10 +1231,23 @@ def _plan_actions(
         holder = parse_holder(lease["holder"])
         key = (holder.repo, holder.issue)
         decision = lease_states[lease["claim_id"]]
-        if lease["claim_id"] in terminal_non_pr:
+        if lease["claim_id"] in terminal_non_pr and decision.state == "dead":
             # Reap the now-ownerless claim, but do not convert its intentional needs:* park
             # into a dead-worker reset. The terminal artifact remains human-owned.
             dead_claims.add(lease["claim_id"])
+        elif lease["claim_id"] in terminal_non_pr and decision.state == "live":
+            backing_run = decision.run_id if decision.run_id is not None else "UNKNOWN"
+            print(
+                f"SKIP lease release claim={lease['claim_id'][:8]}: terminal reap deferred: "
+                f"backing run {backing_run} live"
+            )
+            live_by_issue.add(key)
+        elif lease["claim_id"] in terminal_non_pr and decision.state == "unknown":
+            print(
+                f"SKIP lease release claim={lease['claim_id'][:8]}: terminal reap deferred: "
+                "backing run liveness UNKNOWN"
+            )
+            live_by_issue.add(key)
         elif decision.state == "dead":
             dead_claims.add(lease["claim_id"])
             dead_by_issue.add(key)
@@ -1449,7 +1470,17 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         limits, issues, pulls, admitted, attempts, lease_states, leases, stale_prs, now,
         bot_login,
     )
-    terminal_reap_candidates = _terminal_non_pr_claims(issues, pulls, leases, bot_login)
+    terminal_reap_candidates = (
+        _terminal_non_pr_claims(issues, pulls, leases, bot_login) & dead_claims
+    )
+    if len(terminal_reap_candidates) > MAX_TERMINAL_REAPS_PER_TICK:
+        capped_terminal_reaps = set(
+            sorted(terminal_reap_candidates)[:MAX_TERMINAL_REAPS_PER_TICK]
+        )
+        deferred_reaps = terminal_reap_candidates - capped_terminal_reaps
+        dead_claims.difference_update(deferred_reaps)
+        terminal_reap_candidates = capped_terminal_reaps
+        print(f"reap cap reached — {len(deferred_reaps)} deferred")
 
     # Re-read the mutex before issue mutation. A newly claimed lease suppresses repair; claims
     # already proven dead do not. The remaining cross-repository gap is safe: a retained lease
@@ -1724,11 +1755,13 @@ def _self_test() -> int:
         "expires_at": now + 600,
     }
     active = {
+        "id": 789,
         "status": "in_progress",
         "conclusion": None,
         "path": ".github/workflows/worker.yml",
     }
     complete = {
+        "id": 790,
         "status": "completed",
         "conclusion": "cancelled",
         "path": ".github/workflows/worker.yml",
@@ -2253,25 +2286,63 @@ def _self_test() -> int:
     check("fixture has no PR writes", prs, [])
 
     # ---- issue #509: non-PR terminal/orphan claims are immediate groom candidates. ----
-    live_state = {"a" * 32: LeaseDecision("live", "fixture worker still reported live")}
     terminal_issue = {
         "owner/repo": {
             7: {"labels": [{"name": "area:crate-a"}, {"name": "needs:user"}],
                 "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat()}
         }
     }
-    terminal_actions, _terminal_prs, terminal_dead = _plan_actions(
-        {"owner/repo": limits}, terminal_issue, {"owner/repo": {}},
-        {"owner/repo": set()}, {("owner/repo", 7): 0}, live_state, [base], {}, now,
-        "app[bot]",
-    )
-    check("#509 terminal issue-only claim is reaped despite lease liveness",
-          terminal_dead, {"a" * 32})
-    check("#509 terminal issue-only reaping does not relabel the parked issue",
+    live_state = {
+        "a" * 32: classify_lease(base, limits, now, {"a" * 32: active}, {})
+    }
+    terminal_log = io.StringIO()
+    saved_stdout = sys.stdout
+    sys.stdout = terminal_log
+    try:
+        terminal_actions, _terminal_prs, terminal_dead = _plan_actions(
+            {"owner/repo": limits}, terminal_issue, {"owner/repo": {}},
+            {"owner/repo": set()}, {("owner/repo", 7): 0}, live_state, [base], {}, now,
+            "app[bot]",
+        )
+    finally:
+        sys.stdout = saved_stdout
+    check("#509 terminal issue-only claim backed by a live run is retained",
+          terminal_dead, set())
+    check("#509 live-run terminal reap deferral is loud and identifies the backing run",
+          "terminal reap deferred: backing run 789 live" in terminal_log.getvalue(), True)
+    check("#509 terminal issue-only reap deferral does not relabel the parked issue",
           terminal_actions, [])
 
+    unknown_log = io.StringIO()
+    sys.stdout = unknown_log
+    try:
+        _unknown_actions, _unknown_prs, unknown_dead = _plan_actions(
+            {"owner/repo": limits}, terminal_issue, {"owner/repo": {}},
+            {"owner/repo": set()}, {("owner/repo", 7): 0},
+            {"a" * 32: LeaseDecision("unknown", "fixture liveness unavailable")},
+            [base], {}, now, "app[bot]",
+        )
+    finally:
+        sys.stdout = saved_stdout
+    check("#509 UNKNOWN terminal-claim liveness fails closed and retains the claim",
+          unknown_dead, set())
+    check("#509 UNKNOWN terminal-claim liveness deferral is loud",
+          "terminal reap deferred: backing run liveness UNKNOWN" in unknown_log.getvalue(),
+          True)
+
+    completed_terminal_state = {
+        "a" * 32: classify_lease(base, limits, now, {"a" * 32: complete}, {})
+    }
+    _done_actions, _done_prs, completed_terminal_dead = _plan_actions(
+        {"owner/repo": limits}, terminal_issue, {"owner/repo": {}},
+        {"owner/repo": set()}, {("owner/repo", 7): 0}, completed_terminal_state,
+        [base], {}, now, "app[bot]",
+    )
+    check("#509 terminal issue-only claim with a completed backing run is reaped",
+          completed_terminal_dead, {"a" * 32})
+
     orphan_issues = {"owner/repo": {}}
-    check("#509 orphaned non-PR claim is reaped",
+    check("#509 orphaned non-PR claim is a terminal-reap candidate",
           _terminal_non_pr_claims(
               orphan_issues, {"owner/repo": {}}, [base], "app[bot]"),
           {"a" * 32})
@@ -2992,6 +3063,127 @@ def _self_test() -> int:
         check("persistent CAS conflict fails loud after retries", settled_loud, True)
     finally:
         globals()["_sleep_backoff"] = real_backoff
+
+    # ---- #509 release-side mutation boundary + bounded terminal reaping. ----
+    # These fixtures drive the REAL run_sweep entry. The first changes a needs:* issue back to
+    # status:ready after planning but before release; removing the fresh issue/PR re-confirmation
+    # must release the claim and red the test. The second proves the numeric per-tick bound.
+    terminal_sweep_env: dict[str, Any] = {}
+
+    class _TerminalSweepAPI:
+        def __init__(self, token, purpose):
+            self.purpose = purpose
+
+        def request(self, method, path, body=None, allow_404=False, **_kwargs):
+            if method == "GET" and path.startswith("/repos/owner/repo/issues/"):
+                number = int(path.rsplit("/", 1)[1])
+                return terminal_sweep_env["fresh_issues"].get(number)
+            if method == "GET":
+                return terminal_sweep_env.get("gets", {}).get(path)
+            terminal_sweep_env["writes"].append((method, path))
+            return {}
+
+        def paginate(self, path):
+            if path == "/repos/owner/repo/issues?state=open":
+                return terminal_sweep_env["planned_issues"]
+            if path == "/repos/owner/repo/pulls?state=open":
+                return []
+            return []
+
+    terminal_sweep_releases: list[set[str]] = []
+
+    def _terminal_sweep_release(_api, _repo, claims, **_kwargs):
+        terminal_sweep_releases.append(set(claims))
+        return len(claims)
+
+    terminal_sweep_leases: list[dict[str, Any]] = []
+    terminal_sweep_patched = {
+        "GitHubAPI": _TerminalSweepAPI,
+        "load_limits": lambda *_a, **_k: {"owner/repo": limits},
+        "target_tokens_map": lambda: {"owner": "sweep-token"},
+        "_bot_login": lambda _api, _slug="": "app[bot]",
+        "_read_ledger": lambda _api, _repo: (list(terminal_sweep_leases), "s1"),
+        "_worker_runs": lambda _api, _leases: ({}, {}),
+        "_release_claims": _terminal_sweep_release,
+    }
+    terminal_sweep_saved = {
+        name: globals()[name] for name in terminal_sweep_patched
+    }
+
+    def _terminal_sweep() -> tuple[int, int, int, int]:
+        return run_sweep(argparse.Namespace(
+            registry_repo="owner/registry",
+            policy_file="unused-policy",
+            policy_resolver="unused-resolver",
+            bot_slug="app",
+            ledger_root="",
+        ))
+
+    try:
+        globals().update(terminal_sweep_patched)
+        race_claim = "b" * 32
+        terminal_sweep_leases[:] = [{
+            **base,
+            "claim_id": race_claim,
+            "holder": "owner/repo#7@777.1",
+            "issued_at": 1,
+            "expires_at": 2,
+        }]
+        parked_issue = {
+            "number": 7,
+            "state": "open",
+            "labels": [{"name": "area:crate-a"}, {"name": "needs:user"}],
+            "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat(),
+            "comments": 0,
+        }
+        unparked_issue = {
+            **parked_issue,
+            "labels": [{"name": "area:crate-a"}, {"name": "status:ready"}],
+        }
+        terminal_sweep_env.update(
+            planned_issues=[parked_issue], fresh_issues={7: unparked_issue}, writes=[]
+        )
+        terminal_sweep_releases.clear()
+        race_summary = _terminal_sweep()
+        check(
+            "MUTATION #509 release guard: a freshly UNPARKED issue retains its claim",
+            (race_summary[0], terminal_sweep_releases),
+            (0, [set()]),
+        )
+
+        terminal_sweep_leases[:] = [
+            {
+                **base,
+                "claim_id": f"{index:032x}",
+                "holder": f"owner/repo#{index}@{1000 + index}.1",
+                "issued_at": 1,
+                "expires_at": 2,
+            }
+            for index in range(1, MAX_TERMINAL_REAPS_PER_TICK + 6)
+        ]
+        terminal_sweep_env.update(planned_issues=[], fresh_issues={}, writes=[])
+        terminal_sweep_releases.clear()
+        check("#509 terminal reap cap is explicitly fixed at 20",
+              MAX_TERMINAL_REAPS_PER_TICK, 20)
+        cap_log = io.StringIO()
+        saved_stdout = sys.stdout
+        sys.stdout = cap_log
+        try:
+            cap_summary = _terminal_sweep()
+        finally:
+            sys.stdout = saved_stdout
+        check(
+            "MUTATION #509 reap cap: cap+5 orphans release exactly the numeric cap",
+            (cap_summary[0], len(terminal_sweep_releases[0])),
+            (20, 20),
+        )
+        check(
+            "#509 reap cap logs the exact deferred count",
+            f"reap cap reached — 5 deferred" in cap_log.getvalue(),
+            True,
+        )
+    finally:
+        globals().update(terminal_sweep_saved)
 
     # ---- run_sweep mutation-boundary guard (issue #170, review round 1, finding 3) ----
     # Drive the REAL run_sweep with a stubbed API in which the open-PR listing is SCHEDULED per
