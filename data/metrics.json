@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-22T01:35:40Z",
+  "generated_at": "2026-07-22T01:36:41Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -17,8 +17,8 @@
       "needs_user_parked": 11,
       "review_lane_health": "idle",
       "review_lane_runs_1h": 0,
-      "worker_attempts_1h": 4,
-      "worker_success_rate_1h": 0.5,
+      "worker_attempts_1h": 3,
+      "worker_success_rate_1h": 0.3333,
       "pr_open_rate": 0.0,
       "pr_close_rate": 2.0,
       "net_pr_flow": -2.0
