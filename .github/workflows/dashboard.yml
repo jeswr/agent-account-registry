@@ -169,7 +169,7 @@ jobs:
           set -euo pipefail
           now=$(date -u +%s)
           # workflow-file:stale-threshold-seconds (cadence + slack)
-          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400; do
+          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200 groom.yml:1800 retriage.yml:3600; do
             wf="${spec%%:*}"; limit="${spec##*:}"
             last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
                    --jq '.workflow_runs[0].created_at // empty' || true)
