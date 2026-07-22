@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 547,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "99f63b71b73c3a964b236970d2713ab711d3fd02",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "PR hardens _salted_labels in scripts/dashboard-gen.py to reject a non-string, blank, or non-printable PROVENANCE_SALT before hashing, and adds two self-test assertions. The change strengthens the existing fail-closed posture: account_hash (model-health.py:249) only rejects falsy salts, so the new guard additionally catches truthy-but-degenerate salts ('   ', 'salt\\nvalue') that would otherwise produce a label. It does NOT weaken any trust check or diverge the shared hasher \u2014 valid salts still yield the identical sha256(handle:salt)[:16], and a bad configured salt now dies (fail-closed) rather than deploying a degenerate row. The two added self-tests are non-vacuous: (1) the 16-lowercase-hex regex assertion flips red if the label format regresses; (2) the invalid-salts loop would append False for '   ' and 'salt\\nvalue' if the new guard were removed (account_hash accepts them), so the assertion [True,True,True] genuinely exercises the new rejection path. None is correctly caught since the isinstance guard raises DashboardError, matching the loop's except clause. re is imported (line 14); DashboardError subclasses RuntimeError; check() uses ==. No token/PII exposure, no workflow/permission changes, no injection content in the diff.",
+  "verdict": "approve"
+ }
+}
