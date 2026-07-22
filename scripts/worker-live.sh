@@ -749,17 +749,64 @@ run_gate() {
 
 # [OPUS-4.8] The registry-selftest gate body (extracted so the host self-test can exercise its
 # PURE selectors — touched-file classification + the suite list — without a live cargo/gh call).
-# FULL_SELFTEST_SUITE mirrors the scripts every recent registry wave self-tests; every touched
-# script that HAS a --self-test is additionally run so a change to it is validated directly.
+# [issue #214] FULL_SELFTEST_SUITE is the ONE authoritative self-test manifest. pr-gate.yml no
+# longer carries a hand-maintained copy — it consumes `worker-live.sh print-suite` — so the two
+# lists can no longer drift (pre-#214 they HAD drifted: retriage.py was self-testing but enrolled
+# in NEITHER). _selftest_manifest_issues enforces the manifest in BOTH directions: every entry
+# must exist on disk (deleting a load-bearing script fails the gate instead of silently dropping
+# its test) and every self-testing script on disk must be enrolled (a newly added script is
+# discovered, not forgotten until someone hand-updates a list).
 # NAMING NOTE (review round): the routing validator here is scripts/route-resolve.py (added by the
 # onboarding push) — there is NO scripts/routing-validate.py; do not reference that name in suite
 # lists or briefs.
-FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
-plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
-groom.py account-usage.py usage-alert.py plan-alert.py dispatch-secrets-guard.py model-health.py \
-ledger_retry.py \
-pat-validity.py broker-refresh.py \
-backfill-provenance.py dashboard-gen.py metrics.py ledger-invariant.py trust-gate.py worker-live.sh migrate-secrets.sh"
+FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py curate-frontier.py \
+dispatch-plan.py plan-snapshot.py resolve-conflicts.py triage.py retriage.py dispatch-claim.py \
+worker-pr.py worker-issue.py select-and-claim.py groom.py account-usage.py usage-alert.py \
+plan-alert.py groom-alert.py dispatch-secrets-guard.py model-health.py ledger_retry.py \
+pat-validity.py broker-refresh.py backfill-provenance.py dashboard-gen.py metrics.py \
+ledger-invariant.py trust-gate.py worker-live.sh migrate-secrets.sh"
+
+# PURE (self-tested): audit the manifest against a scripts directory. Prints one line per
+# inconsistency and NOTHING when consistent (sol audit #214):
+#   missing:<name>     an enrolled script is absent from disk — a deletion must fail the gate,
+#                      never silently drop its test (the old `[[ -f ]] || continue` skip)
+#   unenrolled:<name>  a script on disk advertises a self-test (literal `--self-test` in a .py,
+#                      literal `self-test` in a .sh) but is not in the manifest — a new
+#                      self-testing script must be discovered, not lost to list drift
+# Over-capture (the marker appearing only in a comment) fails CLOSED: it demands enrollment, and
+# running the suite immediately surfaces a script with no real self-test — refuse and surface
+# beats guess and proceed.
+_selftest_manifest_issues() {
+  local suite="$1" dir="$2" entry f base marker
+  for entry in $suite; do
+    [[ -f "$dir/$entry" ]] || printf 'missing:%s\n' "$entry"
+  done
+  for f in "$dir"/*.py "$dir"/*.sh; do
+    [[ -f "$f" ]] || continue  # an unmatched glob stays literal (nullglob is not set globally)
+    base=${f##*/}
+    case "$base" in *.sh) marker='self-test' ;; *) marker='--self-test' ;; esac
+    grep -q -e "$marker" "$f" || continue
+    case " $suite " in
+      *" $base "*) ;;
+      *) printf 'unenrolled:%s\n' "$base" ;;
+    esac
+  done
+}
+
+# [issue #214] The single manifest consumer for CI: pr-gate.yml runs `worker-live.sh print-suite`
+# instead of carrying a duplicate suite list. Verifies the manifest against THIS checkout's
+# scripts dir first — deletion and discovery both fail closed — then prints one entry per line.
+print_suite() {
+  local issues entry
+  issues=$(_selftest_manifest_issues "$FULL_SELFTEST_SUITE" "$SCRIPT_DIR")
+  if [[ -n "$issues" ]]; then
+    printf '%s\n' "$issues" >&2
+    die 'self-test manifest inconsistent (fail closed — see missing:/unenrolled: lines above)'
+  fi
+  for entry in $FULL_SELFTEST_SUITE; do
+    printf '%s\n' "$entry"
+  done
+}
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
@@ -982,8 +1029,21 @@ registry_selftest_gate() {
   changed="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
     || die 'registry-selftest gate: changed-path listing refused (fail closed)'
   [[ -n "$changed" ]] || die 'registry-selftest gate: no changed files to validate (fail closed)'
+
+  # [issue #214] ONE authoritative manifest, read from the TARGET checkout's own worker-live.sh:
+  # print-suite verifies it (every enrolled script exists; every self-testing script on disk is
+  # enrolled) and only then prints. Sourcing the HOST copy's FULL_SELFTEST_SUITE here would
+  # false-fail a PR that legitimately adds + enrolls a new script, and would silently under-run
+  # a PR-enrolled script the host list predates. A target whose manifest is inconsistent — or
+  # too old to ship print-suite — dies loudly; it never degrades to a partial suite.
+  local suite
+  suite=$(bash scripts/worker-live.sh print-suite | tr '\n' ' ') \
+    || die 'registry-selftest gate: target self-test manifest failed verification (fail closed)'
+  [[ -n "${suite//[[:space:]]/}" ]] \
+    || die 'registry-selftest gate: target self-test manifest is empty (fail closed)'
+
   local -a targets=()
-  mapfile -t targets < <(printf '%s\n' "$changed" | _registry_selftest_targets "$FULL_SELFTEST_SUITE")
+  mapfile -t targets < <(printf '%s\n' "$changed" | _registry_selftest_targets "$suite")
 
   # `direct` counts validations of the ACTUAL touched files (targets); `ran` counts the always-run
   # regression suite. Non-vacuity is measured against `direct`, never the suite — see the final gate.
@@ -1020,8 +1080,12 @@ registry_selftest_gate() {
   #    Suite runs count toward `ran` (coverage exists) but NOT toward `direct`: the suite validates
   #    unrelated files, so it must never be what makes the gate non-vacuous.
   local script
-  for script in $FULL_SELFTEST_SUITE; do
-    [[ -f "scripts/$script" ]] || continue
+  for script in $suite; do
+    # [issue #214] an enrolled-but-missing script is a HARD failure: the old
+    # `[[ -f ]] || continue` skip let a deleted load-bearing script keep this gate green.
+    # print-suite already refused such a manifest above; this is the in-loop belt.
+    [[ -f "scripts/$script" ]] \
+      || die "enrolled self-test script missing: scripts/$script (fail closed)"
     printf 'worker-live: suite self-test %s\n' "$script"
     if [[ "$script" == *.sh ]]; then
       bash "scripts/$script" self-test || die "suite self-test failed: $script"
@@ -2326,6 +2390,48 @@ PY
   chk "registry gate classifies a touched container definition" \
     "$(grep -c 'dockerfile:containers/worker-model.Dockerfile' <<< "${sel//,/$'\n'}" || true)" "1"
 
+  # --- [issue #214] ONE self-test manifest, enforced in BOTH directions. Deletion: an
+  # enrolled-but-absent script is flagged (the old `[[ -f ]] || continue` silently dropped its
+  # test and kept the gate green). Addition: a self-testing script absent from the manifest is
+  # flagged (pre-#214 a new script was never discovered — retriage.py sat in NEITHER duplicate
+  # list). Drift: pr-gate.yml must consume print-suite instead of carrying its own copy. ---
+  local mandir="$tmp/manifest-fixture"
+  mkdir -p "$mandir"
+  printf '#!/usr/bin/env python3\n# handles --self-test\n' > "$mandir/a.py"
+  printf '#!/usr/bin/env bash\n# handles self-test\n' > "$mandir/enrolled.sh"
+  printf 'print(1)\n' > "$mandir/helper.py"
+  chk "manifest verifier accepts a consistent fixture (no false positives)" \
+    "$(_selftest_manifest_issues "a.py enrolled.sh" "$mandir")" ""
+  chk "manifest verifier flags a DELETED enrolled script (was a silent skip)" \
+    "$(_selftest_manifest_issues "a.py enrolled.sh ghost.py" "$mandir" | grep -c 'missing:ghost.py' || true)" "1"
+  printf '# implements --self-test\n' > "$mandir/newcomer.py"
+  chk "manifest verifier flags an UNENROLLED self-testing py (was never discovered)" \
+    "$(_selftest_manifest_issues "a.py enrolled.sh" "$mandir" | grep -c 'unenrolled:newcomer.py' || true)" "1"
+  printf '# a shell tool with a self-test subcommand\n' > "$mandir/newtool.sh"
+  chk "manifest verifier flags an UNENROLLED self-testing sh" \
+    "$(_selftest_manifest_issues "a.py enrolled.sh newcomer.py" "$mandir" | grep -c 'unenrolled:newtool.sh' || true)" "1"
+  chk "manifest verifier ignores a helper py with no self-test (no spurious enrollment demand)" \
+    "$(_selftest_manifest_issues "a.py enrolled.sh newcomer.py newtool.sh" "$mandir")" ""
+  # The LIVE manifest must be consistent with the LIVE scripts dir — the check that would have
+  # caught retriage.py (self-testing, enrolled in neither pre-#214 list).
+  chk "live manifest consistent: every entry exists, every self-testing script enrolled" \
+    "$(_selftest_manifest_issues "$FULL_SELFTEST_SUITE" "$SCRIPT_DIR")" ""
+  chk "retriage.py is enrolled (the concrete #214 discovery gap)" \
+    "$(case " $FULL_SELFTEST_SUITE " in *" retriage.py "*) printf yes ;; *) printf no ;; esac)" "yes"
+  # shellcheck disable=SC2086  # word-splitting the manifest is the intended framing
+  chk "print-suite prints the verified manifest one entry per line" \
+    "$(print_suite | paste -sd' ' -)" \
+    "$(printf '%s\n' $FULL_SELFTEST_SUITE | paste -sd' ' -)"
+  chk "print-suite REFUSES an inconsistent manifest (fail closed)" \
+    "$( (FULL_SELFTEST_SUITE='ghost.py'; SCRIPT_DIR="$mandir"; print_suite) >/dev/null 2>&1 && printf ok || printf refused)" "refused"
+  # Drift guard: pr-gate.yml consumes print-suite and carries NO duplicate inline list — a
+  # reintroduced hand-maintained copy (recognizable by any literal suite entry) flips this red.
+  local prgate="$SCRIPT_DIR/../.github/workflows/pr-gate.yml"
+  chk "pr-gate.yml consumes print-suite (single manifest, no CI copy)" \
+    "$(grep -c 'worker-live.sh print-suite' "$prgate" 2>/dev/null || true)" "1"
+  chk "pr-gate.yml carries no duplicate inline suite list (drift unrepresentable)" \
+    "$(grep -c 'policy-resolve\.py' "$prgate" 2>/dev/null || true)" "0"
+
   # --- [issue #141] porcelain parser feeding BOTH gate paths: `-z` + NUL-aware so a space/control
   # -char path or a rename's two paths cannot slip past classification. The old `cut -c4-` on the
   # non-z form quoted `crates/x y.rs` into `"crates/x y.rs"` (the leading quote defeats `^crates/`)
@@ -2715,5 +2821,6 @@ case "${1:-}" in
   push-fix) push_fix ;;
   write-back) write_back ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  print-suite) print_suite ;;
+  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test|print-suite>' ;;
 esac
