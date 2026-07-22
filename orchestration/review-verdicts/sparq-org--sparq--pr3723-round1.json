@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3723,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c9ba2ecbae69012dee3106b85903cea87e20f5ec",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Every reference in the corpus is a syntactically valid RFC 3986 reference, so oxiri_base.resolve(reference) never actually returns Err today and the `let Ok(expected) = ... else { continue };` guard never fires. That is fine now, but it means a future oxiri upgrade (or an accidental corpus edit introducing an invalid reference) could cause cases to be skipped silently, potentially reducing the differential test to zero comparisons with no signal \u2014 the exact failure mode a tripwire is meant to prevent.",
+    "file": "crates/sparq-jsonld/src/context/iri.rs",
+    "fix_hint": "Since the corpus is hand-picked and all entries are valid, use `.expect(\"oxiri should resolve <base>/<reference>\")` (or assert on a minimum number of executed comparisons via a counter) instead of `continue`, so a silent-skip regression turns the test red rather than passing vacuously.",
+    "severity": "nit",
+    "title": "`else { continue }` can silently make the tripwire vacuous"
+   }
+  ],
+  "progress": null,
+  "summary": "Test-only change (issue #3714) adding a differential 'mutation tripwire' that compares the crate's dependency-free RFC 3986 reference resolver (resolve_iri) against oxiri across the RFC 3986 \u00a75.4 normal/abnormal corpus plus existing JSON-LD @base shapes. oxiri is added strictly under [dev-dependencies] (oxiri = \"0.2\", locked to 0.2.11), so the crate's advertised zero-mandatory/wasm-lean design is preserved; Cargo.lock reflects only the dev edge. The test has real assertions (assert_eq! resolve_iri(base,ref) == oxiri.resolve(ref).into_inner()) with an informative failure message and is not vacuous. I traced multiple corpus cases against the implementation's split_uri/merge/remove_dot_segments/recompose transform (?y, empty ref, #s, g.., http:g, empty-base-path merge for 'https://example.com'+'relative') and all agree with oxiri's strict RFC 3986 output, so the test locks in currently-correct behaviour. The oxiri 0.2 API used (Iri::parse -> resolve -> into_inner) matches the shipped 0.2.11 surface and returns String, matching resolve_iri's return type, so it compiles. Correct and complete; approved. One non-blocking nit below.",
+  "verdict": "approve"
+ }
+}
