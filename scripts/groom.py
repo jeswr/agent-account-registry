@@ -40,6 +40,15 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
+_schema_spec = importlib.util.spec_from_file_location(
+    "registry_lease_schema", Path(__file__).resolve().with_name("lease_schema.py")
+)
+if _schema_spec is None or _schema_spec.loader is None:
+    raise RuntimeError("cannot load shared lease schema")
+lease_schema = importlib.util.module_from_spec(_schema_spec)
+_schema_spec.loader.exec_module(lease_schema)
+
+
 LEDGER_PATH = "data/leases.json"
 # Mutable data plane lives on a dedicated non-code branch (issue #28): required-status-check
 # protection on the default branch rejects the bot's contents-API PUTs, so every ledger read and
@@ -82,7 +91,7 @@ REPAIR_HOLDER_PREFIXES = ("review:", "fix:")
 
 
 def is_repair_holder(value: Any) -> bool:
-    return isinstance(value, str) and value.startswith(REPAIR_HOLDER_PREFIXES)
+    return lease_schema.is_repair_holder(value)
 WORKER_BRANCH = re.compile(r"^sparq-agent/issue-(?P<issue>[1-9][0-9]*)-")
 LINKED_ISSUE = re.compile(
     r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(?P<issue>[1-9][0-9]*)\b"
@@ -190,39 +199,10 @@ def parse_holder(value: Any) -> Holder:
 
 
 def validate_ledger(document: Any) -> list[dict[str, Any]]:
-    if not isinstance(document, dict) or set(document) != {"leases"}:
-        raise GroomError("lease ledger top level is malformed")
-    leases = document["leases"]
-    if not isinstance(leases, list):
-        raise GroomError("lease ledger leases field is malformed")
-    claims: set[str] = set()
-    for lease in leases:
-        if not isinstance(lease, dict):
-            raise GroomError("lease ledger contains a non-object entry")
-        account = lease.get("account")
-        if not isinstance(account, str) or SAFE_ACCOUNT_HASH.fullmatch(account) is None:
-            # Fingerprinting was introduced while the ledger branch still contained raw handles.
-            # Ignore only those legacy rows so this sweep can CAS-write the validated remainder;
-            # canonical rows retain every fail-closed shape check below.
-            continue
-        claim = lease.get("claim_id")
-        if not isinstance(claim, str) or SAFE_CLAIM.fullmatch(claim) is None:
-            raise GroomError("lease ledger contains an unsafe claim id")
-        if claim in claims:
-            raise GroomError("lease ledger contains duplicate claim ids")
-        claims.add(claim)
-        if not is_repair_holder(lease.get("holder")):
-            parse_holder(lease.get("holder"))
-        issued = _positive_int(lease.get("issued_at"), "lease issued_at")
-        expires = _positive_int(lease.get("expires_at"), "lease expires_at")
-        if expires <= issued:
-            raise GroomError("lease expiry does not follow issuance")
-        for field in ("account", "package", "role", "model"):
-            if not isinstance(lease.get(field), str) or not lease[field]:
-                raise GroomError(f"lease {field} is malformed")
-    return [lease for lease in leases
-            if isinstance(lease.get("account"), str)
-            and SAFE_ACCOUNT_HASH.fullmatch(lease["account"]) is not None]
+    try:
+        return lease_schema.validate_ledger(document)
+    except lease_schema.LeaseSchemaError as exc:
+        raise GroomError(str(exc)) from exc
 
 
 def _run_status(run: dict[str, Any]) -> str:
