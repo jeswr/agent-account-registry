@@ -30,6 +30,7 @@ import os
 from pathlib import Path
 import random
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -56,6 +57,7 @@ LEDGER_PATH = "data/leases.json"
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
 STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
+DEFUSE_PR_MARKER = "<!-- registry-groom-auto-defuse:v1 -->"
 # Registry provenance records — same location and <owner>--<name>--pr<N>.json naming as
 # worker-pr.provenance_path / dispatch-claim's fail-closed review lookup. Groom runs from the
 # registry checkout root (groom.yml), so the directory is reachable relatively.
@@ -88,6 +90,9 @@ WORKER_RUN_NAME = re.compile(r"worker claim=(?P<claim>[0-9a-f]{32}|self)")
 # issue-map them, and never fail the whole sweep on their holder shape (live incident
 # 2026-07-17: every scheduled sweep aborted while a review lease existed).
 REPAIR_HOLDER_PREFIXES = ("review:", "fix:")
+HUMAN_HOLD_PR_LABELS = frozenset({"needs:user", "review:needs-user"})
+DEFAULT_STALE_HOURS = 6
+MAX_AUTO_DEFUSES_PER_TICK = 10
 
 
 def is_repair_holder(value: Any) -> bool:
@@ -158,6 +163,9 @@ class PullAction:
     repo: str
     number: int
     reason: str
+    mode: str = "park"  # park | defuse
+    head_sha: str = ""
+    updated_at: str = ""
 
 
 def _epoch(value: str, where: str) -> int:
@@ -955,6 +963,208 @@ def _comments(api: GitHubAPI, repo: str, number: int) -> list[dict[str, Any]]:
     return comments
 
 
+def _configured_stale_hours(args: argparse.Namespace) -> int:
+    """Configured quiet period for parked-PR defusing (``STALE_HOURS``, default six)."""
+    raw: Any = getattr(args, "stale_hours", None)
+    if raw is None:
+        raw = os.environ.get("STALE_HOURS", str(DEFAULT_STALE_HOURS))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise GroomError("STALE_HOURS must be a positive integer") from exc
+    if isinstance(raw, bool) or value <= 0 or str(raw).strip() != str(value):
+        raise GroomError("STALE_HOURS must be a positive integer")
+    return value
+
+
+def _parked_pr_snapshot(
+    pull: dict[str, Any], now: int, stale_seconds: int
+) -> tuple[str, str] | None:
+    """Return the stable head/activity fingerprint of a defuse candidate, absent its latches."""
+    if pull.get("draft") is not False:
+        return None
+    labels = _labels(pull, "parked pull request")
+    if not (labels & HUMAN_HOLD_PR_LABELS):
+        return None
+    updated_at = pull.get("updated_at")
+    updated = _epoch(updated_at, "parked pull request")
+    if now - updated < stale_seconds:
+        return None
+    head = pull.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+        raise GroomError("parked pull request head sha is malformed")
+    assert isinstance(updated_at, str)  # guaranteed by _epoch
+    return head_sha, updated_at
+
+
+def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[bool, bool]:
+    """Return live ``(queued, auto_merge_requested)`` state, failing closed on shape errors."""
+    owner, name = repo.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+        "mergeQueueEntry{id} autoMergeRequest{enabledAt}}}}"
+    )
+    document = api.request(
+        "POST",
+        "/graphql",
+        {
+            "query": query,
+            "variables": {"owner": owner, "name": name, "number": number},
+        },
+    )
+    pull = None
+    if isinstance(document, dict):
+        data = document.get("data")
+        repository = data.get("repository") if isinstance(data, dict) else None
+        pull = repository.get("pullRequest") if isinstance(repository, dict) else None
+    if (
+        not isinstance(pull, dict)
+        or "mergeQueueEntry" not in pull
+        or "autoMergeRequest" not in pull
+        or (
+            pull["mergeQueueEntry"] is not None
+            and not isinstance(pull["mergeQueueEntry"], dict)
+        )
+        or (
+            pull["autoMergeRequest"] is not None
+            and not isinstance(pull["autoMergeRequest"], dict)
+        )
+    ):
+        raise GroomError("parked pull request merge-latch state is unknown")
+    return pull["mergeQueueEntry"] is not None, pull["autoMergeRequest"] is not None
+
+
+def _live_defuse_snapshot(
+    api: GitHubAPI,
+    repo: str,
+    number: int,
+    pull: dict[str, Any],
+    now: int,
+    stale_seconds: int,
+) -> tuple[str, str] | None:
+    """The complete safe-class predicate, including both live merge latch surfaces."""
+    if pull.get("state") != "open":
+        return None
+    snapshot = _parked_pr_snapshot(pull, now, stale_seconds)
+    if snapshot is None:
+        return None
+    # REST auto_merge is intentionally an additional fail-closed signal. GraphQL is live and
+    # authoritative, but an unexpectedly surviving REST latch must never be redrafted by groom.
+    if "auto_merge" not in pull:
+        raise GroomError("parked pull request auto_merge state is unknown")
+    if pull["auto_merge"] is not None:
+        return None
+    queued, auto_merge_requested = _merge_latch_state(api, repo, number)
+    if queued or auto_merge_requested:
+        return None
+    return snapshot
+
+
+def _collect_defuse_prs(
+    api: GitHubAPI,
+    repo: str,
+    pulls: dict[int, dict[str, Any]],
+    now: int,
+    stale_seconds: int,
+) -> dict[tuple[str, int], tuple[str, str]]:
+    """Collect live safe-class parked PRs; an unreadable latch skips only that PR."""
+    candidates: dict[tuple[str, int], tuple[str, str]] = {}
+    for number, listed in sorted(pulls.items()):
+        try:
+            if _parked_pr_snapshot(listed, now, stale_seconds) is None:
+                continue
+            detail = api.request("GET", f"/repos/{repo}/pulls/{number}", allow_404=True)
+            if not isinstance(detail, dict):
+                continue
+            snapshot = _live_defuse_snapshot(
+                api, repo, number, detail, now, stale_seconds
+            )
+        except GroomError as exc:
+            print(f"ALERT PR {repo}#{number}: {exc} — defuse deferred")
+            continue
+        if snapshot is not None:
+            candidates[(repo, number)] = snapshot
+    return candidates
+
+
+def _redraft_pr(repo: str, number: int, token: str) -> None:
+    if not token:
+        raise GroomError(f"target token is unavailable for parked PR {repo}#{number}")
+    env = dict(os.environ)
+    env["GH_TOKEN"] = token
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "ready", str(number), "-R", repo, "--undo"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise GroomError("gh is unavailable for parked PR defuse") from exc
+    if result.returncode != 0:
+        raise GroomError(f"parked PR redraft failed for {repo}#{number}")
+
+
+def _execute_defuse_actions(
+    actions: list[PullAction],
+    apis: dict[str, GitHubAPI],
+    tokens: dict[str, str],
+    now: int,
+    stale_seconds: int,
+) -> int:
+    """Revalidate and redraft bounded safe-class actions, then write one audit comment."""
+    changed = 0
+    for action in actions:
+        if action.mode != "defuse":
+            continue
+        api = apis[action.repo]
+        try:
+            pull = api.request(
+                "GET", f"/repos/{action.repo}/pulls/{action.number}", allow_404=True
+            )
+            snapshot = (
+                _live_defuse_snapshot(
+                    api,
+                    action.repo,
+                    action.number,
+                    pull,
+                    now,
+                    stale_seconds,
+                )
+                if isinstance(pull, dict)
+                else None
+            )
+        except GroomError as exc:
+            print(f"ALERT PR {action.repo}#{action.number}: {exc} — defuse deferred")
+            continue
+        if snapshot != (action.head_sha, action.updated_at):
+            print(
+                f"SKIP PR {action.repo}#{action.number}: activity, head, hold, or draft state changed"
+            )
+            continue
+        owner = action.repo.split("/", 1)[0]
+        _redraft_pr(action.repo, action.number, tokens.get(owner, ""))
+        body = (
+            "> 🤖 SPARQ agent\n\n"
+            f"This pull request remained ready-for-review while terminally parked and had no "
+            f"head or timeline activity for at least {stale_seconds // 3600} hours. Groom "
+            "converted it to draft so it no longer occupies its orchestration partition. "
+            "Marking it ready for review resumes it.\n\n"
+            f"{DEFUSE_PR_MARKER}"
+        )
+        api.request(
+            "POST",
+            f"/repos/{action.repo}/issues/{action.number}/comments",
+            {"body": body},
+        )
+        print(f"WRITE defuse parked PR repo={action.repo} pr={action.number}")
+        changed += 1
+    return changed
+
+
 # A single newest-100 worker-run page is NOT enough to correlate every live lease (issue #173):
 # once >100 newer worker runs exist, an active claim's run ages off page 1. A dispatcher-style
 # holder carries no worker run_id, so it has NO other correlation path — the aged-off claim then
@@ -1211,6 +1421,7 @@ def _plan_actions(
     stale_prs: dict[tuple[str, int], str],
     now: int,
     bot_login: str,
+    defuse_prs: dict[tuple[str, int], tuple[str, str]] | None = None,
 ) -> tuple[list[IssueAction], list[PullAction], set[str]]:
     terminal_non_pr = _terminal_non_pr_claims(issues, pulls, leases, bot_login)
     live_by_issue: set[tuple[str, int]] = set()
@@ -1305,10 +1516,24 @@ def _plan_actions(
                 )
                 actions.append(IssueAction(repo, number, "ready", reason))
 
+    selected_defuses = sorted((defuse_prs or {}).items())[:MAX_AUTO_DEFUSES_PER_TICK]
+    selected_defuse_keys = {key for key, _snapshot in selected_defuses}
     pull_actions = [
+        PullAction(
+            repo,
+            number,
+            "stale terminal park occupies an orchestration partition",
+            mode="defuse",
+            head_sha=snapshot[0],
+            updated_at=snapshot[1],
+        )
+        for (repo, number), snapshot in selected_defuses
+    ]
+    pull_actions.extend(
         PullAction(repo, number, reason)
         for (repo, number), reason in sorted(stale_prs.items())
-    ]
+        if (repo, number) not in selected_defuse_keys
+    )
     return actions, pull_actions, dead_claims
 
 
@@ -1352,15 +1577,17 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     registry_repo = args.registry_repo
     if SAFE_REPO.fullmatch(registry_repo) is None:
         raise GroomError("registry repo must be a safe owner/name")
+    defuse_stale_seconds = _configured_stale_hours(args) * 3600
     limits = load_limits(Path(args.policy_file), Path(args.policy_resolver))
     registry_api = GitHubAPI(os.environ.get("REGISTRY_GH_TOKEN", ""), "registry")
     registry_api.registry_repo = registry_repo
     # Per-owner target App-token map (issue #168): one client per enabled-policy owner, so each
     # target repo is read/written under ITS owner's token — never a wrong-owner token that 404s
     # and aborts the whole sweep before dead-lease release.
+    target_tokens = target_tokens_map()
     target_apis = {
         owner: GitHubAPI(token, f"target {owner}")
-        for owner, token in target_tokens_map().items()
+        for owner, token in target_tokens.items()
     }
     groomable = {
         repo: api
@@ -1422,10 +1649,16 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     pulls: dict[str, dict[int, dict[str, Any]]] = {}
     attempts: dict[tuple[str, int], int] = {}
     stale_prs: dict[tuple[str, int], str] = {}
+    defuse_prs: dict[tuple[str, int], tuple[str, str]] = {}
     for repo, api in groomable.items():
         repo_limits = limits[repo]
         issues[repo] = _issues(api, repo)
         pulls[repo] = _pulls(api, repo)
+        defuse_prs.update(
+            _collect_defuse_prs(
+                api, repo, pulls[repo], now, defuse_stale_seconds
+            )
+        )
         for number, issue in issues[repo].items():
             comments = _comments(api, repo, number) if issue["comments"] else []
             attempts[(repo, number)] = count_attempts(comments, bot_login)
@@ -1457,7 +1690,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     }
     issue_actions, pull_actions, dead_claims = _plan_actions(
         limits, issues, pulls, admitted, attempts, lease_states, leases, stale_prs, now,
-        bot_login,
+        bot_login, defuse_prs=defuse_prs,
     )
     terminal_reap_candidates = (
         _terminal_non_pr_claims(issues, pulls, leases, bot_login) & dead_claims
@@ -1631,8 +1864,14 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         elif changed:
             deferred += 1
 
+    defused_count = _execute_defuse_actions(
+        pull_actions, groomable, target_tokens, now, defuse_stale_seconds
+    )
+
     stale_count = 0
     for action in pull_actions:
+        if action.mode != "park":
+            continue
         api = groomable[action.repo]
         pull = api.request(
             "GET", f"/repos/{action.repo}/pulls/{action.number}", allow_404=True
@@ -1717,7 +1956,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
 
     reclaimed = _release_claims(registry_api, registry_repo, dead_claims)
     print(
-        f"SUMMARY reclaimed={reclaimed} reset={reset} deferred={deferred} stale_prs={stale_count}"
+        f"SUMMARY reclaimed={reclaimed} reset={reset} deferred={deferred} "
+        f"stale_prs={stale_count} defused_prs={defused_count}"
     )
     return reclaimed, reset, deferred, stale_count
 
@@ -1954,6 +2194,186 @@ def _self_test() -> int:
         None,
     )
     check("worker branch links issue", linked_issue_numbers(old_pr), {7})
+
+    # ---- issue #548: safely defuse stale terminally parked, ready-for-review PRs. ----
+    # These fixtures drive the same live predicate twice (collection and mutation boundary) and
+    # the real gh/comment executor. Removing any age/hold/draft/latch rule therefore turns a
+    # negative fixture into a target mutation and reds its assertion.
+    saved_stale_hours = os.environ.pop("STALE_HOURS", None)
+    try:
+        check(
+            "#548 STALE_HOURS defaults to six",
+            _configured_stale_hours(argparse.Namespace()),
+            6,
+        )
+    finally:
+        if saved_stale_hours is not None:
+            os.environ["STALE_HOURS"] = saved_stale_hours
+
+    defuse_now = 100_000
+    defuse_stale_seconds = DEFAULT_STALE_HOURS * 3600
+    old_activity = datetime.fromtimestamp(
+        defuse_now - defuse_stale_seconds - 1, timezone.utc
+    ).isoformat()
+    recent_activity = datetime.fromtimestamp(defuse_now - 60, timezone.utc).isoformat()
+
+    def _defuse_pull(number: int, **changes: Any) -> dict[str, Any]:
+        pull = {
+            "number": number,
+            "state": "open",
+            "draft": False,
+            "labels": [{"name": "needs:user"}],
+            "updated_at": old_activity,
+            "head": {"sha": f"{number:040x}"},
+            "auto_merge": None,
+        }
+        pull.update(changes)
+        return pull
+
+    defuse_details = {
+        1: _defuse_pull(1),
+        2: _defuse_pull(2, updated_at=recent_activity),
+        3: _defuse_pull(3, labels=[{"name": "review:changes"}]),
+        4: _defuse_pull(4, auto_merge={"enabled_at": old_activity}),
+        5: _defuse_pull(5),
+        6: _defuse_pull(6, draft=True),
+        7: _defuse_pull(7),
+        8: _defuse_pull(8),
+        9: _defuse_pull(9),
+    }
+    del defuse_details[8]["auto_merge"]  # unknown REST latch state must fail closed
+
+    class _DefuseAPI:
+        def __init__(self):
+            self.comments: list[tuple[str, str]] = []
+
+        def request(self, method, path, body=None, allow_404=False, **_kwargs):
+            if method == "GET":
+                return defuse_details.get(int(path.rsplit("/", 1)[1]))
+            if path == "/graphql":
+                number = body["variables"]["number"]
+                if number == 9:
+                    return {"data": {"repository": {"pullRequest": {
+                        "mergeQueueEntry": None,
+                        # Missing autoMergeRequest is UNKNOWN, never safely absent.
+                    }}}}
+                return {"data": {"repository": {"pullRequest": {
+                    "mergeQueueEntry": {"id": "queue-5"} if number == 5 else None,
+                    "autoMergeRequest": {"enabledAt": old_activity}
+                    if number == 7 else None,
+                }}}}
+            self.comments.append((path, body["body"]))
+            return {}
+
+    defuse_api = _DefuseAPI()
+    defuse_candidates = _collect_defuse_prs(
+        defuse_api,
+        "owner/repo",
+        defuse_details,
+        defuse_now,
+        defuse_stale_seconds,
+    )
+    check(
+        "#548 tripwire (b): a recently-active parked PR is NOT defused",
+        ("owner/repo", 2) in defuse_candidates,
+        False,
+    )
+    check(
+        "#548 tripwire (c): review:changes alone is NOT a terminal defuse hold",
+        ("owner/repo", 3) in defuse_candidates,
+        False,
+    )
+    check(
+        "#548 tripwire (d): REST-auto-merged or queued PRs are NOT defused",
+        {("owner/repo", number) in defuse_candidates for number in (4, 5)},
+        {False},
+    )
+    check(
+        "#548 tripwire (d): GraphQL auto-merge and unknown latch states fail closed",
+        {("owner/repo", number) in defuse_candidates for number in (7, 8, 9)},
+        {False},
+    )
+    check(
+        "#548 tripwire (e): an already-draft parked PR is a no-op",
+        ("owner/repo", 6) in defuse_candidates,
+        False,
+    )
+
+    empty_plan_args = (
+        {"owner/repo": limits},
+        {"owner/repo": {}},
+        {"owner/repo": {}},
+        {"owner/repo": set()},
+        {},
+        {},
+        [],
+        {},
+        defuse_now,
+        "app[bot]",
+    )
+    _empty_issues, safe_defuse_actions, _empty_claims = _plan_actions(
+        *empty_plan_args, defuse_prs=defuse_candidates
+    )
+    check(
+        "#548 safe-class planner admits the stale needs:user non-draft PR",
+        [(action.number, action.mode) for action in safe_defuse_actions],
+        [(1, "defuse")],
+    )
+
+    defuse_commands: list[tuple[list[str], str | None]] = []
+
+    class _DefuseResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_defuse_run(args, **kwargs):
+        defuse_commands.append((list(args), (kwargs.get("env") or {}).get("GH_TOKEN")))
+        return _DefuseResult()
+
+    real_subprocess_run = subprocess.run
+    subprocess.run = _fake_defuse_run
+    try:
+        defused = _execute_defuse_actions(
+            safe_defuse_actions,
+            {"owner/repo": defuse_api},
+            {"owner": "owner-target-token"},
+            defuse_now,
+            defuse_stale_seconds,
+        )
+    finally:
+        subprocess.run = real_subprocess_run
+    check(
+        "#548 tripwire (a): stale needs:user non-draft PR is redrafted with its target token",
+        (defused, defuse_commands),
+        (1, [(["gh", "pr", "ready", "1", "-R", "owner/repo", "--undo"],
+              "owner-target-token")]),
+    )
+    check(
+        "#548 tripwire (a): defuse writes one loud audit comment with resume instructions",
+        (
+            len(defuse_api.comments),
+            defuse_api.comments[0][0] if defuse_api.comments else "",
+            defuse_api.comments[0][1].startswith("> 🤖 SPARQ agent")
+            if defuse_api.comments else False,
+            "Marking it ready for review resumes it" in defuse_api.comments[0][1]
+            if defuse_api.comments else False,
+        ),
+        (1, "/repos/owner/repo/issues/1/comments", True, True),
+    )
+
+    over_bound = {
+        ("owner/repo", number): (f"{number:040x}", old_activity)
+        for number in range(1, MAX_AUTO_DEFUSES_PER_TICK + 3)
+    }
+    _bound_issues, bound_actions, _bound_claims = _plan_actions(
+        *empty_plan_args, defuse_prs=over_bound
+    )
+    check(
+        "#548 tripwire (f): auto-defuses are bounded to ten per sweep",
+        (MAX_AUTO_DEFUSES_PER_TICK, len(bound_actions)),
+        (10, 10),
+    )
 
     # [FABLE-5] Deadlock regression (live PRs #3472/#3470): a stale DRAFT worker PR with a VALID
     # registry provenance record (aged past the maintenance threshold purely by WAITING for a
@@ -3127,6 +3547,7 @@ def _self_test() -> int:
             policy_resolver="unused-resolver",
             bot_slug="app",
             ledger_root="",
+            stale_hours=DEFAULT_STALE_HOURS,
         ))
 
     try:
@@ -3265,6 +3686,7 @@ def _self_test() -> int:
             policy_resolver="unused-resolver",
             bot_slug="app",
             ledger_root="",
+            stale_hours=DEFAULT_STALE_HOURS,
         ))
 
     sweep_patched = {
@@ -3405,6 +3827,13 @@ def main() -> int:
     parser.add_argument("--registry-repo")
     parser.add_argument("--policy-file", default="policy/repos.toml")
     parser.add_argument("--policy-resolver", default="scripts/policy-resolve.py")
+    parser.add_argument(
+        "--stale-hours",
+        type=int,
+        default=None,
+        help="quiet hours before safely redrafting a terminally parked PR "
+        "(default: STALE_HOURS or 6)",
+    )
     parser.add_argument(
         "--bot-slug",
         default="",
