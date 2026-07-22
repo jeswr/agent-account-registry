@@ -172,15 +172,14 @@ def _order_eligible_accounts(accounts, leases, usage, package, role):
     return ordered
 
 
-def choose_account(accounts, leases, model_chain, package, role, now, usage=None, margin=SAFETY_MARGIN):
-    """Return the account handle to claim, or None. `accounts`: list of dicts
-    {handle, models:[...], max_concurrent_workers, available:bool}. Walks the model chain; within a
-    model keeps accounts under their concurrency cap and — when live `usage` (a {handle: {status,
-    5h_util,5h_reset,7d_util,7d_reset}} map) is supplied — only accounts that pass `usage_eligible`.
-    Orders eligible accounts by EXPIRY-PRIORITY: soonest whole-account weekly reset first (use credits
-    before they reset), preserving CACHE AFFINITY, least-loaded, and handle order for equal or unknown
-    resets. With `usage=None` the behaviour is the original cache-affinity-then-least-loaded selection
-    (backward compatible)."""
+def _choose_account_model(accounts, leases, model_chain, package, role, now, usage=None,
+                          margin=SAFETY_MARGIN):
+    """Return ``(account, model)`` for the first model with eligible capacity, or None.
+
+    Each alias pass applies the complete account availability, concurrency, and usage/backoff gates
+    before advancing to the next alias. Returning the alias with the account keeps the lease record
+    bound to the model pass that actually admitted it.
+    """
     live = reclaim_expired(leases, now)
     for model in model_chain:
         serving = [a for a in accounts
@@ -193,8 +192,22 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
             continue
 
         serving = _order_eligible_accounts(serving, live, usage, package, role)
-        return serving[0]["handle"]
+        return serving[0], model
     return None
+
+
+def choose_account(accounts, leases, model_chain, package, role, now, usage=None, margin=SAFETY_MARGIN):
+    """Return the account handle to claim, or None. `accounts`: list of dicts
+    {handle, models:[...], max_concurrent_workers, available:bool}. Walks the model chain; within a
+    model keeps accounts under their concurrency cap and — when live `usage` (a {handle: {status,
+    5h_util,5h_reset,7d_util,7d_reset}} map) is supplied — only accounts that pass `usage_eligible`.
+    Orders eligible accounts by EXPIRY-PRIORITY: soonest whole-account weekly reset first (use credits
+    before they reset), preserving CACHE AFFINITY, least-loaded, and handle order for equal or unknown
+    resets. With `usage=None` the behaviour is the original cache-affinity-then-least-loaded selection
+    (backward compatible)."""
+    selected = _choose_account_model(
+        accounts, leases, model_chain, package, role, now, usage=usage, margin=margin)
+    return selected[0]["handle"] if selected is not None else None
 
 
 def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, margin=SAFETY_MARGIN,
@@ -626,23 +639,12 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         if account_slot_bound and available_account_slots(
                 accounts, live, model_chain, now, usage=usage, margin=margin) <= 0:
             return result(None, "no-account-slots")
-        acct = choose_account(accounts, live, model_chain, package, role, now, usage=usage, margin=margin)
-        if acct is None:
+        selected = _choose_account_model(
+            accounts, live, model_chain, package, role, now, usage=usage, margin=margin)
+        if selected is None:
             return result(None, "no-account-slots")
-        a = next(x for x in accounts if x["handle"] == acct)
-        # [FABLE-5] Assign the model CONSISTENTLY with the eligibility that admitted this account. Picking
-        # the first chain-model the account merely SERVES would route fable onto an account whose fable
-        # sub-quota is exhausted (choose_account admitted it only via a later, non-premium pass) — the exact
-        # mid-run-failure the usage gate exists to prevent. When usage is supplied, require the model to
-        # also be usage_eligible; with usage=None this is the original chain-order pick (backward compatible).
-        if usage is not None:
-            model = next((m for m in model_chain
-                          if m in a["models"] and usage_eligible(usage.get(acct), margin, model=m,
-                                                                 now=now)), None)
-            if model is None:
-                return result(None, "no-account-slots")  # defensive; should match the slot gate
-        else:
-            model = next((m for m in model_chain if m in a["models"]), model_chain[0])
+        a, model = selected
+        acct = a["handle"]
         cid = uuid.uuid4().hex
         live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
         if _write_ledger(repo, live, sha, f"claim {cid[:8]} {acct} {package}/{role}"):
@@ -1280,17 +1282,78 @@ def _self_test():
 
         def __init__(self, accounts, leases, write_ok=True):
             self.accounts, self.leases, self.write_ok = accounts, leases, write_ok
+            self.written = None
 
         def __enter__(self):
             self._saved = (read_accounts, _read_ledger, _write_ledger)
             globals()["read_accounts"] = lambda repo: self.accounts
             globals()["_read_ledger"] = lambda repo: (list(self.leases), "sha0")
-            globals()["_write_ledger"] = lambda repo, leases, sha, msg: self.write_ok
+
+            def write(_repo, leases, _sha, _msg):
+                self.written = list(leases)
+                return self.write_ok
+
+            globals()["_write_ledger"] = write
             return self
 
         def __exit__(self, *a):
             (globals()["read_accounts"], globals()["_read_ledger"],
              globals()["_write_ledger"]) = self._saved
+
+    # ---- issue #514: capacity exhaustion walks the target-owned model chain ----
+    # The fixture deliberately crosses providers (sol/openai -> fable/anthropic). These drive the
+    # real claim path so the chosen alias must survive into both the returned claim and CAS ledger
+    # row; selecting only the lead provider, walking unconditionally, or bypassing fallback gates
+    # flips the corresponding assertion red.
+    chain_accounts = [
+        {"handle": "acctlead", "models": ["sol"], "max_concurrent_workers": 1,
+         "available": True, "secret_ref": "ACCTLEAD_TOKEN", "provider": "openai",
+         "harness": "codex", "credential_format": "codex-auth-json"},
+        {"handle": "acctfallback", "models": ["fable"], "max_concurrent_workers": 1,
+         "available": True, "secret_ref": "ACCTFALLBACK_TOKEN", "provider": "anthropic",
+         "harness": "claude", "credential_format": "claude-oauth-token"},
+    ]
+    chain_usage = {
+        "acctlead": {"exempt": True},
+        "acctfallback": {"status": "allowed", "5h_util": 0.2, "5h_reset": 2000,
+                         "7d_util": 0.2, "7d_reset": 3000, "fable_ok": True,
+                         "fable_7d_oi_util": 0.2, "fable_7d_oi_reset": 3000},
+    }
+    lead_full = make_lease("acctlead", "other#1@run", "other", "impl", "sol", now, 100)
+    with _StubLedger(chain_accounts, [lead_full]) as fallback_ledger:
+        fallback_claim = claim(
+            "r", "p", "impl", ["sol", "fable"], "o/r#514@run", now,
+            usage=chain_usage)
+    check("chain walk: exhausted lead provider selects fallback and records fallback alias",
+          (fallback_claim["account"], fallback_claim["model"],
+           fallback_ledger.written[-1]["model"]),
+          ("acctfallback", "fable", "fable"))
+
+    fallback_full = make_lease(
+        "acctfallback", "other#2@run", "other", "impl", "fable", now, 100)
+    with _StubLedger(chain_accounts, [lead_full, fallback_full]):
+        exhausted_claim = claim(
+            "r", "p", "impl", ["sol", "fable"], "o/r#514@run", now,
+            usage=chain_usage)
+    check("chain walk: all providers exhausted returns none-free", exhausted_claim, None)
+
+    with _StubLedger(chain_accounts, []):
+        lead_claim = claim(
+            "r", "p", "impl", ["sol", "fable"], "o/r#514@run", now,
+            usage=chain_usage)
+    check("chain walk: eligible lead provider wins without fallback",
+          (lead_claim["account"], lead_claim["model"]), ("acctlead", "sol"))
+
+    fallback_backoff_usage = {
+        **chain_usage,
+        "acctlead": {"exempt": True, "backoff_until": now + 60},
+    }
+    with _StubLedger(chain_accounts, [fallback_full]):
+        backed_off_fallback = claim(
+            "r", "p", "impl", ["fable", "sol"], "o/r#514@run", now,
+            usage=fallback_backoff_usage)
+    check("chain walk: per-account backoff still blocks the fallback account",
+          backed_off_fallback, None)
 
     # ---- disjoint review:/fix: top-level lease prefixes (cross-provider review loop) ----
     # Review/fix holders are `review:<repo>#<PR>@run` / `fix:<repo>#<PR>@run`. Neither starts with
