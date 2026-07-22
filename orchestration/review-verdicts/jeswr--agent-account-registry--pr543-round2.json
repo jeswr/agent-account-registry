@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 543,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5acaa1a3a1cd2e465dde569d0c1228000b4513f4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 addresses both prior findings on the registry-selftest suite derivation. MAJOR (tamper-evidence lost): the diff adds a committed EXPECTED_SELFTEST_SUITE baseline and a fail-closed reconciliation loop (`for required in $expected` -> `return 1` when a baseline member is absent from the derived set), and the top-level call dies (line 791). Crucially this reconciliation runs at source-time against the real $SCRIPT_DIR every time worker-live.sh loads, so neutering any of the 30 baseline scripts' --self-test entrypoint now drops it from the derived suite and turns the gate red rather than silently shrinking coverage. Verified against the real tree: all 28 baseline .py scripts match the new entrypoint patterns and both .sh scripts match (worker-live.sh:2775, migrate-secrets.sh:2747), so the derivation is self-validating (it must succeed before the self-test can even reach its assertions) and is NOT vacuous. A non-vacuous fixture ('derived suite fails closed when a baseline script loses its self-test entrypoint', expected=helper.py) asserts the refusal and would flip red if the reconciliation loop were removed. MINOR (comment-only textual match): the .py matcher now requires a non-comment line (`^[[:space:]]*[^#]`) plus a genuine dispatch pattern (add_argument(\"--self-test\"| \"--self-test\" in sys.argv | sys.argv[...]==\"--self-test\"), and the .sh matcher anchors on a `self-test)` case arm; the fixture proves comment-only.py (bare '# supports --self-test') is no longer enrolled. Residual: the baseline itself lives in worker-live.sh so removing a baseline entry AND neutering that script in one PR would pass, but that is a reviewable trust-surface edit to a suite-member file and is exactly the committed-baseline tradeoff the prior round's fix_hint requested; the double-quote-only .py pattern is a conservative heuristic (a future single-quoted entrypoint simply wouldn't auto-enroll, staying compile-only, not a weakening). Neither is blocking. Fail-c\u2026 [truncated 112 chars]",
+  "verdict": "approve"
+ }
+}
