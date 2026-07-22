@@ -77,29 +77,24 @@ jobs:
       - name: Run the full registry self-test suite
         run: |
           set -euo pipefail
-          # Every self-testing pipeline script — the same FULL suite worker-live.sh's
-          # registry-selftest gate runs. A missing self-test fails the gate (fail closed).
-          suite="policy-resolve.py route-resolve.py ready-issues.py curate-frontier.py dispatch-plan.py \
-          plan-snapshot.py resolve-conflicts.py triage.py \
-          dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
-          account-usage.py usage-alert.py model-health.py plan-alert.py groom-alert.py pat-validity.py broker-refresh.py \
-          backfill-provenance.py dashboard-gen.py trust-gate.py dispatch-secrets-guard.py"
+          # [sol audit #214] The suite list lives ONLY in scripts/worker-live.sh
+          # (FULL_SELFTEST_SUITE). This job used to carry a hand-maintained copy and the two
+          # lists drifted — retriage.py was self-testing yet enrolled in NEITHER. print-suite
+          # verifies the manifest before printing it: an enrolled-but-deleted script (sol r3 on
+          # #227) and an on-disk self-testing script that is NOT enrolled both fail closed, so
+          # deletion, addition, and drift can no longer produce a green gate.
+          suite="$(bash scripts/worker-live.sh print-suite)"
+          if [[ -z "$suite" ]]; then
+            echo "::error::print-suite returned an empty manifest (fail closed)"; exit 1
+          fi
           for s in $suite; do
-            # An enrolled script that is MISSING is a hard failure (sol r3 on #227): the
-            # silent [[ -f ]] skip would keep this gate green after deleting a security
-            # script — the exact class the trust-gate outage exposed.
-            if [[ ! -f "scripts/$s" ]]; then
-              echo "::error::enrolled self-test script scripts/$s is missing"; exit 1
-            fi
-            if [[ -f "scripts/$s" ]]; then
-              echo "== self-test $s =="
+            echo "== self-test $s =="
+            if [[ "$s" == *.sh ]]; then
+              bash "scripts/$s" self-test
+            else
               python3 "scripts/$s" --self-test
             fi
           done
-          echo "== self-test worker-live.sh =="
-          bash scripts/worker-live.sh self-test
-          echo "== self-test migrate-secrets.sh =="
-          bash scripts/migrate-secrets.sh --self-test
 
       - name: bash -n every shell script
         run: |
