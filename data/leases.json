@@ -1,3 +1,14 @@
 {
- "leases": []
+ "leases": [
+  {
+   "account": "acct2css",
+   "claim_id": "35b118dc823e43e99d127f41c3fd3332",
+   "holder": "jeswr/agent-account-registry#211@dispatch-29927070671.1",
+   "package": "ci",
+   "role": "ci",
+   "model": "fable",
+   "issued_at": 1784730264,
+   "expires_at": 1784732964
+  }
+ ]
 }
