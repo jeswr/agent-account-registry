@@ -199,6 +199,12 @@ def validate_ledger(document: Any) -> list[dict[str, Any]]:
     for lease in leases:
         if not isinstance(lease, dict):
             raise GroomError("lease ledger contains a non-object entry")
+        account = lease.get("account")
+        if not isinstance(account, str) or SAFE_ACCOUNT_HASH.fullmatch(account) is None:
+            # Fingerprinting was introduced while the ledger branch still contained raw handles.
+            # Ignore only those legacy rows so this sweep can CAS-write the validated remainder;
+            # canonical rows retain every fail-closed shape check below.
+            continue
         claim = lease.get("claim_id")
         if not isinstance(claim, str) or SAFE_CLAIM.fullmatch(claim) is None:
             raise GroomError("lease ledger contains an unsafe claim id")
@@ -214,9 +220,9 @@ def validate_ledger(document: Any) -> list[dict[str, Any]]:
         for field in ("account", "package", "role", "model"):
             if not isinstance(lease.get(field), str) or not lease[field]:
                 raise GroomError(f"lease {field} is malformed")
-        if SAFE_ACCOUNT_HASH.fullmatch(lease["account"]) is None:
-            raise GroomError("lease account is not a canonical salted fingerprint")
-    return leases
+    return [lease for lease in leases
+            if isinstance(lease.get("account"), str)
+            and SAFE_ACCOUNT_HASH.fullmatch(lease["account"]) is not None]
 
 
 def _run_status(run: dict[str, Any]) -> str:
@@ -2838,12 +2844,16 @@ def _self_test() -> int:
     except GroomError:
         malformed_failed = True
     check("malformed ledger fails closed", malformed_failed, True)
-    raw_account_failed = False
+    check("raw account handle is dropped during bounded ledger migration",
+          validate_ledger({"leases": [{**base, "account": "acct01"}]}), [])
+    mixed = validate_ledger({"leases": [{**base, "account": "acct01"}, base]})
+    check("canonical lease survives mixed-ledger migration", mixed, [base])
+    canonical_shape_failed = False
     try:
-        validate_ledger({"leases": [{**base, "account": "acct01"}]})
+        validate_ledger({"leases": [{**base, "claim_id": "unsafe"}]})
     except GroomError:
-        raw_account_failed = True
-    check("raw account handle in ledger fails closed", raw_account_failed, True)
+        canonical_shape_failed = True
+    check("canonical lease shape still fails closed", canonical_shape_failed, True)
 
     # Review/fix repair leases: tolerated by validation, never issue-mapped, and a malformed
     # NON-repair holder still fails closed (the skip must not widen into blanket tolerance).
@@ -2991,6 +3001,16 @@ def _self_test() -> int:
         }
     })
     check("ledger read parses at the ledger ref", _read_ledger(seeded, "o/r"), ([], "s1"))
+    mixed_seeded = _StubAPI({
+        ledger_read_path("o/r"): {
+            "content": base64.b64encode(json.dumps({
+                "leases": [{**base, "account": "legacy-handle"}, base],
+            }).encode()).decode(),
+            "sha": "s2",
+        }
+    })
+    check("ledger read drops legacy identity and retains canonical lease",
+          _read_ledger(mixed_seeded, "o/r"), ([base], "s2"))
     missing_ledger_loud = False
     try:
         _read_ledger(_StubAPI({}), "o/r")  # stub 404s every path → branch AND file absent

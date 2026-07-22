@@ -67,10 +67,10 @@ def account_fingerprint(handle, salt=None):
 
 
 def validate_lease_account_identities(leases):
-    """Refuse legacy/raw identities instead of carrying them into another public commit."""
-    if any(ACCOUNT_FINGERPRINT_RE.fullmatch(str(item.get("account", ""))) is None
-           for item in leases):
-        raise ValueError("lease account identities must be canonical fingerprints")
+    """Drop legacy/raw identities so the next CAS write completes the bounded migration."""
+    return [item for item in leases
+            if isinstance(item.get("account"), str)
+            and ACCOUNT_FINGERPRINT_RE.fullmatch(item["account"]) is not None]
 
 
 def active_for(leases, account):
@@ -427,7 +427,7 @@ def _read_ledger(repo):
         leases = content.get("leases")
         if not isinstance(leases, list) or any(not isinstance(item, dict) for item in leases):
             raise ValueError("leases must be a list of objects")
-        validate_lease_account_identities(leases)
+        leases = validate_lease_account_identities(leases)
         sha = meta["sha"]
         if not isinstance(sha, str) or not sha:
             raise ValueError("blob sha is missing")
@@ -1311,13 +1311,11 @@ def _self_test():
           _lease["account"], account_fingerprint("acct02"))
     check("lease fingerprint is 16 lowercase hex",
           ACCOUNT_FINGERPRINT_RE.fullmatch(_lease["account"]) is not None, True)
-    try:
-        validate_lease_account_identities([{"account": "acct02"}])
-        check("raw account identity fails closed at ledger read", "accepted", "ValueError")
-    except ValueError:
-        check("raw account identity fails closed at ledger read", "ValueError", "ValueError")
-    validate_lease_account_identities([{"account": _lease["account"]}])
-    check("canonical fingerprint passes ledger identity validation", True, True)
+    check("raw account identity is dropped during bounded ledger migration",
+          validate_lease_account_identities([{"account": "acct02"}]), [])
+    check("canonical fingerprint survives bounded ledger migration",
+          validate_lease_account_identities([{"account": _lease["account"]}]),
+          [{"account": _lease["account"]}])
     subject = claim_commit_message("abcdef0123456789", "pkg", "impl")
     check("claim commit subject omits raw account identity",
           subject, "claim abcdef01 pkg/impl")
