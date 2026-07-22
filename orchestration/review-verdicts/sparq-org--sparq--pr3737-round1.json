@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3737,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "20f7293571a6b741f54e0fd651d33a1fe6c96bbe",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Supply-chain hygiene PR that bumps actions/checkout from v4.2.2 (11bd71901bbe5b1630ceea73d27597364c9af683) to the repository-canonical v7.0.0 pin (9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0) in deploy-terraform-lint.yml (x2), promote-on-approval.yml, retriage.yml, and triage-issue.yml, plus a comment-format normalization in deploy-lint.yml (same SHA, comment moved inline to '# v7.0.0'). Verified across .github/workflows/: every other workflow (ci.yml, release.yml, codeql.yml, scorecard.yml, etc.) already pins this exact SHA labeled v7.0.0, so this PR eliminates the last stragglers and makes the checkout pin uniform repo-wide. All pins remain commit-SHA-pinned (SLSA/pinned-action posture preserved) with a version comment. The affected steps are plain checkouts with no inputs whose v4->v7 semantics changed, so no behavioral regression; checkout v7's Node 24 runtime is supported on ubuntu-latest. Change is correct, complete, and low-risk. No hostile instructions detected in the diff.",
+  "verdict": "approve"
+ }
+}
