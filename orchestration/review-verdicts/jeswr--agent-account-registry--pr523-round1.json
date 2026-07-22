@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 523,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "898ce7ea30fe6a210d3b56a78dc901d958a42763",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is sound and fail-closed. PyYAML is pinned with hashes while forbidding unchecked sdist fallback, and the new recursive workflow scan covers job- and step-level `uses` entries, exempts only repository-local actions, applies the appropriate immutable-pin format to action and Docker references, reports every violation, and fails both on violations and on a vacuous zero-reference scan. Existing least-privilege permissions and action pins are preserved. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
