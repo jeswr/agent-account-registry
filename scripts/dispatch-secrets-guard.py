@@ -299,6 +299,48 @@ def setup_account_store_step_lines(workflow_text):
     return step
 
 
+def setup_account_reconcile_run_script(workflow_text):
+    """Pure: the DEDENTED shell body of the set-up-account reconcile step's `run: |` block
+    (`id: reconcile`), or None when it cannot be located (callers treat None as a failure —
+    fail closed). Like `setup_account_store_step_lines` above, this is a deliberately NARROW,
+    dependency-free line parser over the one step this repo controls, not a general YAML
+    reader. The body is returned executable so the self-test can RUN the real reconcile shell
+    under stubbed `gh`/`jq` and assert its fail-closed behaviour (the #533 round-1
+    credential-existence contract), instead of pattern-matching what the shell hopefully does."""
+    lines = workflow_text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == "id: reconcile":
+            start = index
+            break
+    if start is None:
+        return None
+    run_index = None
+    for index in range(start + 1, len(lines)):
+        if lines[index].startswith("      - name:"):
+            break  # dedented into the next step without finding a run block
+        if lines[index].strip() == "run: |":
+            run_index = index
+            break
+    if run_index is None:
+        return None
+    body = []
+    indent = None
+    for line in lines[run_index + 1:]:
+        if not line.strip():
+            body.append("")
+            continue
+        current = len(line) - len(line.lstrip())
+        if indent is None:
+            indent = current
+        if current < indent:
+            break  # dedented out of the literal block
+        body.append(line[indent:])
+    if not body:
+        return None
+    return "\n".join(body) + "\n"
+
+
 def setup_account_union_verdict(step_lines):
     """Pure: (ok, reason). The store step's pre-claim union must (a) enumerate EVERY required
     listing (claim refs, acctNN issues in any state, and ACCTNN_TOKEN secret names at BOTH the
@@ -1195,6 +1237,121 @@ def _self_test():
         live_rotation_write = (False, "worker-live.sh unreadable (fail closed)")
     chk("script: the rotation write-back writes into the dispatch-secrets ENVIRONMENT",
         live_rotation_write, (True, "ok"))
+
+    # IDEMPOTENT-RESUME credential-existence contract (#211; review round 1 of #533): the
+    # reconcile step must NEVER grant resume=true on the say-so of a secret_ref LINE — an
+    # account issue can outlive its dispatch-secrets secret (deleted during manual recovery,
+    # or never successfully created), and a granted resume flows straight into
+    # validate -> account_pool PR -> activation around a credential no worker can use. The
+    # reconcile body is pure workflow-shell (no script seam), but unlike the union contract
+    # above it is cheaply EXECUTABLE: run the REAL extracted `run: |` body under stubbed
+    # gh/jq on a private PATH (hermetic — no network, no real gh/jq needed on the host) and
+    # assert the behaviour itself, both directions. Downstream steps gate on
+    # `steps.reconcile.outputs.resume == 'true'` (or a fresh login), so "non-zero exit AND no
+    # resume=true in GITHUB_OUTPUT" proves validate/policy-PR/activation are unreachable.
+    import tempfile
+
+    try:
+        with open(setup_path, encoding="utf-8") as handle:
+            reconcile_script = setup_account_reconcile_run_script(handle.read())
+    except OSError:
+        reconcile_script = None
+    chk("workflow: reconcile run-block located and extracted (a reshaped step fails closed here)",
+        reconcile_script is not None, True)
+
+    gh_stub = r'''#!/usr/bin/env bash
+# Hermetic gh stub for the reconcile harness: keyed on EXACT argv so a reshaped reconcile
+# step fails LOUDLY (exit 64) instead of silently passing. STUB_MODE selects the probe fate.
+args="$*"
+case "$args" in
+  "api --paginate repos/$REPO/issues?state=open&per_page=100")
+    printf '[]\n' ;;
+  "api repos/$REPO/environments/dispatch-secrets/secrets/"*)
+    if [ "${GH_TOKEN:-}" != "$EXPECTED_PROBE_TOKEN" ]; then
+      printf 'gh-stub: existence probe ran with the wrong token\n' >&2; exit 64
+    fi
+    case "$STUB_MODE" in
+      secret-exists) printf '{"name":"%s"}\n' "${args##*/}" ;;
+      secret-404)    printf 'gh: Not Found (HTTP 404)\n' >&2; exit 1 ;;
+      *)             printf 'gh: Internal Server Error (HTTP 500)\n' >&2; exit 1 ;;
+    esac ;;
+  "issue view 5 -R $REPO --json title --jq .title")
+    printf 'acct07\n' ;;
+  "issue view 5 -R $REPO --json body --jq .body")
+    cat "$STUB_BODY_FILE" ;;
+  "issue comment "*)
+    : ;;
+  *)
+    printf 'gh-stub: unexpected argv: %s\n' "$args" >&2; exit 64 ;;
+esac
+'''
+    jq_stub = r'''#!/usr/bin/env bash
+# Hermetic jq stub: the harness controls the bound-issue set directly (the binding filter's
+# OUTPUT is injected), so the real jq binary is not required on the test host.
+cat > /dev/null 2>/dev/null || true
+if [ "$STUB_MODE" = fresh ]; then exit 0; fi
+printf '5\n'
+'''
+
+    def run_reconcile(mode, secret_ref="ACCT07_TOKEN", registry_pat="sentinel-registry-pat"):
+        """rc + GITHUB_OUTPUT text from executing the real reconcile shell hermetically."""
+        if reconcile_script is None:
+            return None, ""
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.mkdir(bindir)
+            for name, text in (("gh", gh_stub), ("jq", jq_stub)):
+                stub_path = os.path.join(bindir, name)
+                with open(stub_path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                os.chmod(stub_path, 0o755)
+            body_file = os.path.join(tmp, "issue-body.txt")
+            with open(body_file, "w", encoding="utf-8") as fh:
+                fh.write("provider: anthropic\nharness: claude\n"
+                         "models: [fable, opus, sonnet, haiku]\n"
+                         "credential_format: claude-oauth-token\n"
+                         "max_concurrent_workers: 1\n"
+                         f"secret_ref: {secret_ref}\n"
+                         "request_issue: 42\n")
+            output_path = os.path.join(tmp, "github-output")
+            open(output_path, "w", encoding="utf-8").close()
+            env = dict(os.environ,
+                       PATH=bindir + os.pathsep + os.environ.get("PATH", ""),
+                       GH_TOKEN="sentinel-github-token",
+                       REGISTRY_PAT=registry_pat,
+                       EXPECTED_PROBE_TOKEN="sentinel-registry-pat",
+                       ISSUE="42",
+                       REPO="jeswr/agent-account-registry",
+                       GITHUB_OUTPUT=output_path,
+                       STUB_MODE=mode,
+                       STUB_BODY_FILE=body_file)
+            proc = subprocess.run(["bash", "-c", reconcile_script],
+                                  env=env, capture_output=True, text=True)
+            with open(output_path, encoding="utf-8") as fh:
+                return proc.returncode, fh.read()
+
+    rc_fresh, out_fresh = run_reconcile("fresh")
+    chk("reconcile: no bound account issue -> fresh enrollment (rc 0, resume=false)",
+        (rc_fresh, "resume=false" in out_fresh, "resume=true" in out_fresh),
+        (0, True, False))
+    rc_resume, out_resume = run_reconcile("secret-exists")
+    chk("reconcile: bound issue + secret PROVEN present (PAT-scoped GET) -> resume granted",
+        (rc_resume, "resume=true" in out_resume, "handle=acct07" in out_resume,
+         "secret=ACCT07_TOKEN" in out_resume),
+        (0, True, True, True))
+    rc_gone, out_gone = run_reconcile("secret-404")
+    chk("reconcile: referenced secret 404s in dispatch-secrets -> refuse (rc!=0, resume NEVER "
+        "granted; validate/policy-PR/activation unreachable)",
+        (rc_gone != 0, "resume=true" in out_gone), (True, False))
+    rc_unproven, out_unproven = run_reconcile("probe-error")
+    chk("reconcile: probe fails for a non-404 reason -> refuse (existence unprovable, fail closed)",
+        (rc_unproven != 0, "resume=true" in out_unproven), (True, False))
+    rc_binding, out_binding = run_reconcile("secret-exists", secret_ref="ACCT99_TOKEN")
+    chk("reconcile: secret_ref is not the broker-minted binding for the handle -> refuse",
+        (rc_binding != 0, "resume=true" in out_binding), (True, False))
+    rc_nopat, out_nopat = run_reconcile("secret-exists", registry_pat="")
+    chk("reconcile: REGISTRY_SECRETS_PAT empty -> refuse (existence cannot be proven)",
+        (rc_nopat != 0, "resume=true" in out_nopat), (True, False))
 
     # Pure scope verdict — accept AND reject directions.
     chk("scope: only github_token -> ok",

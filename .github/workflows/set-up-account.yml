@@ -63,7 +63,12 @@
 # exactly one bound handle exists, skips login/store/register and re-enters the pipeline at
 # validate -> account_pool PR -> report with that SAME handle. One request converges on one
 # stable handle before any completion is reported; two+ bound handles are ambiguous identity and
-# fail closed.
+# fail closed. Resume additionally requires PROOF the referenced credential is REAL (review
+# round 1 of #533): the issue's secret_ref must be the exact broker-minted `${HANDLE}_TOKEN`
+# binding AND the named secret must be readable (PAT-scoped GET) in the dispatch-secrets
+# environment — an account issue can outlive a deleted or never-created secret, and resuming on
+# the secret_ref LINE alone would flip status:available around a credential no worker can use.
+# A 404, a missing PAT, or an unprovable probe fails closed before resume is ever granted.
 name: set-up-account
 on:
   issues:
@@ -141,10 +146,17 @@ jobs:
       # handle -> resume: login/store/register are skipped (their work is done) and the pipeline
       # re-enters at validate -> account_pool PR -> report with the SAME handle. Two+ bound
       # handles -> ambiguous identity -> fail closed (never guess which transaction to complete).
+      # Resume is granted only after the bound issue's secret_ref is proven to name a REAL
+      # credential in the dispatch-secrets environment (review round 1 of #533) — see the
+      # existence probe below.
       - name: Reconcile a prior partial enrollment for this request (#211)
         id: reconcile
         env:
           GH_TOKEN: ${{ github.token }}
+          # The resume-existence probe reads dispatch-secrets environment secret METADATA
+          # (names only, never values), which github.token cannot — same PAT + Environments:
+          # read grant the store step's absence probe uses.
+          REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
           ISSUE: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
         run: |
@@ -178,6 +190,33 @@ jobs:
           fmt=$(printf '%s\n' "$body" | sed -n 's/^credential_format:[[:space:]]*\([A-Za-z0-9._-]*\).*/\1/p' | head -1)
           if [ -z "$secret" ]; then
             echo "::error::account issue #$num ($handle) is bound to request #$ISSUE but carries no secret_ref line — a malformed record can be neither resumed nor safely superseded (fail closed). Fix the issue body, then re-apply set-up-account."; exit 1
+          fi
+          # Review round 1 of #533: the secret_ref LINE proves nothing about the CREDENTIAL — an
+          # account issue can outlive its secret (deleted during manual recovery, or never
+          # successfully created), and a resume that trusts the line alone would validate
+          # metadata, open the account_pool PR and eventually flip status:available around a
+          # credential no worker can use. Resume therefore requires the reference to be proven
+          # REAL: (a) the secret_ref must be the exact broker-minted binding for THIS handle
+          # (`${handle^^}_TOKEN` — the same shape account-usage.py enforces; anything else is a
+          # tampered or hand-edited record that cannot be trusted), and (b) the named secret
+          # must EXIST in the dispatch-secrets environment — the post-#101 canonical home every
+          # consumer resolves from — proven by the same PAT-scoped GET the store step's absence
+          # probe uses. Only an authenticated success proves existence; a 404 means the
+          # credential is GONE, and a missing PAT or any other probe outcome means existence
+          # cannot be proven — all fail closed BEFORE resume is granted, so
+          # validate/account_pool-PR/activation stay unreachable.
+          if [ "$secret" != "${handle^^}_TOKEN" ]; then
+            echo "::error::account issue #$num ($handle) carries secret_ref '$secret' but the broker-minted binding for $handle is '${handle^^}_TOKEN' — a mismatched credential binding cannot be resumed (fail closed). Fix the issue body, then re-apply set-up-account."; exit 1
+          fi
+          if [ -z "${REGISTRY_PAT:-}" ]; then
+            echo "::error::REGISTRY_SECRETS_PAT is unavailable, so it cannot be proven that secret $secret still exists in the dispatch-secrets environment — refusing to resume (fail closed). Restore the PAT (see the preflight guidance), then re-apply set-up-account."; exit 1
+          fi
+          if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/$REPO/environments/dispatch-secrets/secrets/$secret" 2>&1); then
+            echo "resume preflight: secret $secret exists in the dispatch-secrets environment"
+          elif printf '%s' "$probe" | grep -q 'HTTP 404'; then
+            echo "::error::account issue #$num ($handle) references secret $secret, which does NOT exist in the dispatch-secrets environment — resuming would activate an account with no usable credential (fail closed). Either restore the secret and re-apply set-up-account to resume, or close account issue #$num (its slot stays burned by design; claims are never released) and re-apply for a fresh enrollment."; exit 1
+          else
+            echo "::error::could not prove secret $secret exists in the dispatch-secrets environment (the probe failed for a non-404 reason) — refusing to resume (fail closed). Re-apply set-up-account to retry."; exit 1
           fi
           {
             printf 'resume=true\n'
