@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 528,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "eb7177e21b7c3cf290d66741f373c4b1ed2c121e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "privileged_script_coverage_verdict builds its inventory from PRIVILEGED_SCRIPT_RE, which anchors on `(?:python3|bash)\\s+(?:registry/)?scripts/...`. A future secret-consuming or write-permission job that runs a control script via `python scripts/x.py`, `sh scripts/x.sh`, or a direct `./scripts/x.sh` (or a `.github/scripts/` path) would not be added to `privileged`, so it would never be checked for trust-surface coverage \u2014 a fail-OPEN completeness gap in the new invariant. No current workflow uses those forms (all live calls are `python3 scripts/...`), so the live assertions still pass and nothing regresses; this is belt-and-suspenders completeness, not a blocker.",
+    "file": "scripts/dispatch-secrets-guard.py",
+    "fix_hint": "Broaden the interpreter alternation to `python3?|sh|bash` and optionally recognize a bare/relative `\\.?/?scripts/...` executable form, or add a self-test fixture that runs a script via `python`/`sh` inside a secret job and asserts it is inventoried.",
+    "severity": "minor",
+    "title": "PRIVILEGED_SCRIPT_RE only recognizes `python3`/`bash scripts/...`; `python`, `sh`, or direct `./scripts/...` invocations in a secret job would silently escape the inventory"
+   },
+   {
+    "body": "The write detector `^\\s{6,}[a-z-]+:\\s*write(?:\\s*#.*)?$` matches `contents: write` / `pages: write` but NOT the job-level `permissions: write-all` shorthand (trailing `-all` breaks the `write$` anchor) or an inline `permissions: write-all`. A job granted the most dangerous permission via that shorthand, running an uncovered script, would not be treated as privileged by this new check. No live job uses write-all, and trust_surface_paths_touched remains the primary path-diff enforcement, so this is a non-regressing completeness nit in the auxiliary invariant.",
+    "file": "scripts/dispatch-secrets-guard.py",
+    "fix_hint": "Also treat `permissions:\\s*write-all` (and the top-level `permissions: write-all` form) as has_write=True, and add a fixture asserting a write-all secret/inventory job fails closed when its script is uncovered.",
+    "severity": "minor",
+    "title": "has_write regex misses `permissions: write-all` \u2014 the broadest grant is not flagged as a write job"
+   }
+  ],
+  "progress": null,
+  "summary": "Correct, complete, and fail-closed. (1) dashboard.yml splits the single secret-consuming job into `probe` (materializes the ACCT_* token subset + salt, emits only account-usage.py's privacy-safe usage.json aggregate) and `build` (runs the privileged dashboard-gen.py generator with only PROVENANCE_SALT, never the raw-token file). This is a real hardening: the public generator no longer shares a runner with materialized raw tokens. The hand-off artifact is SHA-pinned (upload/download-artifact v4.6.2/v4.3.0), run_id-scoped, retention 1 day, if-no-files-found:error; both jobs keep persist-credentials:false and the ledger-invariant.py data-only guard, and `build` still owns the single Pages deploy. (2) Adding `dashboard/` to policy/repos.toml security_paths and worker-pr.py DEFAULT_TRUST_SURFACE_PATHS is coherent and TIGHTENING (more human-arm), not weakening: verified dashboard-gen.py `--assets default=dashboard` copies dashboard/{app.js,index.html,styles.css} into the published site/, so a dashboard/ change flows into Pages built by an env-secret job. (3) The new privileged_script_coverage_verdict is a non-vacuous self-test \u2014 it asserts accept, reject-on-uncovered, and zero-inventory fail-closed directions, then anchors live_docs against BOTH the worker-pr floor and the policy surface; it fails closed on unparseable jobs, empty inventory, or empty surfaces (including the import-failure branch). It follows the existing binding_map_verdict self-test-as-gate pattern. No trust check is deleted/relaxed/skipped, no default-allow path is introduced, and there is no instruction-shaped text in the diff. This is a trust-surface change and per Decision 7 REVISED an approval auto-arms with a SHA-bound audit trail \u2014 the audit-trail, head/base binding, and injection/tamper human-stops are untouched. Minor completeness gaps in the new auxiliary check are noted below; they have no live trigger and regress nothing.",
+  "verdict": "approve"
+ }
+}
