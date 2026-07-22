@@ -600,6 +600,41 @@ def binding_map_verdict(workflow_docs):
     return True, "ok"
 
 
+PRIVILEGED_SCRIPT_RE = re.compile(
+    r"(?:^|[;&|]\s*|\s)(?:python3|bash)\s+(?:registry/)?(scripts/[A-Za-z0-9_.-]+(?:\.py|\.sh))"
+)
+
+
+def privileged_script_coverage_verdict(workflow_docs, surface_paths):
+    """Pure: prove every script executed by a secret-consuming or write-permission job is inside
+    the human-arm trust surface. The inventory is derived from workflow job bodies; zero matches,
+    an unreadable jobs block, or one uncovered script fails closed."""
+    surfaces = tuple(path.strip().replace("\\", "/").lstrip("./")
+                     for path in surface_paths if isinstance(path, str) and path.strip())
+    privileged = set()
+    for filename, document in sorted(workflow_docs.items()):
+        jobs = workflow_jobs(document)
+        if jobs is None:
+            return False, f"cannot parse jobs in {filename} (fail closed)"
+        for job_name, body_lines in jobs.items():
+            body = "\n".join(body_lines)
+            has_write = bool(re.search(r"(?m)^\s{6,}[a-z-]+:\s*write(?:\s*#.*)?$", body))
+            if job_secret_reads(body_lines) or has_write:
+                privileged.update(PRIVILEGED_SCRIPT_RE.findall(body))
+    if not privileged:
+        return False, "derived ZERO privileged scripts (fail closed)"
+
+    def covered(path):
+        return any(path.startswith(surface) if surface.endswith("/")
+                   else path == surface or path.startswith(surface + "/")
+                   for surface in surfaces)
+
+    uncovered = sorted(path for path in privileged if not covered(path))
+    if uncovered:
+        return False, "privileged scripts outside human-arm trust surface: " + ", ".join(uncovered)
+    return True, "ok"
+
+
 def secret_env_write_verdict(text, secret_arg, where):
     """Pure: (ok, reason). Locates every `gh secret set <secret_arg> ...` invocation in `where`
     (comments stripped, backslash continuations joined) and requires each to carry
@@ -1038,6 +1073,54 @@ def _self_test():
          ("dispatch.yml", "claim") in live_consumers,
          all(key in live_consumers for key in BINDING_EXCEPTIONS)),
         (True, True, True, True))
+
+    privileged_fixture = {
+        "privileged.yml": "\n".join([
+            "jobs:",
+            "  writer:",
+            "    permissions:",
+            "      contents: write",
+            "    steps:",
+            "      - run: python3 scripts/ledger-writer.py",
+            "  probe:",
+            "    steps:",
+            "      - run: bash scripts/probe.sh",
+            "        env:",
+            "          TOKEN: ${{ secrets.ACCT01_TOKEN }}",
+        ])
+    }
+    chk("privileged-script coverage: scripts/ prefix covers secret readers and writers",
+        privileged_script_coverage_verdict(privileged_fixture, ("scripts/",)), (True, "ok"))
+    uncovered = privileged_script_coverage_verdict(privileged_fixture,
+                                                    ("scripts/ledger-writer.py",))
+    chk("privileged-script coverage: uncovered secret probe fails closed",
+        (uncovered[0], "scripts/probe.sh" in uncovered[1]), (False, True))
+    chk("privileged-script coverage: zero derived inventory fails closed",
+        privileged_script_coverage_verdict(
+            {"plain.yml": "jobs:\n  lint:\n    steps:\n      - run: python3 scripts/lint.py"},
+            ("scripts/",))[0], False)
+    try:
+        import importlib.util
+        import tomllib
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        worker_pr_path = os.path.join(repo_root, "scripts", "worker-pr.py")
+        spec = importlib.util.spec_from_file_location("guard_worker_pr", worker_pr_path)
+        worker_pr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker_pr)
+        with open(os.path.join(repo_root, "policy", "repos.toml"), "rb") as handle:
+            policy_doc = tomllib.load(handle)
+        policy_surfaces = policy_doc["repos"]["jeswr/agent-account-registry"]["readiness"][
+            "security_paths"]
+        default_surfaces = worker_pr.DEFAULT_TRUST_SURFACE_PATHS
+    except (OSError, KeyError, TypeError, AttributeError, ImportError):
+        policy_surfaces = ()
+        default_surfaces = ()
+    chk("workflow: every script run with secrets or write permission is covered by the "
+        "worker-pr mandatory human-arm floor",
+        privileged_script_coverage_verdict(live_docs, default_surfaces), (True, "ok"))
+    chk("workflow: every script run with secrets or write permission is covered by the registry "
+        "policy human-arm surface",
+        privileged_script_coverage_verdict(live_docs, policy_surfaces), (True, "ok"))
 
     # Round 19: the ONE shared quote-aware comment stripper, tested directly — every shell-text
     # check strips through it before matching.
