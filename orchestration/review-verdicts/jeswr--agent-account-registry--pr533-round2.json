@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 533,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1d0d18b55de5dad80875c50f3a68e44abb66c3ac",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 fail-closed gap is resolved. Resume now requires an exact handle-bound secret_ref, a present REGISTRY_SECRETS_PAT, and a successful PAT-scoped metadata GET for that exact dispatch-secrets environment secret before resume=true is emitted. Missing, deleted, mismatched, or unprovable credentials exit nonzero before validation, policy PR creation, or activation. The added hermetic tests execute the extracted workflow shell and cover positive existence plus 404, non-404 failure, binding mismatch, and missing-PAT rejection, with explicit assertions that resume=true is absent on every rejection path. No new correctness, security, or test-validity issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
