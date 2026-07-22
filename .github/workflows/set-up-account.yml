@@ -52,6 +52,18 @@
 # handle is genuinely in MERGED `master` account_pool before it flips anything. An `always()` alarm
 # reports every partial enrollment state with explicit recovery (the credential capture is
 # irreversible — claims are never released, #186 — so recovery is forward, never a silent abort).
+#
+# IDEMPOTENT-RESUME fix (#211): a partial enrollment (credential stored + status:pending issue
+# created, but no merged account_pool PR) used to make the retry WORSE than the failure:
+# re-applying `set-up-account` started a fresh login and allocated a fresh `max(acctNN)+1` slot,
+# orphaning the first (irreversible) capture instead of completing its transaction. Now a
+# `reconcile` step runs before any preflight/login: it enumerates the OPEN acctNN issues bound to
+# THIS request via their `request_issue:` body line (fully paginated; a failed listing fails
+# closed — proceeding blind could mint exactly the duplicate slot this fix prevents) and, when
+# exactly one bound handle exists, skips login/store/register and re-enters the pipeline at
+# validate -> account_pool PR -> report with that SAME handle. One request converges on one
+# stable handle before any completion is reported; two+ bound handles are ambiguous identity and
+# fail closed.
 name: set-up-account
 on:
   issues:
@@ -118,6 +130,66 @@ jobs:
           # repository-write git credential (the repo-wide convention; every other checkout does this).
           persist-credentials: false
 
+      # #211: a retry after a PARTIAL enrollment (credential stored + status:pending issue created,
+      # but no merged account_pool PR) must COMPLETE that transaction, not open a second one — the
+      # old path started a fresh login and allocated a fresh slot, orphaning the first irreversible
+      # capture. The register step stamps `request_issue: <n>` into every account issue body
+      # precisely so the handle bound to THIS request is findable. Enumeration is fully paginated
+      # over the OPEN acctNN issues (a closed account issue is deliberately retired — never
+      # resumed); a failed listing means "no prior enrollment" cannot be proven, so it fails closed
+      # rather than minting the duplicate slot this step exists to prevent. Exactly one bound
+      # handle -> resume: login/store/register are skipped (their work is done) and the pipeline
+      # re-enters at validate -> account_pool PR -> report with the SAME handle. Two+ bound
+      # handles -> ambiguous identity -> fail closed (never guess which transaction to complete).
+      - name: Reconcile a prior partial enrollment for this request (#211)
+        id: reconcile
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! raw=$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100"); then
+            echo "::error::could not enumerate account issues — cannot prove request #$ISSUE has no prior partial enrollment (fail closed)"; exit 1
+          fi
+          # `--paginate` emits one JSON array per page; jq iterates each top-level array, so no
+          # slurp is needed and no page is silently dropped. The `[[:space:]]*$` tolerates the
+          # CRLF a web-UI edit can introduce.
+          bound=$(printf '%s' "$raw" | jq -r --arg req "$ISSUE" '
+            .[] | select(has("pull_request") | not)
+                | select(.title | test("^acct[0-9]+$"))
+                | select([.labels[].name] | any(. == "status:pending" or . == "status:available"))
+                | select((.body // "") | test("(?m)^request_issue:[[:space:]]*" + $req + "[[:space:]]*$"))
+                | .number')
+          count=$(printf '%s' "$bound" | grep -c '^[0-9]' || true)
+          if [ "$count" -gt 1 ]; then
+            echo "::error::request #$ISSUE is bound to $count account issues ($(printf '%s' "$bound" | tr '\n' ' ')) — ambiguous identity, refusing to enroll or resume (fail closed)"; exit 1
+          fi
+          if [ "$count" -eq 0 ]; then
+            echo "resume=false" >> "$GITHUB_OUTPUT"
+            echo "no prior enrollment bound to request #$ISSUE — proceeding with a fresh enrollment"
+            exit 0
+          fi
+          num=$(printf '%s' "$bound" | head -1)
+          handle=$(gh issue view "$num" -R "$REPO" --json title --jq .title)
+          body=$(gh issue view "$num" -R "$REPO" --json body --jq .body)
+          secret=$(printf '%s\n' "$body" | sed -n 's/^secret_ref:[[:space:]]*\([A-Za-z0-9_]*\).*/\1/p' | head -1)
+          models=$(printf '%s\n' "$body" | sed -n 's/^models:[[:space:]]*\(.*\)$/\1/p' | head -1 | tr -d '\r')
+          fmt=$(printf '%s\n' "$body" | sed -n 's/^credential_format:[[:space:]]*\([A-Za-z0-9._-]*\).*/\1/p' | head -1)
+          if [ -z "$secret" ]; then
+            echo "::error::account issue #$num ($handle) is bound to request #$ISSUE but carries no secret_ref line — a malformed record can be neither resumed nor safely superseded (fail closed). Fix the issue body, then re-apply set-up-account."; exit 1
+          fi
+          {
+            printf 'resume=true\n'
+            printf 'handle=%s\n' "$handle"
+            printf 'secret=%s\n' "$secret"
+            printf 'models=%s\n' "$models"
+            printf 'fmt=%s\n' "${fmt:-unknown}"
+          } >> "$GITHUB_OUTPUT"
+          gh issue comment "$ISSUE" -R "$REPO" \
+            --body "♻️ Resuming the existing enrollment of **$handle** for this request — its credential is already captured, so there is no new sign-in and no new slot. Completing validation and the account_pool policy PR now." || true
+          echo "resuming $handle (account issue #$num) for request #$ISSUE — login/store/register are skipped"
+
       # The workflow's own github.token cannot write Actions secrets; REGISTRY_SECRETS_PAT is the
       # jeswr-owned fine-grained PAT on THIS registry repo (already proven by the rotation
       # write-back in worker-live.sh). Post-#101 it lives in the dispatch-secrets environment
@@ -143,6 +215,9 @@ jobs:
       # within the calendar-expiry warning window), so enrollment proceeds — rotation is the weekly
       # alert's job, not a reason to refuse a store that works now.
       - name: Preflight — REGISTRY_SECRETS_PAT present AND store-capable, before any login (#187)
+        # #211 resume: nothing is stored on the resume path (github.token + App token only), so
+        # proving store-capability would be a needless canary write.
+        if: steps.reconcile.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ github.token }}   # for the fail() issue comment; the probe uses REGISTRY_PAT
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
@@ -183,6 +258,8 @@ jobs:
 
       - name: Determine provider (structured — no silent default)
         id: meta
+        # #211 resume: provider/models/handle come from the bound account issue, not a fresh hint.
+        if: steps.reconcile.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -216,6 +293,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Install provider CLI (version-pinned, fail on error)
+        if: steps.reconcile.outputs.resume != 'true'
         run: |
           set -e
           # #188: no GitHub token reaches npm or any package lifecycle script. The job sets no
@@ -239,6 +317,7 @@ jobs:
       # usable, encryption-capable key exists HERE, before any login starts (fail closed, mirroring the
       # secrets preflight) — a login whose challenge we cannot deliver confidentially must never run.
       - name: Preflight — requester has a confidential-delivery key, before any login
+        if: steps.reconcile.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTER: ${{ github.event.issue.user.login }}
@@ -281,6 +360,8 @@ jobs:
 
       - name: Device login + deliver encrypted sign-in, capture token
         id: login
+        # #211 resume: the credential is already captured — a second login would orphan it.
+        if: steps.reconcile.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ github.token }}   # used ONLY by the gh issue comment below, never by the CLI
           REQUESTER: ${{ github.event.issue.user.login }}
@@ -473,7 +554,9 @@ jobs:
       # (title + body parse), but choose_account's available-gate skips it (no status:available) AND
       # it is not yet in account_pool — doubly non-allocatable until the policy PR merges. The
       # `request_issue:` line links back so the `activate` job can close the request on merge (the
-      # account body parser ignores unknown keys, so this is safe to add).
+      # account body parser ignores unknown keys, so this is safe to add). It is also the #211
+      # reconcile key: an exact `request_issue: <n>` line is how a retried run finds the one handle
+      # already bound to its request instead of allocating a fresh slot — keep the format stable.
       - name: Register the account issue in a status:pending state (#185)
         id: register
         if: steps.login.outputs.status == 'ok'
@@ -499,10 +582,10 @@ jobs:
 
       - name: Validate the registration through the real allocator parser
         id: validate
-        if: steps.login.outputs.status == 'ok'
+        if: steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true'
         env:
           GH_TOKEN: ${{ github.token }}   # read_accounts shells out to `gh issue list`
-          NEW_HANDLE: ${{ steps.store.outputs.handle }}
+          NEW_HANDLE: ${{ steps.store.outputs.handle || steps.reconcile.outputs.handle }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -531,7 +614,7 @@ jobs:
       # is bound to), scoped to THIS repo with only contents+PR write.
       - name: Mint an App token for the account_pool PR (this repo; contents+PR write) (#185)
         id: app-token-pool
-        if: steps.login.outputs.status == 'ok'
+        if: steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
@@ -553,10 +636,13 @@ jobs:
       # (never propose an unparseable policy).
       - name: Open a checked account_pool PR (never a master PUT) (#185)
         id: policy_pr
-        if: steps.login.outputs.status == 'ok'
+        # #211 resume re-enters here: the branch/PUT/PR logic below is idempotent (reuses the
+        # branch, skips an already-applied edit, reuses an open PR, emits pr=none when master
+        # already carries the handle), so a resumed run converges instead of duplicating.
+        if: steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token-pool.outputs.token }}
-          NEW_HANDLE: ${{ steps.store.outputs.handle }}
+          NEW_HANDLE: ${{ steps.store.outputs.handle || steps.reconcile.outputs.handle }}
           REQUEST_ISSUE: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
@@ -658,17 +744,20 @@ jobs:
 
       - name: Comment PENDING (or activate inline if already in account_pool) on the request issue (#185)
         id: activate_inline
-        if: steps.login.outputs.status == 'ok'
+        if: steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          HANDLE: ${{ steps.store.outputs.handle }}
-          SECRET: ${{ steps.store.outputs.secret }}
-          MODELS: ${{ steps.meta.outputs.models }}
+          HANDLE: ${{ steps.store.outputs.handle || steps.reconcile.outputs.handle }}
+          SECRET: ${{ steps.store.outputs.secret || steps.reconcile.outputs.secret }}
+          MODELS: ${{ steps.meta.outputs.models || steps.reconcile.outputs.models }}
+          RESUME_FMT: ${{ steps.reconcile.outputs.fmt }}
           PR: ${{ steps.policy_pr.outputs.pr }}
           ISSUE: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
+          # #211 resume: no LOGIN_DIR capture exists — the format recorded on the account issue is
+          # authoritative for the already-stored credential.
+          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo "${RESUME_FMT:-unknown}")
           if [ "${PR:-none}" = none ] || [ -z "${PR:-}" ]; then
             # Handle already in master account_pool (a prior run's PR merged) — policy is in place,
             # so activate INLINE. This is a real state transition (identical in consequence to the
@@ -708,7 +797,8 @@ jobs:
           fi
 
       - name: Report failure
-        if: steps.login.outputs.status != 'ok'
+        # #211: on the resume path no login ran, so a skipped login step is not a sign-in timeout.
+        if: steps.reconcile.outputs.resume != 'true' && steps.login.outputs.status != 'ok'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -721,12 +811,13 @@ jobs:
       # PR) is quiet. The capture is irreversible (claims are never released, #186), so every
       # recovery is forward.
       - name: Alarm on partial enrollment state (always) (#185)
-        if: always() && steps.login.outputs.status == 'ok'
+        if: always() && (steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true')
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
-          HANDLE: ${{ steps.store.outputs.handle }}
-          SECRET: ${{ steps.store.outputs.secret }}
+          RESUME: ${{ steps.reconcile.outputs.resume }}
+          HANDLE: ${{ steps.store.outputs.handle || steps.reconcile.outputs.handle }}
+          SECRET: ${{ steps.store.outputs.secret || steps.reconcile.outputs.secret }}
           STORE: ${{ steps.store.outcome }}
           REGISTER: ${{ steps.register.outcome }}
           VALIDATE: ${{ steps.validate.outcome }}
@@ -735,14 +826,16 @@ jobs:
         run: |
           set -uo pipefail
           comment() { gh issue comment "$ISSUE" -R "${{ github.repository }}" --body "$1" || true; }
-          if [ "$STORE" != success ]; then
+          # #211: on the resume path store/register were deliberately skipped (their work is done —
+          # the resumed handle proves both), so only the resumed stages can be partial.
+          if [ "$RESUME" != true ] && [ "$STORE" != success ]; then
             comment "🚨 Enrollment aborted while claiming/storing the credential (store: \`$STORE\`). No usable account was registered; a slot claim ref may have been burned (claims are never released, by design). **Recovery:** re-apply \`set-up-account\` to retry on a fresh slot."
-          elif [ "$REGISTER" != success ]; then
+          elif [ "$RESUME" != true ] && [ "$REGISTER" != success ]; then
             comment "🚨 Credential for **$HANDLE** was STORED (secret \`$SECRET\`) but the \`status:pending\` account issue was not created (register: \`$REGISTER\`). The credential is captured with no account record. **Recovery:** create the \`$HANDLE\` issue (status:pending, \`secret_ref: $SECRET\`) or delete the orphaned \`dispatch-secrets\` secret \`$SECRET\`, then re-apply \`set-up-account\`."
           elif [ "$VALIDATE" != success ]; then
-            comment "🚨 **$HANDLE** was stored and the pending issue created, but read_accounts validation failed (\`$VALIDATE\`) — the account body may be malformed, so no policy PR was opened. **Recovery:** fix the \`$HANDLE\` issue body (models / secret_ref), then open the account_pool PR manually (branch \`account-pool/$HANDLE\`)."
+            comment "🚨 **$HANDLE** was stored and the pending issue created, but read_accounts validation failed (\`$VALIDATE\`) — the account body may be malformed, so no policy PR was opened. **Recovery:** fix the \`$HANDLE\` issue body (models / secret_ref), then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` (#211) and opens the account_pool PR."
           elif [ "$POLICY_PR" != success ]; then
-            comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** open a PR adding \`$HANDLE\` to account_pool (head branch \`account-pool/$HANDLE\`); on merge it activates automatically."
+            comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` on the same slot and re-drives the PR (#211); or open it manually (head branch \`account-pool/$HANDLE\`) — on merge it activates automatically."
           elif [ "$ACTIVATE_INLINE" != success ]; then
             comment "🚨 **$HANDLE** was stored, registered \`status:pending\`, and its handle was ALREADY in master \`account_pool\` (no policy PR needed), but the INLINE activation FAILED (activate: \`$ACTIVATE_INLINE\`) — the account may still be \`status:pending\` and this request may still be open despite policy being in place, so no false success was claimed. **Recovery:** confirm there is exactly one \`$HANDLE\` account issue and flip it to \`status:available\` (or re-apply \`set-up-account\`); re-merging/re-triggering the account_pool PR also drives the \`activate\` job to flip it."
           else
