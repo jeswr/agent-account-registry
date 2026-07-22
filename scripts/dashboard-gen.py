@@ -57,6 +57,22 @@ class DashboardError(RuntimeError):
     pass
 
 
+_LEASE_SCHEMA_MODULE = None
+
+
+def _lease_schema_module():
+    global _LEASE_SCHEMA_MODULE
+    if _LEASE_SCHEMA_MODULE is None:
+        path = Path(__file__).resolve().with_name("lease_schema.py")
+        spec = importlib.util.spec_from_file_location("registry_lease_schema", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load shared lease schema")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LEASE_SCHEMA_MODULE = module
+    return _LEASE_SCHEMA_MODULE
+
+
 def _utc_iso(value):
     if value is None or isinstance(value, bool):
         return None
@@ -928,9 +944,10 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
     handles = [account["handle"] for account in accounts]
     labels = _salted_labels(handles, salt)
     usage = usage if isinstance(usage, dict) else {}
-    leases = leases_document.get("leases") if isinstance(leases_document, dict) else None
-    if not isinstance(leases, list):
-        raise DashboardError("lease ledger must contain a leases array")
+    try:
+        leases = _lease_schema_module().validate_ledger(leases_document)
+    except ValueError as exc:
+        raise DashboardError(f"lease ledger is malformed: {exc}") from exc
     live = _live_leases(leases, now)
     # Lease identities are already the canonical public salted labels. Raw handles come only from
     # the private catalog/usage inputs and remain in the privacy deny-set.
@@ -1034,9 +1051,12 @@ def _self_test():
     }]
     lease_account = hashlib.sha256(f"{handle}:fixture-salt".encode()).hexdigest()[:16]
     leases = {"leases": [
-        {"account": lease_account, "holder": "owner/repo#7@run.1", "model": "opus",
-         "expires_at": now + 60},
-        {"account": lease_account, "expires_at": now - 1},
+        {"account": lease_account, "claim_id": "a" * 32,
+         "holder": "owner/repo#7@run.1", "package": "pkg", "role": "impl", "model": "opus",
+         "issued_at": now - 60, "expires_at": now + 60},
+        {"account": lease_account, "claim_id": "b" * 32,
+         "holder": "owner/repo#8@run.1", "package": "pkg", "role": "impl", "model": "opus",
+         "issued_at": now - 60, "expires_at": now - 1},
     ]}
     usage = {handle: {"status": "allowed", "5h_util": "0.42", "5h_reset": now + 3600,
                       "7d_util": "0.8", "7d_reset": now + 86400}}
@@ -1135,14 +1155,18 @@ def _self_test():
         "future-one": {"status": "allowed", "7d_reset": now + 500},
     }
     activity_leases = {"leases": [
-        {"account": "anth-soon", "holder": "org/alpha#1@run.1", "model": "sol",
-         "expires_at": now + 30},
-        {"account": "anth-late", "holder": "review:org/alpha#2@run.1", "model": "fable",
-         "expires_at": now + 20},
-        {"account": "anth-unknown", "holder": "fix:org/beta#3@run.1", "model": "opus",
-         "expires_at": now + 10},
-        {"account": "expired-private", "holder": "org/expired#4@old", "model": "terra",
-         "expires_at": now - 1},
+        {"account": "1" * 16, "claim_id": "1" * 32,
+         "holder": "org/alpha#1@run.1", "package": "pkg", "role": "impl", "model": "sol",
+         "issued_at": now - 30, "expires_at": now + 30},
+        {"account": "2" * 16, "claim_id": "2" * 32,
+         "holder": "review:org/alpha#2@run.1", "package": "pkg", "role": "review",
+         "model": "fable", "issued_at": now - 30, "expires_at": now + 20},
+        {"account": "3" * 16, "claim_id": "3" * 32,
+         "holder": "fix:org/beta#3@run.1", "package": "pkg", "role": "fix", "model": "opus",
+         "issued_at": now - 30, "expires_at": now + 10},
+        {"account": "4" * 16, "claim_id": "4" * 32,
+         "holder": "org/expired#4@old", "package": "pkg", "role": "impl", "model": "terra",
+         "issued_at": now - 30, "expires_at": now - 1},
     ]}
     # Live ledger fixture — the exact {"records": [...]} shape model-health.py writes (#218).
     health_ledger = {"records": [
@@ -1516,7 +1540,7 @@ def _self_test():
                 "dispatch_outcomes": []}, {"models": [], "repositories": []}))
     try:
         build_dashboard([], {"leases": [{
-            "account": "private-live", "holder": "malformed", "model": "sol",
+            "account": "a" * 16, "holder": "malformed", "model": "sol",
             "expires_at": now + 1,
         }]}, {}, [], None, now, "fixture-salt")
     except DashboardError:

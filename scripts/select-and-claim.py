@@ -36,6 +36,13 @@ if _retry_spec is None or _retry_spec.loader is None:
 ledger_retry = importlib.util.module_from_spec(_retry_spec)
 _retry_spec.loader.exec_module(ledger_retry)
 
+_schema_spec = importlib.util.spec_from_file_location(
+    "registry_lease_schema", os.path.join(os.path.dirname(__file__), "lease_schema.py"))
+if _schema_spec is None or _schema_spec.loader is None:
+    raise RuntimeError("cannot load shared lease schema")
+lease_schema = importlib.util.module_from_spec(_schema_spec)
+_schema_spec.loader.exec_module(lease_schema)
+
 LEDGER_PATH = "data/leases.json"
 # The mutable data plane lives on a dedicated NON-code branch: branch protection on the default
 # (code) branch rejects the bot's contents-API PUTs (issue #28 live incident 2026-07-17 — a
@@ -424,10 +431,7 @@ def _read_ledger(repo):
     try:
         meta = json.loads(result.stdout)
         content = json.loads(base64.b64decode(meta["content"]).decode() or '{"leases":[]}')
-        leases = content.get("leases")
-        if not isinstance(leases, list) or any(not isinstance(item, dict) for item in leases):
-            raise ValueError("leases must be a list of objects")
-        leases = validate_lease_account_identities(leases)
+        leases = lease_schema.validate_ledger(content)
         sha = meta["sha"]
         if not isinstance(sha, str) or not sha:
             raise ValueError("blob sha is missing")
@@ -1955,8 +1959,10 @@ def _self_test():
     def _fake_gh(args, **_kwargs):
         fixture_calls.append(list(args))
         if "-X" not in args:  # contents GET: one expired lease, fresh sha per read
+            expired = make_lease("a1", "o/r#1@run", "p", "impl", "m", now - 100, 1)
+            expired["claim_id"] = "a" * 32
             meta = {"content": base64.b64encode(json.dumps(
-                {"leases": [make_lease("a1", "o/r#1@run", "p", "impl", "m", now - 100, 1)]}
+                {"leases": [expired]}
             ).encode()).decode(), "sha": f"sha{len(fixture_calls)}"}
             return _Res(0, stdout=json.dumps(meta))
         puts = sum(1 for c in fixture_calls if "-X" in c)
