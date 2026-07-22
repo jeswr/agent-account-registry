@@ -1338,6 +1338,69 @@ Path(prompt_path).chmod(0o600)
 PY
 }
 
+# Capture the reviewer-produced (and fixer-consumed) verdict outside the target tree.  The model
+# is instructed to respect worker-pr.py's 2000-character summary cap, but a useful review must not
+# be voided solely because its prose ran long.  Normalize that one producer-side field before the
+# unchanged fail-closed validator sees it.  Python string slicing uses the same character counting
+# as worker-pr.py's len(summary), so multi-byte UTF-8 is never cut at a byte boundary.
+_capture_review_verdict() {
+  local source=$1 destination=$2
+  mv -f -- "$source" "$destination"
+  chmod 600 "$destination"
+  python3 - "$destination" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+with path.open(encoding="utf-8") as handle:
+    document = json.load(handle)
+
+summary = document.get("summary") if isinstance(document, dict) else None
+if not isinstance(summary, str):
+    print("worker-live: reviewer/fixer summary original length: non-string "
+          "(preserved for fail-closed validation)")
+    raise SystemExit(0)
+
+limit = 2000
+original_length = len(summary)
+print(f"worker-live: reviewer/fixer summary original length: {original_length} characters")
+if original_length <= limit:
+    raise SystemExit(0)
+
+# The removed count is part of the marker, and its digit count affects how much source text fits.
+# Iterate to the stable prefix length, then assert the same cap the validator enforces.
+keep = limit
+while True:
+    removed = original_length - keep
+    marker = f"… [truncated {removed} chars]"
+    next_keep = limit - len(marker)
+    if next_keep == keep:
+        break
+    keep = next_keep
+summary = summary[:keep] + marker
+assert len(summary) == limit
+document["summary"] = summary
+
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        json.dump(document, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+finally:
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+print(f"worker-live: reviewer/fixer summary truncated to {limit} characters")
+PY
+}
+
 run_review() {
   require_target
   local worker_root=${WORKER_ROOT:-}
@@ -1414,9 +1477,9 @@ run_review() {
   [[ -f .review-verdict.json && ! -L .review-verdict.json ]] ||
     die 'reviewer produced no verdict file'
   # Lift the verdict OUT of the target tree (mirror .worker-followups.jsonl); the host
-  # schema-validates it in worker-pr.py. Raw model output stays withheld.
-  mv -f .review-verdict.json "$review_file"
-  chmod 600 "$review_file"
+  # schema-validates it in worker-pr.py. Raw model output stays withheld. The capture seam trims
+  # only an overlong string summary; every other schema violation reaches that validator intact.
+  _capture_review_verdict .review-verdict.json "$review_file"
 
   write_output reviewed_sha "$head_sha"
   printf 'worker-live: review run completed with a byte-identical tree; verdict lifted\n'
@@ -1916,6 +1979,89 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"],
     "$(grep -c 'fewer findings than the prior round' "$tmp/p-r2.txt")" "1"
   chk "the progress scale defines regressing" \
     "$(grep -c 'new findings, or findings at a higher severity' "$tmp/p-r2.txt")" "1"
+
+  # --- verdict capture (#527): normalize only an overlong string summary BEFORE worker-pr's
+  # byte-unchanged fail-closed validator. The long case must pass that real CLI after capture and
+  # retain a marker INSIDE the cap (removing capture makes the validator check red). Non-strings
+  # still reach the validator and fail; an exact-bound Unicode string is byte-identical. ---
+  printf '\n' > "$tmp/verdict-files.txt"
+  python3 - "$tmp/verdict-long.source.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "verdict": "approve",
+    "injection_detected": False,
+    "summary": "💡" * 5000,
+    "issues": [],
+}), encoding="utf-8")
+PY
+  _capture_review_verdict "$tmp/verdict-long.source.json" "$tmp/verdict-long.json" \
+    > "$tmp/verdict-long.capture.log"
+  chk "5000-char summary logs its original length" \
+    "$(grep -c 'original length: 5000 characters' "$tmp/verdict-long.capture.log")" "1"
+  chk "5000-char summary is capped with an accurate in-budget marker" \
+    "$(python3 - "$tmp/verdict-long.json" <<'PY'
+import json
+import re
+import sys
+
+summary = json.load(open(sys.argv[1], encoding="utf-8"))["summary"]
+match = re.search(r"… \[truncated ([0-9]+) chars\]$", summary)
+print("ok" if (len(summary) == 2000 and match
+      and int(match.group(1)) == 5000 - match.start()) else "bad")
+PY
+)" "ok"
+  chk "5000-char summary passes unchanged worker-pr validation after capture" \
+    "$( (python3 "$SCRIPT_DIR/worker-pr.py" validate-verdict \
+          --verdict-file "$tmp/verdict-long.json" --files-file "$tmp/verdict-files.txt" \
+          >/dev/null 2>&1 && printf passes) || printf refused)" "passes"
+
+  python3 - "$tmp/verdict-nonstring.source.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "verdict": "approve",
+    "injection_detected": False,
+    "summary": ["not", "a", "string"],
+    "issues": [],
+}), encoding="utf-8")
+PY
+  _capture_review_verdict "$tmp/verdict-nonstring.source.json" "$tmp/verdict-nonstring.json" \
+    > "$tmp/verdict-nonstring.capture.log"
+  chk "non-string summary is preserved for fail-closed validation" \
+    "$(python3 -c 'import json,sys; print(type(json.load(open(sys.argv[1]))["summary"]).__name__)' \
+        "$tmp/verdict-nonstring.json")" "list"
+  chk "non-string summary still fails closed in worker-pr validation" \
+    "$( (python3 "$SCRIPT_DIR/worker-pr.py" validate-verdict \
+          --verdict-file "$tmp/verdict-nonstring.json" --files-file "$tmp/verdict-files.txt" \
+          >/dev/null 2>&1 && printf passes) || printf refused)" "refused"
+
+  python3 - "$tmp/verdict-bound.source.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "verdict": "approve",
+    "injection_detected": False,
+    "summary": "é" * 2000,
+    "issues": [],
+}), encoding="utf-8")
+PY
+  local bound_before bound_after
+  bound_before=$(sha256sum "$tmp/verdict-bound.source.json" | cut -d' ' -f1)
+  _capture_review_verdict "$tmp/verdict-bound.source.json" "$tmp/verdict-bound.json" \
+    > "$tmp/verdict-bound.capture.log"
+  bound_after=$(sha256sum "$tmp/verdict-bound.json" | cut -d' ' -f1)
+  chk "exact-bound summary passes through byte-identical" "$bound_after" "$bound_before"
+  chk "exact-bound summary passes unchanged worker-pr validation" \
+    "$( (python3 "$SCRIPT_DIR/worker-pr.py" validate-verdict \
+          --verdict-file "$tmp/verdict-bound.json" --files-file "$tmp/verdict-files.txt" \
+          >/dev/null 2>&1 && printf passes) || printf refused)" "passes"
 
   # --- conflict-merge plumbing (fix kind=rebase): real git fixture. The host starts a
   # --no-commit merge (HEAD unmoved, markers in the worktree), leftover markers fail the staged
