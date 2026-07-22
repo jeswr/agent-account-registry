@@ -5768,6 +5768,11 @@ def _self_test():
     key_indent = min(len(line) - len(line.lstrip()) for line in key_lines)
     snapshot_fields = {re.match(r'\s*"([a-z_]+)"', line).group(1) for line in key_lines
                        if len(line) - len(line.lstrip()) == key_indent}
+    # Conditional-spread keys (ABSENCE != NULL fields like auto_merge, sol review on #517:
+    # a plain .get() would fabricate a proven-null from an absent upstream key, so such
+    # fields project via **({"k": pull["k"]} if "k" in pull else {}) and are pinned here).
+    snapshot_fields |= {match.group(1) for match in
+                        re.finditer(r'\*\*\(\{"([a-z_]+)"', projection.group(1))}
     assert snapshot_fields == {"number", "state", "draft", "body", "labels",
                                "head", "user", "auto_merge"}, snapshot_fields
 
