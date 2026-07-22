@@ -30,6 +30,14 @@ import sys
 import tempfile
 import time
 
+
+_retry_spec = importlib.util.spec_from_file_location(
+    "registry_ledger_retry", Path(__file__).resolve().parent / "ledger_retry.py")
+if _retry_spec is None or _retry_spec.loader is None:
+    raise RuntimeError("cannot load shared ledger retry policy")
+ledger_retry = importlib.util.module_from_spec(_retry_spec)
+_retry_spec.loader.exec_module(ledger_retry)
+
 REVIEW_LABELS = ("review:needs", "review:changes", "review:pass", "review:needs-user")
 LABEL_COLOURS = {
     "review:needs": "1d76db",
@@ -1200,11 +1208,11 @@ _REGISTRY_CREATE_RACE_SIGNATURE = "\"sha\" wasn't supplied"
 def _registry_backoff_ceiling(attempt, base=0.5, cap=8.0):
     """Upper bound (seconds) for the sleep before CAS retry `attempt` (1-based): exponential
     base*2**(attempt-1), clamped to `cap`."""
-    return min(cap, base * (2 ** (attempt - 1)))
+    return ledger_retry.backoff_ceiling(attempt, base, cap)
 
 
 def _registry_sleep_backoff(attempt):
-    time.sleep(random.uniform(0, _registry_backoff_ceiling(attempt)))
+    ledger_retry.sleep_backoff(attempt, sleeper=time.sleep, draw=random.uniform)
 
 
 def _registry_now():
@@ -1220,10 +1228,7 @@ def _is_registry_cas_conflict(stderr, create):
     (404), non-race request validation (422), server (5xx) — is NOT contention and must never be
     retried until the deadline (mirrors select-and-claim._is_cas_conflict, #179); of those, only
     the transient class (_is_registry_transient_error) gets its own small bounded retry."""
-    text = stderr or ""
-    if "HTTP 409" in text:
-        return True
-    return create and "HTTP 422" in text and _REGISTRY_CREATE_RACE_SIGNATURE in text
+    return ledger_retry.is_cas_conflict(stderr, create=create)
 
 
 def _is_registry_transient_error(stderr):
@@ -1231,12 +1236,7 @@ def _is_registry_transient_error(stderr):
     HTTP 5xx server response, HTTP 429, or GitHub's rate-limit 403s ('API rate limit exceeded' /
     'secondary rate limit'). Everything else — auth (non-rate-limit 403), missing branch/file
     (404), request validation (422) — is permanent and must fail loud immediately."""
-    text = stderr or ""
-    if re.search(r"HTTP 5\d\d", text):
-        return True
-    if "HTTP 429" in text:
-        return True
-    return "HTTP 403" in text and "rate limit" in text.lower()
+    return ledger_retry.is_transient(stderr)
 
 
 def _run_key_identity(value):

@@ -36,6 +36,7 @@
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import random
@@ -43,6 +44,14 @@ import re
 import subprocess
 import sys
 import time
+
+
+_retry_spec = importlib.util.spec_from_file_location(
+    "registry_ledger_retry", os.path.join(os.path.dirname(__file__), "ledger_retry.py"))
+if _retry_spec is None or _retry_spec.loader is None:
+    raise RuntimeError("cannot load shared ledger retry policy")
+ledger_retry = importlib.util.module_from_spec(_retry_spec)
+_retry_spec.loader.exec_module(ledger_retry)
 
 LEDGER_PATH = "data/model-health.json"
 # Mutable data plane lives on a dedicated non-code branch (issue #28): required-status-check
@@ -1094,7 +1103,7 @@ CAS_RETRIES = 8
 def _backoff_ceiling(attempt, base=0.5, cap=8.0):
     """Upper bound (seconds) for the sleep before CAS retry `attempt` (1-based): exponential
     base*2**(attempt-1), clamped to `cap`."""
-    return min(cap, base * (2 ** (attempt - 1)))
+    return ledger_retry.backoff_ceiling(attempt, base, cap)
 
 
 def _backoff_delay(attempt):
@@ -1104,7 +1113,7 @@ def _backoff_delay(attempt):
 def _sleep_backoff(attempt):
     """Sleep a full-jitter exponential backoff before CAS retry `attempt` (module-level so the
     self-test can stub it without sleeping)."""
-    time.sleep(_backoff_delay(attempt))
+    ledger_retry.sleep_backoff(attempt, sleeper=time.sleep, draw=random.uniform)
 
 
 def _record_identity(record):
