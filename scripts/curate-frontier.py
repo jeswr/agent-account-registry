@@ -23,6 +23,7 @@ GATE_LABELS = ("needs:", "trust:untrusted")
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 ACTIONS_BOT_LOGIN = "github-actions[bot]"
 IN_FLIGHT_STATUS = {"status:ready", "status:in-progress"}
+PARKED_AREA_LABELS = {"needs:user", "review:needs-user", "status:blocked"}
 TRUST_LABEL_PREFIXES = (
     "area:sparq-zk", "area:sparq-mpc", "area:zk", "area:mpc", "area:trust",
     "area:sparq-trust", "area:e2ee", "area:sparq-e2ee", "zk", "mpc",
@@ -119,6 +120,15 @@ def labels_of(issue: dict[str, Any]) -> set[str]:
             raise CuratorError("issue carries a malformed label")
         result.add(name)
     return result
+
+
+def occupies_area(artifact: dict[str, Any]) -> bool:
+    """Whether an otherwise in-flight snapshot artifact may occupy its labelled area.
+
+    This is deliberately a pure label predicate: removing a terminal park label in the next
+    snapshot immediately restores occupancy, with no remembered state to reconcile.
+    """
+    return not bool(labels_of(artifact) & PARKED_AREA_LABELS)
 
 
 def is_open_issue(issue: Any) -> bool:
@@ -441,13 +451,19 @@ def plan_repository(
         1 for issue in open_issues if "status:ready" in labels_of(issue)
     )
     depth = max(0, target_ready - current_ready)
-    in_flight_areas = {
-        label
-        for issue in open_issues
-        if labels_of(issue) & IN_FLIGHT_STATUS
-        for label in labels_of(issue)
-        if label.startswith("area:")
-    }
+    in_flight_blockers: dict[str, list[dict[str, Any]]] = {}
+    for issue in open_issues:
+        labels = labels_of(issue)
+        if not labels & IN_FLIGHT_STATUS or not occupies_area(issue):
+            continue
+        for area in sorted(label for label in labels if label.startswith("area:")):
+            in_flight_blockers.setdefault(area, []).append(issue)
+    in_flight_areas = set(in_flight_blockers)
+    for area, blockers in sorted(in_flight_blockers.items()):
+        blocker = blockers[0]
+        kind = "pr" if "pull_request" in blocker else "issue"
+        count = f" ({len(blockers)} blockers)" if len(blockers) > 1 else ""
+        logs.append(f"busy {area} <- {kind}#{blocker['number']}{count}")
     stage_options: list[tuple[int, int, str, tuple[str, ...], dict[str, Any]]] = []
     closing_numbers = {mutation.number for mutation in close_actions}
 
@@ -732,6 +748,7 @@ def load_tokens() -> tuple[dict[str, str], str]:
 def _self_test() -> int:
     all_labels = {
         "status:ready", "status:in-progress", "status:blocked", "needs:ec2", "needs:user",
+        "review:changes", "review:needs-user",
         "priority:P2", "priority:P3", "role:impl", "role:docs", "role:perf",
         "role:ci", "role:site", "role:research",
         "area:alpha", "area:beta", "area:gamma", "area:delta", "area:bench",
@@ -987,6 +1004,62 @@ def _self_test() -> int:
     checks.append(("depth cap and one-per-area/in-flight rules hold",
                    len(stages) == 2 and len(stage_areas) == len(set(stage_areas))
                    and {m.number for m in stages} == {40, 42} and "area:delta" not in stage_areas))
+
+    # Issue #509: the area predicate is snapshot-derived and terminal park labels alone remove an
+    # otherwise active artifact. PR-shaped fixtures pin the label boundary even though the
+    # curator's production snapshot currently derives occupancy from open status-bearing issues.
+    parked_draft = {
+        **issue(70, "Worker draft for alpha", ("status:ready", "area:alpha", "needs:user")),
+        "pull_request": {}, "draft": True,
+    }
+    active_changes_draft = {
+        **issue(71, "Worker draft cycling changes",
+                ("status:ready", "area:beta", "review:changes")),
+        "pull_request": {}, "draft": True,
+    }
+    checks.append(("needs:user-parked draft PR does not occupy its area",
+                   not occupies_area(parked_draft)))
+    checks.append(("review:changes NON-parked PR still occupies",
+                   occupies_area(active_changes_draft)))
+    checks.append(("review:needs-user and status:blocked also park artifacts",
+                   not occupies_area({
+                       **active_changes_draft,
+                       "labels": [{"name": "status:ready"}, {"name": "area:beta"},
+                                  {"name": "review:needs-user"}],
+                   })
+                   and not occupies_area(issue(
+                       72, "Blocked gamma worker",
+                       ("status:in-progress", "area:gamma", "status:blocked"),
+                   ))))
+
+    parked_in_progress = issue(
+        73, "Existing parked delta worker",
+        ("status:in-progress", "area:delta", "needs:user"),
+    )
+    unparked_in_progress = {
+        **parked_in_progress,
+        "labels": [
+            label for label in parked_in_progress["labels"]
+            if label["name"] != "needs:user"
+        ],
+    }
+    waiting_delta = issue(74, "Improve delta snapshot behavior", ("area:delta",))
+    parked_plan, _ = plan_repository(
+        [parked_in_progress, waiting_delta], all_labels, automation, target_ready=1
+    )
+    unparked_plan, unparked_logs = plan_repository(
+        [unparked_in_progress, waiting_delta], all_labels, automation, target_ready=1
+    )
+    checks.append(("an in-progress issue still occupies",
+                   occupies_area(unparked_in_progress)
+                   and not any(m.kind == "stage" and m.number == 74 for m in unparked_plan)))
+    checks.append(("busy-area log names the blocking artifact",
+                   "busy area:delta <- issue#73" in unparked_logs))
+    checks.append(("label removal on the fixture restores occupancy",
+                   not occupies_area(parked_in_progress)
+                   and occupies_area(unparked_in_progress)
+                   and any(m.kind == "stage" and m.number == 74 for m in parked_plan)
+                   and not any(m.kind == "stage" and m.number == 74 for m in unparked_plan)))
 
     # (e) A status:* duplicate and a status:* EC2 issue are protected from every mutation kind.
     status_fixture = [
