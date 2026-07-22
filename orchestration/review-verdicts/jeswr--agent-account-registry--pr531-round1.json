@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 531,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c75662060be8cca1ea0fba3023155ba72f0d35f0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Behavior-preserving extraction of the shared CAS/retry classification into scripts/ledger_retry.py, with model-health.py, select-and-claim.py, and worker-pr.py delegating to it. Verified byte-for-byte semantic equivalence: is_cas_conflict reproduces the inline 409-always / 422-only-when-create+sha-less-signature logic; is_transient reproduces 5xx-or-429-or-rate-limit-403; backoff_ceiling reproduces the clamped exponential. Delegation preserves the module-level _sleep_backoff seam that existing caller self-tests stub via globals(), so those suites stay green, and _backoff_delay is unchanged. Fail-closed: the importlib loader raises RuntimeError if the spec/loader is missing; the new ValueError guard on non-positive backoff inputs never fires in production because every retry loop sleeps only when attempt>=1 (confirmed in all four call sites). The new module's --self-test is non-vacuous: it pins concrete expected outcomes that flip red on a wrong classification (update-422 rejected, validation-422 rejected, auth-403 permanent, bounded exponential schedule), and ledger_retry.py is added to FULL_SELFTEST_SUITE so the gate runs it directly on this change. No trust check, self-test, route, arm-side classifier, or match-label set is removed or relaxed; no token/PII handling introduced; no workflow permissions or pinned-action changes. The diff contains no instructions directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
