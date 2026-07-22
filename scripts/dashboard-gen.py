@@ -218,6 +218,9 @@ def _salted_labels(handles, salt):
     PROVENANCE_SALT FAILS CLOSED: account_hash raises on an empty salt, so the whole build dies
     rather than deploying `salt-missing` rows that would pin a public row to a single account
     with no salt at all."""
+    if not isinstance(salt, str) or not salt.strip() or not salt.isprintable():
+        raise DashboardError(
+            "dashboard account labels require a non-empty printable PROVENANCE_SALT")
     account_hash = _model_health_module().account_hash
     try:
         labels = {handle: account_hash(handle, salt) for handle in handles}
@@ -1130,6 +1133,18 @@ def _self_test():
     check("canonical label is the shared 16-hex hash, not the old 8-hex HMAC",
           _salted_labels([handle], "fixture-salt")[handle],
           _model_health_module().account_hash(handle, "fixture-salt"))
+    check("canonical dashboard label has exactly 16 lowercase hex characters",
+          re.fullmatch(r"[0-9a-f]{16}", _salted_labels([handle], "fixture-salt")[handle])
+          is not None, True)
+    invalid_salts_rejected = []
+    for invalid_salt in (None, "   ", "salt\nvalue"):
+        try:
+            _salted_labels([handle], invalid_salt)
+        except DashboardError:
+            invalid_salts_rejected.append(True)
+        else:
+            invalid_salts_rejected.append(False)
+    check("invalid salts fail closed", invalid_salts_rejected, [True, True, True])
 
     def issue(account_handle, provider, secret):
         return {
