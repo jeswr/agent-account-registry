@@ -1,3 +1,14 @@
 {
- "leases": []
+ "leases": [
+  {
+   "account": "acct3css",
+   "claim_id": "c1052fac250b4a96ac7c404dfb8ab961",
+   "holder": "review:jeswr/agent-account-registry#525@dispatch-29917705913.1",
+   "package": "ci",
+   "role": "review",
+   "model": "opus",
+   "issued_at": 1784722090,
+   "expires_at": 1784726290
+  }
+ ]
 }
