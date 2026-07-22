@@ -747,19 +747,29 @@ run_gate() {
   esac
 }
 
-# [OPUS-4.8] The registry-selftest gate body (extracted so the host self-test can exercise its
-# PURE selectors — touched-file classification + the suite list — without a live cargo/gh call).
-# FULL_SELFTEST_SUITE mirrors the scripts every recent registry wave self-tests; every touched
-# script that HAS a --self-test is additionally run so a change to it is validated directly.
-# NAMING NOTE (review round): the routing validator here is scripts/route-resolve.py (added by the
-# onboarding push) — there is NO scripts/routing-validate.py; do not reference that name in suite
-# lists or briefs.
-FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
-plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
-groom.py account-usage.py usage-alert.py plan-alert.py dispatch-secrets-guard.py model-health.py \
-ledger_retry.py \
-pat-validity.py broker-refresh.py \
-backfill-provenance.py dashboard-gen.py metrics.py ledger-invariant.py trust-gate.py worker-live.sh migrate-secrets.sh"
+# The registry-selftest gate body is extracted so the host self-test can exercise its PURE
+# selectors without a live cargo/gh call. Derive the full suite so adding a script with an
+# advertised --self-test entrypoint enrolls it automatically instead of requiring a conflict-prone
+# edit here. Keep exclusions explicit and exceptional: a denylisted self-test gets no trust credit.
+SELFTEST_DENYLIST=""
+
+_derive_full_selftest_suite() {
+  local scripts_dir=$1 denylist=${2:-$SELFTEST_DENYLIST} file base
+  local -a suite=()
+  [[ -d "$scripts_dir" ]] || return 1
+  for file in "$scripts_dir"/*.py "$scripts_dir"/*.sh; do
+    [[ -f "$file" ]] || continue
+    grep -q -- '--self-test' "$file" || continue
+    base=${file##*/}
+    case " $denylist " in *" $base "*) continue ;; esac
+    suite+=("$base")
+  done
+  ((${#suite[@]} > 0)) || return 1
+  printf '%s\n' "${suite[*]}"
+}
+
+FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR") ||
+  die 'registry-selftest gate: no advertised self-tests found (fail closed)'
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
@@ -2278,6 +2288,25 @@ PY
     "$(git -C "$fixture" rev-parse HEAD^1 HEAD^2 | paste -sd' ' -)" "$feat_sha $main_sha"
   chk "both sides survive the resolution" \
     "$(git -C "$fixture" show HEAD:f.txt | paste -sd'+' -)" "feature side+main side"
+
+  # --- derived full suite: an advertised entrypoint is auto-enrolled, while a script without the
+  # marker and an explicitly denied script stay out. These fixture checks fail if discovery becomes
+  # vacuous, over-broad, or stops honoring the denylist. ---
+  local suite_fixture="$tmp/selftest-suite" derived_fixture
+  mkdir -p "$suite_fixture"
+  printf '%s\n' 'if "--self-test" in argv: run_tests()' > "$suite_fixture/advertised.py"
+  printf '%s\n' 'print("ordinary helper")' > "$suite_fixture/helper.py"
+  printf '%s\n' '# supports --self-test' > "$suite_fixture/denied.sh"
+  derived_fixture=$(_derive_full_selftest_suite "$suite_fixture" "denied.sh")
+  chk "derived suite enrolls an advertised self-test" \
+    "$(grep -cw 'advertised.py' <<< "$derived_fixture" || true)" "1"
+  chk "derived suite rejects a script without a self-test entrypoint" \
+    "$(grep -cw 'helper.py' <<< "$derived_fixture" || true)" "0"
+  chk "derived suite honors its explicit denylist" \
+    "$(grep -cw 'denied.sh' <<< "$derived_fixture" || true)" "0"
+  chk "derived suite fails closed when no advertised self-test exists" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "advertised.py denied.sh" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
 
   # --- registry-selftest gate PURE selector (non-vacuous): classify a fixture diff into the
   # self-test / bash / workflow targets the gate must run. Proves a touched suite script is run,
