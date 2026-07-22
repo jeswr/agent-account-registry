@@ -4,6 +4,7 @@
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import importlib.util
 import io
 import json
@@ -931,7 +932,8 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
     if not isinstance(leases, list):
         raise DashboardError("lease ledger must contain a leases array")
     live = _live_leases(leases, now)
-    private_values.update(str(lease.get("account")) for lease in leases if lease.get("account"))
+    # Lease identities are already the canonical public salted labels. Raw handles come only from
+    # the private catalog/usage inputs and remain in the privacy deny-set.
     private_values.update(str(handle) for handle in usage)
 
     rows = []
@@ -949,7 +951,8 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
             "label": labels[account["handle"]],
             "provider": account["provider"],
             "availability": availability,
-            "active_agents": sum(1 for lease in live if lease.get("account") == account["handle"]),
+            "active_agents": sum(
+                1 for lease in live if lease.get("account") == labels[account["handle"]]),
             "weekly_reset_at": weekly_reset_at,
             "windows": _window_rows(account, entry),
         })
@@ -1029,10 +1032,11 @@ def _self_test():
         "body": ("provider: anthropic\nmodels: [opus]\nsecret_ref: ACCTFIXTURE_TOKEN\n"
                  f"email: {email}\nlimits: 5h_limit=1000 7d_limit=7000\n"),
     }]
+    lease_account = hashlib.sha256(f"{handle}:fixture-salt".encode()).hexdigest()[:16]
     leases = {"leases": [
-        {"account": handle, "holder": "owner/repo#7@run.1", "model": "opus",
+        {"account": lease_account, "holder": "owner/repo#7@run.1", "model": "opus",
          "expires_at": now + 60},
-        {"account": handle, "expires_at": now - 1},
+        {"account": lease_account, "expires_at": now - 1},
     ]}
     usage = {handle: {"status": "allowed", "5h_util": "0.42", "5h_reset": now + 3600,
                       "7d_util": "0.8", "7d_reset": now + 86400}}

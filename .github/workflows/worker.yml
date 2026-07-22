@@ -357,6 +357,7 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: dispatch-secrets
     permissions:
       contents: write
       issues: read
@@ -388,6 +389,7 @@ jobs:
           PACKAGES: ${{ needs.resolve.outputs.packages }}
           ROLE: ${{ needs.resolve.outputs.role }}
           TIMEOUT_MINUTES: ${{ needs.resolve.outputs.worker_timeout_minutes }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -euo pipefail
           [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]
@@ -499,6 +501,7 @@ jobs:
           PACKAGES: ${{ needs.resolve.outputs.packages }}
           ROLE: ${{ needs.resolve.outputs.role }}
           TIMEOUT_MINUTES: ${{ needs.resolve.outputs.worker_timeout_minutes }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -euo pipefail
           # Adoption is a CAS OWNERSHIP TRANSFER, not a read-only look (issue #132): --adopt swaps

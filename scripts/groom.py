@@ -68,6 +68,7 @@ WORKER_PR_MARKER = "> 🤖 SPARQ agent"
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?")
 SAFE_CLAIM = re.compile(r"[0-9a-f]{32}")
+SAFE_ACCOUNT_HASH = re.compile(r"[0-9a-f]{16}")
 HOLDER = re.compile(
     r"(?P<repo>[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)"
     r"#(?P<issue>[1-9][0-9]*)@(?P<run>[^\r\n]+)"
@@ -213,6 +214,8 @@ def validate_ledger(document: Any) -> list[dict[str, Any]]:
         for field in ("account", "package", "role", "model"):
             if not isinstance(lease.get(field), str) or not lease[field]:
                 raise GroomError(f"lease {field} is malformed")
+        if SAFE_ACCOUNT_HASH.fullmatch(lease["account"]) is None:
+            raise GroomError("lease account is not a canonical salted fingerprint")
     return leases
 
 
@@ -1745,7 +1748,7 @@ def _self_test() -> int:
     now = 10_000
     limits = Limits(worker_timeout_minutes=10, max_attempts=2)
     base = {
-        "account": "acct01",
+        "account": "0123456789abcdef",
         "claim_id": "a" * 32,
         "holder": "owner/repo#7@dispatch-123.1",
         "package": "crate-a",
@@ -2835,6 +2838,12 @@ def _self_test() -> int:
     except GroomError:
         malformed_failed = True
     check("malformed ledger fails closed", malformed_failed, True)
+    raw_account_failed = False
+    try:
+        validate_ledger({"leases": [{**base, "account": "acct01"}]})
+    except GroomError:
+        raw_account_failed = True
+    check("raw account handle in ledger fails closed", raw_account_failed, True)
 
     # Review/fix repair leases: tolerated by validation, never issue-mapped, and a malformed
     # NON-repair holder still fails closed (the skip must not widen into blanket tolerance).
@@ -3020,7 +3029,8 @@ def _self_test() -> int:
                 self.reads += 1
                 document = {
                     "leases": [{
-                        "account": "a", "claim_id": dead, "holder": "owner/repo#7@run.1",
+                        "account": "aaaaaaaaaaaaaaaa", "claim_id": dead,
+                        "holder": "owner/repo#7@run.1",
                         "package": "p", "role": "impl", "model": "m",
                         "issued_at": 1, "expires_at": 9,
                     }]
