@@ -10,9 +10,14 @@
 #   worker/review-fix branch pushes — must stay allowed). Do NOT create the ruleset here.
 #
 # Least privilege: contents:read only (the gate reads code + runs tests; it never writes). Actions
-# are SHA-pinned. actionlint is fetched as a pinned release binary verified against the release's
-# published sha256 (the raven-actions installer broke under the runner's forced Node-24 migration,
-# and `go install` is checksum-free — a pinned+checksummed direct download is the sturdiest option).
+# are SHA-pinned, and the gate enforces that policy on itself (sol audit #221): every non-local
+# `uses:` reference in every workflow must be a full 40-hex commit pin — actionlint does not check
+# that, so without the assertion a regression to a mutable tag would pass this REQUIRED check.
+# PyYAML is installed version- and hash-locked for the same reason: a mutable PyPI release must not
+# be able to break or influence the gate. actionlint is fetched as a pinned release binary verified
+# against the release's published sha256 (the raven-actions installer broke under the runner's
+# forced Node-24 migration, and `go install` is checksum-free — a pinned+checksummed direct
+# download is the sturdiest option).
 name: pr-gate
 
 on:
@@ -42,8 +47,20 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PyYAML for the workflow-yaml lint
-        run: python3 -m pip install --disable-pip-version-check pyyaml
+      - name: Install PyYAML for the workflow-yaml lint (version + hash locked)
+        run: |
+          set -euo pipefail
+          # A REQUIRED gate must not depend on a mutable release (sol audit #221): pin the exact
+          # version AND its PyPI sha256 digests (manylinux cp312 x86_64 + aarch64 wheels).
+          # --only-binary forbids a fallback sdist build, whose isolated build deps pip would
+          # download WITHOUT hash-checking.
+          cat > "$RUNNER_TEMP/gate-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/gate-requirements.txt"
 
       - name: Install actionlint (pinned release, sha256-verified)
         run: |
@@ -103,3 +120,50 @@ jobs:
           done
           echo "== actionlint =="
           actionlint -color
+
+      - name: Assert every non-local action reference is pinned to a 40-hex commit
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # actionlint does NOT enforce commit-pinning, so a regression from a 40-hex pin to a
+          # mutable tag would otherwise pass this required gate (sol audit #221). Walk every
+          # parsed workflow and reject any non-local `uses:` whose ref is not exactly 40 hex
+          # (docker refs must pin a sha256 digest). Scanning zero references is itself a
+          # failure — a parser regression must not turn this assertion vacuous (fail closed).
+          python3 - .github/workflows/*.yml .github/workflows/*.yaml <<'PY'
+          import re, sys, yaml
+
+          def walk(node):
+              if isinstance(node, dict):
+                  for key, value in node.items():
+                      if key == "uses" and isinstance(value, str):
+                          yield value
+                      else:
+                          yield from walk(value)
+              elif isinstance(node, list):
+                  for item in node:
+                      yield from walk(item)
+
+          total, bad = 0, []
+          for path in sys.argv[1:]:
+              with open(path, encoding="utf-8") as fh:
+                  doc = yaml.safe_load(fh)
+              for ref in walk(doc):
+                  if ref.startswith("./"):
+                      continue  # local action: already pinned by this PR's own commit
+                  total += 1
+                  if ref.startswith("docker://"):
+                      ok = re.search(r"@sha256:[0-9a-f]{64}$", ref)
+                  else:
+                      ok = re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", ref)
+                  if not ok:
+                      bad.append(f"{path}: uses: {ref}")
+          for entry in bad:
+              print(f"::error::action reference is not commit-pinned (need @<40-hex sha>): {entry}")
+          if bad:
+              sys.exit(1)
+          if total == 0:
+              print("::error::pin check scanned zero non-local action references (fail closed)")
+              sys.exit(1)
+          print(f"pin check OK: all {total} non-local 'uses:' references are 40-hex pinned")
+          PY
