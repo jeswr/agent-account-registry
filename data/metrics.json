@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-22T17:49:59Z",
+  "generated_at": "2026-07-22T17:53:30Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -38,7 +38,7 @@
       "needs_user_parked": 9,
       "review_lane_health": "idle",
       "review_lane_runs_1h": 0,
-      "worker_attempts_1h": 7,
+      "worker_attempts_1h": 6,
       "worker_success_rate_1h": 0.0,
       "pr_open_rate": 2.0,
       "pr_close_rate": 2.0,
@@ -50,10 +50,10 @@
       "target": "jeswr/agent-account-registry",
       "classification": "worker-failing",
       "fire": true,
-      "summary": "worker success rate 0% < 50% floor over 2 snapshots (7 attempts this hour)",
+      "summary": "worker success rate 0% < 50% floor over 2 snapshots (6 attempts this hour)",
       "metrics": {
         "worker_success_rate_1h": 0.0,
-        "worker_attempts_1h": 7
+        "worker_attempts_1h": 6
       }
     }
   ]
