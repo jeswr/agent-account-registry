@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 529,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "294101a4ed6fdb1f8e8486529a987abdc672a1ce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "provenance_admission_error() (line 1272) now returns 'provenance record signature is missing or invalid' unless ledger_record_signature_valid() passes, and that helper returns False when LEDGER_RECORD_HMAC_KEY is empty (worker-pr.py:193-195, no fail-open). This predicate is the single source of truth called by enumerate_review_items (line 1366), which is executed by the dispatch.yml PLAN job's 'Assemble and validate the v2 plan' step (dispatch.yml:453, enumerate at :564). The PLAN job is 'PLAN (unprivileged, secret-free target half)' (dispatch.yml:57-58) \u2014 it runs hostile target planner code and by REG-4 design carries NO secrets and has no `environment:` binding; the diff added LEDGER_RECORD_HMAC_KEY only to the CLAIM step (dispatch.yml:959), groom sweep, review-fix resolve, worker, and backfill \u2014 never to PLAN. Consequently, in production every provenance record fails the signature gate in PLAN, enumerate_review_items returns [], and CLAIM (which consumes only plan['review_items'] at dispatch-claim.py:3257 and never re-enumerates) dispatches zero review/fix runs. The whole cross-provider review/fix loop halts. This is not caught by CI because each _self_test injects the key via os.environ.setdefault, so green self-tests mask the broken production wiring.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Do not enforce the ledger signature inside the PLAN-shared provenance_admission_error / enumerate_review_items. Enforce it only at the trust-consuming boundaries that legitimately hold the key: the CLAIM-side provenance re-read, review-fix.yml's resolve step, and groom's draft carve-out (all already have LEDGER_RECORD_HMAC_KEY). Alternatively give PLAN a key-optional admission path (structure-only in PLAN, signature re-verified at CLAIM before any arm/dispatch), and add a self-test that runs enumerate_review_items with LEDGER_RECORD_HMAC_KEY UNSET to prove PLAN still enumerates while CLAIM/resolve still reject unsigned records \u2014 that test would have caught this.",
+    "severity": "blocker",
+    "title": "Signature check in provenance_admission_error breaks the secret-free PLAN enumerator \u2014 review loop enumerates nothing"
+   },
+   {
+    "body": "Every affected _self_test begins with os.environ.setdefault(LEDGER_HMAC_ENV, 'selftest-ledger-record-key'). This makes the signing/verification assertions pass unconditionally regardless of whether the surrounding production job actually provides the secret. The assertions themselves are non-vacuous (they verify sign/verify, tamper rejection, unsigned-legacy fail-closed, and missing-key rejection at worker-pr.py:4419-4423), but the suite provides false confidence that the feature is wired correctly end-to-end. There is no test asserting that a KEY-ABSENT enumeration environment behaves acceptably \u2014 which is exactly the production PLAN condition that the blocker above exploits.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Add a regression that unsets LEDGER_RECORD_HMAC_KEY and asserts the intended PLAN-vs-CLAIM split (PLAN enumeration still admits by structure; CLAIM/resolve/groom reject unsigned/forged records). Keep the key-set assertions too.",
+    "severity": "minor",
+    "title": "Self-tests inject the signing key, so they cannot detect a job missing the secret"
+   }
+  ],
+  "progress": null,
+  "summary": "The HMAC signing/verification primitives are well-built (canonical JSON, constant-time compare, fail-closed on empty key, type-exact comparison preserved, envelope readers hardened). But the signature check was placed inside provenance_admission_error (dispatch-claim.py:1272) \u2014 the ONE shared predicate that the deliberately SECRET-FREE PLAN job calls via enumerate_review_items. The PLAN job (dispatch.yml:57-58, REG-4 header) runs hostile target-planner code and holds no secrets by design; the diff does not (and cannot safely) wire LEDGER_RECORD_HMAC_KEY into it. So in production ledger_record_signature_valid() sees an empty key, returns False for EVERY record, and PLAN enumerates ZERO review/fix items. CLAIM only consumes plan['review_items'] (dispatch-claim.py:3257) and never re-enumerates, so it cannot recover the dropped items even though CLAIM/groom/resolve DO have the key. Net effect: the entire cross-provider review/fix loop stops enumerating. Every _self_test does os.environ.setdefault(LEDGER_RECORD_HMAC_KEY,...), so the self-tests stay green while masking the production wiring gap \u2014 the change looks verified but breaks the primary orchestration loop. This is fail-closed in the security sense but a total availability regression, and it is not fixable by adding the key to PLAN without violating the REG-4 secret separation that keeps the signing key away from target code. Signature enforcement must move to (or be duplicated at) the trust-CONSUMING boundaries that already hold the key (CLAIM record re-read, review-fix.yml resolve, groom carve-out), leaving PLAN's admission structure-only, OR PLAN must gain a key-optional path. Blocker below.",
+  "verdict": "request_changes"
+ }
+}
