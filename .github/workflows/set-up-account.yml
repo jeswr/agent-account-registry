@@ -610,14 +610,21 @@ jobs:
           set -euo pipefail
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
           harness=$([ "$PROVIDER" = openai ] && echo codex || echo claude)
+          body=$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nrequest_issue: %s\nnotes: registered via set-up-account broker; pending account_pool PR merge\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME" "$ISSUE")
+          # Validate the exact bytes about to be persisted through the allocator's schema guard.
+          # A malformed producer output must fail this step before gh can create a corrupt record.
+          printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
+            --validate-account-record --account-handle "$HANDLE"
           # gh issue create needs the label to pre-exist; ensure it idempotently.
           gh label create status:pending -R "${{ github.repository }}" \
             -c EBECA4 -d "account captured, awaiting account_pool PR merge before activation" 2>/dev/null || true
+          gh label create account -R "${{ github.repository }}" \
+            -c 1D76DB -d "model-account catalog record" 2>/dev/null || true
           # registry issue + comment use the workflow's own github.token (same-owner)
           gh issue create -R "${{ github.repository }}" \
             --title "$HANDLE" \
-            --label "provider:$PROVIDER" --label status:pending \
-            --body "$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nrequest_issue: %s\nnotes: registered via set-up-account broker; pending account_pool PR merge\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME" "$ISSUE")"
+            --label account --label "provider:$PROVIDER" --label status:pending \
+            --body "$body"
 
       - name: Validate the registration through the real allocator parser
         id: validate

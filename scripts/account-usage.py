@@ -187,12 +187,18 @@ def _probe_fable(token):
     return _assemble_fable(hdr)
 
 
-def _load_accounts(script_dir, registry_repo):
+def _load_account_catalog(script_dir):
     spec = importlib.util.spec_from_file_location(
         "registry_select_and_claim", os.path.join(script_dir, "select-and-claim.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load shared account catalog")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.read_accounts(registry_repo)
+    return module
+
+
+def _load_accounts(script_dir, registry_repo):
+    return _load_account_catalog(script_dir).read_accounts(registry_repo)
 
 
 def _load_model_health(script_dir):
@@ -401,7 +407,7 @@ def _issue_view(number, registry_repo, run):
     return issue.get("body") or "", count, True
 
 
-def _persist_one(number, line, registry_repo, run):
+def _persist_one(number, handle, line, registry_repo, run, schema_errors):
     """Merge the single `limits:` line into ONE account issue via a GUARDED read-merge-write (issue
     #198). `gh issue edit --body` REPLACES the whole body and GitHub's issue API has no conditional
     (If-Match/CAS) write, so a plain read->merge->write can clobber a provider / credential-format /
@@ -426,6 +432,12 @@ def _persist_one(number, line, registry_repo, run):
         new_body, changed = _upsert_limits_line(body0, line)
         if not changed:
             return True  # the live body already carries this exact limits line — nothing to write
+        # WRITE GUARD (#521): validate the complete replacement body through the allocator's exact
+        # schema before `gh issue edit --body` can persist it. This catches both a malformed live
+        # record and any corruption introduced by this merge. Keep the annotation handle-free.
+        if schema_errors(handle, new_body):
+            print("::warning::account-usage: account-record write rejected by schema guard")
+            return False
         edit = run(["gh", "issue", "edit", str(number), "-R", registry_repo, "--body", new_body],
                    capture_output=True, text=True, timeout=60, check=False)
         if edit.returncode != 0:
@@ -459,6 +471,12 @@ def persist_limits(usage_path, run=None):
     run = run or subprocess.run
     registry_repo = os.environ["REGISTRY_REPO"]
     try:
+        account_catalog = _load_account_catalog(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        print("::warning::account-usage: shared account schema unavailable; refusing tier-limit "
+              "writes")
+        return 1
+    try:
         with open(usage_path, encoding="utf-8") as handle:
             usage = json.load(handle)
     except (OSError, json.JSONDecodeError):
@@ -487,7 +505,8 @@ def persist_limits(usage_path, run=None):
         line = _limits_line(usage.get(handle))
         if not line:
             continue
-        if not _persist_one(issue.get("number"), line, registry_repo, run):
+        if not _persist_one(issue.get("number"), handle, line, registry_repo, run,
+                            account_catalog.account_record_schema_errors):
             failures += 1
     if failures:
         # No count (locked decision 22b) — only that at least one write did not land.
@@ -903,24 +922,28 @@ def _self_test():
     limits_usage = {"acct01": {"5h_limit": "100", "7d_limit": "700"}}
     upath = _usage_file(limits_usage)
     limits_line = "limits: 5h_limit=100 7d_limit=700"
+    valid_anthropic = ("provider: anthropic\nmodels: [haiku]\n"
+                       "credential_format: claude-oauth-token\nsecret_ref: ACCT01_TOKEN\n")
+    valid_openai = ("provider: openai\nmodels: [sol]\n"
+                    "credential_format: codex-auth-json\nsecret_ref: ACCT01_TOKEN\n")
 
     #   (i) the concurrent-overwrite regression: a provider edit lands between the bulk `list` and the
-    #   mutation. The write MUST merge onto the FRESH view body (preserving `provider: anthropic-eu`),
+    #   mutation. The write MUST merge onto the FRESH view body (preserving `provider: openai`),
     #   never the stale snapshot. This is the core #198 assertion — it flips red if the merge reads a
     #   stale body or drops the concurrent field.
-    fresh = "provider: anthropic-eu\nmodels: [haiku]\n"
+    fresh = valid_openai
     merged = _upsert_limits_line(fresh, limits_line)[0]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(fresh, 0), (merged, 1)]}})
     rc = persist_limits(upath, run=run)
     chk("persist: success returns 0", rc, 0)
     chk("persist: merges limits onto the FRESH body (no stale overwrite)",
-        (len(edits), "provider: anthropic-eu" in edits[0][1], limits_line in edits[0][1]),
+        (len(edits), "provider: openai" in edits[0][1], limits_line in edits[0][1]),
         (1, True, True))
 
     #   (ii) idempotent no-op: the live body already carries the exact line -> zero edits, still 0
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
-                           "view": {"7": [("provider: anthropic\n" + limits_line + "\n", 0)]}})
+                           "view": {"7": [(valid_anthropic + limits_line + "\n", 0)]}})
     chk("persist: idempotent live body writes nothing", (persist_limits(upath, run=run), edits),
         (0, []))
 
@@ -932,7 +955,7 @@ def _self_test():
     #   (iv) an `issue edit` failure is PROPAGATED as a non-zero return, BEFORE the confirm read.
     #   The confirm view is queued to MATCH new_body, so swallowing the edit returncode would
     #   confirm-match and wrongly return 0 — this asserts the returncode is honoured immediately.
-    edit_body0 = "provider: anthropic\n"
+    edit_body0 = valid_anthropic
     edit_merged = _upsert_limits_line(edit_body0, limits_line)[0]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(edit_body0, 0), (edit_merged, 1)]},
@@ -948,8 +971,8 @@ def _self_test():
     #   (vi) retry-merges-on-change: a concurrent writer lands strictly AFTER our edit (their body
     #   is live, edit count shows exactly ours + theirs — nothing lost); the merge is re-applied
     #   onto the writer's NEW body, then confirmed as the only edit of the second window.
-    body0 = "provider: anthropic\n"
-    clob = "provider: anthropic\nnotes: touched-by-other\n"           # concurrent notes edit
+    body0 = valid_anthropic
+    clob = valid_anthropic + "notes: touched-by-other\n"              # concurrent notes edit
     merged2 = _upsert_limits_line(clob, limits_line)[0]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(body0, 0), (clob, 2), (clob, 2), (merged2, 3)]}})
@@ -985,6 +1008,15 @@ def _self_test():
                            "view": {"7": [(fresh, 0), (fresh, 1)]}})
     chk("persist: single-edit confirm with mismatched body fails closed",
         (persist_limits(upath, run=run), len(edits)), (1, 1))
+
+    #   (xi) WRITE GUARD (#521): a selected account whose live replacement body is missing a
+    #   required schema field is rejected BEFORE `gh issue edit`; no corrupt record is persisted.
+    invalid_body = ("provider: openai\nmodels: [sol]\n"
+                    "credential_format: codex-auth-json\n")
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(invalid_body, 0)]}})
+    chk("persist: schema-invalid account body is rejected before write",
+        (persist_limits(upath, run=run), len(edits)), (1, 0))
 
     #   (viii) a non-dict usage snapshot is handled (no probed limits) without touching the catalog
     lpath = _usage_file(["not", "a", "map"])

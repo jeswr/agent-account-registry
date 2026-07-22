@@ -276,7 +276,11 @@ jobs:
           allocator = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(allocator)
           account_name = os.environ["ACCOUNT"]
-          matches = [item for item in catalog if item.get("title", "").strip() == account_name]
+          # Use the allocator's ONE structural selector here as well. Live self-claim and
+          # dispatcher-claim adoption already enter through read_accounts(); keeping dry-run on
+          # this exact function prevents a broad issue listing from becoming a divergent pool.
+          matches = [item for item in allocator.select_account_issues(catalog)
+                     if item.get("title", "").strip() == account_name]
           # Privacy (issue #135): these run in PUBLIC logs, so every failure message stays
           # identifier-free — the raw account handle is never interpolated into the diagnostic.
           if len(matches) != 1:
@@ -294,7 +298,11 @@ jobs:
           # sol-led dry-run even though the live claim path normalizes it. (Privacy: the parsed
           # record carries no handle and this step exports no PROVENANCE_SALT, so the shared
           # diagnostic stays handle-free in these public logs.)
-          account = allocator.normalize_legacy_models(allocator._parse_account(item.get("body")))
+          try:
+              account = allocator.validate_account_record(account_name, item.get("body"))
+          except allocator.LeaseIOError as exc:
+              raise SystemExit("selected account record is malformed") from exc
+          account = allocator.normalize_legacy_models(account)
           model = next((candidate for candidate in policy["model_chain"]
                         if candidate in account.get("models", [])), None)
           if model is None:
