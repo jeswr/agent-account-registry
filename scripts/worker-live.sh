@@ -751,6 +751,7 @@ run_gate() {
 FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
 plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
 groom.py account-usage.py usage-alert.py plan-alert.py dispatch-secrets-guard.py model-health.py \
+ledger_retry.py \
 pat-validity.py broker-refresh.py \
 backfill-provenance.py dashboard-gen.py metrics.py ledger-invariant.py trust-gate.py worker-live.sh migrate-secrets.sh"
 
