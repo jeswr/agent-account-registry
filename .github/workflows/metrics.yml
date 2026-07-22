@@ -114,3 +114,38 @@ jobs:
             --registry-repo "$GITHUB_REPOSITORY" \
             --alert \
             --publish
+
+  # Mutual keepalive: dashboard.yml hosts the fleet's cron-keepalive job, which makes
+  # dashboard's OWN schedule a single point of failure — when its cron delivery stalls
+  # (observed 2026-07-22: 44+ min overdue, published metrics >1h stale), nothing kicks it.
+  # This job rides metrics' independent */15 schedule and re-dispatches ONLY dashboard.yml
+  # when stale, so the two schedules cover each other; both must stall simultaneously to
+  # wedge, and any single fire of either revives the pair. No secrets, actions:write only.
+  dashboard-keepalive:
+    name: Re-dispatch a stale dashboard (mutual cron-delivery fallback)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch dashboard.yml when its last run is stale
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          for spec in dashboard.yml:1500; do
+            wf="${spec%%:*}"; limit="${spec##*:}"
+            last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
+                   --jq '.workflow_runs[0].created_at // empty' || true)
+            prev=0
+            [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
+            age=$(( now - prev ))
+            if [ "$age" -gt "$limit" ]; then
+              echo "keepalive: ${wf} last ran ${age}s ago (limit ${limit}s) — dispatching"
+              gh api -X POST \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/dispatches" -f ref=master
+            else
+              echo "keepalive: ${wf} fresh (${age}s <= ${limit}s)"
+            fi
+          done
