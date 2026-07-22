@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 533,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1d105bfe014cf8ebb225b0765c70cdb09ef37297",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Reconciliation only extracts a non-empty secret_ref from the issue body. On resume, the secrets preflight and store are skipped, and no API read verifies that the named secret exists in the canonical dispatch-secrets environment. An account issue may outlive a deleted or never-successfully-created secret (including manual recovery/edit scenarios), so this path can validate metadata, merge/add the handle to account_pool, and flip status:available with no usable credential. This violates the required fail-closed behavior for a missing token.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Before setting resume=true, validate the secret_ref shape/handle binding and use an appropriately scoped credential to prove that the exact referenced secret exists in the dispatch-secrets environment. Treat 404, missing authorization, listing/probe failure, or ambiguity as a hard failure. Add a hermetic test that makes the secret probe return 404/error and asserts that no policy PR or activation step is reached.",
+    "severity": "major",
+    "title": "Resume can activate an account whose credential secret no longer exists"
+   }
+  ],
+  "progress": null,
+  "summary": "The resume path is not fail-closed with respect to the credential it is about to activate. It treats a syntactically present secret_ref line as proof that the referenced environment secret still exists, skips the store-capability/credential checks, and can consequently open or complete an account_pool change and mark an account available even when its token is missing. A missing token must defer or die in this trust plane. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
