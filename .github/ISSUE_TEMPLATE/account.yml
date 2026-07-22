@@ -1,6 +1,7 @@
 name: Model account
 description: Register a model account (Anthropic/OpenAI) for the worker fleet
 title: "<account-handle>"
+labels: [account]
 body:
   - type: textarea
     id: spec
@@ -9,7 +10,9 @@ body:
       description: No secrets here — the token lives only in the secret named by secret_ref.
       value: |
         provider: anthropic
+        harness: claude
         models: [opus, sonnet, haiku, fable]
+        credential_format: claude-oauth-token
         tier:
           weekly_limit: ""
           five_hour_limit: ""

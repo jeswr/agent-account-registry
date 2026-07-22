@@ -538,11 +538,16 @@ KNOWN_CREDENTIAL_FORMATS = frozenset({
     "claude-oauth-token",
     "anthropic-api-key",
 })
+ACCOUNT_ISSUE_TITLE_RE = re.compile(r"acct[0-9]+")
+ACCOUNT_SECRET_REF_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 
 
-def _valid_catalog_account(account):
-    """Reject malformed routing metadata at the shared catalog parse boundary."""
+def _account_schema_errors(account, require_models=True):
+    """Return parsed account-schema violations without emitting diagnostics."""
     reasons = []
+    handle = account.get("handle")
+    if not isinstance(handle, str) or not handle.strip():
+        reasons.append("missing handle")
     provider = account.get("provider")
     if provider not in KNOWN_ACCOUNT_PROVIDERS:
         reasons.append("missing provider" if not provider else f"unknown provider {provider!r}")
@@ -550,6 +555,81 @@ def _valid_catalog_account(account):
     if credential_format not in KNOWN_CREDENTIAL_FORMATS:
         reasons.append("missing credential_format" if not credential_format else
                        f"unknown credential_format {credential_format!r}")
+    secret_ref = account.get("secret_ref")
+    if not secret_ref:
+        reasons.append("missing secret_ref")
+    elif ACCOUNT_SECRET_REF_RE.fullmatch(secret_ref) is None:
+        reasons.append("unsafe secret_ref")
+    if require_models and not account.get("models"):
+        reasons.append("missing models")
+    return reasons
+
+
+def account_record_schema_errors(handle, body, require_models=True):
+    """Parse a body and return its account-record schema violations without diagnostics.
+
+    Keeping this pure lets the reader use it both for structural selection and for the loud
+    validation boundary, and lets every writer reject an invalid replacement body before it
+    reaches GitHub. ``require_models=False`` is the structural front-matter predicate: the three
+    routing/credential fields are sufficient to identify a record even when its title is not an
+    ``acctNN`` handle. Full read/write validation additionally requires a usable handle and model
+    list.
+    """
+    account = _parse_account(body)
+    account["handle"] = handle
+    return _account_schema_errors(account, require_models=require_models)
+
+
+def validate_account_record(handle, body):
+    """Validate one complete account body for a write, returning its parsed representation.
+
+    The exception text contains field-level corruption reasons but no credential material.
+    """
+    reasons = account_record_schema_errors(handle, body)
+    if reasons:
+        raise LeaseIOError(f"account record schema invalid: {'; '.join(reasons)}")
+    account = _parse_account(body)
+    account["handle"] = handle.strip()
+    return account
+
+
+def _issue_label_names(issue):
+    return {
+        label.get("name") for label in issue.get("labels", [])
+        if isinstance(label, dict) and isinstance(label.get("name"), str)
+    }
+
+
+def select_account_issues(issues):
+    """Structurally select account issues from a broad GitHub issue listing.
+
+    A complete, schema-valid provider/credential/secret front-matter triple selects records with
+    nonstandard legacy titles. Dedicated markers select fail-closed records even when that schema
+    is corrupt: the exact ``account`` label or the ``acct<digits>`` title grammar. Everything else
+    is outside the catalog and is silently ignored rather than parsed-and-dropped as corruption.
+    This is the one selector used by dispatch claim and worker claim/adoption via ``read_accounts``;
+    workflow-side dry-run validation imports it as well.
+    """
+    if not isinstance(issues, list):
+        raise LeaseIOError("registry account catalog listing is malformed")
+    selected = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        title = issue.get("title")
+        title = title.strip() if isinstance(title, str) else ""
+        marked = (ACCOUNT_ISSUE_TITLE_RE.fullmatch(title) is not None
+                  or "account" in _issue_label_names(issue))
+        front_matter_valid = not account_record_schema_errors(
+            title, issue.get("body"), require_models=False)
+        if marked or front_matter_valid:
+            selected.append(issue)
+    return selected
+
+
+def _valid_catalog_account(account):
+    """Reject selected records with malformed schema at the shared catalog parse boundary."""
+    reasons = _account_schema_errors(account)
     if reasons:
         print(f"account catalog: dropping account {account.get('handle')!r}: "
               f"{'; '.join(reasons)}", file=sys.stderr)
@@ -612,17 +692,19 @@ def normalize_legacy_models(account):
 
 
 def read_accounts(repo):
-    """The account catalog from the open account issues (title=handle, YAML body, status:available).
-    Drops records with invalid provider/credential-format metadata, then applies the read-time
-    legacy-shape normalization above, so every downstream consumer sees a valid catalog."""
+    """The structurally selected account catalog from open issues.
+
+    Non-account issues never reach the drop boundary. Selected records are validated loudly, then
+    receive the shared legacy-shape normalization, so dispatch and worker adoption see one pool.
+    """
     out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
                 "--json", "title,body,labels"]).stdout
     accounts = []
-    for it in json.loads(out or "[]"):
+    for it in select_account_issues(json.loads(out or "[]")):
         a = _parse_account(it.get("body"))
         a["handle"] = it["title"].strip()
-        a["available"] = any(lb["name"] == "status:available" for lb in it.get("labels", []))
-        if _valid_catalog_account(a) and a["handle"] and a["models"]:
+        a["available"] = "status:available" in _issue_label_names(it)
+        if _valid_catalog_account(a):
             accounts.append(normalize_legacy_models(a))
     return accounts
 
@@ -938,11 +1020,11 @@ def _self_test():
         {"title": "unknown-provider",
          "body": "provider: legacy\nharness: codex\nmodels: [terra]\n"
                  "credential_format: codex-auth-json\nsecret_ref: LEGACY_TOKEN",
-         "labels": [{"name": "status:available"}]},
+         "labels": [{"name": "account"}, {"name": "status:available"}]},
         {"title": "bad-credential-format",
          "body": "provider: anthropic\nharness: claude\nmodels: [fable]\n"
                  "credential_format: legacy-token\nsecret_ref: BAD_TOKEN",
-         "labels": [{"name": "status:available"}]},
+         "labels": [{"name": "account"}, {"name": "status:available"}]},
     ])
     globals()["_run"] = lambda args: SimpleNamespace(stdout=boundary_rows)
     boundary_log = io.StringIO()
@@ -969,6 +1051,86 @@ def _self_test():
     check("out-of-set credential_format warning names handle and reason",
           "dropping account 'bad-credential-format': unknown credential_format 'legacy-token'"
           in boundary_log.getvalue(), True)
+
+    # ---- structural account-issue selection (issue #521 escalation tripwires) ----
+    # A broad issue listing is expected: audit/work items live beside account records. Only the
+    # shared selector may reduce it. A non-account audit issue is silent; marker-selected corruption
+    # stays loud; both dispatcher reads and worker adoption resolve the identical healthy pool.
+    mixed_rows = json.dumps([
+        {"title": "[sol-audit ledgergate] ordinary work item",
+         "body": "The dispatcher and worker policy pools need an audit.\nNo account metadata here.",
+         "labels": [{"name": "role:ci"}]},
+        {"title": "acct21",
+         "body": "provider: openai\nmodels: [sol]\ncredential_format: codex-auth-json\n"
+                 "secret_ref: ACCT21_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        {"title": "named-anthropic",
+         "body": "provider: anthropic\nmodels: [opus]\n"
+                 "credential_format: claude-oauth-token\nsecret_ref: NAMED_ANTHROPIC_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        {"title": "acct22",
+         "body": "provider: openai\nmodels: [sol]\ncredential_format: codex-auth-json",
+         "labels": [{"name": "status:available"}]},
+        {"title": "explicitly-marked-corrupt",
+         "body": "provider: retired\nmodels: [opus]\n"
+                 "credential_format: claude-oauth-token\nsecret_ref: RETIRED_TOKEN",
+         "labels": [{"name": "account"}, {"name": "status:available"}]},
+    ])
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=mixed_rows)
+    mixed_log = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(mixed_log):
+            dispatcher_pool = read_accounts("o/r")
+    finally:
+        globals()["_run"] = real_run_fn
+    check("structural select: audit issue is not a candidate",
+          [account["handle"] for account in dispatcher_pool],
+          ["acct21", "named-anthropic"])
+    check("structural select: non-account audit issue produces no drop line",
+          "sol-audit ledgergate" in mixed_log.getvalue(), False)
+    check("structural select: acctNN-selected corrupt record still drops loudly",
+          "dropping account 'acct22': missing secret_ref" in mixed_log.getvalue(), True)
+    check("structural select: account-label-selected corrupt record still drops loudly",
+          "dropping account 'explicitly-marked-corrupt': unknown provider 'retired'"
+          in mixed_log.getvalue(), True)
+
+    mixed_leases = []
+    mixed_claims = {}
+    for index, account in enumerate(dispatcher_pool):
+        claim_id = f"MIXED{index}"
+        lease = make_lease(account["handle"], "o/r#21@dispatch.1", "p", "impl",
+                           account["models"][0], now, 100)
+        lease["claim_id"] = claim_id
+        mixed_leases.append(lease)
+        mixed_claims[account["handle"]] = claim_id
+    saved_mixed_ledger = globals()["_read_ledger"]
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=mixed_rows)
+    globals()["_read_ledger"] = lambda repo: (mixed_leases, "sha0")
+    worker_pool = []
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            for account in dispatcher_pool:
+                if inspect_claim("o/r", mixed_claims[account["handle"]], now,
+                                 expected_holder_prefix="o/r#21@"):
+                    worker_pool.append(account["handle"])
+    finally:
+        globals()["_run"] = real_run_fn
+        globals()["_read_ledger"] = saved_mixed_ledger
+    check("structural select: dispatcher and worker adoption resolve the same mixed-fixture pool",
+          worker_pool, [account["handle"] for account in dispatcher_pool])
+
+    valid_write_body = ("provider: openai\nmodels: [sol]\n"
+                        "credential_format: codex-auth-json\nsecret_ref: ACCT23_TOKEN")
+    check("account write guard accepts a schema-valid record",
+          validate_account_record("acct23", valid_write_body)["secret_ref"], "ACCT23_TOKEN")
+    try:
+        validate_account_record(
+            "acct23", "provider: openai\nmodels: [sol]\ncredential_format: codex-auth-json")
+        check("account write guard rejects an invalid record before persistence",
+              "no exception", "LeaseIOError")
+    except LeaseIOError as exc:
+        check("account write guard rejects an invalid record before persistence",
+              (type(exc).__name__, "missing secret_ref" in str(exc)), ("LeaseIOError", True))
 
     # CLAIM SELECTION: a legacy [terra] record now serves a sol-led claim end-to-end (claim()
     # reads the catalog through read_accounts), while a customized [terra, luna] record still
@@ -1166,7 +1328,8 @@ def _self_test():
             accounts_path.write_text(json.dumps([{
                 "title": "acctlegacy",
                 "body": "provider: openai\nharness: codex\nmodels: [terra]\n"
-                        "secret_ref: ACCTLEGACY_TOKEN\nmax_concurrent_workers: 2",
+                        "credential_format: codex-auth-json\nsecret_ref: ACCTLEGACY_TOKEN\n"
+                        "max_concurrent_workers: 2",
                 "labels": [{"name": "status:available"}],
             }]), encoding="utf-8")
             gh_output_path = tdp / "github_output"
@@ -1873,6 +2036,10 @@ def _self_test():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--validate-account-record", action="store_true",
+                    help="validate an account body from stdin before a catalog write")
+    ap.add_argument("--account-handle", default="",
+                    help="account handle for --validate-account-record")
     ap.add_argument("--reclaim", action="store_true", help="CAS-remove expired leases (cron)")
     ap.add_argument("--claim", action="store_true", help="claim a lease")
     ap.add_argument("--adopt", metavar="CLAIM_ID",
@@ -1896,6 +2063,17 @@ def main():
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
+    if args.validate_account_record:
+        if not args.account_handle:
+            print("account record write rejected: --account-handle is required", file=sys.stderr)
+            return 2
+        try:
+            validate_account_record(args.account_handle, sys.stdin.read())
+        except LeaseIOError as exc:
+            print(f"account record write rejected: {exc}", file=sys.stderr)
+            return 2
+        print("account record schema valid")
+        return 0
     if args.reclaim:
         n = reclaim(args.repo, int(time.time()))
         print(f"reclaimed {n} expired lease(s)" if n >= 0 else "reclaim: CAS kept conflicting")

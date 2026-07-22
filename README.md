@@ -20,6 +20,8 @@ front-matter (no secrets):
 
 ```yaml
 provider: anthropic          # anthropic | openai
+harness: claude              # claude | codex
+credential_format: claude-oauth-token
 models: [opus, sonnet, haiku, fable]   # or [sol, luna, terra] for openai; enables model-fallback routing
 tier:
   weekly_limit: "..."        # human note of the plan's weekly cap
@@ -188,7 +190,7 @@ reset timestamps used for account prioritisation (see **Usage-aware selection** 
 `read_accounts()` parses these exact keys from the issue **body**. Title = the handle.
 
 ```bash
-gh issue create -R jeswr/agent-account-registry --title "acct05" --body 'provider: anthropic
+body='provider: anthropic
 harness: claude
 credential_format: claude-oauth-token
 email: "<the account login email — a setup-token CANNOT introspect it (403 on /api/oauth/profile); fill from the account you logged in as>"
@@ -196,6 +198,9 @@ models: [opus, sonnet, haiku, fable]
 max_concurrent_workers: 1
 secret_ref: ACCT05_TOKEN
 notes: "claude setup-token (long-lived, non-rotating). [your-marker]"'
+printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
+  --validate-account-record --account-handle acct05
+gh issue create -R jeswr/agent-account-registry --title "acct05" --label account --body "$body"
 ```
 For an **OpenAI** account: `provider: openai`, `harness: codex`, `credential_format: codex-auth-json`,
 `models: [sol, luna, terra]` (the FULL codex alias set — `select-and-claim.py` gates on exact alias
@@ -205,7 +210,7 @@ membership, so a `terra`-only record would defer every sol/luna claim), `secret_
 
 ```bash
 gh issue edit <ISSUE#> -R jeswr/agent-account-registry \
-  --add-label status:available --add-label provider:anthropic
+  --add-label account --add-label status:available --add-label provider:anthropic
 ```
 `select-and-claim.py` sets `available = (has status:available label)`; without it the account is
 silently skipped.
