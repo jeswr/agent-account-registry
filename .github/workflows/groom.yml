@@ -105,6 +105,7 @@ jobs:
       - name: Sweep dead leases, stale issues, exhausted attempts, and stale PRs
         env:
           REGISTRY_GH_TOKEN: ${{ github.token }}
+          LEDGER_RECORD_HMAC_KEY: ${{ secrets.LEDGER_RECORD_HMAC_KEY }}
           # Per-owner target App tokens (issue #168): groom.py resolves the token for each target
           # repo's OWNER, so a repo under a second owner is never read/written with the wrong token.
           SPARQ_TOKEN: ${{ steps.target-token-sparq.outputs.token }}

@@ -397,6 +397,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
 
 
 def _self_test():
+    os.environ.setdefault("LEDGER_RECORD_HMAC_KEY", "selftest-ledger-record-key")
     ok = True
 
     def check(name, got, want):
@@ -504,6 +505,7 @@ def _self_test():
     admission = _load_dispatch_claim().provenance_admission_error
     valid_record = {"pr_number": 41, "impl_provider": "anthropic", "impl_alias": "fable",
                     "impl_account_h": "ab" * 8, "issue": 7, "head_sha_at_open": "ab" * 20}
+    valid_record = _load_worker_pr().sign_ledger_record(valid_record)
     check("valid matching record admits (skip allowed)",
           existing_record_admission_error(json.dumps(valid_record), 41, admission), None)
     check("undecodable record body never counts as recorded",

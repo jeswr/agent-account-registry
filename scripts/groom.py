@@ -1734,6 +1734,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
 
 
 def _self_test() -> int:
+    os.environ.setdefault("LEDGER_RECORD_HMAC_KEY", "selftest-ledger-record-key")
     ok = True
 
     def check(name: str, got: Any, want: Any) -> None:
@@ -2056,6 +2057,7 @@ def _self_test() -> int:
             "impl_account_h": "ab" * 8,
             "issue": 7,
         }
+        valid_record = _review_loop_module()._worker_pr_helper().sign_ledger_record(valid_record)
         record_path.write_text(json.dumps(valid_record), encoding="utf-8")
         check(
             "provenance validity: schema-valid record -> True (review-loop-owned)",
@@ -2402,14 +2404,14 @@ def _self_test() -> int:
         admit_dir = admit_root / PROVENANCE_DIR
         admit_dir.mkdir(parents=True)
         (admit_dir / "owner--repo--pr91.json").write_text(
-            json.dumps({
+            json.dumps(_review_loop_module()._worker_pr_helper().sign_ledger_record({
                 "pr_number": 91,
                 "head_sha_at_open": "1" * 40,
                 "impl_provider": "anthropic",
                 "impl_alias": "fable",
                 "impl_account_h": "ab" * 8,
                 "issue": 9,
-            }),
+            })),
             encoding="utf-8",
         )
         proven_pull = {
@@ -2570,6 +2572,7 @@ def _self_test() -> int:
         "pr_number": 91, "head_sha_at_open": "1" * 40, "impl_provider": "anthropic",
         "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 9,
     }
+    live_valid = _review_loop_module()._worker_pr_helper().sign_ledger_record(live_valid)
     # A Contents 404 only proves file absence once the ledger REF is verified (review round 1),
     # so every conclusive read first resolves the ref and pins the record read to its tip sha.
     # Literal "ledger" here for the same reason as the ledger-branch-targeting checks below.
@@ -3325,11 +3328,12 @@ def _self_test() -> int:
             )
             sweep_env["gets"][live_prov_path] = {
                 "type": "file",
-                "content": base64.b64encode(json.dumps({
+                "content": base64.b64encode(json.dumps(
+                    _review_loop_module()._worker_pr_helper().sign_ledger_record({
                     "pr_number": 91, "head_sha_at_open": "3" * 40,
                     "impl_provider": "anthropic", "impl_alias": "fable",
                     "impl_account_h": "ef" * 8, "issue": 8,
-                }).encode()).decode(),
+                })).encode()).decode(),
             }
             # (C) The worker PR is visible at the boundary but ABSENT on the immutable checkout;
             # the LIVE ref admits it → the terminal defer park is CANCELLED (no write). Reverting

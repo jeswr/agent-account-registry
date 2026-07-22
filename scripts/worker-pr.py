@@ -19,6 +19,7 @@ Trust posture (locked decisions, review blueprint):
 import argparse
 import base64
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -142,6 +143,8 @@ VERDICT_DIR = "orchestration/review-verdicts"
 # the lease ledger (select-and-claim.py) and model-health CAS append. Keep in sync with
 # groom.py / select-and-claim.py / model-health.py LEDGER_REF.
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
+LEDGER_SIGNATURE_FIELD = "ledger_hmac_sha256"
+LEDGER_HMAC_ENV = "LEDGER_RECORD_HMAC_KEY"
 
 
 class WorkerPrError(RuntimeError):
@@ -157,6 +160,41 @@ def account_hash(handle, salt):
     if not handle or not salt:
         raise WorkerPrError("account hashing requires both a handle and PROVENANCE_SALT")
     return hashlib.sha256(f"{handle}:{salt}".encode()).hexdigest()[:16]
+
+
+def sign_ledger_record(document, key=None):
+    """Return a signed copy of an immutable provenance/verdict record.
+
+    The signature covers the canonical JSON form of every field except the signature itself.
+    A dedicated Actions secret is mandatory: an absent key must stop record production rather
+    than emit an unsigned blob onto the deliberately unprotected ledger branch.
+    """
+    if not isinstance(document, dict):
+        raise WorkerPrError("ledger record must be a JSON object")
+    secret = key if key is not None else os.environ.get(LEDGER_HMAC_ENV, "")
+    if not isinstance(secret, str) or not secret:
+        raise WorkerPrError(f"{LEDGER_HMAC_ENV} is required to sign ledger records")
+    unsigned = dict(document)
+    unsigned.pop(LEDGER_SIGNATURE_FIELD, None)
+    payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode("utf-8")
+    signed = dict(unsigned)
+    signed[LEDGER_SIGNATURE_FIELD] = hmac.new(
+        secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return signed
+
+
+def ledger_record_signature_valid(document, key=None):
+    """True only for an authentic record under the dedicated ledger signing secret."""
+    if not isinstance(document, dict):
+        return False
+    actual = document.get(LEDGER_SIGNATURE_FIELD)
+    secret = key if key is not None else os.environ.get(LEDGER_HMAC_ENV, "")
+    if (not isinstance(actual, str) or not re.fullmatch(r"[0-9a-f]{64}", actual)
+            or not isinstance(secret, str) or not secret):
+        return False
+    expected = sign_ledger_record(document, secret)[LEDGER_SIGNATURE_FIELD]
+    return hmac.compare_digest(actual, expected)
 
 
 def _alert_route():
@@ -1307,12 +1345,18 @@ def _registry_record_equivalent(existing_text, document, volatile_fields):
         return False
     if not isinstance(stored, dict):
         return False
+    # Signatures necessarily change when the permitted per-attempt stamp changes. Authenticate
+    # both complete documents first, then exclude only the signature from logical comparison.
+    if (not ledger_record_signature_valid(stored)
+            or not ledger_record_signature_valid(document)):
+        return False
+    comparison_ignored = set(volatile_fields) | {LEDGER_SIGNATURE_FIELD}
     # Every identifying (non-volatile) field must match with JSON-TYPE-EXACT equality — NOT Python
     # `==`, which coerces `True`/`1`, `False`/`0`, and `7.0`/`7` (#412 r2): a type-confused stored
     # value must never masquerade as an identical record.
     if not _json_type_exact(
-            {k: v for k, v in stored.items() if k not in volatile_fields},
-            {k: v for k, v in document.items() if k not in volatile_fields}):
+            {k: v for k, v in stored.items() if k not in comparison_ignored},
+            {k: v for k, v in document.items() if k not in comparison_ignored}):
         return False
     # Each volatile field is a `recorded_at_run` provenance stamp: ignore ONLY the attempt, never
     # the run identity. BOTH sides must carry a valid stamp sharing the same run — a missing,
@@ -1344,6 +1388,8 @@ def _registry_put_file(registry_repo, path, document, message, volatile_fields=f
     (pr #357 review r1 — a brief outage must not permanently drop a record); a permanent PUT
     error fails loud immediately. On final failure the REAL last API error is raised, never a
     generic conflict message."""
+    if path.startswith(f"{PROVENANCE_DIR}/") or path.startswith(f"{VERDICT_DIR}/"):
+        document = sign_ledger_record(document)
     body = json.dumps(document, indent=1, sort_keys=True) + "\n"
     encoded = base64.b64encode(body.encode()).decode()
     # BOTH record locations are probed before any success short-circuit (sol review r1 on
@@ -1494,7 +1540,7 @@ def verdict_envelope(target_repo, pr_number, round_n, reviewed_sha, document):
     written unbound."""
     if not re.fullmatch(r"[0-9a-f]{40}", reviewed_sha or ""):
         raise WorkerPrError("verdict envelope requires a 40-hex reviewed sha")
-    return {
+    return sign_ledger_record({
         "host_envelope": {
             "repo": target_repo,
             "pr": pr_number,
@@ -1502,13 +1548,15 @@ def verdict_envelope(target_repo, pr_number, round_n, reviewed_sha, document):
             "reviewed_sha": reviewed_sha,
         },
         "verdict": document,
-    }
+    })
 
 
 def envelope_verdict(record):
     """The model verdict document from a registry record: the nested `verdict` of an issue
     #156 envelope, or the whole record for a legacy pre-#156 bare-document record (readers
     stay backward compatible with records written before the envelope existed)."""
+    if not ledger_record_signature_valid(record):
+        return {}
     if (isinstance(record, dict) and isinstance(record.get("host_envelope"), dict)
             and "verdict" in record):
         return record["verdict"]
@@ -1519,7 +1567,8 @@ def envelope_reviewed_sha(record):
     """The reviewed sha an issue #156 envelope binds its verdict to, or None for a legacy
     bare-document record (which the caller MUST treat as unbound — fail closed and re-review,
     never consume it as if it matched the live head)."""
-    if isinstance(record, dict) and isinstance(record.get("host_envelope"), dict):
+    if (ledger_record_signature_valid(record)
+            and isinstance(record.get("host_envelope"), dict)):
         sha = record["host_envelope"].get("reviewed_sha")
         if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
             return sha
@@ -1532,7 +1581,8 @@ def envelope_identity_matches(record, expected_repo, expected_pr, expected_round
     equal to an int). The reviewed sha alone does not identify a verdict: two PRs (or two
     rounds of one PR) can share a commit, so a matching-sha record for the wrong repo/PR/round
     must never seed the fixer. Any missing, malformed, or mismatched field is False."""
-    if not (isinstance(record, dict) and isinstance(record.get("host_envelope"), dict)):
+    if not (ledger_record_signature_valid(record) and
+            isinstance(record.get("host_envelope"), dict)):
         return False
     env = record["host_envelope"]
     repo, pr, round_n = env.get("repo"), env.get("pr"), env.get("round")
@@ -2713,6 +2763,7 @@ def fix_outcome(args):
 
 # ---- self-test ------------------------------------------------------------------------------------
 def _self_test():
+    os.environ.setdefault(LEDGER_HMAC_ENV, "selftest-ledger-record-key")
     ok = True
 
     def check(name, got, want):
@@ -3535,6 +3586,7 @@ def _self_test():
         return argparse.Namespace(returncode=0, stdout=json.dumps(meta), stderr="")
 
     def record_meta(document):
+        document = sign_ledger_record(document)
         body = json.dumps(document, indent=1, sort_keys=True) + "\n"
         return {"content": base64.b64encode(body.encode()).decode(), "sha": "f" * 40}
 
@@ -4352,7 +4404,7 @@ def _self_test():
     check("label colours cover review namespace", set(LABEL_COLOURS), set(REVIEW_LABELS))
 
     # ---- issue #156: the host envelope binds the verdict to the reviewed sha, and readers
-    # unwrap it (legacy bare documents stay readable) ----
+    # unwrap it only after authenticating the immutable ledger envelope ----
     _env_doc = {"verdict": "approve", "injection_detected": False, "summary": "s",
                 "issues": [], "progress": "improving"}
     _env = verdict_envelope("o/r", 41, 3, "a" * 40, _env_doc)
@@ -4362,8 +4414,13 @@ def _self_test():
           ("o/r", 41, 3, "a" * 40))
     check("envelope nests the model document untouched", _env["verdict"], _env_doc)
     check("envelope_verdict unwraps an enveloped record", envelope_verdict(_env), _env_doc)
-    check("envelope_verdict returns a legacy bare document unchanged",
-          envelope_verdict(_env_doc), _env_doc)
+    check("unsigned legacy verdict fails closed", envelope_verdict(_env_doc), {})
+    _tampered_env = json.loads(json.dumps(_env))
+    _tampered_env["verdict"]["verdict"] = "request_changes"
+    check("tampered signed verdict fails closed", envelope_verdict(_tampered_env), {})
+    check("valid signature is accepted", ledger_record_signature_valid(_env), True)
+    check("missing signing key rejects a record",
+          ledger_record_signature_valid(_env, ""), False)
     check("envelope_reviewed_sha reads the bound sha", envelope_reviewed_sha(_env), "a" * 40)
     check("envelope_reviewed_sha is None for a legacy bare document",
           envelope_reviewed_sha(_env_doc), None)
