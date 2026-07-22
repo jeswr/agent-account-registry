@@ -1588,9 +1588,25 @@ def _cmd_record(args):
     else:
         handle = os.environ.get("WORKER_ACCOUNT_HANDLE", args.account or "")
         if not handle or not salt:
-            print("::warning::model-health record: no account handle/salt — recording without a "
-                  "per-account hash is unsafe; skipping (telemetry must never fail a run)")
-            return 0
+            # A missing handle/salt is NOT a benign skip. Recording without the per-account salted
+            # hash is a privacy violation (a raw handle would reach the ledger), so we cannot fall
+            # back to an unsalted record — but the old warning-and-return-0 was worse: it dropped
+            # EVERY per-account health record while the recorder step stayed green. A missing
+            # PROVENANCE_SALT in particular is a FLEET-WIDE configuration failure — it blanks the
+            # whole ledger, so `decide` never sees the outage it exists to page on (issue #201).
+            # Exit NONZERO so a missing salt is never classified as successful recording. The record
+            # call sites are SEPARATE always()-guarded jobs (worker.yml / review-fix.yml
+            # `model_health`); nothing `needs:` them for success, so a red job is a durable,
+            # notifying configuration alert that never fails or reclassifies the model run — the
+            # same posture as the CAS-exhaustion path below (review defect #8).
+            missing = " and ".join(name for name, value in
+                                   (("account handle", handle), ("PROVENANCE_SALT", salt))
+                                   if not value)
+            print(f"::error::model-health record: missing {missing} — cannot compute the "
+                  "per-account salted hash, so this health record is being DROPPED. This is a "
+                  "fleet-wide configuration failure that silently blanks the health ledger; failing "
+                  "the telemetry job so the misconfiguration is visible, not falsely green.")
+            return 1
         account_h = account_hash(handle, salt)
     no_change = {field: getattr(args, field, None)
                  for field in ("input_tokens", "output_tokens", "wall_seconds", "issue")}
@@ -2677,6 +2693,15 @@ def _test_record_exit(chk):
                 return None    # empty ledger; every PUT below loses the CAS race
             raise HealthConflict("stub: permanent CAS contention")
 
+    class _NeverWriteAPI:
+        """Fails LOUD if any request is issued — the missing-input guard must short-circuit BEFORE
+        touching the ledger (a dropped record must not also mint a half-written CAS attempt)."""
+        def __init__(self, token):
+            pass
+
+        def request(self, *a, **k):
+            raise AssertionError("record must not reach the API when handle/salt is missing")
+
     real_sleep = globals()["_sleep_backoff"]
     globals()["_sleep_backoff"] = lambda attempt: None   # never sleep the jittered backoff in-test
     try:
@@ -2686,6 +2711,19 @@ def _test_record_exit(chk):
         args = _ap.Namespace(provider="anthropic", account="", model_alias="fable",
                              exit_class="auth", run_id="1", reset_hint=None)
         chk("record exits nonzero on CAS exhaustion", _cmd_record(args), 1)
+        # issue #201: a missing PROVENANCE_SALT (fleet-wide config failure) or handle must NOT be
+        # classified as successful recording — the recorder exits NONZERO so the separate telemetry
+        # job goes red, and never falls through to a raw/unsalted (or dropped-but-green) record.
+        GitHubAPI = _NeverWriteAPI
+        os.environ.pop("PROVENANCE_SALT", None)
+        chk("record exits nonzero when PROVENANCE_SALT is absent (fleet-wide config failure)",
+            _cmd_record(args), 1)
+        os.environ.update(PROVENANCE_SALT="s3cret")
+        os.environ.pop("WORKER_ACCOUNT_HANDLE", None)
+        no_handle = _ap.Namespace(provider="anthropic", account="", model_alias="fable",
+                                  exit_class="auth", run_id="1", reset_hint=None)
+        chk("record exits nonzero when the account handle is absent",
+            _cmd_record(no_handle), 1)
     finally:
         GitHubAPI = real_api
         globals()["_sleep_backoff"] = real_sleep
