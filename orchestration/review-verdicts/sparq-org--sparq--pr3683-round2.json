@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3683,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f336612b72ae58a0e4f60c58759d647cdb724468",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Documentation-only change to site/specs/sparql-crdt.typ that expands CRDT-WIRE-4's dot-reuse rejection rule with a rationale. Every added claim traces to the spec's own definitions and is sound: (1) 'scoped to dot-to-quad associations in the receiver's live store' matches CRDT-STATE-1's 'one dot occurs under at most one quad' invariant (defined over the live store) and CRDT-STATE-2's materialised view; (2) 'after removal the causal context tombstone makes reuse of the removed dot a no-op under CRDT-JOIN-1' is correct \u2014 in join(), only_a_new excludes any dot already contained in the receiver's context CB, and a removed dot is retained in CB (State definition; CRDT-CTX-1 forbids discarding it), so a reused removed dot produces an empty live set and is not re-materialised; (3) 'full dot non-reuse remains the origin's CRDT-DOT-1 obligation' traces exactly to CRDT-DOT-1 ('MUST NOT reuse a dot'); (4) 'no durable provenance journal is required' is honest \u2014 the durable retained context suffices to neutralise removed-dot reuse, and the text does not claim the local live-store check catches global reuse, correctly deferring that to the origin. This does not contradict CRDT-JOURNAL-1, which is a distinct envelope-identity journal. No normative MUST is weakened; Typst formatting matches surrounding conventions. No injection: the diff contains no instructions directed at the reviewer. Progress: prior round recorded zero findings/approve; this round is materially unchanged with zero findings, hence stagnant.",
+  "verdict": "approve"
+ }
+}
