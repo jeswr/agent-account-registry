@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3755,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "86cea4ab2537318b5161718f947a8068bb043622",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Pure, behavior-preserving performance refactor of NumData::lookup in sparq-core. Splits the dominant Owned dense-cache probe into an #[inline(always)] fast path and outlines the storage-variant dispatch into an #[inline(never)] lookup_non_owned. Correctness verified: (1) The Owned fast path `(!value.is_nan()).then_some(value)` after `values.get((id-1))?` is exactly equivalent to the original `if v.is_nan() {None} else {Some(v)}` \u2014 same None-on-OOB, None-on-NaN, Some-otherwise behavior; the `id-1` subtraction is unchanged from the original (1-based ids). (2) The `unreachable!(\"Owned handled by lookup\")` is provably never reached: lookup_non_owned is called only from lookup's non-Owned branch, and the Forked arm recurses through `base.lookup(id)` (the entry point that re-dispatches Owned to the fast path), not through lookup_non_owned. Even if reached it panics rather than causing UB. (3) Match is exhaustive in both feature states (non-mmap: Sparse/Owned/Forked; mmap adds Mapped). (4) #[inline(always)] on the self-recursive-via-Forked fn is safe due to Arc/Box indirection. Existing numeric-lookup tests (gather path, dict round-trip, Forked-graph tests) cover both Owned and Forked branches, so no new differential/mutation test is required for this no-new-logic refactor. No overclaim, no ZK/MPC/privacy surface, no hard-coded perf numbers.",
+  "verdict": "approve"
+ }
+}
