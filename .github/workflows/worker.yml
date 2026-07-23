@@ -876,6 +876,33 @@ jobs:
             --bot-login "${{ steps.target.outputs.bot_login }}" \
             --issue-file "$RUNNER_TEMP/verified-issue.json"
 
+      # [issue #144 review r1] Snapshot the trust-gate VERIFIER out of every model-reachable path
+      # BEFORE the model runs. The pre-publish `republish-trust` re-check below must not execute
+      # the verifier from the post-model `target` tree: the model runs with that tree read-write
+      # (and a trust-surface issue legitimately edits it), so the candidate change would control
+      # the very program that authorizes its own publish. The copy is taken here — pre-model, from
+      # the SHA-pinned checkout (the same bytes the `trust` step just executed) — and lands under
+      # RUNNER_TEMP *outside* WORKER_ROOT: the model container mounts only the target tree and
+      # WORKER_ROOT/{home,cli} (worker-live.sh _run_headless_harness), so nothing the model runs
+      # can reach the snapshot. The recorded sha256 OUTPUT is the binding for host-side threats:
+      # the gate step later runs target-controlled cargo build scripts on the runner itself, which
+      # CAN rewrite runner files after this step — but completed-step outputs live in the runner's
+      # in-memory state and are re-expanded into the re-check from there, so on-disk tampering
+      # after capture flips the re-check's digest comparison and publish fails closed. No
+      # continue-on-error: a failed snapshot dies HERE, before any model spend, and the separate
+      # final_state job converges the issue exactly as for any pre-model abort.
+      - name: Pin trust-gate verifier outside the model-writable tree
+        id: pin-trust-gate
+        if: ${{ !inputs.dry_run && steps.trust.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          src="$GITHUB_WORKSPACE/target/scripts/trust-gate.py"
+          dst="$RUNNER_TEMP/trust-verifier/trust-gate.py"
+          install -D -m 0444 "$src" "$dst"
+          sha="$(sha256sum "$dst" | cut -d' ' -f1)"
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Mark trusted live issue in progress + post claim receipt
         if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.trust.outcome == 'success' }}
         env:
@@ -1078,9 +1105,61 @@ jobs:
           # branches touching .github/workflows/* (role:ci issues were structurally blocked).
           permission-workflows: write
 
+      # Last-step trust is validated ONCE MORE here — in the fresh publisher, immediately before
+      # push/PR creation (issue #144). The pre-model `trust` step ran BEFORE the model and the
+      # host-side cargo gate, i.e. potentially tens of minutes ago; a maintainer who has since
+      # closed, rewritten, or human-parked the issue would otherwise be published over from that
+      # stale snapshot. This repeats the FULL live author / body-SHA / status-label / trust-gate
+      # revalidation against the LIVE issue and re-freshens verified-issue.json, so publish only
+      # ever runs from a snapshot re-attested seconds earlier. On ANY drift it fails (continue-on-
+      # error, mirroring the pre-model `trust` step) which gates the publish step below OFF.
+      # [review r2] The status-label check runs in `--mode pre-publish`: the claim step above
+      # ITSELF moved the issue ready -> in-progress, so dispatch mode's status:ready demand would
+      # reject every legitimate run and publication would never fire. Pre-publish mode instead
+      # accepts exactly this run's still-live claim — status:in-progress with no other gate, no
+      # returned status:ready, and the issue's NEWEST record-attempt receipt bound to this run's
+      # $GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT key (the immutable receipt the `attempt` step posted).
+      # A foreign or unbound claim, human parking, deferral, or a re-opened pool state still
+      # fails closed exactly as before.
+      # reverify changes NO human-owned issue state — it only READS the issue and runs the
+      # read-only trust gate — so an aborted publish leaves the maintainer's action intact and the
+      # separate final_state job converges the issue to `deferred` (back into the redispatch pool).
+      # --current-run-key excludes THIS run's own record-attempt receipt from the third-party
+      # maintainer-approval staleness check (that receipt is a start, not a failure to be re-blessed).
+      # [review r1] TRUST ROOT: unlike the pre-model `trust` step, this re-check runs AFTER the
+      # model mutated the target tree, so it executes the verifier snapshot the `pin-trust-gate`
+      # step captured pre-model from the SHA-pinned checkout — never the target tree's copy, which
+      # by now is candidate-change-controlled. See that step's comment for the full threat model.
+      - name: Re-verify live trust immediately before publish (drift → abort, no state change)
+        id: republish-trust
+        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' && steps.pin-trust-gate.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
+        run: |
+          set -euo pipefail
+          # The verifier path comes from the runner.temp EXPRESSION (runner state — immune to a
+          # $GITHUB_ENV append by the gate's target-controlled build scripts, which could redirect
+          # a $RUNNER_TEMP env lookup) and is re-bound to the digest recorded in the pin step's
+          # in-memory output before it is executed. Wrong digest → abort → publish stays gated off.
+          verifier='${{ runner.temp }}/trust-verifier/trust-gate.py'
+          expected='${{ steps.pin-trust-gate.outputs.sha256 }}'
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::pinned verifier digest missing'; exit 1; }
+          printf '%s  %s\n' "$expected" "$verifier" | sha256sum --check --strict --quiet -
+          python3 registry/scripts/worker-issue.py reverify \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --expected-author "${{ needs.resolve.outputs.issue_author }}" \
+            --expected-body-sha "${{ needs.resolve.outputs.issue_body_sha }}" \
+            --trust-gate "$verifier" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --issue-file "$RUNNER_TEMP/verified-issue.json" \
+            --current-run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --mode pre-publish
+
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
-        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' && steps.republish-trust.outcome == 'success' }}
         working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}

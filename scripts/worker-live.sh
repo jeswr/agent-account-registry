@@ -911,6 +911,26 @@ _workflow_step_if() {
   ' "$file"
 }
 
+# PURE (self-tested): print a workflow step's FULL text — its `- name:` line through the line
+# before the next `- name:` — selected by its exact `id:`. The `if:`-only extractor above cannot
+# see a step's `run:` block, but the #144 trust-root property is about WHICH program the
+# pre-publish re-check executes, and that lives in the body. Empty when the step is absent.
+# (Comment lines that sit BETWEEN steps buffer with the PRECEDING step — assertions must match
+# text inside the step, e.g. flags in its run block, not prose in surrounding comments.)
+_workflow_step_body() {
+  local file="$1" id="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk -v id="$id" '
+    /^[[:space:]]*-[[:space:]]+name:/ {
+      if (started && has_id) { printf "%s", buf; found=1; exit }
+      started=1; has_id=0; buf=""
+    }
+    started { buf = buf $0 "\n" }
+    started && $0 ~ ("^[[:space:]]*id:[[:space:]]*" id "[[:space:]]*$") { has_id=1 }
+    END { if (started && has_id && !found) printf "%s", buf }
+  ' "$file"
+}
+
 # [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
 # unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
 # workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
@@ -2561,6 +2581,142 @@ PY
     "$(_workflow_step_if "$wf" pr | grep -c 'always()' || true)" "0"
   chk "the publish/PR step is guarded by gate success" \
     "$(_workflow_step_if "$wf" pr | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
+  # [issue #144] publish only ever runs from a snapshot re-attested in the fresh publisher: the
+  # pre-model `trust` step ran BEFORE the (tens-of-minutes) model + gate, so the publish/PR step
+  # additionally gates on a `republish-trust` re-check that runs on the SAME gate-success publish
+  # path. Non-vacuous: dropping the extra gate flips the first assertion red; dropping the re-check
+  # step's own gate flips the second. Both use the per-step extractor already proven above.
+  chk "the publish/PR step is ALSO gated on the pre-publish trust re-check (issue #144)" \
+    "$(_workflow_step_if "$wf" pr | grep -Fc "steps.republish-trust.outcome == 'success'" || true)" "1"
+  chk "the pre-publish trust re-check runs on the gate-success publish path (issue #144)" \
+    "$(_workflow_step_if "$wf" republish-trust | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
+
+  # --- [issue #144 review r1] the re-check's TRUST ROOT. The re-check runs AFTER the model
+  # mutated the target tree, so it must execute the verifier snapshot the `pin-trust-gate` step
+  # captured pre-model (from the SHA-pinned checkout, into RUNNER_TEMP outside every model-container
+  # mount) — NEVER target/scripts/trust-gate.py, where the candidate change would control the
+  # program authorizing its own publish. First prove the body extractor on a fixture (per-step in
+  # both directions + fail-closed on an unknown id), then assert the property on the real workflow.
+  # The pre-model `trust` step doubles as the live negative control: it legitimately uses the
+  # target-tree path (pre-model = still the pinned revision), so the extractor demonstrably
+  # separates the two reverify call sites rather than matching anywhere in the file. ---
+  cat > "$tmp/wf-body.yml" <<'YAML'
+      - name: one
+        id: alpha
+        run: |
+          echo alpha-marker
+      - name: two
+        id: beta
+        run: |
+          echo beta-marker
+YAML
+  chk "step-body extractor returns ONLY the selected step's text (per-step, non-vacuous)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" alpha | grep -c 'marker' || true)" "1"
+  chk "step-body extractor reaches the file's LAST step too (END path)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" beta | grep -Fc 'beta-marker' || true)" "1"
+  chk "step-body extractor yields NOTHING for an unknown id (fail-closed)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" gamma | grep -c . || true)" "0"
+  chk "pre-publish re-check executes the PINNED verifier snapshot (issue #144 r1)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "verifier='\${{ runner.temp }}/trust-verifier/trust-gate.py'" || true)" "1"
+  chk "pre-publish re-check NEVER resolves the model-mutable target verifier (issue #144 r1)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -c 'target/scripts/trust-gate' || true)" "0"
+  chk "pre-publish re-check re-binds the snapshot to the pin step's recorded digest" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "expected='\${{ steps.pin-trust-gate.outputs.sha256 }}'" || true)" "1"
+  chk "pre-publish re-check enforces that digest with sha256sum --check --strict" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Fc 'sha256sum --check --strict' || true)" "1"
+  chk "pre-publish re-check requires the snapshot step to have succeeded" \
+    "$(_workflow_step_if "$wf" republish-trust \
+       | grep -Fc "steps.pin-trust-gate.outcome == 'success'" || true)" "1"
+  chk "verifier snapshot copies FROM the SHA-pinned pre-model checkout" \
+    "$(_workflow_step_body "$wf" pin-trust-gate \
+       | grep -Fc 'src="$GITHUB_WORKSPACE/target/scripts/trust-gate.py"' || true)" "1"
+  chk "pre-model trust step still reverifies with the pinned-checkout copy (negative control)" \
+    "$(_workflow_step_body "$wf" trust \
+       | grep -Fc -- '--trust-gate "$GITHUB_WORKSPACE/target/scripts/trust-gate.py"' || true)" "1"
+  # Capture ORDER is the immutability argument: the snapshot's content is trustworthy only because
+  # it is taken before any model code can run. Moving the pin step below the model step flips this.
+  local pin_at model_at
+  pin_at=$(awk '/^[[:space:]]*id:[[:space:]]*pin-trust-gate[[:space:]]*$/{print NR; exit}' "$wf")
+  model_at=$(awk '/^[[:space:]]*id:[[:space:]]*model[[:space:]]*$/{print NR; exit}' "$wf")
+  chk "verifier snapshot is captured BEFORE the model step runs" \
+    "$([[ -n "$pin_at" && -n "$model_at" && "$pin_at" -lt "$model_at" ]] \
+       && echo before || echo after-or-missing)" "before"
+
+  # --- [issue #144 review r2] the re-check must accept the workflow's OWN label lifecycle. The
+  # claim step moves the issue ready -> in-progress before the model runs, so a dispatch-mode
+  # reverify (which demands status:ready) would deterministically reject EVERY legitimate publish
+  # — the re-check must run in pre-publish mode, bound to this run's record-attempt receipt via
+  # the SAME run key the attempt step posted. Wiring first (text of the real workflow: the mode
+  # flag, both ends of the run-key binding, and the pre-model trust step as the dispatch-mode
+  # negative control), then behaviour: a driver runs the REAL reverify pre-publish path over the
+  # label state produced by the module's own STATUS_TRANSITIONS table, with only the GitHub API
+  # seams stubbed. Non-vacuous in both directions: this run's bound claim must be ACCEPTED (the
+  # r2 always-reject regression flips it red), while a superseded claim, an unbound in-progress
+  # state, and dispatch mode over the same state must all be REFUSED. ---
+  chk "pre-publish re-check runs reverify in pre-publish mode (issue #144 r2)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Fc -- '--mode pre-publish' || true)" "1"
+  chk "pre-publish re-check binds the claim to this run's key" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc -- '--current-run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"' || true)" "1"
+  chk "record-attempt posts the receipt under the SAME run key (the binding's other end)" \
+    "$(_workflow_step_body "$wf" attempt \
+       | grep -Fc -- '--run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"' || true)" "1"
+  chk "pre-model trust step stays in dispatch mode (still demands status:ready)" \
+    "$(_workflow_step_body "$wf" trust | grep -c -- '--mode' || true)" "0"
+  cat > "$tmp/prepub-driver.py" <<'PY'
+"""[issue #144 r2] Drive the REAL worker-issue reverify pre-publish path over the label state the
+workflow's own ready -> in-progress transition produces (taken from STATUS_TRANSITIONS, not
+hand-written). Only the GitHub API seams are stubbed; the trust-gate subprocess is real.
+argv: <worker-issue.py path> <scenario: own|foreign|unbound|dispatch> <tmpdir>"""
+import contextlib
+import importlib.util
+import io
+import json
+import pathlib
+import sys
+
+path, scenario, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("worker_issue", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+gate = pathlib.Path(tmp) / "prepub-gate.py"
+gate.write_text("print('trusted')\n", encoding="utf-8")
+add, remove = module.STATUS_TRANSITIONS["in-progress"]
+live = ({"status:ready", "role:impl"} | add) - (remove - add)
+item = {"state": "open", "user": {"login": "jeswr"}, "body": "task",
+        "labels": [{"name": name} for name in sorted(live)]}
+own = {"user": {"login": "sparq[bot]"},
+       "body": f"x {module.ATTEMPT_MARKER} run=77.1 -->",
+       "created_at": "2026-07-19T01:00:00Z"}
+foreign = {"user": {"login": "sparq[bot]"},
+           "body": f"x {module.ATTEMPT_MARKER} run=88.1 -->",
+           "created_at": "2026-07-19T02:00:00Z"}
+comments = {"own": [own], "dispatch": [own],
+            "foreign": [own, foreign], "unbound": [foreign]}[scenario]
+module._gh_json = lambda args, *, input_doc=None: json.loads(json.dumps(item))
+module._paginated = lambda repo, issue, resource: list(comments)
+try:
+    # reverify prints its own receipt line; the chk contract is the bare verdict word only.
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.reverify("o/r", 1, "jeswr", module.body_sha("task"), str(gate), "sparq[bot]",
+                        str(pathlib.Path(tmp) / f"prepub-issue-{scenario}.json"),
+                        "77.1", "dispatch" if scenario == "dispatch" else "pre-publish")
+    print("accepted")
+except module.WorkerIssueError:
+    print("refused")
+PY
+  local wisrc="$SCRIPT_DIR/worker-issue.py"
+  chk "pre-publish reverify ACCEPTS this run's own ready->in-progress claim (lifecycle)" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" own "$tmp" 2>/dev/null || true)" "accepted"
+  chk "pre-publish reverify REFUSES an in-progress claim superseded by ANOTHER run" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" foreign "$tmp" 2>/dev/null || true)" "refused"
+  chk "pre-publish reverify REFUSES status:in-progress with NO matching claim receipt" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" unbound "$tmp" 2>/dev/null || true)" "refused"
+  chk "dispatch-mode reverify still REFUSES the in-progress state (mode is load-bearing)" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" dispatch "$tmp" 2>/dev/null || true)" "refused"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
