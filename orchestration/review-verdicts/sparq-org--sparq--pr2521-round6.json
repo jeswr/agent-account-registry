@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2521,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e64f3f0bf3a43005d1914be0069342f24225570f",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 resolves the prior major finding. The primer now includes a cargo test --no-run wasm32 invocation for every wasm-pack test package/feature state in ci.yml, covering the test/dev dependency closures that were previously omitted. The new structural guard compares build, clippy, and test state sets in both directions, refuses a vacuous target extraction, and its self-test explicitly proves that dropping a test/dev state is detected. The workflow states shown in the diff match the target wasm-pack states, including default/shacl/jsonld/explain-json, reason default/explain, RSP, text, SHACL default/shacl-af, introspect, and Solid. No correctness, soundness, test-validity, or security defect remains in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
