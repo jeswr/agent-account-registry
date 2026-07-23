@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "38d3cd8362f845139c0aa15aa4212033",
-   "holder": "sparq-org/sparq#3203@29973594669.1",
-   "package": "sparq-engine",
-   "role": "perf",
-   "model": "sol",
-   "issued_at": 1784772480,
-   "expires_at": 1784778780
-  }
- ]
+ "leases": []
 }
