@@ -109,6 +109,26 @@ def _load_helper(name, filename):
     return module
 
 
+# Shared park-label policy: the terminal needs:user write consults the sticky human-unpark
+# veto before every application (park_policy.py).
+_park_policy = _load_helper("registry_park_policy", "park_policy.py")
+
+
+def _is_human_maintainer(api, repo, login):
+    """The strict maintainer probe for the unpark veto (park-policy hygiene finding; the
+    worker-issue._is_human_maintainer pattern): repo collaborator permission in
+    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe-call FAILURE counts as NOT a maintainer
+    and emits the shared distinct ::warning:: diagnostic (park_policy.probe_maintainer,
+    round-3 Opus finding); a genuine not-a-maintainer permission stays quiet."""
+    def read_permission(probe_login):
+        payload = api.request("GET", f"/repos/{repo}/collaborators/{probe_login}/permission")
+        if not isinstance(payload, dict):
+            raise ResolverError("collaborator permission payload is malformed")
+        return payload.get("permission")
+
+    return _park_policy.probe_maintainer(repo, login, read_permission)
+
+
 def load_target_repositories(policy_file, registry_repo):
     """Return enabled policy targets plus the registry itself, in policy order."""
     with open(policy_file, "rb") as handle:
@@ -211,6 +231,9 @@ class GitHubAPI:
 
     def comments(self, repo, number):
         return self.paginated(f"/repos/{repo}/issues/{number}/comments")
+
+    def timeline(self, repo, number):
+        return self.paginated(f"/repos/{repo}/issues/{number}/timeline")
 
     def comment(self, repo, number, body):
         return self.request("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body})
@@ -528,7 +551,18 @@ class ConflictResolver:
             self._post(repo, number, body)
         # Label last: if either mutation is interrupted, the next tick still sees an
         # unheld PR and converges the missing mutation without duplicating the loud marker.
+        # This park stays needs:user — an unresolvable merge conflict is a genuine human
+        # question — but the sticky human-unpark veto (park_policy.py defect 2) still applies:
+        # a human who removed the label more recently than any application is never overridden,
+        # and an unreadable timeline never parks.
         if self.apply:
+            if _park_policy.park_vetoed(
+                    repo, number, "needs:user",
+                    lambda r, n: self.api.timeline(r, n),
+                    is_human=lambda login: _is_human_maintainer(self.api, repo, login)):
+                self._record("needs:user-suppressed", repo, number,
+                             "sticky human unpark (or unreadable timeline)")
+                return
             self.api.add_label(repo, number, "needs:user")
         self._record("needs:user", repo, number, ", ".join(conflicts))
 
@@ -731,13 +765,15 @@ def _self_test():
         }
 
     class FakeAPI:
-        def __init__(self, pulls, sequences=None):
+        def __init__(self, pulls, sequences=None, timelines=None):
             self.tokens = {"example": "test-token"}
             self.prs = {pr["number"]: deepcopy(pr) for pr in pulls}
             self.sequences = {number: [deepcopy(value) for value in values]
                               for number, values in (sequences or {}).items()}
             self.comment_rows = {pr["number"]: [] for pr in pulls}
             self.labels_added = []
+            self.timelines = {number: [deepcopy(event) for event in events]
+                              for number, events in (timelines or {}).items()}
 
         def has_token(self, _repo):
             return True
@@ -760,6 +796,17 @@ def _self_test():
 
         def comments(self, _repo, number):
             return deepcopy(self.comment_rows[number])
+
+        def timeline(self, _repo, number):
+            return deepcopy(self.timelines.get(number, []))
+
+        def request(self, method, url, body=None):
+            # The strict maintainer probe (park-policy hygiene finding): jeswr is a repo
+            # admin; everyone else — bots, outsiders, unverifiable actors — is not.
+            if method == "GET" and "/collaborators/" in url and url.endswith("/permission"):
+                login = url.rsplit("/", 2)[-2]
+                return {"permission": "admin" if login == "jeswr" else "none"}
+            raise AssertionError(f"unexpected FakeAPI request: {method} {url}")
 
         def comment(self, _repo, number, body):
             self.comment_rows[number].append({"body": body, "user": {"login": bot_login}})
@@ -827,6 +874,22 @@ def _self_test():
     check("two distinct attempts add needs:user exactly once", api.labels_added, [(10, "needs:user")])
     check("two attempt markers are durable", sum(bool(ATTEMPT_RE.search(body)) for body in bodies), 2)
     check("loud escalation comment is exactly once", sum(ESCALATION_MARKER in body for body in bodies), 1)
+
+    # (b2) Sticky human unpark (park_policy.py defect 2): the SAME two-attempt escalation is
+    # label-SUPPRESSED when the PR timeline shows a human removed needs:user more recently than
+    # any application — the resolver never overrides an explicit human unpark.
+    veto_timeline = [
+        {"event": "labeled", "label": {"name": "needs:user"},
+         "created_at": "2026-07-18T10:00:00Z", "actor": {"login": bot_login}},
+        {"event": "unlabeled", "label": {"name": "needs:user"},
+         "created_at": "2026-07-18T11:00:00Z", "actor": {"login": "jeswr"}},
+    ]
+    api = FakeAPI([pull(10, "a" * 40)], timelines={10: veto_timeline})
+    rebaser = FakeRebaser("conflict")
+    ConflictResolver(api, snapshot, claim, [repo], bot_login, True, 5, rebaser).run()
+    api.set_head(10, "c" * 40)
+    ConflictResolver(api, snapshot, claim, [repo], bot_login, True, 5, rebaser).run()
+    check("human unpark vetoes the needs:user re-park", api.labels_added, [])
 
     # (c) Dependabot receives a command, never a host rebase, once per head SHA.
     api = FakeAPI([pull(20, "d" * 40, author=DEPENDABOT_LOGIN)])

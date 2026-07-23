@@ -38,13 +38,23 @@ if _retry_spec is None or _retry_spec.loader is None:
 ledger_retry = importlib.util.module_from_spec(_retry_spec)
 _retry_spec.loader.exec_module(ledger_retry)
 
-REVIEW_LABELS = ("review:needs", "review:changes", "review:pass", "review:needs-user")
+REVIEW_LABELS = ("review:needs", "review:changes", "review:pass", "review:needs-user",
+                 "review:parked")
 LABEL_COLOURS = {
     "review:needs": "1d76db",
     "review:changes": "e99695",
     "review:pass": "0e8a16",
     "review:needs-user": "b60205",
+    "review:parked": "1d76db",
 }
+# The MACHINE-owned PR-side capacity park (park_policy.py ownership split; the PR twin of the
+# source issue's status:parked). Written by needs_user(park_class="capacity") INSTEAD of the
+# human-owned review:needs-user: a capacity/decline/budget stop is a SOFT hold — excluded from
+# active review/fix enumeration, veto-gated like every park label, and re-admitted by a human
+# unlabel of review:parked OR status:parked OR needs:user on either surface (latest event
+# wins; park_policy.READMISSION_LABELS). Kept in REVIEW_LABELS so set_review_state's
+# mutually-exclusive namespace machinery converges it like any other review state.
+MACHINE_PARK_PR_LABEL = "review:parked"
 # Run-keyed durable markers (bot comments). Each carries the round + the workflow run key so a
 # re-run of the same phase is idempotent (mirror worker-issue record_attempt) and stop conditions
 # are computed from ordered, run-keyed markers — never raw comment counts.
@@ -73,6 +83,24 @@ MARKER_KINDS = {
 FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
 MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
 PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
+# Budget-exhaustion window receipt (finding B; round-3 finding 1 made it label-INDEPENDENT):
+# EVERY consumed-and-exhausted budget window — the INITIAL full-budget window included — is
+# receipted with this marker bound to its window key (the readmission cutoff, or
+# PARK_WINDOW_NONE for the initial window). The receipt set IS the durable escalation ladder
+# (park_policy.park_ladder_decision): (a) it dedupes the park transition per window (a
+# veto-suppressed label write must not re-comment every tick — and must never STALL the
+# ladder, since generations are counted from receipts, never from labels), and (b) once
+# park_policy.PARK_ESCALATION_GENERATIONS windows have been consumed the park escalates to a
+# QUESTION-class terminal (review:needs-user / needs:user, veto-checked with an HONEST
+# comment when the label write was suppressed) naming the repeated failure, so nothing spins
+# through readmission windows forever. Bot-authored + reserved-namespace like every other
+# durable marker (post_findings defangs the whole `<!-- sparq-` namespace in republished
+# verdict text).
+PARK_GENERATION_MARKER = "<!-- sparq-park-generation:v1"
+# The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
+# (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
+# it cannot collide with a real cutoff).
+PARK_WINDOW_NONE = "none"
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # Provider escalation ladders in ESCALATION order — weakest tier FIRST, STRONGEST (terminal)
 # tier LAST: ladder index is capability rank, exhaustion escalates UPWARD by pinning the tier
@@ -241,6 +269,109 @@ def count_rounds(comments, bot_login):
             if (round_n, run_key) not in voided:
                 best = max(best, round_n)
     return best
+
+
+def count_rounds_since(comments, bot_login, since, log=print):
+    """Substantive review rounds charged to the ROUND BUDGET after a human readmission.
+
+    Live defect (sparq#2804/PR#3442, 2026-07-23): the budget re-derivation counted ALL
+    historical rounds, so five rounds burned during a broken-CI era re-parked the PR 22 minutes
+    after the maintainer explicitly removed needs:user — the human said "keep trying" and the
+    math ignored it. `since` is the readmission cutoff (park_policy.readmission_cutoff — the
+    latest HUMAN `unlabeled` needs:user across the PR and its source issue); this returns the
+    NUMBER of distinct unvoided rounds whose (round, run) attempt was recorded at or after it.
+    A distinct COUNT, deliberately not count_rounds' highest-round-number: post-readmission
+    rounds continue the global numbering (6, 7, ...) for marker/verdict identity, and the
+    budget must charge how many ran since the human re-admitted, not where numbering reached.
+
+    Fail direction (toward the OLD conservative full count, never toward a fresh budget on
+    unproven data): a falsy `since` means no readmission window — the plain count_rounds
+    applies (and so does an UNPARSEABLE `since`, loudly); a marker whose comment has no
+    created_at is CHARGED; a marker whose comment carries an unparseable created_at is
+    CHARGED with a loud log (round-4 finding 3 + round-5 finding 2: the window compare is
+    over PARSED aware datetimes — park_policy.parse_ts — never raw strings, because an
+    equally-valid spelling like the space-separator "2026-07-23 10:30:00Z" VALIDATES yet
+    sorts lexicographically before "2026-07-23T09:00:00Z", so the old string compare read a
+    post-cutoff receipt as pre-cutoff and silently un-charged it, authorizing exhausted
+    work; unprovable time always counts AGAINST the budget, exactly like the
+    missing-timestamp case); an instant tie with the cutoff is CHARGED. Void subtraction is
+    global, exactly as in count_rounds."""
+    if not since:
+        return count_rounds(comments, bot_login)
+    parse_ts = _park_policy().parse_ts
+    try:
+        since_instant = parse_ts(since)
+    except ValueError:
+        log(f"::warning::readmission cutoff {since!r} is not a parseable timestamp — the "
+            "round budget keeps the FULL historical count (never a fresh budget on "
+            "unproven data)")
+        return count_rounds(comments, bot_login)
+    voided = _round_voids(comments, bot_login)
+    charged = set()
+    for comment in _bot_comments(comments, bot_login):
+        rounds = set()
+        for match in re.finditer(
+                re.escape(ROUND_MARKER)
+                + r" n=([1-9][0-9]*) run=(\S+)(?: sha=(?:[0-9a-f]{40}|none))? -->",
+                str(comment.get("body", ""))):
+            round_n, run_key = int(match.group(1)), match.group(2)
+            if (round_n, run_key) not in voided:
+                rounds.add(round_n)
+        if not rounds:
+            continue  # nothing chargeable in this comment — its timestamp is irrelevant
+        created = comment.get("created_at")
+        if isinstance(created, str) and created:
+            try:
+                created_instant = parse_ts(created)
+            except ValueError:
+                log(f"::warning::round receipt carries a malformed created_at {created!r} "
+                    "— CHARGED against the round budget (unprovable time can never "
+                    "authorize exhausted work)")
+            else:
+                if created_instant < since_instant:
+                    continue
+        charged.update(rounds)
+    return len(charged)
+
+
+def park_generation_cutoffs(comments, bot_login, log=print):
+    """The set of window keys whose budget exhaustion was already receipted
+    (PARK_GENERATION_MARKER — the readmission cutoff, or PARK_WINDOW_NONE for the initial
+    no-cutoff window). Bot-authored only, like every marker parser: a forged marker must never
+    inflate the generation count toward the question-class escalation, nor suppress a due park
+    receipt. len() of the result is the number of consumed budget windows — the durable
+    escalation-ladder counter (park_policy.park_ladder_decision).
+
+    Round-3 finding 4 (receipt-cutoff direction): a cutoff that is neither PARK_WINDOW_NONE
+    nor STRICT ISO-8601 is treated as ABSENT with a loud log — a corrupt receipt must never
+    count as a consumed window (it would prematurely escalate the terminal human question)
+    nor dedupe against a real cutoff. The conservative residue: with the receipt absent, the
+    ladder re-consumes that window once (one extra receipted comment) and the generation
+    count stays LOW — escalation is delayed, never fabricated. Receipts are bot-authored, so
+    a malformed one requires corrupted own output, not third-party input.
+
+    Round-6 finding 2 (canonical window keys): every parsed cutoff is CANONICALIZED
+    (park_policy.canonical_ts — compact Z-form, T separator, UTC) so receipt identity
+    matches the canonical keys park_ladder_decision now mints and readmission_cutoff now
+    returns. The pattern tolerates an embedded space so a LEGACY receipt written from a
+    space-form source cutoff ("cutoff=2026-07-23 10:30:00Z -->") — invisible to the old
+    `cutoff=(\\S+) -->` read, which made gen-1 repeat forever and gen-2 unreachable — is
+    recovered onto the same canonical key."""
+    pattern = re.escape(PARK_GENERATION_MARKER) + r" gen=([0-9]+) cutoff=(.+?) -->"
+    policy = _park_policy()
+    cutoffs = set()
+    for comment in _bot_comments(comments, bot_login):
+        for match in re.finditer(pattern, str(comment.get("body", ""))):
+            cutoff = match.group(2)
+            if cutoff != PARK_WINDOW_NONE:
+                if not policy.valid_timestamp(cutoff):
+                    log(f"::warning::malformed park-generation receipt cutoff {cutoff!r} "
+                        "treated as absent — the escalation ladder counts only well-formed "
+                        "receipts")
+                    continue
+                cutoff = policy.canonical_ts(cutoff)
+            cutoffs.add(cutoff)
+    return cutoffs
 
 
 def marker_runs(comments, bot_login, kind, round_n):
@@ -750,12 +881,85 @@ def _gh_json(args, *, input_doc=None, env=None):
 
 
 def _paginated_comments(repo, pr_number):
+    """All PR conversation comments (paginated). A malformed PAGE must RAISE, never be
+    silently dropped (round-3 finding 3): a discarded page could hold a durable receipt
+    (round/attempt/park-generation marker) — hiding one would un-count budget rounds or
+    un-consume an escalation-ladder window. Same fail-closed shape as _issue_timeline.
+
+    ENTRIES are validated at read time too (round-4 finding 4): each must be a dict with the
+    user(dict)/body(str)/created_at(str) shape every counter and marker parser relies on — a
+    `[[null]]` payload passed the old page-only check and crashed the first consumer
+    (_bot_comments None.get()) mid-decision, aborting the whole sweep. A malformed entry
+    raises exactly like a malformed page (it could BE a receipt — a ghost/deleted-user
+    comment is indistinguishable from a shape attack at this boundary), and the raise is a
+    WorkerPrError, which every caller already degrades to its documented conservative
+    per-call result instead of an unhandled crash."""
     pages = _gh_json([
         "api", "--paginate", "--slurp", f"repos/{repo}/issues/{pr_number}/comments?per_page=100",
     ])
     if not isinstance(pages, list):
         raise WorkerPrError("GitHub API returned malformed comments")
-    return [item for page in pages if isinstance(page, list) for item in page]
+    for page in pages:
+        if not isinstance(page, list):
+            raise WorkerPrError("GitHub API returned a malformed comments page")
+        for entry in page:
+            if (not isinstance(entry, dict)
+                    or not isinstance(entry.get("user"), dict)
+                    or not isinstance(entry.get("body"), str)
+                    or not isinstance(entry.get("created_at"), str)):
+                raise WorkerPrError("GitHub API returned a malformed comments entry")
+    return [item for page in pages for item in page]
+
+
+def _issue_timeline(repo, number):
+    """The FULL label timeline of an issue/PR (paginated) for the round-budget readmission
+    window. The newest events — the ones the readmission cutoff hinges on — are on the LAST
+    page, so a truncated/malformed read must RAISE rather than return a prefix — and a
+    malformed PAGE must raise for the same reason (it could hold the newest human unlabel;
+    silently dropping it would hide the exact event the veto/window hinge on). The caller
+    (park_policy) then applies its documented fail direction: veto => suppress the park;
+    budget/readmission => the full historical round count."""
+    pages = _gh_json([
+        "api", "--paginate", "--slurp", f"repos/{repo}/issues/{number}/timeline?per_page=100",
+    ])
+    if not isinstance(pages, list):
+        raise WorkerPrError("GitHub API returned a malformed timeline")
+    for page in pages:
+        if not isinstance(page, list):
+            raise WorkerPrError("GitHub API returned a malformed timeline page")
+    return [item for page in pages for item in page]
+
+
+def _is_human_maintainer(repo, login):
+    """The strict maintainer probe (worker-issue.py pattern; park-policy hygiene finding):
+    collaborator permission in park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe-call FAILURE
+    counts as NOT a maintainer and emits the shared distinct ::warning:: diagnostic
+    (park_policy.probe_maintainer, round-3 Opus finding); a genuine not-a-maintainer
+    permission stays quiet."""
+    def read_permission(probe_login):
+        result = _run_gh(
+            ["api", f"repos/{repo}/collaborators/{probe_login}/permission",
+             "--jq", ".permission"],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise WorkerPrError(f"permission probe exited {result.returncode}")
+        return result.stdout.strip()
+
+    return _park_policy().probe_maintainer(repo, login, read_permission)
+
+
+def _park_policy():
+    """The shared park-label policy module (park_policy.py: label ownership, the sticky
+    human-unpark veto, and the round-budget readmission cutoff). Loaded lazily so only the
+    paths that need it pay the import — same idiom as worker-issue.py."""
+    spec = importlib.util.spec_from_file_location(
+        "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py"))
+    if spec is None or spec.loader is None:
+        raise WorkerPrError("cannot load shared park policy")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _pr_changed_files(repo, pr_number):
@@ -893,6 +1097,13 @@ def set_review_state(repo, pr_number, state):
       between the add and the removes below, or a manual mislabel) to the fail-closed human hold
       (review:needs-user) instead of the requested state: a split state reads inconsistently
       downstream, so it stops at a human rather than resolving to a guessed "clean" value.
+
+    `state="parked"` (the machine capacity park review:parked) rides the same machinery: it is
+    a review:* label, so writing it drops the stale review state, a later legitimate transition
+    (CLAIM's readmission strip to review:needs) drops IT, the needs-user refusal above means a
+    capacity park can never displace a live human question, and an ambiguous split still
+    converges to the fail-closed human hold. Callers gate the parked write behind the sticky
+    human-unpark veto (needs_user) — this primitive stays veto-free like every other state.
 
     Only the review:* namespace is ever touched — needs:user and every non-review label are left
     intact, so a groom park is never collaterally stripped, and the add-before-removes ordering
@@ -1671,11 +1882,139 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
-               maintainer=None):
-    """Terminal, human-owned stop: review:needs-user label, an explanatory comment, the source
-    issue routed to needs-user, and an ops-alert-style registry ping. The PR stays DRAFT."""
-    set_review_state(repo, pr_number, "needs-user")
+               maintainer=None, park_class="question", bot_login=""):
+    """Loop stop: park labels on BOTH surfaces, an explanatory comment, and an ops-alert-style
+    registry ping. The PR stays DRAFT.
+
+    `park_class` picks the label PAIR (park_policy.py ownership split):
+    - "question" (default) — the stop poses a genuine human question (injection flag, corrupt
+      markers, unresolvable routing, a failed draft-undo): human-owned `review:needs-user` on
+      the PR (unconditional, exactly as always) and `needs:user` on the source issue.
+    - "capacity" — the stop is capacity/decline/budget-driven (round budget exhausted, repeated
+      honest declines, consecutive missed fix dispatches): the MACHINE-owned soft-hold pair —
+      `review:parked` on the PR and `status:parked` on the source issue — so a capacity blip
+      never masquerades as a human question on EITHER surface, never terminally absorbs the PR
+      (the pre-fix unconditional review:needs-user bypassed the veto and closed the readmission
+      window forever), and a human unlabel of review:parked / status:parked / needs:user on
+      either surface (latest wins) re-admits the whole loop.
+
+    Capacity parks are additionally BOUNDED by the label-independent escalation ladder
+    (finding B; round-3 finding 1 — park_policy.park_ladder_decision): EVERY consumed budget
+    window — the initial no-cutoff window included — is receipted with a
+    PARK_GENERATION_MARKER bound to its window key; a receipted window re-defers QUIETLY (no
+    label/comment churn even when the sticky veto suppressed the label write — the dedupe is
+    for comments only, the receipts themselves ARE the generation ladder), and once
+    PARK_ESCALATION_GENERATIONS windows have been consumed the stop escalates to the QUESTION
+    class (review:needs-user / needs:user, each write veto-checked, with a comment that is
+    HONEST when a label write was suppressed) so nothing spins forever. An unreadable label
+    timeline FREEZES the ladder (no receipt, no label, no comment this call). The receipt is
+    posted BEFORE any label write (RECEIPT-FIRST, round-4 finding 2): a crash mid-park can
+    only leave receipt-no-label — which the receipt-driven CLAIM proof gate covers — never
+    label-no-receipt, where a triage-side label removal would erase the park from every
+    proof surface. `bot_login` is required for every capacity park (the receipt parser's
+    trust filter). worker-issue's
+    set_status and the review:parked write here both enforce the sticky human-unpark veto
+    (strict maintainer probe) before writing."""
     handle = maintainer or os.environ.get("MAINTAINER_HANDLE", "jeswr")
+    if park_class == "capacity":
+        policy = _park_policy()
+        probe = lambda login: _is_human_maintainer(repo, login)  # noqa: E731
+        if not bot_login:
+            raise WorkerPrError(
+                "capacity park requires --bot-login (the durable generation receipts "
+                "cannot be parsed without the trust filter)")
+        cutoff = policy.readmission_cutoff(repo, pr_number, issue, _issue_timeline,
+                                           is_human=probe,
+                                           on_unreadable=policy.WINDOW_UNREADABLE)
+        receipts = park_generation_cutoffs(_paginated_comments(repo, pr_number), bot_login)
+        action, window_key, generation = policy.park_ladder_decision(cutoff, receipts)
+        if action == "freeze":
+            print(f"capacity park frozen for {repo}#{pr_number}: the label timeline is "
+                  "unreadable — no receipt, no label, no comment this run (the escalation "
+                  "ladder never advances on unproven data)")
+            return
+        if action == "dedupe":
+            print(f"capacity park already receipted for window {window_key}; awaiting a "
+                  "fresh human gesture — no label/comment churn")
+            return
+        generation_marker = (f"\n\n{PARK_GENERATION_MARKER} gen={generation} "
+                             f"cutoff={window_key} -->")
+        if action == "terminal":
+            # Bounded escalation: PARK_ESCALATION_GENERATIONS windows consumed — repeated
+            # post-readmission failure IS a human question now. The terminal label write is
+            # veto-checked like every park write (round-3 finding 1), and the comment never
+            # claims a label that did not land.
+            #
+            # RECEIPT-FIRST ordering (round-4 finding 2): the veto is PROBED first (so the
+            # receipt is honest about a suppressed write), the durable receipt is posted
+            # SECOND, and every label write comes LAST. Dying between receipt and labels
+            # leaves receipt-no-label — the receipt-driven CLAIM proof gate triggers on the
+            # receipts alone, so the park still holds (the designed direction). The OLD
+            # label-first order could die label-no-receipt: a triage actor then removes the
+            # label, PLAN sees no machine label, CLAIM sees no receipt AND no source label,
+            # and no readmission proof is ever requested again.
+            vetoed = policy.park_vetoed(repo, pr_number, "review:needs-user",
+                                        _issue_timeline, is_human=probe)
+            label_note = ("" if not vetoed else
+                          "\n\nNOTE: the `review:needs-user` label write was SUPPRESSED by "
+                          "a standing human unlabel (sticky veto) — no label was applied; "
+                          "this receipt alone records the terminal escalation.")
+            _comment(repo, pr_number,
+                     f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
+                     f"This PR was human-readmitted and exhausted its budget again — "
+                     f"{generation} budget window(s) consumed (latest readmission "
+                     f"{window_key}); repeated post-readmission failure is escalated as a "
+                     f"human question. @{handle} this pull request needs a human decision. "
+                     f"It remains a DRAFT and will not be auto-armed."
+                     f"{label_note}{generation_marker}")
+            if not vetoed:
+                set_review_state(repo, pr_number, "needs-user")
+            if issue:
+                _load_worker_issue().set_status(repo, issue, "needs-user")
+            _ops_alert(alert_repo, alert_token,
+                       f"⚠️ Review loop needs a human — {repo}#{pr_number}",
+                       f"> 🤖 SPARQ agent — {reason} (readmitted and exhausted "
+                       f"{generation}×)\n\nhttps://github.com/{repo}/pull/{pr_number} "
+                       f"needs @{handle}.")
+            print(f"needs-user recorded (post-readmission escalation, generation "
+                  f"{generation}{', label suppressed' if vetoed else ''}): {reason}")
+            return
+        # action == "park": consume this window — the soft-hold pair (best-effort labels)
+        # plus the MANDATORY receipt. The PR-side review:parked write is veto-gated exactly
+        # like the issue-side status:parked (park_policy.py invariant 2); the receipt lands
+        # regardless (it IS the durable ladder and the dedupe key), and the comment is honest
+        # when the label write was suppressed. RECEIPT-FIRST ordering (round-4 finding 2):
+        # veto probe, then the durable receipt, then the label writes — a crash after the
+        # receipt leaves receipt-no-label (covered by the receipt-driven CLAIM proof gate);
+        # the old label-first order could die label-no-receipt, and a triage-side label
+        # removal then erased the park from every proof surface.
+        parked = not policy.park_vetoed(repo, pr_number, MACHINE_PARK_PR_LABEL,
+                                        _issue_timeline, is_human=probe)
+        label_note = ("" if parked else
+                      "\n\nNOTE: the `review:parked` label write was SUPPRESSED by a "
+                      "standing human unlabel (sticky veto); this receipt records the "
+                      "consumed budget window without a label.")
+        _comment(repo, pr_number,
+                 f"> 🤖 SPARQ agent — the autonomous review loop parked this PR: {reason}\n\n"
+                 f"This is the MACHINE-owned capacity park (`{MACHINE_PARK_PR_LABEL}`), not a "
+                 f"human question: it remains a DRAFT and will not be auto-armed. A human can "
+                 f"re-admit it by removing the live machine park label(s) — "
+                 f"`{MACHINE_PARK_PR_LABEL}` here and `status:parked` on the source issue "
+                 f"(whichever are present; a `needs:user` unlabel on either surface also "
+                 f"opens the budget window) — the budget restarts from the latest gesture."
+                 f"{label_note}{generation_marker}")
+        if parked:
+            set_review_state(repo, pr_number, "parked")
+        if issue:
+            _load_worker_issue().set_status(repo, issue, "parked")
+        _ops_alert(alert_repo, alert_token,
+                   f"⚠️ Review loop capacity-parked — {repo}#{pr_number}",
+                   f"> 🤖 SPARQ agent — {reason}\n\nhttps://github.com/{repo}/pull/{pr_number} "
+                   f"is soft-parked (readmit by unlabeling); FYI @{handle}.")
+        print(f"capacity park recorded (generation {generation}"
+              f"{', label suppressed' if not parked else ''}): {reason}")
+        return
+    set_review_state(repo, pr_number, "needs-user")
     _comment(repo, pr_number,
              f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
              f"@{handle} this pull request needs a human decision. It remains a DRAFT and will "
@@ -1698,7 +2037,11 @@ def live_human_holds(repo, pr_number, issue=None, live=None):
     strips review:needs-user (the review:* labels are mutually exclusive) and silently unparks
     a PR whose crate the PLAN busy partition already freed for a sibling.
 
-    Returns the sorted list of live hold labels: the PR's own HUMAN_OWNED_LABELS if any, else
+    Returns the sorted list of live hold labels: the PR's own HUMAN_OWNED_LABELS — plus the
+    machine capacity park review:parked, a SOFT hold that must equally win over a stale
+    in-flight outcome (an outcome label transition would strip it via the mutually-exclusive
+    review:* namespace and silently unpark the PR; CLAIM strips it EXPLICITLY on a proven human
+    readmission before dispatching, so a legitimate re-entry never trips this) — if any, else
     the source issue's needs:* set (the issue is the explicit `issue` when supplied, else
     derived from the worker head ref). `live` may carry an already-fetched pulls/N document to
     avoid a duplicate read (ready_and_arm reuses its CAS read).
@@ -1730,7 +2073,8 @@ def live_human_holds(repo, pr_number, issue=None, live=None):
             for label in raw_labels):
         raise WorkerPrError(
             "live PR label payload is malformed; refusing to mutate (fail closed)")
-    holds = sorted({label["name"] for label in raw_labels} & set(HUMAN_OWNED_LABELS))
+    holds = sorted({label["name"] for label in raw_labels}
+                   & (set(HUMAN_OWNED_LABELS) | {MACHINE_PARK_PR_LABEL}))
     if holds:
         return holds
     source_issue = issue
@@ -2599,16 +2943,32 @@ def review_outcome(args):
     # Round-budget exhaustion consults the PURE decide_budget (maintainer directive 2026-07-17):
     # a model-tier escalation or an improving-progress grade extends the loop (hard cap 6 total
     # rounds inside decide_budget) instead of the flat needs-user at the base budget.
+    # Human-readmission window (sparq#2804/PR#3442, 2026-07-23): the budget charge is the
+    # POST-readmission round count — a human removing needs:user from the PR or its source
+    # issue restarts the budget so the loop actually retries instead of insta-re-parking on
+    # rounds burned before the human said "keep trying". No proven human unlabel (or a failed
+    # timeline read, logged loudly by park_policy) keeps the full historical count. args.round
+    # itself is untouched everywhere else: marker/verdict identity stays on global numbering.
     budget = {"action": "needs-user", "pin": None}
+    budget_rounds = args.round
     if args.round >= args.max_rounds and not document["injection_detected"]:
         comments = _paginated_comments(args.repo, args.pr)
+        cutoff = _park_policy().readmission_cutoff(
+            args.repo, args.pr, args.issue, _issue_timeline,
+            is_human=lambda login: _is_human_maintainer(args.repo, login))
+        if cutoff:
+            budget_rounds = count_rounds_since(comments, args.bot_login, cutoff)
+            if budget_rounds != args.round:
+                print(f"readmission window open for {args.repo}#{args.pr}: a human unlabeled "
+                      f"a park label at {cutoff}; the round budget charges {budget_rounds} of "
+                      f"{args.round} recorded round(s)")
         models = sorted({model
                          for models in fix_round_models(comments, args.bot_login).values()
                          for model in models})
-        budget = decide_budget(args.round, models, document.get("progress"),
+        budget = decide_budget(budget_rounds, models, document.get("progress"),
                                args.impl_provider, base_rounds=args.max_rounds)
     decision = decide_review(document["verdict"], has_blockers,
-                             document["injection_detected"], args.round, args.max_rounds,
+                             document["injection_detected"], budget_rounds, args.max_rounds,
                              security, budget_action=budget["action"])
     _write_outputs({"decision": decision, "verdict": document["verdict"],
                     "has_blockers": has_blockers,
@@ -2623,15 +2983,22 @@ def review_outcome(args):
     elif decision == "needs-user":
         approved = document["verdict"] == "approve" and not has_blockers
         if document["injection_detected"]:
-            reason = "the reviewer flagged possible prompt injection"
+            # A flagged injection is a genuine human (security) question -> needs:user.
+            reason, park_class = "the reviewer flagged possible prompt injection", "question"
         else:
-            reason = (f"the review round budget is exhausted at {args.round} round(s) (base "
+            # Round-budget exhaustion is budget-driven, not a human question: the source issue
+            # takes the machine-owned status:parked soft hold (park_policy.py defect 1).
+            # `budget_rounds` is the charged count — post-readmission when a human unlabeled
+            # needs:user (sparq#2804/PR#3442), the full history otherwise.
+            reason = (f"the review round budget is exhausted at {budget_rounds} round(s) (base "
                       f"{args.max_rounds}, hard cap {HARD_CAP_ROUNDS}) with no extension left — "
                       "the top fix tier has run and the latest verdict does not grade the PR "
                       "improving")
+            park_class = "capacity"
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
-                   alert_repo=alert_repo, alert_token=alert_token)
+                   alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
+                   bot_login=args.bot_login)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
         # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
@@ -2704,9 +3071,14 @@ def fix_outcome(args):
                   "two consecutive fix attempts made no change (fixer judges the findings spurious)"
                   if not made_changes else
                   "the local gate failed twice for the same review round")
+        # Injection is a genuine human (security) question; repeated no-change declines and the
+        # bounded gate-fail churn are decline/budget-driven -> the machine-owned soft hold
+        # (park_policy.py defect 1: capacity parks must not masquerade as human questions).
+        park_class = "question" if injection else "capacity"
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
-                   alert_repo=alert_repo, alert_token=alert_token)
+                   alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
+                   bot_login=args.bot_login)
     else:
         print("fix outcome: staying in review:changes (retried next sweep tick)")
 
@@ -2737,6 +3109,61 @@ def _self_test():
     check("missed runs", len(marker_runs(comments, bot, "missed", 2)), 1)
     check("duplicate run key detected", round_recorded(comments, bot, 1, "10.1"), True)
     check("new run key not recorded", round_recorded(comments, bot, 3, "99.1"), False)
+
+    # Park-generation receipts (finding B): bot-authored only — a forged receipt must never
+    # inflate the generation count toward the question-class escalation.
+    receipts = [
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=1 cutoff=2026-07-23T09:00:00Z -->"},
+        {"user": {"login": "mallory"},
+         "body": f"x {PARK_GENERATION_MARKER} gen=9 cutoff=2026-07-23T12:00:00Z -->"},
+    ]
+    check("park generations parse bot receipts only",
+          park_generation_cutoffs(receipts, bot), {"2026-07-23T09:00:00Z"})
+    check("no receipts => empty generation set", park_generation_cutoffs(comments, bot), set())
+    # Round-3 finding 4: the initial-window key parses; a malformed cutoff is treated as
+    # ABSENT with a loud log (a corrupt receipt must never advance — or dedupe — the ladder).
+    receipt_logs = []
+    mixed_receipts = receipts + [
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=2 cutoff=none -->"},
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=3 cutoff=not-a-timestamp -->"},
+    ]
+    check("initial-window (cutoff=none) receipts parse; malformed cutoffs are absent",
+          park_generation_cutoffs(mixed_receipts, bot, log=receipt_logs.append),
+          {"2026-07-23T09:00:00Z", PARK_WINDOW_NONE})
+    check("a malformed receipt cutoff logs loudly",
+          any("malformed park-generation receipt cutoff" in line for line in receipt_logs),
+          True)
+    # Round-6 finding 2: receipt keys are CANONICAL — a legacy receipt written from a
+    # space-form source cutoff (invisible to the old `cutoff=(\S+) -->` read) is recovered
+    # and every equally-valid spelling collapses onto the one canonical key.
+    legacy_receipts = [
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=1 cutoff=2026-07-23 10:30:00Z -->"},
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T10:30:00+00:00 -->"},
+    ]
+    check("round-6 f2: a legacy space-form receipt parses onto its CANONICAL key "
+          "(and dedupes with the +00:00 spelling)",
+          park_generation_cutoffs(legacy_receipts, bot), {"2026-07-23T10:30:00Z"})
+    # Round-7 finding 1: a receipt cutoff that PARSES but OVERFLOWS UTC normalization
+    # ("0001-01-01T00:00:00+23:59" — astimezone under year 1) used to pass the
+    # valid_timestamp guard and crash canonical_ts with OverflowError; park_policy now
+    # rejects it at parse time, so the receipt is treated ABSENT with the loud
+    # malformed-cutoff log — the reader never crashes.
+    receipt_logs.clear()
+    overflow_receipts = receipts + [
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=2 cutoff=0001-01-01T00:00:00+23:59 -->"},
+    ]
+    check("round-7 f1: an overflow receipt cutoff is treated as absent (no crash)",
+          park_generation_cutoffs(overflow_receipts, bot, log=receipt_logs.append),
+          {"2026-07-23T09:00:00Z"})
+    check("round-7 f1: the overflow receipt cutoff logs loudly",
+          any("malformed park-generation receipt cutoff" in line for line in receipt_logs),
+          True)
 
     # Issue #162: round markers bind the reviewed head sha, and a stale-deferred round is VOIDED
     # (subtracted) so head churn never burns the global round budget.
@@ -2803,6 +3230,97 @@ def _self_test():
     check("defanged void does not cancel a round",
           count_rounds([sha_bound[1],
                         {"user": {"login": bot}, "body": defanged_void}], bot), 2)
+
+    # ---- count_rounds_since (the round-budget human-readmission window, sparq#2804/#3442):
+    # only rounds recorded at/after the human's needs:user unlabel are charged to the budget ----
+    unlabel_ts = "2026-07-23T09:18:19Z"
+
+    def stamped_round(round_n, created):
+        return {"user": {"login": bot}, "created_at": created,
+                "body": f"x {ROUND_MARKER} n={round_n} run={round_n}.1 -->"}
+
+    era_rounds = [stamped_round(i, f"2026-07-22T0{i}:00:00Z") for i in range(1, 6)]
+    check("(1) all 5 rounds predate the human unlabel => effective count 0",
+          count_rounds_since(era_rounds, bot, unlabel_ts), 0)
+    post_rounds = era_rounds + [stamped_round(6, "2026-07-23T10:00:00Z"),
+                                stamped_round(7, "2026-07-23T11:00:00Z")]
+    check("(2) rounds recorded after the unlabel count normally",
+          count_rounds_since(post_rounds, bot, unlabel_ts), 2)
+    check("(4) falsy cutoff => the plain full count (behaviour unchanged)",
+          count_rounds_since(post_rounds, bot, None), 7)
+    check("distinct COUNT, not the highest round number",
+          count_rounds_since([stamped_round(7, "2026-07-23T11:00:00Z")], bot, unlabel_ts), 1)
+    check("a timestamp tie with the cutoff is CHARGED (fail toward the full count)",
+          count_rounds_since([stamped_round(6, unlabel_ts)], bot, unlabel_ts), 1)
+    check("a marker without created_at is CHARGED (fail toward the full count)",
+          count_rounds_since([{"user": {"login": bot},
+                               "body": f"x {ROUND_MARKER} n=6 run=6.1 -->"}], bot,
+                             unlabel_ts), 1)
+    # Round-4 finding 3: a NON-ISO created_at that sorts lexicographically BEFORE the cutoff
+    # ("0000-..." < "2026-...") must be CHARGED with a loud log, never silently omitted from
+    # the budget — the old bare `created < since` skip let a malformed stamp authorize
+    # exhausted work.
+    ts_logs = []
+    check("a malformed created_at sorting BEFORE the cutoff is CHARGED (round-4 finding 3)",
+          count_rounds_since([dict(stamped_round(6, "0000-not-a-timestamp"))], bot,
+                             unlabel_ts, log=ts_logs.append), 1)
+    check("the malformed-timestamp charge logs loudly",
+          any("malformed created_at" in line and "CHARGED" in line for line in ts_logs), True)
+    ts_logs.clear()
+    check("a malformed created_at sorting AFTER the cutoff is also CHARGED",
+          count_rounds_since([stamped_round(6, "zzzz-not-a-timestamp")], bot,
+                             unlabel_ts, log=ts_logs.append), 1)
+    # Round-5 finding 2: the window compare is over PARSED instants, never raw strings. A
+    # space-separator stamp VALIDATES yet sorts lexicographically before every 'T'-form
+    # stamp of the same day — the old string compare read this post-cutoff round as
+    # pre-cutoff and silently un-charged it (budget minting, no warning).
+    ts_logs.clear()
+    check("round-5 f2: a space-separator stamp AFTER the cutoff IS charged",
+          count_rounds_since([stamped_round(6, "2026-07-23 10:30:00Z")], bot,
+                             "2026-07-23T09:00:00Z", log=ts_logs.append), 1)
+    check("round-5 f2: the well-formed space-separator charge stays quiet", ts_logs, [])
+    check("round-5 f2: a +00:00-offset stamp before the Z cutoff stays uncharged",
+          count_rounds_since([stamped_round(6, "2026-07-22T08:00:00+00:00")], bot,
+                             unlabel_ts), 0)
+    check("round-5 f2: a +00:00 vs Z same-instant tie with the cutoff is CHARGED",
+          count_rounds_since([stamped_round(6, "2026-07-23T09:18:19+00:00")], bot,
+                             unlabel_ts), 1)
+    ts_logs.clear()
+    check("round-5 f2: a NAIVE (offset-free) stamp is unorderable => CHARGED",
+          count_rounds_since([stamped_round(6, "2026-07-22T08:00:00")], bot,
+                             unlabel_ts, log=ts_logs.append), 1)
+    check("round-5 f2: the naive-stamp charge logs loudly",
+          any("malformed created_at" in line and "CHARGED" in line for line in ts_logs), True)
+    ts_logs.clear()
+    check("round-5 f2: an unparseable cutoff keeps the FULL count (never mints budget)",
+          count_rounds_since(post_rounds, bot, "not-a-timestamp", log=ts_logs.append), 7)
+    check("round-5 f2: the unparseable-cutoff fallback logs loudly",
+          any("not a parseable timestamp" in line and "FULL historical count" in line
+              for line in ts_logs), True)
+    quiet_logs = []
+    check("a NON-chargeable comment's malformed timestamp stays silent (no marker => no "
+          "charge, no log)",
+          (count_rounds_since([{"user": {"login": bot}, "created_at": "0000-bad",
+                                "body": "no marker here"},
+                               stamped_round(6, "2026-07-23T10:00:00Z")], bot,
+                              unlabel_ts, log=quiet_logs.append), quiet_logs), (1, []))
+    check("void subtraction still applies inside the window",
+          count_rounds_since(post_rounds + [
+              {"user": {"login": bot}, "created_at": "2026-07-23T11:05:00Z",
+               "body": f"x {ROUND_VOID_MARKER} n=7 run=7.1 -->"}], bot, unlabel_ts), 1)
+    check("non-bot markers stay ignored inside the window",
+          count_rounds_since([dict(stamped_round(6, "2026-07-23T10:00:00Z"),
+                                   user={"login": "mallory"})], bot, unlabel_ts), 0)
+    # (1) composed: the effective count feeds decide_budget => "continue", NO budget park —
+    # even for a top-tier/stagnant posture that would terminally park on the full count.
+    check("(1) effective count 0 => decide_budget continues (no budget park)",
+          decide_budget(count_rounds_since(era_rounds, bot, unlabel_ts),
+                        ["fable"], "stagnant", "anthropic"),
+          {"action": "continue", "pin": None})
+    check("(2) 2 post-unlabel rounds with base 3 stay under budget",
+          decide_budget(count_rounds_since(post_rounds, bot, unlabel_ts),
+                        ["fable"], "stagnant", "anthropic"),
+          {"action": "continue", "pin": None})
 
     body = "PR body\n\n<!-- sparq-reviewed-sha:none -->\n"
     sha = "a" * 40
@@ -3455,7 +3973,9 @@ def _self_test():
     wiring_globals = globals()
     real_io = {name: wiring_globals[name]
                for name in ("_paginated_comments", "set_review_state", "needs_user",
-                            "post_findings", "record_model_pin", "_alert_route", "_gh_json")}
+                            "post_findings", "record_model_pin", "_alert_route", "_gh_json",
+                            "_issue_timeline", "_is_human_maintainer")}
+    fake_timelines = {}
     try:
         # [round-5 P1] the outcome now probes the live hold surfaces before mutating; this
         # block exercises the budget machinery, so its fake serves an UNHELD PR + source issue.
@@ -3469,19 +3989,26 @@ def _self_test():
         wiring_globals["set_review_state"] = (
             lambda repo, pr, state: wiring_calls.append(("state", state)))
         wiring_globals["needs_user"] = (
-            lambda repo, pr, reason, **kwargs: wiring_calls.append(("needs-user", reason)))
+            lambda repo, pr, reason, **kwargs: wiring_calls.append(
+                ("needs-user", reason, kwargs.get("park_class", "question"))))
         wiring_globals["post_findings"] = (
             lambda repo, pr, vf, rn: wiring_calls.append(("findings", rn)))
         wiring_globals["record_model_pin"] = (
             lambda repo, pr, rn, tier, provider, run_key, bot_login:
             wiring_calls.append(("pin", tier)))
         wiring_globals["_alert_route"] = lambda: (None, None)
+        # The readmission-window probe reads the PR/issue timelines; empty = no human unlabel,
+        # so every pre-existing expectation below is unchanged (full-count behaviour).
+        wiring_globals["_issue_timeline"] = lambda repo, number: fake_timelines.get(number, [])
+        # The strict maintainer probe (park-policy hygiene finding): jeswr is the trusted
+        # human; everyone else — bots, outsiders, unverifiable actors — is not.
+        wiring_globals["_is_human_maintainer"] = lambda repo, login: login == "jeswr"
         with tempfile.TemporaryDirectory() as tmp:
             verdict_file = Path(tmp) / "verdict.json"
             files_file = Path(tmp) / "files.txt"
             files_file.write_text("src/a.rs\n", encoding="utf-8")
 
-            def outcome(progress, comments):
+            def outcome(progress, comments, round_n=3):
                 wiring_calls.clear()
                 fake_state["comments"] = comments
                 verdict_file.write_text(json.dumps({
@@ -3489,7 +4016,7 @@ def _self_test():
                     "summary": "s", "issues": [], "progress": progress}), encoding="utf-8")
                 review_outcome(argparse.Namespace(
                     repo="o/r", pr=41, verdict_file=str(verdict_file),
-                    files_file=str(files_file), round=3, max_rounds=3, security=False,
+                    files_file=str(files_file), round=round_n, max_rounds=3, security=False,
                     surface_path=[], issue=None, impl_provider="anthropic", bot_login=bot,
                     run_key="9.1", reviewed_sha="b" * 40))
                 return list(wiring_calls)
@@ -3510,8 +4037,376 @@ def _self_test():
                   [entry[0] for entry in terminal], ["findings", "needs-user"])
             check("terminal reason names the exhausted budget",
                   "round budget is exhausted" in terminal[1][1], True)
+            # Park-policy defect 1: budget exhaustion is budget-driven, so the source issue
+            # takes the MACHINE-owned park, never the human-question label.
+            check("budget exhaustion parks as capacity (status:parked), not a human question",
+                  terminal[1][2], "capacity")
+            # An injection flag IS a genuine human (security) question -> needs:user.
+            wiring_calls.clear()
+            fake_state["comments"] = fable_fix
+            verdict_file.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": True,
+                "summary": "s", "issues": [], "progress": "stagnant"}), encoding="utf-8")
+            review_outcome(argparse.Namespace(
+                repo="o/r", pr=41, verdict_file=str(verdict_file),
+                files_file=str(files_file), round=3, max_rounds=3, security=False,
+                surface_path=[], issue=None, impl_provider="anthropic", bot_login=bot,
+                run_key="9.1", reviewed_sha="b" * 40))
+            injection_calls = [entry for entry in wiring_calls if entry[0] == "needs-user"]
+            check("injection flag escalates as a human question (needs:user)",
+                  [(entry[1], entry[2]) for entry in injection_calls],
+                  [("the reviewer flagged possible prompt injection", "question")])
+
+            # ---- round-budget human-readmission window (sparq#2804/PR#3442): a HUMAN
+            # unlabeling needs:user restarts the budget, so the terminal fable/stagnant
+            # posture above stays review:changes instead of insta-re-parking ----
+            def unlabel_event(ts, login):
+                return {"event": "unlabeled", "label": {"name": "needs:user"},
+                        "created_at": ts, "actor": {"login": login}}
+
+            burned = fable_fix + [
+                {"user": {"login": bot}, "created_at": f"2026-07-22T0{i}:00:00Z",
+                 "body": f"x {ROUND_MARKER} n={i} run={i}.1 -->"} for i in range(1, 4)]
+            fake_timelines[41] = [unlabel_event("2026-07-23T09:18:19Z", "jeswr")]
+            check("(1) human unlabel after the burned rounds => no budget park, loop retries",
+                  outcome("stagnant", burned),
+                  [("findings", 3), ("state", "changes")])
+            # (2) rounds recorded AFTER the unlabel count normally: 2 post-unlabel rounds
+            # with base 3 stay under budget even though global numbering reached 7.
+            post_burn = fable_fix + [
+                {"user": {"login": bot}, "created_at": f"2026-07-22T0{i}:00:00Z",
+                 "body": f"x {ROUND_MARKER} n={i} run={i}.1 -->"} for i in range(1, 6)] + [
+                {"user": {"login": bot}, "created_at": f"2026-07-23T1{i}:00:00Z",
+                 "body": f"x {ROUND_MARKER} n={i + 5} run={i + 5}.1 -->"} for i in range(1, 3)]
+            check("(2) two post-unlabel rounds (base 3) stay under budget at global round 7",
+                  outcome("stagnant", post_burn, round_n=7),
+                  [("findings", 7), ("state", "changes")])
+            # (3) a BOT unlabel opens no window: the full count stands and the terminal
+            # capacity park fires exactly as before.
+            fake_timelines[41] = [unlabel_event("2026-07-23T09:18:19Z",
+                                                "sparq-orchestrator[bot]")]
+            bot_unlabel = outcome("stagnant", burned)
+            check("(3) bot unlabel does NOT reset the budget",
+                  [entry[0] for entry in bot_unlabel], ["findings", "needs-user"])
+            check("(3) bot-unlabel terminal still parks as capacity",
+                  bot_unlabel[1][2], "capacity")
+            # (4) no unlabel event => unchanged full-count behaviour (the terminal checks
+            # above already ran with an EMPTY timeline; assert it explicitly once more).
+            fake_timelines.pop(41, None)
+            check("(4) no unlabel event => unchanged terminal at the full count",
+                  [entry[0] for entry in outcome("stagnant", burned)],
+                  ["findings", "needs-user"])
+
+            # (5) a timeline read failure falls back to the FULL count (the OLD conservative
+            # park) — never a fresh budget on unproven data; park_policy logs it loudly.
+            def raising_timeline(_repo, _number):
+                raise WorkerPrError("timeline unavailable")
+
+            wiring_globals["_issue_timeline"] = raising_timeline
+            timeline_error = outcome("stagnant", burned)
+            check("(5) timeline read error => full count, terminal park preserved",
+                  [entry[0] for entry in timeline_error], ["findings", "needs-user"])
+            check("(5) timeline-error reason charges the FULL historical count",
+                  "exhausted at 3 round(s)" in timeline_error[1][1], True)
+            wiring_globals["_issue_timeline"] = (
+                lambda repo, number: fake_timelines.get(number, []))
     finally:
         wiring_globals.update(real_io)
+
+    # ---- needs_user park-class routing (finding A) + the label-independent escalation
+    # ladder (finding B; round-3 finding 1): a capacity stop writes the MACHINE-owned
+    # soft-hold PAIR — review:parked on the PR (veto-gated, readmittable) + status:parked on
+    # the source issue — never the human-owned review:needs-user/needs:user pair; a question
+    # stop keeps the unconditional human pair exactly as always. EVERY consumed budget window
+    # is receipted (the receipts ARE the generation ladder — labels are best-effort UI), and
+    # PARK_ESCALATION_GENERATIONS consumed windows escalate to the question class with a
+    # comment that stays HONEST when the sticky veto suppressed a label write. ----
+    park_route_calls = []
+    park_route_comments = []
+    park_route_state = {"comments": [], "timelines": {}}
+    real_park_route = {name: wiring_globals[name] for name in (
+        "set_review_state", "_comment", "_load_worker_issue", "_ops_alert",
+        "_issue_timeline", "_is_human_maintainer", "_paginated_comments")}
+
+    class _ParkRouteIssueModule:
+        # Round-3 finding 1 (test defect): the old mock recorded EVERY issue write
+        # unconditionally, hiding that the real worker-issue.set_status veto-gates its park
+        # labels at the write point. This mock models the real helper: a park-label write
+        # with a standing proven-human unlabel is SUPPRESSED and recorded as vetoed.
+        @staticmethod
+        def set_status(repo, issue, status):
+            label = {"parked": "status:parked", "needs-user": "needs:user"}.get(status)
+            if label is not None and _park_policy().park_vetoed(
+                    repo, issue, label,
+                    lambda _r, n: park_route_state["timelines"].get(n, []),
+                    is_human=lambda login: login == "jeswr", log=lambda *_a: None):
+                park_route_calls.append(("issue-status-vetoed", issue, status))
+                return
+            park_route_calls.append(("issue-status", issue, status))
+
+    # Round-4 finding 2 (RECEIPT-FIRST): the _comment mock records into the SAME ordered call
+    # list as the label writes, so every capacity-park expectation below asserts the CALL
+    # ORDER — the durable receipt must precede every label write, making the
+    # label-posted-receipt-missing crash window impossible by construction.
+    def _record_park_comment(repo, pr, body):
+        park_route_calls.append(("receipt",))
+        park_route_comments.append(body)
+
+    try:
+        wiring_globals["set_review_state"] = (
+            lambda repo, pr, state: park_route_calls.append(("pr-state", state)))
+        wiring_globals["_comment"] = _record_park_comment
+        wiring_globals["_load_worker_issue"] = lambda: _ParkRouteIssueModule
+        wiring_globals["_ops_alert"] = lambda *a: None
+        wiring_globals["_issue_timeline"] = (
+            lambda repo, number: park_route_state["timelines"].get(number, []))
+        wiring_globals["_is_human_maintainer"] = lambda repo, login: login == "jeswr"
+        wiring_globals["_paginated_comments"] = (
+            lambda repo, pr: park_route_state["comments"])
+
+        def unlabel(label, ts, login="jeswr"):
+            return {"event": "unlabeled", "label": {"name": label},
+                    "created_at": ts, "actor": {"login": login}}
+
+        def labeled(label, ts, login="sparq-orchestrator[bot]"):
+            return {"event": "labeled", "label": {"name": label},
+                    "created_at": ts, "actor": {"login": login}}
+
+        # (a) first-ever capacity stop (no history at all): the machine pair lands AND the
+        # initial full-budget window is receipted (gen=1 cutoff=none) — the ladder is durable
+        # from the very first park, label state notwithstanding.
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
+        check("capacity stop writes the machine pair (review:parked + status:parked), "
+              "RECEIPT FIRST (round-4 finding 2)",
+              park_route_calls,
+              [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+        check("capacity comment names the readmission gestures",
+              MACHINE_PARK_PR_LABEL in park_route_comments[-1]
+              and "status:parked" in park_route_comments[-1], True)
+        check("the INITIAL window is receipted (gen=1 cutoff=none)",
+              f"{PARK_GENERATION_MARKER} gen=1 cutoff={PARK_WINDOW_NONE} -->"
+              in park_route_comments[-1], True)
+        # (b) question stop (default) keeps the unconditional human-owned pair.
+        park_route_calls.clear()
+        needs_user("o/r", 41, "human question", issue=7)
+        check("question stop (default) keeps the human-owned needs:user route",
+              park_route_calls,
+              [("pr-state", "needs-user"), ("receipt",), ("issue-status", 7, "needs-user")])
+
+        # (c-f) THE REAL SEQUENCE end-to-end (round-3 finding 1 — the old test fabricated an
+        # impossible second review:parked unlabel with no re-application in between): an
+        # earlier human-question era ended with the maintainer unlabeling needs:user (issue)
+        # and review:needs-user (PR) — "keep trying", the sparq#2804 shape. The gen-1
+        # capacity park lands (no veto on the MACHINE labels) and consumes that gesture's
+        # window; the human then unlabels review:parked (a second readmission); the next
+        # exhaustion cannot re-apply ANY label (sticky vetoes suppress every write) — but the
+        # receipts still advance to gen2 and the terminal comment is honest about it.
+        era = {
+            41: [unlabel("review:needs-user", "2026-07-23T08:00:00Z")],
+            7: [unlabel("needs:user", "2026-07-23T08:00:00Z")],
+        }
+        park_route_state["timelines"] = era
+        park_route_state["comments"] = []
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
+        check("(c) gen-1 park lands: the era veto covers the HUMAN labels, not the machine "
+              "pair — and the receipt still precedes both label writes", park_route_calls,
+              [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+        check("(c) gen-1 receipt consumes the era gesture's window",
+              f"{PARK_GENERATION_MARKER} gen=1 cutoff=2026-07-23T08:00:00Z -->"
+              in park_route_comments[-1], True)
+        # ... the labels the park just applied become timeline events, and the receipt
+        # becomes a durable bot comment (what the next exhaustion will actually see).
+        era[41] = era[41] + [labeled("review:parked", "2026-07-23T08:30:00Z")]
+        era[7] = era[7] + [labeled("status:parked", "2026-07-23T08:30:00Z")]
+        park_route_state["comments"] = [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        # (d) the SAME window re-fires quietly: dedupe covers comments/labels — the ladder
+        # itself is already durable in the receipt.
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(d) an already-receipted window re-defers quietly",
+              (park_route_calls, park_route_comments), ([], []))
+        # (e) the human re-admits AGAIN (unlabels review:parked); the budget re-exhausts.
+        # Receipts advance to gen2 => TERMINAL — even though the sticky vetoes suppress BOTH
+        # terminal label writes (review:needs-user was human-unlabeled at 08:00 with no
+        # later application; so was needs:user on the issue).
+        era[41] = era[41] + [unlabel("review:parked", "2026-07-23T09:00:00Z")]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(e) re-exhaustion advances the RECEIPTS to gen2 despite every label write "
+              "being veto-suppressed (receipt still first)",
+              park_route_calls, [("receipt",), ("issue-status-vetoed", 7, "needs-user")])
+        check("(e) gen-2 receipt binds the fresh readmission cutoff",
+              f"{PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T09:00:00Z -->"
+              in park_route_comments[-1], True)
+        check("(e) the terminal comment is HONEST about the vetoed label",
+              "`review:needs-user` label write was SUPPRESSED"
+              in park_route_comments[-1], True)
+        check("(e) the terminal comment still names the repeated post-readmission failure",
+              "readmitted and exhausted its budget again" in park_route_comments[-1], True)
+        # (f) the completed terminal is durable: with its receipt recorded, re-fires on the
+        # same window stay quiet — the ladder is finished, not stalled.
+        park_route_state["comments"] = park_route_state["comments"] + [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(f) the receipted terminal re-defers quietly",
+              (park_route_calls, park_route_comments), ([], []))
+        # (g) a BOT unlabel opens no window: the plain machine pair applies and the initial
+        # window is receipted (bot gestures never mint a cutoff key).
+        park_route_state["comments"] = []
+        park_route_state["timelines"] = {
+            41: [unlabel("review:parked", "2026-07-23T14:00:00Z",
+                         login="sparq-orchestrator[bot]"),
+                 labeled("review:parked", "2026-07-23T15:00:00Z")]}
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
+        check("(g) a bot unlabel neither vetoes nor mints a window key",
+              park_route_calls,
+              [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+        check("(g) no gesture => the initial-window receipt (cutoff=none), never a bot key",
+              f"{PARK_GENERATION_MARKER} gen=1 cutoff={PARK_WINDOW_NONE} -->"
+              in park_route_comments[-1], True)
+        # (h) EVERY capacity park requires the bot login (fail loud, never an unparseable
+        # receipt state) — the receipts are parsed on every capacity park now.
+        park_route_state["timelines"] = {}
+        try:
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity")
+            check("capacity park without --bot-login fails loud", "no error", "raised")
+        except WorkerPrError:
+            check("capacity park without --bot-login fails loud", "raised", "raised")
+        # (j / round-6 finding 2) THE EXACT BRIEFED LOOP with a SPACE-form gesture timestamp:
+        # the receipt must be written CANONICALLY (compact Z-form, no space — the old raw
+        # window key produced `cutoff=2026-07-23 08:00:00Z -->`, which the reader's
+        # `cutoff=(\S+) -->` could never match, so gen-1 re-receipted forever and the
+        # terminal gen-2 was unreachable), parse back, dedupe the same window, and let a
+        # fresh space-form gesture reach the gen-2 terminal. The sequence must TERMINATE.
+        park_route_state["timelines"] = {
+            41: [unlabel("review:needs-user", "2026-07-23 08:00:00Z")],
+            7: [unlabel("needs:user", "2026-07-23 08:00:00Z")],
+        }
+        park_route_state["comments"] = []
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
+        check("(j) a space-form gesture parks gen-1, receipt first",
+              park_route_calls,
+              [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+        check("(j) the gen-1 receipt is written CANONICALLY (no space-form key)",
+              f"{PARK_GENERATION_MARKER} gen=1 cutoff=2026-07-23T08:00:00Z -->"
+              in park_route_comments[-1], True)
+        # The receipt becomes a durable bot comment; the park labels become timeline events.
+        park_route_state["timelines"][41].append(
+            labeled("review:parked", "2026-07-23 08:30:00Z"))
+        park_route_state["timelines"][7].append(
+            labeled("status:parked", "2026-07-23 08:30:00Z"))
+        park_route_state["comments"] = [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(j) the canonical receipt round-trips and DEDUPES the space-form window "
+              "(no repeat gen-1)",
+              (park_route_calls, park_route_comments), ([], []))
+        # A FRESH space-form gesture mints the next window: the ladder reaches gen-2 TERMINAL.
+        park_route_state["timelines"][41].append(
+            unlabel("review:parked", "2026-07-23 09:00:00Z"))
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(j) a fresh space-form gesture REACHES the gen-2 terminal (receipt first, "
+              "human labels veto-suppressed by the 08:00 unlabels)",
+              park_route_calls, [("receipt",), ("issue-status-vetoed", 7, "needs-user")])
+        check("(j) the gen-2 receipt binds the fresh gesture's CANONICAL key",
+              f"{PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T09:00:00Z -->"
+              in park_route_comments[-1], True)
+        # ... and the completed terminal is durable: the same window re-fires QUIETLY.
+        park_route_state["comments"] = park_route_state["comments"] + [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(j) the receipted gen-2 terminal re-defers quietly — the loop TERMINATES",
+              (park_route_calls, park_route_comments), ([], []))
+        # (i) an unreadable timeline FREEZES the ladder: no receipt, no label, no comment.
+        def raising_park_timeline(_repo, _number):
+            raise WorkerPrError("timeline unavailable")
+
+        wiring_globals["_issue_timeline"] = raising_park_timeline
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
+        check("(i) an unreadable timeline freezes the ladder (no receipt/label/comment)",
+              (park_route_calls, park_route_comments), ([], []))
+    finally:
+        wiring_globals.update(real_park_route)
+
+    # ---- malformed timeline PAGE (finding E): a non-list page could hold the newest human
+    # unlabel, so _issue_timeline must RAISE — park_policy then applies the documented fail
+    # direction (veto => suppress the park; budget/readmission => the full count). ----
+    newest_unlabel_page = [{"event": "unlabeled", "label": {"name": "needs:user"},
+                            "created_at": "2026-07-23T09:18:19Z",
+                            "actor": {"login": "jeswr"}}]
+    real_timeline_json = wiring_globals["_gh_json"]
+    try:
+        wiring_globals["_gh_json"] = lambda args, **_kw: [newest_unlabel_page, "garbage-page"]
+        try:
+            _issue_timeline("o/r", 41)
+            check("malformed timeline page raises", "no error", "raised")
+        except WorkerPrError as exc:
+            check("malformed timeline page raises",
+                  "malformed timeline page" in str(exc), True)
+        # Round-3 finding 3: the COMMENTS reader takes the same fail-closed shape — a
+        # discarded page could hide a durable receipt (round/attempt/park-generation marker).
+        receipt_page = [{"user": {"login": bot}, "created_at": "2026-07-23T09:00:00Z",
+                         "body": f"x {PARK_GENERATION_MARKER} gen=1 cutoff=none -->"}]
+        wiring_globals["_gh_json"] = lambda args, **_kw: [receipt_page, "garbage-page"]
+        try:
+            _paginated_comments("o/r", 41)
+            check("malformed comments page raises", "no error", "raised")
+        except WorkerPrError as exc:
+            check("malformed comments page raises",
+                  "malformed comments page" in str(exc), True)
+        # Round-4 finding 4: ENTRY validation — [[null]] passed the old page-only check and
+        # crashed _bot_comments (None.get()) mid-decision; a wrong-shaped user/body/created_at
+        # is the same class. Both raise at read time like a malformed page.
+        for bad_entry in (None, "loose-string",
+                          {"user": None, "body": "x", "created_at": "2026-07-23T09:00:00Z"},
+                          {"user": {"login": bot}, "body": None,
+                           "created_at": "2026-07-23T09:00:00Z"},
+                          {"user": {"login": bot}, "body": "x", "created_at": None}):
+            wiring_globals["_gh_json"] = lambda args, **_kw: [receipt_page + [bad_entry]]
+            try:
+                _paginated_comments("o/r", 41)
+                check(f"malformed comments entry raises ({bad_entry!r})", "no error",
+                      "raised")
+            except WorkerPrError as exc:
+                check(f"malformed comments entry raises ({bad_entry!r})",
+                      "malformed comments entry" in str(exc), True)
+        wiring_globals["_gh_json"] = lambda args, **_kw: [receipt_page]
+        check("a well-formed comments page still reads clean",
+              _paginated_comments("o/r", 41), receipt_page)
+    finally:
+        wiring_globals["_gh_json"] = real_timeline_json
+
+    # review:parked is a live SOFT hold for every outcome/arm mutation path (finding A(a)):
+    # a stale in-flight outcome must not strip it via the mutually-exclusive namespace.
+    parked_live = {"labels": [{"name": "review:parked"}],
+                   "head": {"ref": "sparq-agent/issue-7-1-1"}}
+    check("live_human_holds treats review:parked as a hold",
+          live_human_holds("o/r", 41, issue=7, live=parked_live), ["review:parked"])
 
     # ---- registry record writes pin the `ledger` data-plane branch (issue #96): master's
     # required `gate` status check permanently rejects every direct contents-API PUT from
@@ -5135,7 +6030,8 @@ def main():
 
     state = subparsers.add_parser("review-state", parents=[common])
     state.add_argument("action", choices=("get", "set"))
-    state.add_argument("--state", choices=("needs", "changes", "pass", "needs-user"))
+    state.add_argument("--state", choices=("needs", "changes", "pass", "needs-user",
+                                          "parked"))
 
     rrec = subparsers.add_parser("round-record", parents=[common])
     rrec.add_argument("--round", required=True, type=int)
@@ -5234,6 +6130,12 @@ def main():
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
+    # Source-issue park ownership (park_policy.py): "question" -> human-owned needs:user,
+    # "capacity" -> machine-owned status:parked (capacity/decline/budget-driven stops).
+    nuser.add_argument("--park-class", choices=("question", "capacity"), default="question")
+    # Required for capacity parks once a readmission window exists (the generation-receipt
+    # parser's bot trust filter); the question class never needs it.
+    nuser.add_argument("--bot-login", default="")
 
     dis = subparsers.add_parser("disarm", parents=[common])
     dis.add_argument("--when", choices=("mismatch", "always"), required=True)
@@ -5372,7 +6274,8 @@ def main():
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
-                       alert_repo=alert_repo, alert_token=alert_token)
+                       alert_repo=alert_repo, alert_token=alert_token,
+                       park_class=args.park_class, bot_login=args.bot_login)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
                    preserve_review_state=args.preserve_review_state)
