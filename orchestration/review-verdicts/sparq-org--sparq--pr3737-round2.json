@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3737,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f8ed8bbf8ad0f608d7367c2bef4df3c9410b94fd",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added '^[[:space:]]*' anchor on the R4 secret-literal grep (line 85) correctly eliminates a false positive: the old unanchored regex matched deploy/gcp/sparq-server.yaml:77 ('run.googleapis.com/secrets: sparq-auth-token:projects/PROJECT_NUMBER/secrets/sparq-auth-token'), a legitimate Secret Manager REFERENCE, causing the deploy-lint job to fail with a bogus 'possible plaintext credential' error. That fix is needed.\n\nBut by anchoring the KEYWORD itself to line-start (only optional whitespace may precede 'token|password|passwd|private_key'), the new pattern no longer matches any key with a prefix before the keyword. I verified empirically against sample manifests: the OLD regex flags all of\n  github_token: \"ghp_...\"\n  access_token: AKIA...EXAMPLE...\n  db_password: \"...\"\n  token: \"...\"\n  password: \"...\"\nwhile the NEW regex matches ONLY the bare 'token:' and 'password:' lines. github_token / access_token / db_password with an inline 24+ char literal now slip through undetected.\n\nThis is a gating (exit 1) R4 security control, and the dropped patterns ('*_token:', '*_password:', 'access_key:') are precisely the most common accidental-commit shapes the scan exists to catch. The coverage loss is undocumented and rides inside a PR otherwise presented as a mechanical SHA-bump, so it is easy to miss. Because a strictly-better fix exists that fixes the false positive WITHOUT the coverage loss, the current form should not merge as-is.",
+    "file": ".github/workflows/deploy-lint.yml",
+    "fix_hint": "Anchor the LINE but still allow a key prefix before the keyword, e.g.:\n  -E \"^[[:space:]]*[A-Za-z0-9_.-]*(token|password|passwd|private[_-]?key)[A-Za-z0-9_.-]*[[:space:]]*:[[:space:]]*['\\\"]?[A-Za-z0-9+/=_-]{24,}['\\\"]?[[:space:]]*$\"\nI verified against the real deploy/ tree that this variant does NOT match the GCP Secret Manager reference at deploy/gcp/sparq-server.yaml:77 (the leading '[A-Za-z0-9_.-]*' run stops at the '/' in 'run.googleapis.com/secrets', so no keyword follows at the anchor) yet DOES flag github_token / access_token / db_password inline literals. Alternatively, keep the current anchor but split this functional security-control change out of the SHA-bump PR and document the coverage decision.",
+    "severity": "major",
+    "title": "R4 credential-scan regex over-narrows: line-start keyword anchor silently drops detection of prefixed keys (github_token, access_token, db_password)"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Two logically distinct changes ride in this PR. (1) actions/checkout SHA bumps from v4.2.2 (11bd719...) to the repo-canonical v7.0.0 pin (9c091bb...) across deploy-terraform-lint.yml (x2), promote-on-approval.yml, retriage.yml, triage-issue.yml, plus a comment-format normalization in deploy-lint.yml. Verified: all 121 checkout references now pin the single v7.0.0 SHA, zero v4.2.2 stragglers remain \u2014 this part is correct and complete. (2) NEW in this round: deploy-lint.yml's R4 plaintext-credential grep gains a '^[[:space:]]*' line-start anchor. Empirically this fixes a real false positive \u2014 the old unanchored regex matched the legitimate GCP Secret Manager reference at deploy/gcp/sparq-server.yaml:77 ('run.googleapis.com/secrets: sparq-auth-token:projects/...'), which explains the 'repair failing CI legs' commit. However, anchoring the KEYWORD (not just the line) to the start silently drops detection of prefixed credential keys: I confirmed by test that 'github_token:', 'access_token:', and 'db_password:' with inline 24+ char literals are matched by the OLD regex but MISSED by the NEW one. These are among the most common credential-leak key names, and this is a gating (exit 1) security control. A strictly-better one-line fix ('^[[:space:]]*[A-Za-z0-9_.-]*(token|password|passwd|private[_-]?key)...') fixes the false positive AND preserves that coverage (verified against the real deploy/ tree). The change is otherwise low-risk; requesting the regex be tightened before merge. No hostile instructions in the diff.",
+  "verdict": "request_changes"
+ }
+}
