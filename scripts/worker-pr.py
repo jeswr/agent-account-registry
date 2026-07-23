@@ -243,6 +243,42 @@ def count_rounds(comments, bot_login):
     return best
 
 
+def count_rounds_since(comments, bot_login, since):
+    """Substantive review rounds charged to the ROUND BUDGET after a human readmission.
+
+    Live defect (sparq#2804/PR#3442, 2026-07-23): the budget re-derivation counted ALL
+    historical rounds, so five rounds burned during a broken-CI era re-parked the PR 22 minutes
+    after the maintainer explicitly removed needs:user — the human said "keep trying" and the
+    math ignored it. `since` is the readmission cutoff (park_policy.readmission_cutoff — the
+    latest HUMAN `unlabeled` needs:user across the PR and its source issue); this returns the
+    NUMBER of distinct unvoided rounds whose (round, run) attempt was recorded at or after it.
+    A distinct COUNT, deliberately not count_rounds' highest-round-number: post-readmission
+    rounds continue the global numbering (6, 7, ...) for marker/verdict identity, and the
+    budget must charge how many ran since the human re-admitted, not where numbering reached.
+
+    Fail direction (toward the OLD conservative full count, never toward a fresh budget on
+    unproven data): a falsy `since` means no readmission window — the plain count_rounds
+    applies; a marker whose comment has no parseable created_at is CHARGED; a timestamp tie
+    with the cutoff is CHARGED (ISO-8601 UTC compares lexicographically). Void subtraction is
+    global, exactly as in count_rounds."""
+    if not since:
+        return count_rounds(comments, bot_login)
+    voided = _round_voids(comments, bot_login)
+    charged = set()
+    for comment in _bot_comments(comments, bot_login):
+        created = comment.get("created_at")
+        if isinstance(created, str) and created and created < since:
+            continue
+        for match in re.finditer(
+                re.escape(ROUND_MARKER)
+                + r" n=([1-9][0-9]*) run=(\S+)(?: sha=(?:[0-9a-f]{40}|none))? -->",
+                str(comment.get("body", ""))):
+            round_n, run_key = int(match.group(1)), match.group(2)
+            if (round_n, run_key) not in voided:
+                charged.add(round_n)
+    return len(charged)
+
+
 def marker_runs(comments, bot_login, kind, round_n):
     """Distinct run keys recorded for a marker kind at a given round (ordered-marker counting)."""
     prefix = MARKER_KINDS[kind]
@@ -756,6 +792,33 @@ def _paginated_comments(repo, pr_number):
     if not isinstance(pages, list):
         raise WorkerPrError("GitHub API returned malformed comments")
     return [item for page in pages if isinstance(page, list) for item in page]
+
+
+def _issue_timeline(repo, number):
+    """The FULL label timeline of an issue/PR (paginated) for the round-budget readmission
+    window. The newest events — the ones the readmission cutoff hinges on — are on the LAST
+    page, so a truncated/malformed read must RAISE rather than return a prefix; the caller
+    (park_policy.latest_human_unlabel) then falls back to the full historical round count with
+    a loud log line (fail toward the OLD conservative budget, never a fresh one)."""
+    pages = _gh_json([
+        "api", "--paginate", "--slurp", f"repos/{repo}/issues/{number}/timeline?per_page=100",
+    ])
+    if not isinstance(pages, list):
+        raise WorkerPrError("GitHub API returned a malformed timeline")
+    return [item for page in pages if isinstance(page, list) for item in page]
+
+
+def _park_policy():
+    """The shared park-label policy module (park_policy.py: label ownership, the sticky
+    human-unpark veto, and the round-budget readmission cutoff). Loaded lazily so only the
+    paths that need it pay the import — same idiom as worker-issue.py."""
+    spec = importlib.util.spec_from_file_location(
+        "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py"))
+    if spec is None or spec.loader is None:
+        raise WorkerPrError("cannot load shared park policy")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _pr_changed_files(repo, pr_number):
@@ -2610,16 +2673,31 @@ def review_outcome(args):
     # Round-budget exhaustion consults the PURE decide_budget (maintainer directive 2026-07-17):
     # a model-tier escalation or an improving-progress grade extends the loop (hard cap 6 total
     # rounds inside decide_budget) instead of the flat needs-user at the base budget.
+    # Human-readmission window (sparq#2804/PR#3442, 2026-07-23): the budget charge is the
+    # POST-readmission round count — a human removing needs:user from the PR or its source
+    # issue restarts the budget so the loop actually retries instead of insta-re-parking on
+    # rounds burned before the human said "keep trying". No proven human unlabel (or a failed
+    # timeline read, logged loudly by park_policy) keeps the full historical count. args.round
+    # itself is untouched everywhere else: marker/verdict identity stays on global numbering.
     budget = {"action": "needs-user", "pin": None}
+    budget_rounds = args.round
     if args.round >= args.max_rounds and not document["injection_detected"]:
         comments = _paginated_comments(args.repo, args.pr)
+        cutoff = _park_policy().readmission_cutoff(
+            args.repo, args.pr, args.issue, _issue_timeline)
+        if cutoff:
+            budget_rounds = count_rounds_since(comments, args.bot_login, cutoff)
+            if budget_rounds != args.round:
+                print(f"readmission window open for {args.repo}#{args.pr}: a human unlabeled "
+                      f"needs:user at {cutoff}; the round budget charges {budget_rounds} of "
+                      f"{args.round} recorded round(s)")
         models = sorted({model
                          for models in fix_round_models(comments, args.bot_login).values()
                          for model in models})
-        budget = decide_budget(args.round, models, document.get("progress"),
+        budget = decide_budget(budget_rounds, models, document.get("progress"),
                                args.impl_provider, base_rounds=args.max_rounds)
     decision = decide_review(document["verdict"], has_blockers,
-                             document["injection_detected"], args.round, args.max_rounds,
+                             document["injection_detected"], budget_rounds, args.max_rounds,
                              security, budget_action=budget["action"])
     _write_outputs({"decision": decision, "verdict": document["verdict"],
                     "has_blockers": has_blockers,
@@ -2639,7 +2717,9 @@ def review_outcome(args):
         else:
             # Round-budget exhaustion is budget-driven, not a human question: the source issue
             # takes the machine-owned status:parked soft hold (park_policy.py defect 1).
-            reason = (f"the review round budget is exhausted at {args.round} round(s) (base "
+            # `budget_rounds` is the charged count — post-readmission when a human unlabeled
+            # needs:user (sparq#2804/PR#3442), the full history otherwise.
+            reason = (f"the review round budget is exhausted at {budget_rounds} round(s) (base "
                       f"{args.max_rounds}, hard cap {HARD_CAP_ROUNDS}) with no extension left — "
                       "the top fix tier has run and the latest verdict does not grade the PR "
                       "improving")
@@ -2822,6 +2902,49 @@ def _self_test():
     check("defanged void does not cancel a round",
           count_rounds([sha_bound[1],
                         {"user": {"login": bot}, "body": defanged_void}], bot), 2)
+
+    # ---- count_rounds_since (the round-budget human-readmission window, sparq#2804/#3442):
+    # only rounds recorded at/after the human's needs:user unlabel are charged to the budget ----
+    unlabel_ts = "2026-07-23T09:18:19Z"
+
+    def stamped_round(round_n, created):
+        return {"user": {"login": bot}, "created_at": created,
+                "body": f"x {ROUND_MARKER} n={round_n} run={round_n}.1 -->"}
+
+    era_rounds = [stamped_round(i, f"2026-07-22T0{i}:00:00Z") for i in range(1, 6)]
+    check("(1) all 5 rounds predate the human unlabel => effective count 0",
+          count_rounds_since(era_rounds, bot, unlabel_ts), 0)
+    post_rounds = era_rounds + [stamped_round(6, "2026-07-23T10:00:00Z"),
+                                stamped_round(7, "2026-07-23T11:00:00Z")]
+    check("(2) rounds recorded after the unlabel count normally",
+          count_rounds_since(post_rounds, bot, unlabel_ts), 2)
+    check("(4) falsy cutoff => the plain full count (behaviour unchanged)",
+          count_rounds_since(post_rounds, bot, None), 7)
+    check("distinct COUNT, not the highest round number",
+          count_rounds_since([stamped_round(7, "2026-07-23T11:00:00Z")], bot, unlabel_ts), 1)
+    check("a timestamp tie with the cutoff is CHARGED (fail toward the full count)",
+          count_rounds_since([stamped_round(6, unlabel_ts)], bot, unlabel_ts), 1)
+    check("a marker without created_at is CHARGED (fail toward the full count)",
+          count_rounds_since([{"user": {"login": bot},
+                               "body": f"x {ROUND_MARKER} n=6 run=6.1 -->"}], bot,
+                             unlabel_ts), 1)
+    check("void subtraction still applies inside the window",
+          count_rounds_since(post_rounds + [
+              {"user": {"login": bot}, "created_at": "2026-07-23T11:05:00Z",
+               "body": f"x {ROUND_VOID_MARKER} n=7 run=7.1 -->"}], bot, unlabel_ts), 1)
+    check("non-bot markers stay ignored inside the window",
+          count_rounds_since([dict(stamped_round(6, "2026-07-23T10:00:00Z"),
+                                   user={"login": "mallory"})], bot, unlabel_ts), 0)
+    # (1) composed: the effective count feeds decide_budget => "continue", NO budget park —
+    # even for a top-tier/stagnant posture that would terminally park on the full count.
+    check("(1) effective count 0 => decide_budget continues (no budget park)",
+          decide_budget(count_rounds_since(era_rounds, bot, unlabel_ts),
+                        ["fable"], "stagnant", "anthropic"),
+          {"action": "continue", "pin": None})
+    check("(2) 2 post-unlabel rounds with base 3 stay under budget",
+          decide_budget(count_rounds_since(post_rounds, bot, unlabel_ts),
+                        ["fable"], "stagnant", "anthropic"),
+          {"action": "continue", "pin": None})
 
     body = "PR body\n\n<!-- sparq-reviewed-sha:none -->\n"
     sha = "a" * 40
@@ -3474,7 +3597,9 @@ def _self_test():
     wiring_globals = globals()
     real_io = {name: wiring_globals[name]
                for name in ("_paginated_comments", "set_review_state", "needs_user",
-                            "post_findings", "record_model_pin", "_alert_route", "_gh_json")}
+                            "post_findings", "record_model_pin", "_alert_route", "_gh_json",
+                            "_issue_timeline")}
+    fake_timelines = {}
     try:
         # [round-5 P1] the outcome now probes the live hold surfaces before mutating; this
         # block exercises the budget machinery, so its fake serves an UNHELD PR + source issue.
@@ -3496,12 +3621,15 @@ def _self_test():
             lambda repo, pr, rn, tier, provider, run_key, bot_login:
             wiring_calls.append(("pin", tier)))
         wiring_globals["_alert_route"] = lambda: (None, None)
+        # The readmission-window probe reads the PR/issue timelines; empty = no human unlabel,
+        # so every pre-existing expectation below is unchanged (full-count behaviour).
+        wiring_globals["_issue_timeline"] = lambda repo, number: fake_timelines.get(number, [])
         with tempfile.TemporaryDirectory() as tmp:
             verdict_file = Path(tmp) / "verdict.json"
             files_file = Path(tmp) / "files.txt"
             files_file.write_text("src/a.rs\n", encoding="utf-8")
 
-            def outcome(progress, comments):
+            def outcome(progress, comments, round_n=3):
                 wiring_calls.clear()
                 fake_state["comments"] = comments
                 verdict_file.write_text(json.dumps({
@@ -3509,7 +3637,7 @@ def _self_test():
                     "summary": "s", "issues": [], "progress": progress}), encoding="utf-8")
                 review_outcome(argparse.Namespace(
                     repo="o/r", pr=41, verdict_file=str(verdict_file),
-                    files_file=str(files_file), round=3, max_rounds=3, security=False,
+                    files_file=str(files_file), round=round_n, max_rounds=3, security=False,
                     surface_path=[], issue=None, impl_provider="anthropic", bot_login=bot,
                     run_key="9.1", reviewed_sha="b" * 40))
                 return list(wiring_calls)
@@ -3549,6 +3677,60 @@ def _self_test():
             check("injection flag escalates as a human question (needs:user)",
                   [(entry[1], entry[2]) for entry in injection_calls],
                   [("the reviewer flagged possible prompt injection", "question")])
+
+            # ---- round-budget human-readmission window (sparq#2804/PR#3442): a HUMAN
+            # unlabeling needs:user restarts the budget, so the terminal fable/stagnant
+            # posture above stays review:changes instead of insta-re-parking ----
+            def unlabel_event(ts, login):
+                return {"event": "unlabeled", "label": {"name": "needs:user"},
+                        "created_at": ts, "actor": {"login": login}}
+
+            burned = fable_fix + [
+                {"user": {"login": bot}, "created_at": f"2026-07-22T0{i}:00:00Z",
+                 "body": f"x {ROUND_MARKER} n={i} run={i}.1 -->"} for i in range(1, 4)]
+            fake_timelines[41] = [unlabel_event("2026-07-23T09:18:19Z", "jeswr")]
+            check("(1) human unlabel after the burned rounds => no budget park, loop retries",
+                  outcome("stagnant", burned),
+                  [("findings", 3), ("state", "changes")])
+            # (2) rounds recorded AFTER the unlabel count normally: 2 post-unlabel rounds
+            # with base 3 stay under budget even though global numbering reached 7.
+            post_burn = fable_fix + [
+                {"user": {"login": bot}, "created_at": f"2026-07-22T0{i}:00:00Z",
+                 "body": f"x {ROUND_MARKER} n={i} run={i}.1 -->"} for i in range(1, 6)] + [
+                {"user": {"login": bot}, "created_at": f"2026-07-23T1{i}:00:00Z",
+                 "body": f"x {ROUND_MARKER} n={i + 5} run={i + 5}.1 -->"} for i in range(1, 3)]
+            check("(2) two post-unlabel rounds (base 3) stay under budget at global round 7",
+                  outcome("stagnant", post_burn, round_n=7),
+                  [("findings", 7), ("state", "changes")])
+            # (3) a BOT unlabel opens no window: the full count stands and the terminal
+            # capacity park fires exactly as before.
+            fake_timelines[41] = [unlabel_event("2026-07-23T09:18:19Z",
+                                                "sparq-orchestrator[bot]")]
+            bot_unlabel = outcome("stagnant", burned)
+            check("(3) bot unlabel does NOT reset the budget",
+                  [entry[0] for entry in bot_unlabel], ["findings", "needs-user"])
+            check("(3) bot-unlabel terminal still parks as capacity",
+                  bot_unlabel[1][2], "capacity")
+            # (4) no unlabel event => unchanged full-count behaviour (the terminal checks
+            # above already ran with an EMPTY timeline; assert it explicitly once more).
+            fake_timelines.pop(41, None)
+            check("(4) no unlabel event => unchanged terminal at the full count",
+                  [entry[0] for entry in outcome("stagnant", burned)],
+                  ["findings", "needs-user"])
+
+            # (5) a timeline read failure falls back to the FULL count (the OLD conservative
+            # park) — never a fresh budget on unproven data; park_policy logs it loudly.
+            def raising_timeline(_repo, _number):
+                raise WorkerPrError("timeline unavailable")
+
+            wiring_globals["_issue_timeline"] = raising_timeline
+            timeline_error = outcome("stagnant", burned)
+            check("(5) timeline read error => full count, terminal park preserved",
+                  [entry[0] for entry in timeline_error], ["findings", "needs-user"])
+            check("(5) timeline-error reason charges the FULL historical count",
+                  "exhausted at 3 round(s)" in timeline_error[1][1], True)
+            wiring_globals["_issue_timeline"] = (
+                lambda repo, number: fake_timelines.get(number, []))
     finally:
         wiring_globals.update(real_io)
 

@@ -314,6 +314,13 @@ def _load_module(name, path):
     return module
 
 
+# Shared park-label policy (park_policy.py): the round-budget human-readmission window
+# (readmission_cutoff) consumed by the CLAIM review loop. Loaded at module scope, same idiom as
+# groom.py, so the per-item review sweep never re-imports it.
+_park_policy = _load_module(
+    "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py"))
+
+
 def _require_exact_fields(value, fields, where):
     if not isinstance(value, dict):
         raise DispatchError(f"{where} must be an object")
@@ -1883,6 +1890,20 @@ def _pr_comments(repo, pr_number):
     return [item for page in pages if isinstance(page, list) for item in page]
 
 
+def _issue_timeline_events(repo, number):
+    """The FULL label timeline of an issue/PR (paginated) for the round-budget readmission
+    window. The newest events — the ones the readmission cutoff hinges on — are on the LAST
+    page, so a truncated/malformed read must RAISE rather than return a prefix; the caller
+    (park_policy.latest_human_unlabel) then keeps the full historical round count with a loud
+    log line (fail toward the OLD conservative budget, never a fresh one)."""
+    pages = _gh_json([
+        "api", "--paginate", "--slurp", f"repos/{repo}/issues/{number}/timeline?per_page=100",
+    ])
+    if not isinstance(pages, list):
+        raise DispatchError("target timeline is malformed")
+    return [item for page in pages if isinstance(page, list) for item in page]
+
+
 def _read_model_health_window(model_health, registry_repo, now, api=None):
     """Read the task-decline evidence through model-health's authoritative validated reader.
 
@@ -2351,6 +2372,29 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 continue
             comments = _pr_comments(repo, number)
             rounds = worker_pr.count_rounds(comments, bot_login)
+            # Human-readmission window (live defect sparq#2804/PR#3442, 2026-07-23): the budget
+            # decision below used to charge ALL historical rounds, so five rounds burned during
+            # the broken-CI era (gate-aggregator churn, phantom-leg failures, Copilot-outage
+            # stub reviews) re-parked the PR 22 minutes after the maintainer explicitly removed
+            # needs:user — the human said "keep trying" and the math ignored it. The budget
+            # instead charges only rounds recorded AFTER the latest HUMAN `unlabeled needs:user`
+            # event across the PR and its provenance-linked source issue (an explicit
+            # re-admission restarts the budget so the loop actually retries). No proven human
+            # unlabel — including a failed timeline read, which park_policy logs loudly — keeps
+            # the full historical count (never a fresh budget on unproven data). `rounds` itself
+            # stays the global count everywhere else: round numbering, the pending-fix lookup,
+            # the latest-progress read and the pin round all keep marker/verdict identity.
+            # Probed only at/above the base budget: below it decide_budget continues either way.
+            budget_rounds = rounds
+            if rounds >= max_rounds:
+                cutoff = _park_policy.readmission_cutoff(
+                    repo, number, issue_number, _issue_timeline_events)
+                if cutoff:
+                    budget_rounds = worker_pr.count_rounds_since(comments, bot_login, cutoff)
+                    if budget_rounds != rounds:
+                        print(f"readmission window open for {repo}#{number}: a human "
+                              f"unlabeled needs:user at {cutoff}; the round budget charges "
+                              f"{budget_rounds} of {rounds} recorded round(s)")
             impl_provider = record["impl_provider"]
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
@@ -2380,8 +2424,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # no-change or gate-failed attempts, not a pushed head awaiting grading.
                 pending_fix = (round_models.get(rounds, [])
                                if item["state"] == "needs-review" else [])
-                budget = worker_pr.decide_budget(rounds, fix_models, progress, impl_provider,
-                                                 base_rounds=max_rounds,
+                budget = worker_pr.decide_budget(budget_rounds, fix_models, progress,
+                                                 impl_provider, base_rounds=max_rounds,
                                                  pending_fix_models=pending_fix,
                                                  pin_floor=pin_floor)
             except worker_pr.WorkerPrError as exc:
@@ -2393,8 +2437,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # Budget-driven stop -> the machine-owned status:parked on the source issue
                 # (park_policy.py defect 1): exhaustion is not a human question, and needs:user
                 # there terminally absorbed the whole PR surface (2026-07-18 mass park).
+                # `budget_rounds` is the charged count — post-readmission when a human
+                # unlabeled needs:user (sparq#2804/PR#3442), the full history otherwise.
                 _pr_needs_user(script_dir, repo, number, issue_number,
-                               f"the review round budget is exhausted at {rounds} round(s) "
+                               f"the review round budget is exhausted at {budget_rounds} "
+                               f"round(s) "
                                f"(base {max_rounds}, hard cap {worker_pr.HARD_CAP_ROUNDS}) "
                                "with no extension left — the top fix tier has run, the latest "
                                "verdict does not grade the PR improving, and no pushed fix at "
@@ -4989,6 +5036,14 @@ def _self_test():
             return fake["pull"]
         if "/check-runs" in path:
             return {"check_runs": fake["check_runs"]}
+        if "/timeline" in path:
+            # The readmission-window probe (PR + source-issue label timelines). A missing
+            # entry serves an EMPTY timeline (no human unlabel — the full-count behaviour
+            # every pre-existing expectation assumes); timeline_error simulates a failed read.
+            if fake.get("timeline_error"):
+                raise RuntimeError("timeline unavailable")
+            match = re.search(r"/issues/(\d+)/timeline", path)
+            return [fake.get("timeline", {}).get(int(match.group(1)), [])]
         if "/issues/41/comments" in path:
             return [fake.get("comments", [])]
         if "/issues/7" in path:
@@ -5258,6 +5313,81 @@ def _self_test():
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
             assert alloc.chains == [], alloc.chains
+
+            # ---- round-budget human-readmission window (live defect sparq#2804/PR#3442,
+            # 2026-07-23: the maintainer unlabeled needs:user at 09:18:19Z and the CLAIM
+            # re-derivation re-parked at 09:40:55Z on 5 broken-CI-era rounds): a HUMAN
+            # unlabel restarts the budget; bot/absent/failed reads keep the full count ----
+            def stamped_rounds(count, created, start=1):
+                return [dict(bot_comment(
+                    f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->"),
+                    created_at=created) for i in range(start, start + count)]
+
+            def unlabel_event(ts, login):
+                return {"event": "unlabeled", "label": {"name": "needs:user"},
+                        "created_at": ts, "actor": {"login": login}}
+
+            def needs_user_reasons():
+                return [args[args.index("--reason") + 1] for script, args in helper_calls
+                        if script == "worker-pr.py" and args[0] == "needs-user"]
+
+            burned_era = stamped_rounds(5, "2026-07-22T05:00:00Z") + [
+                dict(bot_comment(f"x {fix_model} round=4 model=fable run=4.9 -->"),
+                     created_at="2026-07-22T05:30:00Z")]
+            # (1) human unlabel on the SOURCE ISSUE after 5 burned rounds => effective count
+            # 0 => NO budget park; the fix chain is offered again (the missed-marker defer is
+            # the allocator saying no slot, not an escalation).
+            fake["comments"] = burned_era
+            fake["timeline"] = {7: [unlabel_event("2026-07-23T09:18:19Z", "jeswr")]}
+            write_verdict(5, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            # (2) rounds recorded AFTER the unlabel count normally: 2 post-unlabel rounds
+            # (base 3) stay under budget even though the GLOBAL count (7) is at the hard cap.
+            fake["comments"] = burned_era + stamped_rounds(
+                2, "2026-07-23T10:00:00Z", start=6)
+            write_verdict(7, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            # (3) a BOT unlabel does NOT reset: the full 5-round count stands and the
+            # terminal park fires with the historical charge.
+            fake["comments"] = burned_era
+            fake["timeline"] = {
+                7: [unlabel_event("2026-07-23T09:18:19Z", "sparq-orchestrator[bot]")]}
+            write_verdict(5, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            # (4) no unlabel event anywhere => behaviour unchanged (the full count parks).
+            fake.pop("timeline", None)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            # (5) a timeline read failure keeps the FULL count (the OLD conservative park —
+            # never a fresh budget on unproven data) and logs the failure LOUDLY.
+            fake["timeline_error"] = True
+            alloc = FakeAllocator()
+            probe_log = io.StringIO()
+            with contextlib.redirect_stdout(probe_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            assert "timeline read failed" in probe_log.getvalue(), probe_log.getvalue()
+            fake.pop("timeline_error", None)
+            # (2) wrote a LEGACY round-7 verdict; the ledger-first resolution tests below
+            # depend on the legacy round-7 copy being absent — remove the fixture residue.
+            (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 7)).unlink()
 
             # hard cap: 6 rounds stop even with a weaker tier + an improving grade
             fake["comments"] = round_markers(6) + [
