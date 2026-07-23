@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3482,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ba13a5438f9eaae18ab898378c35b96b35952004",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Since round 1, this PR has gained a very large generated benchmark diff that changes the latest commit, nearly every displayed measurement, and extensive history. Many values move by roughly 2x or more while one string-filter benchmark changes by an order of magnitude, indicating a different runner/build state rather than a deterministic consequence of the CSS/component work. Landing this would publish non-canonical performance data and obscure the actual design-system change; the diff provides no provenance or ratchet evidence establishing that this regenerated snapshot is valid.",
+    "file": "site/src/data/benchmarks.generated.json",
+    "fix_hint": "Remove the generated benchmark-data changes from this PR. If a refresh is intentional, submit it as a dedicated change produced by the canonical benchmark pipeline, with the source commit/runner provenance and required performance-ratchet validation.",
+    "severity": "major",
+    "title": "Unrelated benchmark regeneration replaces the site's published performance data"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 regresses from the previously approved, narrowly scoped design-system change by adding a wholesale regeneration of the public benchmark dataset. The generated snapshot is unrelated to the Badge/Button accessibility synchronization and replaces the latest result plus extensive history with measurements from different commits, including broad multi-fold timing changes. This is not reviewable as a harmless generated-file refresh in this PR and violates the repository rule that session/work-box timings are non-canonical. The UI changes themselves remain internally consistent, but the benchmark churn must be removed or submitted separately with provenance and the benchmark ratchet/generation evidence.",
+  "verdict": "request_changes"
+ }
+}
