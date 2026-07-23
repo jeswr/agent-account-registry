@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3681,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d8b0270e44e482259ee4438e16a3c6c1ae277572",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 addresses round 2's sole (nit) finding: the next/dynamic call for ResultGraphView now passes { ssr: false } alongside { loading }, matching the established convention (lazy-demo.tsx, hero-runner-lazy.tsx) and guarding against a future unconditional render of this browser-only SVG renderer. ssr:false is harmless-to-correct in the static export \u2014 the view is only mounted on the showGraph toggle, never in the prerender tree, so it hydrates client-side as before. Verified correct/complete: (1) dynamic(() => import(\"@/components/repl-graph-view\").then((m) => m.ResultGraphView), {...}) is the documented named-export loader form \u2014 the component is returned directly (the React.lazy `{ default: ... }` wrapper is correctly dropped) and ResultGraphView is a genuine named export at repl-graph-view.tsx:56; (2) the React.Suspense boundary is removed and next/dynamic's own loading fallback carries the identical markup; (3) the HEAVY_MODULE_SUFFIXES entry `-> @/components/repl-graph-view` is added and the doc comment in result-graph-shape.ts updated to `next/dynamic` with SSR disabled; (4) the new PRESENCE test is non-vacuous \u2014 it pre-asserts the suffix is pinned, deletes the exact `src -> @/components/repl-graph-view` loadable key, and asserts exactly one /^PRESENCE:/ error naming the module, mirroring the bb.js/fzstd tests, so a static-import regression fails the guard. No security, soundness, or injection concerns.",
+  "verdict": "approve"
+ }
+}
