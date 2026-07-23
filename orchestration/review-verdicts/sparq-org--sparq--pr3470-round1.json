@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3470,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "45b868154a466a1f0d09fac2fc95859380ce3f8f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`full_epsg_definition` accepts projected definitions based only on datum/grid safety, while `to_crs84` swaps coordinates only for `+proj=longlat`. PROJ.4 definitions do not carry EPSG coordinate-system axis metadata. Consequently, projected EPSG CRSs whose official axis order is northing/easting (for example the EPSG north/east variants in the ETRS89 UTM family) are accepted but interpreted as easting/northing by proj4rs, producing a silent wrong result. This violates the documented promise that unevaluable or silently wrong registry entries are refused. The successful projected tests use ordinary easting/northing definitions and are not a witness for this case.",
+    "file": "crates/sparq-geo/src/reproject.rs",
+    "fix_hint": "Either ship reliable axis-order metadata for registry entries and normalize both geographic and projected coordinates before transformation, or conservatively reject fallback definitions whose official axis order cannot be proven to match proj4rs x/y order. Add a real-path regression test using a non-curated projected EPSG CRS with northing/easting axes and independent reference coordinates; also test the chosen fail-closed behavior if the embedded crate cannot supply axis metadata.",
+    "severity": "major",
+    "title": "Registry fallback ignores projected CRS axis order"
+   }
+  ],
+  "progress": null,
+  "summary": "The opt-in dependency and feature wiring are appropriately isolated, and the added tests exercise registry lookup, curated precedence, datum filtering, and several successful transformations. However, the fallback treats every projected EPSG definition as easting/ northing solely from its PROJ.4 string. EPSG coordinate-system axis order is not encoded by these strings, and some projected EPSG CRSs use northing/easting. Those accepted definitions will therefore silently transform swapped coordinates, contradicting the change's fail-closed correctness policy. The tests cover only conventional projected axis order, so they do not expose this class.",
+  "verdict": "request_changes"
+ }
+}
