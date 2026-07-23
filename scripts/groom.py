@@ -23,6 +23,7 @@ import argparse
 import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import http.client
 import importlib.util
 import io
 import json
@@ -667,19 +668,28 @@ class GitHubAPI:
                 **({"Content-Type": "application/json"} if payload is not None else {}),
             },
         )
-        try:
-            with urlopen(request, timeout=30) as response:
-                raw = response.read()
-        except HTTPError as exc:
-            if allow_404 and exc.code == 404:
-                return None
-            if retry_conflict and exc.code in {409, 422}:
-                raise GroomConflict("lease ledger compare-and-swap conflict") from exc
-            raise GroomError(
-                f"{self._purpose} GitHub API {method} failed with HTTP {exc.code}"
-            ) from exc
-        except (URLError, TimeoutError) as exc:
-            raise GroomError(f"{self._purpose} GitHub API request failed") from exc
+        retryable = method.upper() in _IDEMPOTENT_METHODS
+        for attempt in range(1, _TRANSIENT_RETRIES + 1):
+            try:
+                with urlopen(request, timeout=30) as response:
+                    raw = response.read()
+                break
+            except HTTPError as exc:
+                if allow_404 and exc.code == 404:
+                    return None
+                if retry_conflict and exc.code in {409, 422}:
+                    raise GroomConflict("lease ledger compare-and-swap conflict") from exc
+                if retryable and exc.code in _TRANSIENT_HTTP and attempt < _TRANSIENT_RETRIES:
+                    _sleep_transient(attempt, _retry_after_seconds(exc.headers))
+                    continue
+                raise GroomError(
+                    f"{self._purpose} GitHub API {method} failed with HTTP {exc.code}"
+                ) from exc
+            except (URLError, TimeoutError, ConnectionResetError) as exc:
+                if retryable and _is_transient_network(exc) and attempt < _TRANSIENT_RETRIES:
+                    _sleep_transient(attempt)
+                    continue
+                raise GroomError(f"{self._purpose} GitHub API request failed") from exc
         try:
             return json.loads(raw or b"null")
         except json.JSONDecodeError as exc:
@@ -863,6 +873,62 @@ def _sleep_backoff(attempt: int) -> None:
     """Sleep a full-jitter exponential backoff before CAS retry `attempt` (module-level so the
     self-test can stub it without sleeping)."""
     time.sleep(random.uniform(0, _backoff_ceiling(attempt)))
+
+
+# ---- transient-network retry (issue #494) -------------------------------------------------------
+# A scheduled sweep died on a raw http.client.RemoteDisconnected out of api.paginate -> request():
+# one transient TCP hiccup killed the ENTIRE hygiene pass, and groom's O(issues) comment fetches
+# (#36) maximise the exposure. request() now retries only genuinely TRANSIENT failures — the
+# RemoteDisconnected / ConnectionReset / timeout family and 502/503/504 — with bounded full-jitter
+# backoff, honouring a (capped) Retry-After. It still fails closed on every 4xx (auth/permission)
+# and on the 409/422 CAS conflict, which has its own caller-owned ledger re-read loop.
+#
+# Retries apply ONLY to reads. A dropped connection or gateway 5xx on a mutation does not prove
+# GitHub skipped the attempt — replaying a POST duplicates comments and replaying a PATCH/PUT can
+# repeat or overwrite a state transition. PUT/DELETE are nominally idempotent in HTTP but not in
+# effect here (the ledger contents PUT is CAS-keyed on a sha a completed first attempt consumes),
+# so mutations get NO transparent replay: an ambiguous failure fails loud and the next scheduled
+# sweep reconciles from re-read state, exactly as before #494.
+_IDEMPOTENT_METHODS = {"GET", "HEAD"}
+_TRANSIENT_RETRIES = 3           # total attempts (2 retries) before a transient failure fails loud
+_TRANSIENT_HTTP = {502, 503, 504}
+_RETRY_AFTER_CAP = 60.0          # never let a hostile/confused Retry-After stall the whole sweep
+
+
+def _is_transient_network(exc: BaseException) -> bool:
+    """True for the connection-dropped / timeout family that is safe to retry. RemoteDisconnected is
+    a ConnectionResetError subclass, so it is covered whether it propagates raw or wrapped in a
+    URLError; a URLError for anything else (DNS, refused, bad-cert) stays fatal exactly as before."""
+    if isinstance(exc, (ConnectionResetError, TimeoutError)):
+        return True
+    if isinstance(exc, URLError) and not isinstance(exc, HTTPError):
+        return isinstance(exc.reason, (ConnectionResetError, TimeoutError))
+    return False
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    """Parse a numeric Retry-After (seconds) into a capped delay; None when absent/unparseable so
+    the caller falls back to exponential backoff. HTTP-date forms are treated as absent (rare from
+    GitHub) rather than mis-parsed, and a negative value is ignored."""
+    raw = headers.get("Retry-After") if headers is not None else None
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, _RETRY_AFTER_CAP)
+
+
+def _sleep_transient(attempt: int, retry_after: float | None = None) -> None:
+    """Sleep before a transient retry: honour a (capped) Retry-After when the server sent one, else a
+    full-jitter exponential backoff. Module-level so the self-test can stub it without sleeping."""
+    if retry_after is not None:
+        time.sleep(retry_after)
+    else:
+        _sleep_backoff(attempt)
 
 
 def _release_claims(
@@ -3493,6 +3559,145 @@ def _self_test() -> int:
         check("persistent CAS conflict fails loud after retries", settled_loud, True)
     finally:
         globals()["_sleep_backoff"] = real_backoff
+
+    # ---- #494 bounded transient-network retry in GitHubAPI.request ----
+    # The live failure was a raw http.client.RemoteDisconnected out of api.paginate -> request()
+    # that exited the whole sweep 1. These drive the REAL request() through a swapped urlopen: a
+    # transient class that succeeds on the 2nd attempt must complete (delete the retry -> the first
+    # RemoteDisconnected propagates and reds "sweep completes"), and a 403 must NEVER be retried
+    # (widen the retry to 4xx -> the call count reds "403 is not retried").
+    check("RemoteDisconnected classifies transient", _is_transient_network(
+        http.client.RemoteDisconnected("Remote end closed connection without response")), True)
+    check("URLError-wrapped reset classifies transient",
+          _is_transient_network(URLError(ConnectionResetError("reset by peer"))), True)
+    check("timeout classifies transient", _is_transient_network(TimeoutError("timed out")), True)
+    check("DNS/refused URLError stays fatal",
+          _is_transient_network(URLError("Name or service not known")), False)
+    check("an HTTPError is not a network-transient (handled by code branch)",
+          _is_transient_network(HTTPError("https://x", 503, "u", {}, None)), False)
+    check("transient HTTP codes are exactly 502/503/504", sorted(_TRANSIENT_HTTP), [502, 503, 504])
+    check("Retry-After is honoured and capped",
+          (_retry_after_seconds({"Retry-After": "2"}),
+           _retry_after_seconds({"Retry-After": "9999"}),
+           _retry_after_seconds({}),
+           _retry_after_seconds({"Retry-After": "soon"})),
+          (2.0, _RETRY_AFTER_CAP, None, None))
+
+    class _FakeResp:
+        def __init__(self, raw: bytes):
+            self._raw = raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self) -> bytes:
+            return self._raw
+
+    real_urlopen = globals()["urlopen"]
+    real_sleep_transient = globals()["_sleep_transient"]
+    transient_sleeps: list[Any] = []
+    globals()["_sleep_transient"] = (
+        lambda attempt, retry_after=None: transient_sleeps.append((attempt, retry_after)))
+    calls = {"n": 0}
+    try:
+        api = GitHubAPI("t", "registry")
+
+        def _flaky(_request, timeout=None):        # RemoteDisconnected once, then a good page
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise http.client.RemoteDisconnected("Remote end closed connection")
+            return _FakeResp(json.dumps({"ok": True}).encode())
+
+        globals()["urlopen"] = _flaky
+        result = api.request("GET", "/repos/o/r/issues/7/comments")
+        check("transient RemoteDisconnected retried, sweep completes",
+              (result, calls["n"], transient_sleeps), ({"ok": True}, 2, [(1, None)]))
+
+        calls["n"] = 0
+        transient_sleeps.clear()
+
+        def _forbidden(_request, timeout=None):    # 403 is auth/permission — never retried
+            calls["n"] += 1
+            raise HTTPError("https://api.github.com/x", 403, "Forbidden", {}, None)
+
+        globals()["urlopen"] = _forbidden
+        forbidden_loud = False
+        try:
+            api.request("GET", "/repos/o/r/issues/7/comments")
+        except GroomError as exc:
+            forbidden_loud = "403" in str(exc)
+        check("403 is not retried (fails closed on the first attempt)",
+              (forbidden_loud, calls["n"], transient_sleeps), (True, 1, []))
+
+        calls["n"] = 0
+        transient_sleeps.clear()
+
+        def _throttled(_request, timeout=None):    # 503 + Retry-After, then a good page
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise HTTPError("https://x", 503, "Unavailable", {"Retry-After": "2"}, None)
+            return _FakeResp(json.dumps([]).encode())
+
+        globals()["urlopen"] = _throttled
+        throttled = api.request("GET", "/repos/o/r/issues?state=open")
+        check("503 retried, honouring the Retry-After header",
+              (throttled, calls["n"], transient_sleeps), ([], 2, [(1, 2.0)]))
+
+        calls["n"] = 0
+        transient_sleeps.clear()
+
+        def _always_reset(_request, timeout=None):  # persistent transient still fails loud
+            calls["n"] += 1
+            raise ConnectionResetError("connection reset by peer")
+
+        globals()["urlopen"] = _always_reset
+        exhausted_loud = False
+        try:
+            api.request("GET", "/repos/o/r/issues/7/comments")
+        except GroomError:
+            exhausted_loud = True
+        check("persistent transient fails loud after the bounded attempts (no infinite loop)",
+              (exhausted_loud, calls["n"]), (True, _TRANSIENT_RETRIES))
+
+        # Mutations are NEVER transparently replayed: an ambiguous transient failure cannot prove
+        # the first attempt was not applied (a replayed POST duplicates a comment; a replayed
+        # PATCH/PUT repeats a state transition). Widen _IDEMPOTENT_METHODS or drop the retryable
+        # guard and the call counts here red at 2.
+        check("only GET/HEAD are transparently retried",
+              sorted(_IDEMPOTENT_METHODS), ["GET", "HEAD"])
+
+        calls["n"] = 0
+        transient_sleeps.clear()
+        globals()["urlopen"] = _flaky   # RemoteDisconnected once, then success — GETs recover here
+        post_loud = False
+        try:
+            api.request("POST", "/repos/o/r/issues/7/comments", {"body": "x"})
+        except GroomError:
+            post_loud = True
+        check("ambiguous connection drop on a POST is not replayed (fails loud, one attempt)",
+              (post_loud, calls["n"], transient_sleeps), (True, 1, []))
+
+        calls["n"] = 0
+        transient_sleeps.clear()
+
+        def _gateway_503(_request, timeout=None):   # transient-class 503 on a mutation
+            calls["n"] += 1
+            raise HTTPError("https://x", 503, "Unavailable", {"Retry-After": "2"}, None)
+
+        globals()["urlopen"] = _gateway_503
+        patch_loud = False
+        try:
+            api.request("PATCH", "/repos/o/r/issues/7", {"state": "closed"})
+        except GroomError as exc:
+            patch_loud = "503" in str(exc)
+        check("transient 503 on a PATCH is not replayed (fails loud, one attempt)",
+              (patch_loud, calls["n"], transient_sleeps), (True, 1, []))
+    finally:
+        globals()["urlopen"] = real_urlopen
+        globals()["_sleep_transient"] = real_sleep_transient
 
     # ---- #509 release-side mutation boundary + bounded terminal reaping. ----
     # These fixtures drive the REAL run_sweep entry. The first changes a needs:* issue back to
