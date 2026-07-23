@@ -1895,6 +1895,17 @@ def _run_gh_target_comment(repo, issue_or_pr, body):
         repo, "POST", f"repos/{repo}/issues/{issue_or_pr}/comments", {"body": body})
 
 
+def capacity_park_proof_required(labels, park_receipts):
+    """True when the CLAIM sweep must re-prove a human readmission gesture before touching a
+    worker PR: EITHER the live review:parked label OR any durable park-generation receipt
+    triggers the ONE proof gate (round-3 finding 2; round-4 finding 2). The receipt leg is
+    load-bearing for the crash window: park writers post the receipt BEFORE any label write
+    (RECEIPT-FIRST), so a crash mid-park leaves receipt-no-label — this predicate still
+    demands the proof, and a triage-side label removal can re-enumerate the PR but never
+    strip the park. Label-no-receipt is impossible by the writers' ordering."""
+    return MACHINE_PARK_PR_LABEL in labels or bool(park_receipts)
+
+
 def _run_gh_target_api(repo, method, path, input_doc=None):
     """One target-owner issue mutation in the same token-isolated API style as every existing
     dispatch-side target write. The registry token is never used as a fallback for another
@@ -1950,7 +1961,17 @@ def _pr_comments(repo, pr_number):
     RAISE, never be silently dropped (round-3 finding 3): a discarded page could hide a
     durable receipt (round/attempt/park-generation marker) — hiding one would un-count budget
     rounds or un-consume an escalation-ladder window. Same fail-closed shape as
-    _issue_timeline_events."""
+    _issue_timeline_events.
+
+    ENTRIES are validated at read time too (round-4 finding 4): each must be a dict with the
+    user(dict)/body(str)/created_at(str) shape every counter and marker parser relies on — a
+    `[[null]]` payload passed the old page-only check and crashed the first consumer
+    (_bot_comments None.get()) with an unhandled AttributeError that ABORTED the whole CLAIM
+    sweep. A malformed entry raises exactly like a malformed page, and the raise is a
+    DispatchError — which every sweep call site already catches PER ITEM (the review/worker
+    loops' per-item `except DispatchError` and the escalate-starved inner handlers), so one
+    hostile/ghost comment now defers ONE item to its documented conservative result instead
+    of stranding the entire tick."""
     pages = _gh_json([
         "api", "--paginate", "--slurp", f"repos/{repo}/issues/{pr_number}/comments?per_page=100",
     ])
@@ -1959,6 +1980,12 @@ def _pr_comments(repo, pr_number):
     for page in pages:
         if not isinstance(page, list):
             raise DispatchError("target PR comments page is malformed")
+        for entry in page:
+            if (not isinstance(entry, dict)
+                    or not isinstance(entry.get("user"), dict)
+                    or not isinstance(entry.get("body"), str)
+                    or not isinstance(entry.get("created_at"), str)):
+                raise DispatchError("target PR comments entry is malformed")
     return [item for page in pages for item in page]
 
 
@@ -2368,7 +2395,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # processing below.
             comments = _pr_comments(repo, number)
             park_receipts = worker_pr.park_generation_cutoffs(comments, bot_login)
-            if MACHINE_PARK_PR_LABEL in labels or park_receipts:
+            if capacity_park_proof_required(labels, park_receipts):
                 # ONE proof gate (round-3 finding 2): the trigger is the DURABLE receipt
                 # state OR a live review:parked label — never the label alone. A triage-side
                 # label dismissal leaves the receipts standing, so CLAIM still re-proves the
@@ -2376,6 +2403,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # most-recent-event-wins against the park application, receipted windows
                 # consumed) before anything mutates or dispatches — a spoofed/stale label
                 # state can re-enumerate, but it can never mint budget or strip the park.
+                # Round-4 finding 2 pairs this with RECEIPT-FIRST park writers: a crash
+                # mid-park leaves receipt-no-label, which this gate still catches.
                 if not _park_policy.capacity_park_readmitted(
                         repo, number, issue_number, _issue_timeline_events,
                         is_human=lambda login: _target_is_human_maintainer(repo, login),
@@ -3340,14 +3369,24 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                             if action == "terminal":
                                 # Bounded escalation: PARK_ESCALATION_GENERATIONS windows
                                 # consumed — repeated post-readmission failure IS a human
-                                # question now. The needs:user write is veto-checked at the
-                                # write point (worker-issue set_status), and the comment is
-                                # HONEST when the veto suppressed it (round-3 finding 1:
-                                # never claim a label that did not land).
-                                landed = _issue_needs_user_landed(script_dir, repo, number)
+                                # question now. RECEIPT-FIRST ordering (round-4 finding 2):
+                                # the sticky veto is PROBED first (so the receipt is honest
+                                # about a suppressed write), the durable receipt posts
+                                # SECOND, and the veto-checked needs:user write (worker-issue
+                                # set_status re-checks it at the write point) comes LAST — a
+                                # crash after the receipt leaves receipt-no-label, which the
+                                # receipt-driven ladder/proof reads cover; the old
+                                # label-first order could die label-no-receipt, and a
+                                # triage-side label removal then erased the escalation from
+                                # every durable surface.
+                                vetoed = _park_policy.park_vetoed(
+                                    repo, number, "needs:user", _issue_timeline_events,
+                                    is_human=lambda login: _target_is_human_maintainer(
+                                        repo, login))
                                 label_note = (
-                                    " Escalated as a human question (`needs:user`)."
-                                    if landed else
+                                    " Escalated as a human question (`needs:user`; the "
+                                    "label write follows this receipt)."
+                                    if not vetoed else
                                     " The escalation is TERMINAL, but the `needs:user` "
                                     "label write was SUPPRESSED by a standing human "
                                     "unlabel (sticky veto) — no label was applied; this "
@@ -3364,6 +3403,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                     "readmission — a decision is needed, not another retry."
                                     f"\n\n{worker_pr.PARK_GENERATION_MARKER} "
                                     f"gen={generation} cutoff={window_key} -->")
+                                landed = (False if vetoed else
+                                          _issue_needs_user_landed(script_dir, repo, number))
                                 defer_reasons["budget-exhausted-escalated"] += 1
                                 print(f"escalated {repo}#{number}: deferred-retry budget "
                                       f"exhausted post-readmission (generation "
@@ -3374,13 +3415,20 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                             # label, best-effort) + the MANDATORY receipt. The receipt
                             # comment lands exactly once per window even when the sticky
                             # veto suppressed the label — it IS the durable ladder and what
-                            # keeps every later tick quiet.
-                            parked = _park_source_issue(script_dir, repo, number)
+                            # keeps every later tick quiet. RECEIPT-FIRST ordering (round-4
+                            # finding 2): veto probe, then the receipt, then the label write
+                            # — a crash after the receipt leaves receipt-no-label (the
+                            # ladder/proof reads key on receipts), never label-no-receipt.
+                            vetoed = _park_policy.park_vetoed(
+                                repo, number, "status:parked", _issue_timeline_events,
+                                is_human=lambda login: _target_is_human_maintainer(
+                                    repo, login))
                             label_note = (
-                                "Parked with the machine-owned `status:parked` soft hold: "
-                                "the whole PR surface holds (no review/fix dispatch, no "
-                                "new implementation attempt) until a human readmission. "
-                                if parked else
+                                "Parking with the machine-owned `status:parked` soft hold "
+                                "(the label write follows this receipt): the whole PR "
+                                "surface holds (no review/fix dispatch, no new "
+                                "implementation attempt) until a human readmission. "
+                                if not vetoed else
                                 "The `status:parked` label write was SUPPRESSED by a "
                                 "standing human unlabel (sticky veto); this receipt "
                                 "records the consumed budget window without a label. ")
@@ -3394,6 +3442,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                 "attempt budget is spent — approve a retry or decide "
                                 f"the route.\n\n{worker_pr.PARK_GENERATION_MARKER} "
                                 f"gen={generation} cutoff={window_key} -->")
+                            parked = (False if vetoed else
+                                      _park_source_issue(script_dir, repo, number))
                             defer_reasons["budget-exhausted"] += 1
                             print(f"escalated {repo}#{number}: deferred-retry budget "
                                   f"exhausted (generation {generation}"
@@ -4067,12 +4117,14 @@ def _self_test():
                    "action=research -->")
     bot_marked = run_decline_tripwire(
         [no_change_a, no_change_b], role="research",
-        comments=[{"user": {"login": "sparq[bot]"}, "body": marker_body}])
+        comments=[{"user": {"login": "sparq[bot]"}, "body": marker_body,
+                   "created_at": "2026-07-23T09:00:00Z"}])
     assert bot_marked["api_calls"] == [] and bot_marked["helper_calls"] == [], bot_marked
     assert bot_marked["claim_calls"] == 1, bot_marked
     forged = run_decline_tripwire(
         [no_change_a, no_change_b], role="research",
-        comments=[{"user": {"login": "mallory"}, "body": marker_body}])
+        comments=[{"user": {"login": "mallory"}, "body": marker_body,
+                   "created_at": "2026-07-23T09:00:00Z"}])
     assert [call[0] for call in forged["api_calls"]] == ["POST"], forged
     assert len(forged["helper_calls"]) == 1 and forged["claim_calls"] == 0, forged
     print("  ok   decline tripwire (e): bot marker is idempotent; third-party forgery is ignored")
@@ -5504,7 +5556,7 @@ def _self_test():
             # repeated failed recovery: the round budget is spent (hard cap) -> loud needs-user,
             # and no review is dispatched — terminal escalation is RESERVED for this case
             fake["comments"] = [
-                {"user": {"login": bot},
+                {"user": {"login": bot}, "created_at": "2026-07-30T00:00:00Z",
                  "body": f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->"}
                 for i in range(1, wiring_worker_pr.HARD_CAP_ROUNDS + 1)]
             alloc = StrandAllocator()
@@ -5535,7 +5587,11 @@ def _self_test():
                     return True
 
             def bot_comment(body):
-                return {"user": {"login": bot}, "body": body}
+                # created_at postdates every fixture cutoff below, preserving the old
+                # missing-timestamp-is-charged semantics now that the validated reader
+                # (round-4 finding 4) requires the full comment shape.
+                return {"user": {"login": bot}, "body": body,
+                        "created_at": "2026-07-30T00:00:00Z"}
 
             def round_markers(count):
                 return [bot_comment(f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->")
@@ -5619,7 +5675,7 @@ def _self_test():
             assert alloc.chains == [["fable"]], alloc.chains
             # ... while a NON-bot forged pin marker is inert (bot-login trust filter)
             fake["comments"] = round_markers(2) + [
-                {"user": {"login": "mallory"},
+                {"user": {"login": "mallory"}, "created_at": "2026-07-30T00:00:00Z",
                  "body": f"z {pin_marker} round=1 tier=fable run=6.6 -->"}]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -6957,15 +7013,46 @@ def _self_test():
             raise AssertionError("a malformed live issue page must fail loud")
         # round-3 finding 3: a malformed COMMENTS page could hide a durable receipt
         # (round/attempt/park-generation marker) — _pr_comments must RAISE, never drop it.
-        globals()["_gh_json"] = lambda args: [[{"user": {"login": "b[bot]"}}], "garbage"]
+        good_comment = {"user": {"login": "b[bot]"}, "body": "x",
+                        "created_at": "2026-07-23T09:00:00Z"}
+        globals()["_gh_json"] = lambda args: [[good_comment], "garbage"]
         try:
             _pr_comments(repo, 41)
         except DispatchError as exc:
             assert "comments page is malformed" in str(exc), exc
         else:
             raise AssertionError("a malformed PR comments page must fail loud")
+        # round-4 finding 4: ENTRY validation — [[null]] passed the old page-only check and
+        # the first consumer (_bot_comments None.get()) crashed with an AttributeError that
+        # aborted the ENTIRE claim sweep. Each malformed shape must raise DispatchError at
+        # read time (the sweep's per-item handlers then defer just that item).
+        for bad_entry in (None, "loose-string", {**good_comment, "user": None},
+                          {**good_comment, "body": None},
+                          {**good_comment, "created_at": None}):
+            globals()["_gh_json"] = lambda args: [[good_comment, bad_entry]]
+            try:
+                _pr_comments(repo, 41)
+            except DispatchError as exc:
+                assert "comments entry is malformed" in str(exc), (bad_entry, exc)
+            else:
+                raise AssertionError(f"a malformed comments entry must fail loud: {bad_entry!r}")
+        globals()["_gh_json"] = lambda args: [[good_comment]]
+        assert _pr_comments(repo, 41) == [good_comment]
     finally:
         globals()["_gh_json"] = prev_live_gh
+
+    # ---- round-4 finding 2 (the crash window, CLAIM side): the ONE proof-gate trigger is
+    # receipt-OR-label. Receipt-posted-label-missing (a park writer died between its durable
+    # receipt and its label write — the only crash residue RECEIPT-FIRST ordering permits)
+    # still requires the readmission proof; label-no-receipt is impossible by the writers'
+    # ordering (worker-pr's self-test asserts the call order), and a live label alone still
+    # gates (a pre-receipt legacy park). ----
+    assert capacity_park_proof_required([], {"2026-07-23T09:00:00Z"}) is True
+    assert capacity_park_proof_required([], {"none"}) is True
+    assert capacity_park_proof_required(["review:parked"], set()) is True
+    assert capacity_park_proof_required(["review:parked"], {"none"}) is True
+    assert capacity_park_proof_required(["review:needs"], set()) is False
+    assert capacity_park_proof_required([], set()) is False
 
     # ---- round-3 Opus finding: a maintainer probe-CALL failure emits the distinct loud
     # ::warning:: diagnostic (and still fails toward not-human); a genuine not-a-maintainer

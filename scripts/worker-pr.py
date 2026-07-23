@@ -272,7 +272,7 @@ def count_rounds(comments, bot_login):
     return best
 
 
-def count_rounds_since(comments, bot_login, since):
+def count_rounds_since(comments, bot_login, since, log=print):
     """Substantive review rounds charged to the ROUND BUDGET after a human readmission.
 
     Live defect (sparq#2804/PR#3442, 2026-07-23): the budget re-derivation counted ALL
@@ -287,24 +287,38 @@ def count_rounds_since(comments, bot_login, since):
 
     Fail direction (toward the OLD conservative full count, never toward a fresh budget on
     unproven data): a falsy `since` means no readmission window — the plain count_rounds
-    applies; a marker whose comment has no parseable created_at is CHARGED; a timestamp tie
-    with the cutoff is CHARGED (ISO-8601 UTC compares lexicographically). Void subtraction is
-    global, exactly as in count_rounds."""
+    applies; a marker whose comment has no created_at is CHARGED; a marker whose comment
+    carries a NON-ISO-8601 created_at is CHARGED with a loud log (round-4 finding 3: the
+    window compare is lexicographic and only sound over well-formed stamps — a garbage stamp
+    like "0000-not-a-timestamp" sorts BEFORE any real cutoff and would silently un-charge
+    the round, authorizing exhausted work; unprovable time always counts AGAINST the
+    budget, exactly like the missing-timestamp case); a timestamp tie with the cutoff is
+    CHARGED (ISO-8601 UTC compares lexicographically). Void subtraction is global, exactly
+    as in count_rounds."""
     if not since:
         return count_rounds(comments, bot_login)
     voided = _round_voids(comments, bot_login)
     charged = set()
     for comment in _bot_comments(comments, bot_login):
-        created = comment.get("created_at")
-        if isinstance(created, str) and created and created < since:
-            continue
+        rounds = set()
         for match in re.finditer(
                 re.escape(ROUND_MARKER)
                 + r" n=([1-9][0-9]*) run=(\S+)(?: sha=(?:[0-9a-f]{40}|none))? -->",
                 str(comment.get("body", ""))):
             round_n, run_key = int(match.group(1)), match.group(2)
             if (round_n, run_key) not in voided:
-                charged.add(round_n)
+                rounds.add(round_n)
+        if not rounds:
+            continue  # nothing chargeable in this comment — its timestamp is irrelevant
+        created = comment.get("created_at")
+        if isinstance(created, str) and created:
+            if not _valid_iso_timestamp(created):
+                log(f"::warning::round receipt carries a malformed created_at {created!r} "
+                    "— CHARGED against the round budget (unprovable time can never "
+                    "authorize exhausted work)")
+            elif created < since:
+                continue
+        charged.update(rounds)
     return len(charged)
 
 
@@ -859,7 +873,16 @@ def _paginated_comments(repo, pr_number):
     """All PR conversation comments (paginated). A malformed PAGE must RAISE, never be
     silently dropped (round-3 finding 3): a discarded page could hold a durable receipt
     (round/attempt/park-generation marker) — hiding one would un-count budget rounds or
-    un-consume an escalation-ladder window. Same fail-closed shape as _issue_timeline."""
+    un-consume an escalation-ladder window. Same fail-closed shape as _issue_timeline.
+
+    ENTRIES are validated at read time too (round-4 finding 4): each must be a dict with the
+    user(dict)/body(str)/created_at(str) shape every counter and marker parser relies on — a
+    `[[null]]` payload passed the old page-only check and crashed the first consumer
+    (_bot_comments None.get()) mid-decision, aborting the whole sweep. A malformed entry
+    raises exactly like a malformed page (it could BE a receipt — a ghost/deleted-user
+    comment is indistinguishable from a shape attack at this boundary), and the raise is a
+    WorkerPrError, which every caller already degrades to its documented conservative
+    per-call result instead of an unhandled crash."""
     pages = _gh_json([
         "api", "--paginate", "--slurp", f"repos/{repo}/issues/{pr_number}/comments?per_page=100",
     ])
@@ -868,6 +891,12 @@ def _paginated_comments(repo, pr_number):
     for page in pages:
         if not isinstance(page, list):
             raise WorkerPrError("GitHub API returned a malformed comments page")
+        for entry in page:
+            if (not isinstance(entry, dict)
+                    or not isinstance(entry.get("user"), dict)
+                    or not isinstance(entry.get("body"), str)
+                    or not isinstance(entry.get("created_at"), str)):
+                raise WorkerPrError("GitHub API returned a malformed comments entry")
     return [item for page in pages for item in page]
 
 
@@ -1867,8 +1896,12 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     PARK_ESCALATION_GENERATIONS windows have been consumed the stop escalates to the QUESTION
     class (review:needs-user / needs:user, each write veto-checked, with a comment that is
     HONEST when a label write was suppressed) so nothing spins forever. An unreadable label
-    timeline FREEZES the ladder (no receipt, no label, no comment this call). `bot_login` is
-    required for every capacity park (the receipt parser's trust filter). worker-issue's
+    timeline FREEZES the ladder (no receipt, no label, no comment this call). The receipt is
+    posted BEFORE any label write (RECEIPT-FIRST, round-4 finding 2): a crash mid-park can
+    only leave receipt-no-label — which the receipt-driven CLAIM proof gate covers — never
+    label-no-receipt, where a triage-side label removal would erase the park from every
+    proof surface. `bot_login` is required for every capacity park (the receipt parser's
+    trust filter). worker-issue's
     set_status and the review:parked write here both enforce the sticky human-unpark veto
     (strict maintainer probe) before writing."""
     handle = maintainer or os.environ.get("MAINTAINER_HANDLE", "jeswr")
@@ -1900,10 +1933,17 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             # post-readmission failure IS a human question now. The terminal label write is
             # veto-checked like every park write (round-3 finding 1), and the comment never
             # claims a label that did not land.
+            #
+            # RECEIPT-FIRST ordering (round-4 finding 2): the veto is PROBED first (so the
+            # receipt is honest about a suppressed write), the durable receipt is posted
+            # SECOND, and every label write comes LAST. Dying between receipt and labels
+            # leaves receipt-no-label — the receipt-driven CLAIM proof gate triggers on the
+            # receipts alone, so the park still holds (the designed direction). The OLD
+            # label-first order could die label-no-receipt: a triage actor then removes the
+            # label, PLAN sees no machine label, CLAIM sees no receipt AND no source label,
+            # and no readmission proof is ever requested again.
             vetoed = policy.park_vetoed(repo, pr_number, "review:needs-user",
                                         _issue_timeline, is_human=probe)
-            if not vetoed:
-                set_review_state(repo, pr_number, "needs-user")
             label_note = ("" if not vetoed else
                           "\n\nNOTE: the `review:needs-user` label write was SUPPRESSED by "
                           "a standing human unlabel (sticky veto) — no label was applied; "
@@ -1916,6 +1956,8 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                      f"human question. @{handle} this pull request needs a human decision. "
                      f"It remains a DRAFT and will not be auto-armed."
                      f"{label_note}{generation_marker}")
+            if not vetoed:
+                set_review_state(repo, pr_number, "needs-user")
             if issue:
                 _load_worker_issue().set_status(repo, issue, "needs-user")
             _ops_alert(alert_repo, alert_token,
@@ -1930,11 +1972,13 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
         # plus the MANDATORY receipt. The PR-side review:parked write is veto-gated exactly
         # like the issue-side status:parked (park_policy.py invariant 2); the receipt lands
         # regardless (it IS the durable ladder and the dedupe key), and the comment is honest
-        # when the label write was suppressed.
+        # when the label write was suppressed. RECEIPT-FIRST ordering (round-4 finding 2):
+        # veto probe, then the durable receipt, then the label writes — a crash after the
+        # receipt leaves receipt-no-label (covered by the receipt-driven CLAIM proof gate);
+        # the old label-first order could die label-no-receipt, and a triage-side label
+        # removal then erased the park from every proof surface.
         parked = not policy.park_vetoed(repo, pr_number, MACHINE_PARK_PR_LABEL,
                                         _issue_timeline, is_human=probe)
-        if parked:
-            set_review_state(repo, pr_number, "parked")
         label_note = ("" if parked else
                       "\n\nNOTE: the `review:parked` label write was SUPPRESSED by a "
                       "standing human unlabel (sticky veto); this receipt records the "
@@ -1948,6 +1992,8 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                  f"(whichever are present; a `needs:user` unlabel on either surface also "
                  f"opens the budget window) — the budget restarts from the latest gesture."
                  f"{label_note}{generation_marker}")
+        if parked:
+            set_review_state(repo, pr_number, "parked")
         if issue:
             _load_worker_issue().set_status(repo, issue, "parked")
         _ops_alert(alert_repo, alert_token,
@@ -3171,6 +3217,27 @@ def _self_test():
           count_rounds_since([{"user": {"login": bot},
                                "body": f"x {ROUND_MARKER} n=6 run=6.1 -->"}], bot,
                              unlabel_ts), 1)
+    # Round-4 finding 3: a NON-ISO created_at that sorts lexicographically BEFORE the cutoff
+    # ("0000-..." < "2026-...") must be CHARGED with a loud log, never silently omitted from
+    # the budget — the old bare `created < since` skip let a malformed stamp authorize
+    # exhausted work.
+    ts_logs = []
+    check("a malformed created_at sorting BEFORE the cutoff is CHARGED (round-4 finding 3)",
+          count_rounds_since([dict(stamped_round(6, "0000-not-a-timestamp"))], bot,
+                             unlabel_ts, log=ts_logs.append), 1)
+    check("the malformed-timestamp charge logs loudly",
+          any("malformed created_at" in line and "CHARGED" in line for line in ts_logs), True)
+    ts_logs.clear()
+    check("a malformed created_at sorting AFTER the cutoff is also CHARGED",
+          count_rounds_since([stamped_round(6, "zzzz-not-a-timestamp")], bot,
+                             unlabel_ts, log=ts_logs.append), 1)
+    quiet_logs = []
+    check("a NON-chargeable comment's malformed timestamp stays silent (no marker => no "
+          "charge, no log)",
+          (count_rounds_since([{"user": {"login": bot}, "created_at": "0000-bad",
+                                "body": "no marker here"},
+                               stamped_round(6, "2026-07-23T10:00:00Z")], bot,
+                              unlabel_ts, log=quiet_logs.append), quiet_logs), (1, []))
     check("void subtraction still applies inside the window",
           count_rounds_since(post_rounds + [
               {"user": {"login": bot}, "created_at": "2026-07-23T11:05:00Z",
@@ -4011,11 +4078,18 @@ def _self_test():
                 return
             park_route_calls.append(("issue-status", issue, status))
 
+    # Round-4 finding 2 (RECEIPT-FIRST): the _comment mock records into the SAME ordered call
+    # list as the label writes, so every capacity-park expectation below asserts the CALL
+    # ORDER — the durable receipt must precede every label write, making the
+    # label-posted-receipt-missing crash window impossible by construction.
+    def _record_park_comment(repo, pr, body):
+        park_route_calls.append(("receipt",))
+        park_route_comments.append(body)
+
     try:
         wiring_globals["set_review_state"] = (
             lambda repo, pr, state: park_route_calls.append(("pr-state", state)))
-        wiring_globals["_comment"] = (
-            lambda repo, pr, body: park_route_comments.append(body))
+        wiring_globals["_comment"] = _record_park_comment
         wiring_globals["_load_worker_issue"] = lambda: _ParkRouteIssueModule
         wiring_globals["_ops_alert"] = lambda *a: None
         wiring_globals["_issue_timeline"] = (
@@ -4036,9 +4110,10 @@ def _self_test():
         # initial full-budget window is receipted (gen=1 cutoff=none) — the ladder is durable
         # from the very first park, label state notwithstanding.
         needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
-        check("capacity stop writes the machine pair (review:parked + status:parked)",
+        check("capacity stop writes the machine pair (review:parked + status:parked), "
+              "RECEIPT FIRST (round-4 finding 2)",
               park_route_calls,
-              [("pr-state", "parked"), ("issue-status", 7, "parked")])
+              [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
         check("capacity comment names the readmission gestures",
               MACHINE_PARK_PR_LABEL in park_route_comments[-1]
               and "status:parked" in park_route_comments[-1], True)
@@ -4050,7 +4125,7 @@ def _self_test():
         needs_user("o/r", 41, "human question", issue=7)
         check("question stop (default) keeps the human-owned needs:user route",
               park_route_calls,
-              [("pr-state", "needs-user"), ("issue-status", 7, "needs-user")])
+              [("pr-state", "needs-user"), ("receipt",), ("issue-status", 7, "needs-user")])
 
         # (c-f) THE REAL SEQUENCE end-to-end (round-3 finding 1 — the old test fabricated an
         # impossible second review:parked unlabel with no re-application in between): an
@@ -4070,8 +4145,8 @@ def _self_test():
         park_route_comments.clear()
         needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
         check("(c) gen-1 park lands: the era veto covers the HUMAN labels, not the machine "
-              "pair", park_route_calls,
-              [("pr-state", "parked"), ("issue-status", 7, "parked")])
+              "pair — and the receipt still precedes both label writes", park_route_calls,
+              [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
         check("(c) gen-1 receipt consumes the era gesture's window",
               f"{PARK_GENERATION_MARKER} gen=1 cutoff=2026-07-23T08:00:00Z -->"
               in park_route_comments[-1], True)
@@ -4099,8 +4174,8 @@ def _self_test():
         needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
                    bot_login=bot)
         check("(e) re-exhaustion advances the RECEIPTS to gen2 despite every label write "
-              "being veto-suppressed",
-              park_route_calls, [("issue-status-vetoed", 7, "needs-user")])
+              "being veto-suppressed (receipt still first)",
+              park_route_calls, [("receipt",), ("issue-status-vetoed", 7, "needs-user")])
         check("(e) gen-2 receipt binds the fresh readmission cutoff",
               f"{PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T09:00:00Z -->"
               in park_route_comments[-1], True)
@@ -4131,7 +4206,7 @@ def _self_test():
         needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
         check("(g) a bot unlabel neither vetoes nor mints a window key",
               park_route_calls,
-              [("pr-state", "parked"), ("issue-status", 7, "parked")])
+              [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
         check("(g) no gesture => the initial-window receipt (cutoff=none), never a bot key",
               f"{PARK_GENERATION_MARKER} gen=1 cutoff={PARK_WINDOW_NONE} -->"
               in park_route_comments[-1], True)
@@ -4173,7 +4248,7 @@ def _self_test():
                   "malformed timeline page" in str(exc), True)
         # Round-3 finding 3: the COMMENTS reader takes the same fail-closed shape — a
         # discarded page could hide a durable receipt (round/attempt/park-generation marker).
-        receipt_page = [{"user": {"login": bot},
+        receipt_page = [{"user": {"login": bot}, "created_at": "2026-07-23T09:00:00Z",
                          "body": f"x {PARK_GENERATION_MARKER} gen=1 cutoff=none -->"}]
         wiring_globals["_gh_json"] = lambda args, **_kw: [receipt_page, "garbage-page"]
         try:
@@ -4182,6 +4257,25 @@ def _self_test():
         except WorkerPrError as exc:
             check("malformed comments page raises",
                   "malformed comments page" in str(exc), True)
+        # Round-4 finding 4: ENTRY validation — [[null]] passed the old page-only check and
+        # crashed _bot_comments (None.get()) mid-decision; a wrong-shaped user/body/created_at
+        # is the same class. Both raise at read time like a malformed page.
+        for bad_entry in (None, "loose-string",
+                          {"user": None, "body": "x", "created_at": "2026-07-23T09:00:00Z"},
+                          {"user": {"login": bot}, "body": None,
+                           "created_at": "2026-07-23T09:00:00Z"},
+                          {"user": {"login": bot}, "body": "x", "created_at": None}):
+            wiring_globals["_gh_json"] = lambda args, **_kw: [receipt_page + [bad_entry]]
+            try:
+                _paginated_comments("o/r", 41)
+                check(f"malformed comments entry raises ({bad_entry!r})", "no error",
+                      "raised")
+            except WorkerPrError as exc:
+                check(f"malformed comments entry raises ({bad_entry!r})",
+                      "malformed comments entry" in str(exc), True)
+        wiring_globals["_gh_json"] = lambda args, **_kw: [receipt_page]
+        check("a well-formed comments page still reads clean",
+              _paginated_comments("o/r", 41), receipt_page)
     finally:
         wiring_globals["_gh_json"] = real_timeline_json
 

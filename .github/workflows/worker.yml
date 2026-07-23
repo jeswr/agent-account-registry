@@ -848,6 +848,13 @@ jobs:
           print(f"selected account resolved: model={model}, harness={values['harness']}")
           PY
 
+      # Round-4 finding 1 (windowed-vs-lifetime split brain): attempt-check re-derives the SAME
+      # human-readmission cutoff CLAIM granted the retry on (park_policy.readmission_cutoff over
+      # the live label timeline, strict maintainer probe) and charges the WINDOWED attempt
+      # count. The cutoff is deliberately derived WORKER-SIDE, never taken from the dispatch
+      # payload: like every other last-step guard here (trust reverify, strict routing
+      # equality), the budget evidence is re-proved live so a workflow_dispatch caller can
+      # never mint budget. A genuinely exhausted windowed budget still fails closed below.
       - name: Check durable per-issue attempt budget
         id: budget
         if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
