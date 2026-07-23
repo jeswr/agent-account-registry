@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3454,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "65eda1b325f6c1e9c142f737d292890b5b72b0e7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 fixes the prior major finding. The version-pin test now reads the dependency edges from sparq-canon's own Cargo.lock package entry and compares the complete resolved oxrdf/oxttl version sets without filtering by the expected version prefixes. Consequently, moving sparq-canon's serializer dependency to another major or minor version fails even if another workspace crate retains the old version. The resolver also fails closed when the expected direct edge disappears or the lockfile shape no longer yields it. The byte-exact token tests exercise the real canonicalization entry point, and the parser/serializer round-trip test is non-vacuous. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
