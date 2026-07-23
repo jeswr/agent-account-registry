@@ -646,10 +646,22 @@ def _sanitize_leg(name):
     return re.sub(r"[^ -~]", "?", str(name))[:120].strip()
 
 
-def interpret_check_runs(check_runs):
+# The rank instant for a check-run whose started_at cannot be parsed (round-6 finding 1):
+# the oldest representable aware instant, so unparseable data never beats a parseable stamp.
+_CHECK_RUN_EPOCH = _park_policy.parse_ts("0001-01-01T00:00:00Z")
+
+
+def interpret_check_runs(check_runs, log=print):
     """PURE interpreter for a commit's check-runs listing (hostile-tolerant: malformed input
-    degrades to gate=unknown, never a crash and never an ACT). Re-runs of the same check name are
-    superseded by the latest `started_at`. Returns {"gate", "failing_legs"} where gate is one of
+    degrades to gate=unknown, never a crash and never an ACT). Re-runs of the same check name
+    are superseded by the latest `started_at`, ordered by PARSED INSTANT
+    (park_policy.parse_ts — round-6 finding 1: the old raw-string compare read an older
+    failed gate "2026-07-23T09:00:00Z" as newer than a successful rerun spelled
+    "2026-07-23 10:00:00Z" — the space sorts before "T" — retaining the stale failure, so
+    the needs-ci-fix admission dispatched a fixer against a green head). A run with a
+    malformed/unparseable `started_at` ranks OLDEST with a loud log — unparseable data can
+    never supersede a parseable stamp (two unparseable stamps keep the old last-listed-wins
+    tie rule). Returns {"gate", "failing_legs"} where gate is one of
     failure|pending|success|missing|unknown — ONLY a concluded `failure` ever admits a ci-fix
     (an in-progress gate is deliberately not enumerated: no churn)."""
     if not isinstance(check_runs, list):
@@ -661,7 +673,16 @@ def interpret_check_runs(check_runs):
         name = run.get("name")
         if not isinstance(name, str) or not name:
             continue
-        started = str(run.get("started_at") or "")
+        started_raw = run.get("started_at")
+        try:
+            # Rank tuples order parseable (1, instant) strictly above every unparseable
+            # (0, epoch) entry, so hostile/garbage stamps can only LOSE to real ones.
+            started = (1, _park_policy.parse_ts(started_raw))
+        except ValueError:
+            started = (0, _CHECK_RUN_EPOCH)
+            log(f"::warning::check-run {_sanitize_leg(name)!r} carries an unparseable "
+                f"started_at {str(started_raw)[:64]!r} — ranked OLDEST (an unparseable "
+                "stamp never supersedes a parseable rerun)")
         prior = latest.get(name)
         if prior is None or started >= prior[0]:
             latest[name] = (started, run)
@@ -5078,40 +5099,87 @@ def _self_test():
 
     # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
     runs = [
-        {"name": "gate", "status": "completed", "conclusion": "failure", "started_at": "T2"},
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": "2026-07-23T02:00:00Z"},
         {"name": "docs-quality", "status": "completed", "conclusion": "failure",
-         "started_at": "T1"},
-        {"name": "js", "status": "completed", "conclusion": "timed_out", "started_at": "T1"},
-        {"name": "green", "status": "completed", "conclusion": "success", "started_at": "T1"},
+         "started_at": "2026-07-23T01:00:00Z"},
+        {"name": "js", "status": "completed", "conclusion": "timed_out",
+         "started_at": "2026-07-23T01:00:00Z"},
+        {"name": "green", "status": "completed", "conclusion": "success",
+         "started_at": "2026-07-23T01:00:00Z"},
     ]
     assert interpret_check_runs(runs) == {"gate": "failure",
                                           "failing_legs": ["docs-quality", "js"]}
     # a later re-run supersedes an earlier conclusion of the same check name
     rerun = runs + [{"name": "gate", "status": "completed", "conclusion": "success",
-                     "started_at": "T3"}]
+                     "started_at": "2026-07-23T03:00:00Z"}]
     assert interpret_check_runs(rerun)["gate"] == "success"
+    # [round-6 f1] rerun supersession is by PARSED INSTANT, never raw strings: the EXACT
+    # spelling pair — an older failed gate "2026-07-23T09:00:00Z" lexicographically BEATS a
+    # newer successful rerun "2026-07-23 10:00:00Z" (space sorts before "T"), so the old
+    # string compare retained the stale failure and needs-ci-fix dispatched a fixer against
+    # a green head. Order-independent: the parsed compare wins both listing orders.
+    spelling_pair = [
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": "2026-07-23T09:00:00Z"},
+        {"name": "gate", "status": "completed", "conclusion": "success",
+         "started_at": "2026-07-23 10:00:00Z"},
+    ]
+    assert interpret_check_runs(spelling_pair)["gate"] == "success"
+    assert interpret_check_runs(list(reversed(spelling_pair)))["gate"] == "success"
+    # ... and the inverse spelling (older space-form failure vs newer T-form success) too.
+    assert interpret_check_runs([
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": "2026-07-23 09:00:00Z"},
+        {"name": "gate", "status": "completed", "conclusion": "success",
+         "started_at": "2026-07-23T10:00:00Z"},
+    ])["gate"] == "success"
+    # [round-6 f1] a malformed started_at ranks OLDEST with a loud log — a hostile
+    # lexicographically-huge garbage stamp must never retain a stale conclusion over a
+    # parseable rerun (unparseable never beats parseable, in either listing order).
+    ic_logs = []
+    garbage_stamped = [
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": "zzz-later-than-everything"},
+        {"name": "gate", "status": "completed", "conclusion": "success",
+         "started_at": "2026-07-23T09:00:00Z"},
+    ]
+    assert interpret_check_runs(garbage_stamped, log=ic_logs.append)["gate"] == "success"
+    assert interpret_check_runs(list(reversed(garbage_stamped)),
+                                log=ic_logs.append)["gate"] == "success"
+    assert any("unparseable started_at" in line for line in ic_logs), ic_logs
+    # two unparseable stamps keep the deterministic last-listed-wins tie rule
+    assert interpret_check_runs([
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": None},
+        {"name": "gate", "status": "completed", "conclusion": "success",
+         "started_at": "not-a-timestamp"},
+    ], log=ic_logs.append)["gate"] == "success"
     # [issue #160] ONLY literal `success` is green. A COMPLETED gate whose conclusion is a
     # broken/incomplete run (cancelled, never-started, stale, needs-a-human) is NOT green — it
     # takes the same ci-fix rerun/escalation path as a hard failure. Pre-fix EVERY one of these
     # fell through to gate="success", suppressing repair on a PR that required checks won't merge.
+    quiet = ic_logs.append  # absent started_at logs loudly by design; keep the suite quiet
     for broken in ("cancelled", "action_required", "startup_failure", "stale",
                    "neutral", "skipped"):
         assert interpret_check_runs([{"name": "gate", "status": "completed",
-                                      "conclusion": broken}])["gate"] == "failure", broken
+                                      "conclusion": broken}],
+                                    log=quiet)["gate"] == "failure", broken
     # ... but an UNRECOGNISED conclusion on a "completed" run (None / hostile garbage) is NOT a
     # known non-pass: it degrades to unknown (never ACT on a poisoned snapshot), not to failure
     # (no spurious repair) and never to success (pre-fix bug: both collapsed to green).
     for junk in (None, "wat", 42, [], {"x": 1}):
         assert interpret_check_runs([{"name": "gate", "status": "completed",
-                                      "conclusion": junk}])["gate"] == "unknown", junk
+                                      "conclusion": junk}],
+                                    log=quiet)["gate"] == "unknown", junk
     assert interpret_check_runs([{"name": "gate", "status": "in_progress",
-                                  "conclusion": None}])["gate"] == "pending"
+                                  "conclusion": None}], log=quiet)["gate"] == "pending"
     assert interpret_check_runs([])["gate"] == "missing"
     assert interpret_check_runs("junk") == {"gate": "unknown", "failing_legs": []}
     assert interpret_check_runs([
         {"name": "gate", "status": "completed", "conclusion": "failure"},
         {"name": "lég\nx", "status": "completed", "conclusion": "failure"},
-    ])["failing_legs"] == ["l?g?x"]
+    ], log=quiet)["failing_legs"] == ["l?g?x"]
 
     record = {"head_sha": sha_a, "mergeable": False, "auto_merge": {"merge_method": "squash"},
               "check_runs": runs}
@@ -5509,9 +5577,9 @@ def _self_test():
             globals()["_target_is_human_maintainer"] = (
                 lambda repo, login: login == "jeswr")
             gate_red = [{"name": "gate", "status": "completed", "conclusion": "failure",
-                         "started_at": "T1"}]
+                         "started_at": "2026-07-23T01:00:00Z"}]
             gate_green = [{"name": "gate", "status": "completed", "conclusion": "success",
-                           "started_at": "T1"}]
+                           "started_at": "2026-07-23T01:00:00Z"}]
             # trigger evaporated (gate re-ran green): the ready PR is NOT defused — no mutation
             fake.update(pull=live_pull(draft=False, auto_merge={"merge_method": "squash"}),
                         check_runs=gate_green, issue_labels=["area:crate-a"])

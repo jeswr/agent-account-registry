@@ -35,7 +35,7 @@
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 # The machine-owned soft hold for SOURCE ISSUES (capacity/decline/budget parks). Ensured on
@@ -100,14 +100,31 @@ def parse_ts(value):
     post-cutoff receipt as pre-cutoff and silently mint budget (and a "+00:00" spelling
     sorts before the same instant's "Z" spelling, breaking tie handling). A NAIVE stamp (no
     UTC offset) also raises: it cannot be soundly ordered against aware stamps. Window-key
-    IDENTITY (receipt-set membership / dedupe) deliberately stays string EQUALITY — receipts
-    store the exact string a cutoff re-derives to — only ORDERING must be parsed."""
+    IDENTITY (receipt-set membership / dedupe) stays string EQUALITY, but over the CANONICAL
+    spelling (canonical_ts, round-6 finding 2) — exact source-string identity could not
+    round-trip a space-form cutoff through the receipt marker."""
     if not isinstance(value, str) or not value:
         raise ValueError(f"not a timestamp: {value!r}")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError(f"naive (offset-free) timestamp cannot be ordered: {value!r}")
     return parsed
+
+
+def canonical_ts(value):
+    """The ONE canonical spelling of a decision-logic timestamp: parse_ts(value) normalized
+    to UTC and rendered as compact ISO-8601 Z-form ("2026-07-23T10:30:00Z" — T separator,
+    trailing Z, no spaces, deterministic). Round-6 finding 2: window-key/receipt identity
+    previously kept the EXACT source-string spelling, but a space-form cutoff
+    ("2026-07-23 10:30:00Z") cannot round-trip through the receipt marker — worker-pr's
+    `cutoff=(\\S+) -->` pattern can never match a space — so the gen-1 receipt was written
+    unparseable, never deduped, and the ladder minted generation 1 forever (the terminal
+    gen-2 escalation was unreachable). Every window key is therefore canonicalized at
+    WRITE/derive time (latest_human_unlabel / readmission_cutoff / park_ladder_decision)
+    and every receipt reader canonicalizes at parse time (worker-pr
+    park_generation_cutoffs), so receipt equality is over one deterministic spelling.
+    Raises ValueError exactly like parse_ts on anything unparseable."""
+    return parse_ts(value).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def valid_timestamp(value):
@@ -267,9 +284,10 @@ def latest_human_unlabel(repo, number, label, fetch_events, is_human=None, log=p
     candidates = [(parse_ts(created), created)
                   for created, kind, login, via_app in rows
                   if kind == "unlabeled" and _is_proven_human(login, via_app, probe)]
-    # Ordering is by parsed instant (round-5 finding 2); the RETURNED value stays the exact
-    # source string so receipt window keys keep their string identity.
-    return max(candidates)[1] if candidates else None
+    # Ordering is by parsed instant (round-5 finding 2); the RETURNED value is the CANONICAL
+    # spelling (canonical_ts, round-6 finding 2) so receipt window keys share one
+    # deterministic identity across equally-valid source spellings.
+    return canonical_ts(max(candidates)[1]) if candidates else None
 
 
 def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=None, log=print,
@@ -279,8 +297,9 @@ def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=Non
     needs:user / status:parked / review:parked) across the PR itself and its provenance-linked
     source issue (either surface is an explicit human re-admission; latest event wins;
     ordering is by PARSED instants — parse_ts, round-5 finding 2 — while the returned cutoff
-    keeps its exact source string for receipt-key identity). `issue_number` may be falsy (no
-    linked issue) — only the PR timeline is consulted.
+    is the CANONICAL spelling — canonical_ts, round-6 finding 2: a source-spelled space-form
+    cutoff could never round-trip through the receipt marker, so gen-1 repeated forever).
+    `issue_number` may be falsy (no linked issue) — only the PR timeline is consulted.
 
     FAIL CLOSED ON ANY PARTIAL VIEW: if EITHER timeline read fails (or returns a malformed
     shape), the whole cutoff is None — the full historical count — with a loud log line. A
@@ -310,7 +329,7 @@ def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=Non
                 f"({exc}); NO readmission credit on a partial view — the budget keeps the "
                 f"FULL historical count")
             return on_unreadable
-    return max(stamps)[1] if stamps else None
+    return canonical_ts(max(stamps)[1]) if stamps else None
 
 
 def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_human=None,
@@ -331,9 +350,10 @@ def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_hum
     by parsed instants (parse_ts, round-5 finding 2), never raw strings.
 
     `consumed` is the durable receipt set (worker-pr park_generation_cutoffs — bot-authored
-    only): a gesture whose exact cutoff is already receipted was consumed by a previous
-    budget window that then re-exhausted; it must never re-admit AGAIN — this is what keeps
-    the proof label-INDEPENDENT (round-3 finding 2): a veto-suppressed label re-apply leaves
+    only, CANONICAL window keys — canonical_ts, round-6 finding 2 — matching the canonical
+    cutoff this helper derives): a gesture whose cutoff is already receipted was consumed by
+    a previous budget window that then re-exhausted; it must never re-admit AGAIN — this is
+    what keeps the proof label-INDEPENDENT (round-3 finding 2): a veto-suppressed re-apply leaves
     no fresh `labeled` event to out-date the old gesture, so without the receipt check a
     single stale gesture would re-admit forever."""
     cutoff = readmission_cutoff(repo, pr_number, issue_number, fetch_events,
@@ -384,9 +404,23 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False):
       never escalate, and a cutoff that regressed to None cannot prove a fresh window.
     - ("park", window_key, generation): consume this window — soft park (veto-gated label,
       best-effort) + the MANDATORY receipt binding window_key.
+
+    The window key is CANONICALIZED here (canonical_ts, round-6 finding 2) — this is the
+    value every writer embeds in the receipt marker, so it must be the one deterministic
+    space-free spelling receipt readers (park_generation_cutoffs) key on; an exact
+    source-string key could carry a space and never round-trip through `cutoff=(...) -->`.
     """
     if cutoff == WINDOW_UNREADABLE:
         return ("freeze", None, None)
+    if cutoff:
+        try:
+            cutoff = canonical_ts(cutoff)
+        except ValueError:
+            # An unparseable cutoff can mint neither a window key nor a receipt: FREEZE —
+            # no receipt, no label, no comment — exactly like an unreadable timeline.
+            # readmission_cutoff only returns validated stamps, so this is a defensive
+            # rail against a drifted caller, never a live path.
+            return ("freeze", None, None)
     window_key = cutoff or PARK_WINDOW_NONE
     if window_key in receipts:
         return ("dedupe", window_key, None)
@@ -776,11 +810,14 @@ def _self_test():
               [event("labeled", "needs:user", "2026-07-23T09:00:00Z", "b[bot]"),
                event("unlabeled", "needs:user", "2026-07-23T09:00:00+00:00", "jeswr")],
               "needs:user", trusted)[0], True)
-    # The cutoff picks the latest INSTANT across spellings and returns the exact source string.
+    # The cutoff picks the latest INSTANT across spellings and returns the CANONICAL spelling
+    # (round-6 finding 2: the old exact-source-string return could carry a space and never
+    # round-trip through the receipt marker).
     timelines[41] = [event("unlabeled", "needs:user", "2026-07-23T09:00:00Z", "jeswr")]
     timelines[7] = [event("unlabeled", "status:parked", "2026-07-23 10:30:00Z", "jeswr")]
-    check("round-5 f2: the cutoff picks the latest instant across spellings",
-          readmission_cutoff("o/r", 41, 7, fetch, is_human=trusted), "2026-07-23 10:30:00Z")
+    check("round-5 f2 + round-6 f2: the cutoff picks the latest instant across spellings "
+          "and returns it CANONICALIZED",
+          readmission_cutoff("o/r", 41, 7, fetch, is_human=trusted), "2026-07-23T10:30:00Z")
     # A space-separator gesture AFTER the park application re-admits (string compare said no).
     timelines[41] = [event("labeled", "review:parked", "2026-07-23T09:00:00Z", "b[bot]")]
     timelines[7] = [event("unlabeled", "status:parked", "2026-07-23 10:30:00Z", "jeswr")]
@@ -790,6 +827,38 @@ def _self_test():
     timelines[7] = [event("unlabeled", "status:parked", "2026-07-23T09:00:00+00:00", "jeswr")]
     check("round-5 f2: a +00:00 vs Z same-instant gesture stays parked",
           capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted), False)
+
+    # ---- Round-6 finding 2: window-key identity is the CANONICAL spelling (canonical_ts).
+    # A space-form cutoff written raw into a receipt (`cutoff=2026-07-23 10:30:00Z -->`)
+    # never matched the reader's `cutoff=(\S+) -->`, so the gen-1 receipt was invisible:
+    # never deduped, gen-2 never reachable. Canonical form: compact Z, T separator, UTC. ----
+    check("round-6 f2: canonical_ts normalizes the space-form spelling",
+          canonical_ts("2026-07-23 10:30:00Z"), "2026-07-23T10:30:00Z")
+    check("round-6 f2: canonical_ts normalizes the +00:00 spelling",
+          canonical_ts("2026-07-23T10:30:00+00:00"), "2026-07-23T10:30:00Z")
+    check("round-6 f2: canonical_ts renders a non-UTC offset in UTC",
+          canonical_ts("2026-07-23T11:30:00+01:00"), "2026-07-23T10:30:00Z")
+    check("round-6 f2: canonical_ts is idempotent on the canonical form",
+          canonical_ts(canonical_ts("2026-07-23 10:30:00Z")), "2026-07-23T10:30:00Z")
+    check("round-6 f2: the canonical form carries no whitespace",
+          " " in canonical_ts("2026-07-23 10:30:00.500Z"), False)
+    for bad_canonical in ("2026-07-23T09:18:19", "zzz", "", None, 7):
+        try:
+            canonical_ts(bad_canonical)
+            check(f"canonical_ts rejects {bad_canonical!r}", "no error", "ValueError")
+        except ValueError:
+            check(f"canonical_ts rejects {bad_canonical!r}", "raised", "raised")
+    # A space-form gesture whose CANONICAL key is already receipted was consumed: it must
+    # not re-admit (cross-spelling receipt membership — the round-trip that used to fail).
+    timelines[41] = [event("labeled", "review:parked", "2026-07-23T09:00:00Z", "b[bot]")]
+    timelines[7] = [event("unlabeled", "status:parked", "2026-07-23 10:30:00Z", "jeswr")]
+    check("round-6 f2: a space-form gesture already receipted under its canonical key "
+          "stays parked",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted,
+                                   consumed={"2026-07-23T10:30:00Z"}), False)
+    check("round-6 f2: the same space-form gesture unreceipted still re-admits",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted,
+                                   consumed=set()), True)
 
     # ---- readmission_cutoff on_unreadable: the ladder can DISTINGUISH windowless from
     # unreadable; default callers keep the plain None => full-count path ----
@@ -827,6 +896,21 @@ def _self_test():
     check("ladder: already_labeled never suppresses a due receipt once a window exists",
           park_ladder_decision("2026-07-23T09:18:19Z", set(), already_labeled=True),
           ("park", "2026-07-23T09:18:19Z", 1))
+    # Round-6 finding 2: the ladder CANONICALIZES the window key it hands to every receipt
+    # writer — a space-form cutoff mints the compact Z-form key (writable + round-trippable),
+    # dedupes against its canonical receipt, and escalates on the canonical identity.
+    check("ladder round-6 f2: a space-form cutoff mints the CANONICAL window key",
+          park_ladder_decision("2026-07-23 10:30:00Z", set()),
+          ("park", "2026-07-23T10:30:00Z", 1))
+    check("ladder round-6 f2: a space-form cutoff dedupes against its canonical receipt",
+          park_ladder_decision("2026-07-23 10:30:00Z", {"2026-07-23T10:30:00Z"}),
+          ("dedupe", "2026-07-23T10:30:00Z", None))
+    check("ladder round-6 f2: a space-form cutoff reaches the gen-2 terminal",
+          park_ladder_decision("2026-07-23 10:30:00Z", {PARK_WINDOW_NONE}),
+          ("terminal", "2026-07-23T10:30:00Z", 2))
+    check("ladder round-6 f2: an unparseable cutoff freezes (defensive rail — it can mint "
+          "neither a window key nor a receipt)",
+          park_ladder_decision("not-a-timestamp", set()), ("freeze", None, None))
 
     # ---- probe_maintainer (round-3 Opus finding): a probe-call FAILURE warns loudly and
     # fails toward not-human; a genuine not-a-maintainer stays quiet ----

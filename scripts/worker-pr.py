@@ -348,18 +348,28 @@ def park_generation_cutoffs(comments, bot_login, log=print):
     nor dedupe against a real cutoff. The conservative residue: with the receipt absent, the
     ladder re-consumes that window once (one extra receipted comment) and the generation
     count stays LOW — escalation is delayed, never fabricated. Receipts are bot-authored, so
-    a malformed one requires corrupted own output, not third-party input."""
-    pattern = re.escape(PARK_GENERATION_MARKER) + r" gen=([0-9]+) cutoff=(\S+) -->"
-    valid_timestamp = _park_policy().valid_timestamp
+    a malformed one requires corrupted own output, not third-party input.
+
+    Round-6 finding 2 (canonical window keys): every parsed cutoff is CANONICALIZED
+    (park_policy.canonical_ts — compact Z-form, T separator, UTC) so receipt identity
+    matches the canonical keys park_ladder_decision now mints and readmission_cutoff now
+    returns. The pattern tolerates an embedded space so a LEGACY receipt written from a
+    space-form source cutoff ("cutoff=2026-07-23 10:30:00Z -->") — invisible to the old
+    `cutoff=(\\S+) -->` read, which made gen-1 repeat forever and gen-2 unreachable — is
+    recovered onto the same canonical key."""
+    pattern = re.escape(PARK_GENERATION_MARKER) + r" gen=([0-9]+) cutoff=(.+?) -->"
+    policy = _park_policy()
     cutoffs = set()
     for comment in _bot_comments(comments, bot_login):
         for match in re.finditer(pattern, str(comment.get("body", ""))):
             cutoff = match.group(2)
-            if cutoff != PARK_WINDOW_NONE and not valid_timestamp(cutoff):
-                log(f"::warning::malformed park-generation receipt cutoff {cutoff!r} "
-                    "treated as absent — the escalation ladder counts only well-formed "
-                    "receipts")
-                continue
+            if cutoff != PARK_WINDOW_NONE:
+                if not policy.valid_timestamp(cutoff):
+                    log(f"::warning::malformed park-generation receipt cutoff {cutoff!r} "
+                        "treated as absent — the escalation ladder counts only well-formed "
+                        "receipts")
+                    continue
+                cutoff = policy.canonical_ts(cutoff)
             cutoffs.add(cutoff)
     return cutoffs
 
@@ -3126,6 +3136,18 @@ def _self_test():
     check("a malformed receipt cutoff logs loudly",
           any("malformed park-generation receipt cutoff" in line for line in receipt_logs),
           True)
+    # Round-6 finding 2: receipt keys are CANONICAL — a legacy receipt written from a
+    # space-form source cutoff (invisible to the old `cutoff=(\S+) -->` read) is recovered
+    # and every equally-valid spelling collapses onto the one canonical key.
+    legacy_receipts = [
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=1 cutoff=2026-07-23 10:30:00Z -->"},
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T10:30:00+00:00 -->"},
+    ]
+    check("round-6 f2: a legacy space-form receipt parses onto its CANONICAL key "
+          "(and dedupes with the +00:00 spelling)",
+          park_generation_cutoffs(legacy_receipts, bot), {"2026-07-23T10:30:00Z"})
 
     # Issue #162: round markers bind the reviewed head sha, and a stale-deferred round is VOIDED
     # (subtracted) so head churn never burns the global round budget.
@@ -4246,6 +4268,62 @@ def _self_test():
             check("capacity park without --bot-login fails loud", "no error", "raised")
         except WorkerPrError:
             check("capacity park without --bot-login fails loud", "raised", "raised")
+        # (j / round-6 finding 2) THE EXACT BRIEFED LOOP with a SPACE-form gesture timestamp:
+        # the receipt must be written CANONICALLY (compact Z-form, no space — the old raw
+        # window key produced `cutoff=2026-07-23 08:00:00Z -->`, which the reader's
+        # `cutoff=(\S+) -->` could never match, so gen-1 re-receipted forever and the
+        # terminal gen-2 was unreachable), parse back, dedupe the same window, and let a
+        # fresh space-form gesture reach the gen-2 terminal. The sequence must TERMINATE.
+        park_route_state["timelines"] = {
+            41: [unlabel("review:needs-user", "2026-07-23 08:00:00Z")],
+            7: [unlabel("needs:user", "2026-07-23 08:00:00Z")],
+        }
+        park_route_state["comments"] = []
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
+        check("(j) a space-form gesture parks gen-1, receipt first",
+              park_route_calls,
+              [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+        check("(j) the gen-1 receipt is written CANONICALLY (no space-form key)",
+              f"{PARK_GENERATION_MARKER} gen=1 cutoff=2026-07-23T08:00:00Z -->"
+              in park_route_comments[-1], True)
+        # The receipt becomes a durable bot comment; the park labels become timeline events.
+        park_route_state["timelines"][41].append(
+            labeled("review:parked", "2026-07-23 08:30:00Z"))
+        park_route_state["timelines"][7].append(
+            labeled("status:parked", "2026-07-23 08:30:00Z"))
+        park_route_state["comments"] = [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(j) the canonical receipt round-trips and DEDUPES the space-form window "
+              "(no repeat gen-1)",
+              (park_route_calls, park_route_comments), ([], []))
+        # A FRESH space-form gesture mints the next window: the ladder reaches gen-2 TERMINAL.
+        park_route_state["timelines"][41].append(
+            unlabel("review:parked", "2026-07-23 09:00:00Z"))
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(j) a fresh space-form gesture REACHES the gen-2 terminal (receipt first, "
+              "human labels veto-suppressed by the 08:00 unlabels)",
+              park_route_calls, [("receipt",), ("issue-status-vetoed", 7, "needs-user")])
+        check("(j) the gen-2 receipt binds the fresh gesture's CANONICAL key",
+              f"{PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T09:00:00Z -->"
+              in park_route_comments[-1], True)
+        # ... and the completed terminal is durable: the same window re-fires QUIETLY.
+        park_route_state["comments"] = park_route_state["comments"] + [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("(j) the receipted gen-2 terminal re-defers quietly — the loop TERMINATES",
+              (park_route_calls, park_route_comments), ([], []))
         # (i) an unreadable timeline FREEZES the ladder: no receipt, no label, no comment.
         def raising_park_timeline(_repo, _number):
             raise WorkerPrError("timeline unavailable")
