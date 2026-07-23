@@ -1,3 +1,14 @@
 {
- "leases": []
+ "leases": [
+  {
+   "account": "9e13ea21abf27e68",
+   "claim_id": "8efc2401b40e4669a5482f63de877381",
+   "holder": "fix:sparq-org/sparq#3523@dispatch-29999988802.1",
+   "package": "sparq-shacl",
+   "role": "fix",
+   "model": "fable",
+   "issued_at": 1784803670,
+   "expires_at": 1784809970
+  }
+ ]
 }
