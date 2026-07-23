@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3754,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f49be12601c44d39b98921dcf4f7148066225cde",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "CI-only change (#3547): adds two opt-in feature-matrix legs for sparq-core \u2014 native-ttl and iri-fast \u2014 with test: true, plus the corresponding two lines in the gate-critical legnames golden. Verified correct and complete: (1) both features exist in crates/sparq-core/Cargo.toml (iri-fast/native-ttl = [dep:oxiri]); (2) the legs are NON-vacuous \u2014 the whole `iri` module including its #[cfg(test)] mod tests is #[cfg(feature=\"iri-fast\")], and ttl.rs is #![cfg(feature=\"native-ttl\")] with its own tests submodule and the native_ttl_matches_oxttl differential, so without a dedicated feature leg these tests never compile/run in CI, exactly matching the PR's stated rationale; (3) golden file is sorted and the new entries sit in correct alphabetical position (iri-fast between compact-index and jsonld; native-ttl between mmap,dict-spill and spqcprm2,mmap); (4) check-run names obey the gate contract (no forbidden 'advisory'/'informational' whole words); (5) assembler golden test compares emitted leg-name set to golden byte-for-byte with leg count derived from the fragments, so both edited files stay consistent and no other artifact/count needs updating. No security or soundness concerns; comments are ordinary provenance annotations.",
+  "verdict": "approve"
+ }
+}
