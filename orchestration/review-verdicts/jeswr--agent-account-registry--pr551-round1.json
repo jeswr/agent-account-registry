@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 551,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dfd8d402e2db40fb29c0101094480260e275df0a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "GitHubAPI.request retries every HTTP method on 502/503/504 and qualifying connection failures. For a mutating request, those failures do not prove that GitHub did not process the first attempt; replaying the same POST/PATCH/PUT/DELETE can duplicate comments or repeat/overwrite state transitions. This is especially unsafe in a registry/orchestration trust plane. The added tests cover only GET requests, so they do not constrain this behavior. Bounded retries prevent an infinite loop but do not make ambiguous mutation replay sound.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Restrict transparent transient retries to demonstrably idempotent reads (at minimum GET/HEAD), and handle mutations with operation-specific idempotency or post-failure reconciliation before retrying. Add a self-test asserting that an ambiguous transient failure on a non-idempotent method is not automatically replayed (or that the chosen mutation-specific safety mechanism prevents duplicate effects).",
+    "severity": "major",
+    "title": "Generic transient retries can replay non-idempotent GitHub mutations"
+   }
+  ],
+  "progress": null,
+  "summary": "The retry implementation is well bounded and its self-tests exercise the intended transient, non-transient, Retry-After, and exhaustion paths. However, GitHubAPI.request is a method-agnostic primitive, so the new automatic retries also apply to mutation requests. A connection reset or gateway error can occur after GitHub accepted a POST/PATCH/PUT/DELETE, making replay ambiguous and potentially duplicating or overwriting trust-plane state. The change is therefore not sound as a generic request-layer retry without an idempotency restriction or operation-specific reconciliation.",
+  "verdict": "request_changes"
+ }
+}
