@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3741,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ceed417cffb35368a1a41bda11acc29aea1e139a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The class-partitioned batching change is internally consistent and fail-closed: unknown or non-slim diffs remain in the engine class, legacy omnibus branches conservatively suppress both classes, per-class action state prevents conflict/abort leakage, and the 15-constituent cap preserves ascending selection. The expanded hermetic self-test exercises classification, legacy parsing, two-class planning, per-class suppression, cap behavior, conflict re-templating, and cross-class abort isolation on the real planner/executor paths. Workflow routing now runs that self-test when either side of the ci_select import contract changes. No correctness, soundness, security, or vacuous-test defect is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
