@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2519,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d8be4dfdf7c37663a08117f040c8125f888b6dcd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The opt-in stateful API remains correctly feature-isolated and delegates to the established SHACL validation and report serialization paths. The native and real wasm tests exercise parsing, repeat use, output equivalence, report formats, severity filtering, and malformed-input errors without bypassing the exported behavior. CI now covers default, each opt-in feature, and their combination. The benchmark excludes parsing from the validate-only interval, cross-checks each measured result against the one-shot result, distinguishes absent feature data from zero, records feature provenance, and prevents stale artifacts through its feature marker. Documentation accurately treats measurements and feature-build bundle sizes as non-canonical. No correctness, soundness, security, test-validity, or injection issue was found. This is materially unchanged from round 2, which also had no findings.",
+  "verdict": "approve"
+ }
+}
