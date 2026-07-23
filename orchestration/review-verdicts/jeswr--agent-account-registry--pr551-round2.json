@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 551,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7f8a95faec20ed82fde8c26971244d705f21e3c1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_retry_after_seconds accepts values such as \"NaN\" because float parsing succeeds and the negative-value check is false. min(NaN, 60.0) remains NaN, so _sleep_transient calls time.sleep(NaN), which raises ValueError rather than falling back to jitter or ultimately raising GroomError. Retry-After is external response data, so finite-value validation would make the bounded retry path robust to malformed headers.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Reject non-finite parsed values with math.isfinite(seconds) before the range checks, return None for them, and add NaN/Infinity cases to the Retry-After self-test.",
+    "severity": "minor",
+    "title": "Non-finite Retry-After values escape the controlled failure path"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. Transparent retries are limited to GET and HEAD, while ambiguous connection and 503 failures on POST/PATCH fail after one attempt. The added mutation assertions are non-vacuous because widening the retryable method set or bypassing the guard changes the observed call count and fails the self-test. Retry exhaustion, non-transient failures, CAS conflicts, and 404 handling remain fail-closed. One minor malformed Retry-After edge remains: Python accepts NaN as a float, after which time.sleep raises ValueError instead of using backoff or the normal GroomError path. This does not weaken a trust decision or justify blocking the otherwise sound fix.",
+  "verdict": "approve"
+ }
+}
