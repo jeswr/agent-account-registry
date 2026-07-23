@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3482,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a9e1d0be6e9d707cd80beabf456874ab2acc3646",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is internally consistent: both light and dark themes define the new success-on-tint token, the Tailwind theme bridge exports it, and the Badge success variant consumes it while retaining the existing success token for the background tint. The new CVA boolean count variant is correctly threaded through Badge and remains optional. The focus-visible ring changes on Badge and Button are additive and use existing theme tokens. No correctness, security, or vacuous-test concern is evident in this narrowly scoped design-system synchronization.",
+  "verdict": "approve"
+ }
+}
