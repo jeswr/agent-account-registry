@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3745,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "79a90f25039ff515e2d3611adeae682312ad1309",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding by documenting the new public SPARQL JSON directional-literal input and resulting RDF/JS semantics in skills/javascript-wasm/SKILL.md. The implementation preserves ordinary language-tagged literals when its:dir is absent, reconstructs both ltr and rtl directional literals when present, and the focused test exercises the exported conversion path while checking direction and datatype. No correctness, soundness, security, or test-validity issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
