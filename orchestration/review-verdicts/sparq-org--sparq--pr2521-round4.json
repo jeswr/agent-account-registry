@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2521,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2aed6267182c5526be9b136c460ca26669a54dc0",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `prime-wasm` job only builds `sparq-wasm` in default and `shacl,jsonld` states and clippies the latter. The actual `ci.yml` wasm job sharing the `wasm` key also builds/clippies separate `shacl`, `jsonld`, `policy`, and `explain-json` states and additional wasm packages such as `sparq-reason-wasm` (including its feature states) later in that job. Since rust-cache prunes workspace members and retains their dependency artifacts, dependencies unique to those omitted closures are exactly what the primer must compile to make the first target job warm. This contradicts the workflow's claim that it primes the canonical wasm family and leaves the stated fresh-key/stable-bump hole only partially addressed.",
+    "file": ".github/workflows/cache-prime.yml",
+    "fix_hint": "Mirror the complete dependency closure of the target wasm job under the same target and relevant feature/package states, or derive a deliberate union build that demonstrably covers all of those third-party dependencies. Add a structural test that compares the target wasm job's package/feature closures with the primer so future additions cannot silently drift.",
+    "severity": "major",
+    "title": "The wasm primer omits feature and package closures used by the target job"
+   }
+  ],
+  "progress": null,
+  "summary": "The cache-audit stdin regression is fixed and its hermetic test is meaningful, but the new wasm primer does not reproduce the dependency closure of the canonical wasm cache family it claims to prime. The target CI job builds several additional feature/package states under the same shared key, so a fresh key can remain substantially cold after the nightly primer.",
+  "verdict": "request_changes"
+ }
+}
