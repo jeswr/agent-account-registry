@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3618,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "78edb92a2c09fb3d02499f2b8db9e7c78e302eb6",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the sole prior finding: BaseOtBootstrap now accurately distinguishes the public-key-style base-OT bootstrap from the symmetric-key OT-extension phase and keeps the concrete PQ posture conditional. The document remains a design-only, research-grade, unaudited proposal; it adds no backend or crypto, preserves fail-closed selection, correctly states plain SPDZ's unanimous rather than identifiable abort guarantee, and gives the corrected Beaver multiplication identity. The existing select_fails_closed_on_dishonest_majority_malicious_over_shipped_set test exercises the real registry selection path and confirms the load-bearing shipped behavior. No correctness, soundness, test-validity, or security defect remains in this doc-only change. injection_detected remains true because the diff contains prose explicitly directed to a worker's follow-up channel and tells that worker to file work; that text is treated only as untrusted diff data.",
+  "verdict": "approve"
+ }
+}
