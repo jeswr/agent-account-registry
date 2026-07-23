@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3749,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2860c10bf6fd9f173490694d1b13b7d71a4d0374",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Inside `probe`, `github.request('POST .../actions/jobs/{job_id}/rerun', ...)` is awaited without a try/catch. `Promise.all(failed.map(probe))` rejects entirely if any single probe throws. GitHub rejects a job rerun when a rerun of the same workflow run is already in progress ('Unable to rerun ... currently in progress'), so when two or more failed legs belong to the SAME merge_group workflow run, the concurrent reruns can race: the first starts the run re-executing and the second POST 409/403s. That rejection propagates out of Promise.all and aborts the whole step before any tracking issue or PR comment is filed \u2014 the same silently-degraded, no-audit-trail outcome the round-1 refactor was meant to eliminate, just triggered by a different path. Also applies to a plain transient 5xx on the rerun POST.",
+    "file": ".github/workflows/omnibus-flake-quarantine.yml",
+    "fix_hint": "Wrap the probe body (at least the rerun POST and the poll loop) in try/catch and return undefined on failure, mirroring the try/catch already used around the check-run PATCH, so one un-rerunnable/racy leg degrades to 'not quarantined' rather than aborting the pass. Optionally de-duplicate reruns by workflow run id (rerun each distinct run once) instead of per-job, or serialize reruns of jobs sharing a run, to avoid the concurrent-rerun rejection entirely.",
+    "severity": "minor",
+    "title": "probe()'s rerun POST is unguarded; a single rejected rerun rejects the whole Promise.all"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves every blocking finding from round 1. (1) The forgeable pull_request_target gate is now guarded by `github.event.pull_request.head.repo.full_name == github.repository`, which a fork PR cannot forge (head.repo is GitHub-populated), so the write-scoped token (issues:write / actions:write) is no longer reachable by untrusted fork authors. (2) The sequential per-leg polling that could blow the 20-min timeout is replaced with `Promise.all(failed.map(probe))` concurrent probing (worst case ~7.5 min < 20 min), and the tracking issue is now created before the rename loop so a partial run still leaves an audit trail. (3) Rerun-replacement detection now also handles in-place check-run updates via `c.id === check.id && updated_at > check.updated_at`. (4) The PATCH rename is wrapped in try/catch so one non-updatable check no longer aborts the pass. (5) Unused `pull-requests: write` dropped. (6) Conclusion sets aligned to ['failure','timed_out','cancelled'] for both run-selection and per-leg filtering. The `advisory` quarantine premise remains sound: the renamed check `${name} (advisory, flaky quarantine)` matches the workflow's own `\\b(advisory|informational)\\b` token and the ci-summary skip convention. No injection in the diff. One residual minor: the rerun POST inside `probe` is not itself wrapped in try/catch, so a rejected single-job rerun (e.g. concurrent reruns of two jobs in the same merge_group run) rejects the whole Promise.all and fails the step with no issue/comment. Non-gating observer, best-effort \u2014 not blocking. Recommend approve.",
+  "verdict": "approve"
+ }
+}
