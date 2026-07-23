@@ -1303,6 +1303,7 @@ jobs:
           # 16-hex hash is stored; this job runs no target code, so the salt cannot leak to it.
           WORKER_IMPL_ACCOUNT: ${{ needs.claim.outputs.account }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          LEDGER_RECORD_HMAC_KEY: ${{ secrets.LEDGER_RECORD_HMAC_KEY }}
           # DETERMINISTIC head branch — MUST match worker-live.sh's `branch=` construction. Built
           # from trusted run identity (github.run_id/run_attempt are shared across every job in this
           # run), never from the hostile worker job's pr_number output (issue #128).

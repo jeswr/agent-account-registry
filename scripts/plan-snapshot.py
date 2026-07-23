@@ -294,6 +294,7 @@ def snapshot_targets(fetch, claim, repos, out_dir):
 
 
 def _self_test():
+    os.environ.setdefault("LEDGER_RECORD_HMAC_KEY", "selftest-ledger-record-key")
     import tempfile
     from unittest.mock import patch
 
@@ -430,6 +431,7 @@ def _self_test():
         "impl_alias": "sol", "impl_account_h": "ab" * 8, "issue": 19,
         "recorded_at_run": "1.1",
     }}
+    provenance19[19] = claim._worker_pr_helper().sign_ledger_record(provenance19[19])
     status19 = {19: claim.pr_ci_status(doc["items"]["19"])}
     repair_items = claim.enumerate_review_items(
         repo, [review_changes], provenance19, [], {19: ["role:impl"]}, 1000,

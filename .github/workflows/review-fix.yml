@@ -89,9 +89,12 @@ concurrency:
 
 jobs:
   resolve:
-    name: Resolve PR, provenance, and inverse chain without worker secrets
+    name: Resolve PR, authenticated provenance, and inverse chain
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Host-only verifier: no target code executes in this job. Environment binding exposes only
+    # the explicitly mapped ledger HMAC key used below, not any worker account credential.
+    environment: dispatch-secrets
     permissions:
       contents: read
     outputs:
@@ -219,6 +222,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           MODE: ${{ inputs.mode }}
           FIX_KIND: ${{ inputs.fix_kind }}
+          LEDGER_RECORD_HMAC_KEY: ${{ secrets.LEDGER_RECORD_HMAC_KEY }}
         run: |
           set -euo pipefail
           gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pull.json"
@@ -1107,6 +1111,7 @@ jobs:
         id: stage-verdict
         if: ${{ inputs.mode == 'fix' && inputs.fix_kind != 'ci' && inputs.fix_kind != 'rebase' && steps.prepare.outcome == 'success' }}
         env:
+          LEDGER_RECORD_HMAC_KEY: ${{ secrets.LEDGER_RECORD_HMAC_KEY }}
           TARGET_REPO: ${{ inputs.target_repo }}
           REVIEW_ROUND: ${{ inputs.review_round }}
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
@@ -1317,6 +1322,7 @@ jobs:
         if: ${{ inputs.mode == 'review' && steps.reverify.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          LEDGER_RECORD_HMAC_KEY: ${{ secrets.LEDGER_RECORD_HMAC_KEY }}
         run: |
           python3 registry/scripts/worker-pr.py verdict-record \
             --registry-repo "$GITHUB_REPOSITORY" \

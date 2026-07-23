@@ -306,6 +306,17 @@ def _load_module(name, path):
     return module
 
 
+_WORKER_PR_HELPER = None
+
+
+def _worker_pr_helper():
+    global _WORKER_PR_HELPER
+    if _WORKER_PR_HELPER is None:
+        _WORKER_PR_HELPER = _load_module(
+            "registry_worker_pr_signatures", Path(__file__).resolve().parent / "worker-pr.py")
+    return _WORKER_PR_HELPER
+
+
 def _require_exact_fields(value, fields, where):
     if not isinstance(value, dict):
         raise DispatchError(f"{where} must be an object")
@@ -1207,7 +1218,7 @@ def _ledger_leases(ledger_root):
     return leases if isinstance(leases, list) else None
 
 
-def provenance_admission_error(record, pr_number):
+def provenance_admission_error(record, pr_number, *, require_signature=True):
     """Return why a PARSED provenance record for target PR ``pr_number`` is NOT admissible by
     the review loop, or None when it passes EVERY record-shape requirement of EVERY consumer.
 
@@ -1225,13 +1236,11 @@ def provenance_admission_error(record, pr_number):
     - salted 16-hex ``impl_account_h`` (locked decision 22a; CLAIM reviewer!=implementer
       assertion, review-fix.yml resolve).
 
-    EVERY consumer calls this ONE function — enumerate_review_items (PLAN), the CLAIM record
-    re-read below, review-fix.yml's resolve step (imports this module from the registry
-    checkout), and groom.py's draft age-park carve-out (is_enumerable_provenance): a stale
-    draft worker PR is review-loop-owned (exempt from the terminal needs:user park) exactly
-    when this returns None. Adding a field constraint HERE updates every consumer in the same
-    commit — the partial-replica drift that groom-preserved a review-rejected draft (round-3
-    finding: alias/issue unchecked) is structurally impossible to reintroduce."""
+    EVERY consumer calls this ONE function. PLAN's secret-free enumerator explicitly requests
+    structure-only admission; the CLAIM record re-read, review-fix.yml resolve, and groom.py's
+    draft age-park carve-out retain the default authenticated admission. Adding a shape field
+    constraint HERE still updates every consumer in the same commit, while only consumers at a
+    trust boundary require the ledger secret."""
     if not isinstance(record, dict):
         return "provenance record is not a JSON object"
     number = record.get("pr_number")
@@ -1258,6 +1267,8 @@ def provenance_admission_error(record, pr_number):
     opened_sha = record.get("head_sha_at_open")
     if not isinstance(opened_sha, str) or not SAFE_SHA.fullmatch(opened_sha):
         return "provenance head sha is malformed"
+    if require_signature and not _worker_pr_helper().ledger_record_signature_valid(record):
+        return "provenance record signature is missing or invalid"
     return None
 
 
@@ -1350,14 +1361,14 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             exclude_changes("author is not the trusted App bot")
             continue
         record = provenance.get(number)
-        record_error = provenance_admission_error(record, number)
+        # PLAN is deliberately secret-free. Validate the complete record structure here;
+        # CLAIM authenticates the live ledger re-read before dispatching any work.
+        record_error = provenance_admission_error(record, number, require_signature=False)
         if record_error:
             exclude_changes(record_error)
             continue                      # missing/invalid registry provenance record — fail
-                                          # closed by the ONE shared predicate (CLAIM,
-                                          # review-fix.yml resolve, and groom's draft carve-out
-                                          # apply the same one, so "enumerated here" and
-                                          # "admitted there" cannot drift)
+                                          # closed on shape by the shared predicate; authenticated
+                                          # consumers apply its signature check at their boundary
         impl_provider = record["impl_provider"]
         if HUMAN_HOLD_PR_LABELS & set(labels):
             exclude_changes("PR carries a human-owned hold label")
@@ -3389,6 +3400,7 @@ def _review_fix_workflow_values():
 
 
 def _self_test():
+    os.environ.setdefault("LEDGER_RECORD_HMAC_KEY", "selftest-ledger-record-key")
     # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are DOCS-ONLY
     # models — they must never appear in any review/fix chain (review-fix.yml asserts the same
     # over its own chain tables, worker-pr.py over ESCALATION_LADDERS).
@@ -4191,6 +4203,8 @@ def _self_test():
              "impl_alias": "sol", "impl_account_h": "cd" * 8, "issue": 9,
              "recorded_at_run": "2.1"},
     }
+    provenance = {number: _worker_pr_helper().sign_ledger_record(record)
+                  for number, record in provenance.items()}
     issue_labels = {7: ["area:crate-a", "role:impl"], 9: ["area:sparq-zk", "role:impl"]}
 
     # ---- issue #460 SNAPSHOT -> WORKFLOW ROW -> ENUMERATOR end-to-end regression ----
@@ -4232,6 +4246,8 @@ def _self_test():
         "issue": 144,
         "recorded_at_run": "29694084610.1",
     }}
+    snapshot_provenance[442] = _worker_pr_helper().sign_ledger_record(
+        snapshot_provenance[442])
     snapshot_items = enumerate_review_items(
         snapshot_repo, snapshot_rows, snapshot_provenance, [],
         {144: ["area:dispatch", "role:impl", "status:in-progress-review"]}, now)
@@ -4438,9 +4454,8 @@ def _self_test():
     assert enumerate_review_items(repo, pulls[:1], provenance, [], issue_labels, now,
                                   bot_login="another[bot]") == []
 
-    # ---- provenance_admission_error / is_enumerable_provenance (the ONE record-shape
-    # admission shared by PLAN, CLAIM, review-fix.yml resolve, and groom.py's draft age-park
-    # carve-out) ----
+    # ---- provenance_admission_error / is_enumerable_provenance (shared record-shape
+    # admission; authenticated consumers additionally require the ledger signature) ----
     # Known-good: exactly the fixtures the enumerator admits above — complete records with a
     # valid impl_alias and a positive-int issue.
     assert provenance_admission_error(provenance[41], 41) is None
@@ -4503,6 +4518,27 @@ def _self_test():
         == "provenance record does not match this PR"
     assert provenance_admission_error({**provenance[41], "impl_provider": []}, 41) \
         == "provenance implementer provider is invalid"
+    assert provenance_admission_error(provenance[41], 41) is None
+    unsigned_provenance = dict(provenance[41])
+    unsigned_provenance.pop("ledger_hmac_sha256")
+    assert provenance_admission_error(unsigned_provenance, 41) \
+        == "provenance record signature is missing or invalid"
+    assert provenance_admission_error({**provenance[41], "impl_alias": "opus"}, 41) \
+        == "provenance record signature is missing or invalid"
+
+    # PLAN runs without secrets: it must still enumerate a structurally valid record. Trust-
+    # consuming admission remains fail-closed without the key, even when the record carries a
+    # signature made earlier. This catches workflow wiring that accidentally makes enumeration
+    # depend on LEDGER_RECORD_HMAC_KEY while pinning the PLAN-vs-CLAIM split in both directions.
+    saved_ledger_key = os.environ.pop("LEDGER_RECORD_HMAC_KEY", None)
+    try:
+        assert enumerate_review_items(repo, pulls[:1], provenance, [], issue_labels, now) != []
+        assert provenance_admission_error(provenance[41], 41) \
+            == "provenance record signature is missing or invalid"
+        assert not is_enumerable_provenance(provenance[41], 41)
+    finally:
+        if saved_ledger_key is not None:
+            os.environ["LEDGER_RECORD_HMAC_KEY"] = saved_ledger_key
 
     # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
     runs = [
@@ -4995,9 +5031,9 @@ def _self_test():
                 path = Path(root or wiring_root) / wiring_worker_pr.verdict_path(
                     repo, 41, round_n)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps({
+                path.write_text(json.dumps(wiring_worker_pr.sign_ledger_record({
                     "verdict": "request_changes", "injection_detected": False,
-                    "summary": "s", "issues": [], "progress": progress}), encoding="utf-8")
+                    "summary": "s", "issues": [], "progress": progress})), encoding="utf-8")
 
             fix_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-fix",
                         "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
@@ -5506,12 +5542,12 @@ def _self_test():
                 })
                 path = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, pr_number)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps({
+                path.write_text(json.dumps(wiring_worker_pr.sign_ledger_record({
                     "head_sha_at_open": head_sha, "impl_account_h": "ef" * 8,
                     "impl_alias": "sol", "impl_provider": "openai",
                     "issue": issue_number, "pr_number": pr_number,
                     "recorded_at_run": "448.1",
-                }), encoding="utf-8")
+                })), encoding="utf-8")
 
             def fanout_gh_json(args):
                 path = args[-1]
@@ -5658,9 +5694,9 @@ def _self_test():
     # SAME validated provenance record the enumerator admits, so these fixtures carry
     # provenance — the branch name is only the worker-pattern gate.
     def busy_record(number, issue):
-        return {"pr_number": number, "head_sha_at_open": sha_a,
+        return _worker_pr_helper().sign_ledger_record({"pr_number": number, "head_sha_at_open": sha_a,
                 "impl_provider": "anthropic", "impl_alias": "fable",
-                "impl_account_h": "ab" * 8, "issue": issue, "recorded_at_run": "1.1"}
+                "impl_account_h": "ab" * 8, "issue": issue, "recorded_at_run": "1.1"})
 
     busy_prov = {**provenance,
                  60: busy_record(60, 8), 61: busy_record(61, 999),

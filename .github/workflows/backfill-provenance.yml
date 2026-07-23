@@ -89,6 +89,7 @@ jobs:
           # non-draft PR needing conversion is WARNed with the manual command (github.token
           # has no target write; the outage population is already draft).
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          LEDGER_RECORD_HMAC_KEY: ${{ secrets.LEDGER_RECORD_HMAC_KEY }}
           TARGET_REPO: ${{ inputs.target_repo }}
           APPLY: ${{ inputs.apply }}
           ROUTING_FILE: ${{ steps.policy.outputs.routing_file }}

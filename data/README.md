@@ -43,6 +43,14 @@ checkout (`dispatch.yml` PLAN + CLAIM, `review-fix.yml` resolve + run, `groom.ym
 master-checkout copy so pre-outage records stay visible. Readers fail LOUD if the `ledger`
 branch is missing — never silently-empty.
 
+Provenance and review-verdict records are additionally authenticated with HMAC-SHA256 in
+`ledger_hmac_sha256`. Writers and trusted host-side readers receive the dedicated
+`LEDGER_RECORD_HMAC_KEY` environment secret; it is never stored on the ledger or passed to a
+model command. Missing-key, unsigned, or modified records are rejected fail closed, so
+`contents:write` access to the unprotected data branch alone cannot forge an implementer or
+verdict identity. Deployments must configure this secret before enabling record writers; legacy
+unsigned envelopes are intentionally not trusted and must be re-recorded by a trusted writer.
+
 ## `data/observability.json` — agent-run observability snapshot (issue #246)
 
 The dashboard's Observability panels (cache effectiveness / per-lane run health + top defer

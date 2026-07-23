@@ -956,6 +956,7 @@ jobs:
           # Salt for the provenance account-hash comparison (locked decision 22a). This job runs
           # registry code only — the salt never enters a job that executes target code.
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          LEDGER_RECORD_HMAC_KEY: ${{ secrets.LEDGER_RECORD_HMAC_KEY }}
           WORKFLOW_REF: ${{ github.ref_name }}
           WORKER_USAGE_FILE: ${{ runner.temp }}/usage.json
           # Zero-dispatch visibility (registry #28/#32): dispatch-claim writes a compact
