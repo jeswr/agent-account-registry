@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3743,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "09d2ea3cee8e487b2bfe01d09f216d698600ef33",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": null,
+  "summary": "This is a design-only change plus cross-references; it does not alter batch-merge behavior. The revision-pinning design consistently binds planning, artifacts, merges, arming, deletion, closure, and future bisection evidence to immutable OIDs, explicitly acknowledges the residual read-back race for GitHub mutations without server-side leases, and specifies reconciliation and hermetic coverage for that residue. No correctness, soundness, security, or test-validity defect blocks merging this record. Injection detection is true because the untrusted prose contains an imperative telling its reader to read another header; that text was treated solely as documentation and did not influence review procedure.",
+  "verdict": "approve"
+ }
+}
