@@ -102,12 +102,27 @@ def parse_ts(value):
     UTC offset) also raises: it cannot be soundly ordered against aware stamps. Window-key
     IDENTITY (receipt-set membership / dedupe) stays string EQUALITY, but over the CANONICAL
     spelling (canonical_ts, round-6 finding 2) — exact source-string identity could not
-    round-trip a space-form cutoff through the receipt marker."""
+    round-trip a space-form cutoff through the receipt marker.
+
+    Round-7 finding 1: a stamp can PASS fromisoformat yet OVERFLOW UTC normalization —
+    "0001-01-01T00:00:00+23:59" parses to an aware datetime whose astimezone(utc) subtracts
+    the offset under datetime.min and raises OverflowError, escaping every ValueError-keyed
+    malformed-timestamp handler and CRASHING the sweep (canonical_ts sits outside the
+    per-surface try in readmission_cutoff, and park_generation_cutoffs guards receipts with
+    valid_timestamp before canonicalizing). parse_ts therefore PROVES UTC normalization here
+    and re-raises OverflowError/OSError as ValueError, so valid_timestamp rejects the stamp
+    and every existing handler (freeze / receipt-absent / event-cannot-prove) applies
+    unchanged. Only stamps within ~a day of year 1 / year 9999 are affected — never a real
+    GitHub event time."""
     if not isinstance(value, str) or not value:
         raise ValueError(f"not a timestamp: {value!r}")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError(f"naive (offset-free) timestamp cannot be ordered: {value!r}")
+    try:
+        parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError) as exc:
+        raise ValueError(f"timestamp overflows UTC normalization: {value!r}") from exc
     return parsed
 
 
@@ -123,8 +138,15 @@ def canonical_ts(value):
     WRITE/derive time (latest_human_unlabel / readmission_cutoff / park_ladder_decision)
     and every receipt reader canonicalizes at parse time (worker-pr
     park_generation_cutoffs), so receipt equality is over one deterministic spelling.
-    Raises ValueError exactly like parse_ts on anything unparseable."""
-    return parse_ts(value).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    Raises ValueError exactly like parse_ts on anything unparseable — including a stamp
+    that parses but OVERFLOWS UTC normalization (round-7 finding 1; parse_ts proves the
+    normalization, and the wrap here is the defensive rail against drift): every caller
+    keys its malformed-timestamp handling on ValueError, and an OverflowError would crash
+    the sweep instead."""
+    try:
+        return parse_ts(value).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError) as exc:
+        raise ValueError(f"timestamp overflows UTC normalization: {value!r}") from exc
 
 
 def valid_timestamp(value):
@@ -859,6 +881,48 @@ def _self_test():
     check("round-6 f2: the same space-form gesture unreceipted still re-admits",
           capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted,
                                    consumed=set()), True)
+
+    # ---- Round-7 finding 1: a stamp that PASSES parsing but OVERFLOWS UTC normalization
+    # ("0001-01-01T00:00:00+23:59" — astimezone subtracts the offset under year 1) must raise
+    # ValueError, never OverflowError: every malformed-timestamp handler (freeze /
+    # receipt-absent / event-cannot-prove) keys on ValueError/valid_timestamp, and an
+    # OverflowError escaping them crashed the sweep. ----
+    for overflow_ts in ("0001-01-01T00:00:00+23:59",   # underflows datetime.min in UTC
+                        "9999-12-31T23:59:59-23:59"):  # overflows datetime.max in UTC
+        for name, fn in (("canonical_ts", canonical_ts), ("parse_ts", parse_ts)):
+            try:
+                fn(overflow_ts)
+                check(f"round-7 f1: {name} raises ValueError on {overflow_ts!r}",
+                      "no error", "ValueError")
+            except ValueError:
+                check(f"round-7 f1: {name} raises ValueError on {overflow_ts!r}",
+                      "ValueError", "ValueError")
+            except OverflowError:
+                check(f"round-7 f1: {name} raises ValueError on {overflow_ts!r}",
+                      "OverflowError", "ValueError")
+        check(f"round-7 f1: valid_timestamp rejects {overflow_ts!r}",
+              valid_timestamp(overflow_ts), False)
+    # As a relevant EVENT timestamp reaching readmission_cutoff: the malformed-event
+    # direction applies unchanged (MalformedTimelineError -> the per-surface read-failure
+    # handler -> full historical count, loud log) — the sweep never crashes.
+    logs.clear()
+    timelines[41] = [event("unlabeled", "needs:user", "0001-01-01T00:00:00+23:59", "jeswr")]
+    timelines[7] = [bot_park]
+    check("round-7 f1: an overflow event timestamp takes the malformed-event direction "
+          "(full count, no crash)",
+          readmission_cutoff("o/r", 41, 7, fetch, is_human=trusted, log=logs.append), None)
+    check("round-7 f1: the overflow-event fallback logs loudly",
+          any("timeline read failed" in line for line in logs), True)
+    check("round-7 f1: the ladder caller sees WINDOW_UNREADABLE (freeze), not a crash",
+          readmission_cutoff("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                             on_unreadable=WINDOW_UNREADABLE), WINDOW_UNREADABLE)
+    check("round-7 f1: park_vetoed suppresses the park on an overflow event timestamp",
+          park_vetoed("o/r", 41, "needs:user",
+                      lambda _r, n: timelines[n], is_human=trusted, log=logs.append), True)
+    # An overflow cutoff handed straight to the ladder freezes on the defensive rail —
+    # it can mint neither a window key nor a receipt.
+    check("round-7 f1: an overflow cutoff freezes the ladder",
+          park_ladder_decision("0001-01-01T00:00:00+23:59", set()), ("freeze", None, None))
 
     # ---- readmission_cutoff on_unreadable: the ladder can DISTINGUISH windowless from
     # unreadable; default callers keep the plain None => full-count path ----

@@ -3148,6 +3148,22 @@ def _self_test():
     check("round-6 f2: a legacy space-form receipt parses onto its CANONICAL key "
           "(and dedupes with the +00:00 spelling)",
           park_generation_cutoffs(legacy_receipts, bot), {"2026-07-23T10:30:00Z"})
+    # Round-7 finding 1: a receipt cutoff that PARSES but OVERFLOWS UTC normalization
+    # ("0001-01-01T00:00:00+23:59" — astimezone under year 1) used to pass the
+    # valid_timestamp guard and crash canonical_ts with OverflowError; park_policy now
+    # rejects it at parse time, so the receipt is treated ABSENT with the loud
+    # malformed-cutoff log — the reader never crashes.
+    receipt_logs.clear()
+    overflow_receipts = receipts + [
+        {"user": {"login": bot},
+         "body": f"x {PARK_GENERATION_MARKER} gen=2 cutoff=0001-01-01T00:00:00+23:59 -->"},
+    ]
+    check("round-7 f1: an overflow receipt cutoff is treated as absent (no crash)",
+          park_generation_cutoffs(overflow_receipts, bot, log=receipt_logs.append),
+          {"2026-07-23T09:00:00Z"})
+    check("round-7 f1: the overflow receipt cutoff logs loudly",
+          any("malformed park-generation receipt cutoff" in line for line in receipt_logs),
+          True)
 
     # Issue #162: round markers bind the reviewed head sha, and a stale-deferred round is VOIDED
     # (subtracted) so head churn never burns the global round budget.
