@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-23T19:47:46Z",
+  "generated_at": "2026-07-23T19:57:54Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -27,13 +27,13 @@
       "issues_open": 215,
       "issues_ready": 64,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 10,
+      "issues_closed_24h": 9,
       "prs_open": 23,
       "prs_draft": 23,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 5,
+      "prs_merged_24h": 4,
       "review_changes_backlog": 8,
       "needs_user_parked": 9,
       "review_lane_health": "idle",
@@ -45,5 +45,16 @@
       "net_pr_flow": 0.0
     }
   },
-  "alerts": []
+  "alerts": [
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "ready-starved",
+      "fire": true,
+      "summary": "ready frontier 64 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "metrics": {
+        "issues_ready": 64,
+        "issues_closed_1h": 0
+      }
+    }
+  ]
 }
