@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3738,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8e5597db9a867d9820570d48aedb8975bab36ae6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly adds both hermetic triage self-tests to the per-PR docs-quality gate and makes retriage's fixture assertions fail cleanly instead of raising KeyError when an expected action is absent. The default empty action tuple preserves the asserted data shape, the guarded bot-author check avoids a secondary IndexError, and both self-tests pass at the PR head. No correctness, soundness, security, or test-validity issues found.",
+  "verdict": "approve"
+ }
+}
