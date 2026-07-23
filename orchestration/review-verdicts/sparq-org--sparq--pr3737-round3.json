@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3737,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d5aa972a66b6177bbf98167a0e34054e922cb6bf",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the round-2 major finding. The R4 credential-scan regex in deploy-lint.yml is now `^[[:space:]]*[A-Za-z0-9_.-]*(token|password|passwd|private[_-]?key)[A-Za-z0-9_.-]*[[:space:]]*:...` \u2014 precisely the strictly-better fix the round-2 reviewer proposed: it anchors the LINE but keeps a `[A-Za-z0-9_.-]*` key-prefix run before the keyword. Verified empirically: the new regex matches github_token / access_token / db_password inline literals (the coverage that round 2 flagged as dropped) AND the bare token/password/private_key lines, while the legitimate GCP Secret Manager reference at deploy/gcp/sparq-server.yaml:77 no longer matches (the `/` in `run.googleapis.com/secrets` breaks the anchored `[A-Za-z0-9_.-]*` run before any keyword can follow). A scan of the real deploy/ tree with the new pattern is clean (exit 1). The remaining changes are mechanical actions/checkout SHA bumps v4.2.2 (11bd719...) -> v7.0.0 (9c091bb...) across deploy-terraform-lint.yml (x2), promote-on-approval.yml, retriage.yml, triage-issue.yml, plus a comment-format normalization in deploy-lint.yml. Verified: all 121 checkout references now pin the single v7.0.0 SHA, zero v4.2.2 stragglers. The change is correct and complete. No hostile instructions in the diff.",
+  "verdict": "approve"
+ }
+}
