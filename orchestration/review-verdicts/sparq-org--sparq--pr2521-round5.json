@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2521,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e2f908d75739132b20ce97991267989e6ec5cf7a",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The primer explicitly excludes ci.yml's wasm-pack test invocations, saying the next post-merge target run will save their build-mode dev dependencies. That does not solve the fresh-stable-key hole this workflow is intended to close: before such a target run, the first PR/main wasm job must compile those omitted closures cold. The target job has wasm-pack states for sparq-wasm default/shacl/jsonld/explain-json, sparq-reason-wasm default/explain, and sparq-rsp-wasm. Because these use the same `wasm` cache family and introduce test/dev dependency artifacts, mirroring only cargo build/clippy is not the complete dependency closure claimed by the workflow.",
+    "file": ".github/workflows/cache-prime.yml",
+    "fix_hint": "Prime the wasm-pack test closures (or equivalent cargo test/no-run invocations proven to generate the same wasm32 dependency artifacts) for every target package/feature state. Extend the structural guard to model those target states rather than explicitly ignoring wasm-pack, and add a self-test proving omission of a test/dev state fails.",
+    "severity": "major",
+    "title": "The wasm primer still omits test/dev dependency closures in the shared family"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 remains materially incomplete. The direct cargo build/clippy states called out previously are now mirrored and guarded, but the primer still deliberately omits every wasm-pack test state in the same ci.yml wasm cache family. Those invocations compile test/dev dependency closures (including wasm-bindgen-test) under default, shacl, jsonld, explain-json, RSP, and reasoner/explain states. After a fresh stable-key rotation, the first target wasm job therefore still has cold dependency work, contrary to the workflow's stated goal and its claim to cover every browser bundle. The new equality check cannot detect this gap because its parser intentionally ignores wasm-pack. Progress is stagnant because the prior major completeness finding remains at the same severity, albeit narrowed.",
+  "verdict": "request_changes"
+ }
+}
