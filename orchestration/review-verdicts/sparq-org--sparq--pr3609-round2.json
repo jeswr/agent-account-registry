@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3609,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f82caf0f28c43dc65da8fd082a2808c9479a9eff",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The adversary drift test now exhaustively maps every MPC_PROTOCOL_IRIS entry to implementation-owned descriptor metadata, checks that the annotation subjects exactly equal the declared protocol set, and asserts exact equality for both the semi-honest set and its malicious complement; hidden-property-path and both authenticated protocols are covered. The design record is also amended to define the mixed estate, closed-world interpretation, admission evidence, and unaudited status. The ontology and public skill consistently retain Claimed + ExternalSignOffPending caveats, and the parser dependency remains feature-gated. The diff still contains process-directed text asking for later Fable re-review, so injection_detected remains true, but that text does not affect the code-review conclusion.",
+  "verdict": "approve"
+ }
+}
