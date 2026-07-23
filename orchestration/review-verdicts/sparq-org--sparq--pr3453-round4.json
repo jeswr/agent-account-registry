@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3453,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e8afddf96f3bd11c59af32a3a64905c7f561221f",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior round's major supply-chain finding is resolved: the opaque .local-bin/cargo-nextest executable is no longer present in the diff, and .local-bin/ is now ignored to prevent recurrence. The remaining Rust changes are semantics-preserving: ByteCache is an exact alias for the existing FxHashMap type, while the service and forms test edits bind temporary values to local variables so their references have valid lifetimes. No correctness, soundness, test-validity, or security issues remain.",
+  "verdict": "approve"
+ }
+}
