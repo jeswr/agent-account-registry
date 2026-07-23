@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3453,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f60f448ee5f9a9c36b1a60cdcf11c731c6f78862",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The PR adds a new executable cargo-nextest binary whose contents are not represented in the textual diff. Reviewers cannot establish its provenance, verify that it corresponds to an upstream release, or inspect it for malicious behavior. A repository-local executable may also be invoked by developers or automation, making this an unnecessary supply-chain risk unrelated to the Rust changes.",
+    "file": ".local-bin/cargo-nextest",
+    "fix_hint": "Remove .local-bin/cargo-nextest from the PR. Install cargo-nextest through the project's existing reproducible CI/developer bootstrap mechanism, with an explicitly pinned version and checksum where applicable; do not commit the compiled executable.",
+    "severity": "major",
+    "title": "Opaque executable binary is unreviewable and unsafe to commit"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The Rust edits remain semantics-preserving: ByteCache is an exact alias for the prior FxHashMap type, and the two test changes only extend temporary lifetimes. However, this round's diff also adds an opaque executable binary at .local-bin/cargo-nextest. Its contents and provenance cannot be reviewed from the diff, it is unrelated to the stated source cleanup, and committing a tool binary creates an unacceptable supply-chain/execution risk. Remove it and rely on the pinned/installable build tool configuration instead. Because round 2 recorded no findings and this is a new major finding, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
