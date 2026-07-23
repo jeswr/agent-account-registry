@@ -1,0 +1,9 @@
+{
+ "head_sha_at_open": "f49be12601c44d39b98921dcf4f7148066225cde",
+ "impl_account_h": "dc2d751954080e13",
+ "impl_alias": "sol",
+ "impl_provider": "openai",
+ "issue": 3547,
+ "pr_number": 3754,
+ "recorded_at_run": "30002074553.1"
+}
