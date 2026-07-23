@@ -1392,16 +1392,21 @@ def _ensure_label(api: GitHubAPI, repo: str, label: str) -> bool:
 def _is_human_maintainer(api: GitHubAPI, repo: str, login: str) -> bool:
     """The strict maintainer probe for the unpark veto (park-policy hygiene finding; the
     worker-issue._is_human_maintainer pattern): repo collaborator permission in
-    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe failure counts as NOT a maintainer — an
-    unverifiable actor must never mint an unpark veto."""
-    try:
+    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe-call FAILURE counts as NOT a maintainer
+    and emits the shared distinct ::warning:: diagnostic (park_policy.probe_maintainer,
+    round-3 Opus finding); a clean 404 (not a collaborator) or a non-maintainer permission
+    stays quiet."""
+    def read_permission(probe_login: str):
         payload = api.request(
-            "GET", f"/repos/{repo}/collaborators/{login}/permission", allow_404=True
+            "GET", f"/repos/{repo}/collaborators/{probe_login}/permission", allow_404=True
         )
-    except GroomError:
-        return False
-    return (isinstance(payload, dict)
-            and payload.get("permission") in park_policy.HUMAN_MAINTAINER_PERMISSIONS)
+        if payload is None:
+            return None  # 404: not a collaborator — a genuine, quiet not-a-maintainer
+        if not isinstance(payload, dict):
+            raise GroomError("collaborator permission payload is malformed")
+        return payload.get("permission")
+
+    return park_policy.probe_maintainer(repo, login, read_permission)
 
 
 def _apply_labels(

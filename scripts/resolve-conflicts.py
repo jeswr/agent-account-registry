@@ -117,14 +117,16 @@ _park_policy = _load_helper("registry_park_policy", "park_policy.py")
 def _is_human_maintainer(api, repo, login):
     """The strict maintainer probe for the unpark veto (park-policy hygiene finding; the
     worker-issue._is_human_maintainer pattern): repo collaborator permission in
-    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe failure counts as NOT a maintainer — an
-    unverifiable actor must never mint an unpark veto."""
-    try:
-        payload = api.request("GET", f"/repos/{repo}/collaborators/{login}/permission")
-    except ResolverError:
-        return False
-    return (isinstance(payload, dict)
-            and payload.get("permission") in _park_policy.HUMAN_MAINTAINER_PERMISSIONS)
+    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe-call FAILURE counts as NOT a maintainer
+    and emits the shared distinct ::warning:: diagnostic (park_policy.probe_maintainer,
+    round-3 Opus finding); a genuine not-a-maintainer permission stays quiet."""
+    def read_permission(probe_login):
+        payload = api.request("GET", f"/repos/{repo}/collaborators/{probe_login}/permission")
+        if not isinstance(payload, dict):
+            raise ResolverError("collaborator permission payload is malformed")
+        return payload.get("permission")
+
+    return _park_policy.probe_maintainer(repo, login, read_permission)
 
 
 def load_target_repositories(policy_file, registry_repo):

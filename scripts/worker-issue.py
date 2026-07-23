@@ -146,12 +146,21 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
 def _is_human_maintainer(repo, login):
     # Same derivation as the triage-issue trust-gate: collaborator permission probe. The
     # trust-gate's extra exact-match entry is the registry App bot, which is excluded here by
-    # design — approval must come from a human. Probe failure counts as "not a maintainer".
-    result = _run_gh(
-        ["api", f"repos/{repo}/collaborators/{login}/permission", "--jq", ".permission"],
-        check=False,
-    )
-    return result.returncode == 0 and result.stdout.strip() in HUMAN_MAINTAINER_PERMISSIONS
+    # design — approval must come from a human. Probe-call FAILURE counts as "not a
+    # maintainer" and emits the shared distinct ::warning:: diagnostic
+    # (park_policy.probe_maintainer, round-3 Opus finding); a genuine not-a-maintainer
+    # permission stays quiet.
+    def read_permission(probe_login):
+        result = _run_gh(
+            ["api", f"repos/{repo}/collaborators/{probe_login}/permission",
+             "--jq", ".permission"],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise WorkerIssueError(f"permission probe exited {result.returncode}")
+        return result.stdout.strip()
+
+    return _park_policy().probe_maintainer(repo, login, read_permission)
 
 
 def _run_gh(args, *, input_text=None, check=True):
@@ -332,9 +341,12 @@ def set_status(repo, issue, status):
     # readmission — reaching it proves capacity exists (the allocator granted a claim), so the
     # soft hold lifts exactly then.
     # `parked`: the MACHINE-owned capacity/decline/budget park (park_policy.py). Unlike
-    # `needs-user` it is a SOFT hold: no new implementation dispatch, but an existing worker PR
-    # keeps flowing through the review/fix loop (status:parked is not a needs:* label, so
-    # enumerate_review_items does not exclude on it), and readmission clears it automatically.
+    # `needs-user` it is a SOFT hold cleared by a human readmission gesture (or the `retry`
+    # flip) rather than a terminal question — but it DOES park the whole PR surface while it
+    # stands (round-3 finding 2, the one-predicate rule): a PR is capacity-parked iff EITHER
+    # machine label is live (review:parked on the PR OR status:parked on the source), so
+    # enumerate_review_items excludes on it and CLAIM re-proves any readmission from the
+    # durable receipts + label timelines.
     # `needs-user` stays reserved for genuine human questions and supersedes a machine park.
     # NOTE (issue #31): status:ready written here is dispatchability only, never maintainer
     # approval — the reverify third-party path demands separate human evidence.

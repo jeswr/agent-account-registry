@@ -648,14 +648,17 @@ def _issue_timeline(repo: str, number: int, token: str) -> list[dict[str, Any]]:
 def _is_human_maintainer(repo: str, login: str, token: str) -> bool:
     """The strict maintainer probe for the unpark veto (park-policy hygiene finding; the
     worker-issue._is_human_maintainer pattern): repo collaborator permission in
-    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe failure counts as NOT a maintainer — an
-    unverifiable actor must never mint an unpark veto."""
-    try:
-        payload = _gh_json(["api", f"repos/{repo}/collaborators/{login}/permission"], token)
-    except CuratorError:
-        return False
-    return (isinstance(payload, dict)
-            and payload.get("permission") in _park_policy.HUMAN_MAINTAINER_PERMISSIONS)
+    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe-call FAILURE counts as NOT a maintainer
+    and emits the shared distinct ::warning:: diagnostic (park_policy.probe_maintainer,
+    round-3 Opus finding); a genuine not-a-maintainer permission stays quiet."""
+    def read_permission(probe_login: str):
+        payload = _gh_json(
+            ["api", f"repos/{repo}/collaborators/{probe_login}/permission"], token)
+        if not isinstance(payload, dict):
+            raise CuratorError("collaborator permission payload is malformed")
+        return payload.get("permission")
+
+    return _park_policy.probe_maintainer(repo, login, read_permission)
 
 
 def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) -> int:

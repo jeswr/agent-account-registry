@@ -35,6 +35,7 @@
 
 import argparse
 import sys
+from datetime import datetime
 
 
 # The machine-owned soft hold for SOURCE ISSUES (capacity/decline/budget parks). Ensured on
@@ -55,8 +56,23 @@ READMISSION_LABELS = (HUMAN_PARK_LABEL, MACHINE_PARK_LABEL, MACHINE_PARK_PR_LABE
 # Bounded post-readmission escalation: an item that is human-readmitted and exhausts its
 # round/attempt budget again this many times escalates to a QUESTION-class park (terminal
 # review:needs-user / needs:user with a comment naming the repeated failure) so nothing can
-# spin through readmission windows forever.
+# spin through readmission windows forever. GENERATIONS ARE TRACKED SOLELY BY BOT-AUTHORED
+# RECEIPTS (round-3 finding 1): every consumed budget window — including the INITIAL
+# full-budget window, which has no readmission cutoff — is receipted with a
+# PARK_GENERATION_MARKER whose window key is the cutoff (or PARK_WINDOW_NONE for the initial
+# window). Label writes are best-effort UI on top: a sticky-veto-suppressed label re-apply
+# never stalls the ladder, because the ladder never reads labels.
 PARK_ESCALATION_GENERATIONS = 2
+# The receipt window key for a budget exhaustion with NO readmission cutoff (the initial
+# full-budget window). Never a valid ISO-8601 timestamp, so it can never collide with a real
+# cutoff key.
+PARK_WINDOW_NONE = "none"
+# Sentinel a caller may request from readmission_cutoff (on_unreadable=WINDOW_UNREADABLE) to
+# DISTINGUISH "no proven human unlabel exists" (None) from "the timeline could not be read"
+# (this sentinel). The escalation ladder must FREEZE on an unreadable timeline — advancing a
+# generation (or minting a PARK_WINDOW_NONE receipt) on a failed read would corrupt the durable
+# ladder — while plain budget consumers keep the default None => full-historical-count path.
+WINDOW_UNREADABLE = "window-unreadable"
 # The strict maintainer probe set (the worker-issue.py _is_human_maintainer pattern): repo
 # collaborator permission must be one of these for an actor to count as a trusted human.
 HUMAN_MAINTAINER_PERMISSIONS = {"admin", "maintain", "write"}
@@ -74,15 +90,39 @@ class MalformedTimelineError(RuntimeError):
     park; budget/readmission => the full historical count)."""
 
 
+def valid_timestamp(value):
+    """STRICT ISO-8601 check for every timestamp consumed by a park decision (round-3 finding
+    3/4): parseable via datetime.fromisoformat after Z-normalization. The lexicographic
+    comparisons throughout this module are only sound over well-formed ISO-8601 UTC stamps —
+    a garbage string like "zzz" would otherwise sort ABOVE every real timestamp and dominate
+    max(), silently minting (or destroying) a veto/cutoff."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
 def _event_rows(events, label):
     """Normalize a GitHub issue-timeline payload to (created_at, kind, actor_login, via_app)
     rows for `label`. RAISES MalformedTimelineError on any malformed RELEVANT shape — a
     non-dict event, a labeled/unlabeled event whose label field is unreadable, or a matching
-    event without a readable created_at — because a silently dropped entry could be the newest
-    human unlabel (the exact event the veto and the readmission window hinge on). Irrelevant
-    event kinds and readable other-label events are skipped as before. A missing/unreadable
-    actor is preserved as login "" (an UNVERIFIABLE actor — not human on either side), and a
-    non-null performed_via_github_app marks the event as App-driven (never human)."""
+    event without a STRICT ISO-8601 created_at — because a silently dropped entry could be the
+    newest human unlabel (the exact event the veto and the readmission window hinge on).
+    Irrelevant event kinds and readable other-label events are skipped as before. A
+    missing/unreadable actor is preserved as login "" (an UNVERIFIABLE actor — not human on
+    either side), and a non-null performed_via_github_app marks the event as App-driven (never
+    human).
+
+    Round-3 finding 3/4 (timestamp direction, deliberately RAISE not skip): a relevant event
+    whose created_at fails the strict ISO parse can never prove a gesture — and raising is
+    uniformly AT LEAST as conservative as skipping at every consumer (veto => the park is
+    suppressed; readmission/budget => the full historical count; capacity_park_readmitted =>
+    stays parked). Skipping instead would be ANTI-conservative at two sites: a skipped
+    malformed park-APPLICATION event shrinks latest_labeled/latest_park, making the veto and
+    the readmission proof EASIER on corrupt data."""
     rows = []
     for event in events or []:
         if not isinstance(event, dict):
@@ -97,9 +137,9 @@ def _event_rows(events, label):
         if name != label:
             continue
         created = event.get("created_at")
-        if not isinstance(created, str) or not created:
+        if not valid_timestamp(created):
             raise MalformedTimelineError(
-                f"{kind} event for {label} has an unreadable created_at")
+                f"{kind} event for {label} has an unreadable/non-ISO-8601 created_at")
         actor = event.get("actor")
         login = str(actor.get("login", "")) if isinstance(actor, dict) else ""
         via_app = event.get("performed_via_github_app") is not None
@@ -208,7 +248,7 @@ def latest_human_unlabel(repo, number, label, fetch_events, is_human=None, log=p
 
 
 def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=None, log=print,
-                       labels=READMISSION_LABELS):
+                       labels=READMISSION_LABELS, on_unreadable=None):
     """The budget readmission cutoff for a worker PR (or a bare source issue): the LATEST
     proven-human `unlabeled` event for ANY of `labels` (default READMISSION_LABELS —
     needs:user / status:parked / review:parked) across the PR itself and its provenance-linked
@@ -221,7 +261,13 @@ def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=Non
     surviving side must never mint readmission credit while the other side is unreadable: the
     unreadable side could hold a newer PARK application or a newer event that changes the
     picture, and a budget window opened on half the evidence silently retries forever. None =
-    no proven human unlabel anywhere = the caller keeps the full historical count."""
+    no proven human unlabel anywhere = the caller keeps the full historical count.
+
+    `on_unreadable` (default None — the plain full-count path) lets an ESCALATION-LADDER
+    caller distinguish a failed/malformed read (return `on_unreadable`, typically
+    WINDOW_UNREADABLE) from a genuinely windowless timeline (None): the ladder must FREEZE on
+    an unreadable view — never mint a PARK_WINDOW_NONE receipt or advance a generation on
+    unproven data — while budget consumers keep the conservative full count either way."""
     probe = _human_probe(is_human)
     stamps = []
     surfaces = [pr_number] + ([issue_number] if issue_number else [])
@@ -236,21 +282,34 @@ def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=Non
             log(f"readmission window unknown: timeline read failed for {repo}#{number} "
                 f"({exc}); NO readmission credit on a partial view — the budget keeps the "
                 f"FULL historical count")
-            return None
+            return on_unreadable
     return max(stamps, default=None)
 
 
 def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_human=None,
-                             log=print):
-    """True when a LIVE PR-side capacity park (`review:parked` still on the PR) has been
-    superseded by a human readmission gesture: the readmission cutoff (latest proven-human
-    unlabel of any READMISSION_LABELS across both surfaces) is strictly MORE RECENT than the
-    latest application of `review:parked` on the PR. Most-recent-event-wins, with ambiguity
-    (no cutoff, a failed/malformed read, or a timestamp tie) failing toward STAYING PARKED —
-    re-admission dispatches real work, so it runs only on proven, newest evidence."""
+                             log=print, consumed=frozenset()):
+    """True when a capacity park (durably receipted, whatever labels currently remain) has
+    been superseded by an UNCONSUMED human readmission gesture: the readmission cutoff (latest
+    proven-human unlabel of any READMISSION_LABELS across both surfaces) is strictly MORE
+    RECENT than the latest application of `review:parked` on the PR, AND that cutoff's window
+    has not already been consumed-and-receipted. Most-recent-event-wins, with ambiguity (no
+    cutoff, a failed/malformed read, or a timestamp tie) failing toward STAYING PARKED —
+    re-admission dispatches real work, so it runs only on proven, newest evidence.
+
+    `consumed` is the durable receipt set (worker-pr park_generation_cutoffs — bot-authored
+    only): a gesture whose exact cutoff is already receipted was consumed by a previous
+    budget window that then re-exhausted; it must never re-admit AGAIN — this is what keeps
+    the proof label-INDEPENDENT (round-3 finding 2): a veto-suppressed label re-apply leaves
+    no fresh `labeled` event to out-date the old gesture, so without the receipt check a
+    single stale gesture would re-admit forever."""
     cutoff = readmission_cutoff(repo, pr_number, issue_number, fetch_events,
                                 is_human=is_human, log=log)
     if not cutoff:
+        return False
+    if cutoff in consumed:
+        log(f"readmission declined for {repo}#{pr_number}: the human gesture at {cutoff} "
+            "was already consumed by a receipted budget window — a FRESH gesture is "
+            "required")
         return False
     try:
         rows = _event_rows(fetch_events(repo, pr_number), MACHINE_PARK_PR_LABEL)
@@ -261,6 +320,61 @@ def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_hum
     latest_park = max(
         (created for created, kind, _login, _app in rows if kind == "labeled"), default="")
     return cutoff > latest_park
+
+
+def park_ladder_decision(cutoff, receipts, already_labeled=False):
+    """The ONE label-independent capacity-park escalation ladder (round-3 finding 1), shared
+    by the deferred-issue lane (dispatch-claim) and the worker-PR lane (worker-pr needs_user).
+    `cutoff` is readmission_cutoff(..., on_unreadable=WINDOW_UNREADABLE); `receipts` is the
+    durable bot-authored receipt set (worker-pr park_generation_cutoffs); `already_labeled`
+    says whether the machine park label is currently live (COMMENT-DEDUPE input only — the
+    generation math never reads it). Returns (action, window_key, generation):
+
+    - ("freeze", None, None): the timeline was unreadable — no window, no receipt, no label,
+      no comment; the ladder never advances on unproven data.
+    - ("dedupe", window_key, None): this exact window is already receipted — the park (or the
+      terminal escalation) for it was recorded once, honestly; re-defer QUIETLY until a fresh
+      human gesture mints a new window key. Dedupe applies to COMMENTS/labels only: the
+      generation progression is already durable in the receipts.
+    - ("legacy-quiet", None, None): a pre-receipt park (label live, no gesture, no receipts)
+      — stay quiet; generation accounting starts with the first receipted window.
+    - ("terminal", window_key, generation): PARK_ESCALATION_GENERATIONS windows consumed —
+      escalate to the question class. The terminal label write must consult the sticky veto
+      and the comment must be HONEST when the write was suppressed (never claim a label that
+      did not land). Requires a REAL cutoff: the initial PARK_WINDOW_NONE window alone can
+      never escalate, and a cutoff that regressed to None cannot prove a fresh window.
+    - ("park", window_key, generation): consume this window — soft park (veto-gated label,
+      best-effort) + the MANDATORY receipt binding window_key.
+    """
+    if cutoff == WINDOW_UNREADABLE:
+        return ("freeze", None, None)
+    window_key = cutoff or PARK_WINDOW_NONE
+    if window_key in receipts:
+        return ("dedupe", window_key, None)
+    if not cutoff and already_labeled and not receipts:
+        return ("legacy-quiet", None, None)
+    generation = len(receipts) + 1
+    if cutoff and generation >= PARK_ESCALATION_GENERATIONS:
+        return ("terminal", window_key, generation)
+    return ("park", window_key, generation)
+
+
+def probe_maintainer(repo, login, read_permission, log=print):
+    """The shared strict-maintainer probe wrapper (round-3 Opus finding): `read_permission(
+    login)` returns the collaborator permission value for `login` on `repo` (None for a clean
+    404 "not a collaborator"), RAISING on any probe-call failure (transport error, non-zero
+    exit, malformed payload). A raising probe emits ONE distinct loud diagnostic and yields
+    False — the fail DIRECTION is unchanged (unverifiable = not human; no veto, no window) —
+    while a genuine not-a-maintainer permission stays QUIET (an expected result, not an
+    outage). Without the diagnostic, a broken/expired probe token silently degrades every
+    human gesture to "not human" with zero operator signal."""
+    try:
+        permission = read_permission(login)
+    except Exception as exc:  # noqa: BLE001 — probe failure = unverifiable = not human
+        log(f"::warning::maintainer probe FAILED for {repo} actor={login} "
+            f"({type(exc).__name__}) — treating as not-human")
+        return False
+    return permission in HUMAN_MAINTAINER_PERMISSIONS
 
 
 def _self_test():
@@ -513,6 +627,116 @@ def _self_test():
     timelines[7] = [event("unlabeled", "status:parked", "2026-07-23T09:00:00Z", "jeswr")]
     check("an unreadable side stays parked",
           capacity_park_readmitted("o/r", 41, 404, fetch, is_human=trusted), False)
+    # Round-3 finding 2: a CONSUMED (receipted) gesture never re-admits — even when the
+    # veto-suppressed label re-apply left no fresh `labeled` event to out-date it.
+    timelines[7] = [event("unlabeled", "status:parked", "2026-07-23T09:00:00Z", "jeswr")]
+    logs.clear()
+    check("a receipted (consumed) gesture never re-admits",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted,
+                                   log=logs.append,
+                                   consumed={"2026-07-23T09:00:00Z"}), False)
+    check("the consumed decline is logged loudly",
+          any("already consumed" in line and "FRESH gesture" in line for line in logs), True)
+    check("an UNCONSUMED newer gesture still re-admits with receipts present",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted,
+                                   consumed={"2026-07-20T00:00:00Z"}), True)
+    # A park whose review:parked write was ALWAYS veto-suppressed leaves no `labeled` event;
+    # a fresh (unconsumed) gesture still re-admits it, a consumed one still does not.
+    timelines[43] = []
+    check("no label application ever + fresh gesture => re-admitted",
+          capacity_park_readmitted("o/r", 43, 7, fetch, is_human=trusted), True)
+    check("no label application ever + consumed gesture => stays parked",
+          capacity_park_readmitted("o/r", 43, 7, fetch, is_human=trusted,
+                                   consumed={"2026-07-23T09:00:00Z"}), False)
+
+    # ---- STRICT ISO-8601 timestamps (round-3 finding 3/4): a "not-a-timestamp" relevant
+    # event RAISES — it can never be a cutoff, never mint a veto, never loosen the park ----
+    check("valid_timestamp accepts real ISO-8601 UTC", valid_timestamp("2026-07-23T09:18:19Z"),
+          True)
+    for garbage_ts in ("zzz-later-than-everything", "not-a-timestamp", "2026-13-99T99:99:99Z",
+                      "", None, 7):
+        check(f"valid_timestamp rejects {garbage_ts!r}", valid_timestamp(garbage_ts), False)
+    garbage_unlabel = event("unlabeled", "needs:user", "not-a-timestamp", "jeswr")
+    try:
+        human_unpark_veto([bot_park, garbage_unlabel], "needs:user", trusted)
+        check("non-ISO relevant timestamp raises", "no error", "MalformedTimelineError")
+    except MalformedTimelineError:
+        check("non-ISO relevant timestamp raises", "raised", "raised")
+    timelines[9] = [bot_park, garbage_unlabel]
+    logs.clear()
+    check("a not-a-timestamp event cannot be a cutoff (full count)",
+          latest_human_unlabel("o/r", 9, "needs:user", fetch, is_human=trusted,
+                               log=logs.append), None)
+    check("the malformed-timestamp fallback logs loudly",
+          any("readmission window unknown" in line for line in logs), True)
+    # a lexicographically-huge garbage stamp on a LABELED event must not dominate the veto
+    # comparison either — it raises instead of silently out-dating the human unlabel.
+    garbage_label = event("labeled", "needs:user", "zzzz-not-a-timestamp", "b[bot]")
+    try:
+        human_unpark_veto([bot_park, human_unpark, garbage_label], "needs:user", trusted)
+        check("garbage labeled timestamp raises (never out-dates a human)", "no error",
+              "MalformedTimelineError")
+    except MalformedTimelineError:
+        check("garbage labeled timestamp raises (never out-dates a human)", "raised", "raised")
+
+    # ---- readmission_cutoff on_unreadable: the ladder can DISTINGUISH windowless from
+    # unreadable; default callers keep the plain None => full-count path ----
+    timelines[41] = [bot_park, human_unpark]
+    check("on_unreadable sentinel returned on a failed read",
+          readmission_cutoff("o/r", 41, 404, fetch, is_human=trusted, log=logs.append,
+                             on_unreadable=WINDOW_UNREADABLE), WINDOW_UNREADABLE)
+    check("readable windowless timeline still returns None with on_unreadable set",
+          readmission_cutoff("o/r", 41, None, fetch, is_human=trusted,
+                             labels=("status:parked",),
+                             on_unreadable=WINDOW_UNREADABLE), None)
+
+    # ---- park_ladder_decision: the ONE receipts-driven escalation ladder ----
+    check("ladder: unreadable timeline freezes",
+          park_ladder_decision(WINDOW_UNREADABLE, set()), ("freeze", None, None))
+    check("ladder: initial park consumes the PARK_WINDOW_NONE window as generation 1",
+          park_ladder_decision(None, set()), ("park", PARK_WINDOW_NONE, 1))
+    check("ladder: the initial window re-fires quietly once receipted",
+          park_ladder_decision(None, {PARK_WINDOW_NONE}), ("dedupe", PARK_WINDOW_NONE, None))
+    check("ladder: legacy pre-receipt park stays quiet (no receipt minted)",
+          park_ladder_decision(None, set(), already_labeled=True),
+          ("legacy-quiet", None, None))
+    check("ladder: a fresh gesture window after the initial receipt is TERMINAL at gen 2",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE}),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    check("ladder: a fresh gesture window with NO prior receipts parks as generation 1",
+          park_ladder_decision("2026-07-23T09:18:19Z", set()),
+          ("park", "2026-07-23T09:18:19Z", 1))
+    check("ladder: an already-receipted gesture window dedupes (comments), never advances",
+          park_ladder_decision("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"}),
+          ("dedupe", "2026-07-23T09:18:19Z", None))
+    check("ladder: a cutoff regressed to None can NEVER escalate past prior receipts",
+          park_ladder_decision(None, {"2026-07-21T08:00:00Z"}),
+          ("park", PARK_WINDOW_NONE, 2))
+    check("ladder: already_labeled never suppresses a due receipt once a window exists",
+          park_ladder_decision("2026-07-23T09:18:19Z", set(), already_labeled=True),
+          ("park", "2026-07-23T09:18:19Z", 1))
+
+    # ---- probe_maintainer (round-3 Opus finding): a probe-call FAILURE warns loudly and
+    # fails toward not-human; a genuine not-a-maintainer stays quiet ----
+    logs.clear()
+
+    def broken_probe(_login):
+        raise RuntimeError("collaborator API unavailable")
+
+    check("probe-call failure => not human", probe_maintainer("o/r", "jeswr", broken_probe,
+                                                              log=logs.append), False)
+    check("probe-call failure emits the distinct ::warning:: diagnostic",
+          logs, ["::warning::maintainer probe FAILED for o/r actor=jeswr (RuntimeError) — "
+                 "treating as not-human"])
+    logs.clear()
+    check("genuine not-a-maintainer stays quiet and False",
+          (probe_maintainer("o/r", "drive-by", lambda login: "read", log=logs.append), logs),
+          (False, []))
+    check("a clean 404 (None permission) stays quiet and False",
+          (probe_maintainer("o/r", "ghost", lambda login: None, log=logs.append), logs),
+          (False, []))
+    check("a maintainer permission passes",
+          probe_maintainer("o/r", "jeswr", lambda login: "admin"), True)
 
     print("park-policy self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

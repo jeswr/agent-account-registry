@@ -1406,19 +1406,22 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             exclude_signalled(f"source issue #{issue_number} carries a needs:* human hold")
             continue                      # the SOURCE issue is human-parked (groom/escalation) —
                                           # the whole PR surface is human-owned too
-        # MACHINE capacity park (finding A): review:parked is a SOFT hold — excluded from the
-        # active review/fix loop while it stands, but a human readmission gesture re-admits it.
-        # The enumeration-visible gesture is LABEL-STATE-BASED (no timeline reads in this pure
-        # snapshot walk): the park pair is review:parked (PR) + status:parked (issue), so a
-        # still-parked SOURCE issue means no gesture has landed and the PR stays excluded; a
-        # source issue clean of status:parked (the human removed it — needs:* was already
-        # excluded above, and removing review:parked itself empties this branch) re-admits the
-        # PR. CLAIM then re-derives the readmission window from the label TIMELINES (the strict
-        # human probe) before any budget/dispatch decision, so a spoofed label state can only
-        # re-enumerate, never mint budget or strip the park.
-        if MACHINE_PARK_PR_LABEL in labels and "status:parked" in source_labels:
+        # MACHINE capacity park — ONE predicate, one proof gate (round-3 finding 2): a PR is
+        # capacity-parked iff EITHER machine label is live — review:parked on the PR OR
+        # status:parked on its source issue — and a parked PR is excluded from this pure
+        # snapshot walk outright. The old AND-predicate let a half-cleared pair (a
+        # veto-suppressed PR-side write, or a triage-side dismissal of one label) re-enter
+        # enumeration, and CLAIM's proof only triggered on the surviving review:parked label —
+        # so a label-free-but-still-parked PR dispatched with NO proof at all. Re-admission is
+        # now label-clearing + strict proof: a human clears the live machine label(s)
+        # (whichever are present), which re-enumerates the PR here, and CLAIM then re-proves
+        # the human gesture from the DURABLE receipts + label timelines (strict maintainer
+        # probe) before any budget/dispatch decision — receipts trigger that proof even when
+        # every label is already gone, so a label dismissal can never bypass it.
+        if MACHINE_PARK_PR_LABEL in labels or "status:parked" in source_labels:
             exclude_signalled(
-                "machine capacity park stands (review:parked + source status:parked)")
+                "machine capacity park stands (review:parked on the PR or status:parked "
+                "on the source issue)")
             continue
         # [round-5 P1] CROSS-LANE SUPERSESSION: an (un)parked PR that reaches this point may
         # sit in a crate a SIBLING lease already owns — the park -> sibling-launch -> UNPARK
@@ -1505,11 +1508,10 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 continue                  # per-PR single-flight; re-emit after release/expiry
             emit("needs-fix")
             continue
-        if "review:needs" in labels or MACHINE_PARK_PR_LABEL in labels:
-            # A re-admitted machine park (review:parked with the source-side park lifted — the
-            # carve-out above) re-enters exactly like an explicit review:needs signal: CLAIM
-            # strips the stale review:parked once the timeline-derived readmission window
-            # confirms the human gesture.
+        if "review:needs" in labels:
+            # (review:parked no longer re-enters here: the one-predicate exclusion above
+            # excludes ANY live machine park label — round-3 finding 2. A readmitted PR
+            # arrives label-free and CLAIM re-proves the gesture from receipts + timelines.)
             if f"review:{repo}#{number}" in live_keys:
                 # Finding D: this exit was telemetry-silent — a labeled PR could sit here
                 # every tick while PLAN printed "0 review item(s)" with zero logged exclusions.
@@ -1861,14 +1863,29 @@ def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="quest
 def _park_source_issue(script_dir, repo, number):
     """Apply the machine-owned capacity park (worker-issue `--status parked`; that helper
     enforces the sticky human-unpark veto at the write point — park_policy.py defect 2).
-    Returns True when the park LANDED and False when the veto suppressed it — the caller must
-    then skip its park comment: the human explicitly unparked (or the timeline was unreadable,
-    which must never park), and re-commenting every tick would spam the issue."""
+    Returns True when the park LANDED and False when the veto suppressed it — the caller's
+    park comment must then be HONEST about the suppressed label (round-3 finding 1; the
+    receipt still lands exactly once, so a standing veto never induces comment spam)."""
     result = _run_target_helper(script_dir, repo, "worker-issue.py", [
         "status", "--repo", repo, "--issue", str(number), "--status", "parked"])
     if "park suppressed" in (result.stdout or ""):
         print(f"park suppressed for {repo}#{number}: sticky human unpark (or unreadable "
               "timeline) — no park label was written this tick")
+        return False
+    return True
+
+
+def _issue_needs_user_landed(script_dir, repo, number):
+    """Apply the terminal question park (worker-issue `--status needs-user`; that helper
+    enforces the sticky human-unpark veto at the write point). Returns True when the label
+    pair LANDED and False when the veto suppressed it — the caller's terminal comment must
+    then say so (round-3 finding 1: the escalation is terminal in the durable receipts, but
+    NO label was applied — never claim a label that did not land)."""
+    result = _run_target_helper(script_dir, repo, "worker-issue.py", [
+        "status", "--repo", repo, "--issue", str(number), "--status", "needs-user"])
+    if "park suppressed" in (result.stdout or ""):
+        print(f"terminal needs:user suppressed for {repo}#{number}: sticky human unpark — "
+              "the escalation is recorded in the receipts without a label")
         return False
     return True
 
@@ -1929,12 +1946,20 @@ def _replace_issue_role_with_research(repo, item):
 
 
 def _pr_comments(repo, pr_number):
+    """All conversation comments of a target PR/issue (paginated). A malformed PAGE must
+    RAISE, never be silently dropped (round-3 finding 3): a discarded page could hide a
+    durable receipt (round/attempt/park-generation marker) — hiding one would un-count budget
+    rounds or un-consume an escalation-ladder window. Same fail-closed shape as
+    _issue_timeline_events."""
     pages = _gh_json([
         "api", "--paginate", "--slurp", f"repos/{repo}/issues/{pr_number}/comments?per_page=100",
     ])
     if not isinstance(pages, list):
         raise DispatchError("target PR comments are malformed")
-    return [item for page in pages if isinstance(page, list) for item in page]
+    for page in pages:
+        if not isinstance(page, list):
+            raise DispatchError("target PR comments page is malformed")
+    return [item for page in pages for item in page]
 
 
 def _issue_timeline_events(repo, number):
@@ -1960,16 +1985,19 @@ def _target_is_human_maintainer(repo, login):
     """The strict maintainer probe for the readmission window / unpark veto (park-policy
     hygiene finding; the worker-issue._is_human_maintainer pattern): TARGET collaborator
     permission in park_policy.HUMAN_MAINTAINER_PERMISSIONS, read under the target App token
-    (the ambient registry token has no collaborator visibility there). Probe failure counts as
-    NOT a maintainer — an unverifiable actor must never mint a veto or a budget window."""
-    try:
+    (the ambient registry token has no collaborator visibility there). Probe-call FAILURE
+    counts as NOT a maintainer and emits the shared distinct ::warning:: diagnostic
+    (park_policy.probe_maintainer, round-3 Opus finding); a genuine not-a-maintainer
+    permission stays quiet."""
+    def read_permission(probe_login):
         result = _run_gh_target_api(
-            repo, "GET", f"repos/{repo}/collaborators/{login}/permission")
+            repo, "GET", f"repos/{repo}/collaborators/{probe_login}/permission")
         payload = json.loads(result.stdout or "null")
-    except (DispatchError, json.JSONDecodeError):
-        return False
-    return (isinstance(payload, dict)
-            and payload.get("permission") in _park_policy.HUMAN_MAINTAINER_PERMISSIONS)
+        if not isinstance(payload, dict):
+            raise DispatchError("collaborator permission payload is malformed")
+        return payload.get("permission")
+
+    return _park_policy.probe_maintainer(repo, login, read_permission)
 
 
 def _read_model_health_window(model_health, registry_repo, now, api=None):
@@ -2322,30 +2350,50 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # maintainer ping) — the repair loop must never disarm/redraft/push (nor review
             # past) a PR whose work item a human explicitly owns. Live read, fail closed.
             source_issue = _gh_json(["api", f"repos/{repo}/issues/{issue_number}"])
-            if any(label.startswith("needs:") for label in _labels(source_issue)):
+            source_labels_live = _labels(source_issue)
+            if any(label.startswith("needs:") for label in source_labels_live):
                 print(f"defer review {repo}#{number}: source issue #{issue_number} is "
                       "human-owned (needs:*)")
                 continue
-            if MACHINE_PARK_PR_LABEL in labels:
-                # Finding A: the machine capacity park is a SOFT hold. The PLAN carve-out
-                # re-admitted this PR on label STATE (source side clean); re-derive the actual
-                # human readmission gesture from the label TIMELINES (strict maintainer probe;
-                # most-recent-event-wins against the park application) before anything mutates
-                # or dispatches — a spoofed/stale label state must never strip a standing park.
+            if "status:parked" in source_labels_live:
+                # The one-predicate rule (round-3 finding 2): EITHER live machine label parks
+                # the whole PR surface. PLAN already excludes on this; a status:parked read
+                # here means the park landed in the PLAN->CLAIM window — a fresh park, never
+                # a readmission candidate this tick.
+                print(f"defer review {repo}#{number}: machine capacity park stands "
+                      f"(status:parked on source issue #{issue_number})")
+                continue
+            # Comments are read ONCE here (before the park-proof gate — the durable
+            # park-generation receipts live in them) and reused by the round-budget
+            # processing below.
+            comments = _pr_comments(repo, number)
+            park_receipts = worker_pr.park_generation_cutoffs(comments, bot_login)
+            if MACHINE_PARK_PR_LABEL in labels or park_receipts:
+                # ONE proof gate (round-3 finding 2): the trigger is the DURABLE receipt
+                # state OR a live review:parked label — never the label alone. A triage-side
+                # label dismissal leaves the receipts standing, so CLAIM still re-proves the
+                # human gesture from the label TIMELINES (strict maintainer probe;
+                # most-recent-event-wins against the park application, receipted windows
+                # consumed) before anything mutates or dispatches — a spoofed/stale label
+                # state can re-enumerate, but it can never mint budget or strip the park.
                 if not _park_policy.capacity_park_readmitted(
                         repo, number, issue_number, _issue_timeline_events,
-                        is_human=lambda login: _target_is_human_maintainer(repo, login)):
+                        is_human=lambda login: _target_is_human_maintainer(repo, login),
+                        consumed=park_receipts):
                     print(f"defer review {repo}#{number}: machine capacity park stands "
-                          "(review:parked; no newer proven-human readmission gesture)")
+                          "(durable receipts/label; no unconsumed proven-human readmission "
+                          "gesture)")
                     continue
-                # Proven gesture: converge the stale PR-side park back into the loop (the
-                # review-fix.yml admission rejects review:parked, so the strip must precede
-                # any dispatch). set_review_state drops review:parked for review:needs.
-                _run_target_helper(script_dir, repo, "worker-pr.py", [
-                    "review-state", "set", "--repo", repo, "--pr", str(number),
-                    "--state", "needs"])
-                print(f"re-admit review {repo}#{number}: human readmission gesture proven; "
-                      "review:parked converged to review:needs")
+                if MACHINE_PARK_PR_LABEL in labels:
+                    # Proven gesture: converge the stale PR-side park back into the loop (the
+                    # review-fix.yml admission rejects review:parked, so the strip must
+                    # precede any dispatch). set_review_state drops review:parked for
+                    # review:needs.
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
+                        "review-state", "set", "--repo", repo, "--pr", str(number),
+                        "--state", "needs"])
+                    print(f"re-admit review {repo}#{number}: human readmission gesture "
+                          "proven; review:parked converged to review:needs")
             if opened_sha != head_sha:
                 compare = _gh_json(["api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"])
                 if compare.get("status") not in {"identical", "ahead"}:
@@ -2458,7 +2506,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                       "protected default branch (retargeted/unresolved) — refusing to "
                       "process against the wrong base")
                 continue
-            comments = _pr_comments(repo, number)
+            # `comments` was read once above (before the park-proof gate); the round markers
+            # and receipts below parse the same snapshot.
             rounds = worker_pr.count_rounds(comments, bot_login)
             # Human-readmission window (live defect sparq#2804/PR#3442, 2026-07-23): the budget
             # decision below used to charge ALL historical rounds, so five rounds burned during
@@ -3225,25 +3274,29 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     # human question (park_policy.py defect 1): needs:user here terminally
                     # stripped the issue's open PR from the review loop (2026-07-18 mass park).
                     #
-                    # Finding B: the durable count is WINDOWED by the human-readmission cutoff
-                    # (park_policy.readmission_cutoff over the issue's own label timeline,
-                    # strict maintainer probe) — the pre-fix unconditional full count exited
-                    # this tick forever, making the `retry` transition below unreachable and
-                    # looping the item parked/deferred eternally. A human readmission gesture
-                    # now restarts the attempt budget; each consumed-and-exhausted window is
-                    # receipted (PARK_GENERATION_MARKER bound to the cutoff — quiet re-defers,
-                    # no re-park/comment spam even when the sticky veto suppressed the label),
-                    # and PARK_ESCALATION_GENERATIONS consumed windows escalate to the
-                    # QUESTION-class terminal (needs:user naming the repeated failure) so
-                    # nothing spins through readmission windows forever.
+                    # Finding B + round-3 finding 1: the durable count is WINDOWED by the
+                    # human-readmission cutoff (park_policy.readmission_cutoff over the
+                    # issue's own label timeline, strict maintainer probe), and the bounded
+                    # escalation is the LABEL-INDEPENDENT ladder
+                    # (park_policy.park_ladder_decision): EVERY consumed budget window — the
+                    # initial no-cutoff window included — is receipted
+                    # (PARK_GENERATION_MARKER), generations are counted from receipts alone
+                    # (a veto-suppressed label re-apply never stalls the ladder), the
+                    # receipt-dedupe silences COMMENTS only, an unreadable timeline FREEZES
+                    # the ladder, and PARK_ESCALATION_GENERATIONS consumed windows escalate
+                    # to the QUESTION-class terminal whose needs:user write is veto-checked
+                    # with an HONEST comment when suppressed.
                     comments = comments if comments is not None else _pr_comments(repo, number)
                     used = worker_issue.count_attempts(comments, bot_login)
                     if used >= resolved["max_attempts"]:
                         cutoff = _park_policy.readmission_cutoff(
                             repo, number, None, _issue_timeline_events,
-                            is_human=lambda login: _target_is_human_maintainer(repo, login))
-                        windowed = (worker_issue.count_attempts_since(
-                            comments, bot_login, cutoff) if cutoff else used)
+                            is_human=lambda login: _target_is_human_maintainer(repo, login),
+                            on_unreadable=_park_policy.WINDOW_UNREADABLE)
+                        windowed = used
+                        if cutoff and cutoff != _park_policy.WINDOW_UNREADABLE:
+                            windowed = worker_issue.count_attempts_since(
+                                comments, bot_login, cutoff)
                         if windowed < resolved["max_attempts"]:
                             print(f"readmission window open for {repo}#{number}: a human "
                                   f"unlabeled a park label at {cutoff}; the attempt budget "
@@ -3251,72 +3304,100 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                   "allocation re-enabled")
                             # fall through: the allocator + the `retry` label flip run again.
                         else:
-                            receipts = worker_pr.park_generation_cutoffs(comments, bot_login)
-                            if cutoff and cutoff in receipts:
-                                # This readmission window was already consumed-and-receipted:
-                                # re-defer QUIETLY until a FRESH human gesture.
+                            action, window_key, generation = (
+                                _park_policy.park_ladder_decision(
+                                    cutoff,
+                                    worker_pr.park_generation_cutoffs(comments, bot_login),
+                                    already_labeled="status:parked" in item["labels"]))
+                            if action == "freeze":
+                                # Unreadable timeline: the ladder never advances on unproven
+                                # data — no window, no receipt, no label, no comment.
                                 defer_reasons["budget-exhausted"] += 1
                                 print(f"defer {repo}#{number}: deferred-retry budget "
-                                      f"exhausted; readmission window {cutoff} already "
-                                      "consumed (receipted)")
+                                      "exhausted and the label timeline is unreadable — "
+                                      "ladder frozen (no readmission credit, no generation "
+                                      "receipt) until the timeline reads clean")
                                 continue
-                            if cutoff and (len(receipts) + 1
-                                           >= _park_policy.PARK_ESCALATION_GENERATIONS):
-                                # Bounded escalation (finding B): readmitted and exhausted
-                                # again PARK_ESCALATION_GENERATIONS times — repeated
-                                # post-readmission failure IS a human question now.
-                                generation = len(receipts) + 1
-                                _run_target_helper(script_dir, repo, "worker-issue.py", [
-                                    "status", "--repo", repo, "--issue", str(number),
-                                    "--status", "needs-user"])
+                            if action == "dedupe":
+                                # This window is already receipted (its park or terminal was
+                                # recorded once, honestly): re-defer QUIETLY until a FRESH
+                                # human gesture. Dedupe covers comments/labels only — the
+                                # generation progression is already durable in the receipts.
+                                defer_reasons["budget-exhausted"] += 1
+                                print(f"defer {repo}#{number}: deferred-retry budget "
+                                      f"exhausted; window {window_key} already consumed "
+                                      "(receipted)")
+                                continue
+                            if action == "legacy-quiet":
+                                # Pre-receipt park: already status:parked, no gesture, no
+                                # receipts — stay quiet; the ladder starts counting with the
+                                # first receipted window.
+                                defer_reasons["budget-exhausted"] += 1
+                                print(f"defer {repo}#{number}: deferred-retry budget "
+                                      "exhausted; already status:parked (legacy "
+                                      "pre-receipt park)")
+                                continue
+                            if action == "terminal":
+                                # Bounded escalation: PARK_ESCALATION_GENERATIONS windows
+                                # consumed — repeated post-readmission failure IS a human
+                                # question now. The needs:user write is veto-checked at the
+                                # write point (worker-issue set_status), and the comment is
+                                # HONEST when the veto suppressed it (round-3 finding 1:
+                                # never claim a label that did not land).
+                                landed = _issue_needs_user_landed(script_dir, repo, number)
+                                label_note = (
+                                    " Escalated as a human question (`needs:user`)."
+                                    if landed else
+                                    " The escalation is TERMINAL, but the `needs:user` "
+                                    "label write was SUPPRESSED by a standing human "
+                                    "unlabel (sticky veto) — no label was applied; this "
+                                    "receipt alone records it.")
                                 _run_gh_target_comment(
                                     repo, number,
                                     f"> 🤖 SPARQ agent — deferred-retry budget exhausted "
                                     f"AGAIN after a human readmission ({windowed}/"
                                     f"{resolved['max_attempts']} attempts since {cutoff}; "
                                     f"generation {generation}). Repeated post-readmission "
-                                    "failure is escalated as a human question "
-                                    "(`needs:user`). "
+                                    f"failure needs a decision.{label_note} "
                                     f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: this "
                                     "item keeps failing its attempt budget after each "
                                     "readmission — a decision is needed, not another retry."
                                     f"\n\n{worker_pr.PARK_GENERATION_MARKER} "
-                                    f"gen={generation} cutoff={cutoff} -->")
+                                    f"gen={generation} cutoff={window_key} -->")
                                 defer_reasons["budget-exhausted-escalated"] += 1
                                 print(f"escalated {repo}#{number}: deferred-retry budget "
                                       f"exhausted post-readmission (generation "
-                                      f"{generation}) -> question-class needs:user")
+                                      f"{generation}) -> question-class terminal"
+                                      f"{'' if landed else ' (label suppressed)'}")
                                 continue
-                            if not cutoff and "status:parked" in item["labels"]:
-                                # Already parked, no readmission gesture: re-defer QUIETLY —
-                                # no re-park, no comment spam.
-                                defer_reasons["budget-exhausted"] += 1
-                                print(f"defer {repo}#{number}: deferred-retry budget "
-                                      "exhausted; already status:parked")
-                                continue
+                            # action == "park": consume this window — soft park (veto-gated
+                            # label, best-effort) + the MANDATORY receipt. The receipt
+                            # comment lands exactly once per window even when the sticky
+                            # veto suppressed the label — it IS the durable ladder and what
+                            # keeps every later tick quiet.
                             parked = _park_source_issue(script_dir, repo, number)
-                            marker = (f"\n\n{worker_pr.PARK_GENERATION_MARKER} "
-                                      f"gen={len(receipts) + 1} cutoff={cutoff} -->"
-                                      if cutoff else "")
-                            if parked or cutoff:
-                                # The receipt comment must land whenever a window was
-                                # consumed, even if the sticky veto suppressed the label —
-                                # it is what keeps every later tick quiet.
-                                _run_gh_target_comment(
-                                    repo, number,
-                                    f"> 🤖 SPARQ agent — deferred-retry budget exhausted "
-                                    f"({windowed}/{resolved['max_attempts']} attempts"
-                                    f"{f' since the readmission at {cutoff}' if cutoff else ''}"
-                                    "). Parked with the machine-owned `status:parked` soft "
-                                    "hold: any open worker PR keeps flowing through the "
-                                    "review/fix loop, and no new implementation attempt "
-                                    "dispatches. "
-                                    f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: the "
-                                    "attempt budget is spent — approve a retry or decide "
-                                    f"the route.{marker}")
+                            label_note = (
+                                "Parked with the machine-owned `status:parked` soft hold: "
+                                "the whole PR surface holds (no review/fix dispatch, no "
+                                "new implementation attempt) until a human readmission. "
+                                if parked else
+                                "The `status:parked` label write was SUPPRESSED by a "
+                                "standing human unlabel (sticky veto); this receipt "
+                                "records the consumed budget window without a label. ")
+                            _run_gh_target_comment(
+                                repo, number,
+                                f"> 🤖 SPARQ agent — deferred-retry budget exhausted "
+                                f"({windowed}/{resolved['max_attempts']} attempts"
+                                f"{f' since the readmission at {cutoff}' if cutoff else ''}"
+                                f"). {label_note}"
+                                f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: the "
+                                "attempt budget is spent — approve a retry or decide "
+                                f"the route.\n\n{worker_pr.PARK_GENERATION_MARKER} "
+                                f"gen={generation} cutoff={window_key} -->")
                             defer_reasons["budget-exhausted"] += 1
                             print(f"escalated {repo}#{number}: deferred-retry budget "
-                                  "exhausted")
+                                  f"exhausted (generation {generation}"
+                                  f"{'' if parked else ', label suppressed'})")
                             continue
             except DispatchError as exc:
                 defer_reasons["route-policy-failed"] += 1
@@ -4615,21 +4696,23 @@ def _self_test():
         "PR carries a human-owned hold label"), needs_log.getvalue()
     assert needs_counts == Counter({"PR carries a human-owned hold label": 1}), needs_counts
 
-    # Park-policy defect 1 semantics: the MACHINE-owned status:parked on the SOURCE issue is a
-    # SOFT hold — unlike a needs:* label it must NOT exclude the PR from review/fix
-    # enumeration (the existing PR keeps flowing while new implementation dispatch is parked).
-    parked_items = enumerate_review_items(
-        snapshot_repo, snapshot_rows, snapshot_provenance, [],
-        {144: ["area:dispatch", "role:impl", "status:parked", "status:deferred"]}, now)
-    assert [(item["pr_number"], item["state"]) for item in parked_items] == \
-        [(442, "needs-fix")], parked_items
+    # ONE park predicate (round-3 finding 2): a PR is capacity-parked iff EITHER machine
+    # label is live. status:parked on the SOURCE issue alone excludes the PR — the old
+    # AND-predicate let a half-cleared pair re-enter enumeration and (with the PR-side label
+    # gone) dispatch with NO proof at all.
+    machine_park_reason = ("machine capacity park stands (review:parked on the PR or "
+                           "status:parked on the source issue)")
+    source_park_counts = Counter()
+    source_park_log = io.StringIO()
+    with contextlib.redirect_stdout(source_park_log):
+        assert enumerate_review_items(
+            snapshot_repo, snapshot_rows, snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl", "status:parked", "status:deferred"]}, now,
+            exclusions=source_park_counts) == []
+    assert source_park_counts == Counter({machine_park_reason: 1}), source_park_counts
+    assert "machine capacity park stands" in source_park_log.getvalue()
 
-    # Finding A: the PR-side machine capacity park (review:parked). While the park PAIR stands
-    # (review:parked on the PR + status:parked on the source issue) the PR is EXCLUDED from
-    # the active loop — with telemetry, never silently. A source issue clean of status:parked
-    # (the human's readmission gesture; needs:* was already terminal above) RE-ADMITS the PR
-    # like an explicit review:needs re-entry; CLAIM then re-proves the gesture on the label
-    # timelines before stripping the label or dispatching.
+    # ... review:parked on the PR alone excludes the same way (whatever the source says) ...
     parked_pr_row = {**snapshot_rows[0], "labels": ["review:parked"]}
     machine_park_log = io.StringIO()
     machine_park_counts = Counter()
@@ -4638,22 +4721,31 @@ def _self_test():
             snapshot_repo, [parked_pr_row], snapshot_provenance, [],
             {144: ["area:dispatch", "role:impl", "status:parked", "status:deferred"]}, now,
             exclusions=machine_park_counts) == []
-    assert machine_park_counts == Counter(
-        {"machine capacity park stands (review:parked + source status:parked)": 1}), \
-        machine_park_counts
+    assert machine_park_counts == Counter({machine_park_reason: 1}), machine_park_counts
     assert "machine capacity park stands" in machine_park_log.getvalue()
+    half_cleared_counts = Counter()
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert enumerate_review_items(
+            snapshot_repo, [parked_pr_row], snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl", "status:deferred"]}, now,
+            exclusions=half_cleared_counts) == []
+    assert half_cleared_counts == Counter({machine_park_reason: 1}), half_cleared_counts
+
+    # ... and a PR with BOTH machine labels cleared re-enumerates: CLAIM then re-proves the
+    # human gesture from the durable receipts + label timelines before any dispatch.
     readmitted = enumerate_review_items(
-        snapshot_repo, [parked_pr_row], snapshot_provenance, [],
+        snapshot_repo, snapshot_rows, snapshot_provenance, [],
         {144: ["area:dispatch", "role:impl", "status:deferred"]}, now)
     assert [(item["pr_number"], item["state"]) for item in readmitted] == \
-        [(442, "needs-review")], readmitted
-    # A live per-PR review lease still single-flights the readmitted entry — WITH telemetry
+        [(442, "needs-fix")], readmitted
+    # A live per-PR review lease still single-flights a label-free re-entry — WITH telemetry
     # (finding D: this exit used to be silent for labeled PRs).
+    label_free_row = {**snapshot_rows[0], "labels": ["review:needs"]}
     lease_log = io.StringIO()
     lease_counts = Counter()
     with contextlib.redirect_stdout(lease_log):
         assert enumerate_review_items(
-            snapshot_repo, [parked_pr_row], snapshot_provenance,
+            snapshot_repo, [label_free_row], snapshot_provenance,
             [{"holder": f"review:{snapshot_repo}#442@run.1", "expires_at": now + 100}],
             {144: ["area:dispatch", "role:impl"]}, now, exclusions=lease_counts) == []
     assert lease_counts == Counter(
@@ -5668,6 +5760,53 @@ def _self_test():
             assert "--state" in helper_calls[0][1] and "needs" in helper_calls[0][1], \
                 helper_calls
             assert alloc.chains == [["sol", "luna"]], alloc.chains
+
+            # ---- round-3 finding 2: the proof gate triggers off the DURABLE RECEIPTS, not
+            # the live label. A triage-side dismissal of review:parked (label GONE, receipts
+            # standing, no proven-human gesture) still re-proves here — and DECLINES. ----
+            fake.update(pull=live_pull(draft=True, labels=[]))
+            fake["comments"] = [bot_comment(
+                f"parked {wiring_worker_pr.PARK_GENERATION_MARKER} gen=1 cutoff=none -->")]
+            fake["timeline"] = {
+                41: [park_event("labeled", "review:parked", "2026-07-23T10:00:00Z",
+                                "sparq-orchestrator[bot]"),
+                     park_event("unlabeled", "review:parked", "2026-07-23T10:30:00Z",
+                                "drive-by-triage")],
+                7: []}
+            alloc = FakeAllocator()
+            park_gate_log = io.StringIO()
+            with contextlib.redirect_stdout(park_gate_log):
+                run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [] and alloc.chains == [], (helper_calls, alloc.chains)
+            assert "machine capacity park stands (durable receipts/label" \
+                in park_gate_log.getvalue(), park_gate_log.getvalue()
+            # ... a PROVEN human gesture (newer than the park application, unconsumed) on
+            # the SOURCE issue re-admits the label-free PR — with NO strip call (nothing to
+            # strip) and the review chain offered.
+            fake["timeline"][7] = [park_event("unlabeled", "status:parked",
+                                              "2026-07-23T11:00:00Z", "jeswr")]
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
+            # ... but a gesture whose window is already CONSUMED (receipted) never
+            # re-admits: the veto-suppressed label re-apply leaves no fresh application to
+            # out-date it, so without the receipt check this stale gesture would re-admit
+            # forever.
+            fake["comments"] = [bot_comment(
+                f"parked {wiring_worker_pr.PARK_GENERATION_MARKER} gen=2 "
+                "cutoff=2026-07-23T11:00:00Z -->")]
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [] and alloc.chains == [], (helper_calls, alloc.chains)
+            # ---- the one-predicate race guard: status:parked live on the SOURCE at CLAIM
+            # defers outright (a fresh park landed in the PLAN->CLAIM window) ----
+            fake["comments"] = []
+            fake["issue_labels"] = ["area:crate-a", "status:parked"]
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [] and alloc.chains == [], (helper_calls, alloc.chains)
+            fake["issue_labels"] = ["area:crate-a"]
             fake.pop("timeline", None)
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
 
@@ -6816,8 +6955,59 @@ def _self_test():
             pass
         else:
             raise AssertionError("a malformed live issue page must fail loud")
+        # round-3 finding 3: a malformed COMMENTS page could hide a durable receipt
+        # (round/attempt/park-generation marker) — _pr_comments must RAISE, never drop it.
+        globals()["_gh_json"] = lambda args: [[{"user": {"login": "b[bot]"}}], "garbage"]
+        try:
+            _pr_comments(repo, 41)
+        except DispatchError as exc:
+            assert "comments page is malformed" in str(exc), exc
+        else:
+            raise AssertionError("a malformed PR comments page must fail loud")
     finally:
         globals()["_gh_json"] = prev_live_gh
+
+    # ---- round-3 Opus finding: a maintainer probe-CALL failure emits the distinct loud
+    # ::warning:: diagnostic (and still fails toward not-human); a genuine not-a-maintainer
+    # permission stays quiet ----
+    prev_target_api = globals()["_run_gh_target_api"]
+    try:
+        def broken_target_api(*_args, **_kwargs):
+            raise DispatchError("target token mint failed")
+
+        globals()["_run_gh_target_api"] = broken_target_api
+        probe_out = io.StringIO()
+        with contextlib.redirect_stdout(probe_out):
+            assert _target_is_human_maintainer("example/repo", "jeswr") is False
+        assert ("::warning::maintainer probe FAILED for example/repo actor=jeswr "
+                "(DispatchError) — treating as not-human") in probe_out.getvalue(), \
+            probe_out.getvalue()
+
+        def denying_target_api(*_args, **_kwargs):
+            return types.SimpleNamespace(stdout=json.dumps({"permission": "read"}))
+
+        globals()["_run_gh_target_api"] = denying_target_api
+        probe_out = io.StringIO()
+        with contextlib.redirect_stdout(probe_out):
+            assert _target_is_human_maintainer("example/repo", "drive-by") is False
+        assert probe_out.getvalue() == "", probe_out.getvalue()
+
+        def granting_target_api(*_args, **_kwargs):
+            return types.SimpleNamespace(stdout=json.dumps({"permission": "admin"}))
+
+        globals()["_run_gh_target_api"] = granting_target_api
+        assert _target_is_human_maintainer("example/repo", "jeswr") is True
+
+        def malformed_target_api(*_args, **_kwargs):
+            return types.SimpleNamespace(stdout=json.dumps(["not", "a", "dict"]))
+
+        globals()["_run_gh_target_api"] = malformed_target_api
+        probe_out = io.StringIO()
+        with contextlib.redirect_stdout(probe_out):
+            assert _target_is_human_maintainer("example/repo", "jeswr") is False
+        assert "maintainer probe FAILED" in probe_out.getvalue(), probe_out.getvalue()
+    finally:
+        globals()["_run_gh_target_api"] = prev_target_api
 
     # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
     deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]
