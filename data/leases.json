@@ -39,6 +39,16 @@
    "model": "fable",
    "issued_at": 1784818954,
    "expires_at": 1784825254
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "2d8b449ab02b499cb80a1c3b71028e3f",
+   "holder": "fix:sparq-org/sparq#3572@dispatch-30017763421.1",
+   "package": "ci",
+   "role": "fix",
+   "model": "sol",
+   "issued_at": 1784818960,
+   "expires_at": 1784825260
   }
  ]
 }
