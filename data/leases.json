@@ -99,6 +99,16 @@
    "model": "sol",
    "issued_at": 1784813904,
    "expires_at": 1784820204
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "7a1e4bc12f0f411dbadb32e301fb1cda",
+   "holder": "fix:sparq-org/sparq#3681@dispatch-30010600552.1",
+   "package": "site",
+   "role": "fix",
+   "model": "sol",
+   "issued_at": 1784813911,
+   "expires_at": 1784820211
   }
  ]
 }
