@@ -668,6 +668,7 @@ class GitHubAPI:
                 **({"Content-Type": "application/json"} if payload is not None else {}),
             },
         )
+        retryable = method.upper() in _IDEMPOTENT_METHODS
         for attempt in range(1, _TRANSIENT_RETRIES + 1):
             try:
                 with urlopen(request, timeout=30) as response:
@@ -678,14 +679,14 @@ class GitHubAPI:
                     return None
                 if retry_conflict and exc.code in {409, 422}:
                     raise GroomConflict("lease ledger compare-and-swap conflict") from exc
-                if exc.code in _TRANSIENT_HTTP and attempt < _TRANSIENT_RETRIES:
+                if retryable and exc.code in _TRANSIENT_HTTP and attempt < _TRANSIENT_RETRIES:
                     _sleep_transient(attempt, _retry_after_seconds(exc.headers))
                     continue
                 raise GroomError(
                     f"{self._purpose} GitHub API {method} failed with HTTP {exc.code}"
                 ) from exc
             except (URLError, TimeoutError, ConnectionResetError) as exc:
-                if _is_transient_network(exc) and attempt < _TRANSIENT_RETRIES:
+                if retryable and _is_transient_network(exc) and attempt < _TRANSIENT_RETRIES:
                     _sleep_transient(attempt)
                     continue
                 raise GroomError(f"{self._purpose} GitHub API request failed") from exc
@@ -881,6 +882,14 @@ def _sleep_backoff(attempt: int) -> None:
 # RemoteDisconnected / ConnectionReset / timeout family and 502/503/504 — with bounded full-jitter
 # backoff, honouring a (capped) Retry-After. It still fails closed on every 4xx (auth/permission)
 # and on the 409/422 CAS conflict, which has its own caller-owned ledger re-read loop.
+#
+# Retries apply ONLY to reads. A dropped connection or gateway 5xx on a mutation does not prove
+# GitHub skipped the attempt — replaying a POST duplicates comments and replaying a PATCH/PUT can
+# repeat or overwrite a state transition. PUT/DELETE are nominally idempotent in HTTP but not in
+# effect here (the ledger contents PUT is CAS-keyed on a sha a completed first attempt consumes),
+# so mutations get NO transparent replay: an ambiguous failure fails loud and the next scheduled
+# sweep reconciles from re-read state, exactly as before #494.
+_IDEMPOTENT_METHODS = {"GET", "HEAD"}
 _TRANSIENT_RETRIES = 3           # total attempts (2 retries) before a transient failure fails loud
 _TRANSIENT_HTTP = {502, 503, 504}
 _RETRY_AFTER_CAP = 60.0          # never let a hostile/confused Retry-After stall the whole sweep
@@ -3652,6 +3661,40 @@ def _self_test() -> int:
             exhausted_loud = True
         check("persistent transient fails loud after the bounded attempts (no infinite loop)",
               (exhausted_loud, calls["n"]), (True, _TRANSIENT_RETRIES))
+
+        # Mutations are NEVER transparently replayed: an ambiguous transient failure cannot prove
+        # the first attempt was not applied (a replayed POST duplicates a comment; a replayed
+        # PATCH/PUT repeats a state transition). Widen _IDEMPOTENT_METHODS or drop the retryable
+        # guard and the call counts here red at 2.
+        check("only GET/HEAD are transparently retried",
+              sorted(_IDEMPOTENT_METHODS), ["GET", "HEAD"])
+
+        calls["n"] = 0
+        transient_sleeps.clear()
+        globals()["urlopen"] = _flaky   # RemoteDisconnected once, then success — GETs recover here
+        post_loud = False
+        try:
+            api.request("POST", "/repos/o/r/issues/7/comments", {"body": "x"})
+        except GroomError:
+            post_loud = True
+        check("ambiguous connection drop on a POST is not replayed (fails loud, one attempt)",
+              (post_loud, calls["n"], transient_sleeps), (True, 1, []))
+
+        calls["n"] = 0
+        transient_sleeps.clear()
+
+        def _gateway_503(_request, timeout=None):   # transient-class 503 on a mutation
+            calls["n"] += 1
+            raise HTTPError("https://x", 503, "Unavailable", {"Retry-After": "2"}, None)
+
+        globals()["urlopen"] = _gateway_503
+        patch_loud = False
+        try:
+            api.request("PATCH", "/repos/o/r/issues/7", {"state": "closed"})
+        except GroomError as exc:
+            patch_loud = "503" in str(exc)
+        check("transient 503 on a PATCH is not replayed (fails loud, one attempt)",
+              (patch_loud, calls["n"], transient_sleeps), (True, 1, []))
     finally:
         globals()["urlopen"] = real_urlopen
         globals()["_sleep_transient"] = real_sleep_transient
