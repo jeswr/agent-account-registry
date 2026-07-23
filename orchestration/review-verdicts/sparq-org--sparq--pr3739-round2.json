@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 3739,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "296e5c8bcd3d9bb393a90cca9bc43f1f489a7f64",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `pred_stat` fallback only returns a predicate NDV when the opposite terminal is unbound ((0,..) requires id_pat[2].is_none(); (2,..) requires id_pat[0].is_none()), otherwise returning `est` because the column is effectively keyed. The new branch (exec.rs:7618-7621) returns the catalog NDV for any pos in {0,2} regardless of whether the other terminal is bound. It is clamped to [1.0, est] and only feeds cost estimation, so query results are unaffected, but for keyed lookups the feature yields a different (arguably worse) estimate than the documented fallback in exactly the cases the fallback deliberately treats as keyed. Unchanged since round 1.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Mirror the fallback's guards before consulting the catalog: only take the catalog NDV when the opposite terminal is unbound (subject-var + id_pat[2].is_none() for pos 0; object-var + id_pat[0].is_none() for pos 2); otherwise fall through so keyed columns still estimate `est`.",
+    "severity": "minor",
+    "title": "persistent-stats branch ignores the 'other-terminal-bound -> keyed' guard the fallback applies"
+   },
+   {
+    "body": "`predicate_ndv` computes `hist.iter().map(|b| b.distinct).sum()`, which always equals the true NDV (freq.len()) because every freq entry increments `distinct` exactly once and each is flushed into exactly one bucket. The per-bucket `upper`/`count` and the equi-depth boundaries are never read by the only consumer, so the histogram machinery is currently forward-looking storage rather than an active planning input. This is correct (the returned value is an exact NDV) but the equi-depth buckets earn no keep for v1. Unchanged since round 1.",
+    "file": "crates/sparq-engine/src/stats.rs",
+    "fix_hint": "Either wire a histogram-consuming estimate (range/point selectivity for a bound terminal) so the buckets earn their keep, or store just the per-column distinct count for v1 and add histograms when a consumer lands. If keeping the buckets, add a short comment noting the per-bucket detail is intentionally unused so far.",
+    "severity": "minor",
+    "title": "Only the summed histogram `distinct` is consumed; equi-depth bucket detail is dead for the estimator"
+   },
+   {
+    "body": "`with_stats_catalog` installs a catalog on the thread and `predicate_ndv` looks it up by dictionary id, but dictionary ids are graph-specific. Installing a catalog analyzed for graph A while querying graph B returns A's NDV for any colliding predicate id. It is planning-only so results stay correct, but it is a silent footgun with no validation. Also: the catalog is read via a thread-local, so if planning ever runs off the installing thread the catalog is silently ignored (feature no-ops) with no diagnostic. Unchanged since round 1.",
+    "file": "crates/sparq-engine/src/stats.rs",
+    "fix_hint": "Persist a cheap graph fingerprint (dict length / store epoch) in the header and validate it in load/with_stats_catalog, or document the caller's obligation to install only a catalog analyzed from the same saved store, plus the on-thread-planning requirement, in the module and SKILL doc.",
+    "severity": "minor",
+    "title": "No catalog<->graph identity binding; a mismatched catalog silently feeds foreign estimates"
+   },
+   {
+    "body": "`analyze_round_trips_deterministically_and_rejects_corruption` appends a trailing byte and asserts 'mutation must be detected'. The format has no checksum; detection here comes solely from the exact-length `if at != bytes.len()` trailing-data check. An in-place value flip (e.g. mutating a bucket `count`) that preserves length would decode successfully and go undetected, so the comment reads as a stronger integrity claim than the format provides. Fine for a planning-only catalog. Unchanged since round 1.",
+    "file": "crates/sparq-engine/src/stats.rs",
+    "fix_hint": "Reword to 'trailing/truncated data must be rejected', or add an in-place byte-flip case (and, if in-place detection is actually desired, a checksum) so the assertion matches the claim.",
+    "severity": "nit",
+    "title": "Corruption test comment overstates the format's integrity guarantee"
+   },
+   {
+    "body": "Both feature-ON tests build a temp dir from `std::env::temp_dir().join(format!(\"...{}\", std::process::id()))` with no random/unique suffix; a stale dir from a crashed prior run (reused pid) could interfere, and the dir is only removed on the success path (a panic leaks it). Separately, `analyze` accumulates a full BTreeMap of every subject and object per predicate before histogramming (O(triples) memory for an offline op) \u2014 acceptable for v1 but worth noting for large stores. Unchanged since round 1.",
+    "file": "crates/sparq-engine/src/stats.rs",
+    "fix_hint": "Use a unique temp dir (tempfile or a per-test atomic counter) and clean it even on panic; consider a streaming/bounded accumulation for `analyze` or document the memory profile.",
+    "severity": "nit",
+    "title": "Test temp dirs keyed only by process id; analyze holds full per-predicate value distribution in memory"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Opt-in `persistent-stats` feature: an explicitly-built `stats.bin` catalog (per-predicate cardinalities + equi-depth subject/object id histograms) written atomically (tmp+fsync+rename) beside a saved store, installed via a thread-local guard and consumed only by `pattern_var_ndv` as an NDV estimate clamped to [1.0, est]. It is a pure planning/selectivity input \u2014 it can reorder joins but never change query results (verified: the exec.rs branch is `#[cfg(feature=\"persistent-stats\")]`-gated, so the default native + wasm builds compile it out entirely). Confirmed the feature-ON test APIs all exist in-tree: `Graph::load_str`/`iter_ids`, `store.pred_stat`, `Id::{from,to}_le_bytes`, `crate::query`, and `QueryResult{vars,rows}`. decode() is fully bounds-checked (checked take, per-record/per-bucket count caps against remaining input, exact-length trailing check) with no panic or unbounded allocation on hostile bytes. The round-2 delta over round 1 is the addition of the `sparq-engine (persistent-stats)` CI leg (feature-matrix.d + golden legnames, alphabetically consistent), which now genuinely exercises the feature-ON module (round-trip, corruption-rejection, deterministic-encode, and a non-vacuous result-equivalence differential with a decline path). No blocker or major issue. The findings below are the same planning-only quality/doc nuances recorded in round 1; none were changed by this round and none block merge.",
+  "verdict": "approve"
+ }
+}
