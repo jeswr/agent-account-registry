@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 3739,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d16efa41b787b88532fccedce670f30eb7412d76",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The existing fallback only returns a predicate NDV when the opposite terminal is unbound (`(0, Some(s)) if id_pat[2].is_none()` / `(2, ..) if id_pat[0].is_none()`), otherwise returning `est` because the column is effectively keyed. The new branch returns the predicate's global NDV for any pos in {0,2} regardless of whether the other terminal is bound. It is bounded by `clamp(1.0, est)` and only feeds cost estimation, so results are unaffected, but enabling the feature yields a different (and for keyed lookups, arguably worse) estimate than the documented fallback in exactly the cases the fallback deliberately treats as keyed.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Mirror the fallback's guards: only take the catalog NDV when the opposite terminal is unbound (subject-var + object none for pos 0; object-var + subject none for pos 2); otherwise fall through so keyed columns still estimate `est`.",
+    "severity": "minor",
+    "title": "persistent-stats branch ignores the 'other-terminal-bound -> keyed' guard the fallback applies"
+   },
+   {
+    "body": "`predicate_ndv` computes `hist.iter().map(|b| b.distinct).sum()`, which always equals the true NDV (freq.len()), since every freq entry increments `distinct` exactly once. The per-bucket `upper`/`count` and the equi-depth boundaries are never read by the only consumer. That is a lot of encode/decode machinery for a value that could be a single stored u64, and it means the 'equi-depth histograms' are currently forward-looking storage, not an active planning input.",
+    "file": "crates/sparq-engine/src/stats.rs",
+    "fix_hint": "Either wire a histogram-consuming estimate (e.g. range/point selectivity for a bound terminal) so the buckets earn their keep, or store just the per-column distinct count for v1 and add histograms when a consumer lands. If keeping them, add a short comment noting the bucket detail is intentionally unused so far.",
+    "severity": "minor",
+    "title": "Only the summed histogram `distinct` is consumed; equi-depth bucket detail is dead for the estimator"
+   },
+   {
+    "body": "`with_stats_catalog` installs a catalog globally on the thread and `predicate_ndv` looks up by dictionary id, but dictionary ids are graph-specific. Installing a catalog analyzed for graph A while querying graph B will return A's NDV for any colliding predicate id. It is planning-only so results stay correct, but it is a silent footgun with no validation. (Related: the catalog is read via a thread-local, so if planning ever runs off the calling thread the catalog is silently ignored -> feature no-ops.)",
+    "file": "crates/sparq-engine/src/stats.rs",
+    "fix_hint": "Persist a cheap graph fingerprint (e.g. dict length / a store epoch) in the header and validate it in `predicate_ndv`/`with_stats_catalog`, or document the caller's obligation to only install a catalog analyzed from the same saved store, and note the on-thread-planning requirement.",
+    "severity": "minor",
+    "title": "No catalog<->graph identity binding; a mismatched catalog silently feeds foreign estimates"
+   },
+   {
+    "body": "`analyze_round_trips_deterministically_and_rejects_corruption` appends a trailing byte and asserts 'mutation must be detected'. The format has no checksum; detection here comes solely from the exact-length `if at != bytes.len()` trailing-data check. An in-place value flip (e.g. mutating a `count`) that preserves length would decode successfully and go undetected. This is fine for a planning-only catalog, but the comment reads as a stronger integrity claim than the format provides.",
+    "file": "crates/sparq-engine/src/stats.rs",
+    "fix_hint": "Reword to 'trailing/truncated data must be rejected', or add an in-place byte-flip case and (if detection is desired) a checksum/length-per-record scheme so the assertion matches the claim.",
+    "severity": "nit",
+    "title": "Corruption test comment overstates the format's integrity guarantee"
+   },
+   {
+    "body": "Both tests build a temp dir from `std::env::temp_dir().join(format!(\"...{}\", std::process::id()))` with no random/unique suffix; a stale dir from a crashed prior run (same pid reused) could interfere, and concurrent binaries relying on pid uniqueness is fragile. Separately, `analyze` accumulates a full BTreeMap of every subject and object per predicate before histogramming \u2014 O(triples) memory for an explicit/offline op; acceptable for v1 but worth noting for large stores.",
+    "file": "crates/sparq-engine/src/stats.rs",
+    "fix_hint": "Use a unique temp dir (tempfile crate or a per-test counter) and remove it even on panic; consider a streaming/bounded accumulation for `analyze` or note the memory profile in the doc.",
+    "severity": "nit",
+    "title": "Test temp dirs keyed only by process id; analyze holds full per-predicate value distribution in memory"
+   }
+  ],
+  "progress": null,
+  "summary": "Adds opt-in `persistent-stats` feature: an explicitly-built `stats.bin` catalog (per-predicate cardinalities + equi-depth subject/object histograms) beside a saved store, installed via a thread-local guard and consumed by `pattern_var_ndv`. The consumer is a pure planning/selectivity estimator (returns an f64 clamped to [1.0, est]), so the catalog can only change join order, never query results. Verified against the real APIs: `Graph::iter_ids`, `store.pred_stat`, and `Id::{from,to}_le_bytes` all exist. Gating is clean and lean: empty feature with no deps; `pub mod stats`, the exec branch, and the SKILL note are all cfg-consistent, so the default native + wasm builds are unchanged. decode() is fully bounds-checked (checked take, record/bucket-count caps, exact-length trailing check) with no panic or unbounded allocation on hostile input; encode/analyze are deterministic (BTreeMap order) and publish atomically via tmp+fsync+rename. The result-equivalence test is a genuine non-vacuous differential (same vars/rows with vs without the catalog, plus a decline path). No blocker or major issue; the findings below are planning-only quality nuances and doc/test-comment precision.",
+  "verdict": "approve"
+ }
+}
