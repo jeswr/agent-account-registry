@@ -50,6 +50,17 @@ if _schema_spec is None or _schema_spec.loader is None:
 lease_schema = importlib.util.module_from_spec(_schema_spec)
 _schema_spec.loader.exec_module(lease_schema)
 
+# Shared park-label ownership + the sticky human-unpark veto (park_policy.py): groom's
+# budget-exhaustion defer writes the MACHINE-owned status:parked, its stale-PR hand-off writes
+# the human-owned needs:user, and BOTH consult the timeline veto before any label lands.
+_park_spec = importlib.util.spec_from_file_location(
+    "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py")
+)
+if _park_spec is None or _park_spec.loader is None:
+    raise RuntimeError("cannot load shared park policy")
+park_policy = importlib.util.module_from_spec(_park_spec)
+_park_spec.loader.exec_module(park_policy)
+
 
 LEDGER_PATH = "data/leases.json"
 # Mutable data plane lives on a dedicated non-code branch (issue #28): required-status-check
@@ -114,6 +125,8 @@ BAD_MERGE_STATES = {
 LABELS = {
     "status:ready": ("0e8a16", "Ready for trusted automated dispatch"),
     "status:deferred": ("d4c5f9", "Private-registry worker orchestration state"),
+    "status:parked": ("1d76db",
+                      "Machine-owned capacity park (soft hold; cleared on readmission)"),
     "needs:user": ("b60205", "Human attention required"),
 }
 
@@ -281,11 +294,17 @@ def count_attempts(comments: list[dict[str, Any]], bot_login: str) -> int:
 def label_transition(labels: set[str], mode: str) -> tuple[set[str], set[str]]:
     # status:in-progress-review is removed by BOTH modes: the orphan repair (a worker PR that
     # closed without merging) must not leave the review-loop label behind on a re-readied issue.
+    # `defer` (attempt budget exhausted) is BUDGET-driven, so it writes the MACHINE-owned
+    # status:parked soft hold (park_policy.py defect 1) — never the human-question terminal
+    # needs:user, which would strip the issue's PR surface from the review loop and absorb it
+    # until a human intervened (2026-07-18 mass-park incident). The `ready` repair also clears
+    # a leftover machine park: a re-readied issue is dispatchable again by definition.
     if mode == "ready":
         desired = {"status:ready"}
-        remove = {"status:in-progress", "status:in-progress-review", "status:deferred"}
+        remove = {"status:in-progress", "status:in-progress-review", "status:deferred",
+                  "status:parked"}
     elif mode == "defer":
-        desired = {"needs:user", "status:deferred"}
+        desired = {"status:parked", "status:deferred"}
         remove = {"status:ready", "status:in-progress", "status:in-progress-review"}
     else:
         raise GroomError("unknown issue label transition")
@@ -1374,6 +1393,16 @@ def _apply_labels(
     api: GitHubAPI, repo: str, number: int, current: set[str], mode: str
 ) -> bool:
     add, remove = label_transition(current, mode)
+    for label in sorted(set(add) & set(park_policy.PARK_LABELS)):
+        # Sticky human unpark (park_policy.py defect 2): a human who removed this park label
+        # more recently than any application VETOES the whole transition — groom must never
+        # override a human's explicit unpark, and an unreadable timeline must never park.
+        if park_policy.park_vetoed(
+                repo, number, label,
+                lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline")):
+            print(f"SKIP issue {repo}#{number}: {mode} park suppressed "
+                  "(sticky human unpark)")
+            return False
     for label in sorted(add):
         _ensure_label(api, repo, label)
     if add:
@@ -1889,9 +1918,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             # Covers BOTH defer paths (a planned exhaustion defer and the ready-path downgrade
             # above). Suppression requires the ADMITTED proven-worker set, never loose linkage.
             # This is as close to the label write as the API permits; the residual window is
-            # GitHub's own read-to-write gap, and since `needs:user` is terminal for the review
-            # loop (no automated repair), skipping — the fail-closed side, retried next sweep —
-            # wins any tie.
+            # GitHub's own read-to-write gap. The park is now the machine-owned status:parked
+            # soft hold (an admitted PR would keep flowing through review either way), but an
+            # open admitted PR means the FINAL allowed attempt SUCCEEDED — parking its issue is
+            # simply wrong, so skipping — the fail-closed side, retried next sweep — wins any
+            # tie.
             boundary_pulls = _pulls(api, action.repo)
             if action.number in _admitted_worker_prs(
                 action.repo, boundary_pulls, bot_login, ledger_root=ledger_root
@@ -1903,10 +1934,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             # Issue #174: the checkout the on-disk admission reads is IMMUTABLE for the whole
             # sweep, so a provenance record a delayed job or backfill lands DURING the sweep is
             # invisible above. Re-read this issue's worker-PR provenance from the LIVE `ledger`
-            # ref immediately before the terminal park: a raced-in valid record still suppresses
-            # it (review-loop-owned), and an unavailable or conflicting live read skips the park
-            # with an operational alert rather than terminally parking on an unusable read
-            # (`needs:user` is terminal for the review loop — a wrong park strands the issue).
+            # ref immediately before the park: a raced-in valid record still suppresses it
+            # (review-loop-owned — its final attempt succeeded), and an unavailable or
+            # conflicting live read skips the park with an operational alert rather than
+            # parking on an unusable read (a wrong park mislabels the issue for a full
+            # readmission cycle).
             live = _live_issue_admission(
                 registry_api, registry_repo, action.repo, action.number,
                 boundary_pulls, bot_login,
@@ -1920,7 +1952,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             if live == "indeterminate":
                 print(
                     f"ALERT issue {action.repo}#{action.number}: live provenance revalidation "
-                    "was unavailable or conflicting — deferring the terminal needs:user park to "
+                    "was unavailable or conflicting — deferring the status:parked park to "
                     "the next sweep"
                 )
                 continue
@@ -1985,6 +2017,17 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
         label_changed = False
         if "needs:user" not in labels:
+            # Sticky human unpark (park_policy.py defect 2): a human who removed needs:user
+            # from this PR more recently than any application vetoes the re-park (the whole
+            # action — a repeated "human review is required" comment would spam a PR the human
+            # explicitly unparked). This PR park stays needs:user: an orphan draft / wedged
+            # merge state is a genuine human hand-off, not a capacity park.
+            if park_policy.park_vetoed(
+                    action.repo, action.number, "needs:user",
+                    lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline")):
+                print(f"SKIP PR {action.repo}#{action.number}: needs:user park suppressed "
+                      "(sticky human unpark)")
+                continue
             _ensure_label(api, action.repo, "needs:user")
             api.request(
                 "POST",
@@ -2192,12 +2235,30 @@ def _self_test() -> int:
     check(
         "defer transition removes dispatch state",
         label_transition({"status:ready", "status:in-progress"}, "defer"),
-        ({"needs:user", "status:deferred"}, {"status:ready", "status:in-progress"}),
+        ({"status:parked", "status:deferred"}, {"status:ready", "status:in-progress"}),
+    )
+    # Park-policy defect 1: the budget-exhaustion defer is MACHINE-owned — it must never write
+    # the human-question terminal needs:user (which stripped the issue's PR from the review
+    # loop and terminally absorbed it; 2026-07-18 mass-park incident).
+    check(
+        "defer transition never writes needs:user",
+        "needs:user" in label_transition({"status:ready"}, "defer")[0],
+        False,
+    )
+    check(
+        "defer transition is idempotent on an already-parked issue",
+        label_transition({"status:parked", "status:deferred"}, "defer"),
+        (set(), set()),
     )
     check(
         "ready transition clears the review-loop label",
         label_transition({"status:in-progress-review"}, "ready"),
         ({"status:ready"}, {"status:in-progress-review"}),
+    )
+    check(
+        "ready repair clears a leftover machine park",
+        label_transition({"status:parked", "status:in-progress-review"}, "ready"),
+        ({"status:ready"}, {"status:parked", "status:in-progress-review"}),
     )
 
     class _StubAPI:
@@ -3946,6 +4007,35 @@ def _self_test() -> int:
                  in sweep_env["writes"]),
                 (1, True, True),
             )
+            # (B2) Sticky human unpark (park_policy.py defect 2): the SAME exhausted defer is
+            # SUPPRESSED end-to-end when the issue timeline shows a human removed status:parked
+            # more recently than the bot applied it — the machine never overrides a human's
+            # explicit unpark. A later bot re-application (most-recent-event wins) re-enables
+            # the park, proving the veto reads the timeline rather than latching forever.
+            sweep_timeline = "/repos/owner/repo/issues/8/timeline"
+            sweep_env["pages"][sweep_timeline] = [
+                {"event": "labeled", "label": {"name": "status:parked"},
+                 "created_at": "2026-07-18T10:00:00Z", "actor": {"login": "app[bot]"}},
+                {"event": "unlabeled", "label": {"name": "status:parked"},
+                 "created_at": "2026-07-18T11:00:00Z", "actor": {"login": "jeswr"}},
+            ]
+            summary_b2 = _sweep_scenario(pr_visible_from=10**6)
+            check(
+                "sticky human unpark VETOES the exhausted defer write",
+                (summary_b2[2], sweep_env["writes"]),
+                (0, []),
+            )
+            sweep_env["pages"][sweep_timeline].append(
+                {"event": "labeled", "label": {"name": "status:parked"},
+                 "created_at": "2026-07-18T12:00:00Z", "actor": {"login": "app[bot]"}})
+            summary_b3 = _sweep_scenario(pr_visible_from=10**6)
+            check(
+                "a newer application supersedes the human unpark (most-recent-event wins)",
+                (summary_b3[2],
+                 ("POST", "/repos/owner/repo/issues/8/labels") in sweep_env["writes"]),
+                (1, True),
+            )
+            del sweep_env["pages"][sweep_timeline]
             # ---- issue #174: live-ref revalidation at the terminal defer boundary ----
             # Remove the ON-DISK provenance record so the on-disk mutation-boundary admission no
             # longer suppresses (modelling a record that landed on the live `ledger` ref AFTER the

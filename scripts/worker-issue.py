@@ -5,6 +5,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,18 @@ import re
 import subprocess
 import sys
 import tempfile
+
+
+def _park_policy():
+    """The shared park-label policy module (machine/human ownership + the sticky human-unpark
+    veto). Loaded lazily so only the park transitions pay the import."""
+    spec = importlib.util.spec_from_file_location(
+        "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py"))
+    if spec is None or spec.loader is None:
+        raise WorkerIssueError("cannot load shared park policy")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
@@ -26,6 +39,7 @@ BUSY_OR_GATED = {
     "status:deferred",
     "status:in-progress",
     "status:in-progress-review",
+    "status:parked",
     "status:untriaged",
     "trust:untrusted",
 }
@@ -33,9 +47,14 @@ LABEL_COLOURS = {
     "status:in-progress": "fbca04",
     "status:in-progress-review": "c5def5",
     "status:deferred": "d4c5f9",
+    "status:parked": "1d76db",
     "status:ready": "0e8a16",
     "needs:user": "b60205",
 }
+# The park transitions and the label each one applies. `needs:user` is HUMAN-owned (genuine
+# human questions only); `status:parked` is the MACHINE-owned capacity/decline/budget soft hold
+# (see park_policy.py). Both are gated by the sticky human-unpark veto in set_status.
+PARK_STATUS_LABELS = {"needs-user": "needs:user", "parked": "status:parked"}
 
 
 class WorkerIssueError(RuntimeError):
@@ -276,20 +295,40 @@ def set_status(repo, issue, status):
     # cross-provider review loop — the issue completes only when the review-fix ARM path fires.
     # `retry`: the dispatcher re-enumerates a deferred issue (deferred-retry, locked decision 20)
     # — status:deferred is stripped and status:ready restored so the worker's reverify passes.
+    # `retry` also clears `status:parked`: the deferred-retry dispatch IS the machine park's
+    # readmission — reaching it proves capacity exists (the allocator granted a claim), so the
+    # soft hold lifts exactly then.
+    # `parked`: the MACHINE-owned capacity/decline/budget park (park_policy.py). Unlike
+    # `needs-user` it is a SOFT hold: no new implementation dispatch, but an existing worker PR
+    # keeps flowing through the review/fix loop (status:parked is not a needs:* label, so
+    # enumerate_review_items does not exclude on it), and readmission clears it automatically.
+    # `needs-user` stays reserved for genuine human questions and supersedes a machine park.
     # NOTE (issue #31): status:ready written here is dispatchability only, never maintainer
     # approval — the reverify third-party path demands separate human evidence.
     transitions = {
         "in-progress": ({"status:in-progress"}, {"status:ready", "status:deferred"}),
         "in-progress-review": ({"status:in-progress-review"},
                                {"status:ready", "status:in-progress", "status:deferred"}),
-        "retry": ({"status:ready"}, {"status:deferred"}),
+        "retry": ({"status:ready"}, {"status:deferred", "status:parked"}),
         "deferred": ({"status:deferred"},
                      {"status:ready", "status:in-progress", "status:in-progress-review"}),
         "needs-user": ({"needs:user", "status:deferred"},
-                       {"status:ready", "status:in-progress", "status:in-progress-review"}),
-        "complete": (set(), {"status:in-progress", "status:in-progress-review", "status:deferred"}),
+                       {"status:ready", "status:in-progress", "status:in-progress-review",
+                        "status:parked"}),
+        "parked": ({"status:parked", "status:deferred"},
+                   {"status:ready", "status:in-progress", "status:in-progress-review"}),
+        "complete": (set(), {"status:in-progress", "status:in-progress-review",
+                             "status:deferred", "status:parked"}),
     }
     add, remove = transitions[status]
+    park_label = PARK_STATUS_LABELS.get(status)
+    if park_label and _park_policy().park_vetoed(
+            repo, issue, park_label, lambda r, n: _paginated(r, n, "timeline")):
+        # Sticky human unpark (park_policy.py): a human removed this park label more recently
+        # than any application (or the timeline could not be read, which must never park). The
+        # veto helper already logged the loud "park suppressed:" line; mutate NOTHING.
+        print(f"target issue state UNCHANGED: {status} park suppressed for {repo}#{issue}")
+        return
     for label in sorted(add):
         _ensure_label(repo, label)
     if add:
@@ -371,8 +410,12 @@ def _self_test():
     assert count_attempts(fake, "sparq[bot]") == 2
     assert body_sha("task") == hashlib.sha256(b"task").hexdigest()
     assert set(LABEL_COLOURS) == {"status:in-progress", "status:in-progress-review",
-                                  "status:deferred", "status:ready", "needs:user"}
+                                  "status:deferred", "status:parked", "status:ready",
+                                  "needs:user"}
     assert "status:in-progress-review" in BUSY_OR_GATED
+    # The machine park gates worker admission exactly like every other busy status: reverify
+    # fails closed on a parked issue, so no NEW implementation dispatch survives a park.
+    assert "status:parked" in BUSY_OR_GATED
 
     # Maintainer-approval evidence for the reverify third-party retry (issue #31).
     maintainers = lambda login: login == "jeswr"  # noqa: E731 — trivial trusted-set stub
@@ -495,6 +538,93 @@ def _self_test():
             assert json.loads(issue_file.read_text(encoding="utf-8")) == item
         finally:
             globals().update(saved)
+
+    # (x) set_status park transitions (park-policy defects 1+2): real set_status wiring with the
+    # GitHub seams patched; the recorded label POSTs/DELETEs prove which park label lands and
+    # that the sticky human-unpark veto suppresses the whole mutation.
+    import contextlib
+    import io
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    posts, deletes, timeline = [], [], []
+
+    def fake_run_gh(args, *, input_text=None, check=True):
+        if args[1] == "-X" and args[2] == "DELETE":
+            deletes.append(args[3])
+        return _Result()
+
+    def fake_gh_json(args, *, input_doc=None):
+        if input_doc is not None and "labels" in input_doc:
+            posts.append(input_doc["labels"])
+        return {}
+
+    def fake_paginated(repo, issue, resource):
+        assert resource == "timeline"
+        return list(timeline)
+
+    park_seams = {"_run_gh": fake_run_gh, "_gh_json": fake_gh_json, "_paginated": fake_paginated}
+    saved = {name: globals()[name] for name in park_seams}
+    globals().update(park_seams)
+    try:
+        def park_event(kind, label, ts, login):
+            return {"event": kind, "label": {"name": label},
+                    "created_at": ts, "actor": {"login": login}}
+
+        # (x-i) a CAPACITY park writes status:parked (+ status:deferred) — NEVER needs:user.
+        set_status("o/r", 9, "parked")
+        assert posts == [["status:deferred", "status:parked"]], posts
+        assert all("needs:user" not in labels for labels in posts), posts
+        assert any(path.endswith("labels/status:ready") for path in deletes), deletes
+        # (x-ii) sticky human unpark: bot labeled < human unlabeled => the veto suppresses the
+        # ENTIRE park transition (no add, no remove) and says so loudly.
+        posts.clear(); deletes.clear()
+        timeline[:] = [
+            park_event("labeled", "status:parked", "2026-07-18T10:00:00Z", "sparq[bot]"),
+            park_event("unlabeled", "status:parked", "2026-07-18T11:00:00Z", "jeswr"),
+        ]
+        vetoed_out = io.StringIO()
+        with contextlib.redirect_stdout(vetoed_out):
+            set_status("o/r", 9, "parked")
+        assert posts == [] and deletes == [], (posts, deletes)
+        assert "park suppressed" in vetoed_out.getvalue(), vetoed_out.getvalue()
+        # (x-iii) human unlabeled < bot labeled (a NEWER application supersedes) => no veto, the
+        # park proceeds.
+        timeline.append(
+            park_event("labeled", "status:parked", "2026-07-18T12:00:00Z", "sparq[bot]"))
+        set_status("o/r", 9, "parked")
+        assert posts == [["status:deferred", "status:parked"]], posts
+        # (x-iv) a timeline read failure NEVER parks (fail open only toward NOT parking) and is
+        # logged loudly.
+        posts.clear(); deletes.clear()
+
+        def broken_paginated(repo, issue, resource):
+            raise WorkerIssueError("timeline unavailable")
+
+        globals()["_paginated"] = broken_paginated
+        broken_out = io.StringIO()
+        with contextlib.redirect_stdout(broken_out):
+            set_status("o/r", 9, "needs-user")
+        assert posts == [] and deletes == [], (posts, deletes)
+        assert "timeline read failed" in broken_out.getvalue(), broken_out.getvalue()
+        globals()["_paginated"] = fake_paginated
+        # (x-v) the human-question park still lands when no veto exists, and it SUPERSEDES a
+        # machine park (status:parked is removed alongside the busy statuses).
+        timeline.clear()
+        set_status("o/r", 9, "needs-user")
+        assert posts == [["needs:user", "status:deferred"]], posts
+        assert any(path.endswith("labels/status:parked") for path in deletes), deletes
+        # (x-vi) readmission: the deferred-retry `retry` flip clears the machine park.
+        posts.clear(); deletes.clear()
+        set_status("o/r", 9, "retry")
+        assert posts == [["status:ready"]], posts
+        assert any(path.endswith("labels/status:parked") for path in deletes), deletes
+        assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
+    finally:
+        globals().update(saved)
     print("worker-issue self-test PASSED")
 
 
@@ -523,7 +653,7 @@ def main():
 
     status = subparsers.add_parser("status", parents=[common])
     status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
-                                             "deferred", "needs-user", "complete"),
+                                             "deferred", "needs-user", "parked", "complete"),
                         required=True)
 
     receipt = subparsers.add_parser("claim-receipt", parents=[common])

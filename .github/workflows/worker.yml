@@ -1222,7 +1222,10 @@ jobs:
           set -euo pipefail
           status=deferred
           if [[ "$ACQUIRED" == true && "$EXHAUSTED" == true ]]; then
-            status=needs-user
+            # Attempt-budget exhaustion is BUDGET-driven, not a human question: the
+            # machine-owned status:parked soft hold (scripts/park_policy.py defect 1), never
+            # needs:user — worker-issue.py enforces the sticky human-unpark veto on the write.
+            status=parked
           elif [[ "$ACQUIRED" == true && -n "$PR_URL" ]]; then
             # Completion is DEFERRED to the review-fix ARM path (the issue closes only when its
             # PR is approved cross-provider and armed); the review loop owns it from here.
@@ -1231,7 +1234,8 @@ jobs:
                   && "$ATTEMPT_NUMBER" =~ ^[1-9][0-9]*$ \
                   && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ \
                   && "$ATTEMPT_NUMBER" -ge "$MAX_ATTEMPTS" ]]; then
-            status=needs-user
+            # Final allowed attempt ran without publishing a PR: the same budget-driven park.
+            status=parked
           fi
           # FAIL LOUD on a failed write (issue #127): the old in-job step swallowed this as a
           # ::warning:: and left the issue stranded status:in-progress. A red job here is the

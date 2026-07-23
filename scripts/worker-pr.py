@@ -1671,9 +1671,19 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
-               maintainer=None):
-    """Terminal, human-owned stop: review:needs-user label, an explanatory comment, the source
-    issue routed to needs-user, and an ops-alert-style registry ping. The PR stays DRAFT."""
+               maintainer=None, park_class="question"):
+    """Terminal loop stop: review:needs-user label on the PR, an explanatory comment, the source
+    issue parked, and an ops-alert-style registry ping. The PR stays DRAFT.
+
+    `park_class` picks the SOURCE-ISSUE park label (park_policy.py ownership split):
+    - "question" (default) — the stop poses a genuine human question (injection flag, corrupt
+      markers, unresolvable routing, a failed draft-undo): the issue takes human-owned
+      `needs:user`.
+    - "capacity" — the stop is capacity/decline/budget-driven (round budget exhausted, repeated
+      honest declines, consecutive missed fix dispatches): the issue takes the MACHINE-owned
+      `status:parked` soft hold instead, so a capacity blip never masquerades as a human
+      question or terminally absorbs the issue (2026-07-18 mass-park incident).
+    Either way worker-issue's set_status enforces the sticky human-unpark veto before writing."""
     set_review_state(repo, pr_number, "needs-user")
     handle = maintainer or os.environ.get("MAINTAINER_HANDLE", "jeswr")
     _comment(repo, pr_number,
@@ -1681,7 +1691,8 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
              f"@{handle} this pull request needs a human decision. It remains a DRAFT and will "
              "not be auto-armed.")
     if issue:
-        _load_worker_issue().set_status(repo, issue, "needs-user")
+        _load_worker_issue().set_status(
+            repo, issue, "parked" if park_class == "capacity" else "needs-user")
     # Reuse the rolling ops-alert posture (usage-alert.py): one deduped registry issue.
     _ops_alert(alert_repo, alert_token,
                f"⚠️ Review loop needs a human — {repo}#{pr_number}",
@@ -2623,15 +2634,19 @@ def review_outcome(args):
     elif decision == "needs-user":
         approved = document["verdict"] == "approve" and not has_blockers
         if document["injection_detected"]:
-            reason = "the reviewer flagged possible prompt injection"
+            # A flagged injection is a genuine human (security) question -> needs:user.
+            reason, park_class = "the reviewer flagged possible prompt injection", "question"
         else:
+            # Round-budget exhaustion is budget-driven, not a human question: the source issue
+            # takes the machine-owned status:parked soft hold (park_policy.py defect 1).
             reason = (f"the review round budget is exhausted at {args.round} round(s) (base "
                       f"{args.max_rounds}, hard cap {HARD_CAP_ROUNDS}) with no extension left — "
                       "the top fix tier has run and the latest verdict does not grade the PR "
                       "improving")
+            park_class = "capacity"
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
-                   alert_repo=alert_repo, alert_token=alert_token)
+                   alert_repo=alert_repo, alert_token=alert_token, park_class=park_class)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
         # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
@@ -2704,9 +2719,13 @@ def fix_outcome(args):
                   "two consecutive fix attempts made no change (fixer judges the findings spurious)"
                   if not made_changes else
                   "the local gate failed twice for the same review round")
+        # Injection is a genuine human (security) question; repeated no-change declines and the
+        # bounded gate-fail churn are decline/budget-driven -> the machine-owned soft hold
+        # (park_policy.py defect 1: capacity parks must not masquerade as human questions).
+        park_class = "question" if injection else "capacity"
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
-                   alert_repo=alert_repo, alert_token=alert_token)
+                   alert_repo=alert_repo, alert_token=alert_token, park_class=park_class)
     else:
         print("fix outcome: staying in review:changes (retried next sweep tick)")
 
@@ -3469,7 +3488,8 @@ def _self_test():
         wiring_globals["set_review_state"] = (
             lambda repo, pr, state: wiring_calls.append(("state", state)))
         wiring_globals["needs_user"] = (
-            lambda repo, pr, reason, **kwargs: wiring_calls.append(("needs-user", reason)))
+            lambda repo, pr, reason, **kwargs: wiring_calls.append(
+                ("needs-user", reason, kwargs.get("park_class", "question"))))
         wiring_globals["post_findings"] = (
             lambda repo, pr, vf, rn: wiring_calls.append(("findings", rn)))
         wiring_globals["record_model_pin"] = (
@@ -3510,8 +3530,57 @@ def _self_test():
                   [entry[0] for entry in terminal], ["findings", "needs-user"])
             check("terminal reason names the exhausted budget",
                   "round budget is exhausted" in terminal[1][1], True)
+            # Park-policy defect 1: budget exhaustion is budget-driven, so the source issue
+            # takes the MACHINE-owned park, never the human-question label.
+            check("budget exhaustion parks as capacity (status:parked), not a human question",
+                  terminal[1][2], "capacity")
+            # An injection flag IS a genuine human (security) question -> needs:user.
+            wiring_calls.clear()
+            fake_state["comments"] = fable_fix
+            verdict_file.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": True,
+                "summary": "s", "issues": [], "progress": "stagnant"}), encoding="utf-8")
+            review_outcome(argparse.Namespace(
+                repo="o/r", pr=41, verdict_file=str(verdict_file),
+                files_file=str(files_file), round=3, max_rounds=3, security=False,
+                surface_path=[], issue=None, impl_provider="anthropic", bot_login=bot,
+                run_key="9.1", reviewed_sha="b" * 40))
+            injection_calls = [entry for entry in wiring_calls if entry[0] == "needs-user"]
+            check("injection flag escalates as a human question (needs:user)",
+                  [(entry[1], entry[2]) for entry in injection_calls],
+                  [("the reviewer flagged possible prompt injection", "question")])
     finally:
         wiring_globals.update(real_io)
+
+    # ---- needs_user park-class routing (park-policy defect 1): the SOURCE issue takes the
+    # machine-owned status:parked for capacity-class stops and human-owned needs:user for
+    # genuine questions; the PR-side review:needs-user loop terminal is identical in both. ----
+    park_route_calls = []
+    real_park_route = {name: wiring_globals[name] for name in (
+        "set_review_state", "_comment", "_load_worker_issue", "_ops_alert")}
+
+    class _ParkRouteIssueModule:
+        @staticmethod
+        def set_status(repo, issue, status):
+            park_route_calls.append(("issue-status", issue, status))
+
+    try:
+        wiring_globals["set_review_state"] = (
+            lambda repo, pr, state: park_route_calls.append(("pr-state", state)))
+        wiring_globals["_comment"] = lambda repo, pr, body: None
+        wiring_globals["_load_worker_issue"] = lambda: _ParkRouteIssueModule
+        wiring_globals["_ops_alert"] = lambda *a: None
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity")
+        check("capacity stop parks the source issue status:parked (never needs:user)",
+              park_route_calls,
+              [("pr-state", "needs-user"), ("issue-status", 7, "parked")])
+        park_route_calls.clear()
+        needs_user("o/r", 41, "human question", issue=7)
+        check("question stop (default) keeps the human-owned needs:user route",
+              park_route_calls,
+              [("pr-state", "needs-user"), ("issue-status", 7, "needs-user")])
+    finally:
+        wiring_globals.update(real_park_route)
 
     # ---- registry record writes pin the `ledger` data-plane branch (issue #96): master's
     # required `gate` status check permanently rejects every direct contents-API PUT from
@@ -5234,6 +5303,9 @@ def main():
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
+    # Source-issue park ownership (park_policy.py): "question" -> human-owned needs:user,
+    # "capacity" -> machine-owned status:parked (capacity/decline/budget-driven stops).
+    nuser.add_argument("--park-class", choices=("question", "capacity"), default="question")
 
     dis = subparsers.add_parser("disarm", parents=[common])
     dis.add_argument("--when", choices=("mismatch", "always"), required=True)
@@ -5372,7 +5444,8 @@ def main():
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
-                       alert_repo=alert_repo, alert_token=alert_token)
+                       alert_repo=alert_repo, alert_token=alert_token,
+                       park_class=args.park_class)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
                    preserve_review_state=args.preserve_review_state)

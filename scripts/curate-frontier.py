@@ -7,6 +7,7 @@ that mutates target issues.  No issue labels are ever removed.
 """
 import argparse
 from dataclasses import dataclass
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,22 @@ import subprocess
 import sys
 import tomllib
 from typing import Any
+
+
+def _load_park_policy() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load shared park policy")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Shared park-label policy: every park-label application (the steering-question and
+# conditional-evidence fences write needs:user) consults the sticky human-unpark veto first
+# (park_policy.py defect 2).
+_park_policy = _load_park_policy()
 
 
 TARGET_READY = 12
@@ -617,6 +634,17 @@ def _live_issue(repo: str, number: int, token: str) -> dict[str, Any]:
     return issue
 
 
+def _issue_timeline(repo: str, number: int, token: str) -> list[dict[str, Any]]:
+    """The FULL label timeline for the sticky human-unpark veto. Paginated: the newest events
+    (the ones the veto decision hinges on) are on the LAST page, so a truncated read must raise
+    (park_vetoed then fails toward NOT parking) rather than return a prefix."""
+    pages = _gh_json([
+        "api", "--paginate", "--slurp",
+        f"repos/{repo}/issues/{number}/timeline?per_page=100",
+    ], token)
+    return _flatten_pages(pages, "timeline event")
+
+
 def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) -> int:
     """Apply snapshot-revalidated mutations; return the number of actual duplicate closes."""
     closed = 0
@@ -651,6 +679,18 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
                 "--reason", "not planned", "--comment", comment,
             ]
         else:
+            # Sticky human unpark (park_policy.py defect 2): a fence that applies a park label
+            # (needs:user — steering questions and the conditional-evidence fallback) is
+            # SUPPRESSED when a human removed that label more recently than any application;
+            # an unreadable timeline never parks.
+            if any(
+                _park_policy.park_vetoed(
+                    repo, mutation.number, label,
+                    lambda r, n: _issue_timeline(r, n, token))
+                for label in mutation.labels if label in _park_policy.PARK_LABELS
+            ):
+                print(f"skip {repo}#{mutation.number}: park suppressed (sticky human unpark)")
+                continue
             command = ["issue", "edit", str(mutation.number), "--repo", repo]
             for label in mutation.labels:
                 command.extend(["--add-label", label])
@@ -911,6 +951,49 @@ def _self_test() -> int:
     checks.append((
         "already-fenced fixture produces zero label calls",
         not planned and not label_calls,
+    ))
+
+    # Sticky human unpark (park_policy.py defect 2): the steering-question needs:user fence is
+    # SUPPRESSED end-to-end when the issue timeline shows a human removed needs:user more
+    # recently than any application; with no such removal the identical fence lands. The stub
+    # serves the live-issue re-read, the paginated timeline, and captures label edits.
+    steering = issue(61, "Should we implement epsilon parser?", ("area:delta",))
+    veto_state = {"timeline": [
+        {"event": "labeled", "label": {"name": "needs:user"},
+         "created_at": "2026-07-18T10:00:00Z", "actor": {"login": "app[bot]"}},
+        {"event": "unlabeled", "label": {"name": "needs:user"},
+         "created_at": "2026-07-18T11:00:00Z", "actor": {"login": "jeswr"}},
+    ]}
+
+    def veto_subprocess(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if command[1:3] == ["issue", "edit"]:
+            label_calls.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if "--paginate" in command:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps([veto_state["timeline"]]), stderr="")
+        return subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(steering), stderr="")
+
+    planned, _ = plan_repository([steering], all_labels, automation)
+    steering_planned = [m for m in planned if m.kind == "steering-question"]
+    label_calls.clear()
+    try:
+        subprocess.run = veto_subprocess
+        execute_plan("o/r", steering_planned, "self-test-token", True)
+        vetoed_calls = list(label_calls)
+        veto_state["timeline"] = []
+        execute_plan("o/r", steering_planned, "self-test-token", True)
+        clean_calls = list(label_calls)
+    finally:
+        subprocess.run = original_run
+    checks.append((
+        "human unpark vetoes the steering needs:user fence",
+        len(steering_planned) == 1 and vetoed_calls == [],
+    ))
+    checks.append((
+        "the same fence lands once no human unpark is on the timeline",
+        len(clean_calls) == 1 and "needs:user" in clean_calls[0],
     ))
 
     # Every open-ended operative word independently forces impl/ci work into research unless the

@@ -186,12 +186,19 @@ BUSY_OR_GATED = {
     "status:deferred",
     "status:in-progress",
     "status:in-progress-review",
+    "status:parked",
     "status:untriaged",
     "trust:untrusted",
 }
 # Busy/gated set for the deferred-RETRY path: status:deferred is the retry trigger, everything
-# else still gates (locked decision 20).
-DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
+# else still gates (locked decision 20) — EXCEPT status:parked, the MACHINE-owned capacity park
+# (park_policy.py): a parked+deferred issue stays IN the deferred-retry lane, which is its
+# readmission hook — the same lane that re-sweeps status:deferred. The park lifts exactly when
+# the allocator grants a claim (capacity exists): the `retry` label flip strips BOTH
+# status:deferred and status:parked. Until then the escalation guards below hold it parked
+# without re-commenting, and the ordinary ready lane still gates on status:parked (no NEW
+# implementation dispatch outside this readmission path).
+DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred", "status:parked"}
 # Readiness re-derivation (issue #102): PLAN computes blockers/non-dispatchability with HOSTILE
 # target code (dispatch-plan.py in the cloned target). CLAIM must independently re-prove the same
 # readiness predicate from LIVE registry-owned code before dispatch — an epic is a tracking
@@ -1270,7 +1277,7 @@ def is_enumerable_provenance(record, pr_number):
 
 
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
-                           pr_status=None):
+                           pr_status=None, exclusions=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
     unit-tested by --self-test). Fail-closed trust posture (locked decisions 1/3/11/13/19):
     - only open PRs whose head branch matches the worker pattern,
@@ -1318,8 +1325,13 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         sha = str(head.get("sha", ""))
         head_repo = (head.get("repo") or {}).get("full_name")
         login = str((pull.get("user") or {}).get("login", ""))
-        # Issue #460 exclusion telemetry: identify the explicit fix signal BEFORE any trust/
-        # shape gate, then make every rejection of such a PR visible with its exact reason.
+        # Issue #460 exclusion telemetry, GENERALIZED (park-policy defect 3): identify EVERY
+        # explicit review-loop signal (review:changes AND review:needs) BEFORE any trust/shape
+        # gate, then make every rejection of such a PR visible with its exact reason. The old
+        # review:changes-only telemetry let a PLAN print "0 review item(s)" while 13
+        # review:needs-labeled worker PRs sat excluded with ZERO logged exclusions (live
+        # 2026-07-18). The optional `exclusions` Counter aggregates reason->count so the PLAN
+        # caller can emit ONE fleet-wide summary line at completion.
         # The snapshot projection emits label-name strings while direct REST fixtures carry
         # objects, so accept exactly those two production shapes and ignore malformed entries.
         labels = sorted({
@@ -1327,33 +1339,35 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             for name in [label.get("name") if isinstance(label, dict) else label]
             if isinstance(name, str) and name
         })
-        changes_signalled = "review:changes" in labels
+        signalled = bool({"review:changes", "review:needs"} & set(labels))
 
-        def exclude_changes(reason):
-            if changes_signalled:
+        def exclude_signalled(reason):
+            if signalled:
                 identity = number if isinstance(number, int) and not isinstance(number, bool) \
                     and number > 0 else "unknown"
-                print(f"fix-enumeration: exclude {repo}#{identity}: {reason}")
+                print(f"review-enumeration: exclude {repo}#{identity}: {reason}")
+                if exclusions is not None:
+                    exclusions[reason] += 1
 
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-            exclude_changes("invalid PR number in snapshot")
+            exclude_signalled("invalid PR number in snapshot")
             continue
         if pull.get("state") != "open":
-            exclude_changes(f"snapshot state is {pull.get('state')!r}, not open")
+            exclude_signalled(f"snapshot state is {pull.get('state')!r}, not open")
             continue
         if not HEAD_REF_RE.match(ref):
-            exclude_changes("head ref is not a worker branch")
+            exclude_signalled("head ref is not a worker branch")
             continue
         if head_repo != repo:
-            exclude_changes("head repo is not the target repo")
+            exclude_signalled("head repo is not the target repo")
             continue                      # fork head — attacker-controlled, never reviewed
         if not login.endswith("[bot]") or (bot_login and login != bot_login):
-            exclude_changes("author is not the trusted App bot")
+            exclude_signalled("author is not the trusted App bot")
             continue
         record = provenance.get(number)
         record_error = provenance_admission_error(record, number)
         if record_error:
-            exclude_changes(record_error)
+            exclude_signalled(record_error)
             continue                      # missing/invalid registry provenance record — fail
                                           # closed by the ONE shared predicate (CLAIM,
                                           # review-fix.yml resolve, and groom's draft carve-out
@@ -1361,15 +1375,15 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                                           # "admitted there" cannot drift)
         impl_provider = record["impl_provider"]
         if HUMAN_HOLD_PR_LABELS & set(labels):
-            exclude_changes("PR carries a human-owned hold label")
+            exclude_signalled("PR carries a human-owned hold label")
             continue                      # terminal — human-owned, nothing autonomous re-enters
         if not SAFE_SHA.fullmatch(sha):
-            exclude_changes("head SHA is missing or malformed")
+            exclude_signalled("head SHA is missing or malformed")
             continue
         issue_number = record["issue"]    # a positive int — guaranteed by the predicate above
         source_labels = issue_labels.get(issue_number, [])
         if any(isinstance(label, str) and label.startswith("needs:") for label in source_labels):
-            exclude_changes(f"source issue #{issue_number} carries a needs:* human hold")
+            exclude_signalled(f"source issue #{issue_number} carries a needs:* human hold")
             continue                      # the SOURCE issue is human-parked (groom/escalation) —
                                           # the whole PR surface is human-owned too
         # [round-5 P1] CROSS-LANE SUPERSESSION: an (un)parked PR that reaches this point may
@@ -1392,7 +1406,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             print(f"exclude {repo}#{number}: superseded-until-sibling-resolves — a live "
                   "sibling lease (any lane) still holds this PR's package(s); it re-enters "
                   "when that lease releases or expires")
-            exclude_changes("superseded until a live sibling package lease resolves")
+            exclude_signalled("superseded until a live sibling package lease resolves")
             continue
         draft = pull.get("draft") is True
         status = pr_status.get(number) if isinstance(pr_status, dict) else None
@@ -1444,7 +1458,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             if lease_free:
                 emit("needs-rebase")
             else:
-                exclude_changes("a live per-PR review/fix lease holds the conflict repair")
+                exclude_signalled("a live per-PR review/fix lease holds the conflict repair")
             continue
         # Explicit review labels are authoritative re-entry signals, independent of GitHub's
         # draft bit.  An orchestrator/human adjudication can relabel a formerly human-owned READY
@@ -1453,7 +1467,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         # redrafts a ready item while preserving this state before any model is launched.
         if "review:changes" in labels:
             if f"fix:{repo}#{number}" in live_keys:
-                exclude_changes("a live per-PR fix lease already owns this PR")
+                exclude_signalled("a live per-PR fix lease already owns this PR")
                 continue                  # per-PR single-flight; re-emit after release/expiry
             emit("needs-fix")
             continue
@@ -1776,11 +1790,33 @@ def _run_target_helper(script_dir, repo, script, args):
     return result
 
 
-def _pr_needs_user(script_dir, repo, pr_number, issue, reason):
-    args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason]
+def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="question"):
+    """Stop the loop for a PR: review:needs-user on the PR plus a park on the source issue.
+    `park_class` picks the SOURCE-ISSUE label (park_policy.py ownership): "question" (default)
+    -> human-owned needs:user for genuine human questions; "capacity" -> machine-owned
+    status:parked for capacity/decline/budget-driven stops, which keeps the PR flowing through
+    review/fix and readmits automatically. worker-pr/worker-issue enforce the sticky
+    human-unpark veto at the write point."""
+    args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason,
+            "--park-class", park_class]
     if isinstance(issue, int) and issue > 0:
         args += ["--issue", str(issue)]
     _run_target_helper(script_dir, repo, "worker-pr.py", args)
+
+
+def _park_source_issue(script_dir, repo, number):
+    """Apply the machine-owned capacity park (worker-issue `--status parked`; that helper
+    enforces the sticky human-unpark veto at the write point — park_policy.py defect 2).
+    Returns True when the park LANDED and False when the veto suppressed it — the caller must
+    then skip its park comment: the human explicitly unparked (or the timeline was unreadable,
+    which must never park), and re-commenting every tick would spam the issue."""
+    result = _run_target_helper(script_dir, repo, "worker-issue.py", [
+        "status", "--repo", repo, "--issue", str(number), "--status", "parked"])
+    if "park suppressed" in (result.stdout or ""):
+        print(f"park suppressed for {repo}#{number}: sticky human unpark (or unreadable "
+              "timeline) — no park label was written this tick")
+        return False
+    return True
 
 
 def _run_gh_target_comment(repo, issue_or_pr, body):
@@ -1933,9 +1969,14 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
             if action == "research":
                 _replace_issue_role_with_research(repo, item)
             else:
+                # Repeated honest declines are decline-driven, not a human question: the issue
+                # takes the MACHINE-owned status:parked soft hold (park_policy.py defect 1).
+                # The durable marker keeps its historical action name "needs-user" so
+                # pre-existing escalation receipts still reconcile. worker-issue's set_status
+                # enforces the sticky human-unpark veto at the write point.
                 _run_target_helper(script_dir, repo, "worker-issue.py", [
                     "status", "--repo", repo, "--issue", str(item["number"]),
-                    "--status", "needs-user",
+                    "--status", "parked",
                 ])
     if post_comment is None:
         post_comment = lambda body: _run_gh_target_comment(repo, item["number"], body)
@@ -1952,7 +1993,9 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
             return "rerouted"
         raise DispatchError("recorded decline reroute conflicts with the issue's current role")
     if marked_action == "needs-user":
-        if "needs:user" not in labels:
+        # Reconcile a crashed label write for THIS evidence pair. Legacy needs:user parks (or a
+        # human's own needs:user) also count as already-parked — never re-park over them.
+        if "status:parked" not in labels and "needs:user" not in labels:
             apply_action("needs-user")
         return "parked"
 
@@ -1967,9 +2010,12 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
                        "new research route may dispatch.")
     else:
         role = item.get("role") or "unknown"
-        action_text = (f"**Action:** parked this issue with `needs:user`. It was already on the "
-                       f"non-implementation route `role:{role}`, so another automated reroute "
-                       "would loop; a human must decide how to proceed.")
+        action_text = (f"**Action:** parked this issue with the machine-owned `status:parked` "
+                       f"soft hold. It was already on the non-implementation route "
+                       f"`role:{role}`, so another automated reroute would loop. The park "
+                       "clears automatically once the decline evidence ages out of the "
+                       "model-health window and capacity exists; no human action is required "
+                       "unless it persists.")
     marker = f"<!-- {DECLINE_ESCALATION_MARKER} key={key} action={action} -->"
     post_comment(
         "> 🤖 SPARQ agent — **repeated honest-decline escalation**\n\n"
@@ -2344,13 +2390,16 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "human must inspect this PR's round/model/pin markers")
                 continue
             if budget["action"] == "needs-user":
+                # Budget-driven stop -> the machine-owned status:parked on the source issue
+                # (park_policy.py defect 1): exhaustion is not a human question, and needs:user
+                # there terminally absorbed the whole PR surface (2026-07-18 mass park).
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the review round budget is exhausted at {rounds} round(s) "
                                f"(base {max_rounds}, hard cap {worker_pr.HARD_CAP_ROUNDS}) "
                                "with no extension left — the top fix tier has run, the latest "
                                "verdict does not grade the PR improving, and no pushed fix at "
                                "or above the pinned floor awaits re-review; a human must "
-                               "decide")
+                               "decide", park_class="capacity")
                 continue
             if budget["action"] == "extend-model-pin" and budget["pin"]:
                 # Converge the durable pin marker (normally recorded by the review outcome; this
@@ -2412,9 +2461,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 round_number = max(rounds, 1)
                 missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
                 if len(missed) >= MISSED_FIX_LIMIT:
+                    # Missed dispatches ARE capacity starvation (the allocator found no slot
+                    # every tick) -> the machine-owned park, never a fake human question.
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    f"{len(missed)} consecutive fix dispatches missed for round "
-                                   f"{round_number}; a human must unstick this PR")
+                                   f"{round_number}; a human must unstick this PR",
+                                   park_class="capacity")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
@@ -2426,9 +2478,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 round_number = max(rounds, 1)
                 missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
                 if len(missed) >= MISSED_FIX_LIMIT:
+                    # Same capacity-starvation classification as the repair-state branch above.
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    f"{len(missed)} consecutive fix dispatches missed for round "
-                                   f"{round_number}; a human must unstick this PR")
+                                   f"{round_number}; a human must unstick this PR",
+                                   park_class="capacity")
                     continue
                 verdict_file = record_file_path(ledger_root, registry_root,
                                                 worker_pr.verdict_path(repo, number, round_number))
@@ -2756,10 +2810,12 @@ def escalate_starved(escalate, usage, effective_cap):
 
 
 # Issue #116: how long an escalate-tier route must stay CONTINUOUSLY starved before a transient
-# capacity snapshot is promoted to a human terminal (needs:user). Rate-limit headroom is
-# pipeline-owned and refills within minutes; a bounded grace lets auto-retry recover the common
-# case while still guaranteeing a genuinely persistent starvation reaches a human. Measured against
-# the first alert of the CURRENT streak, so it is independent of how often the dispatcher ticks.
+# capacity snapshot is promoted to a loud persistent-shortage park (the machine-owned
+# status:parked — capacity starvation is never the human-question terminal needs:user;
+# park_policy.py defect 1). Rate-limit headroom is pipeline-owned and refills within minutes; a
+# bounded grace lets auto-retry recover the common case while still guaranteeing a genuinely
+# persistent starvation is alerted and parked. Measured against the first alert of the CURRENT
+# streak, so it is independent of how often the dispatcher ticks.
 ESCALATE_PERSIST_SECONDS = 30 * 60
 # Durable, privacy-safe receipt marking an escalate-tier starvation alert. Its presence + timestamp
 # ARE the persistence clock (mirroring the worker-attempt receipt idiom); it carries no PII.
@@ -2786,13 +2842,14 @@ def _latest_receipt(comments, bot, marker):
 
 def escalate_persist_decision(comments, bot_login, now, attempt_marker,
                               persist_seconds=ESCALATE_PERSIST_SECONDS):
-    """Bounded-persistence gate between a TRANSIENT escalate-tier capacity snapshot and a
-    PERMANENT human terminal (issue #116). A single usage snapshot showing zero eligible accounts
-    is pipeline-owned rate-limit exhaustion that refills on its own; converting it straight to
-    needs:user strands pipeline-owned work behind a human who can only wait for the same capacity.
-    So the FIRST starved tick just alerts ops with a durable STARVE_ALERT_MARKER receipt and keeps
-    the issue status:deferred (auto-retry); needs:user is applied ONLY once that alert streak has
-    persisted at least `persist_seconds`.
+    """Bounded-persistence gate between a TRANSIENT escalate-tier capacity snapshot and a loud
+    persistent-shortage park (issue #116). A single usage snapshot showing zero eligible accounts
+    is pipeline-owned rate-limit exhaustion that refills on its own; promoting it straight to a
+    park strands pipeline-owned work behind a wait for the same capacity. So the FIRST starved
+    tick just alerts ops with a durable STARVE_ALERT_MARKER receipt and keeps the issue
+    status:deferred (auto-retry); the machine-owned status:parked soft hold (park_policy.py —
+    capacity starvation is never the human-question terminal needs:user) is applied ONLY once
+    that alert streak has persisted at least `persist_seconds`.
 
     The streak RESETS on a real dispatch: only starvation receipts posted (by `bot_login`) STRICTLY
     AFTER the most recent worker attempt receipt (`attempt_marker`) count — the exact "after the
@@ -3021,20 +3078,31 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                   f"{decline_result}; cached {item['role']} claim cancelled")
                             continue
                     # Deferred-retry budget (locked decision 20): re-dispatch is bounded by the
-                    # SAME durable attempt markers the worker records; exhausted -> needs-user +
-                    # a maintainer-visible comment, never another silent attempt.
+                    # SAME durable attempt markers the worker records; exhausted -> the
+                    # MACHINE-owned status:parked soft hold + a maintainer-visible comment,
+                    # never another silent attempt. Budget exhaustion is budget-driven, not a
+                    # human question (park_policy.py defect 1): needs:user here terminally
+                    # stripped the issue's open PR from the review loop (2026-07-18 mass park).
                     comments = comments if comments is not None else _pr_comments(repo, number)
                     used = worker_issue.count_attempts(comments, bot_login)
                     if used >= resolved["max_attempts"]:
-                        _run_target_helper(script_dir, repo, "worker-issue.py", [
-                            "status", "--repo", repo, "--issue", str(number),
-                            "--status", "needs-user"])
-                        _run_gh_target_comment(repo, number,
-                                               f"> 🤖 SPARQ agent — deferred-retry budget "
-                                               f"exhausted ({used}/{resolved['max_attempts']} "
-                                               "attempts). "
-                                               f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')} "
-                                               "this issue needs a human.")
+                        if "status:parked" in item["labels"]:
+                            # Already parked: a readmitted item whose budget is still spent
+                            # re-defers QUIETLY — no re-park, no comment spam.
+                            defer_reasons["budget-exhausted"] += 1
+                            print(f"defer {repo}#{number}: deferred-retry budget exhausted; "
+                                  "already status:parked")
+                            continue
+                        if _park_source_issue(script_dir, repo, number):
+                            _run_gh_target_comment(
+                                repo, number,
+                                f"> 🤖 SPARQ agent — deferred-retry budget exhausted "
+                                f"({used}/{resolved['max_attempts']} attempts). Parked with "
+                                "the machine-owned `status:parked` soft hold: any open worker "
+                                "PR keeps flowing through the review/fix loop, and no new "
+                                "implementation attempt dispatches. "
+                                f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: the attempt "
+                                "budget is spent — approve a retry or decide the route.")
                         defer_reasons["budget-exhausted"] += 1
                         print(f"escalated {repo}#{number}: deferred-retry budget exhausted")
                         continue
@@ -3068,36 +3136,51 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     absolute_cap=resolved["max_concurrent"], margin=margin)
                 if escalate_starved(resolved.get("escalate"), usage, effective_cap):
                     # Issue #116: a SINGLE zero-headroom usage snapshot is TRANSIENT, pipeline-owned
-                    # rate-limit exhaustion — not a semantic routing failure. Converting it straight
-                    # to needs:user strands pipeline-owned work behind a human who can only wait for
-                    # the same capacity to refill. So keep the issue status:deferred (auto-retry),
-                    # alert ops with a durable receipt, and hand it to a human ONLY once the
-                    # starvation has PERSISTED past the bounded grace (escalate_persist_decision).
-                    # Security surfaces still never degrade to a weaker model — the route stays
-                    # deferred (undispatched) throughout; the grace only defers the human terminal.
+                    # rate-limit exhaustion — not a semantic routing failure. Promoting it straight
+                    # to a park strands pipeline-owned work behind a wait for the same capacity to
+                    # refill. So keep the issue status:deferred (auto-retry), alert ops with a
+                    # durable receipt, and park it (machine-owned status:parked — park_policy.py)
+                    # ONLY once the starvation has PERSISTED past the bounded grace
+                    # (escalate_persist_decision). Security surfaces still never degrade to a
+                    # weaker model — the route stays deferred (undispatched) throughout; the grace
+                    # only defers the persistent-shortage park.
                     try:
                         comments = _pr_comments(repo, number)
                         escalate_now, since = escalate_persist_decision(
                             comments, bot_login, now, worker_issue.ATTEMPT_MARKER)
                         if escalate_now:
-                            _run_target_helper(script_dir, repo, "worker-issue.py", [
-                                "status", "--repo", repo, "--issue", str(number),
-                                "--status", "needs-user"])
-                            _run_gh_target_comment(
-                                repo, number,
-                                "> 🤖 SPARQ agent — this task routes to the restricted "
-                                f"`{'/'.join(resolved['model_chain'])}` tier (a security/soundness "
-                                "surface, `escalate = true` in routing.toml), and NO account has "
-                                f"had usage headroom to run that tier since {since} — past the "
-                                "auto-retry grace, so this is a persistent shortage, not a blip. "
-                                "Escalating to a human instead of silently starving or degrading to "
-                                "a weaker model. "
-                                f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: free capacity "
-                                "(or decide the route), then remove `needs:user` and re-add "
-                                "`status:ready`.")
-                            defer_reasons["escalate-tier-starved"] += 1
-                            print(f"escalated {repo}#{number}: escalate-tier starved since {since} "
-                                  "(persistent past the auto-retry grace)")
+                            # Persistent capacity starvation is CAPACITY-driven, never a human
+                            # question (park_policy.py defect 1): the machine-owned
+                            # status:parked soft hold replaces the old needs:user terminal. The
+                            # issue stays in the deferred lane, so the park lifts automatically
+                            # the moment capacity recovers (the retry flip strips it) — an
+                            # already-parked, still-starved issue just re-defers quietly.
+                            if "status:parked" in item["labels"]:
+                                defer_reasons["escalate-tier-starved"] += 1
+                                print(f"defer {repo}#{number}: escalate-tier starved since "
+                                      f"{since}; already status:parked — auto-readmits when "
+                                      "capacity recovers")
+                            elif _park_source_issue(script_dir, repo, number):
+                                _run_gh_target_comment(
+                                    repo, number,
+                                    "> 🤖 SPARQ agent — this task routes to the restricted "
+                                    f"`{'/'.join(resolved['model_chain'])}` tier (a security/"
+                                    "soundness surface, `escalate = true` in routing.toml), and "
+                                    "NO account has had usage headroom to run that tier since "
+                                    f"{since} — past the auto-retry grace, so this is a "
+                                    "persistent shortage, not a blip. Parked with the "
+                                    "machine-owned `status:parked` soft hold; it clears "
+                                    "automatically when capacity recovers (the route never "
+                                    "degrades to a weaker model). "
+                                    f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')} (ops): "
+                                    "persistent escalate-tier capacity shortage.")
+                                defer_reasons["escalate-tier-starved"] += 1
+                                print(f"escalated {repo}#{number}: escalate-tier starved since "
+                                      f"{since} (persistent past the auto-retry grace)")
+                            else:
+                                defer_reasons["escalate-tier-starved"] += 1
+                                print(f"defer {repo}#{number}: escalate-tier starved since "
+                                      f"{since}; park suppressed by a sticky human unpark")
                         else:
                             # Keep it recoverable: status:deferred re-enters the deferred-retry path
                             # every tick, so the moment capacity refills the same item dispatches
@@ -3661,15 +3744,18 @@ def _self_test():
     assert trip_b["claim_calls"] == 1, trip_b
     print("  ok   decline tripwire (b): one no_change performs no escalation")
 
-    # (c) A repeated decline already on role:research parks needs:user and must never PATCH another
-    # research reroute. Removing the loop guard turns this red.
+    # (c) A repeated decline already on role:research parks and must never PATCH another
+    # research reroute. Removing the loop guard turns this red. Park-policy defect 1: the park
+    # is the MACHINE-owned status:parked capacity/decline soft hold — a capacity/decline park
+    # must NEVER write the human-question terminal needs:user.
     trip_c = run_decline_tripwire([no_change_a, no_change_b], role="research")
     assert [call[0] for call in trip_c["api_calls"]] == ["POST"], trip_c
     assert len(trip_c["helper_calls"]) == 1, trip_c
     assert trip_c["helper_calls"][0][0] == "worker-issue.py", trip_c
-    assert trip_c["helper_calls"][0][1][-2:] == ["--status", "needs-user"], trip_c
+    assert trip_c["helper_calls"][0][1][-2:] == ["--status", "parked"], trip_c
+    assert "needs-user" not in trip_c["helper_calls"][0][1], trip_c
     assert trip_c["claim_calls"] == 0, trip_c
-    print("  ok   decline tripwire (c): research decline parks needs:user without reroute loop")
+    print("  ok   decline tripwire (c): research decline parks status:parked without reroute loop")
 
     # (d) Poisoned and unreadable ledgers both fail closed: no target action, no cached claim, and
     # an Actions error annotation that explicitly says escalation did not fire.
@@ -4079,6 +4165,30 @@ def _self_test():
     epic_item = dict(item102, labels=epic_labels)
     epic_ok, epic_reason = match_with(ready_issue(epic_labels, plain_body), {}, epic_item)
     assert not epic_ok and "epic" in epic_reason, epic_reason
+    # Park-policy readmission semantics: status:parked GATES the ordinary ready lane (no NEW
+    # implementation dispatch on a parked issue) ...
+    parked_ready_labels = sorted(ready_labels + ["status:parked"])
+    parked_ready_ok, parked_ready_reason = match_with(
+        ready_issue(parked_ready_labels, plain_body), {},
+        dict(item102, labels=parked_ready_labels))
+    assert not parked_ready_ok and "busy or gated" in parked_ready_reason, parked_ready_reason
+    # ... while the DEFERRED-retry lane deliberately ADMITS a parked+deferred issue: that lane
+    # is the machine park's readmission hook (the retry flip strips status:parked exactly when
+    # the allocator proves capacity exists). Removing status:parked from the DEFERRED_GATED
+    # carve-out turns this red.
+    parked_deferred_labels = sorted(
+        ["area:crate-a", "priority:P1", "role:impl", "status:deferred", "status:parked"])
+    parked_deferred_ok, parked_deferred_reason = match_with(
+        ready_issue(parked_deferred_labels, plain_body), {},
+        dict(item102, labels=parked_deferred_labels, deferred=True))
+    assert parked_deferred_ok, parked_deferred_reason
+    # ... and every OTHER busy/gated label still gates the deferred lane (locked decision 20).
+    blocked_deferred_labels = sorted(parked_deferred_labels + ["status:blocked"])
+    blocked_deferred_ok, blocked_deferred_reason = match_with(
+        ready_issue(blocked_deferred_labels, plain_body), {},
+        dict(item102, labels=blocked_deferred_labels, deferred=True))
+    assert not blocked_deferred_ok and "busy or gated" in blocked_deferred_reason, \
+        blocked_deferred_reason
     # an OPEN `Blocked-by: #N` gates; the SAME body with a CLOSED blocker does not
     blk_body = "prep first\nBlocked-by: #42"
     blk_item = dict(item102, body_sha=hashlib.sha256(blk_body.encode()).hexdigest())
@@ -4257,18 +4367,50 @@ def _self_test():
     assert [(item["pr_number"], item["state"], item["package"])
             for item in snapshot_items] == [(442, "needs-fix", "dispatch")], snapshot_items
 
-    # Every snapshot-visible changes PR excluded before emit names its exact reason. Missing
+    # Every snapshot-visible SIGNALLED PR (review:changes OR review:needs) excluded before emit
+    # names its exact reason, and the optional exclusions Counter aggregates it. Missing
     # provenance is representative of an early trust-gate rejection; the valid twin above must
     # remain quiet. Restoring the pre-#456 `if draft:` wrapper makes the READY twin produce zero,
     # which is the mutation check run explicitly by issue #460's gate command.
     excluded_log = io.StringIO()
+    excluded_counts = Counter()
     with contextlib.redirect_stdout(excluded_log):
         assert enumerate_review_items(
             snapshot_repo, snapshot_rows, {}, [],
-            {144: ["area:dispatch", "role:impl"]}, now) == []
+            {144: ["area:dispatch", "role:impl"]}, now, exclusions=excluded_counts) == []
     assert excluded_log.getvalue().strip() == (
-        "fix-enumeration: exclude jeswr/agent-account-registry#442: "
+        "review-enumeration: exclude jeswr/agent-account-registry#442: "
         "provenance record is not a JSON object"), excluded_log.getvalue()
+    # Park-policy defect 3 (aggregate correctness): the Counter carries the same reason with
+    # the same count as the per-item line, so PLAN's one-line summary can never read zero while
+    # a labeled worker PR was excluded.
+    assert excluded_counts == Counter({"provenance record is not a JSON object": 1}), \
+        excluded_counts
+
+    # Defect 3 core regression: a review:NEEDS-labeled PR (the state the old review:changes-only
+    # telemetry silently dropped) excluded for a human hold prints its reason AND aggregates —
+    # "0 review item(s)" can never again coexist with labeled worker PRs and zero logged
+    # exclusions.
+    needs_row = {**snapshot_rows[0], "labels": ["review:needs", "needs:user"]}
+    needs_log = io.StringIO()
+    needs_counts = Counter()
+    with contextlib.redirect_stdout(needs_log):
+        assert enumerate_review_items(
+            snapshot_repo, [needs_row], snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl"]}, now, exclusions=needs_counts) == []
+    assert needs_log.getvalue().strip() == (
+        "review-enumeration: exclude jeswr/agent-account-registry#442: "
+        "PR carries a human-owned hold label"), needs_log.getvalue()
+    assert needs_counts == Counter({"PR carries a human-owned hold label": 1}), needs_counts
+
+    # Park-policy defect 1 semantics: the MACHINE-owned status:parked on the SOURCE issue is a
+    # SOFT hold — unlike a needs:* label it must NOT exclude the PR from review/fix
+    # enumeration (the existing PR keeps flowing while new implementation dispatch is parked).
+    parked_items = enumerate_review_items(
+        snapshot_repo, snapshot_rows, snapshot_provenance, [],
+        {144: ["area:dispatch", "role:impl", "status:parked", "status:deferred"]}, now)
+    assert [(item["pr_number"], item["state"]) for item in parked_items] == \
+        [(442, "needs-fix")], parked_items
 
     pulls = [
         pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"]),
