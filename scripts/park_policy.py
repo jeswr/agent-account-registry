@@ -90,16 +90,34 @@ class MalformedTimelineError(RuntimeError):
     park; budget/readmission => the full historical count)."""
 
 
-def valid_timestamp(value):
-    """STRICT ISO-8601 check for every timestamp consumed by a park decision (round-3 finding
-    3/4): parseable via datetime.fromisoformat after Z-normalization. The lexicographic
-    comparisons throughout this module are only sound over well-formed ISO-8601 UTC stamps —
-    a garbage string like "zzz" would otherwise sort ABOVE every real timestamp and dominate
-    max(), silently minting (or destroying) a veto/cutoff."""
+def parse_ts(value):
+    """Parse ONE decision-logic timestamp to a timezone-AWARE datetime, raising ValueError on
+    anything else — the single parser EVERY timestamp ordering comparison in the park/budget
+    decision surface (park_policy / worker-pr / worker-issue / dispatch-claim) must route
+    through (round-5 finding 2). Raw ISO-8601 STRINGS do not order correctly across
+    equally-valid spellings: "2026-07-23 10:30:00Z" (space separator) parses fine yet sorts
+    lexicographically BEFORE "2026-07-23T09:00:00Z", so a string compare would read a
+    post-cutoff receipt as pre-cutoff and silently mint budget (and a "+00:00" spelling
+    sorts before the same instant's "Z" spelling, breaking tie handling). A NAIVE stamp (no
+    UTC offset) also raises: it cannot be soundly ordered against aware stamps. Window-key
+    IDENTITY (receipt-set membership / dedupe) deliberately stays string EQUALITY — receipts
+    store the exact string a cutoff re-derives to — only ORDERING must be parsed."""
     if not isinstance(value, str) or not value:
-        return False
+        raise ValueError(f"not a timestamp: {value!r}")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"naive (offset-free) timestamp cannot be ordered: {value!r}")
+    return parsed
+
+
+def valid_timestamp(value):
+    """STRICT timestamp check for every stamp consumed by a park decision (round-3 finding
+    3/4; round-5 finding 2): True iff parse_ts accepts it — ISO-8601 WITH a UTC offset,
+    parseable to an aware datetime. A garbage string like "zzz" (or a naive, unorderable
+    stamp) would otherwise slip into an ordering decision and silently mint (or destroy) a
+    veto/cutoff."""
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parse_ts(value)
     except ValueError:
         return False
     return True
@@ -181,19 +199,24 @@ def human_unpark_veto(events, label, is_human=None):
     human" is the strict maintainer probe (`is_human(login)` — collaborator permission in
     HUMAN_MAINTAINER_PERMISSIONS), with `[bot]` logins, App-driven events
     (performed_via_github_app), missing logins, and failed/denying probes all counting as NOT
-    human: an unverifiable actor must never mint a veto. An exact timestamp tie between a
-    proven-human removal and an application fails toward NOT parking (ISO-8601 UTC timestamps
-    compare lexicographically). Malformed relevant events RAISE MalformedTimelineError (the
-    park_vetoed wrapper suppresses the park on it)."""
+    human: an unverifiable actor must never mint a veto. An exact INSTANT tie between a
+    proven-human removal and an application fails toward NOT parking (ordering is by PARSED
+    aware datetimes — parse_ts, round-5 finding 2 — never by raw strings, so a "+00:00"
+    spelling ties with the same instant's "Z" spelling instead of sorting before it).
+    Malformed relevant events RAISE MalformedTimelineError (the park_vetoed wrapper
+    suppresses the park on it)."""
     rows = _event_rows(events, label)
     probe = _human_probe(is_human)
     latest_labeled = max(
-        (created for created, kind, _login, _app in rows if kind == "labeled"), default="")
-    latest_human_unlabeled = max(
-        (created for created, kind, login, via_app in rows
-         if kind == "unlabeled" and _is_proven_human(login, via_app, probe)), default="")
-    if latest_human_unlabeled and latest_human_unlabeled >= latest_labeled:
-        return True, f"human unlabeled {label} at {latest_human_unlabeled}"
+        (parse_ts(created) for created, kind, _login, _app in rows if kind == "labeled"),
+        default=None)
+    human_unlabels = [(parse_ts(created), created)
+                      for created, kind, login, via_app in rows
+                      if kind == "unlabeled" and _is_proven_human(login, via_app, probe)]
+    if human_unlabels:
+        latest_instant, latest_stamp = max(human_unlabels)
+        if latest_labeled is None or latest_instant >= latest_labeled:
+            return True, f"human unlabeled {label} at {latest_stamp}"
     return False, ""
 
 
@@ -241,10 +264,12 @@ def latest_human_unlabel(repo, number, label, fetch_events, is_human=None, log=p
             f"{label})")
         return None
     probe = _human_probe(is_human)
-    latest = max((created for created, kind, login, via_app in rows
-                  if kind == "unlabeled" and _is_proven_human(login, via_app, probe)),
-                 default="")
-    return latest or None
+    candidates = [(parse_ts(created), created)
+                  for created, kind, login, via_app in rows
+                  if kind == "unlabeled" and _is_proven_human(login, via_app, probe)]
+    # Ordering is by parsed instant (round-5 finding 2); the RETURNED value stays the exact
+    # source string so receipt window keys keep their string identity.
+    return max(candidates)[1] if candidates else None
 
 
 def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=None, log=print,
@@ -252,9 +277,10 @@ def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=Non
     """The budget readmission cutoff for a worker PR (or a bare source issue): the LATEST
     proven-human `unlabeled` event for ANY of `labels` (default READMISSION_LABELS —
     needs:user / status:parked / review:parked) across the PR itself and its provenance-linked
-    source issue (either surface is an explicit human re-admission; latest event wins; ISO-8601
-    UTC timestamps compare lexicographically). `issue_number` may be falsy (no linked issue) —
-    only the PR timeline is consulted.
+    source issue (either surface is an explicit human re-admission; latest event wins;
+    ordering is by PARSED instants — parse_ts, round-5 finding 2 — while the returned cutoff
+    keeps its exact source string for receipt-key identity). `issue_number` may be falsy (no
+    linked issue) — only the PR timeline is consulted.
 
     FAIL CLOSED ON ANY PARTIAL VIEW: if EITHER timeline read fails (or returns a malformed
     shape), the whole cutoff is None — the full historical count — with a loud log line. A
@@ -276,14 +302,15 @@ def readmission_cutoff(repo, pr_number, issue_number, fetch_events, is_human=Non
             events = fetch_events(repo, number)
             for label in labels:
                 stamps.extend(
-                    created for created, kind, login, via_app in _event_rows(events, label)
+                    (parse_ts(created), created)
+                    for created, kind, login, via_app in _event_rows(events, label)
                     if kind == "unlabeled" and _is_proven_human(login, via_app, probe))
         except Exception as exc:  # noqa: BLE001 — a budget question must never crash the sweep
             log(f"readmission window unknown: timeline read failed for {repo}#{number} "
                 f"({exc}); NO readmission credit on a partial view — the budget keeps the "
                 f"FULL historical count")
             return on_unreadable
-    return max(stamps, default=None)
+    return max(stamps)[1] if stamps else None
 
 
 def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_human=None,
@@ -291,10 +318,17 @@ def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_hum
     """True when a capacity park (durably receipted, whatever labels currently remain) has
     been superseded by an UNCONSUMED human readmission gesture: the readmission cutoff (latest
     proven-human unlabel of any READMISSION_LABELS across both surfaces) is strictly MORE
-    RECENT than the latest application of `review:parked` on the PR, AND that cutoff's window
-    has not already been consumed-and-receipted. Most-recent-event-wins, with ambiguity (no
-    cutoff, a failed/malformed read, or a timestamp tie) failing toward STAYING PARKED —
-    re-admission dispatches real work, so it runs only on proven, newest evidence.
+    RECENT than the LATEST park-label application on EITHER surface — the max over `labeled`
+    events for ANY of READMISSION_LABELS across the PR and its provenance-linked source issue
+    (round-5 finding 1: the old PR-only `review:parked` compare accepted a stale gesture after
+    the sequence PR park lands -> maintainer unlabels the PR park -> a LATER source-side
+    `status:parked` lands -> triage removes the source label; the completed park was NEWER on
+    the source surface, so the gesture proved nothing about it — the recency proof must span
+    the SAME surfaces and labels the cutoff itself spans) — AND that cutoff's window has not
+    already been consumed-and-receipted. Most-recent-event-wins, with ambiguity (no cutoff, a
+    failed/malformed read on either surface, or an instant tie) failing toward STAYING PARKED —
+    re-admission dispatches real work, so it runs only on proven, newest evidence. Ordering is
+    by parsed instants (parse_ts, round-5 finding 2), never raw strings.
 
     `consumed` is the durable receipt set (worker-pr park_generation_cutoffs — bot-authored
     only): a gesture whose exact cutoff is already receipted was consumed by a previous
@@ -311,15 +345,20 @@ def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_hum
             "was already consumed by a receipted budget window — a FRESH gesture is "
             "required")
         return False
-    try:
-        rows = _event_rows(fetch_events(repo, pr_number), MACHINE_PARK_PR_LABEL)
-    except Exception as exc:  # noqa: BLE001 — ambiguity stays parked
-        log(f"readmission unknown: timeline read failed for {repo}#{pr_number} ({exc}); "
-            "the capacity park stands")
-        return False
-    latest_park = max(
-        (created for created, kind, _login, _app in rows if kind == "labeled"), default="")
-    return cutoff > latest_park
+    park_instants = []
+    for number in [pr_number] + ([issue_number] if issue_number else []):
+        try:
+            events = fetch_events(repo, number)
+            for label in READMISSION_LABELS:
+                park_instants.extend(
+                    parse_ts(created)
+                    for created, kind, _login, _app in _event_rows(events, label)
+                    if kind == "labeled")
+        except Exception as exc:  # noqa: BLE001 — ambiguity stays parked
+            log(f"readmission unknown: timeline read failed for {repo}#{number} ({exc}); "
+                "the capacity park stands")
+            return False
+    return not park_instants or parse_ts(cutoff) > max(park_instants)
 
 
 def park_ladder_decision(cutoff, receipts, already_labeled=False):
@@ -648,13 +687,44 @@ def _self_test():
     check("no label application ever + consumed gesture => stays parked",
           capacity_park_readmitted("o/r", 43, 7, fetch, is_human=trusted,
                                    consumed={"2026-07-23T09:00:00Z"}), False)
+    # ---- Round-5 finding 1: the gesture must out-date the LATEST park application on
+    # EITHER surface, over ALL park labels. The exact live failure sequence: receipt -> PR
+    # park lands -> maintainer unlabels the PR park -> a LATER source-side status:parked
+    # lands -> triage (a bot) removes the source label. The old PR-only review:parked compare
+    # accepted the stale gesture; the completed park is NEWER on the source surface => NO
+    # readmission.
+    timelines[41] = [event("labeled", "review:parked", "2026-07-22T10:00:00Z", "b[bot]"),
+                     event("unlabeled", "review:parked", "2026-07-22T12:00:00Z", "jeswr")]
+    timelines[7] = [event("labeled", "status:parked", "2026-07-22T14:00:00Z", "b[bot]"),
+                    event("unlabeled", "status:parked", "2026-07-22T15:00:00Z",
+                          "sparq-orchestrator[bot]")]
+    check("round-5 f1: a source park NEWER than the gesture blocks readmission "
+          "(PR park -> human unlabel -> later source park -> bot source unlabel)",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted), False)
+    # The same shape with the gesture NEWER than every application (either surface) re-admits.
+    timelines[41] = [event("labeled", "review:parked", "2026-07-22T10:00:00Z", "b[bot]"),
+                     event("unlabeled", "review:parked", "2026-07-23T09:00:00Z", "jeswr")]
+    check("round-5 f1: a gesture newer than BOTH surfaces' park applications re-admits",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted), True)
+    # An instant tie between the gesture and the source-side application stays parked.
+    timelines[41] = [event("labeled", "review:parked", "2026-07-22T10:00:00Z", "b[bot]"),
+                     event("unlabeled", "review:parked", "2026-07-22T14:00:00Z", "jeswr")]
+    check("round-5 f1: a gesture tying the source park application stays parked",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted), False)
+    # A needs:user application on the source AFTER the gesture blocks too (the recency proof
+    # spans the same READMISSION_LABELS window the cutoff spans).
+    timelines[41] = [event("labeled", "review:parked", "2026-07-22T10:00:00Z", "b[bot]"),
+                     event("unlabeled", "review:parked", "2026-07-22T12:00:00Z", "jeswr")]
+    timelines[7] = [event("labeled", "needs:user", "2026-07-22T14:00:00Z", "b[bot]")]
+    check("round-5 f1: a source needs:user applied after the gesture blocks readmission",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted), False)
 
     # ---- STRICT ISO-8601 timestamps (round-3 finding 3/4): a "not-a-timestamp" relevant
     # event RAISES — it can never be a cutoff, never mint a veto, never loosen the park ----
     check("valid_timestamp accepts real ISO-8601 UTC", valid_timestamp("2026-07-23T09:18:19Z"),
           True)
     for garbage_ts in ("zzz-later-than-everything", "not-a-timestamp", "2026-13-99T99:99:99Z",
-                      "", None, 7):
+                      "", None, 7, "2026-07-23T09:18:19"):  # naive (offset-free) is unorderable
         check(f"valid_timestamp rejects {garbage_ts!r}", valid_timestamp(garbage_ts), False)
     garbage_unlabel = event("unlabeled", "needs:user", "not-a-timestamp", "jeswr")
     try:
@@ -678,6 +748,48 @@ def _self_test():
               "MalformedTimelineError")
     except MalformedTimelineError:
         check("garbage labeled timestamp raises (never out-dates a human)", "raised", "raised")
+
+    # ---- Round-5 finding 2: ordering is by PARSED INSTANT (parse_ts), never by raw string.
+    # "2026-07-23 10:30:00Z" (space separator) VALIDATES yet sorts lexicographically before
+    # "2026-07-23T09:00:00Z"; "+00:00" sorts before the same instant's "Z" spelling. ----
+    check("parse_ts: Z and +00:00 spellings are the same instant",
+          parse_ts("2026-07-23T09:00:00Z") == parse_ts("2026-07-23T09:00:00+00:00"), True)
+    check("parse_ts: a space-separator stamp orders by instant, not by string",
+          parse_ts("2026-07-23 10:30:00Z") > parse_ts("2026-07-23T09:00:00Z"), True)
+    for bad_ts in ("2026-07-23T09:18:19", "zzz", "", None, 7):
+        try:
+            parse_ts(bad_ts)
+            check(f"parse_ts rejects {bad_ts!r}", "no error", "ValueError")
+        except ValueError:
+            check(f"parse_ts rejects {bad_ts!r}", "raised", "raised")
+    # A space-separator human unlabel LATER by instant must veto even though it sorts
+    # lexicographically BEFORE the labeled stamp (the old string compare read it as older).
+    check("round-5 f2: space-separator later unlabel still vetoes",
+          human_unpark_veto(
+              [event("labeled", "needs:user", "2026-07-23T09:00:00Z", "b[bot]"),
+               event("unlabeled", "needs:user", "2026-07-23 10:30:00Z", "jeswr")],
+              "needs:user", trusted)[0], True)
+    # A +00:00-spelled unlabel tying a Z-spelled application is an instant TIE => veto stands
+    # (the old string compare read "+00:00" < "Z" and dropped the tie protection).
+    check("round-5 f2: +00:00 vs Z same-instant tie still vetoes",
+          human_unpark_veto(
+              [event("labeled", "needs:user", "2026-07-23T09:00:00Z", "b[bot]"),
+               event("unlabeled", "needs:user", "2026-07-23T09:00:00+00:00", "jeswr")],
+              "needs:user", trusted)[0], True)
+    # The cutoff picks the latest INSTANT across spellings and returns the exact source string.
+    timelines[41] = [event("unlabeled", "needs:user", "2026-07-23T09:00:00Z", "jeswr")]
+    timelines[7] = [event("unlabeled", "status:parked", "2026-07-23 10:30:00Z", "jeswr")]
+    check("round-5 f2: the cutoff picks the latest instant across spellings",
+          readmission_cutoff("o/r", 41, 7, fetch, is_human=trusted), "2026-07-23 10:30:00Z")
+    # A space-separator gesture AFTER the park application re-admits (string compare said no).
+    timelines[41] = [event("labeled", "review:parked", "2026-07-23T09:00:00Z", "b[bot]")]
+    timelines[7] = [event("unlabeled", "status:parked", "2026-07-23 10:30:00Z", "jeswr")]
+    check("round-5 f2: a space-separator gesture after the park re-admits",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted), True)
+    # A +00:00 gesture tying the Z-spelled park application is NOT strictly newer => parked.
+    timelines[7] = [event("unlabeled", "status:parked", "2026-07-23T09:00:00+00:00", "jeswr")]
+    check("round-5 f2: a +00:00 vs Z same-instant gesture stays parked",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted), False)
 
     # ---- readmission_cutoff on_unreadable: the ladder can DISTINGUISH windowless from
     # unreadable; default callers keep the plain None => full-count path ----

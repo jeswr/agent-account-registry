@@ -3047,20 +3047,25 @@ STARVE_ALERT_MARKER = "<!-- sparq-escalate-starved:v1 -->"
 STARVE_RESET_MARKER = "<!-- sparq-escalate-recovered:v1 -->"
 
 
-def _latest_receipt(comments, bot, marker):
-    """Newest `created_at` (ISO-8601 UTC, lexicographically comparable) among comments authored by
-    `bot` (casefolded login) that carry `marker`; "" when none. Shared clock helper for the
-    starvation-persistence + recovery-reset logic."""
-    return max(
-        (str(c.get("created_at", "")) for c in comments
-         if str(c.get("user", {}).get("login", "")).casefold() == bot
-         and marker in str(c.get("body", ""))),
-        default="",
-    )
+def _receipt_instants(comments, bot, marker):
+    """(instant, created_at-string) pairs — instants PARSED to aware datetimes via
+    park_policy.parse_ts (round-5 finding 2: receipt ordering is by parsed instant, never raw
+    string — a space-separator spelling sorts lexicographically before every 'T' spelling of
+    a LATER time) — for comments authored by `bot` (casefolded login) that carry `marker`.
+    RAISES ValueError on a matching receipt whose created_at cannot be parsed: these receipts
+    ARE the persistence clock, and both consumers FREEZE the starvation ladder on an
+    unreadable clock (never escalate to a park, never mint a recovery receipt, on unprovable
+    time). Shared helper for the starvation-persistence + recovery-reset logic."""
+    return [
+        (_park_policy.parse_ts(c.get("created_at")), str(c.get("created_at")))
+        for c in comments
+        if str(c.get("user", {}).get("login", "")).casefold() == bot
+        and marker in str(c.get("body", ""))
+    ]
 
 
 def escalate_persist_decision(comments, bot_login, now, attempt_marker,
-                              persist_seconds=ESCALATE_PERSIST_SECONDS):
+                              persist_seconds=ESCALATE_PERSIST_SECONDS, log=print):
     """Bounded-persistence gate between a TRANSIENT escalate-tier capacity snapshot and a loud
     persistent-shortage park (issue #116). A single usage snapshot showing zero eligible accounts
     is pipeline-owned rate-limit exhaustion that refills on its own; promoting it straight to a
@@ -3079,42 +3084,57 @@ def escalate_persist_decision(comments, bot_login, now, attempt_marker,
     Returns (escalate: bool, streak_started_at: str). `streak_started_at` is the oldest in-streak
     receipt ("" when this is the first observation, i.e. no receipt yet). `escalate` is True only
     when that oldest receipt is at least `persist_seconds` old — a bounded persistent failure,
-    never one snapshot. ISO-8601 UTC `created_at` values compare lexicographically."""
+    never one snapshot. Ordering is by PARSED instants (park_policy.parse_ts — round-5 finding
+    2: a raw-string compare read a space-separator alert stamp as both pre-reset AND
+    past-grace, so a 60-second-old snapshot could escalate straight to a park); a receipt
+    whose stamp cannot be parsed FREEZES the ladder — (False, "") with a loud log — because an
+    unreadable clock can prove neither persistence nor recovery."""
     bot = bot_login.casefold()
     # The continuous-starvation streak ENDS on any durable end-of-starvation signal, not solely a
     # worker attempt: a live-capacity RECOVERY receipt (STARVE_RESET_MARKER) closes it too (issue
     # #116 round 1). Recovery is a real streak end even when it produced no attempt (allocator
     # returned no slot, the launch failed, or a later pre-dispatch hold intervened), so alerts at or
     # before the NEWER of {last attempt, last reset} are stale and must not age a later snapshot.
-    reset_at = max(_latest_receipt(comments, bot, attempt_marker),
-                   _latest_receipt(comments, bot, STARVE_RESET_MARKER))
-    streak = sorted(
-        str(c.get("created_at", "")) for c in comments
-        if str(c.get("user", {}).get("login", "")).casefold() == bot
-        and STARVE_ALERT_MARKER in str(c.get("body", ""))
-        and str(c.get("created_at", "")) > reset_at
-    )
+    try:
+        resets = (_receipt_instants(comments, bot, attempt_marker)
+                  + _receipt_instants(comments, bot, STARVE_RESET_MARKER))
+        alerts = _receipt_instants(comments, bot, STARVE_ALERT_MARKER)
+    except ValueError as exc:
+        log(f"::warning::starvation-ladder clock unreadable ({exc}) — freezing: no "
+            "escalation on unprovable time")
+        return False, ""
+    reset_at = max((instant for instant, _stamp in resets), default=None)
+    streak = sorted((instant, stamp) for instant, stamp in alerts
+                    if reset_at is None or instant > reset_at)
     if not streak:
         return False, ""
-    threshold_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - persist_seconds))
-    return streak[0] <= threshold_iso, streak[0]
+    threshold = _park_policy.parse_ts(
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - persist_seconds)))
+    return streak[0][0] <= threshold, streak[0][1]
 
 
-def escalate_recovery_pending(comments, bot_login, attempt_marker):
+def escalate_recovery_pending(comments, bot_login, attempt_marker, log=print):
     """True when an escalate-tier issue carries an ACTIVE starvation alert — a STARVE_ALERT_MARKER
     posted strictly after the latest reset/attempt receipt — so an observed live-capacity recovery
     should now persist a STARVE_RESET_MARKER that closes the streak (issue #116 round 1). Returns
     False once a reset (or attempt) already supersedes every alert, which keeps recovery recording to
-    ONE receipt per streak — no per-tick comment spam while capacity stays healthy."""
+    ONE receipt per streak — no per-tick comment spam while capacity stays healthy. Ordering is
+    by PARSED instants (park_policy.parse_ts — round-5 finding 2: a space-separator alert
+    stamp sorts lexicographically before a 'T'-form reset stamp of an EARLIER instant, so the
+    raw-string compare read a fresh post-reset alert as already closed); an unparseable
+    receipt stamp FREEZES the ladder (False, loud log) — same fail direction as
+    escalate_persist_decision."""
     bot = bot_login.casefold()
-    reset_at = max(_latest_receipt(comments, bot, attempt_marker),
-                   _latest_receipt(comments, bot, STARVE_RESET_MARKER))
-    return any(
-        str(c.get("user", {}).get("login", "")).casefold() == bot
-        and STARVE_ALERT_MARKER in str(c.get("body", ""))
-        and str(c.get("created_at", "")) > reset_at
-        for c in comments
-    )
+    try:
+        resets = (_receipt_instants(comments, bot, attempt_marker)
+                  + _receipt_instants(comments, bot, STARVE_RESET_MARKER))
+        alerts = _receipt_instants(comments, bot, STARVE_ALERT_MARKER)
+    except ValueError as exc:
+        log(f"::warning::starvation-ladder clock unreadable ({exc}) — freezing: no "
+            "recovery receipt on unprovable time")
+        return False
+    reset_at = max((instant for instant, _stamp in resets), default=None)
+    return any(reset_at is None or instant > reset_at for instant, _stamp in alerts)
 
 
 def _load_usage():
@@ -7285,6 +7305,38 @@ def _self_test():
     assert escalate_recovery_pending(attempt_closed, "app[bot]", attempt) is False
     # a post-reset alert is once again an OPEN streak (recovery recurred into a new shortage).
     assert escalate_recovery_pending(recovered_noattempt, "app[bot]", attempt) is True
+    # (ix) Round-5 finding 2: receipt ordering is by PARSED instant, never raw string. A
+    # space-separator stamp sorts lexicographically before every 'T'-form stamp of the same
+    # day, so the old string compare (a) read a 60-second-old space-form alert as already past
+    # the grace threshold — escalating one snapshot straight to a park — and (b) read a fresh
+    # space-form alert posted AFTER a 'T'-form reset as pre-reset, suppressing the recovery
+    # receipt.
+    space116 = lambda ago: {  # noqa: E731 — space-separator spelling of iso116
+        "user": {"login": "app[bot]"}, "body": f"ops alert {STARVE_ALERT_MARKER}",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(now116 - ago))}
+    assert escalate_persist_decision([space116(60)], "app[bot]", now116, attempt) \
+        == (False, time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(now116 - 60)))
+    assert escalate_persist_decision([reset(300), space116(60)], "app[bot]", now116, attempt) \
+        == (False, time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(now116 - 60)))
+    assert escalate_recovery_pending([reset(300), space116(60)], "app[bot]", attempt) is True
+    # a genuinely persistent space-form streak still escalates (instants, not spellings).
+    assert escalate_persist_decision(
+        [space116(ESCALATE_PERSIST_SECONDS + 120)], "app[bot]", now116, attempt) \
+        == (True, time.strftime("%Y-%m-%d %H:%M:%SZ",
+                                time.gmtime(now116 - ESCALATE_PERSIST_SECONDS - 120)))
+    # (x) an unparseable receipt stamp FREEZES the starvation ladder loudly: no escalation, no
+    # recovery receipt, on unprovable time.
+    bad_clock = [{"user": {"login": "app[bot]"}, "body": f"x {STARVE_RESET_MARKER}",
+                  "created_at": "not-a-timestamp"},
+                 starve(ESCALATE_PERSIST_SECONDS + 120)]
+    freeze_logs = []
+    assert escalate_persist_decision(bad_clock, "app[bot]", now116, attempt,
+                                     log=freeze_logs.append) == (False, "")
+    assert any("clock unreadable" in line and "freezing" in line for line in freeze_logs)
+    freeze_logs = []
+    assert escalate_recovery_pending(bad_clock, "app[bot]", attempt,
+                                     log=freeze_logs.append) is False
+    assert any("clock unreadable" in line and "freezing" in line for line in freeze_logs)
 
     print("dispatch-claim self-test PASSED")
 

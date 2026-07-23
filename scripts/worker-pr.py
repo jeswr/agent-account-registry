@@ -18,7 +18,6 @@ Trust posture (locked decisions, review blueprint):
 
 import argparse
 import base64
-from datetime import datetime
 import hashlib
 import importlib.util
 import json
@@ -287,15 +286,25 @@ def count_rounds_since(comments, bot_login, since, log=print):
 
     Fail direction (toward the OLD conservative full count, never toward a fresh budget on
     unproven data): a falsy `since` means no readmission window — the plain count_rounds
-    applies; a marker whose comment has no created_at is CHARGED; a marker whose comment
-    carries a NON-ISO-8601 created_at is CHARGED with a loud log (round-4 finding 3: the
-    window compare is lexicographic and only sound over well-formed stamps — a garbage stamp
-    like "0000-not-a-timestamp" sorts BEFORE any real cutoff and would silently un-charge
-    the round, authorizing exhausted work; unprovable time always counts AGAINST the
-    budget, exactly like the missing-timestamp case); a timestamp tie with the cutoff is
-    CHARGED (ISO-8601 UTC compares lexicographically). Void subtraction is global, exactly
-    as in count_rounds."""
+    applies (and so does an UNPARSEABLE `since`, loudly); a marker whose comment has no
+    created_at is CHARGED; a marker whose comment carries an unparseable created_at is
+    CHARGED with a loud log (round-4 finding 3 + round-5 finding 2: the window compare is
+    over PARSED aware datetimes — park_policy.parse_ts — never raw strings, because an
+    equally-valid spelling like the space-separator "2026-07-23 10:30:00Z" VALIDATES yet
+    sorts lexicographically before "2026-07-23T09:00:00Z", so the old string compare read a
+    post-cutoff receipt as pre-cutoff and silently un-charged it, authorizing exhausted
+    work; unprovable time always counts AGAINST the budget, exactly like the
+    missing-timestamp case); an instant tie with the cutoff is CHARGED. Void subtraction is
+    global, exactly as in count_rounds."""
     if not since:
+        return count_rounds(comments, bot_login)
+    parse_ts = _park_policy().parse_ts
+    try:
+        since_instant = parse_ts(since)
+    except ValueError:
+        log(f"::warning::readmission cutoff {since!r} is not a parseable timestamp — the "
+            "round budget keeps the FULL historical count (never a fresh budget on "
+            "unproven data)")
         return count_rounds(comments, bot_login)
     voided = _round_voids(comments, bot_login)
     charged = set()
@@ -312,12 +321,15 @@ def count_rounds_since(comments, bot_login, since, log=print):
             continue  # nothing chargeable in this comment — its timestamp is irrelevant
         created = comment.get("created_at")
         if isinstance(created, str) and created:
-            if not _valid_iso_timestamp(created):
+            try:
+                created_instant = parse_ts(created)
+            except ValueError:
                 log(f"::warning::round receipt carries a malformed created_at {created!r} "
                     "— CHARGED against the round budget (unprovable time can never "
                     "authorize exhausted work)")
-            elif created < since:
-                continue
+            else:
+                if created_instant < since_instant:
+                    continue
         charged.update(rounds)
     return len(charged)
 
@@ -338,29 +350,18 @@ def park_generation_cutoffs(comments, bot_login, log=print):
     count stays LOW — escalation is delayed, never fabricated. Receipts are bot-authored, so
     a malformed one requires corrupted own output, not third-party input."""
     pattern = re.escape(PARK_GENERATION_MARKER) + r" gen=([0-9]+) cutoff=(\S+) -->"
+    valid_timestamp = _park_policy().valid_timestamp
     cutoffs = set()
     for comment in _bot_comments(comments, bot_login):
         for match in re.finditer(pattern, str(comment.get("body", ""))):
             cutoff = match.group(2)
-            if cutoff != PARK_WINDOW_NONE and not _valid_iso_timestamp(cutoff):
+            if cutoff != PARK_WINDOW_NONE and not valid_timestamp(cutoff):
                 log(f"::warning::malformed park-generation receipt cutoff {cutoff!r} "
                     "treated as absent — the escalation ladder counts only well-formed "
                     "receipts")
                 continue
             cutoffs.add(cutoff)
     return cutoffs
-
-
-def _valid_iso_timestamp(value):
-    """STRICT ISO-8601 check for receipt cutoffs (round-3 finding 4) — the same rule as
-    park_policy.valid_timestamp, kept local so the pure marker parser needs no module load."""
-    if not isinstance(value, str) or not value:
-        return False
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return True
 
 
 def marker_runs(comments, bot_login, kind, round_n):
@@ -3231,6 +3232,33 @@ def _self_test():
     check("a malformed created_at sorting AFTER the cutoff is also CHARGED",
           count_rounds_since([stamped_round(6, "zzzz-not-a-timestamp")], bot,
                              unlabel_ts, log=ts_logs.append), 1)
+    # Round-5 finding 2: the window compare is over PARSED instants, never raw strings. A
+    # space-separator stamp VALIDATES yet sorts lexicographically before every 'T'-form
+    # stamp of the same day — the old string compare read this post-cutoff round as
+    # pre-cutoff and silently un-charged it (budget minting, no warning).
+    ts_logs.clear()
+    check("round-5 f2: a space-separator stamp AFTER the cutoff IS charged",
+          count_rounds_since([stamped_round(6, "2026-07-23 10:30:00Z")], bot,
+                             "2026-07-23T09:00:00Z", log=ts_logs.append), 1)
+    check("round-5 f2: the well-formed space-separator charge stays quiet", ts_logs, [])
+    check("round-5 f2: a +00:00-offset stamp before the Z cutoff stays uncharged",
+          count_rounds_since([stamped_round(6, "2026-07-22T08:00:00+00:00")], bot,
+                             unlabel_ts), 0)
+    check("round-5 f2: a +00:00 vs Z same-instant tie with the cutoff is CHARGED",
+          count_rounds_since([stamped_round(6, "2026-07-23T09:18:19+00:00")], bot,
+                             unlabel_ts), 1)
+    ts_logs.clear()
+    check("round-5 f2: a NAIVE (offset-free) stamp is unorderable => CHARGED",
+          count_rounds_since([stamped_round(6, "2026-07-22T08:00:00")], bot,
+                             unlabel_ts, log=ts_logs.append), 1)
+    check("round-5 f2: the naive-stamp charge logs loudly",
+          any("malformed created_at" in line and "CHARGED" in line for line in ts_logs), True)
+    ts_logs.clear()
+    check("round-5 f2: an unparseable cutoff keeps the FULL count (never mints budget)",
+          count_rounds_since(post_rounds, bot, "not-a-timestamp", log=ts_logs.append), 7)
+    check("round-5 f2: the unparseable-cutoff fallback logs loudly",
+          any("not a parseable timestamp" in line and "FULL historical count" in line
+              for line in ts_logs), True)
     quiet_logs = []
     check("a NON-chargeable comment's malformed timestamp stays silent (no marker => no "
           "charge, no log)",

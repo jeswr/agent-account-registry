@@ -4,7 +4,6 @@
 """Small GitHub API helper for the live private-registry worker."""
 
 import argparse
-from datetime import datetime
 import hashlib
 import importlib.util
 import json
@@ -84,15 +83,24 @@ def count_attempts_since(comments, bot_login, since, log=print):
     only attempt receipts recorded at or after it are charged, so a human's explicit
     re-admission gesture actually re-enables allocation instead of the full historical count
     exiting the tick forever. Fail direction (toward the OLD conservative full count, never a
-    fresh budget on unproven data): a falsy `since` charges everything (plain count_attempts);
-    a receipt without a created_at is CHARGED; a receipt whose created_at is NOT strict
-    ISO-8601 is CHARGED with a loud log (round-4 finding 3: the window compare is
-    lexicographic and only sound over well-formed stamps — a garbage stamp like
-    "0000-not-a-timestamp" sorts BEFORE any real cutoff and would silently drop the receipt
-    from the charged budget, authorizing exhausted work; unprovable time always counts
-    AGAINST the budget, exactly like the missing-timestamp case); a timestamp tie with the
-    cutoff is CHARGED (ISO-8601 UTC timestamps compare lexicographically)."""
+    fresh budget on unproven data): a falsy `since` charges everything (plain count_attempts),
+    and so does an UNPARSEABLE `since`, loudly; a receipt without a created_at is CHARGED; a
+    receipt whose created_at cannot be parsed is CHARGED with a loud log (round-4 finding 3 +
+    round-5 finding 2: the window compare is over PARSED aware datetimes —
+    park_policy.parse_ts — never raw strings, because an equally-valid spelling like the
+    space-separator "2026-07-23 10:30:00Z" VALIDATES yet sorts lexicographically before
+    "2026-07-23T09:00:00Z", so the old string compare read a post-cutoff receipt as
+    pre-cutoff and silently un-charged it; unprovable time always counts AGAINST the budget,
+    exactly like the missing-timestamp case); an instant tie with the cutoff is CHARGED."""
     if not since:
+        return count_attempts(comments, bot_login)
+    parse_ts = _park_policy().parse_ts
+    try:
+        since_instant = parse_ts(since)
+    except ValueError:
+        log(f"::warning::readmission cutoff {since!r} is not a parseable timestamp — the "
+            "attempt budget keeps the FULL historical count (never a fresh budget on "
+            "unproven data)")
         return count_attempts(comments, bot_login)
     bot = bot_login.casefold()
     charged = 0
@@ -102,30 +110,20 @@ def count_attempts_since(comments, bot_login, since, log=print):
             continue
         created = comment.get("created_at")
         if isinstance(created, str) and created:
-            if not _valid_iso_timestamp(created):
+            try:
+                created_instant = parse_ts(created)
+            except ValueError:
                 log(f"::warning::attempt receipt carries a malformed created_at {created!r} "
                     "— CHARGED against the attempt budget (unprovable time can never "
                     "authorize exhausted work)")
-            elif created < since:
-                continue
+            else:
+                if created_instant < since_instant:
+                    continue
         charged += 1
     return charged
 
 
-def _valid_iso_timestamp(value):
-    """STRICT ISO-8601 check for budget-window timestamps (round-4 finding 3) — the same rule
-    as park_policy.valid_timestamp / worker-pr._valid_iso_timestamp, kept local so the pure
-    counter needs no module load."""
-    if not isinstance(value, str) or not value:
-        return False
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return True
-
-
-def find_maintainer_approval(comments, bot_login, is_human_maintainer):
+def find_maintainer_approval(comments, bot_login, is_human_maintainer, log=print):
     """Return the approving comment, or None when the retry must fail closed.
 
     Evidence of maintainer approval (issue #31) is a comment by a HUMAN maintainer whose body
@@ -138,15 +136,32 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
     collaborator probe all pass; only the App attribution field betrays that no human typed it.
     `is_human_maintainer(login)` supplies the trusted-set probe so this stays pure and
     self-testable.
+
+    Staleness ordering is over PARSED aware datetimes (park_policy.parse_ts — round-5
+    finding 2), never raw strings: a space-separator receipt stamp sorts lexicographically
+    before every 'T'-form stamp of the same day, so the old string compare could read a
+    PRE-failure approval as post-failure (blessing a run the maintainer never saw fail). Fail
+    directions, both closed: an attempt receipt whose created_at cannot be parsed makes
+    "strictly after the last failure" unprovable for EVERY candidate — no approval stands
+    (loud log); an approval whose created_at cannot be parsed can never prove it postdates
+    the failure — that comment never approves.
     """
     bot = bot_login.casefold()
-    last_failure = max(
-        (str(comment.get("created_at", ""))
-         for comment in comments
-         if str(comment.get("user", {}).get("login", "")).casefold() == bot
-         and ATTEMPT_MARKER in str(comment.get("body", ""))),
-        default="",
-    )
+    parse_ts = _park_policy().parse_ts
+    last_failure = None
+    for comment in comments:
+        if (str(comment.get("user", {}).get("login", "")).casefold() != bot
+                or ATTEMPT_MARKER not in str(comment.get("body", ""))):
+            continue
+        try:
+            stamp = parse_ts(comment.get("created_at"))
+        except ValueError:
+            log(f"::warning::attempt receipt carries an unparseable created_at "
+                f"{comment.get('created_at')!r} — approval evidence cannot be proven to "
+                "postdate the last failure; the retry fails closed")
+            return None
+        if last_failure is None or stamp > last_failure:
+            last_failure = stamp
     for comment in comments:
         user = comment.get("user", {}) or {}
         login = str(user.get("login", ""))
@@ -158,9 +173,13 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
             continue
         if not APPROVAL_RE.search(str(comment.get("body", ""))):
             continue
-        # ISO-8601 UTC timestamps compare lexicographically; an approval at-or-before the last
-        # attempt receipt is stale — it blessed a run that has since failed.
-        if str(comment.get("created_at", "")) <= last_failure:
+        # An approval at-or-before the last attempt receipt is stale — it blessed a run that
+        # has since failed. Unprovable approval time never blesses anything.
+        try:
+            approved_at = parse_ts(comment.get("created_at"))
+        except ValueError:
+            continue
+        if last_failure is not None and approved_at <= last_failure:
             continue
         if is_human_maintainer(login):
             return comment
@@ -579,6 +598,35 @@ def _self_test():
     assert count_attempts_since(stamped, "sparq[bot]", "2026-07-23T09:00:00Z",
                                 log=quiet_logs.append) == 1
     assert quiet_logs == []  # well-formed stamps never warn
+    # Round-5 finding 2: the window compare is over PARSED instants, never raw strings. A
+    # space-separator stamp VALIDATES yet sorts lexicographically before every 'T'-form stamp
+    # of the same day — the old string compare read this post-cutoff attempt as pre-cutoff
+    # and silently un-charged it (budget minting, no warning).
+    space_receipt = [{"user": {"login": "sparq[bot]"}, "created_at": "2026-07-23 10:30:00Z",
+                      "body": f"x {ATTEMPT_MARKER} run=6 -->"}]
+    quiet_logs = []
+    assert count_attempts_since(space_receipt, "sparq[bot]", "2026-07-23T09:00:00Z",
+                                log=quiet_logs.append) == 1
+    assert quiet_logs == []  # a well-formed spelling variant charges quietly
+    offset_receipt = [{"user": {"login": "sparq[bot]"},
+                       "created_at": "2026-07-20T00:00:00+00:00",
+                       "body": f"x {ATTEMPT_MARKER} run=7 -->"}]
+    assert count_attempts_since(offset_receipt, "sparq[bot]", "2026-07-23T09:00:00Z") == 0
+    tie_receipt = [{"user": {"login": "sparq[bot]"},
+                    "created_at": "2026-07-23T09:00:00+00:00",
+                    "body": f"x {ATTEMPT_MARKER} run=8 -->"}]
+    assert count_attempts_since(tie_receipt, "sparq[bot]", "2026-07-23T09:00:00Z") == 1
+    naive_receipt = [{"user": {"login": "sparq[bot]"}, "created_at": "2026-07-20T00:00:00",
+                      "body": f"x {ATTEMPT_MARKER} run=9 -->"}]
+    ts_logs = []
+    assert count_attempts_since(naive_receipt, "sparq[bot]", "2026-07-23T09:00:00Z",
+                                log=ts_logs.append) == 1  # naive = unorderable = charged
+    assert any("malformed created_at" in line and "CHARGED" in line for line in ts_logs)
+    ts_logs = []
+    assert count_attempts_since(stamped, "sparq[bot]", "not-a-timestamp",
+                                log=ts_logs.append) == 2  # unparseable cutoff => full count
+    assert any("not a parseable timestamp" in line and "FULL historical count" in line
+               for line in ts_logs)
     assert body_sha("task") == hashlib.sha256(b"task").hexdigest()
     assert set(LABEL_COLOURS) == {"status:in-progress", "status:in-progress-review",
                                   "status:deferred", "status:parked", "status:ready",
@@ -667,6 +715,36 @@ def _self_test():
     after_both = {**human_after, "created_at": "2026-07-13T00:00:00Z"}
     assert find_maintainer_approval([failure, human_after, failure2], "sparq[bot]", maintainers) is None
     assert find_maintainer_approval([failure2, human_after, failure], "sparq[bot]", maintainers) is None
+
+    # (ix) Round-5 finding 2: staleness ordering is over PARSED instants, never raw strings.
+    # A space-separator approval stamp AFTER the failure by instant sorts lexicographically
+    # BEFORE the failure's 'T'-form stamp — it must still approve.
+    space_approval = {**human_after, "created_at": "2026-07-10 12:00:00Z"}
+    assert find_maintainer_approval(
+        [failure, space_approval], "sparq[bot]", maintainers) is space_approval
+    # A space-separator RECEIPT stamp sorts before a 'T'-form approval of an EARLIER instant:
+    # the old string compare accepted that PRE-failure approval (blessing a run the
+    # maintainer never saw fail); the instant compare rejects it as stale.
+    space_failure = {**failure, "created_at": "2026-07-11 08:00:00Z"}
+    pre_failure_approval = {**human_after, "created_at": "2026-07-11T07:00:00Z"}
+    assert find_maintainer_approval(
+        [space_failure, pre_failure_approval], "sparq[bot]", maintainers) is None
+    # A +00:00 approval tying the Z-spelled receipt INSTANT is stale (strict at-or-before,
+    # across spellings).
+    offset_tie = {**human_after, "created_at": "2026-07-10T00:00:00+00:00"}
+    assert find_maintainer_approval([failure, offset_tie], "sparq[bot]", maintainers) is None
+    # An attempt receipt with an unparseable stamp makes "strictly after the last failure"
+    # unprovable for every candidate: the retry fails closed, loudly.
+    approval_logs = []
+    bad_failure = {**failure, "created_at": "not-a-timestamp"}
+    assert find_maintainer_approval([bad_failure, human_after], "sparq[bot]", maintainers,
+                                    log=approval_logs.append) is None
+    assert any("unparseable created_at" in line and "fails closed" in line
+               for line in approval_logs)
+    # An approval with an unparseable (or naive) stamp can never prove it postdates the
+    # failure — that comment never approves.
+    bad_approval = {**human_after, "created_at": "2026-07-11T00:00:00"}
+    assert find_maintainer_approval([failure, bad_approval], "sparq[bot]", maintainers) is None
     assert find_maintainer_approval(
         [failure, human_after, failure2, after_both], "sparq[bot]", maintainers) is after_both
 
