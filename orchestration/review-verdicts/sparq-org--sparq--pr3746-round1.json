@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3746,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3a46e6ba9381db151e119afaf6ef9e45011cc626",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces a detached, fixed-iteration poller with sampling tied to the lifetime of each in-flight HTTP response and bounded sequential retries. The biased select polls the response before yielding, while the yield branch gives server tasks opportunities to register the query; a removed registration remains unobservable across all attempts, so the mutation-sensitive assertion is not weakened. Requests are sequential and share the same AppState-backed registry, making the expected peak of one valid. No correctness, soundness, security, or vacuity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
