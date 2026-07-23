@@ -1,0 +1,58 @@
+{
+ "host_envelope": {
+  "pr": 3749,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "56c7e2a12ee936d4e7da7204c542d707670d0017",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The header asserts this 'runs only after the batcher closes an omnibus', but nothing enforces that. The only guards are `if: startsWith(github.event.pull_request.head.ref, 'sparq-omnibus/')` and a marker-comment check. For a fork PR, `head.ref` is the fork's branch name and is fully attacker-controlled, so naming a branch `sparq-omnibus/x` passes the gate. The marker `sparq-omnibus-failure:v1` is checked in issue comments (`comments.some(...)`), and any GitHub user can post that comment on their own PR, so it is also forgeable. `pull_request_target: [closed]` fires for fork PRs (merged or not) with the base-repo token and the declared `issues: write` + `actions: write`. Result: an external contributor can trigger repo issue creation (spam) via `issues.create`, and rerun base-repo Actions jobs via POST .../jobs/{job_id}/rerun. Unlike the repo's other pull_request_target workflow (bead-autoclose.yml), this one has no same-repo / trusted-author / merged guard. No secret exfil or code-exec (no PR checkout), but the write-scoped token is reachable by untrusted actors.",
+    "file": ".github/workflows/omnibus-flake-quarantine.yml",
+    "fix_hint": "Add a trusted-provenance guard to the job `if`: require the PR to be same-repo, e.g. `github.event.pull_request.head.repo.full_name == github.repository` (fork branches cannot forge this), and consider gating on `github.event.pull_request.merged == true` since only merged omnibuses have a real merge-group head. Optionally verify the marker comment was authored by the batcher account rather than trusting any comment body.",
+    "severity": "major",
+    "title": "pull_request_target gate is forgeable by fork PRs -> unauthorized issue creation and job reruns"
+   },
+   {
+    "body": "Each failed leg is processed sequentially, and for each the code polls up to 30 times with a 15s sleep (`for (let attempt = 0; attempt < 30; attempt++) { setTimeout(..., 15000) }`) = up to 7.5 minutes of waiting per leg before giving up. `timeout-minutes: 20` means 3+ slow legs (or 2 legs whose reruns are slow) can blow the timeout. Because the check-run rename (`PATCH .../check-runs`) happens inside the per-leg loop but the tracking-issue creation and the PR comment happen only AFTER the loop, a mid-loop timeout can rename some checks to `advisory` while filing no issue and posting no comment \u2014 a silently degraded outcome where quarantined legs have no audit trail.",
+    "file": ".github/workflows/omnibus-flake-quarantine.yml",
+    "fix_hint": "Probe legs concurrently (Promise.all over the failed legs) rather than serially, and/or bound total wait against the job timeout. Persist/append the tracking issue incrementally (or create it before the rename loop) so a timeout still leaves a traceable record of what was quarantined.",
+    "severity": "major",
+    "title": "Sequential per-leg polling can exceed the 20-minute job timeout, leaving partial quarantine with no tracking issue"
+   },
+   {
+    "body": "Replacement detection is `checks.filter(c => c.name === check.name && !initialIds.has(c.id))`. This only works if re-running a single job via POST /actions/jobs/{job_id}/rerun produces a check-run with a NEW id at the same head SHA. If GitHub updates the existing check-run in place (same id, new attempt), the `!initialIds.has(c.id)` predicate is never satisfied, the loop always times out with 'did not conclude', and no leg is ever quarantined \u2014 the workflow silently no-ops. This is the load-bearing assumption of the whole mechanism and is not defended by a test.",
+    "file": ".github/workflows/omnibus-flake-quarantine.yml",
+    "fix_hint": "Confirm empirically that a single-job rerun yields a fresh check-run id at the same SHA. If it can update in place, detect the flip by comparing the check-run's updated_at / started_at against the initial run, or by the run attempt number, instead of relying on id novelty.",
+    "severity": "minor",
+    "title": "Rerun-replacement detection depends on the reran job producing a NEW check-run id"
+   },
+   {
+    "body": "The quarantine step does `PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}` with the workflow GITHUB_TOKEN. The Checks API only permits a check-run to be updated by the GitHub App that created it. The targeted legs are native Actions jobs (guaranteed by the details_url regex), which are created by the GitHub Actions app; the workflow token is the same app installation, so this likely works \u2014 but this is not obviously guaranteed across all leg producers and would 403 (throwing the step) if any targeted check-run was created by a different integration. Worth verifying, since a 403 aborts the run before the issue/comment is filed.",
+    "file": ".github/workflows/omnibus-flake-quarantine.yml",
+    "fix_hint": "Wrap the PATCH in a try/catch so a single non-updatable check-run does not abort the whole quarantine pass, and confirm the token can rename Actions-created check-runs in practice.",
+    "severity": "minor",
+    "title": "check-runs PATCH rename may be rejected for check-runs the token's app did not create"
+   },
+   {
+    "body": "The workflow declares `pull-requests: write`, but the PR interaction is a comment via `issues.createComment` (PR comments are issue comments, covered by `issues: write`). No pulls API mutation is performed. Least-privilege suggests dropping `pull-requests: write`.",
+    "file": ".github/workflows/omnibus-flake-quarantine.yml",
+    "fix_hint": "Remove `pull-requests: write` from the permissions block unless a genuine pulls-API write is added.",
+    "severity": "nit",
+    "title": "Over-broad permissions (pull-requests: write appears unused)"
+   },
+   {
+    "body": "The merge-group run selection accepts conclusions ['failure','timed_out','cancelled'], but the per-leg `failed` filter only accepts ['failure','timed_out']. A run selected because it was 'cancelled' may therefore contribute no rerunnable legs, and cancelled legs are never probed for flakiness even though cancellation is a common flake symptom. Harmless but inconsistent.",
+    "file": ".github/workflows/omnibus-flake-quarantine.yml",
+    "fix_hint": "Align the two conclusion sets, or document why cancelled legs are intentionally excluded from re-probing.",
+    "severity": "nit",
+    "title": "Inconsistent conclusion sets: 'cancelled' selects the merge-group run but is never re-probed as a leg"
+   }
+  ],
+  "progress": null,
+  "summary": "New non-gating observer workflow that reruns failed omnibus merge-group legs once and renames green-flip check-runs with the whole-word `advisory` token so a future v2 bisection collector skips them. The `advisory` rename premise is sound (verified against .github/E2E-GATING-POLICY.md and the ci-summary aggregator), and the marker string matches scripts/batch-merge.py. Not checking out PR code is the right call for pull_request_target. However the trigger is guarded ONLY by a forgeable branch-name prefix plus a forgeable marker comment, so an external fork PR author can drive this write-scoped token (issues:write / actions:write) to spam issues and rerun base-repo CI jobs. Separately, the sequential per-leg polling (up to 7.5 min each) can exceed the 20-minute job timeout and leave a partial quarantine with no tracking issue. These are the blocking concerns; a few least-privilege / robustness nits follow. Recommend request_changes.",
+  "verdict": "request_changes"
+ }
+}
