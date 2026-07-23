@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3454,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5bd1e410bdafd63d2fd73617ac7a87b9ab46bad7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`serializer_versions_pinned` collects every workspace package named oxrdf/oxttl and then keeps only versions starting with `0.3.`/`0.2.`. It never proves that those are the versions resolved for sparq-canon. For example, if sparq-canon moves to oxrdf 0.4 while another workspace crate still resolves oxrdf 0.3.3, `oxrdf03` remains exactly `[\"0.3.3\"]` and this test passes, contrary to the documented guarantee that a serializer bump fails loudly. The same false-negative applies to oxttl. This undermines the load-bearing purpose of the tracking suite.",
+    "file": "crates/sparq-canon/tests/rdf12_nquads_token_tracking.rs",
+    "fix_hint": "Resolve the dependency versions specifically for the sparq-canon package and relevant feature, rather than filtering all lockfile entries by the expected version prefix. A small test using Cargo metadata/package dependency edges, or a checked source that unambiguously binds sparq-canon's direct oxrdf/oxttl dependency to the resolved package IDs, should assert the complete actual versions without first discarding unexpected major/minor versions.",
+    "severity": "major",
+    "title": "Version pin can pass after sparq-canon moves to an unreviewed serializer version"
+   }
+  ],
+  "progress": null,
+  "summary": "The byte-exact cases are useful and non-vacuous, but the version-pin test does not actually identify the oxrdf/oxttl versions used by sparq-canon. It filters the global lockfile by the old major/minor lines, so a dependency migration can evade the intended re-verification gate when another workspace dependency retains the pinned line.",
+  "verdict": "request_changes"
+ }
+}
