@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3662,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c7bdb2f9b724beefe1a0d32db5dee6250d6f8b2a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The remote invocation `bash scripts/ci-bench.sh \"$SCALE\" /tmp/out.json >/dev/null 2>&1` (line 110) discards stderr. run-ec2.sh emits precise fail-closed diagnostics to stderr (`ERROR: sp2b scale=X query=Y rows=A expected=B`, timeout, malformed-output) and those propagate up through ci-bench.sh's stderr, but this line sends the stream to /dev/null. The nightly still fails correctly (via set -e) but with no visible reason, undercutting the self-asserting oracle's diagnostic value on the EC2 path. Pre-existing (all suite output was already redirected), so non-blocking. Unchanged since round 1/2.",
+    "file": "scripts/ec2-bench.sh",
+    "fix_hint": "Capture stderr and echo it on failure, e.g. `... >/dev/null 2>/tmp/bench.err || { cat /tmp/bench.err >&2; exit 1; }`, or drop `2>&1` so the drift line reaches the ssh stderr the driver sees.",
+    "severity": "minor",
+    "title": "run-ec2.sh drift diagnostics discarded (ci-bench invoked with >/dev/null 2>&1)"
+   },
+   {
+    "body": "gen.sh caches each corpus (/tmp/sp2b/sp2b-<triples>.ttl) and run-ec2.sh iterates 5M, 25M, 100M via `$($GEN \"$scale\")` with no rm between scales, so all corpora (plus the 250k one) coexist. The 100M Turtle file alone is on the order of ~10-20 GB, so the nightly instance must be provisioned for the sum of all scales or the 100M generation fails (fail-closed, but only after wasting earlier scales). Operational sizing concern rather than a code bug. Unchanged since round 1/2.",
+    "file": "bench/sp2b/run-ec2.sh",
+    "fix_hint": "Remove the previous scale's cached corpus before generating the next (rm -f the prior $SP2B_CACHE/sp2b-<prev>.ttl after its queries complete), or document required free-disk headroom in bench/sp2b/README.md.",
+    "severity": "minor",
+    "title": "Full-scale corpora accumulate on disk with no cleanup between scales"
+   },
+   {
+    "body": "The new SP2B_EC2_ENV assignment (lines 94-98) adds a second `if [ -n \"$BENCH_FULL_SUITE\" ]; then ... else ... fi` identical in condition to the immediately-preceding SUITE_* block (lines 85-93). Purely cosmetic; folding SP2B_EC2_ENV into the existing conditional would reduce duplication. Unchanged since round 1/2.",
+    "file": "scripts/ec2-bench.sh",
+    "fix_hint": "Move `SP2B_EC2_ENV='export SP2B_EC2=1'` / `SP2B_EC2_ENV='true'` into the existing SUITE_APT/SUITE_WASM/SUITE_REF if/else.",
+    "severity": "nit",
+    "title": "Duplicate `if [ -n \"$BENCH_FULL_SUITE\" ]` block"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Verified against the checkout at PR head. The SP2Bench EC2/nightly runner is correct and fail-closed. (1) queries-heavy/ contains exactly {q05a,q06,q12a}, matching the three 250000 oracle rows, so the 250k glob loop yields no spurious expected=MISSING. (2) Every big-scale query the oracle references resolves: q01/q03c/q08/q09/q10/q11/q12b/q12c in queries/, q12a via the queries-heavy/ fallback; 100M correctly drops the two expensive saturating queries (q08/q10). (3) gen.sh writes only the corpus path to stdout (line 90) with all progress on stderr, so corpus=$($GEN scale) is clean. (4) set -euo pipefail in run-ec2.sh + set -e in ci-bench.sh propagate every run_query failure (timeout, malformed output, ERROR row, rows!=expected/MISSING) up through the redirected capture; the got=ERROR guard prevents any non-numeric 'us' from reaching add()/emit_json float(). (5) SP2B_EC2 defaults to 0, so per-commit runs pay nothing; only the BENCH_FULL_SUITE EC2 path exports SP2B_EC2=1. Oracle saturation values (q01=1,q03c=0,q08=493,q09=4,q10=656,q11=10,q12a=1,q12b=1,q12c=0) match the SP2Bench reference for >=5M; q05a/q06 are pinned only at 250k where their scale-dependent counts are fixed. The shellcheck fixes (for _ in seq; while read ... _) are clean. The three round-2 items persist unchanged and remain minor/nit operational/cosmetic, not blockers: EC2-path stderr discarded via >/dev/null 2>&1; no inter-scale corpus cleanup on disk; a duplicate BENCH_FULL_SUITE if-block. No new findings, none fixed, none escalated. Correct and complete; approve.",
+  "verdict": "approve"
+ }
+}
