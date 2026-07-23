@@ -11,16 +11,6 @@
    "expires_at": 1784843455
   },
   {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "469a96a99e544e8eb03ce791c04963a6",
-   "holder": "fix:sparq-org/sparq#3542@dispatch-30039834563.1",
-   "package": "sparq-zk-compose",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784837161,
-   "expires_at": 1784843461
-  },
-  {
    "account": "dc2d751954080e13",
    "claim_id": "6474b0bfa04c40a9847995e8875d01fc",
    "holder": "fix:sparq-org/sparq#3572@dispatch-30039834563.1",
