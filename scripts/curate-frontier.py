@@ -645,6 +645,19 @@ def _issue_timeline(repo: str, number: int, token: str) -> list[dict[str, Any]]:
     return _flatten_pages(pages, "timeline event")
 
 
+def _is_human_maintainer(repo: str, login: str, token: str) -> bool:
+    """The strict maintainer probe for the unpark veto (park-policy hygiene finding; the
+    worker-issue._is_human_maintainer pattern): repo collaborator permission in
+    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe failure counts as NOT a maintainer — an
+    unverifiable actor must never mint an unpark veto."""
+    try:
+        payload = _gh_json(["api", f"repos/{repo}/collaborators/{login}/permission"], token)
+    except CuratorError:
+        return False
+    return (isinstance(payload, dict)
+            and payload.get("permission") in _park_policy.HUMAN_MAINTAINER_PERMISSIONS)
+
+
 def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) -> int:
     """Apply snapshot-revalidated mutations; return the number of actual duplicate closes."""
     closed = 0
@@ -686,7 +699,8 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
             if any(
                 _park_policy.park_vetoed(
                     repo, mutation.number, label,
-                    lambda r, n: _issue_timeline(r, n, token))
+                    lambda r, n: _issue_timeline(r, n, token),
+                    is_human=lambda login: _is_human_maintainer(repo, login, token))
                 for label in mutation.labels if label in _park_policy.PARK_LABELS
             ):
                 print(f"skip {repo}#{mutation.number}: park suppressed (sticky human unpark)")
@@ -972,6 +986,15 @@ def _self_test() -> int:
         if "--paginate" in command:
             return subprocess.CompletedProcess(
                 command, 0, stdout=json.dumps([veto_state["timeline"]]), stderr="")
+        if any("/collaborators/" in part and part.endswith("/permission")
+               for part in command):
+            # The strict maintainer probe: jeswr is a repo admin; nobody else counts.
+            login = next(part for part in command if "/collaborators/" in part
+                         ).rsplit("/", 2)[-2]
+            return subprocess.CompletedProcess(
+                command, 0,
+                stdout=json.dumps({"permission": "admin" if login == "jeswr" else "none"}),
+                stderr="")
         return subprocess.CompletedProcess(
             command, 0, stdout=json.dumps(steering), stderr="")
 

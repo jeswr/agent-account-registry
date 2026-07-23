@@ -1389,6 +1389,21 @@ def _ensure_label(api: GitHubAPI, repo: str, label: str) -> bool:
     return True
 
 
+def _is_human_maintainer(api: GitHubAPI, repo: str, login: str) -> bool:
+    """The strict maintainer probe for the unpark veto (park-policy hygiene finding; the
+    worker-issue._is_human_maintainer pattern): repo collaborator permission in
+    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe failure counts as NOT a maintainer — an
+    unverifiable actor must never mint an unpark veto."""
+    try:
+        payload = api.request(
+            "GET", f"/repos/{repo}/collaborators/{login}/permission", allow_404=True
+        )
+    except GroomError:
+        return False
+    return (isinstance(payload, dict)
+            and payload.get("permission") in park_policy.HUMAN_MAINTAINER_PERMISSIONS)
+
+
 def _apply_labels(
     api: GitHubAPI, repo: str, number: int, current: set[str], mode: str
 ) -> bool:
@@ -1399,7 +1414,8 @@ def _apply_labels(
         # override a human's explicit unpark, and an unreadable timeline must never park.
         if park_policy.park_vetoed(
                 repo, number, label,
-                lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline")):
+                lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                is_human=lambda login: _is_human_maintainer(api, repo, login)):
             print(f"SKIP issue {repo}#{number}: {mode} park suppressed "
                   "(sticky human unpark)")
             return False
@@ -2024,7 +2040,9 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             # merge state is a genuine human hand-off, not a capacity park.
             if park_policy.park_vetoed(
                     action.repo, action.number, "needs:user",
-                    lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline")):
+                    lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                    is_human=lambda login: _is_human_maintainer(
+                        api, action.repo, login)):
                 print(f"SKIP PR {action.repo}#{action.number}: needs:user park suppressed "
                       "(sticky human unpark)")
                 continue
@@ -3926,7 +3944,12 @@ def _self_test() -> int:
         "updated_at": datetime.fromtimestamp(sweep_now - 700, timezone.utc).isoformat(),
         "comments": 1,
     }
-    sweep_env["gets"] = {"/repos/owner/repo/issues/8": sweep_issue}
+    sweep_env["gets"] = {
+        "/repos/owner/repo/issues/8": sweep_issue,
+        # The strict maintainer probe (park-policy hygiene finding): jeswr is a repo admin,
+        # so the human-unpark veto honours exactly this actor and nobody unverifiable.
+        "/repos/owner/repo/collaborators/jeswr/permission": {"permission": "admin"},
+    }
     sweep_env["pages"] = {
         "/repos/owner/repo/issues?state=open": [sweep_issue],
         # Two durable bot attempt comments: the budget (max_attempts=2) is exhausted, so

@@ -75,6 +75,32 @@ def count_attempts(comments, bot_login):
     )
 
 
+def count_attempts_since(comments, bot_login, since):
+    """Durable worker attempts charged to the DEFERRED-RETRY budget after a human readmission.
+
+    Mirrors worker-pr.count_rounds_since: `since` is the readmission cutoff
+    (park_policy.readmission_cutoff — the latest proven-human unlabel of a park label), and
+    only attempt receipts recorded at or after it are charged, so a human's explicit
+    re-admission gesture actually re-enables allocation instead of the full historical count
+    exiting the tick forever. Fail direction (toward the OLD conservative full count, never a
+    fresh budget on unproven data): a falsy `since` charges everything (plain count_attempts);
+    a receipt without a parseable created_at is CHARGED; a timestamp tie with the cutoff is
+    CHARGED (ISO-8601 UTC timestamps compare lexicographically)."""
+    if not since:
+        return count_attempts(comments, bot_login)
+    bot = bot_login.casefold()
+    charged = 0
+    for comment in comments:
+        if (str(comment.get("user", {}).get("login", "")).casefold() != bot
+                or ATTEMPT_MARKER not in str(comment.get("body", ""))):
+            continue
+        created = comment.get("created_at")
+        if isinstance(created, str) and created and created < since:
+            continue
+        charged += 1
+    return charged
+
+
 def find_maintainer_approval(comments, bot_login, is_human_maintainer):
     """Return the approving comment, or None when the retry must fail closed.
 
@@ -158,7 +184,14 @@ def _paginated(repo, issue, resource):
     ])
     if not isinstance(pages, list):
         raise WorkerIssueError(f"GitHub API returned malformed {resource}")
-    return [item for page in pages if isinstance(page, list) for item in page]
+    for page in pages:
+        # A malformed PAGE must RAISE, never be silently dropped: for the timeline it could
+        # hold the newest human unlabel (the exact event the park veto and the readmission
+        # window hinge on), so the caller's documented fail direction must apply instead
+        # (veto => suppress the park; budget/readmission => the full historical count).
+        if not isinstance(page, list):
+            raise WorkerIssueError(f"GitHub API returned a malformed {resource} page")
+    return [item for page in pages for item in page]
 
 
 def _write_outputs(values):
@@ -323,10 +356,13 @@ def set_status(repo, issue, status):
     add, remove = transitions[status]
     park_label = PARK_STATUS_LABELS.get(status)
     if park_label and _park_policy().park_vetoed(
-            repo, issue, park_label, lambda r, n: _paginated(r, n, "timeline")):
-        # Sticky human unpark (park_policy.py): a human removed this park label more recently
-        # than any application (or the timeline could not be read, which must never park). The
-        # veto helper already logged the loud "park suppressed:" line; mutate NOTHING.
+            repo, issue, park_label, lambda r, n: _paginated(r, n, "timeline"),
+            is_human=lambda login: _is_human_maintainer(repo, login)):
+        # Sticky human unpark (park_policy.py): a PROVEN human (the same strict
+        # _is_human_maintainer probe as retry approval — an unverifiable actor never counts)
+        # removed this park label more recently than any application (or the timeline could
+        # not be read, which must never park). The veto helper already logged the loud
+        # "park suppressed:" line; mutate NOTHING.
         print(f"target issue state UNCHANGED: {status} park suppressed for {repo}#{issue}")
         return
     for label in sorted(add):
@@ -408,6 +444,24 @@ def _self_test():
         {"user": {"login": "someone"}, "body": ATTEMPT_MARKER},
     ]
     assert count_attempts(fake, "sparq[bot]") == 2
+
+    # count_attempts_since (deferred-retry readmission window): only receipts at/after the
+    # cutoff are charged; missing timestamps and exact ties stay CHARGED (fail toward the full
+    # count, never a fresh budget on unproven data); no cutoff = the plain full count.
+    stamped = [
+        {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-20T00:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=1 -->"},
+        {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-23T10:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=2 -->"},
+        {"user": {"login": "someone"}, "created_at": "2026-07-23T10:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=3 -->"},
+    ]
+    assert count_attempts_since(stamped, "sparq[bot]", "2026-07-23T09:00:00Z") == 1
+    assert count_attempts_since(stamped, "sparq[bot]", None) == 2
+    assert count_attempts_since(stamped, "sparq[bot]", "2026-07-23T10:00:00Z") == 1  # tie charged
+    unstamped = [{"user": {"login": "sparq[bot]"}, "body": f"x {ATTEMPT_MARKER} run=4 -->"}]
+    assert count_attempts_since(stamped + unstamped, "sparq[bot]",
+                                "2026-07-24T00:00:00Z") == 1  # no created_at stays charged
     assert body_sha("task") == hashlib.sha256(b"task").hexdigest()
     assert set(LABEL_COLOURS) == {"status:in-progress", "status:in-progress-review",
                                   "status:deferred", "status:parked", "status:ready",
@@ -555,7 +609,12 @@ def _self_test():
     def fake_run_gh(args, *, input_text=None, check=True):
         if args[1] == "-X" and args[2] == "DELETE":
             deletes.append(args[3])
-        return _Result()
+        result = _Result()
+        if "/collaborators/" in str(args[1]):
+            # The strict maintainer probe (_is_human_maintainer): jeswr is a repo admin,
+            # everyone else is not — the park veto only honours PROVEN humans.
+            result.stdout = "admin" if "/collaborators/jeswr/" in args[1] else "none"
+        return result
 
     def fake_gh_json(args, *, input_doc=None):
         if input_doc is not None and "labels" in input_doc:
@@ -623,8 +682,37 @@ def _self_test():
         assert posts == [["status:ready"]], posts
         assert any(path.endswith("labels/status:parked") for path in deletes), deletes
         assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
+        # (x-vii) STRICT human probe (park-policy hygiene finding): an unlabel by an actor the
+        # collaborator probe cannot confirm as a maintainer mints NO veto — the park proceeds.
+        posts.clear(); deletes.clear()
+        timeline[:] = [
+            park_event("labeled", "status:parked", "2026-07-18T10:00:00Z", "sparq[bot]"),
+            park_event("unlabeled", "status:parked", "2026-07-18T11:00:00Z", "drive-by"),
+        ]
+        set_status("o/r", 9, "parked")
+        assert posts == [["status:deferred", "status:parked"]], posts
     finally:
         globals().update(saved)
+
+    # (xi) malformed timeline PAGE (finding E): a non-list page could hold the newest human
+    # unlabel, so _paginated must RAISE — the veto then suppresses the park (its documented
+    # fail direction) instead of parking over an invisible human unpark.
+    good_page = [{"event": "unlabeled", "label": {"name": "status:parked"},
+                  "created_at": "2026-07-23T09:00:00Z", "actor": {"login": "jeswr"}}]
+
+    def malformed_page_gh_json(args, *, input_doc=None):
+        return [good_page, "not-a-list-page"]
+
+    saved_json = globals()["_gh_json"]
+    globals()["_gh_json"] = malformed_page_gh_json
+    try:
+        try:
+            _paginated("o/r", 9, "timeline")
+            raise AssertionError("malformed timeline page did not raise")
+        except WorkerIssueError as exc:
+            assert "malformed timeline page" in str(exc), exc
+    finally:
+        globals()["_gh_json"] = saved_json
     print("worker-issue self-test PASSED")
 
 

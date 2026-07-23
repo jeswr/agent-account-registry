@@ -267,6 +267,14 @@ jobs:
           # attention required" marker) are BOTH human-owned terminal for every mode/flavour.
           if {"review:needs-user", "needs:user"} & set(labels):
               raise SystemExit("pull request is human-owned (review:needs-user / needs:user)")
+          # review:parked is the MACHINE-owned capacity park (park_policy.py): a SOFT hold, not
+          # a human terminal — but a parked PR must still never be reviewed/fixed. On a proven
+          # human readmission gesture CLAIM strips this label (converging it to review:needs)
+          # BEFORE dispatching, so a legitimately re-admitted run never carries it here; seeing
+          # it means the park still stands (or landed mid-window) — stand down.
+          if "review:parked" in labels:
+              raise SystemExit("pull request is capacity-parked (review:parked); "
+                               "a human readmission gesture re-admits it via the dispatcher")
           # Only the verdict flavour is bound to review:changes; the ci/rebase repair flavours
           # (GAP-A/B) run over any non-terminal review state — the dispatcher re-derived their
           # triggers (concluded-red gate / conflicting base) from live data at admission.

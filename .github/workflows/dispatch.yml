@@ -570,7 +570,8 @@ jobs:
               # excluded here either: CLAIM re-derives the live round count and applies the
               # terminal transition itself, so a PR whose final outcome mutation crashed
               # converges loudly. `review_exclusions` collects every SIGNALLED
-              # (review:changes / review:needs) exclusion reason for the one aggregate line at
+              # (review:changes / review:needs / review:parked) exclusion reason for the one
+              # aggregate line at
               # PLAN completion (park-policy defect 3: "0 review item(s)" can never again
               # coexist silently with labeled worker PRs).
               review_items.extend(claim_mod.enumerate_review_items(

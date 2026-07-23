@@ -114,6 +114,19 @@ def _load_helper(name, filename):
 _park_policy = _load_helper("registry_park_policy", "park_policy.py")
 
 
+def _is_human_maintainer(api, repo, login):
+    """The strict maintainer probe for the unpark veto (park-policy hygiene finding; the
+    worker-issue._is_human_maintainer pattern): repo collaborator permission in
+    park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe failure counts as NOT a maintainer — an
+    unverifiable actor must never mint an unpark veto."""
+    try:
+        payload = api.request("GET", f"/repos/{repo}/collaborators/{login}/permission")
+    except ResolverError:
+        return False
+    return (isinstance(payload, dict)
+            and payload.get("permission") in _park_policy.HUMAN_MAINTAINER_PERMISSIONS)
+
+
 def load_target_repositories(policy_file, registry_repo):
     """Return enabled policy targets plus the registry itself, in policy order."""
     with open(policy_file, "rb") as handle:
@@ -543,7 +556,8 @@ class ConflictResolver:
         if self.apply:
             if _park_policy.park_vetoed(
                     repo, number, "needs:user",
-                    lambda r, n: self.api.timeline(r, n)):
+                    lambda r, n: self.api.timeline(r, n),
+                    is_human=lambda login: _is_human_maintainer(self.api, repo, login)):
                 self._record("needs:user-suppressed", repo, number,
                              "sticky human unpark (or unreadable timeline)")
                 return
@@ -783,6 +797,14 @@ def _self_test():
 
         def timeline(self, _repo, number):
             return deepcopy(self.timelines.get(number, []))
+
+        def request(self, method, url, body=None):
+            # The strict maintainer probe (park-policy hygiene finding): jeswr is a repo
+            # admin; everyone else — bots, outsiders, unverifiable actors — is not.
+            if method == "GET" and "/collaborators/" in url and url.endswith("/permission"):
+                login = url.rsplit("/", 2)[-2]
+                return {"permission": "admin" if login == "jeswr" else "none"}
+            raise AssertionError(f"unexpected FakeAPI request: {method} {url}")
 
         def comment(self, _repo, number, body):
             self.comment_rows[number].append({"body": body, "user": {"login": bot_login}})
