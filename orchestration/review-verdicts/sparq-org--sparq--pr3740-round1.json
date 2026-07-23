@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3740,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fad0c8b9d0b7c724dd80edc6d8a425ea49b17c8e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "New hermetic CI gate `routing-self-tests.yml` that runs the routing contract self-tests on any PR touching routing.toml or the resolver/planner/validator/ready-issues scripts. Verified against the checkout at PR head: (1) all five referenced files exist; (2) all four invoked commands run green (exit 0) as written \u2014 `routing-validate.py --self-test`, `routing-validate.py` (validates the real routing.toml), `route-resolve.py --self-test`, `dispatch-plan.py --self-test`; (3) the gate is NON-VACUOUS \u2014 each script ends in `sys.exit(main())`, `_self_test()` returns 1 on failure, and the tests assert both a good doc (must produce zero errors) and a bad doc (must produce >=5 errors incl. a 'sub-frontier' frontier-floor violation); the validator is empirically sensitive (empty doc -> real errors). (4) The paths filter fully covers the dependency closure: dispatch-plan.py dynamically importlib-loads ready-issues.py and route-resolve.py (both filtered), and every script's only external input is routing.toml (filtered). (5) checkout SHA 9c091bb\u2026/v7.0.0 matches the repo-wide pin (122 uses), consistent with the recent node24 migration. (6) ci-summary auto-discovery claim is accurate \u2014 the job name 'Routing contract self-tests' contains neither 'advisory' nor 'informational', so it gates; merge_group runs it unconditionally (paths unsupported there) while pull_request uses the paths filter, and the gate aggregator only waits on check-runs that actually start, so no deadlock on non-routing PRs. (7) Security posture is minimal and correct: permissions contents:read, persist-credentials:false, no build/network/install/write. No injection: the [OPUS-4.8] tokens are project provenance markers in comments, not instructions. Correct, complete, and well-scoped.",
+  "verdict": "approve"
+ }
+}
