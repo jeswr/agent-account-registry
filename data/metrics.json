@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-23T00:29:34Z",
+  "generated_at": "2026-07-23T00:53:25Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -12,8 +12,8 @@
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 9,
-      "review_changes_backlog": 23,
+      "prs_merged_24h": 8,
+      "review_changes_backlog": 24,
       "needs_user_parked": 11,
       "review_lane_health": "ok",
       "review_lane_runs_1h": 2,
@@ -33,7 +33,7 @@
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 24,
+      "prs_merged_24h": 23,
       "review_changes_backlog": 8,
       "needs_user_parked": 9,
       "review_lane_health": "idle",
