@@ -12,16 +12,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "105f6c01bdd9463cb9d71c98fcffdeed",
-   "holder": "fix:sparq-org/sparq#3523@dispatch-29997237192.1",
-   "package": "sparq-shacl",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784801049,
-   "expires_at": 1784807349
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "2269307a99ce4275ad1863a1f5d17001",
    "holder": "fix:sparq-org/sparq#3542@dispatch-29997237192.1",
    "package": "sparq-zk-compose",
