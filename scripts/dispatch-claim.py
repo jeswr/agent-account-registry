@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import types
 import sys
 import tempfile
 import textwrap
@@ -1804,6 +1805,7 @@ def _run_gh_target_api(repo, method, path, input_doc=None):
     )
     if result.returncode != 0:
         raise DispatchError("target issue mutation failed")
+    return result
 
 
 def _replace_issue_role_with_research(repo, item):
@@ -3389,6 +3391,23 @@ def _review_fix_workflow_values():
 
 
 def _self_test():
+    # _run_gh_target_api MUST return the CompletedProcess on success — callers read .stdout
+    # (decline reroute re-read, #505). A missing `return result` made it fall off to None and
+    # crash the CLAIM job with AttributeError on every escalation tick (run 29982184587).
+    import subprocess as _subprocess
+    _saved_run = _subprocess.run
+    try:
+        _subprocess.run = lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        _saved_token = globals().get("_target_token")
+        globals()["_target_token"] = lambda _repo: "tok"
+        _probe = _run_gh_target_api("example/repo", "GET", "repos/example/repo/issues/1")
+        assert _probe is not None and _probe.stdout == "{}", (
+            "_run_gh_target_api must return the CompletedProcess on success")
+    finally:
+        _subprocess.run = _saved_run
+        if _saved_token is not None:
+            globals()["_target_token"] = _saved_token
+
     # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are DOCS-ONLY
     # models — they must never appear in any review/fix chain (review-fix.yml asserts the same
     # over its own chain tables, worker-pr.py over ESCALATION_LADDERS).
