@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3745,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aca25b0f5fad8e3d1f66a3a874510ca6ce13ca28",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Adding the exported `SparqlJsonTerm['its:dir']` field and changing `termFromSparqlJson` to construct RDF 1.2 directional literals changes a published JavaScript surface. The repository maintenance rule requires the matching `skills/javascript-wasm/SKILL.md` (and package-facing README where applicable) to be updated in the same change. The diff only changes implementation and tests, leaving consumers without documentation for the new accepted JSON shape and resulting RDF/JS literal semantics.",
+    "file": "js/src/sparql.ts",
+    "fix_hint": "Update `skills/javascript-wasm/SKILL.md` with a concise `termFromSparqlJson` example showing `{ type: 'literal', value, 'xml:lang', 'its:dir' }` and the resulting `direction`/`rdf:dirLangString` behavior; update the JavaScript package README too if it documents this helper or result-term conversion.",
+    "severity": "major",
+    "title": "Public SPARQL JSON API change is missing its required usage documentation update"
+   }
+  ],
+  "progress": null,
+  "summary": "The conversion and focused test are internally consistent: `its:dir` is reassembled with `xml:lang`, both directions are exercised, and the no-direction behavior is pinned. However, this changes the exported `SparqlJsonTerm` public API and the behavior of the exported `termFromSparqlJson` helper without updating the required JavaScript/WASM usage skill (and package-facing documentation). The repository's maintenance contract requires those updates in the same change, so the PR is incomplete as submitted.",
+  "verdict": "request_changes"
+ }
+}
