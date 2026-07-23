@@ -9,6 +9,16 @@
    "model": "fable",
    "issued_at": 1784828761,
    "expires_at": 1784835061
+  },
+  {
+   "account": "9e13ea21abf27e68",
+   "claim_id": "e7ed805f17cd4dcea6394315932e5253",
+   "holder": "fix:sparq-org/sparq#3542@dispatch-30029951068.1",
+   "package": "sparq-zk-compose",
+   "role": "fix",
+   "model": "fable",
+   "issued_at": 1784828766,
+   "expires_at": 1784835066
   }
  ]
 }
