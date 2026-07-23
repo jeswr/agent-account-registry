@@ -11,16 +11,6 @@
    "expires_at": 1784827912
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "0b208d20c27e40bd99b1bbb89d79dd90",
-   "holder": "fix:sparq-org/sparq#3572@dispatch-30023956689.1",
-   "package": "ci",
-   "role": "fix",
-   "model": "sol",
-   "issued_at": 1784823732,
-   "expires_at": 1784830032
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "1c00402c8e804047b89439ca96a47e01",
    "holder": "fix:sparq-org/sparq#3573@dispatch-30023956689.1",
