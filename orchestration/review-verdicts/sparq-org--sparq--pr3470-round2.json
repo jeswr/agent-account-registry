@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3470,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1258d637a9bcd25ee1a4109b1cede44eb1ea2f18",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The fallback now requires projected registry entries to expose an EAST/NORTH WKT axis pair before returning their PROJ.4 definition, so northing/easting and west/south definitions fail closed instead of being passed verbatim to proj4rs. The feature-gated real-path tests cover both registry acceptance (EPSG:2056 with independent reference coordinates) and the previously missing refusal class (EPSG:2180 and EPSG:3044, including a to_crs84 Unsupported assertion), while curated precedence and datum/grid refusal remain exercised. The dependency remains optional and default-off, and the public documentation was updated consistently. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
