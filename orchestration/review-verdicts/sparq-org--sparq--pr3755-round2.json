@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3755,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "36292f9f5be2564a622841b0ea7d4a61ac83e3e8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 of a pure, behavior-preserving performance refactor of NumData::lookup in sparq-core. The reviewed code is substantively unchanged from the round-1-approved state; re-verified against the checkout. (1) The extracted Owned fast path `(!value.is_nan()).then_some(value)` after `values.get((id-1) as usize)?` is exactly equivalent to the original `if v.is_nan(){None}else{Some(v)}` \u2014 same None-on-OOB, None-on-NaN, Some-otherwise; the `id-1` (1-based id) subtraction is unchanged. (2) `unreachable!(\"Owned handled by lookup\")` in lookup_non_owned is provably dead: grep confirms lookup_non_owned has exactly ONE caller (lib.rs:208), reached only from lookup's non-Owned branch, and the Forked arm recurses through `base.lookup(id)` (lib.rs:224, the entry that re-dispatches Owned to the fast path), never through lookup_non_owned; if ever reached it panics, no UB. (3) The mmap Mapped arm is byte-for-byte unchanged and the match is exhaustive in both feature states (non-mmap: Sparse/Owned/Forked; mmap adds Mapped). (4) `#[inline(always)]` is safe on the self-recursive-via-Forked fn: recursion crosses the `#[inline(never)]` lookup_non_owned boundary and dispatches on a runtime Arc/Box, so no unbounded inlining. The bench/feature-off-declarations/3755.json entry legitimately documents the expected wasm-byte movement (size still governed by the separate ratchet). No overclaim, no ZK/MPC/privacy surface, no hard-coded perf numbers. Correct and complete.",
+  "verdict": "approve"
+ }
+}
