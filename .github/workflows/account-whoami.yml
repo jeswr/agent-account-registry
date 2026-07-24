@@ -10,6 +10,11 @@ name: account-whoami
 on:
   workflow_dispatch: {}
 permissions: {}
+# Manual-only diagnostic; singleton so a double manual fire queues instead of interleaving
+# two secret-reading probes (#559 concurrency-hygiene audit; registry #563 item 1).
+concurrency:
+  group: account-whoami-singleton
+  cancel-in-progress: false
 jobs:
   whoami:
     runs-on: ubuntu-latest

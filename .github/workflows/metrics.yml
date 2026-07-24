@@ -136,6 +136,18 @@ jobs:
           now=$(date -u +%s)
           for spec in dashboard.yml:1500; do
             wf="${spec%%:*}"; limit="${spec##*:}"
+            # LIVE-RUN GUARD (#559): a QUEUED or IN_PROGRESS dashboard run counts as FRESH —
+            # kicking a live run queues a duplicate its singleton group then runs back-to-back
+            # (dashboard runs probe->build->deploy and routinely outlives its created_at limit),
+            # feeding exactly the #559 dup-dispatch storm. Same rule as the orchestrator's local
+            # keepalive bridge: skip on any live run; only then consult last-run age. Fail-open:
+            # an unreadable live check falls through to the age check.
+            live=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=30" \
+                   --jq '[.workflow_runs[] | select(.status != "completed")] | length' || echo "")
+            if [ -n "$live" ] && [ "$live" -gt 0 ]; then
+              echo "keepalive: ${wf} has ${live} queued/in-progress run(s) — live, skipping kick"
+              continue
+            fi
             last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
                    --jq '.workflow_runs[0].created_at // empty' || true)
             prev=0
