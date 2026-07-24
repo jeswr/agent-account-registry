@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3523,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2b4b28121679118f37ba83d950352c32c993f011",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The mixed-timezone ordering remains correct: an untimezoned value denotes the closed instant interval [u-14h, u+14h], comparison is determinate only when that entire interval lies strictly before or after the zoned instant, equality at either boundary stays indeterminate, and operand reversal is handled correctly. The focused unit assertions cover interior indeterminacy, both determinate directions, reversed operands, the exact boundary, and just beyond the boundary. The SHACL integration test exercises the real maxInclusive behavior for a determinately conforming untimezoned value and an indeterminate violation. No hostile review instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
