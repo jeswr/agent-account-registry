@@ -477,48 +477,111 @@ Path(prompt_path).chmod(0o600)
 PY
 }
 
-run_model() {
+# --- model-phase decomposition (registry #563, OSS adoption 5). The implementation step runs
+# through ONE of two execution harnesses, selected by worker.yml's `harness-mode` step:
+#   cli    (default) run_model — the containerized headless CLI below, unchanged.
+#   action (opt-in)  worker.yml runs the pinned anthropics/claude-code-action between
+#                    run_model_prompt (phase 1: the SAME brief run_model builds, plus a
+#                    lane-specific cwd preamble, with the base sha recorded to disk) and
+#                    run_model_postcheck (phase 3: the SAME post-run contract — follow-up
+#                    lift, HEAD/.beads guards, no_change classification, branch creation).
+# Only the execution MIDDLE differs between lanes; prompt construction and outcome
+# classification live HERE for both, so publish/provenance/no_change semantics cannot drift. ---
+
+# Shared validation + naming for every model phase. Sets MODEL_* globals; never mutates git.
+_model_context() {
   require_target
-  local issue_file=${WORKER_ISSUE_FILE:-}
-  local worker_root=${WORKER_ROOT:-}
-  local model_alias=${WORKER_MODEL_ALIAS:-}
-  local default_branch=${TARGET_DEFAULT_BRANCH:-}
-  local issue_number=${ISSUE_NUMBER:-}
-  local packages=${WORKER_PACKAGES:-}
+  MODEL_ISSUE_FILE=${WORKER_ISSUE_FILE:-}
+  MODEL_WORKER_ROOT=${WORKER_ROOT:-}
+  MODEL_ALIAS=${WORKER_MODEL_ALIAS:-}
+  MODEL_DEFAULT_BRANCH=${TARGET_DEFAULT_BRANCH:-}
+  MODEL_ISSUE_NUMBER=${ISSUE_NUMBER:-}
+  MODEL_PACKAGES=${WORKER_PACKAGES:-}
 
-  [[ -f "$issue_file" && ! -L "$issue_file" ]] || die 'verified issue snapshot is missing'
-  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
-  safe_atom "$model_alias" || die 'unsafe routed model alias'
-  safe_atom "$default_branch" || die 'unsafe target default branch'
-  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
+  [[ -f "$MODEL_ISSUE_FILE" && ! -L "$MODEL_ISSUE_FILE" ]] || die 'verified issue snapshot is missing'
+  [[ -n "$MODEL_WORKER_ROOT" && "$MODEL_WORKER_ROOT" != / ]] || die 'WORKER_ROOT is unsafe'
+  safe_atom "$MODEL_ALIAS" || die 'unsafe routed model alias'
+  safe_atom "$MODEL_DEFAULT_BRANCH" || die 'unsafe target default branch'
+  [[ "$MODEL_ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
 
-  local base_sha branch prompt
-  base_sha=$(git rev-parse HEAD)
-  branch="sparq-agent/issue-${issue_number}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'generated branch name is unsafe'
+  MODEL_PROMPT_FILE="$MODEL_WORKER_ROOT/task-prompt.txt"
+  MODEL_BASE_SHA_FILE="$MODEL_WORKER_ROOT/model-base-sha"
+  MODEL_STARTED_AT_FILE="$MODEL_WORKER_ROOT/model-started-at"
+  MODEL_GIT_FPR_FILE="$MODEL_WORKER_ROOT/model-git-fingerprint"
+  MODEL_BRANCH="sparq-agent/issue-${MODEL_ISSUE_NUMBER}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+  [[ "$MODEL_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'generated branch name is unsafe'
+}
 
-  prompt="$worker_root/task-prompt.txt"
-  _write_task_prompt "$issue_file" "$prompt" "$packages"
-  # Prefix-stability: the model runs ON the default-branch checkout (no per-run branch name in
-  # anything it can observe); the host creates the worker branch AFTER the run and asserts HEAD
-  # never moved. `git switch -c` carries the model's uncommitted edits onto the new branch.
-  _run_headless_harness "$prompt" allow
+# PURE (self-tested): fingerprint the HOST-EXECUTABLE git state of the current directory's
+# checkout — .git/config (+ .git/config.worktree when present) and every file under .git/hooks.
+# Why: the CLI lane's container mounts .git READ-ONLY, so a prompt-injected model cannot plant
+# hooks / core.fsmonitor / alias config that the host-side publish `git` (which holds the
+# target-scoped App token in env) would then execute. The action lane runs the model on the
+# HOST with .git writable, so it records this fingerprint BEFORE the model runs and the
+# postcheck refuses to proceed on drift — verified with pure file reads BEFORE any git command
+# runs in the postcheck, so a poisoned config is never executed. (A hostile target can still
+# run code host-side in the LATER cargo gate on both lanes — a pre-existing, accepted boundary;
+# this guard restores lane parity for the MODEL phase specifically.)
+_git_state_fingerprint() {
+  local f
+  {
+    for f in .git/config .git/config.worktree; do
+      if [[ -f "$f" ]]; then sha256sum "$f"; fi
+    done
+    if [[ -d .git/hooks ]]; then
+      find .git/hooks -type f -print0 | sort -z | xargs -0 -r sha256sum
+    fi
+  } | sha256sum | awk '{print $1}'
+}
+
+# PURE (self-tested): prepend the action-lane cwd anchor to an already-written brief. The
+# claude-code-action step runs Claude at the WORKFLOW WORKSPACE root (a `uses:` step cannot set
+# working-directory), where the target checkout is the `target/` SUBDIRECTORY beside the registry
+# helper checkout — while the CLI lane's container mounts the target AT the model's cwd. The
+# shared brief's "current checkout" wording therefore needs this one lane-specific anchor ABOVE
+# it. STATIC text only (prefix-stability: nothing issue-specific is added above the brief's
+# cache marker), and the brief below stays byte-identical to what run_model would send.
+_prepend_action_lane_preamble() {
+  local prompt_file=$1
+  local tmp="$prompt_file.preamble"
+  [[ -f "$prompt_file" && ! -L "$prompt_file" ]] || die 'brief to prepend is missing'
+  {
+    printf '%s\n' \
+      'Execution-harness note: your working directory is the workflow WORKSPACE, not the target' \
+      'repository. The target repository checkout is the `target/` subdirectory; the sibling' \
+      '`registry/` checkout is orchestration tooling you must NEVER read or modify. Every' \
+      'instruction below that says "the current checkout" means the `target/` directory: make' \
+      'ALL edits inside `target/` and nowhere else.' \
+      ''
+    cat "$prompt_file"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$prompt_file"
+}
+
+# The post-run contract shared by BOTH harness lanes: lift follow-ups, enforce the edits-only +
+# .beads guards, classify no_change, and carry the uncommitted edits onto the deterministic
+# worker branch (which provenance reconciles by NAME — issue #128 — so this construction must
+# stay in lockstep with worker.yml's HEAD_BRANCH). $1 = the pre-run base sha, $2 = a lane label
+# for the completion log line only.
+_model_postrun() {
+  local base_sha=$1 lane_label=$2
   # [OPUS-4.8] Lift any model-declared follow-ups OUT of the target tree BEFORE the change-detection +
   # commit, so they become issues (worker.yml) but are NEVER committed. Doing it before the
   # "no repository changes" check means a follow-ups-only run correctly registers as no real work.
   if [[ -f "${TARGET_DIR:-.}/.worker-followups.jsonl" ]]; then
-    mkdir -p "${WORKER_ROOT:?}"
-    mv -f "${TARGET_DIR:-.}/.worker-followups.jsonl" "$WORKER_ROOT/followups.jsonl"
+    mkdir -p "${MODEL_WORKER_ROOT:?}"
+    mv -f "${TARGET_DIR:-.}/.worker-followups.jsonl" "$MODEL_WORKER_ROOT/followups.jsonl"
     printf 'worker-live: lifted %s model-declared follow-up line(s) out of the tree\n' \
-      "$(wc -l < "$WORKER_ROOT/followups.jsonl" 2>/dev/null || echo 0)"
+      "$(wc -l < "$MODEL_WORKER_ROOT/followups.jsonl" 2>/dev/null || echo 0)"
   fi
   [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'model created commits; worker requires edits only'
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'model modified forbidden .beads state'
   if [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
     local no_change_envelope
     no_change_envelope=$(_no_change_health_envelope \
-      "$worker_root/usage-telemetry.json" "$issue_number") ||
-      no_change_envelope="no-change-v1 issue:$issue_number"
+      "$MODEL_WORKER_ROOT/usage-telemetry.json" "$MODEL_ISSUE_NUMBER") ||
+      no_change_envelope="no-change-v1 issue:$MODEL_ISSUE_NUMBER"
     if [[ -n ${GITHUB_ENV:-} ]]; then
       {
         printf 'WORKER_EXIT_CLASS=no_change\n'
@@ -533,14 +596,84 @@ run_model() {
   fi
   git diff --check
 
-  git switch -c "$branch"
+  git switch -c "$MODEL_BRANCH"
   [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'fresh branch did not retain the default-branch HEAD'
 
-  write_output branch "$branch"
+  write_output branch "$MODEL_BRANCH"
   if [[ -n ${GITHUB_ENV:-} ]]; then
-    printf 'WORKER_BRANCH=%s\n' "$branch" >> "$GITHUB_ENV"
+    printf 'WORKER_BRANCH=%s\n' "$MODEL_BRANCH" >> "$GITHUB_ENV"
   fi
-  printf 'worker-live: headless %s run completed with repository changes\n' "${WORKER_HARNESS:-}"
+  printf 'worker-live: headless %s run completed with repository changes\n' "$lane_label"
+}
+
+run_model() {
+  _model_context
+  _write_task_prompt "$MODEL_ISSUE_FILE" "$MODEL_PROMPT_FILE" "$MODEL_PACKAGES"
+  local base_sha
+  base_sha=$(git rev-parse HEAD)
+  # Prefix-stability: the model runs ON the default-branch checkout (no per-run branch name in
+  # anything it can observe); the host creates the worker branch AFTER the run and asserts HEAD
+  # never moved. `git switch -c` carries the model's uncommitted edits onto the new branch.
+  _run_headless_harness "$MODEL_PROMPT_FILE" allow
+  _model_postrun "$base_sha" "${WORKER_HARNESS:-}"
+}
+
+# Action-lane phase 1 (worker.yml `model-action-brief`): build the SAME brief run_model builds,
+# add the cwd preamble, and RECORD the pre-run base sha + start time to disk so phase 3 can
+# enforce the identical edits-only contract after the `uses:` step ran in between. Mirrors the
+# CLI harness's own pre-launch guards (routed agent file present, concrete claude model id) so a
+# doomed launch dies here with the same diagnostics instead of an opaque action failure.
+run_model_prompt() {
+  _model_context
+  local agent=${WORKER_AGENT:-}
+  local provider_model=${WORKER_PROVIDER_MODEL:-}
+  safe_atom "$agent" || die 'unsafe routed agent'
+  [[ -f ".claude/agents/$agent.md" && ! -L ".claude/agents/$agent.md" ]] ||
+    die "routed agent prompt .claude/agents/$agent.md is missing"
+  safe_atom "$provider_model" || die 'unsafe provider model'
+  [[ "$provider_model" != TBD ]] || die 'provider model is an unresolved TBD sentinel'
+  _write_task_prompt "$MODEL_ISSUE_FILE" "$MODEL_PROMPT_FILE" "$MODEL_PACKAGES"
+  _prepend_action_lane_preamble "$MODEL_PROMPT_FILE"
+  git rev-parse HEAD > "$MODEL_BASE_SHA_FILE"
+  date +%s > "$MODEL_STARTED_AT_FILE"
+  _git_state_fingerprint > "$MODEL_GIT_FPR_FILE"
+  [[ -s "$MODEL_GIT_FPR_FILE" ]] || die 'action-lane git-state fingerprint could not be recorded'
+  chmod 600 "$MODEL_BASE_SHA_FILE" "$MODEL_STARTED_AT_FILE" "$MODEL_GIT_FPR_FILE"
+  printf 'worker-live: action-lane brief written (base sha + git-state fingerprint recorded)\n'
+}
+
+# Action-lane phase 3 (worker.yml `model-action-post`): re-derive the recorded base sha and run
+# the SAME post-run contract as the CLI lane. Best-effort telemetry parity: the action's
+# execution_file IS the claude stream-json log, so the standard numeric-only extractor applies
+# (transcript content never leaves the runner, exactly like the CLI lane's withheld model log).
+run_model_postcheck() {
+  _model_context
+  # FIRST, before ANY git invocation in this phase: refuse a model-mutated .git/config or hooks
+  # dir (see _git_state_fingerprint — the action lane's substitute for the CLI lane's read-only
+  # .git mount). Pure file reads only up to this point, so poisoned git config never executes.
+  [[ -f "$MODEL_GIT_FPR_FILE" && ! -L "$MODEL_GIT_FPR_FILE" ]] ||
+    die 'action-lane git-state fingerprint record is missing'
+  local recorded_fpr current_fpr
+  recorded_fpr=$(<"$MODEL_GIT_FPR_FILE")
+  [[ "$recorded_fpr" =~ ^[0-9a-f]{64}$ ]] || die 'action-lane git-state fingerprint record is unsafe'
+  current_fpr=$(_git_state_fingerprint)
+  [[ "$current_fpr" == "$recorded_fpr" ]] ||
+    die 'action-lane model modified host-executable git state (.git/config or hooks); refusing to publish (fail closed)'
+  [[ -f "$MODEL_BASE_SHA_FILE" && ! -L "$MODEL_BASE_SHA_FILE" ]] ||
+    die 'action-lane base sha record is missing'
+  local base_sha
+  base_sha=$(<"$MODEL_BASE_SHA_FILE")
+  [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || die 'action-lane base sha record is unsafe'
+  local exec_file=${WORKER_ACTION_EXECUTION_FILE:-} started_at wall_seconds=0
+  if [[ -f "$MODEL_STARTED_AT_FILE" && ! -L "$MODEL_STARTED_AT_FILE" ]]; then
+    started_at=$(<"$MODEL_STARTED_AT_FILE")
+    [[ "$started_at" =~ ^[0-9]+$ ]] && wall_seconds=$(( $(date +%s) - started_at ))
+    [[ "$wall_seconds" -ge 0 ]] || wall_seconds=0
+  fi
+  if [[ -n "$exec_file" && -f "$exec_file" && ! -L "$exec_file" ]]; then
+    _extract_usage_telemetry "$exec_file" claude "$MODEL_WORKER_ROOT" "$wall_seconds" || true
+  fi
+  _model_postrun "$base_sha" claude-code-action
 }
 
 # [FABLE-5] Workspace-member discovery for the crate-scoped gate (defect #2, run 29634738177).
@@ -1887,6 +2020,49 @@ self_test() {
     "$( (_credential_mount_args /w/root /w/root/elsewhere/auth.json >/dev/null 2>&1 && echo ok) || echo refused)" \
     "refused"
 
+  # --- action-lane brief preamble (registry #563, OSS adoption 5): the opt-in
+  # claude-code-action lane must execute the SAME brief as the CLI lane — the preamble is a
+  # STATIC cwd anchor prepended ABOVE it, with the shared brief preserved byte-identical
+  # below. These flip red if the preamble stops anchoring `target/`, lands below the brief,
+  # or mutates the brief content (which would let harness lanes drift semantically). ---
+  local preamble_dir="$tmp/action-preamble"
+  mkdir -p "$preamble_dir"
+  printf '%s\n' 'SHARED-BRIEF-FIRST-LINE contract text' 'brief body line' \
+    > "$preamble_dir/brief.txt"
+  cp "$preamble_dir/brief.txt" "$preamble_dir/original.txt"
+  _prepend_action_lane_preamble "$preamble_dir/brief.txt"
+  chk "action-lane preamble opens with the execution-harness cwd anchor" \
+    "$(head -n1 "$preamble_dir/brief.txt" | grep -c 'Execution-harness note' || true)" "1"
+  chk "action-lane preamble anchors edits to the target/ subdirectory" \
+    "$(grep -c 'ALL edits inside `target/`' "$preamble_dir/brief.txt" || true)" "1"
+  chk "action-lane preamble keeps the shared brief byte-identical below it" \
+    "$(tail -n 2 "$preamble_dir/brief.txt")" "$(cat "$preamble_dir/original.txt")"
+  chk "action-lane preamble never duplicates the brief" \
+    "$(grep -c 'SHARED-BRIEF-FIRST-LINE' "$preamble_dir/brief.txt" || true)" "1"
+
+  # --- action-lane git-state fingerprint (registry #563): the lane's substitute for the CLI
+  # container's read-only .git mount. The postcheck refuses to proceed when .git/config or any
+  # hook drifted between phase 1 and phase 3 — a planted hook/fsmonitor would otherwise execute
+  # during the host-side publish git with the App token in env. These flip red if the
+  # fingerprint stops covering config edits, hook edits, or NEW hook files. ---
+  local fpr_dir="$tmp/git-state" fpr_a fpr_b fpr_c fpr_d
+  mkdir -p "$fpr_dir/.git/hooks"
+  printf '[core]\n\trepositoryformatversion = 0\n' > "$fpr_dir/.git/config"
+  printf '#!/bin/sh\nexit 0\n' > "$fpr_dir/.git/hooks/pre-commit.sample"
+  fpr_a=$( (cd "$fpr_dir" && _git_state_fingerprint) )
+  fpr_b=$( (cd "$fpr_dir" && _git_state_fingerprint) )
+  chk "git-state fingerprint is deterministic" "$fpr_a" "$fpr_b"
+  chk "git-state fingerprint is a 64-hex digest" \
+    "$( [[ "$fpr_a" =~ ^[0-9a-f]{64}$ ]] && echo ok || echo bad)" "ok"
+  printf '[core]\n\tfsmonitor = /tmp/evil.sh\n' >> "$fpr_dir/.git/config"
+  fpr_c=$( (cd "$fpr_dir" && _git_state_fingerprint) )
+  chk "git-state fingerprint catches a .git/config edit (fsmonitor plant)" \
+    "$( [[ "$fpr_c" != "$fpr_a" ]] && echo drifted || echo missed)" "drifted"
+  printf '#!/bin/sh\ncurl evil\n' > "$fpr_dir/.git/hooks/pre-push"
+  fpr_d=$( (cd "$fpr_dir" && _git_state_fingerprint) )
+  chk "git-state fingerprint catches a NEWLY planted hook" \
+    "$( [[ "$fpr_d" != "$fpr_c" ]] && echo drifted || echo missed)" "drifted"
+
   # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
   cat > "$tmp/claude.log" <<'LOG'
 non-json noise line
@@ -2555,13 +2731,32 @@ PY
   chk "post-gate token mint runs on a failed gate (always()-guarded)" \
     "$(_workflow_step_if "$wf" app-token-publish | grep -c 'always()' || true)" "1"
   chk "post-gate token mint still requires model success (fail-closed on model failure)" \
-    "$(_workflow_step_if "$wf" app-token-publish | grep -Fc "steps.model.outcome == 'success'" || true)" "1"
+    "$(_workflow_step_if "$wf" app-token-publish | grep -Fc "steps.model-outcome.outputs.outcome == 'success'" || true)" "1"
   chk "followups step runs on a failed gate (always()-guarded)" \
     "$(_workflow_step_if "$wf" followups | grep -c 'always()' || true)" "1"
   chk "the publish/PR step stays gate-gated — NOT always() (extractor is per-step, non-vacuous)" \
     "$(_workflow_step_if "$wf" pr | grep -c 'always()' || true)" "0"
   chk "the publish/PR step is guarded by gate success" \
     "$(_workflow_step_if "$wf" pr | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
+
+  # --- opt-in claude-code-action lane (registry #563, OSS adoption 5): the two harness lanes
+  # must stay MUTUALLY exclusive on the harness-mode resolver, the shared postcheck must be
+  # chained on the action step, the gate must consume the UNIFIED outcome (or an action-lane
+  # success could never reach the gate), and the action reference must stay the 40-hex-pinned
+  # anthropics action (a swap to another action name/ref flips this red even though the
+  # repo-wide pr-gate pin assertion would still pass on any 40-hex pin). ---
+  chk "cli model step yields to the opt-in action lane (mode != 'action')" \
+    "$(_workflow_step_if "$wf" model | grep -Fc "steps.harness-mode.outputs.mode != 'action'" || true)" "1"
+  chk "action brief step runs ONLY on the opt-in action lane" \
+    "$(_workflow_step_if "$wf" model-action-brief | grep -Fc "steps.harness-mode.outputs.mode == 'action'" || true)" "1"
+  chk "action harness step runs ONLY on the opt-in action lane" \
+    "$(_workflow_step_if "$wf" model-action | grep -Fc "steps.harness-mode.outputs.mode == 'action'" || true)" "1"
+  chk "action postcheck is chained on the action step's success" \
+    "$(_workflow_step_if "$wf" model-action-post | grep -Fc "steps.model-action.outcome == 'success'" || true)" "1"
+  chk "local gate consumes the UNIFIED model outcome (both lanes reach it)" \
+    "$(_workflow_step_if "$wf" gate | grep -Fc "steps.model-outcome.outputs.outcome == 'success'" || true)" "1"
+  chk "claude-code-action reference stays the 40-hex-pinned anthropics action" \
+    "$(grep -Ec 'uses: anthropics/claude-code-action@[0-9a-f]{40}( |$)' "$wf" || true)" "1"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
@@ -2767,6 +2962,8 @@ FAKE
 
 case "${1:-}" in
   model) run_model ;;
+  model-prompt) run_model_prompt ;;
+  model-postcheck) run_model_postcheck ;;
   gate) run_gate ;;
   publish) publish_pr ;;
   review) run_review ;;
@@ -2774,5 +2971,5 @@ case "${1:-}" in
   push-fix) push_fix ;;
   write-back) write_back ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|model-prompt|model-postcheck|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
 esac
