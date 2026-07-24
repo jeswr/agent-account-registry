@@ -6,14 +6,6 @@
    "account": "9e13ea21abf27e68",
    "model_alias": "fable",
    "exit_class": "unknown",
-   "run_id": "30059914980.1"
-  },
-  {
-   "ts": 1784857719,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "fable",
-   "exit_class": "unknown",
    "run_id": "30059918487.1"
   },
   {
@@ -1599,6 +1591,14 @@
    "model_alias": "fable",
    "exit_class": "unknown",
    "run_id": "30069496744.1"
+  },
+  {
+   "ts": 1784870942,
+   "provider": "anthropic",
+   "account": "9e13ea21abf27e68",
+   "model_alias": "fable",
+   "exit_class": "unknown",
+   "run_id": "30069511321.1"
   }
  ]
 }
