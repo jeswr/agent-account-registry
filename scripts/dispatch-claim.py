@@ -223,17 +223,22 @@ BLOCKED_BY_RE = re.compile(r"[Bb]locked-by:\s*#([0-9]+)")
 # CONTENT author's provider and is computed HERE, never through policy-resolve.resolve() (whose
 # role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
 # Model policy (maintainer directive 2026-07-18): sol — the codex-side frontier model — is THE
-# reviewer of anthropic-authored content (luna is its fallback); opus stays lead reviewer of
-# openai-authored content (proven verdict quality + the security-surface doctrine). terra and
+# reviewer of anthropic-authored content (luna is its fallback); opus5 (Opus 5, maintainer
+# directive 2026-07-24) takes the primary reviewer slot for openai-authored content that opus
+# held, with opus/fable retained as TAIL FALLBACKS only — a degradation path so an opus5
+# capacity outage parks work gracefully instead of stalling the chain. terra and
 # sonnet are DOCS-ONLY models and must NEVER appear in a review/fix chain (asserted in
 # _self_test; review-fix.yml + worker-pr.py ESCALATION_LADDERS enforce the same).
-REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
+REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]}
 # FIX_CHAIN is the UNPINNED allocator PREFERENCE walk (strongest tier FIRST — choose_account
-# takes the first serving account, and the frontier tier leads per the sol-first doctrine).
+# takes the first serving account, and the frontier tier leads per the sol-first doctrine;
+# opus5 leads the anthropic walk since 2026-07-24, fable/opus as tail fallbacks).
 # It is deliberately the REVERSE of worker_pr.ESCALATION_LADDERS, which are capability-
-# ASCENDING (weakest first, terminal strongest LAST; opus < luna < fable < sol) and govern
+# ASCENDING (weakest first, terminal strongest LAST; opus < luna < fable < opus5 < sol —
+# opus5 is the top ANTHROPIC tier per the 2026-07-24 directive; sol keeps the global frontier
+# slot, cross-provider order unchanged) and govern
 # exhaustion escalation + pinned floors (sol r2 f2 fixed the previously inverted ladders).
-FIX_CHAIN = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
+FIX_CHAIN = {"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]}
 # Probe-exempt PROVIDERS for the require_usage hold (issue #115). Mirrors account-usage.py's
 # EXEMPT_PROVIDERS allowlist (the maintainer decision names openai): codex/openai accounts report
 # no rate-limit-header usage and are governed by reactive backoff, so a usage=None probe outage is
@@ -5697,6 +5702,7 @@ def _self_test():
                         "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
                         "security": False, "context": ""}
             routing_ok = {"models": {
+                "opus5": {"provider_model": "claude-opus-5", "harness": "claude"},
                 "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
                 "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
                 "sol": {"provider_model": "TBD", "harness": "codex"},
@@ -5716,7 +5722,7 @@ def _self_test():
             write_verdict(1, None)
             alloc = FakeAllocator()
             launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert launched == 0 and alloc.chains == [["fable", "opus"]], \
+            assert launched == 0 and alloc.chains == [["opus5", "fable", "opus"]], \
                 (launched, alloc.chains)
             assert run_items.fix_dispatch["eligible"] == 1, run_items.fix_dispatch
             assert reasons["fix:no-slot"] == 1, reasons
@@ -5730,7 +5736,8 @@ def _self_test():
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]), comments=[])
 
             # ACT: base budget spent on OPUS -> extension escalates UP the ladder
-            # (opus < fable, sol r2 f2), fable pin converged, and a chain WITHOUT opus;
+            # (opus < fable < opus5, sol r2 f2 + 2026-07-24), fable pin converged, and a chain
+            # WITHOUT opus (floor-and-above: fable + opus5);
             # the None claim then defers with a missed marker, NOT needs-user
             fake["comments"] = round_markers(3) + [
                 bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
@@ -5743,7 +5750,7 @@ def _self_test():
                 ("worker-pr.py", "record-marker")], helper_calls
             pin_args = helper_calls[0][1]
             assert pin_args[pin_args.index("--tier") + 1] == "fable", pin_args
-            assert alloc.chains == [["fable"]], alloc.chains
+            assert alloc.chains == [["fable", "opus5"]], alloc.chains
 
             # DO-NOTHING flip: under budget -> no pin call, the DEFAULT fix chain is offered
             fake["comments"] = round_markers(2)
@@ -5752,39 +5759,41 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
 
             # a recorded bot pin governs the chain even under budget (the floor never lowers) —
-            # a fable floor offers ONLY fable (tiers below the floor are never offered) ...
+            # a fable floor offers only floor-and-above (fable + opus5; tiers below the floor
+            # are never offered) ...
             fake["comments"] = round_markers(2) + [
                 bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->")]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable"]], alloc.chains
+            assert alloc.chains == [["fable", "opus5"]], alloc.chains
             # ... while a NON-bot forged pin marker is inert (bot-login trust filter)
             fake["comments"] = round_markers(2) + [
                 {"user": {"login": "mallory"}, "created_at": "2026-07-30T00:00:00Z",
                  "body": f"z {pin_marker} round=1 tier=fable run=6.6 -->"}]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
 
-            # top tier ran + latest verdict improving -> progress extension (pin floor kept)
+            # top tier (opus5, 2026-07-24) ran + latest verdict improving -> progress
+            # extension (pin floor kept)
             fake["comments"] = round_markers(4) + [
                 bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->"),
-                bot_comment(f"z {pin_marker} round=3 tier=fable run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=3 model=opus5 run=3.9 -->"),
+                bot_comment(f"z {pin_marker} round=3 tier=opus5 run=3.9 -->")]
             write_verdict(4, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["fable"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
 
             # flip-goes-red: top tier + stagnant -> the loud terminal needs-user, no claim
             fake["comments"] = round_markers(4) + [
                 bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=3 model=opus5 run=3.9 -->")]
             write_verdict(4, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -5810,7 +5819,7 @@ def _self_test():
                         if script == "worker-pr.py" and args[0] == "needs-user"]
 
             burned_era = stamped_rounds(5, "2026-07-22T05:00:00Z") + [
-                dict(bot_comment(f"x {fix_model} round=4 model=fable run=4.9 -->"),
+                dict(bot_comment(f"x {fix_model} round=4 model=opus5 run=4.9 -->"),
                      created_at="2026-07-22T05:30:00Z")]
             # (1) human unlabel on the SOURCE ISSUE after 5 burned rounds => effective count
             # 0 => NO budget park; the fix chain is offered again (the missed-marker defer is
@@ -5822,7 +5831,7 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
             # (2) rounds recorded AFTER the unlabel count normally: 2 post-unlabel rounds
             # (base 3) stay under budget even though the GLOBAL count (7) is at the hard cap.
             fake["comments"] = burned_era + stamped_rounds(
@@ -5832,7 +5841,7 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
             # (3) a BOT unlabel does NOT reset: the full 5-round count stands and the
             # terminal park fires with the historical charge.
             fake["comments"] = burned_era
@@ -6008,12 +6017,12 @@ def _self_test():
             assert alloc.chains == [], alloc.chains
             fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
 
-            # flip-goes-red: the same posture whose latest fix ran BELOW the recorded fable
+            # flip-goes-red: the same posture whose latest fix ran BELOW the recorded opus5
             # floor (a pin violation / forged marker) mints NO re-review — with the top tier
             # already graded stagnant it is the loud terminal instead
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
-                bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->"),
+                bot_comment(f"x {fix_model} round=1 model=opus5 run=1.9 -->"),
+                bot_comment(f"z {pin_marker} round=1 tier=opus5 run=1.5 -->"),
                 bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
@@ -6041,7 +6050,7 @@ def _self_test():
             # would-be terminal needs-user (the flip-goes-red posture above)
             fake["comments"] = round_markers(4) + [
                 bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=3 model=opus5 run=3.9 -->")]
             write_verdict(4, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
@@ -6108,7 +6117,7 @@ def _self_test():
             write_verdict(2, None, root=wiring_ledger_root)
             alloc = FakeAllocator()
             launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
             # a deferring (None-claim) allocator is contention, NOT ledger rot: no lease-error,
             # ledger stays ok, and the zero-dispatch tick stays green
             assert launched == 0 and reasons["lease-error"] == 0, (launched, reasons)
@@ -6196,6 +6205,8 @@ def _self_test():
             # A routing catalog carrying the model `provider` field (as the live routing.toml
             # does): anthropic models are probe-GATED, openai/codex models are probe-EXEMPT.
             routing_prov = {"models": {
+                "opus5": {"provider": "anthropic", "provider_model": "claude-opus-5",
+                          "harness": "claude"},
                 "fable": {"provider": "anthropic", "provider_model": "claude-fable-5",
                           "harness": "claude"},
                 "opus": {"provider": "anthropic", "provider_model": "claude-opus-4-8",
@@ -6218,13 +6229,13 @@ def _self_test():
             # policy (require_usage unset) still dispatches — a non-opted-in repo is unchanged.
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_prov, usage=None)
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
             # (c) the hold is CONDITIONED on the OUTAGE: require_usage with a LIVE usage map
             # dispatches (usage!=None is not a probe failure).
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_prov,
                       policy=usage_gated, usage={"acct01": {"ok": True}})
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
             # (d) a probe-EXEMPT (codex/openai) REVIEW chain PROCEEDS despite usage=None: absent
             # usage is its expected steady state (reactive backoff), so the hold must NOT gate it.
             exempt_review = dict(fix_item, state="needs-review")
@@ -7214,12 +7225,14 @@ def _self_test():
         "sol": {"provider": "openai", "harness": "codex"},
         "luna": {"provider": "openai", "harness": "codex"},
         "opus": {"provider": "anthropic", "harness": "claude"},
+        "opus5": {"provider": "anthropic", "harness": "claude"},
         "fable": {"provider": "anthropic", "harness": "claude"},
         "mystery": {"harness": "codex"},                 # no provider field
         "typo": {"provider": "openia", "harness": "codex"},  # misspelled provider
     }}
     assert _chain_probe_exempt(["sol", "luna"], prov_routing) is True
     assert _chain_probe_exempt(["opus", "fable"], prov_routing) is False   # anthropic gated
+    assert _chain_probe_exempt(["opus5", "opus"], prov_routing) is False   # opus5 gated too
     assert _chain_probe_exempt(["sol", "opus"], prov_routing) is False     # mixed -> gated
     assert _chain_probe_exempt(["sol", "mystery"], prov_routing) is False  # missing provider
     assert _chain_probe_exempt(["sol", "typo"], prov_routing) is False     # unknown provider

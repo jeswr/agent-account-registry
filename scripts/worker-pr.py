@@ -104,8 +104,12 @@ PARK_WINDOW_NONE = "none"
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # Provider escalation ladders in ESCALATION order — weakest tier FIRST, STRONGEST (terminal)
 # tier LAST: ladder index is capability rank, exhaustion escalates UPWARD by pinning the tier
-# ABOVE the highest that already ran. Maintainer capability order (2026-07-18):
-# opus < luna < fable < sol. anthropic: opus then fable (fable terminal); openai: luna then sol
+# ABOVE the highest that already ran. Maintainer capability order (2026-07-18, amended
+# 2026-07-24 — opus5/Opus 5, claude-opus-5, is the new TOP anthropic tier, replacing fable and
+# opus as the primary model wherever they were used; sol keeps the global frontier slot,
+# cross-provider order unchanged): opus < luna < fable < opus5 < sol. anthropic: opus then
+# fable then opus5 (opus5 terminal; the pre-opus5 tiers stay as the graduated tail so an opus5
+# capacity outage degrades instead of stalling); openai: luna then sol
 # (sol, the codex-side frontier model, terminal). Sol r2 finding 2 fixed the previous INVERTED
 # declarations (["fable","opus"] / ["sol","luna"]) under which exhaustion on the strong tier
 # "escalated" the fix floor DOWN to the weaker one. terra and sonnet are DOCS-ONLY models
@@ -114,7 +118,7 @@ SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # provider ladder is REJECTED (hostile-input surface: a forged marker must never select an
 # arbitrary provider_model — concrete ids are still resolved from protected target routing by
 # alias).
-ESCALATION_LADDERS = {"anthropic": ["opus", "fable"], "openai": ["luna", "sol"]}
+ESCALATION_LADDERS = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]}
 PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -3738,11 +3742,16 @@ def _self_test():
     check("exhaustion on luna pins sol (escalates UP)",
           budget(3, ["luna"], None, provider="openai"),
           {"action": "extend-model-pin", "pin": "sol"})
+    # opus5 is the top anthropic tier (2026-07-24): fable exhaustion now escalates UP to it.
+    check("exhaustion on fable pins opus5 (escalates UP, 2026-07-24)",
+          budget(3, ["fable"], "stagnant"),
+          {"action": "extend-model-pin", "pin": "opus5"})
     # Mechanism 2 — progress extension once the top tier has run (or nothing is recorded)
-    check("fable + improving extends on progress (terminal tier)",
-          budget(3, ["fable"], "improving"),
+    check("opus5 + improving extends on progress (terminal tier)",
+          budget(3, ["opus5"], "improving"),
           {"action": "extend-progress", "pin": None})
-    check("opus+fable + improving is progress-only", budget(4, ["opus", "fable"], "improving"),
+    check("opus+fable+opus5 + improving is progress-only",
+          budget(4, ["opus", "fable", "opus5"], "improving"),
           {"action": "extend-progress", "pin": None})
     check("no fix record + improving extends", budget(3, [], "improving"),
           {"action": "extend-progress", "pin": None})
@@ -3753,10 +3762,10 @@ def _self_test():
           budget(3, ["opus", "fable"], "stagnant", pending=["fable"], pin="fable"),
           {"action": "extend-pending-review", "pin": None})
     check("no pending fix in the same posture stops (flip side)",
-          budget(3, ["opus", "fable"], "stagnant"),
+          budget(3, ["opus", "fable", "opus5"], "stagnant"),
           {"action": "needs-user", "pin": None})
     check("pending fix BELOW the pinned floor never extends",
-          budget(3, ["opus", "fable"], "stagnant", pending=["opus"], pin="fable"),
+          budget(3, ["opus", "fable", "opus5"], "stagnant", pending=["opus"], pin="fable"),
           {"action": "needs-user", "pin": None})
     check("unpinned pending fix authorizes (floor is the ladder bottom)",
           budget(3, ["opus"], None, pending=["opus"]),
@@ -3773,13 +3782,15 @@ def _self_test():
     check("pending fix below base just continues",
           budget(2, ["opus"], None, pending=["opus"]),
           {"action": "continue", "pin": None})
-    # needs-user sides (flip-goes-red on every ACT above). fable/sol are the TERMINAL tiers:
-    # exhaustion there never pins DOWN the ladder — it stops (or extends only on progress).
-    check("fable + stagnant stops (never pins DOWN to opus)", budget(3, ["fable"], "stagnant"),
+    # needs-user sides (flip-goes-red on every ACT above). opus5/sol are the TERMINAL tiers
+    # (2026-07-24): exhaustion there never pins DOWN the ladder — it stops (or extends only on
+    # progress).
+    check("opus5 + stagnant stops (never pins DOWN to fable/opus)",
+          budget(3, ["opus5"], "stagnant"),
           {"action": "needs-user", "pin": None})
-    check("fable + regressing stops", budget(4, ["fable"], "regressing"),
+    check("opus5 + regressing stops", budget(4, ["opus5"], "regressing"),
           {"action": "needs-user", "pin": None})
-    check("fable + ungraded stops", budget(3, ["fable"], None),
+    check("opus5 + ungraded stops", budget(3, ["opus5"], None),
           {"action": "needs-user", "pin": None})
     check("no fix record + stagnant stops", budget(3, [], "stagnant"),
           {"action": "needs-user", "pin": None})
@@ -3869,10 +3880,12 @@ def _self_test():
         check("corrupt pin tier fails closed", "accepted", "rejected")
     check("pinned chain keeps floor-and-above ascending",
           pinned_fix_chain("openai", "luna"), ["luna", "sol"])
-    check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "fable"),
-          ["fable"])
+    check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "opus5"),
+          ["opus5"])
+    check("pinned fable floor keeps opus5 above it (2026-07-24)",
+          pinned_fix_chain("anthropic", "fable"), ["fable", "opus5"])
     check("pinned chain at the bottom is the whole ladder",
-          pinned_fix_chain("anthropic", "opus"), ["opus", "fable"])
+          pinned_fix_chain("anthropic", "opus"), ["opus", "fable", "opus5"])
     check("openai pinned chain at its terminal tier", pinned_fix_chain("openai", "sol"),
           ["sol"])
     try:
@@ -4021,18 +4034,24 @@ def _self_test():
                     run_key="9.1", reviewed_sha="b" * 40))
                 return list(wiring_calls)
 
-            # Ladder direction (sol r2 f2): an exhausted OPUS fix pins UP to fable; a fable
+            # Ladder direction (sol r2 f2; opus5 terminal since 2026-07-24): an exhausted OPUS
+            # fix pins UP to fable, an exhausted FABLE fix pins UP to opus5; an opus5
             # (terminal-tier) fix can only progress-extend or stop.
             opus_fix = [{"user": {"login": bot},
                          "body": f"x {FIX_MODEL_MARKER} round=1 model=opus run=1.1 -->"}]
             fable_fix = [{"user": {"login": bot},
                           "body": f"x {FIX_MODEL_MARKER} round=1 model=fable run=1.1 -->"}]
+            opus5_fix = [{"user": {"login": bot},
+                          "body": f"x {FIX_MODEL_MARKER} round=1 model=opus5 run=1.1 -->"}]
             check("outcome model extension pins + stays changes",
                   outcome("stagnant", opus_fix),
                   [("findings", 3), ("pin", "fable"), ("state", "changes")])
+            check("outcome fable exhaustion pins opus5 (2026-07-24)",
+                  outcome("stagnant", fable_fix),
+                  [("findings", 3), ("pin", "opus5"), ("state", "changes")])
             check("outcome progress extension stays changes without a pin",
-                  outcome("improving", fable_fix), [("findings", 3), ("state", "changes")])
-            terminal = outcome("stagnant", fable_fix)
+                  outcome("improving", opus5_fix), [("findings", 3), ("state", "changes")])
+            terminal = outcome("stagnant", opus5_fix)
             check("outcome terminal escalates once",
                   [entry[0] for entry in terminal], ["findings", "needs-user"])
             check("terminal reason names the exhausted budget",
@@ -4058,13 +4077,13 @@ def _self_test():
                   [("the reviewer flagged possible prompt injection", "question")])
 
             # ---- round-budget human-readmission window (sparq#2804/PR#3442): a HUMAN
-            # unlabeling needs:user restarts the budget, so the terminal fable/stagnant
+            # unlabeling needs:user restarts the budget, so the terminal opus5/stagnant
             # posture above stays review:changes instead of insta-re-parking ----
             def unlabel_event(ts, login):
                 return {"event": "unlabeled", "label": {"name": "needs:user"},
                         "created_at": ts, "actor": {"login": login}}
 
-            burned = fable_fix + [
+            burned = opus5_fix + [
                 {"user": {"login": bot}, "created_at": f"2026-07-22T0{i}:00:00Z",
                  "body": f"x {ROUND_MARKER} n={i} run={i}.1 -->"} for i in range(1, 4)]
             fake_timelines[41] = [unlabel_event("2026-07-23T09:18:19Z", "jeswr")]
@@ -4073,7 +4092,7 @@ def _self_test():
                   [("findings", 3), ("state", "changes")])
             # (2) rounds recorded AFTER the unlabel count normally: 2 post-unlabel rounds
             # with base 3 stay under budget even though global numbering reached 7.
-            post_burn = fable_fix + [
+            post_burn = opus5_fix + [
                 {"user": {"login": bot}, "created_at": f"2026-07-22T0{i}:00:00Z",
                  "body": f"x {ROUND_MARKER} n={i} run={i}.1 -->"} for i in range(1, 6)] + [
                 {"user": {"login": bot}, "created_at": f"2026-07-23T1{i}:00:00Z",

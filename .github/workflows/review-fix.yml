@@ -163,7 +163,7 @@ jobs:
           # the provenance-bound implementer provider in the resolve step below). terra and
           # sonnet are DOCS-ONLY models (maintainer directive 2026-07-18) and this lane is
           # never docs, so a terra/sonnet pin is rejected outright.
-          if model_pin and model_pin not in {"fable", "opus", "sol", "luna"}:
+          if model_pin and model_pin not in {"opus5", "fable", "opus", "sol", "luna"}:
               raise SystemExit("model_pin must be empty or an escalation-ladder tier")
           if mode == "review" and model_pin:
               raise SystemExit("review mode takes no model pin")
@@ -454,10 +454,15 @@ jobs:
           # the proven codex drain passes no --model flag (CLI default), and worker-live.sh omits
           # --model in that case — so an unpinned sol/luna never stalls the common
           # anthropic-implemented direction. A claude alias still needs a concrete id.
-          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
-          fix_chain = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
+          # Opus 5 (maintainer directive 2026-07-24): opus5 takes the primary slot on
+          # every chain where fable/opus led; the old tiers stay as TAIL FALLBACKS only, a
+          # degradation path so an opus5 capacity outage parks work gracefully instead of
+          # stalling the chain. Mirrors dispatch-claim.py REVIEW_CHAIN/FIX_CHAIN.
+          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]}
+          fix_chain = {"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]}
           # Escalation ladders in escalation order — weakest tier FIRST, STRONGEST (terminal)
-          # tier LAST per the maintainer capability order opus < luna < fable < sol — mirrors
+          # tier LAST per the maintainer capability order opus < luna < fable < opus5 < sol
+          # (2026-07-24: opus5 is the top ANTHROPIC tier; cross-provider order unchanged) — mirrors
           # worker-pr.py ESCALATION_LADDERS (directives 2026-07-17/18; sol r2 f2 fixed the
           # previously INVERTED order under which exhaustion pinned the weaker tier). A pinned
           # fix-model FLOOR replaces the default fix chain with the ladder tiers at/above the
@@ -466,7 +471,7 @@ jobs:
           # later tick instead of burning the extended round budget on the model that already
           # failed; see dispatch-claim.py). A pin outside the implementer provider's ladder
           # fails closed.
-          ladders = {"anthropic": ["opus", "fable"], "openai": ["luna", "sol"]}
+          ladders = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]}
           # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are
           # DOCS-ONLY — review-fix has no docs lane, so their appearance in ANY chain here is a
           # policy defect. Fail closed before any claim can run on the wrong model.
