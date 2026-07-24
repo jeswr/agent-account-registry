@@ -1308,7 +1308,7 @@ printf '5\n'
             body_file = os.path.join(tmp, "issue-body.txt")
             with open(body_file, "w", encoding="utf-8") as fh:
                 fh.write("provider: anthropic\nharness: claude\n"
-                         "models: [fable, opus, sonnet, haiku]\n"
+                         "models: [opus5, fable, opus, sonnet, haiku]\n"
                          "credential_format: claude-oauth-token\n"
                          "max_concurrent_workers: 1\n"
                          f"secret_ref: {secret_ref}\n"

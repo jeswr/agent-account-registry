@@ -22,7 +22,7 @@ front-matter (no secrets):
 provider: anthropic          # anthropic | openai
 harness: claude              # claude | codex
 credential_format: claude-oauth-token
-models: [opus, sonnet, haiku, fable]   # or [sol, luna, terra] for openai; enables model-fallback routing
+models: [opus5, fable, opus, sonnet, haiku]   # or [sol, luna, terra] for openai; enables model-fallback routing
 tier:
   weekly_limit: "..."        # human note of the plan's weekly cap
   five_hour_limit: "..."     # the rolling 5h window cap
@@ -68,7 +68,7 @@ slot automatically — no receipt-guessing).
 `scripts/select-and-claim.py` (added in Phase 3) takes `(package, role, model-chain)` and returns an
 opaque claim (which secret to use) or `none-free`:
 
-1. Walk the **model fallback chain** (e.g. `sol → fable`) to the first provider/model with a
+1. Walk the **model fallback chain** (e.g. `sol → opus5 → fable`) to the first provider/model with a
    non-full, non-reset-exhausted account.
 2. Among eligible accounts, prefer the one with **prompt-cache affinity** — most recently used for the
    same `package`+`role` within the provider's cache window (Anthropic prompt cache ≈ 5-min TTL), to
@@ -88,7 +88,8 @@ a rolling `data/cache-affinity.json`), never in the public repos.
 - **UI/front-end surfaces route to the openai/codex model chain** (original-builder ownership:
   **GPT-5.6 built the registry dashboard, `e4098b9`**). Repos onboarded to the registry inherit
   this default. Machine-readable form: the `role = "site"` route (`model_chain = ["sol",
-  "fable", "opus"]` — sol-led; terra/sonnet are docs-only, 2026-07-18) in this repo's
+  "opus5", "fable", "opus"]` — sol-led; opus5 primary Anthropic tier since 2026-07-24;
+  terra/sonnet are docs-only, 2026-07-18) in this repo's
   `orchestration/routing.toml`; when onboarding a new target
   repo in `policy/repos.toml`, mirror that route into the target's own routing table
   (`sparq-org/sparq` already carries it). `scripts/triage.py` derives `role:site` from the exact
@@ -97,12 +98,14 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   `match_labels` keywords, so UI keywords there would security-classify every UI PR (post-Decision-7 revision: an audit trail, not a park).
 
 - **Frontier-tier agents author ALL CI/infrastructure work** (maintainer decision 2026-07-17):
-  GPT-5.6 sol (openai; alias `sol`) or Claude Fable (`fable`) — explicitly including the
+  GPT-5.6 sol (openai; alias `sol`) or the Anthropic frontier tier (`opus5` primary since
+  2026-07-24, `fable` as its tail fallback) — explicitly including the
   self-draining pipeline infrastructure itself (dispatch, workers, gate aggregators,
   `.github/workflows`, orchestration scripts). Cheaper tiers (sonnet/haiku) no longer author
   infra, and terra/sonnet are docs-only (2026-07-18); cross-provider review is unchanged
   (whichever provider's frontier writes, the other
-  reviews). Machine-readable form: the `role = "ci"` route (`model_chain = ["sol", "fable"]`)
+  reviews). Machine-readable form: the `role = "ci"` route (`model_chain = ["sol", "opus5",
+  "fable"]`)
   in this repo's `orchestration/routing.toml`; mirror a frontier-only ci chain into each
   onboarded target's routing table (`sparq-org/sparq` carries it, sparq PR #3422).
   `scripts/triage.py` derives `role:ci` from the exact infra-surface labels (`area:ci`,
@@ -194,7 +197,7 @@ body='provider: anthropic
 harness: claude
 credential_format: claude-oauth-token
 email: "<the account login email — a setup-token CANNOT introspect it (403 on /api/oauth/profile); fill from the account you logged in as>"
-models: [opus, sonnet, haiku, fable]
+models: [opus5, fable, opus, sonnet, haiku]
 max_concurrent_workers: 1
 secret_ref: ACCT05_TOKEN
 notes: "claude setup-token (long-lived, non-rotating). [your-marker]"'
