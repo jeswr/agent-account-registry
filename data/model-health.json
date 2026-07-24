@@ -1,14 +1,6 @@
 {
  "records": [
   {
-   "ts": 1784847292,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30050858809.1"
-  },
-  {
    "ts": 1784847320,
    "provider": "anthropic",
    "account": "9e13ea21abf27e68",
@@ -1599,6 +1591,14 @@
    "model_alias": "fable",
    "exit_class": "unknown",
    "run_id": "30063027690.1"
+  },
+  {
+   "ts": 1784862308,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "success",
+   "run_id": "30062753418.1"
   }
  ]
 }
