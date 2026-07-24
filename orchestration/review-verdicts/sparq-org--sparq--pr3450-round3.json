@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3450,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2a2b94feb0e0a0d7c57a3f4b3129bf9fea14854e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. The new auth_sum helper is a direct fallible auth_add fold, rejects empty input, and inherits party-point validation from auth_add. Its public rustdoc and the MPC skill accurately limit the MAC-preservation claim to same-session, honestly formed inputs, explicitly state that auth_sum does not call mac_check, require a successful caller-side batched check before opening or relying on the result, and retain the research-grade/external-audit-pending sq-qhy4 caveat. The non-empty test exercises the actual helper, verifies the reconstructed sum and MAC relation, and compares against an explicit fold; the empty test covers fail-closed behavior. This is consistent with research/mpc-malicious-security-design.md \u00a72.3. No correctness, soundness, test-validity, security, or honesty defect is evident.",
+  "verdict": "approve"
+ }
+}
