@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3572,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e6be76ed97b803f0aa7b4e07ef79c444a9dcc019",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 re-verifies the advisory mutation-review lane against the live repo; no issues remain. Confirmed: (1) the ci-summary aggregator (ci-summary.yml:55) and check-advisory-registry.py:59 both use the exact word-boundary regex \\b(advisory|informational)\\b, and the job NAME 'changed-code mutation review (advisory)' matches it, so a failing/continue-on-error advisory job is excluded from the gating set. (2) The new advisory-registry.json entry carries the required {owner_bead=sq-qcnn.30, promotion_criteria, registered} fields; mutants-diff.sh is not a scripts/*gate*.py, so no gate_script_waiver is required (C3 clean). (3) All five pinned action SHAs (checkout@9c091bb, rust-toolchain@29eef33, rust-cache@e18b497, upload-artifact@043fb46, install-action@43aecc8) are the canonical pins reused across the existing workflow tree. (4) Trigger is pull_request (not pull_request_target) with permissions contents:read and no secret exposure \u2014 the safe pattern for building/running untrusted PR code with a read-only token. (5) The deterministic cap invariant holds: SHARDS=ceil(TOTAL/CAP) and shard 0 = ceil(TOTAL/SHARDS) <= CAP by the identity ceil(n/ceil(n/k)) <= k, robust to contiguous or modulo sharding; SHARDS>1 guard, --no-shuffle determinism, and the reported SELECTED all agree. (6) Input validation on CAP/TIMEOUT, empty-diff, list-enumeration failure (exit 1, tolerated by continue-on-error), zero-mutant, and survivor-count-from-missed.txt are all handled under set -euo pipefail with a scoped set +e around the mutants run; missing trailing newline in the registry is fixed. No blocker/major/minor/nit findings.",
+  "verdict": "approve"
+ }
+}
