@@ -57,6 +57,7 @@
 #   }
 import argparse
 import base64
+import importlib.util
 import json
 import os
 import re
@@ -64,6 +65,16 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+
+# Shared bounded-retry mechanics for IDEMPOTENT gh reads (registry #563 adoption item 4;
+# sparq#3759 / #558 transient-red class). READS ONLY — the ledger CAS writers below keep their
+# own deliberate conflict/fail-loud semantics and are NEVER routed through this wrapper.
+_gh_retry_spec = importlib.util.spec_from_file_location(
+    "registry_gh_retry", os.path.join(os.path.dirname(__file__), "gh_retry.py"))
+if _gh_retry_spec is None or _gh_retry_spec.loader is None:
+    raise RuntimeError("cannot load shared gh retry policy")
+gh_retry = importlib.util.module_from_spec(_gh_retry_spec)
+_gh_retry_spec.loader.exec_module(gh_retry)
 
 # Keep in sync with select-and-claim.py / groom.py / model-health.py LEDGER_REF (issue #28 data
 # plane). Every write pins this ref; readers fail LOUD if the branch is missing.
@@ -388,7 +399,11 @@ def _gh_json(args, token, what):
     env = dict(os.environ)
     if token:
         env["GH_TOKEN"] = token
-    proc = subprocess.run(["gh"] + args, capture_output=True, text=True, env=env)
+    # Every _gh_json call site is an idempotent READ (search counts, --paginate lists,
+    # actions-run reads), so transient 5xx/secondary-403/connection blips get gh_retry's bounded
+    # backoff (registry #563 item 4 — the 16:00-class 503 red) instead of redding the whole tick.
+    # Mutations (_gh: issue create/edit/comment) and the ledger CAS writers stay fail-loud.
+    proc = gh_retry.run_gh(args, env=env)
     if proc.returncode != 0:
         raise MetricsError(f"gh {what} failed (rc={proc.returncode})")
     try:

@@ -19,6 +19,7 @@ The registry has no cargo build — the gate profile is `registry-selftest` (`sc
 
 ## Fail-closed philosophy — NEVER weaken a trust check
 - A missing owner/token/label/route/gate must **DEFER or DIE**, never silently pick a default that grants access. Prefer "refuse and surface" over "guess and proceed".
+- **Retry via `scripts/gh_retry.py` for idempotent reads; NEVER wrap CAS/ledger writes or mutation-confirmations.** Transient 5xx/secondary-403/connection blips on a read get the shared bounded backoff; a replayed mutation can double-dispatch a worker (#559) and a wrapped ledger CAS write consumes the conflict signal its caller's own re-read loop keys on (#558). Do not hand-roll new retry/sleep loops.
 - **Never weaken a trust check to make a test or gate pass**: do not delete/skip/relax a self-test, a security-label route, an exact-match target assertion, the `needs:design` hard gate, the per-owner token map, or the arm-side `trust_surface_paths_touched` classifier. If the honest fix is larger than your scope, stop and say so.
 - Keep the security surfaces load-bearing: `orchestration/routing.toml` `match_labels` keywords feed the arm-side classifier AND model selection; do not thin them.
 

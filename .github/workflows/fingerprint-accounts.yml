@@ -10,6 +10,11 @@ name: fingerprint-accounts
 on:
   workflow_dispatch: {}
 permissions: {}
+# Manual-only diagnostic; singleton so a double manual fire queues instead of interleaving
+# two fleet-wide probe sweeps (#559 concurrency-hygiene audit; registry #563 item 1).
+concurrency:
+  group: fingerprint-accounts-singleton
+  cancel-in-progress: false
 jobs:
   fingerprint:
     runs-on: ubuntu-latest

@@ -34,6 +34,22 @@ def _load_park_policy() -> Any:
 _park_policy = _load_park_policy()
 
 
+def _load_gh_retry() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "registry_gh_retry", Path(__file__).resolve().with_name("gh_retry.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load shared gh retry policy")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Shared bounded-retry mechanics for IDEMPOTENT gh reads (registry #563 adoption item 4): the
+# 16:00 incident redded a whole curate tick on one transient 503. READS ONLY — execute_plan's
+# label/close mutations stay fail-loud and are never routed through this wrapper.
+_gh_retry = _load_gh_retry()
+
+
 TARGET_READY = 12
 MAX_CLOSES = 5
 GATE_LABELS = ("needs:", "trust:untrusted")
@@ -580,16 +596,18 @@ def _gh_env(token: str) -> dict[str, str]:
 
 
 def _gh_json(args: list[str], token: str) -> Any:
+    # Every _gh_json call site is an idempotent READ (issue/label/timeline/collaborator lists),
+    # so a transient 5xx/secondary-403/connection blip gets gh_retry's bounded backoff instead of
+    # redding the whole curate tick (registry #563 item 4). Error classification and the
+    # fail-loud CuratorError stay owned here; gh_retry replaces only the loop/sleep mechanics.
     try:
-        result = subprocess.run(
-            ["gh", *args], capture_output=True, text=True, check=True, env=_gh_env(token)
-        )
-        return json.loads(result.stdout or "null")
+        result = _gh_retry.run_gh(args, env=_gh_env(token))
     except FileNotFoundError as exc:
         raise CuratorError("gh is unavailable") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or "gh command failed").strip()
-        raise CuratorError(detail) from exc
+    if result.returncode != 0:
+        raise CuratorError((result.stderr or "gh command failed").strip())
+    try:
+        return json.loads(result.stdout or "null")
     except json.JSONDecodeError as exc:
         raise CuratorError("gh returned malformed JSON") from exc
 

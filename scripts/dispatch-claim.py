@@ -337,6 +337,14 @@ def _load_module(name, path):
 _park_policy = _load_module(
     "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py"))
 
+# Shared bounded-retry mechanics for IDEMPOTENT gh reads (registry #563 adoption item 4;
+# sparq#3759 / #558 transient-red class). READ paths ONLY: _gh_json and _run_gh_target_api GETs.
+# The ledger CAS writers, `gh workflow run` dispatch realizations, label flips, and comment posts
+# keep their deliberate fail-loud single-attempt semantics (#558's own design) — a replayed
+# mutation could double-dispatch a worker, which is exactly incident #559's storm class.
+_gh_retry = _load_module(
+    "registry_gh_retry", Path(__file__).resolve().with_name("gh_retry.py"))
+
 
 def _require_exact_fields(value, fields, where):
     if not isinstance(value, dict):
@@ -1599,8 +1607,14 @@ def filter_deferred_items(items, repo, leases, now):
     ]
 
 
-def _run_gh(args, *, check=True):
-    result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+def _run_gh(args, *, check=True, retry_transient=False):
+    # retry_transient is opt-in and READ-ONLY by policy: _gh_json (all idempotent `gh api` GETs)
+    # sets it; the direct `gh workflow run` dispatch realizations never do — an ambiguous replay
+    # there double-dispatches a worker (incident #559's class), so they stay single-attempt.
+    if retry_transient:
+        result = _gh_retry.run_gh(args)
+    else:
+        result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
     if check and result.returncode != 0:
         operation = args[0] if args else "request"
         raise DispatchError(f"GitHub {operation} failed")
@@ -1608,7 +1622,10 @@ def _run_gh(args, *, check=True):
 
 
 def _gh_json(args):
-    result = _run_gh(args)
+    # Every _gh_json call site is an idempotent READ (issue/PR/compare/check-run/timeline reads),
+    # so transient 5xx/secondary-403/connection blips get gh_retry's bounded backoff instead of
+    # deferring the item or redding the sweep (registry #563 item 4).
+    result = _run_gh(args, retry_transient=True)
     try:
         return json.loads(result.stdout or "null")
     except json.JSONDecodeError as exc:
@@ -1939,14 +1956,24 @@ def _run_gh_target_api(repo, method, path, input_doc=None):
     token = _target_token(repo)
     if not token:
         raise DispatchError("target-scoped App token is unavailable")
-    command = ["gh", "api", "-X", method, path]
+    args = ["api", "-X", method, path]
     if input_doc is not None:
-        command += ["--input", "-"]
-    result = subprocess.run(
-        command, input=json.dumps(input_doc) if input_doc is not None else None,
-        capture_output=True, text=True, check=False,
-        env={**os.environ, "GH_TOKEN": token},
-    )
+        args += ["--input", "-"]
+    env = {**os.environ, "GH_TOKEN": token}
+    payload = json.dumps(input_doc) if input_doc is not None else None
+    if method.upper() == "GET":
+        # Idempotent target READ (issue re-reads, collaborator-permission probes): transient
+        # 5xx/secondary-403 blips get gh_retry's bounded backoff (registry #563 item 4 — the
+        # 14:42 RemoteDisconnected class; a 422 stays fatal and is never retried).
+        result = _gh_retry.run_gh(args, env=env, input=payload)
+    else:
+        # Mutations get NO transparent replay: an ambiguous transient failure cannot prove the
+        # attempt was skipped — a replayed POST duplicates comments and a replayed PATCH can
+        # repeat a label transition. Fail-loud single attempt is deliberate (#558).
+        result = subprocess.run(
+            ["gh", *args], input=payload,
+            capture_output=True, text=True, check=False, env=env,
+        )
     if result.returncode != 0:
         raise DispatchError("target issue mutation failed")
     return result

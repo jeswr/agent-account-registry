@@ -7,9 +7,14 @@ on:
 
 permissions: {}
 
+# Scheduler-singleton semantics (#559 dup-dispatch storms; registry #563 adoption item 1):
+# cancel-in-progress flipped true -> false so a new fire QUEUES behind a live run (GitHub keeps
+# exactly one pending run per group, superseding older pendings) instead of cancel-storming a
+# probe/build/deploy mid-flight — a cancelled deploy leg was indistinguishable from a cron stall
+# and re-triggered the keepalive mesh into exactly the duplicate-dispatch loop #559 documents.
 concurrency:
   group: account-fleet-dashboard
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   probe:
@@ -208,6 +213,19 @@ jobs:
           # workflow-file:stale-threshold-seconds (cadence + slack)
           for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200 groom.yml:1800 retriage.yml:3600; do
             wf="${spec%%:*}"; limit="${spec##*:}"
+            # LIVE-RUN GUARD (#559): a QUEUED or IN_PROGRESS run of the target counts as FRESH —
+            # kicking a live workflow queues a duplicate behind it that its singleton group then
+            # runs back-to-back, which is exactly the #559 dup-dispatch storm (a long run's
+            # created_at ages past the limit while it is still executing). Same rule as the
+            # orchestrator's local keepalive bridge: skip on any live run; only then consult age.
+            # Fail-open: an unreadable live check falls through to the age check, preserving the
+            # keepalive's liveness job.
+            live=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=30" \
+                   --jq '[.workflow_runs[] | select(.status != "completed")] | length' || echo "")
+            if [ -n "$live" ] && [ "$live" -gt 0 ]; then
+              echo "keepalive: ${wf} has ${live} queued/in-progress run(s) — live, skipping kick"
+              continue
+            fi
             last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
                    --jq '.workflow_runs[0].created_at // empty' || true)
             prev=0
@@ -248,6 +266,14 @@ jobs:
           # workflow-file:stale-threshold-seconds (cadence + slack)
           for spec in rearm-sweeper.yml:1200; do
             wf="${spec%%:*}"; limit="${spec##*:}"
+            # LIVE-RUN GUARD (#559): a queued/in-progress target run is FRESH — never kick a
+            # duplicate behind a live run (same rule as the registry leg above).
+            live=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=30" \
+                   --jq '[.workflow_runs[] | select(.status != "completed")] | length' || echo "")
+            if [ -n "$live" ] && [ "$live" -gt 0 ]; then
+              echo "keepalive: sparq-org/sparq ${wf} has ${live} queued/in-progress run(s) — live, skipping kick"
+              continue
+            fi
             last=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=1" \
                    --jq '.workflow_runs[0].created_at // empty' || true)
             prev=0

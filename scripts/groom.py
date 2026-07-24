@@ -908,10 +908,16 @@ def _sleep_backoff(attempt: int) -> None:
 # effect here (the ledger contents PUT is CAS-keyed on a sha a completed first attempt consumes),
 # so mutations get NO transparent replay: an ambiguous failure fails loud and the next scheduled
 # sweep reconciles from re-read state, exactly as before #494.
+#
+# The loop/sleep MECHANICS (attempt bound, exponential-jitter schedule, Retry-After cap) are the
+# fleet-shared gh_retry policy (registry #563 adoption item 4 — one tuned copy, not N drifting
+# ones); the CLASSIFICATION predicates below (_is_transient_network, _TRANSIENT_HTTP,
+# _retry_after_seconds, the GET/HEAD-only guard) stay groom-owned exactly as reviewed in #494.
+_gh_retry = _load_module(Path(__file__).resolve().with_name("gh_retry.py"), "registry_gh_retry")
 _IDEMPOTENT_METHODS = {"GET", "HEAD"}
-_TRANSIENT_RETRIES = 3           # total attempts (2 retries) before a transient failure fails loud
+_TRANSIENT_RETRIES = _gh_retry.MAX_ATTEMPTS  # total attempts before a transient failure fails loud
 _TRANSIENT_HTTP = {502, 503, 504}
-_RETRY_AFTER_CAP = 60.0          # never let a hostile/confused Retry-After stall the whole sweep
+_RETRY_AFTER_CAP = _gh_retry.RETRY_AFTER_CAP  # never let a hostile Retry-After stall the sweep
 
 
 def _is_transient_network(exc: BaseException) -> bool:
@@ -942,12 +948,10 @@ def _retry_after_seconds(headers: Any) -> float | None:
 
 
 def _sleep_transient(attempt: int, retry_after: float | None = None) -> None:
-    """Sleep before a transient retry: honour a (capped) Retry-After when the server sent one, else a
-    full-jitter exponential backoff. Module-level so the self-test can stub it without sleeping."""
-    if retry_after is not None:
-        time.sleep(retry_after)
-    else:
-        _sleep_backoff(attempt)
+    """Sleep before a transient retry: honour a (capped) Retry-After when the server sent one, else
+    gh_retry's shared exponential-jitter schedule (2s->30s). Module-level so the self-test can stub
+    it without sleeping."""
+    _gh_retry.sleep_backoff(attempt, retry_after)
 
 
 def _release_claims(
