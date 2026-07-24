@@ -12,16 +12,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "55065f6105bf43508d1a455393912a79",
-   "holder": "fix:sparq-org/sparq#3573@dispatch-30076722957.1",
-   "package": "sparq-engine",
-   "role": "fix",
-   "model": "fable",
-   "issued_at": 1784880108,
-   "expires_at": 1784886408
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "ddeeb4c94dc040ef87716bbcd8665514",
    "holder": "fix:sparq-org/sparq#3608@dispatch-30076722957.1",
    "package": "sparq-zk",
