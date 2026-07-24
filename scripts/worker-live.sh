@@ -1120,6 +1120,7 @@ registry_selftest_gate() {
 # it labels WHOEVER authored a commit (docs lanes included) — it is not a review/fix chain.
 coauthor_for() {
   case "$1" in
+    opus5) printf '%s' 'Claude Opus 5 <noreply@anthropic.com>' ;;
     fable) printf '%s' 'Claude Fable 5 <noreply@anthropic.com>' ;;
     opus) printf '%s' 'Claude Opus 4.8 (1M context) <noreply@anthropic.com>' ;;
     sonnet) printf '%s' 'Claude Sonnet 4.6 <noreply@anthropic.com>' ;;

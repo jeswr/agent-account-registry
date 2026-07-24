@@ -124,22 +124,26 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {detail}")
 
-    # impl + a trust surface (area:worker) -> security rule wins over role -> Opus, escalate.
+    # impl + a trust surface (area:worker) -> security rule wins over role -> Opus-5-led
+    # (opus tail fallback, 2026-07-24), escalate.
     mc, ag, esc = resolve(["role:impl", "area:worker"], doc)
-    chk("impl+worker -> opus/escalate", (mc, ag, esc), (["opus"], "registry-reviewer", True))
+    chk("impl+worker -> opus5-led/escalate", (mc, ag, esc),
+        (["opus5", "opus"], "registry-reviewer", True))
     # dispatch is a trust surface too.
     mc, ag, esc = resolve(["role:impl", "area:dispatch"], doc)
-    chk("impl+dispatch -> opus/escalate", (mc, esc), (["opus"], True))
+    chk("impl+dispatch -> opus5-led/escalate", (mc, esc), (["opus5", "opus"], True))
     # a NON-trust area (usage) -> plain impl -> sol-led chain (sol-first routing, 2026-07-18).
     mc, ag, esc = resolve(["role:impl", "area:usage"], doc)
     chk("impl+usage -> sol-led", (mc[0], ag, esc), ("sol", "registry-impl", False))
     # docs -> haiku-led.
     chk("docs -> haiku", resolve(["role:docs", "area:docs"], doc)[0][0], "haiku")
     # [FABLE-5] frontier-tier infra authorship (standing rule 2026-07-17): ci -> sol-led
-    # (sol/fable, 2026-07-18), FRONTIER-ONLY chain — no sub-frontier model (sonnet/haiku), so
+    # (sol/opus5/fable — opus5 primary anthropic tier since 2026-07-24, fable its tail
+    # fallback), FRONTIER-ONLY chain — no sub-frontier model (sonnet/haiku), so
     # chain exhaustion DEFERS at the claim step (defer-not-fallback) instead of degrading tier.
     mc, ag, esc = resolve(["role:ci", "area:ci"], doc)
-    chk("ci -> frontier-only sol-first (terra is docs-only)", (mc, ag, esc), (["sol", "fable"], "registry-ci", False))
+    chk("ci -> frontier-only sol-first (terra is docs-only)", (mc, ag, esc),
+        (["sol", "opus5", "fable"], "registry-ci", False))
     chk("ci chain has no sub-frontier tier", sorted(set(mc) & {"sonnet", "haiku"}), [])
     # no role -> defaults (sol-led, 2026-07-18).
     chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "sol")

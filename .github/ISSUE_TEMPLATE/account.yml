@@ -11,7 +11,7 @@ body:
       value: |
         provider: anthropic
         harness: claude
-        models: [opus, sonnet, haiku, fable]
+        models: [opus5, fable, opus, sonnet, haiku]
         credential_format: claude-oauth-token
         tier:
           weekly_limit: ""

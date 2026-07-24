@@ -152,10 +152,11 @@ def _self_test():
         ("impl", "sol", "registry-impl", False))
     chk("impl package", row["package"], "usage")
 
-    # a TRUST-SURFACE issue (area:worker) -> opus + escalate (security override beats role).
+    # a TRUST-SURFACE issue (area:worker) -> opus5-led (opus tail fallback, 2026-07-24) +
+    # escalate (security override beats role).
     sec = compute_ready([iss(2, R + ["priority:P0", "role:impl", "area:worker"])])
     row = plan_dispatch(sec, doc)[0]
-    chk("worker -> opus", row["model_chain"], ["opus"])
+    chk("worker -> opus5-led", row["model_chain"], ["opus5", "opus"])
     chk("worker -> reviewer/escalate", (row["agent"], row["escalate"]),
         ("registry-reviewer", True))
     chk("worker role stays declared", row["role"], "impl")

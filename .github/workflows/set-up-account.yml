@@ -315,9 +315,11 @@ jobs:
           # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
           # openai mints the FULL codex alias set [sol, luna, terra]: select-and-claim's
           # choose_account requires exact alias membership, so a terra-only record would defer
-          # every sol/luna claim forever (sol r2 finding 1). anthropic stays
-          # [fable, opus, sonnet, haiku] — unchanged.
-          if [ "$prov" = openai ]; then models='[sol, luna, terra]'; else models='[fable, opus, sonnet, haiku]'; fi
+          # every sol/luna claim forever (sol r2 finding 1). anthropic mints
+          # [opus5, fable, opus, sonnet, haiku] — opus5 added 2026-07-24 (Opus 5 is the new
+          # primary anthropic tier; an account without the alias could never serve an
+          # opus5-led claim).
+          if [ "$prov" = openai ]; then models='[sol, luna, terra]'; else models='[opus5, fable, opus, sonnet, haiku]'; fi
           # handle/secret here are only a PRE-LOGIN RESERVATION HINT: the login below can take ~13 min,
           # during which another (non-serialized) writer may claim this number, so the store step
           # derives the real slot from complete live state and atomically claims it (an acct-claims

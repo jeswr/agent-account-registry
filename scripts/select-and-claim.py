@@ -102,6 +102,10 @@ SAFETY_MARGIN = 0.10  # default fraction of each window that must remain free to
 # headroom before a worker starts — routing one of these to an account with low WHOLE-account usage but an
 # exhausted premium bucket fails mid-run and burns credits. account-usage.py only ever emits the fable
 # sub-quota fields for the claude-fable-5 alias; keep this in sync with any alias that maps to that bucket.
+# opus5 (claude-opus-5, the primary anthropic tier since 2026-07-24) is DELIBERATELY not listed yet:
+# its rate-limit bucket mapping is unobserved, and wiring it to the fable probe would gate opus5
+# admissions on ANOTHER model's headers. Revisit once account-usage observes claude-opus-5 headers
+# (add the alias here + emit its sub-quota fields there in the same change).
 PREMIUM_MODELS = frozenset({"fable"})
 FABLE_WINDOW = "fable_7d_oi"  # prefix of the fable sub-quota util/reset keys in the usage map
 

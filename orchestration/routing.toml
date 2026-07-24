@@ -40,6 +40,18 @@ provider = "anthropic"
 harness = "claude"
 provider_model = "claude-fable-5"
 credential_format = "claude-oauth-token"
+[models.opus5]
+provider = "anthropic"
+harness = "claude"
+provider_model = "claude-opus-5"      # Opus 5 (maintainer directive 2026-07-24): replaces BOTH
+                                       # fable (claude-fable-5) AND opus (claude-opus-4-8) as the
+                                       # primary model on every task where they were used — opus5
+                                       # is now the TOP anthropic tier. The old tiers stay in every
+                                       # chain as TAIL FALLBACKS only (degradation path: an opus5
+                                       # capacity outage parks work gracefully instead of stalling
+                                       # single-model chains). Probe-verified live 2026-07-24
+                                       # (`claude --model claude-opus-5 -p` -> OK).
+credential_format = "claude-oauth-token"
 [models.terra]
 provider = "openai"
 harness = "codex"
@@ -59,17 +71,22 @@ credential_format = "codex-auth-json"
 [models.luna]
 provider = "openai"
 harness = "codex"
-provider_model = "gpt-5.6-luna"        # Second codex tier (opus<luna<fable<sol); sol's fallback.
+provider_model = "gpt-5.6-luna"        # Second codex tier (opus<luna<fable<opus5<sol, 2026-07-24:
+                                       # opus5 is the top ANTHROPIC tier; sol keeps the global
+                                       # frontier slot — cross-provider order unchanged); sol's
+                                       # fallback.
 credential_format = "codex-auth-json"
 
 [defaults]
-model_chain = ["sol", "fable", "opus"]
+model_chain = ["sol", "opus5", "fable", "opus"]
 agent = "registry-impl"
 
 # ---------------------------------------------------------------------------------------------------
 # SECURITY-LABEL OVERRIDES (first-match; win over role). On the trust plane the orchestration
 # surfaces themselves are soundness surfaces: any issue whose labels touch dispatch / worker /
-# set-up-account / review-loop / groom runs on Opus and, on chain-exhaustion, ESCALATES to a human
+# set-up-account / review-loop / groom runs on Opus 5 (opus-4.8 as tail fallback, 2026-07-24 — the
+# fallback exists so an opus5 capacity outage degrades to the previous soundness tier instead of
+# stalling the chain) and, on chain-exhaustion, ESCALATES to a human
 # (needs:user) rather than degrading to a weaker/cross-provider model. `escalate = true` is
 # consumed by dispatch (escalate_starved) AND the substring keywords here are read by the review
 # lane's arm-side classifier so an approved trust-surface PR is HUMAN-armed, never auto-armed.
@@ -78,19 +95,20 @@ match_labels = [
   "dispatch", "worker", "set-up-account", "review-loop", "groom",
   "zk", "mpc", "crypto", "auth", "e2ee",
 ]
-model_chain = ["opus"]
+model_chain = ["opus5", "opus"]
 agent = "registry-reviewer"
 escalate = true
 
 # ---------------------------------------------------------------------------------------------------
 # ROLE ROUTES. Sol (GPT-5.6, the codex-side frontier model) is the primary code-writer
-# (maintainer directive 2026-07-18, credit abundance); fable/opus are the cross-provider
+# (maintainer directive 2026-07-18, credit abundance); opus5-led anthropic tiers (opus5, then
+# fable/opus as tail fallbacks — directive 2026-07-24) are the cross-provider
 # fallback so an OpenAI outage does not stall implementation. docs -> haiku-led (cheap;
 # the ONLY surface where the docs-only aliases terra/sonnet may appear —
 # policy-resolve.py rejects them in any non-docs route).
 [[route]]
 role = "impl"
-model_chain = ["sol", "fable", "opus"]
+model_chain = ["sol", "opus5", "fable", "opus"]
 agent = "registry-impl"
 
 # [FABLE-5] STANDING RULE — UI/front-end ownership (maintainer decision 2026-07-17): UI/front-end
@@ -102,13 +120,14 @@ agent = "registry-impl"
 # unions ALL match_labels keywords, so UI keywords there would human-arm every UI PR.
 [[route]]
 role = "site"
-model_chain = ["sol", "fable", "opus"]
+model_chain = ["sol", "opus5", "fable", "opus"]
 agent = "registry-impl"
 
 # [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
 # 2026-07-17, same standing-rule pattern as the UI→codex route above): ALL CI/infrastructure work
 # — .github/workflows, gate aggregators, orchestration plumbing, the self-draining pipeline itself
-# — is authored by a FRONTIER-tier model only: sol (GPT-5.6 codex) or fable (Claude Fable).
+# — is authored by a FRONTIER-tier model only: sol (GPT-5.6 codex) or the anthropic frontier tier
+# (opus5 primary since 2026-07-24; fable retained as its tail fallback).
 # Cheaper tiers (sonnet/haiku) no longer author infra — and terra/sonnet are docs-only
 # (2026-07-18); cross-provider review is unchanged.
 # FRONTIER-ONLY chain rather than a floor marker: the routing schema has no floor/pin field (the
@@ -123,30 +142,32 @@ agent = "registry-impl"
 # into each target's routing.toml (sparq-org/sparq carries it, PR #3422).
 [[route]]
 role = "ci"
-model_chain = ["sol", "fable"]
+model_chain = ["sol", "opus5", "fable"]
 agent = "registry-ci"
 
 [[route]]
 role = "research"
-model_chain = ["fable", "opus"]
+model_chain = ["opus5", "fable", "opus"]
 agent = "registry-researcher"
 
 [[route]]
 role = "docs"
-model_chain = ["haiku", "fable"]
+model_chain = ["haiku", "opus5", "fable"]
 agent = "registry-docs"
 
-# Review / soundness: Opus only; escalate to a human on unavailability (never fall to a weaker
+# Review / soundness: Opus-5-led (opus-4.8 tail fallback, directive 2026-07-24 — the fallback is a
+# degradation path so an opus5 capacity outage parks work instead of stalling the chain); escalate
+# to a human on chain exhaustion (never fall to a weaker
 # model). The review chain proper is computed cross-provider by dispatch-claim.py; this row exists
 # so a `role:review`/`role:soundness` issue resolves + so policy-resolve escalate is set.
 [[route]]
 role = "review"
-model_chain = ["opus"]
+model_chain = ["opus5", "opus"]
 agent = "registry-reviewer"
 escalate = true
 
 [[route]]
 role = "soundness"
-model_chain = ["opus"]
+model_chain = ["opus5", "opus"]
 agent = "registry-reviewer"
 escalate = true
