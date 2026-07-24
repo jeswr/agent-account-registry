@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3470,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "552368bd5dd609d54ba0d0834fcfe7600f12a2bd",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds the change correct and complete on the supplied evidence. The default-off `epsg_full` fallback preserves curated-definition precedence and fails closed for unavailable grid shifts, datum-less non-coincident ellipsoids, projected CRSs without proven EAST/NORTH order, and out-of-range codes. The feature-gated tests exercise the real reprojection path with independent coordinates, geographic axis normalization including an explicit longitude-first case, curated precedence, and refusal cases. Feature-matrix, public documentation, lockfile, and supply-chain metadata are updated consistently. No correctness, soundness, test-validity, security, or prompt-injection issue is present. Because round 3 also approved with no findings and the substantive behavior remains sound, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
