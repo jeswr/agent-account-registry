@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 587,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e83c2266aa2c6e7254ed75229468fbf6678377b8",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The security property depends on `codex login status` and `claude auth status --json` loading the isolated OAuth credential and performing a provider refresh. The implementation provides no sound evidence that these status-reporting commands perform that network/authentication operation. Every happy-path test injects `fake_cli`, which writes the supplied refreshed fixture itself, so the tests pass unchanged if the real commands only inspect local credential state and never refresh. In that case a genuinely stale credential always fails even when its refresh token is valid, making the advertised broker path non-functional. The argv equality assertions establish only command spelling, not the required behavior.",
+    "file": "scripts/broker-refresh.py",
+    "fix_hint": "Use provider CLI operations whose documented contract actually authenticates and refreshes without inference, and add a non-vacuous contract/integration check that observes the real operation updating an expired isolated credential (kept outside hermetic unit tests if necessary). Do not describe a local status command as authenticated merely because the injected runner rewrites the fixture.",
+    "severity": "major",
+    "title": "Status probes are assumed to refresh, while the self-test fakes the only refresh"
+   },
+   {
+    "body": "`_require` accepts any non-bool `int`/`float`, including `float('nan')` and infinities. Python `json.load` accepts non-standard `NaN` and `Infinity` constants by default. For `expiresAt: NaN`, `_epoch_seconds` returns NaN and `exp - now <= _MIN_REMAINING_SECONDS` is false, so `assert_token_live` returns true and `broker` mints a capability with a non-finite expiry. Positive infinity similarly passes. This is a fail-open path in the new security gate. The self-test has no non-finite expiry assertion.",
+    "file": "scripts/broker-refresh.py",
+    "fix_hint": "Require expiry values to be finite and positive (for example with `math.isfinite`) before unit conversion/comparison, and add broker-path tests asserting that NaN, positive/negative Infinity, booleans, and otherwise invalid numeric expiries cannot mint a capability.",
+    "severity": "major",
+    "title": "NaN Anthropic expiry bypasses the liveness gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The change fails closed in many ordinary failure cases, but the central refresh proof is not soundly established and the Anthropic liveness gate has a concrete non-finite-number bypass. The self-test only proves that an injected fake runner can rewrite the credential; it does not prove that either selected status command performs an authenticated provider operation or refreshes an expired token. In addition, Python's JSON parser accepts NaN/Infinity and the numeric validation allows them, causing the future-expiry comparison to fail open.",
+  "verdict": "request_changes"
+ }
+}
