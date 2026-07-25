@@ -246,6 +246,22 @@ _credential_mount_args() {
 # pr_url/exhausted are surfaced as step outputs there. A started-but-unreported attempt therefore
 # still carries the marker, and the downstream job defaults its lost class to `unknown` instead of
 # dropping the genuine timeout.
+#
+# RESIDUAL WINDOW, stated honestly (review round 1 of PR #665). A HOST-side marker cannot be exact.
+# Two paths still set it without a provider CLI having run:
+#   1. a cancel landing between this append and the kernel starting docker — irreducible for a
+#      host-side signal, and now bounded by ONE printf instead of by the whole multi-minute
+#      prep/build phase the rejected earlier derivations covered;
+#   2. a `docker run` that fails before exec'ing the container command (daemon down, mount/runtime
+#      fault, missing entrypoint). This is NOT the fabrication this change closes and is NOT new:
+#      such a run COMPLETES, so the host classifier below sets WORKER_EXIT_CLASS and the record
+#      carries that host-observed class — byte-identical to the behaviour before this change, which
+#      admitted it through the `exit_class != ''` gate. Self-test case (D) pins that parity; giving
+#      docker's own startup faults a non-provider class is tracked separately, out of this scope.
+# Relocating the marker into a container-side handshake does NOT close window 1 — it only moves the
+# gap to between the wrapper's write and its own exec — while placing a trust-plane signal inside
+# the model-writable HOME mount, where an untrusted model could delete it to hide its own auth
+# failures from account health. That trade is a net loss for the trust surface; rejected.
 _mark_model_launched() {
   [[ -n ${GITHUB_OUTPUT:-} ]] || return 0
   printf 'launched=true\n' >> "$GITHUB_OUTPUT"
@@ -3552,6 +3568,40 @@ STUB
     "$([[ "$lc_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
   chk "(C) a completed launch is marked, and carries its host-observed class" \
     "$(grep -c '^launched=true$' "$tmp/launch-c.out" || true):$(grep -c '^WORKER_EXIT_CLASS=' "$tmp/launch-c.env" || true)" \
+    "1:1"
+
+  # (D) `docker run` FAILS AT STARTUP — daemon unavailable / mount or runtime fault / missing
+  # entrypoint — so the marker is set but no provider CLI ever executed (review round 1 of PR #665).
+  # The point of this case is that such a run COMPLETES: the host classifier therefore writes a real
+  # WORKER_EXIT_CLASS, so the recorder consumes a HOST-OBSERVED class and never reaches the
+  # `${EXIT_CLASS:-unknown}` default that case (B) exercises. That is byte-identical to the pre-#569
+  # behaviour, which admitted this record through the `exit_class != ''` gate — this change neither
+  # adds nor removes it. The class is `unknown` because docker's own daemon error matches no
+  # provider signal; pinning it EXACTLY keeps the case load-bearing (dropping the classification, or
+  # later giving docker's startup faults their own non-provider class, both turn this red on
+  # purpose). The `.cli-started` marker the stub never writes is what proves no CLI ran.
+  local lroot_d="$tmp/launch-dockerfail" ld_rc=0
+  _launch_fixture "$lroot_d" 'exit 0' \
+    'printf "docker: Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n" >&2
+     printf "%s\n" "$$" > "'"$lroot_d"'/.docker-startup-failed"; exit 125'
+  (
+    cd "$lroot_d/cwd" || exit 1
+    export PATH="$lroot_d/bin:$PATH"
+    export WORKER_ROOT="$lroot_d" WORKER_HARNESS=codex WORKER_AGENT=registry-impl \
+           WORKER_PROVIDER_MODEL='' WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_CREDENTIAL_PATH="$lroot_d/home/.codex/auth.json" \
+           TARGET_DIR="$lroot_d/target" GITHUB_OUTPUT="$tmp/launch-d.out" \
+           GITHUB_ENV="$tmp/launch-d.env"
+    unset WORKER_OUTPUT_DIR
+    _run_headless_harness "$lroot_d/prompt.txt" allow
+  ) > "$tmp/launch-d.log" 2>&1 || ld_rc=$?
+  chk "(D) docker really died at STARTUP with no provider CLI executed (non-vacuous)" \
+    "$([[ -s "$lroot_d/.docker-startup-failed" ]] && printf 'startup-failed' || printf 'never-run'):$([[ -e "$lroot_d/.cli-started" ]] && printf ran || printf 'no-cli')" \
+    "startup-failed:no-cli"
+  chk "(D) a docker startup failure still fails the harness" \
+    "$([[ "$ld_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "(D) it is HOST-CLASSIFIED (master parity), so the recorder never uses the lost-class default" \
+    "$(grep -c '^launched=true$' "$tmp/launch-d.out" || true):$(grep -c '^WORKER_EXIT_CLASS=unknown$' "$tmp/launch-d.env" || true)" \
     "1:1"
 
   # --- [issue #569] the workflow half of the contract: the marker, not exit_class, admits the
