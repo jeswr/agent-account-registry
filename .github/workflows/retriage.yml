@@ -31,14 +31,27 @@ jobs:
       - name: Verify retriage planner
         run: python3 scripts/retriage.py --self-test
 
-      - name: Sweep at most 40 untriaged issues
+      # BOTH directions of the drift sweep (#586) share ONE snapshot and ONE apply path, so the
+      # promotion lane and the re-park lane can never drift apart:
+      #   * status:untriaged -> promote once the label set is triage-complete (#415).
+      #   * status:ready     -> re-park/repair once the readiness engine provably cannot enumerate
+      #                         it (the label-lost half of #178: nothing on master recovered it).
+      # The snapshot is REAL cursor pagination with a runaway ceiling and an explicit per-run cap;
+      # `retriage.py --snapshot` fails closed (non-zero) on a partial page, so `set -e` aborts the
+      # step BEFORE any write rather than mistaking a truncated board for "nothing to do".
+      - name: Sweep the untriaged and status:ready boards (at most 80 issues)
         run: |
           set -euo pipefail
           tmp="$RUNNER_TEMP/retriage"
           mkdir -p "$tmp"
-          gh issue list -R "$REPO" --state open --label status:untriaged --limit 40 \
-            --json number,author,body,labels,updatedAt > "$tmp/untriaged.json"
-          jq -c 'sort_by(.updatedAt) | .[]' "$tmp/untriaged.json" > "$tmp/issues.jsonl"
+          for label in status:untriaged status:ready; do
+            gh api --paginate --slurp \
+              "repos/$REPO/issues?state=open&labels=$label&per_page=100" \
+              > "$tmp/pages-${label#status:}.json"
+          done
+          jq -s 'add' "$tmp/pages-untriaged.json" "$tmp/pages-ready.json" > "$tmp/pages.json"
+          python3 scripts/retriage.py --snapshot --cap 80 \
+            < "$tmp/pages.json" > "$tmp/issues.jsonl"
 
           while IFS= read -r issue; do
             number=$(jq -r .number <<<"$issue")
@@ -52,16 +65,27 @@ jobs:
               --maintainer "$MAINTAINER_LOGIN" --app-bot "$APP_BOT_LOGIN" \
               --permission "$permission" <<<"$issue")
             action=$(jq -r .action <<<"$decision")
-            if [ "$action" != promote ]; then
-              echo "skip #$number: $(jq -r .reason <<<"$decision")"
-              continue
-            fi
+            case "$action" in
+              promote|repark|repair) ;;
+              *)
+                echo "skip #$number: $(jq -r .reason <<<"$decision")"
+                continue
+                ;;
+            esac
 
             args=()
             while IFS= read -r label; do args+=(--add-label "$label"); done \
               < <(jq -r '.add[]' <<<"$decision")
             while IFS= read -r label; do args+=(--remove-label "$label"); done \
               < <(jq -r '.remove[]' <<<"$decision")
+            # An action with no label write is unreachable by construction (every accepted action
+            # carries drift) — treat it as a planner bug and write NOTHING rather than issuing a
+            # bare `gh issue edit`.
+            if [ "${#args[@]}" -eq 0 ]; then
+              echo "skip #$number: $action carried no label write"
+              continue
+            fi
             gh issue edit "$number" -R "$REPO" "${args[@]}"
-            echo "promoted #$number"
+            echo "$action #$number: +[$(jq -r '.add | join(",")' <<<"$decision")]" \
+              "-[$(jq -r '.remove | join(",")' <<<"$decision")]"
           done < "$tmp/issues.jsonl"

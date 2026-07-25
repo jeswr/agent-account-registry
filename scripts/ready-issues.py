@@ -69,7 +69,50 @@ def is_busy(labels):
     return bool(labels & BUSY_STATUS)
 
 
-def ready_candidates(issues):
+def _defer_log(message):
+    """Default sink for the readiness defer lines: STDERR, so the frontier this engine prints on
+    stdout stays machine-readable while the reasons are still visible in a green CI run."""
+    print(message, file=sys.stderr)
+
+
+def exclusion_reason(labels, open_blockers=0):
+    """The ONE label-side completeness predicate, as a REASON: None when the engine can enumerate
+    an OPEN issue carrying these labels, else a short attributable string naming the FIRST failing
+    condition (checked in the documented priority order above).
+
+    Issue #586: `ready_candidates` used to drop a `status:ready` candidate with a bare `continue`
+    — no log line, no counter — so an issue that lost its priority/role label while KEEPING the
+    positive `status:ready` attestation left the frontier forever with zero emitted signal. The
+    predicate is factored out here so (a) the drop is attributable and (b) the retriage re-park
+    sweep can ask the readiness engine ITSELF whether an issue is enumerable instead of growing a
+    second, divergent notion of triage-completeness.
+
+    Package SERIALIZATION drops (compute_ready's one-per-package concurrency width) are
+    deliberately NOT reported here: they are transient by design — the issue is still on the
+    frontier next tick — and the assembler already names them (`assembler defer #N: crate ...`).
+    """
+    labels = set(labels)
+    if "status:ready" not in labels:          # positive attestation required
+        return "no status:ready attestation"
+    if NON_DISPATCHABLE in labels:            # epics are tracking umbrellas, not work items
+        return f"{NON_DISPATCHABLE} is a tracking umbrella, never dispatchable"
+    gates = sorted(lb for lb in labels if any(lb == g or lb.startswith(g) for g in GATE_LABELS))
+    if gates:
+        return "gated by " + ",".join(gates)
+    busy = sorted(labels & BUSY_STATUS)
+    if busy:
+        return "busy: " + ",".join(busy)
+    if valid_priority(labels) is None:        # need exactly one valid priority
+        seen = sorted(lb for lb in labels if lb.startswith("priority:"))
+        return "no single valid priority:P0..P4 (have: " + (",".join(seen) or "none") + ")"
+    if not has_role(labels):                  # need a role
+        return "no role:* label"
+    if int(open_blockers) > 0:
+        return f"{int(open_blockers)} open blocker(s)"
+    return None
+
+
+def ready_candidates(issues, log=None):
     """Every issue that passes the FAIL-CLOSED readiness LABEL gate (open + status:ready + exactly
     one priority + a role + no gate/busy label + zero open blockers), priority-then-number ordered.
 
@@ -77,31 +120,29 @@ def ready_candidates(issues):
     one-per-package concurrency serialization that compute_ready() layers on top. The two answer
     different questions: this is 'how much ready work exists'; compute_ready() is 'how many can be
     claimed RIGHT NOW without a package collision'. Throughput/backlog metrics want THIS count, not
-    the concurrency width (see metrics.py issues_ready)."""
+    the concurrency width (see metrics.py issues_ready).
+
+    Every dropped candidate that HOLDS the `status:ready` attestation emits one attributable
+    `readiness defer #N: <reason>` line via `log` (default: stderr) — issue #586: a bare `continue`
+    made a label-regressed issue invisible in a green run, recoverable only by noticing its absence
+    from the frontier. Non-attested issues stay quiet (they are simply not candidates)."""
+    log = _defer_log if log is None else log
     cands = []
     for it in issues:
         if str(it.get("state", "OPEN")).upper() != "OPEN":
             continue
         L = labels_of(it)
-        if "status:ready" not in L:          # positive attestation required
+        reason = exclusion_reason(L, it.get("open_blockers", 0))
+        if reason is not None:
+            if "status:ready" in L:
+                log(f"readiness defer #{it.get('number', 0)}: {reason}")
             continue
-        if NON_DISPATCHABLE in L:            # epics are tracking umbrellas, not work items
-            continue
-        if is_gated(L) or is_busy(L):
-            continue
-        p = valid_priority(L)
-        if p is None:                        # need exactly one valid priority
-            continue
-        if not has_role(L):                  # need a role
-            continue
-        if int(it.get("open_blockers", 0)) > 0:
-            continue
-        cands.append((p, it.get("number", 0), it, packages_of(L)))
+        cands.append((valid_priority(L), it.get("number", 0), it, packages_of(L)))
     cands.sort(key=lambda c: (c[0], c[1]))   # priority then number (deterministic)
     return cands
 
 
-def compute_ready(issues, in_progress_packages=None):
+def compute_ready(issues, in_progress_packages=None, log=None):
     """Conflict-free, priority-ordered, FAIL-CLOSED ready frontier (one-per-package concurrency
     width). This is NOT the count of drainable work — see ready_candidates() for that."""
     taken = set(in_progress_packages or ())
@@ -111,7 +152,7 @@ def compute_ready(issues, in_progress_packages=None):
         L = labels_of(it)
         if "status:in-progress" in L or "status:in-progress-review" in L:
             taken |= packages_of(L)
-    cands = ready_candidates(issues)
+    cands = ready_candidates(issues, log=log)
     ready = []
     for _p, _n, it, pkgs in cands:
         if GLOBAL in taken:                  # cross-cutting work in flight -> nothing else co-runs
@@ -145,6 +186,7 @@ def _self_test():
         iss(11, R + ["priority:P4"]),                                        # no package -> global
         iss(12, R + ["priority:P1", "area:groom"]),                          # groom (free)
         iss(13, R + ["priority:P0", "area:docs", "kind:epic"]),              # epic -> excluded
+        iss(14, ["status:ready", "priority:P1", "area:usage"]),              # #586: lost its role
     ]
     ok = True
 
@@ -177,6 +219,34 @@ def _self_test():
     check("valid_priority single", valid_priority({"priority:P0"}), 0)
     check("valid_priority ambiguous", valid_priority({"priority:P1", "priority:P2"}), None)
     check("packages none->global", packages_of({"role:impl"}), {GLOBAL})
+    # ---- #586: every dropped `status:ready` candidate is ATTRIBUTABLE (the silent `continue` is
+    # what let a label-regressed issue leave the frontier forever with zero signal) ----
+    lines = []
+    compute_ready(F, log=lines.append)
+    check("every dropped status:ready candidate emits one attributable defer line",
+          sorted(int(re.search(r"#(\d+)", line).group(1)) for line in lines),
+          [4, 5, 7, 9, 10, 13, 14, 40])
+    reasons = {int(re.search(r"#(\d+)", line).group(1)): line for line in lines}
+    check("#586 lost-priority names the priority condition",
+          "no single valid priority:P0..P4" in reasons[9], True)
+    check("#586 lost-role names the role condition", "no role:* label" in reasons[14], True)
+    check("gated defer names the gate", "gated by needs:design" in reasons[40], True)
+    check("busy defer names the status", "busy: status:in-progress-review" in reasons[10], True)
+    check("blocked defer names the blocker count", "2 open blocker(s)" in reasons[5], True)
+    check("epic defer names the umbrella", "kind:epic" in reasons[13], True)
+    # A NON-attested issue is not a candidate at all — it must stay quiet (no log flood).
+    check("issue without status:ready stays quiet", 8 in reasons, False)
+    check("closed issue stays quiet", 6 in reasons, False)
+    quiet = []
+    compute_ready([iss(20, R + ["priority:P1", "area:usage"])], log=quiet.append)
+    check("an enumerable board emits NO defer line", quiet, [])
+    # exclusion_reason is the single predicate ready_candidates and retriage's re-park both use.
+    check("exclusion_reason: complete label set is enumerable",
+          exclusion_reason({"status:ready", "priority:P1", "role:impl", "area:usage"}), None)
+    check("exclusion_reason: no attestation",
+          exclusion_reason({"priority:P1", "role:impl"}), "no status:ready attestation")
+    check("exclusion_reason: an area-less set is still enumerable (it reserves __global__)",
+          exclusion_reason({"status:ready", "priority:P1", "role:impl"}), None)
     check("flatten pages drops PRs", _flatten_pages(
         [[{"number": 1}, {"number": 2, "pull_request": {}}], [{"number": 3}], "junk", [None]]),
         [{"number": 1}, {"number": 3}])
