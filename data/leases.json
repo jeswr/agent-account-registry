@@ -29,16 +29,6 @@
    "model": "sol",
    "issued_at": 1785023357,
    "expires_at": 1785029657
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "0631785b76fd4bbc8e28a07c5c89680a",
-   "holder": "sparq-org/sparq#3806@30180080878.1",
-   "package": "sparq-substrate",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785023377,
-   "expires_at": 1785029677
   }
  ]
 }
