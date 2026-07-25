@@ -281,9 +281,21 @@ Edit `policy/repos.toml` for each target repo that should be allowed to use this
 
 ```toml
 [repos."sparq-org/sparq"]
-account_pool = ["acct01", "acct02", "acct03", "acct04", "acct05"]   # add the new handle
-max_concurrent = 5                                                   # optional: allow more parallelism
+account_pool = ["acct01", "acct02", "acct04", "acct05"]   # add the handle from the steps above
+max_concurrent = 5                                                  # optional: allow more parallelism
 ```
+
+Two constraints the resolver enforces, so a pool that violates either is refused outright rather
+than failing later at claim time:
+
+- **Handles must be canonical** — exactly `acct[0-9a-z]{2,}`, no surrounding whitespace and no case
+  variation. `" acct04"` and `"ACCT04"` are both rejected. (A padded handle used to pass validation
+  while evading the retirement check below, and downstream `select-and-claim` strips before
+  matching, so it became claimable and leaked its CAS lease to TTL.)
+- **Retired handles can never reappear.** `acct03` and `acct06` are retired (accounts cancelled /
+  expired 2026-07-25) and are refused by `policy-resolve.RETIRED_ACCOUNTS`. Their slot names stay
+  permanently reserved — `set-up-account` counts `acctNN` issues in ANY state — so a new enrolment
+  always gets a NEW handle, never a recycled one.
 Commit + push to `master`. An account that is available + in the catalog but **not** in a repo's
 `account_pool` will never be claimed for that repo.
 

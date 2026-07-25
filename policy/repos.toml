@@ -88,7 +88,13 @@
 [repos."sparq-org/sparq"]
 enabled = true
 routing = "orchestration/routing.toml"
-account_pool = ["acct01", "acct02", "acct03", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct06", "acct07"]
+# acct03 and acct06 RETIRED 2026-07-25 (maintainer: both underlying accounts cancelled/expired).
+# Removed from the pool so no dispatch tick tries to claim a dead credential. Their `acctNN`
+# issues (#14, #25) stay PRESENT on purpose: set-up-account derives its slot-allocation union
+# from acctNN issues in ANY state, so keeping the records reserves those slot names permanently
+# and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
+# provenance records or salted fingerprints.
+account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
 max_concurrent = 40
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
@@ -127,7 +133,13 @@ worker_success_floor    = 0.5  # worker-failing below 50% success with any worke
 [repos."jeswr/agent-account-registry"]
 enabled = true
 routing = "orchestration/routing.toml"   # THIS repo's own routing (self-managed target)
-account_pool = ["acct01", "acct02", "acct03", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct06", "acct07"]
+# acct03 and acct06 RETIRED 2026-07-25 (maintainer: both underlying accounts cancelled/expired).
+# Removed from the pool so no dispatch tick tries to claim a dead credential. Their `acctNN`
+# issues (#14, #25) stay PRESENT on purpose: set-up-account derives its slot-allocation union
+# from acctNN issues in ANY state, so keeping the records reserves those slot names permanently
+# and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
+# provenance records or salted fingerprints.
+account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
 max_concurrent = 3            # SMALL: the trust plane drains slowly + conservatively
 worker_timeout_minutes = 30   # python self-tests + actionlint are fast (no cargo build)
 gate_profile = "registry-selftest"  # python --self-test suite + bash -n + actionlint (see worker-live.sh)
