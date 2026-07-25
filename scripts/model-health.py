@@ -191,6 +191,44 @@ NO_CHANGE_LIMIT_MIN_ISSUES = 2
 BACKOFF_BASE_SECONDS = 15 * 60
 BACKOFF_CAP_SECONDS = 5 * 3600
 BACKOFF_CLASSES = frozenset({CLASS_LIMIT, CLASS_TRANSIENT})
+# --- AUTH COOLDOWN (registry #596). `auth` was DELIBERATELY absent from BACKOFF_CLASSES above: a
+# credential problem is not a usage window, and retrying it sooner is harmless. But acct01's codex
+# OAuth access token expires HOURLY while the fleet stores a static snapshot of it, so the fleet's
+# ONLY cross-provider review account fails `auth` for a whole window at a time (observed live for
+# fingerprint dc2d7519: 5 × auth against 5 × success interleaved in one window, then 2 more auth
+# plus 1 rate in the next). Handing that credential to the allocator every tick converts a
+# maintainer-fixable credential outage into a stream of dead review lanes.
+#
+# So a RUN of consecutive `auth` outcomes for ONE account now yields a bounded COOLDOWN through the
+# EXISTING probe-exempt backoff primitive (issue #29: account_backoffs -> account-usage's
+# `backoff_until` overlay -> usage_eligible skips the account). No parallel mechanism, no new
+# ledger, no new write path.
+#
+# NOT A DISABLE — deliberately (#596 nuance). acct01 is currently the ONLY cross-provider review
+# account, so marking it permanently unavailable would mean ZERO verdicts fleet-wide, which is
+# strictly worse than a ~50% success rate. The cooldown is therefore a SHORT, SINGLE-STEP,
+# NON-DOUBLING TTL: exactly BACKOFF_BASE_SECONDS (15 min ~= one or two of dispatch's 10-minute
+# ticks), never the 5 h exponential the limit/transient chain can reach, and it expires on its own
+# with no maintainer action. The account comes back automatically; the ALERT is what asks the
+# maintainer to re-mint the token.
+#
+# WHY N=2 (AUTH_COOLDOWN_MIN). One `auth` is exactly what the hourly expiry boundary looks like,
+# and the very next claim may pick up a freshly-uploaded secret — sidelining the sole reviewer on a
+# single blip costs more verdict supply than it saves. TWO CONSECUTIVE auth outcomes with NO
+# interleaved success is credential ROT, not a boundary flap. N=3 was considered and rejected: with
+# one reviewer, three consecutive auth failures already means ~30 min of zero fleet-wide verdicts
+# before anything signals, and the observed pattern is interleaved, so a 3-run is rarer than the
+# outage it is supposed to catch.
+#
+# SCOPE (honest): account_backoffs is consumed by account-usage.py for PROBE-EXEMPT providers only
+# (openai/codex), so the cooldown governs allocation for exactly those. That is not a gap — it is
+# where the gap WAS. A metered provider's rejected credential already fails the usage probe, so its
+# entry never reaches status `allowed` and select-and-claim's fail-closed arm excludes it (this is
+# why the two revoked anthropic accounts publish as `unknown` and are already skipped). Probe-exempt
+# accounts have no probe to fail closed on, which is precisely why acct01 kept being handed out.
+# The ALERT below fires for either provider regardless of allocation.
+AUTH_COOLDOWN_MIN = 2
+AUTH_COOLDOWN_SECONDS = BACKOFF_BASE_SECONDS
 # The consecutive-hit count at which the exponential arm saturates the 5 h cap (smallest n with
 # BASE * 2**(n-1) >= CAP). prune's active-backoff retention (issue #82) keeps at most this many
 # tail records of a live chain: past saturation, extra chain records cannot change the derived
@@ -311,8 +349,10 @@ def prune(records, now):
     tail of its current consecutive chain (the limit/transient records since its last success,
     truncated to BACKOFF_CHAIN_KEEP — past cap-saturation extra records cannot change the
     derived backoff_until) is preserved. A derived no_change limit additionally retains its
-    minimal three source observations. Earlier ordinary backoff records cannot affect the derived
-    state (a success resets them), so re-deriving backoff_until on the pruned window is exact.
+    minimal three source observations, and a live AUTH COOLDOWN (registry #596) retains the
+    AUTH_COOLDOWN_MIN tail of its consecutive `auth` run. Earlier ordinary backoff records cannot
+    affect the derived state (a success resets them), so re-deriving backoff_until on the pruned
+    window is exact.
 
     BOUND CONTRACT (PR #85 finding 1): preserved records spend the MAX_RECORDS budget first and
     the newest non-preserved records fill only the REMAINING budget, so the total is bounded by
@@ -323,7 +363,8 @@ def prune(records, now):
     diagnostic surfaces the overshoot (that many simultaneously backed-off accounts is a
     fleet-wide rate-limit saturation signal the maintainer must see, not a bookkeeping detail).
     len(preserved) itself is bounded by live_accounts * (BACKOFF_CHAIN_KEEP +
-    NO_CHANGE_LIMIT_MIN - 1), and every backoff expires within BACKOFF_CAP_SECONDS, so the
+    NO_CHANGE_LIMIT_MIN - 1 + AUTH_COOLDOWN_MIN), and every backoff expires within
+    BACKOFF_CAP_SECONDS (an auth cooldown within the much shorter AUTH_COOLDOWN_SECONDS), so the
     overshoot is transient, not unbounded growth."""
     kept = [r for r in records if isinstance(r, dict)
             and isinstance(r.get("ts"), int)
@@ -337,15 +378,25 @@ def prune(records, now):
     if active:
         derived, no_change_evidence = _no_change_limit_view(kept, now)
         chains = {}                 # account -> indices of its current consecutive chain
+        auth_runs = {}              # account -> indices of its current consecutive auth run (#596)
         for index, r in enumerate(derived):
             acct, cls = r.get("account"), r.get("exit_class")
             if cls == SUCCESS:
                 chains.pop(acct, None)      # a success resets the chain — and the derived state
+                auth_runs.pop(acct, None)
             elif cls in BACKOFF_CLASSES:
                 chains.setdefault(acct, []).append(index)
+            elif cls == CLASS_AUTH:
+                auth_runs.setdefault(acct, []).append(index)
         for acct in active:
             chain = chains.get(acct, ())
             preserved.update(chain[-BACKOFF_CHAIN_KEEP:])
+            # A live AUTH COOLDOWN (registry #596) is derived from `auth` records, which are NOT in
+            # BACKOFF_CLASSES and so appear in no `chain` — without this a flood of later unrelated
+            # records would evict the run and readmit the account mid-cooldown, the exact bug issue
+            # #82 fixed for rate limits. Kept in its own bucket so the limit/transient tail above
+            # (whose length determines the re-derived exponential) is byte-for-byte unchanged.
+            preserved.update(auth_runs.get(acct, ())[-AUTH_COOLDOWN_MIN:])
             # A derived no_change limit needs all three source observations after pruning; keeping
             # only the newest (derived) member would erase the discriminator and readmit the capped
             # account on the next ledger read. Preserve this bounded evidence only when the derived
@@ -579,6 +630,48 @@ def _no_change_limit_view(records, now):
     return derived, evidence
 
 
+def auth_cooldowns(records, now):
+    """PURE per-account AUTH COOLDOWN (registry #596), derived from the same health window as
+    account_backoffs. Walks ts-ordered records: a SUCCESS clears the account's auth run (and any
+    cooldown it earned — the credential works again); the AUTH_COOLDOWN_MIN'th consecutive `auth`
+    and every one after it (re)start a cooldown of AUTH_COOLDOWN_SECONDS from that record.
+
+    Consecutiveness follows the same convention as _per_account_tail_failures: only a SUCCESS on the
+    SAME account breaks the run — an interleaved limit/transient/setup/unknown record neither counts
+    toward it nor clears it (the credential state is unchanged by an unrelated failure).
+
+    Bounded by construction: no doubling, no reset-hint arm (an auth failure carries no provider
+    reset time), and the end is clamped to now + AUTH_COOLDOWN_SECONDS, so a forged or clock-skewed
+    record can sideline an account for at most that one short TTL — which matters because the
+    account it will most often name is the fleet's ONLY cross-provider reviewer.
+
+    Returns only ACTIVE cooldowns, in the same shape account_backoffs returns:
+    {account_hash: {"backoff_until", "consecutive", "saturated", "last_signal", "last_ts"}}."""
+    runs, state = {}, {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        acct, cls, ts = record.get("account"), record.get("exit_class"), record.get("ts")
+        if not isinstance(acct, str) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            continue
+        if ts != ts or ts in (float("inf"), float("-inf")) or ts > now + FUTURE_SKEW_SECONDS:
+            continue                    # non-finite / future-forged stamp: skip fail-open
+        if cls == SUCCESS:
+            runs.pop(acct, None)
+            state.pop(acct, None)       # the credential authenticated again — cooldown cleared
+        elif cls == CLASS_AUTH:
+            run = runs.get(acct, 0) + 1
+            runs[acct] = run
+            if run >= AUTH_COOLDOWN_MIN:
+                until = min(ts + AUTH_COOLDOWN_SECONDS, now + AUTH_COOLDOWN_SECONDS)
+                state[acct] = {"backoff_until": int(until), "consecutive": run,
+                               # never truncated by prune's chain cap (the run is retained whole),
+                               # so the count is exact — unlike a saturated limit/transient chain
+                               "saturated": False,
+                               "last_signal": CLASS_AUTH, "last_ts": int(ts)}
+    return {acct: cd for acct, cd in state.items() if cd["backoff_until"] > now}
+
+
 def account_backoffs(records, now):
     """Reactive per-account backoff for probe-exempt providers (maintainer decision 2026-07-17,
     registry issue #29), DERIVED purely from the pruned health window. Walks records in ts order:
@@ -633,8 +726,18 @@ def account_backoffs(records, now):
                            # render a saturated count as "x6+", never as an exact "x6".
                            "saturated": consecutive >= BACKOFF_CHAIN_KEEP,
                            "last_signal": cls, "last_ts": int(ts)}
-        # other classes (auth/setup/unknown/raw no_change) neither extend nor clear a backoff
-    return {acct: b for acct, b in state.items() if b["backoff_until"] > now}
+        # other classes (auth/setup/unknown/raw no_change) neither extend nor clear THIS chain
+    active = {acct: b for acct, b in state.items() if b["backoff_until"] > now}
+    # AUTH COOLDOWN overlay (registry #596). Derived in a SEPARATE pass and merged by LATEST end so
+    # the limit/transient exponential chain above is untouched: folding `auth` into that walk would
+    # have let an interleaved auth record inflate the `consecutive` multiplier (and therefore the
+    # 5 h-capped exponential) of an unrelated rate-limit chain. A cooldown never SHORTENS a live
+    # backoff — only extends when it ends later.
+    for acct, cooldown in auth_cooldowns(valid, now).items():
+        current = active.get(acct)
+        if current is None or cooldown["backoff_until"] > current["backoff_until"]:
+            active[acct] = cooldown
+    return active
 
 
 def classify_records(records, provider_accounts, now, open_alerts=()):
@@ -659,9 +762,14 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
                            distinct accounts, per-account runs unbroken by their OWN success.
       persistent-transient: >=5 transient/unknown fails in 15 min (even one account).
       provider-capped    : EVERY enabled account's LATEST limit/success outcome is limit-class.
+      account-auth-cooldown: >=AUTH_COOLDOWN_MIN consecutive `auth` outcomes put one or more of the
+                           provider's accounts in a bounded credential cooldown (registry #596).
       zero-dispatch      : >=3 consecutive zero-dispatch ticks (provider == 'fleet').
     """
     records, _ = _no_change_limit_view(records, now)
+    # Live per-account credential cooldowns (registry #596), derived from the SAME window. Keyed by
+    # salted fingerprint; mapped onto providers inside the per-provider loop below.
+    cooldowns = auth_cooldowns(records, now)
     actions = []
     providers = {r["provider"] for r in records if isinstance(r.get("provider"), str)}
 
@@ -750,6 +858,30 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
                        else "transient failures are within blip tolerance"),
         })
 
+        # ---- account-auth-cooldown (registry #596) ----------------------------------------------
+        # A run of consecutive `auth` outcomes on one account is a CREDENTIAL OUTAGE the maintainer
+        # must fix (re-mint the setup-token) — it is NOT a model decline, and it never self-heals by
+        # retrying. The action is keyed on (condition, provider) like every other, so the upsert
+        # raises the alert EXACTLY ONCE for the whole outage and refreshes it thereafter rather than
+        # commenting per failed run; it recovers (fire=False -> the issue closes) as soon as the
+        # account authenticates again, which is also when the cooldown clears.
+        #
+        # The body names only the SALTED FINGERPRINT (locked decision 22a) — never the acctNN handle
+        # or the account email — and the fingerprints ride the same private-route redaction as every
+        # other count in render_body.
+        cooled = sorted(acct for acct in cooldowns if acct in observed)
+        actions.append({
+            "condition": "account-auth-cooldown",
+            "provider": provider,
+            "fire": bool(cooled),
+            "accounts": cooled,
+            "reason": (f"{len(cooled)} {provider} account(s) hit >= "
+                       f"{AUTH_COOLDOWN_MIN} consecutive `auth` failures and are in a bounded "
+                       "credential cooldown"
+                       if cooled
+                       else "no account is in a credential cooldown"),
+        })
+
         # ---- provider-capped -------------------------------------------------------------------
         # Every ENABLED account of the provider is usage-limited within the window. STALENESS
         # (review defect #1): a limit record is invalidated by any LATER success from the SAME
@@ -824,6 +956,7 @@ def _alert_title(condition, provider):
         "provider-outage": f"model access OUTAGE — provider `{provider}`",
         "persistent-transient": f"persistent transient model errors — provider `{provider}`",
         "provider-capped": f"provider `{provider}` fully usage-CAPPED",
+        "account-auth-cooldown": (f"`{provider}` worker credential is REJECTED — re-mint required"),
         "zero-dispatch": "dispatcher launched nothing while work was ready",
     }
     return f"⚠️ {labels.get(condition, condition)}"
@@ -881,6 +1014,29 @@ def render_body(action, maintainer, redact=False):
         if action.get("reset_hint"):
             lines.append(f"\nEarliest known reset: **{action['reset_hint']}** — capacity should "
                          "self-restore then. Reset a subscription window sooner to unblock.")
+    elif cond == "account-auth-cooldown":
+        # Fingerprints ONLY (locked decision 22a): the salted 16-hex hash is what the ledger holds,
+        # and it is what the maintainer's own email->reset fingerprint map resolves. The raw acctNN
+        # handle and the account email NEVER appear here. This branch is unreachable on the public
+        # route — `redact` returns above — so the fingerprints only ever land on a verified private
+        # repository.
+        fingerprints = ", ".join(f"`{a}`" for a in (action.get("accounts") or [])) or "(unknown)"
+        lines.append(
+            f"🔑 **A `{action['provider']}` worker credential is being REJECTED, not "
+            f"rate-limited.** {action['reason']}. Account fingerprint(s): {fingerprints}.")
+        lines.append(
+            "\n**Maintainer action required — re-mint the credential** (`claude setup-token` for "
+            "anthropic, `codex login --device-auth` for openai) and re-upload the account secret. "
+            "See jeswr/agent-account-registry#596: a codex OAuth **access** token expires hourly, "
+            "so a static snapshot of one dies within the hour no matter how it was minted — the "
+            "durable fix is storing refresh-capable material.")
+        lines.append(
+            f"\nUntil then the allocator skips the account for a bounded "
+            f"{AUTH_COOLDOWN_SECONDS // 60}-minute cooldown and then tries again — deliberately "
+            "NOT a permanent disable, because this may be the only cross-provider review account "
+            "and zero reviews is worse than a partial success rate. Nothing about this counts as a "
+            "model decline: `auth` outcomes consume no review round and no attempt budget "
+            "(registry #596), so no PR or issue is parked on account of it.")
     elif cond == "zero-dispatch":
         lines.append(f"🚨 **The dispatcher planned ready work but launched NOTHING.** "
                      f"{action['reason']}. Ready issues exist but no worker started — a capacity, "
@@ -2149,6 +2305,135 @@ def _self_test():
     # transient (rate-limit) records now KEEP their reset hint (the backoff needs it)
     chk("rate-limit record keeps reset_hint",
         "reset_hint" in rec("openai", "codex01", "rate-limit", reset="in 20s"), True)
+
+    # ---- [registry #596] AUTH COOLDOWN: N consecutive auth outcomes sideline ONE account, BOUNDED,
+    # and raise the ops alert exactly once. Reuses the issue-#29 probe-exempt backoff primitive
+    # (account_backoffs -> account-usage's backoff_until overlay), NOT a parallel mechanism. ------
+    one_auth = [rec("openai", "codex01", "auth", dt=0)]
+    chk(f"a SINGLE auth does NOT cool down the account (N={AUTH_COOLDOWN_MIN})",
+        auth_cooldowns(one_auth, now + 60), {})
+    chk("a single auth leaves account_backoffs untouched too",
+        account_backoffs(one_auth, now + 60), {})
+    two_auth = [rec("openai", "codex01", "auth", dt=0, run="a1"),
+                rec("openai", "codex01", "auth", dt=60, run="a2")]
+    cd = auth_cooldowns(two_auth, now + 120)
+    chk(f"{AUTH_COOLDOWN_MIN} consecutive auth outcomes cool the account down",
+        (cd.get(ah, {}).get("backoff_until"), cd.get(ah, {}).get("last_signal"),
+         cd.get(ah, {}).get("consecutive")),
+        (now + 60 + AUTH_COOLDOWN_SECONDS, CLASS_AUTH, 2))
+    chk("the cooldown surfaces through the SAME account_backoffs primitive the allocator reads",
+        account_backoffs(two_auth, now + 120).get(ah, {}).get("last_signal"), CLASS_AUTH)
+    # BOUNDED, not a disable: it is one short non-doubling TTL and it EXPIRES on its own — the sole
+    # cross-provider reviewer must come back without maintainer action.
+    chk("the cooldown EXPIRES (no permanent unavailable flag)",
+        (auth_cooldowns(two_auth, now + 60 + AUTH_COOLDOWN_SECONDS + 1),
+         account_backoffs(two_auth, now + 60 + AUTH_COOLDOWN_SECONDS + 1)), ({}, {}))
+    chk("the cooldown never doubles (a long auth run stays one short TTL)",
+        auth_cooldowns([rec("openai", "codex01", "auth", dt=i * 10, run=f"a{i}")
+                        for i in range(12)], now + 200).get(ah, {}).get("backoff_until"),
+        now + 110 + AUTH_COOLDOWN_SECONDS)
+    chk("the cooldown end is clamped to now + AUTH_COOLDOWN_SECONDS even on a skewed stamp",
+        auth_cooldowns([{"account": ah, "exit_class": CLASS_AUTH, "ts": now + FUTURE_SKEW_SECONDS,
+                         "provider": "openai"},
+                        {"account": ah, "exit_class": CLASS_AUTH, "ts": now + FUTURE_SKEW_SECONDS,
+                         "provider": "openai"}], now).get(ah, {}).get("backoff_until"),
+        now + AUTH_COOLDOWN_SECONDS)
+    # A SUCCESS between the auths breaks the run: the interleaved 5-auth/5-success live pattern must
+    # not cool the account down on every other run.
+    chk("an interleaved success breaks the auth run",
+        auth_cooldowns([rec("openai", "codex01", "auth", dt=0, run="a1"),
+                        rec("openai", "codex01", SUCCESS, dt=30, run="s1"),
+                        rec("openai", "codex01", "auth", dt=60, run="a2")], now + 120), {})
+    chk("a later success CLEARS a cooldown already earned",
+        auth_cooldowns(two_auth + [rec("openai", "codex01", SUCCESS, dt=90, run="s2")],
+                       now + 120), {})
+    # Per-ACCOUNT: another account's auth failures never sideline this one.
+    other_h = account_hash("codex02", salt)
+    two_acct = two_auth + [rec("openai", "codex02", "auth", dt=10, run="b1")]
+    chk("the cooldown is per-account (the other account is untouched)",
+        sorted(auth_cooldowns(two_acct, now + 120)), sorted([ah]))
+    chk("the other account's fingerprint is absent", other_h in auth_cooldowns(two_acct, now + 120),
+        False)
+    # The auth pass must NOT perturb the limit/transient exponential chain (why it is a separate
+    # pass): an interleaved auth record used to be able to inflate `consecutive`.
+    mixed_chain = [rec("openai", "codex01", "rate-limit", dt=0, run="r1"),
+                   rec("openai", "codex01", "auth", dt=10, run="a1"),
+                   rec("openai", "codex01", "rate-limit", dt=20, run="r2")]
+    chk("an interleaved auth does not inflate the rate-limit consecutive count",
+        account_backoffs(mixed_chain, now + 30).get(ah, {}).get("consecutive"), 2)
+    # A LONGER live rate-limit backoff wins over the short cooldown (never shortened).
+    long_then_auth = [rec("openai", "codex01", "rate-limit", dt=0, run="r1"),
+                      rec("openai", "codex01", "rate-limit", dt=10, run="r2"),
+                      rec("openai", "codex01", "rate-limit", dt=20, run="r3"),
+                      rec("openai", "codex01", "auth", dt=30, run="a1"),
+                      rec("openai", "codex01", "auth", dt=40, run="a2")]
+    merged = account_backoffs(long_then_auth, now + 50).get(ah, {})
+    chk("a longer live rate-limit backoff is never SHORTENED by the auth cooldown",
+        (merged.get("last_signal"), merged.get("backoff_until")),
+        (CLASS_TRANSIENT, now + 20 + BACKOFF_BASE_SECONDS * 4))
+    # prune must not evict a live cooldown's evidence (the issue-#82 bug, for auth).
+    auth_flood = two_auth + [rec("anthropic", f"a{i:03d}", SUCCESS, dt=100 + i)
+                             for i in range(MAX_RECORDS + 5)]
+    auth_window = prune(auth_flood, now + 200)
+    chk("prune retains a live auth cooldown's evidence (no mid-cooldown readmission)",
+        (len(auth_window) <= MAX_RECORDS,
+         auth_cooldowns(auth_window, now + 200).get(ah, {}).get("last_signal")),
+        (True, CLASS_AUTH))
+    # ---- the ops alert: ONE alert per (condition, provider), naming FINGERPRINTS only -----------
+    openai_fleet = {"openai": {ah}}
+    auth_actions = classify_records(two_auth, openai_fleet, now + 120)
+    chk("the auth cooldown FIRES the account-auth-cooldown alert",
+        fires(auth_actions, "account-auth-cooldown", "openai"), True)
+    auth_action = next(a for a in auth_actions if a["condition"] == "account-auth-cooldown")
+    chk("the firing action carries the salted fingerprint", auth_action["accounts"], [ah])
+    # Idempotence is the (condition, provider) marker: the SAME single action for a 5-run outage,
+    # so _upsert_alert refreshes ONE issue instead of alerting per failed run.
+    many_auth = [rec("openai", "codex01", "auth", dt=i * 10, run=f"a{i}") for i in range(5)]
+    many_actions = [a for a in classify_records(many_auth, openai_fleet, now + 60)
+                    if a["condition"] == "account-auth-cooldown"]
+    chk("5 auth runs still produce exactly ONE alert action (not one per run)",
+        (len(many_actions), many_actions[0]["fire"], many_actions[0]["accounts"]),
+        (1, True, [ah]))
+    chk("the alert marker is keyed per (condition, provider) so the upsert dedupes",
+        _marker("account-auth-cooldown", "openai"),
+        f"<!-- {MARKER_PREFIX}:account-auth-cooldown:openai -->")
+    # RECOVERY: the credential works again -> the action recovers and the alert closes.
+    chk("a success recovers the cooldown alert (fire=False)",
+        [a["fire"] for a in classify_records(
+            two_auth + [rec("openai", "codex01", SUCCESS, dt=90, run="s2")], openai_fleet,
+            now + 120) if a["condition"] == "account-auth-cooldown"], [False])
+    chk("a single auth does not fire the alert",
+        fires(classify_records(one_auth, openai_fleet, now + 60),
+              "account-auth-cooldown", "openai"), False)
+    # BODY: fingerprint + the required maintainer action; NEVER a raw handle or email; and the
+    # public route redacts it entirely.
+    auth_body = render_body(auth_action, "jeswr")
+    chk("the alert body names the fingerprint", ah in auth_body, True)
+    chk("the alert body carries NO raw handle",
+        any(h in auth_body for h in ("codex01", "acct01", "@gmail", "acct0")), False)
+    chk("the alert body names the required maintainer action",
+        "re-mint" in auth_body.lower() and "#596" in auth_body, True)
+    chk("the alert body says it is a bounded cooldown, not a disable",
+        "cooldown" in auth_body and "NOT a permanent disable" in auth_body, True)
+    chk("the PUBLIC (redacted) route suppresses the fingerprint",
+        ah in render_body(auth_action, "jeswr", redact=True), False)
+    # LADDER SEPARATION: an auth outcome is NOT a decline. The #500 no-change discriminator and the
+    # dispatch decline ladder both key on CLASS_NO_CHANGE, so auth records can never advance them.
+    # Structurally, an auth record cannot even CARRY the decline evidence field the ladders read.
+    chk("make_record refuses to attach no-change decline evidence to an auth record",
+        _raises(lambda: rec("openai", "codex01", "auth", issue=500)), True)
+    # And a hand-forged one (bypassing make_record) still cannot advance either ladder.
+    auth_as_declines = [dict(rec("openai", "codex01", "auth", dt=i * 10, run=f"d{i}"), issue=500)
+                        for i in range(NO_CHANGE_LIMIT_MIN + 2)]
+    chk("auth records never satisfy the #500 no-change limit discriminator",
+        _no_change_limit_view(auth_as_declines, now + 60)[1], {})
+    chk("auth records are never derived to limit-class (no capped-account escalation)",
+        {r["exit_class"] for r in _no_change_limit_view(auth_as_declines, now + 60)[0]},
+        {CLASS_AUTH})
+    chk("a genuine no_change run of the same length DOES satisfy it (ladder still works)",
+        bool(_no_change_limit_view(
+            [rec("openai", "codex01", CLASS_NO_CHANGE, dt=i * 10, run=f"n{i}", issue=500 + i)
+             for i in range(NO_CHANGE_LIMIT_MIN)], now + 60)[1]), True)
 
     # ---- prune / window bound ---------------------------------------------------------------
     many = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=i) for i in range(MAX_RECORDS + 50)]
