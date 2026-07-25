@@ -36,9 +36,12 @@ jobs:
       #   * status:untriaged -> promote once the label set is triage-complete (#415).
       #   * status:ready     -> re-park/repair once the readiness engine provably cannot enumerate
       #                         it (the label-lost half of #178: nothing on master recovered it).
-      # The snapshot is REAL cursor pagination with a runaway ceiling and an explicit per-run cap;
-      # `retriage.py --snapshot` fails closed (non-zero) on a partial page, so `set -e` aborts the
-      # step BEFORE any write rather than mistaking a truncated board for "nothing to do".
+      # The board is fetched page by page with an explicit REQUEST ceiling (max_pages below), and
+      # completeness is proved by reading until a page comes back short — a board too large for the
+      # ceiling fails the step closed rather than being swept partially. `retriage.py --snapshot`
+      # then validates the SHAPE of those pages (fail closed, non-zero, so `set -e` aborts before
+      # any write) and hands back THIS run's window: an explicit per-run cap whose offset ROTATES
+      # by the run number, so a capped board cannot starve its tail (#605 review findings 1 + 2).
       #
       # PR #595 findings 3 + 6. The sweep no longer touches labels itself: it plans NOTHING and
       # mutates NOTHING in shell. `scripts/retriage.py --apply` owns the whole
@@ -72,13 +75,41 @@ jobs:
           # of a label that does not exist (nor a strip of the last role:* label for one). Without
           # it, `role:soundness` — absent from this repo — stranded promoted issues role-less.
           known=$(gh_read label list -R "$REPO" --limit 500 --json name --jq '[.[].name]|join(",")')
+          # #605 review finding 2: `--paginate --slurp` pulled EVERY page into a file BEFORE any
+          # ceiling could look at it, so the "runaway ceiling" bounded neither requests nor memory
+          # — it only refused to mutate afterwards — and a genuinely TRUNCATED sequence was
+          # undetectable (a well-formed board missing its last page reads exactly like a short
+          # board). Page explicitly instead, with a REAL request ceiling, and prove completeness the
+          # only way the API offers: keep going until a page comes back short. A board that does not
+          # fit inside the ceiling fails the step CLOSED — a board we could not read completely must
+          # never be mistaken for "nothing to do".
+          max_pages=20     # retriage.SWEEP_MAX_PAGES * 100 issues per label lane
           for label in status:untriaged status:ready; do
-            gh_read api --paginate --slurp \
-              "repos/$REPO/issues?state=open&labels=$label&per_page=100" \
-              > "$tmp/pages-${label#status:}.json"
+            lane=${label#status:}
+            page=1
+            while : ; do
+              out="$tmp/page-$lane-$page.json"
+              gh_read api "repos/$REPO/issues?state=open&labels=$label&per_page=100&page=$page" \
+                > "$out"
+              got=$(jq 'length' "$out")   # a non-array payload fails here, under set -e
+              if [ "$got" -lt 100 ]; then
+                break
+              fi
+              if [ "$page" -ge "$max_pages" ]; then
+                echo "::error::the $label board is larger than ${max_pages} pages (>= $((max_pages * 100)) issues) — refusing to sweep a board this run could not read completely (fail closed)"
+                exit 1
+              fi
+              page=$((page + 1))
+            done
           done
-          jq -s 'add' "$tmp/pages-untriaged.json" "$tmp/pages-ready.json" > "$tmp/pages.json"
-          python3 scripts/retriage.py --snapshot --cap 80 \
+          # Each page file is already a JSON array, so slurping them yields the list-of-pages shape
+          # `--snapshot` validates. Glob order is irrelevant: it flattens and re-orders by number.
+          jq -s '.' "$tmp"/page-*.json > "$tmp/pages.json"
+          # --rotation makes the per-run window ROTATE (#605 review finding 1): a fixed
+          # oldest-updated window filled with permanent no-op skips and starved the rest of the
+          # board forever. GITHUB_RUN_NUMBER is monotonic per workflow, so consecutive runs walk
+          # disjoint windows with no cursor state to persist.
+          python3 scripts/retriage.py --snapshot --cap 80 --rotation "$GITHUB_RUN_NUMBER" \
             < "$tmp/pages.json" > "$tmp/issues.jsonl"
 
           failed=0

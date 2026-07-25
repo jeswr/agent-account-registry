@@ -76,7 +76,7 @@ def _defer_log(message):
 
 
 def exclusion_reason(labels, open_blockers=0):
-    """The ONE label-side completeness predicate, as a REASON: None when the engine can enumerate
+    """The ONE label-side ENUMERABILITY predicate, as a REASON: None when the engine can enumerate
     an OPEN issue carrying these labels, else a short attributable string naming the FIRST failing
     condition (checked in the documented priority order above).
 
@@ -84,8 +84,17 @@ def exclusion_reason(labels, open_blockers=0):
     — no log line, no counter — so an issue that lost its priority/role label while KEEPING the
     positive `status:ready` attestation left the frontier forever with zero emitted signal. The
     predicate is factored out here so (a) the drop is attributable and (b) the retriage re-park
-    sweep can ask the readiness engine ITSELF whether an issue is enumerable instead of growing a
-    second, divergent notion of triage-completeness.
+    sweep can ask the readiness engine ITSELF whether an issue is enumerable rather than re-deriving
+    enumerability from a private copy of these rules.
+
+    SCOPE, precisely (#605 review finding 6). This is NOT the whole notion of triage-completeness,
+    and the earlier wording overclaimed. It deliberately calls an AREA-LESS issue enumerable — a
+    package-less issue reserves the serializing `__global__` partition, so the engine can still
+    plan it — while `triage.triage()` calls that same issue triage-INCOMPLETE. Two predicates are
+    therefore genuinely in play, answering different questions, and `retriage.plan()` composes both
+    on purpose: this one decides "can the frontier see it", the classifier decides "is its label set
+    complete", and an area regression is caught only by the second. What must never happen is a
+    THIRD, divergent copy of either rule.
 
     Package SERIALIZATION drops (compute_ready's one-per-package concurrency width) are
     deliberately NOT reported here: they are transient by design — the issue is still on the
@@ -236,7 +245,13 @@ def _self_test():
     check("epic defer names the umbrella", "kind:epic" in reasons[13], True)
     # A NON-attested issue is not a candidate at all — it must stay quiet (no log flood).
     check("issue without status:ready stays quiet", 8 in reasons, False)
-    check("closed issue stays quiet", 6 in reasons, False)
+    # #605 review finding 5: "stays quiet" asserted only the ABSENCE of a defer line, which a
+    # closed issue that wrongly reached the frontier would also satisfy. Assert both halves: no
+    # log line AND not on the frontier (nor a candidate).
+    check("closed issue stays quiet AND is not on the frontier",
+          (6 in reasons, 6 in [i["number"] for i in compute_ready(F)],
+           6 in [candidate[1] for candidate in ready_candidates(F, log=lambda _line: None)]),
+          (False, False, False))
     quiet = []
     compute_ready([iss(20, R + ["priority:P1", "area:usage"])], log=quiet.append)
     check("an enumerable board emits NO defer line", quiet, [])

@@ -72,10 +72,15 @@ CLAIM_OWNED = {"status:in-progress", "status:in-progress-review"}
 # other verdict is a no-op skip (fail-closed: an unknown action never becomes a write).
 WRITING_ACTIONS = ("promote", "repark", "repair")
 NON_DISPATCHABLE = _ready.NON_DISPATCHABLE            # kind:epic
-# Bounded, rate-limit-safe sweep: an explicit per-run write cap and a runaway ceiling on the
-# paginated snapshot. A partial page must never be mistaken for the whole board.
+# Bounded, rate-limit-safe sweep: an explicit per-run cap and a runaway ceiling on the paginated
+# snapshot. A partial page must never be mistaken for the whole board.
 SWEEP_CAP = 40
 SWEEP_CEILING = 5000
+# The REQUEST bound on the board fetch, enforced where the pagination happens (retriage.yml) —
+# #605 review finding 2: `--paginate --slurp` pulled EVERY page into a file before SWEEP_CEILING
+# could look at anything, so the ceiling bounded neither requests nor memory and could only refuse
+# to mutate after the fact. 100 issues per page.
+SWEEP_MAX_PAGES = 20
 
 
 class SweepError(RuntimeError):
@@ -183,14 +188,32 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
     return {"action": "skip", "reason": "unprovable"}
 
 
-def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING):
-    """Normalize a `gh api --paginate --slurp` page list into (issues, dropped).
+def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING, rotation=0):
+    """Normalize a paginated issue-page list into (this run's board, count outside the window).
 
-    FAIL CLOSED on any partial view: a page that is not a list, an entry that is not an object, a
-    missing issue number or a malformed label RAISES rather than yielding a short board — acting on
-    a truncated snapshot would look exactly like "nothing to do". `ceiling` is the runaway guard
-    (mirrors ready-issues._fetch); `cap` bounds the writes one run may plan, oldest-updated first,
-    with the remainder reported by the caller (never silently truncated).
+    FAIL CLOSED on any malformed view: a page that is not a list, an entry that is not an object, a
+    missing issue number or a malformed label RAISES rather than yielding a short board. What that
+    validates is SHAPE, not COMPLETENESS — a well-formed board missing its last page is
+    indistinguishable here, which is why the caller (retriage.yml) is the one that proves it read
+    every page and fails closed on a board larger than SWEEP_MAX_PAGES (#605 review finding 2).
+    `ceiling` stays as defence in depth against a runaway board reaching the planner at all.
+
+    SELECTION IS A ROTATING PARTITION OF A STABLE ORDERING (#605 review finding 1, a BLOCKER). The
+    first form sorted the whole board by `(updatedAt, number)` and took the oldest `cap` — but the
+    overwhelming majority of selected issues are NO-OP skips (healthy `status:ready`, `needs:*`-gated,
+    machine-parked, claim-owned, untrusted-author, incomplete-untriaged), and a no-op does not change
+    `updated_at`. So the oldest-`cap` window filled with permanent no-ops and the SAME issues were
+    selected on every scheduled run, forever, while everything behind them was reported as "deferred
+    to the next run" and in fact deferred for good. The ordering was inverted for exactly the case
+    #586 exists to rescue: an issue that JUST lost a label has a RECENT `updated_at`, so it sorted to
+    the very back. Measured on the live board when this was written: 178 `status:untriaged` + 24
+    `status:ready` = 202 open issues against a cap of 80, i.e. 122 permanently unreachable.
+
+    So the window now rotates: the board is ordered by ISSUE NUMBER — immutable, so the ordering is
+    stable across runs and the windows really do partition it — and the start offset advances by
+    `cap` per `rotation` (the workflow passes its run number). Every issue is therefore visited
+    within ceil(total/cap) runs with NO persistent cursor state to keep. Within the run the board is
+    handed over oldest-updated first, which is a fairness ORDER only, never a decision input.
     """
     if not isinstance(pages, list):
         raise SweepError("snapshot payload is not a list of pages")
@@ -229,10 +252,20 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING):
                        "body": item.get("body") or "",
                        "labels": names,
                        "updatedAt": str(item.get("updated_at") or "")})
-    # Oldest-updated first: a FAIRNESS ordering only (never a decision input), so a stranded issue
-    # is at the head of every run until it is repaired. Number breaks ties deterministically.
-    issues.sort(key=lambda i: (i["updatedAt"], i["number"]))
-    return issues[:cap], max(0, len(issues) - cap)
+    # Stable ordering for the partition: the issue NUMBER never changes, so consecutive rotations
+    # really do walk disjoint windows (an `updatedAt` ordering re-shuffles between runs and can
+    # skip past an issue entirely).
+    issues.sort(key=lambda issue: issue["number"])
+    total = len(issues)
+    if total <= cap:
+        window, dropped = issues, 0
+    else:
+        start = (max(0, int(rotation)) * cap) % total
+        window = (issues + issues)[start:start + cap]   # wraps past the end of the board
+        dropped = total - cap
+    # Oldest-updated first WITHIN the run: a fairness order only, never a decision input.
+    window.sort(key=lambda issue: (issue["updatedAt"], issue["number"]))
+    return window, dropped
 
 
 def apply_decision(current, decision, edit, view, read_state=None, warn=None):
@@ -375,8 +408,15 @@ def _self_test():
     chk("POSITIVE CONTROL: a fully-labelled status:ready issue is untouched",
         plan(healthy, "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "ready-consistent"})
-    chk("POSITIVE CONTROL: the untouched decision carries NO label writes",
-        set(plan(healthy, "owner", "app[bot]", "none")) & {"add", "remove"}, set())
+    # #605 review finding 5: "carries NO label writes" alone was satisfied by the PRE-FIX code too,
+    # which rejected every `status:ready` issue as `not-retriageable` and so also wrote nothing. The
+    # assertion only means something PAIRED with its opposite, so assert the discrimination: the
+    # healthy issue carries no writes AND a drifted twin (same labels minus the role) carries them.
+    chk("POSITIVE CONTROL: 'no label writes' DISCRIMINATES — the drifted twin does write",
+        (sorted(set(plan(healthy, "owner", "app[bot]", "none")) & {"add", "remove"}),
+         sorted(set(plan(labelled("status:ready", "priority:P2", "area:groom"),
+                         "owner", "app[bot]", "none")) & {"add", "remove"})),
+        ([], ["add", "remove"]))
     # Criterion 4 scope: an ENUMERABLE status:ready issue is never rewritten by this sweep, even
     # when the classifier sees other drift (here: an ambiguous role set it would collapse).
     chk("an enumerable status:ready issue is left alone despite unrelated classifier drift",
@@ -481,26 +521,73 @@ def _self_test():
     chk("snapshot drops pull requests and normalizes the gh-issue-list shape",
         [i["number"] for i in issues], [1, 3])
     chk("snapshot normalizes user.login to author.login", issues[0]["author"], {"login": "owner"})
-    chk("snapshot normalizes labels", issues[1]["labels"], [{"name": "status:ready"}])
-    chk("snapshot plans nothing beyond the board", dropped, 0)
+    # #605 review finding 4: the old label check fed `{"name": ...}` dicts, the exact output shape,
+    # so the normalization step was an IDENTITY there and deleting it left the check green. Feed the
+    # OTHER accepted input shape — the bare string the REST payload uses for a label-name list — and
+    # a missing/absent author, so the normalization has real work to do.
+    bare, _ = snapshot([[{"number": 5, "labels": ["status:ready", "priority:P2"],
+                         "updated_at": "2026-07-05T00:00:00Z"}]])
+    chk("[#605] snapshot normalizes BARE string labels and a missing author",
+        (bare[0]["labels"], bare[0]["author"], bare[0]["body"]),
+        ([{"name": "status:ready"}, {"name": "priority:P2"}], {"login": ""}, ""))
     chk("snapshot dedupes an issue matched by BOTH label queries",
         [i["number"] for i in snapshot([[api(4, "status:ready")], [api(4, "status:ready")]])[0]],
         [4])
-    capped, dropped = snapshot([[api(n, "status:ready", updated=f"2026-07-0{n}T00:00:00Z")
-                                 for n in (1, 2, 3)]], cap=2)
-    chk("the per-run cap is explicit and oldest-updated first",
-        ([i["number"] for i in capped], dropped), ([1, 2], 1))
-    for label, payload in (("a runaway board", [[api(n, "status:ready") for n in range(12)]]),
-                           ("a partial page", [[api(1, "status:ready")], "truncated"]),
-                           ("a non-object entry", [[api(1, "status:ready"), 7]]),
-                           ("a numberless entry", [[{"user": {"login": "o"}, "labels": []}]]),
-                           ("a malformed label", [[{"number": 1, "labels": [{"colour": "red"}]}]]),
-                           ("a non-list payload", {"pages": []})):
+
+    # ---- #605 review finding 1 (BLOCKER): the per-run window must ROTATE, or a capped board
+    # starves its tail FOREVER. The old window was the oldest-`cap` by `updatedAt`, and a no-op skip
+    # does not change `updated_at`, so the same head was re-selected on every run while the warning
+    # claimed the rest were "deferred to the next run". These checks are the coverage proof.
+    board = [[api(n, "status:ready", updated=f"2026-07-{n:02d}T00:00:00Z") for n in range(1, 8)]]
+    windows = [[i["number"] for i in snapshot(board, cap=3, rotation=r)[0]] for r in range(4)]
+    # (each window is then re-sorted oldest-updated-first for hand-over, so #7 leads its window by
+    # NUMBER but trails it by updatedAt — the selection is what rotates, not the hand-over order.)
+    chk("[#605] consecutive rotations ADVANCE the window — there is no fixed head any more",
+        windows, [[1, 2, 3], [4, 5, 6], [1, 2, 7], [3, 4, 5]])
+    chk("[#605] every issue on the board is covered within ceil(total/cap) runs",
+        sorted({number for window in windows[:3] for number in window}), [1, 2, 3, 4, 5, 6, 7])
+    chk("[#605] the cap and the outside-the-window count are exact at every rotation",
+        {(len(window), snapshot(board, cap=3, rotation=r)[1])
+         for r, window in enumerate(windows)}, {(3, 4)})
+    # the old fixed-window behaviour, stated as the thing that must NOT come back: rotation 0 and
+    # rotation 1 must not be the same window.
+    chk("[#605] rotation actually MOVES the window (a fixed window is the starvation bug)",
+        windows[0] == windows[1], False)
+    chk("[#605] within a run the window is handed over oldest-updated first",
+        [i["updatedAt"] for i in snapshot(
+            [[api(3, "status:ready", updated="2026-07-09T00:00:00Z"),
+              api(1, "status:ready", updated="2026-07-02T00:00:00Z"),
+              api(2, "status:ready", updated="2026-07-05T00:00:00Z")]], cap=3)[0]],
+        ["2026-07-02T00:00:00Z", "2026-07-05T00:00:00Z", "2026-07-09T00:00:00Z"])
+    # #605 review finding 4: a cap ABOVE the board size proved nothing (dropped was 0 either way).
+    # Assert the boundary in both directions.
+    chk("[#605] a board that fits is whole and drops nothing; one over the cap drops exactly one",
+        (snapshot(board, cap=7, rotation=9)[1], snapshot(board, cap=6, rotation=0)[1],
+         len(snapshot(board, cap=7, rotation=9)[0])),
+        (0, 1, 7))
+    huge = [i["number"] for i in snapshot(board, cap=3, rotation=10 ** 9)[0]]
+    chk("a negative/absurd rotation cannot escape the board",
+        ([i["number"] for i in snapshot(board, cap=3, rotation=-5)[0]],
+         len(huge), sorted(set(huge) - set(range(1, 8)))),
+        ([1, 2, 3], 3, []))
+
+    # #605 review finding 4: each refusal now asserts the MESSAGE, not merely that SOMETHING raised
+    # — the payloads reach several different guards, and a bare "did it raise" check cannot tell
+    # which one fired, so deleting one guard could leave the check green on a neighbour's raise.
+    for label, payload, needle in (
+            ("a runaway board", [[api(n, "status:ready") for n in range(12)]], "looks runaway"),
+            ("a partial page", [[api(1, "status:ready")], "truncated"], "is not a list — refusing"),
+            ("a non-object entry", [[api(1, "status:ready"), 7]], "entry is not an object"),
+            ("a numberless entry", [[{"user": {"login": "o"}, "labels": []}]],
+             "no integer issue number"),
+            ("a malformed label", [[{"number": 1, "labels": [{"colour": "red"}]}]],
+             "malformed label"),
+            ("a non-list payload", {"pages": []}, "payload is not a list of pages")):
         try:
             snapshot(payload, ceiling=10)
-            chk(f"snapshot refuses {label}", "no error", "SweepError")
-        except SweepError:
-            chk(f"snapshot refuses {label}", "raised", "raised")
+            chk(f"snapshot refuses {label}", "no error", f"SweepError({needle!r})")
+        except SweepError as exc:
+            chk(f"snapshot refuses {label}", needle in str(exc), True)
 
     # -------------------------------------------------------------------------------------------
     # [PR #595 finding 3] THE LIVE TRANSITION IS FAIL-CLOSED — verified against a fake GitHub, not
@@ -749,14 +836,35 @@ def _self_test():
     # snapshot. A workflow that lists only `status:untriaged` re-opens the label-lost half of #178:
     # nothing else recovers a `status:ready` issue that dropped a required label. The step's `name:`
     # is excluded so a DESCRIPTION of the ready lane can never stand in for querying it.
+    # (`body` is ALREADY comment-stripped above, so a prose mention cannot satisfy these; #605
+    # review finding 3 read this as comment-inclusive and is answered in the PR thread with the
+    # mutation. The `- name:` strip is what keeps the step TITLE from standing in for the query,
+    # and the assertion is now on the LOOP itself rather than on two loose substrings.)
     executable = "\n".join(line for line in body.splitlines()
                            if not line.strip().startswith("- name:"))
-    checks.append(("[#586] the sweep board is built from BOTH the untriaged AND ready lanes",
-                   "status:untriaged" in executable and "status:ready" in executable))
+    checks.append(("[#586] the sweep board is QUERIED from BOTH the untriaged AND ready lanes",
+                   re.search(r"for\s+label\s+in\s+status:untriaged\s+status:ready\s*;",
+                             executable) is not None))
+    # [#605 review finding 2] the fetch itself must be bounded, and must PROVE it read the whole
+    # board: `--paginate --slurp` pulled every page before any ceiling applied, and a board missing
+    # its last page was indistinguishable from a short one.
+    checks.append(("[#605 f2] the board fetch is page-bounded — no unbounded --paginate remains",
+                   "--paginate" not in executable and "max_pages=" in executable))
+    checks.append(("[#605 f2] a board too large for that ceiling fails the step CLOSED",
+                   "could not read completely" in executable
+                   and re.search(r"exit\s+1", executable) is not None))
+    checks.append(("[#605 f2] completeness is proved by reading until a page comes back short",
+                   re.search(r"-lt\s+100", executable) is not None))
     snapshot_argv = next((argv for argv in argvs if "--snapshot" in argv), [])
     cap = (snapshot_argv[snapshot_argv.index("--cap") + 1] if "--cap" in snapshot_argv else "")
     checks.append(("[#586] the board goes through the fail-closed, per-run-capped snapshot",
                    bool(snapshot_argv) and cap.isdigit() and 0 < int(cap) <= SWEEP_CEILING))
+    # [#605 review finding 1] and that cap must come with a ROTATION, or its window starves the
+    # rest of the board forever (no-op skips never move `updated_at`, so a fixed oldest-first
+    # window re-selects the same head on every run).
+    checks.append(("[#605 f1] the capped window ROTATES per run (never a fixed head)",
+                   "--rotation" in snapshot_argv
+                   and "GITHUB_RUN_NUMBER" in executable))
 
     ok = all(result for _, result in checks)
     for name, result in checks:
@@ -774,10 +882,14 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--snapshot", action="store_true",
-                        help="read a `gh api --paginate --slurp` page list on stdin and emit the "
-                             "bounded, oldest-updated-first sweep board as JSON lines")
+                        help="read a list of issue pages on stdin and emit THIS run's rotating "
+                             "sweep window as JSON lines")
     parser.add_argument("--cap", type=int, default=SWEEP_CAP)
     parser.add_argument("--ceiling", type=int, default=SWEEP_CEILING)
+    parser.add_argument("--rotation", type=int, default=0,
+                        help="rotates the per-run window by --cap (the workflow passes its run "
+                             "number) so a capped board cannot starve its tail — #605 review "
+                             "finding 1")
     parser.add_argument("--maintainer", default="")
     parser.add_argument("--app-bot", default="")
     parser.add_argument("--permission", default="none")
@@ -798,13 +910,21 @@ def main(argv=None):
         return _self_test()
     if args.snapshot:
         try:
-            issues, dropped = snapshot(json.load(sys.stdin), cap=args.cap, ceiling=args.ceiling)
+            issues, dropped = snapshot(json.load(sys.stdin), cap=args.cap, ceiling=args.ceiling,
+                                       rotation=args.rotation)
         except (SweepError, ValueError) as exc:
             print(f"::error::retriage sweep refused its snapshot: {exc}", file=sys.stderr)
             return 1
         if dropped:
-            print(f"::warning::retriage sweep cap {args.cap} reached — {dropped} issue(s) deferred "
-                  "to the next run (oldest-updated first)", file=sys.stderr)
+            # #605 review finding 1: the old wording — "deferred to the next run (oldest-updated
+            # first)" — was materially FALSE under a fixed oldest-first window: the tail was
+            # deferred forever. State what the rotation actually guarantees, in runs.
+            total = len(issues) + dropped
+            runs = -(-total // args.cap)
+            print(f"::warning::retriage sweep cap {args.cap} reached — {dropped} of {total} board "
+                  f"issue(s) are outside THIS run's window; the window rotates by {args.cap} per "
+                  f"run (--rotation {args.rotation}), so the whole board is covered within {runs} "
+                  "runs", file=sys.stderr)
         for issue in issues:
             print(json.dumps(issue, sort_keys=True))
         return 0
