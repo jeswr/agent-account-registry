@@ -96,7 +96,7 @@ routing = "orchestration/routing.toml"
 # provenance records or salted fingerprints.
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
 # [OPUS-5 issue #688] DELIBERATELY UNCHANGED at 40, and that is a finding rather than an omission.
-# 40 already equals the whole measured pool (7 anthropic x 4 = 28, plus acct01's 12 codex slots), so
+# 40 already equals the whole measured pool (7 anthropic x 4 = 28, plus the codex account's 12 slots), so
 # it is not the binding limiter and raising it would be a placebo. On the 2026-07-25 snapshot sparq
 # had 1118 open issues but only 10 DRAINABLE (`ready_candidates`) and a frontier of 7 — the limiter
 # is TRIAGE STARVATION (issues never reaching status:ready + priority + role), which no concurrency
@@ -158,7 +158,7 @@ account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css"
 #   * package_width = 2 widens that frontier to 6 on the same snapshot; 8 leaves headroom for a tick
 #     whose backlog spreads over more areas, without pretending the frontier is wider than it is.
 #   * Pool capacity is nowhere near binding: the 7 available in-pool anthropic accounts carry
-#     max_concurrent_workers = 4 each = 28 slots (acct01 adds 12 codex slots on top). 8 is a
+#     max_concurrent_workers = 4 each = 28 slots (the codex account adds 12 slots on top). 8 is a
 #     quarter of the anthropic pool — deliberately conservative for the trust plane.
 #   * Safe to raise ONLY because the wind-down half ships with it: dynamic_concurrency now sums the
 #     window-tapered per-account grant, so a higher static ceiling can no longer push a full
