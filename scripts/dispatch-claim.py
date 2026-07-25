@@ -4202,6 +4202,29 @@ def _self_test():
     assert len(forged["helper_calls"]) == 1 and forged["claim_calls"] == 0, forged
     print("  ok   decline tripwire (e): bot marker is idempotent; third-party forgery is ignored")
 
+    # (f) [registry #596] `auth` is NOT a decline. A whole window of credential-outage outcomes for
+    # the SAME issue — more than DECLINE_ESCALATION_MIN of them — must perform NO escalation: no
+    # marker, no impl->research reroute, no park, and the ordinary deferred claim stays live.
+    # This is the ladder half of #596: acct01's hourly-expiring codex token produced runs of `auth` outcomes
+    # that must never read as "the model gave up on this task".
+    auth_records = [
+        model_health.make_record("openai", "a" * 16, "codex", "auth", f"600{i}.1",
+                                 decline_now - 60 + (i * 10))
+        for i in range(DECLINE_ESCALATION_MIN + 3)
+    ]
+    assert len(auth_records) > DECLINE_ESCALATION_MIN, auth_records
+    assert {r["exit_class"] for r in auth_records} == {model_health.CLASS_AUTH}, auth_records
+    trip_f = run_decline_tripwire(auth_records)
+    assert trip_f["api_calls"] == [] and trip_f["helper_calls"] == [], trip_f
+    assert trip_f["claim_calls"] == 1, trip_f
+    assert DECLINE_ESCALATION_MARKER not in trip_f["output"], trip_f["output"]
+    # The evidence selector itself is the guard: auth rows never enter the decline window, while a
+    # genuine no_change pair still does (so the ladder is not disabled, only made honest).
+    assert _issue_no_change_outcomes(model_health, auth_records, 500) == [], auth_records
+    assert len(_issue_no_change_outcomes(
+        model_health, auth_records + [no_change_a, no_change_b], 500)) == 2
+    print("  ok   decline tripwire (f): a run of auth outcomes never advances the decline ladder")
+
     fixture = {
         "schema": SCHEMA,
         "generated_at": "2026-07-16T12:00:00Z",

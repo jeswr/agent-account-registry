@@ -27,7 +27,32 @@ def _park_policy():
     return module
 
 
+def _worker_pr():
+    """The sibling PR-control module, loaded lazily (same pattern as _park_policy). Used ONLY for
+    is_credential_outage — the single shared definition of "this exit class is a credential/capacity
+    outage, so no round or attempt was spent" (registry #596). Keeping ONE definition is the point:
+    a second copy here would drift from the review-round path it must agree with."""
+    spec = importlib.util.spec_from_file_location(
+        "registry_worker_pr", Path(__file__).resolve().with_name("worker-pr.py"))
+    if spec is None or spec.loader is None:
+        raise WorkerIssueError("cannot load the sibling worker-pr module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
+# [registry #596] CREDENTIAL-OUTAGE attempt void — the task-side mirror of
+# worker-pr.ROUND_VOID_MARKER. The attempt receipt is posted BEFORE the model launches (it is the
+# last budget gate), so a launch that dies on the worker ACCOUNT's credential — acct01's codex
+# OAuth access token expires hourly and the fleet stores a static snapshot of it — used to burn a
+# full attempt from the bounded deferred-retry budget without the model ever running. Enough of
+# those and the issue reaches status:parked as if the model had declined the task, which inverts the
+# park policy: a credential outage is not a decline. worker.yml records this marker for the SAME run
+# key the receipt used once the exit class is known, and count_attempts subtracts it.
+#
+# Bot-authored only, like every other durable marker: a third party cannot forge one to mint budget.
+ATTEMPT_VOID_MARKER = "<!-- sparq-worker-attempt-void:v1"
 # Maintainer-approval convention (issue #31): a HUMAN maintainer approves a retry by commenting
 # the word "approved" on the issue AFTER the worker's most recent attempt receipt. The trusted
 # human set is derived the same way the triage trust-gate derives it — repo collaborator
@@ -65,14 +90,44 @@ def body_sha(body):
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
 
 
-def count_attempts(comments, bot_login):
+def _attempt_run_keys(body):
+    """The run keys carried by the attempt receipts in one comment body."""
+    return set(re.findall(re.escape(ATTEMPT_MARKER) + r" run=(\S+) -->", body))
+
+
+def attempt_voids(comments, bot_login):
+    """The set of run keys whose attempt was VOIDED as a credential outage (registry #596) and so
+    must NOT be charged against the deferred-retry budget. Bot-authored only, like every marker
+    parser here — a third party's comment can never un-charge an attempt."""
     bot = bot_login.casefold()
-    return sum(
-        1
-        for comment in comments
-        if str(comment.get("user", {}).get("login", "")).casefold() == bot
-        and ATTEMPT_MARKER in str(comment.get("body", ""))
-    )
+    voided = set()
+    pattern = re.escape(ATTEMPT_VOID_MARKER) + r" run=(\S+) -->"
+    for comment in comments:
+        if str(comment.get("user", {}).get("login", "")).casefold() != bot:
+            continue
+        voided.update(re.findall(pattern, str(comment.get("body", ""))))
+    return voided
+
+
+def count_attempts(comments, bot_login):
+    """Durable worker attempts CHARGED to the budget. A receipt whose run was voided as a
+    credential outage (registry #596 — the model never launched, so no attempt was spent) is
+    subtracted; a receipt with no run key at all is a legacy/degenerate form and stays charged
+    (the fail direction is always toward CHARGING)."""
+    bot = bot_login.casefold()
+    voided = attempt_voids(comments, bot_login)
+    charged = 0
+    for comment in comments:
+        if str(comment.get("user", {}).get("login", "")).casefold() != bot:
+            continue
+        body = str(comment.get("body", ""))
+        if ATTEMPT_MARKER not in body:
+            continue
+        keys = _attempt_run_keys(body)
+        if keys and keys <= voided:
+            continue
+        charged += 1
+    return charged
 
 
 def count_attempts_since(comments, bot_login, since, log=print):
@@ -103,10 +158,16 @@ def count_attempts_since(comments, bot_login, since, log=print):
             "unproven data)")
         return count_attempts(comments, bot_login)
     bot = bot_login.casefold()
+    # Void subtraction is GLOBAL, exactly as in worker-pr.count_rounds_since (registry #596): a
+    # credential-outage attempt is uncharged whichever side of the readmission cutoff it landed on.
+    voided = attempt_voids(comments, bot_login)
     charged = 0
     for comment in comments:
         if (str(comment.get("user", {}).get("login", "")).casefold() != bot
                 or ATTEMPT_MARKER not in str(comment.get("body", ""))):
+            continue
+        keys = _attempt_run_keys(str(comment.get("body", "")))
+        if keys and keys <= voided:
             continue
         created = comment.get("created_at")
         if isinstance(created, str) and created:
@@ -357,6 +418,51 @@ def record_attempt(repo, issue, max_attempts, bot_login, run_key):
     )
     _write_outputs({"number": number})
     print(f"worker attempt recorded: {number}/{max_attempts}")
+
+
+def void_attempt_on_outage(repo, issue, bot_login, run_key, exit_class):
+    """[registry #596] Un-charge THIS run's attempt receipt when the model launch died on the
+    worker account's credential/capacity (auth / rate-limit / session-limit / billing). The class
+    gate is worker-pr.is_credential_outage — ONE definition shared by both the review-round and the
+    task-attempt path, so the two can never drift.
+
+    Called from worker.yml right after the exit class is captured (the model step's own job): the
+    later `final_state` job cannot do it because the attempt budget is re-read by the NEXT tick's
+    dispatch, and by then the receipt is already charged.
+
+    A non-outage class is a NO-OP: the attempt stays charged, so the bounded-crash accounting for
+    `setup`/`unknown`/timeouts is untouched. Idempotent per run key.
+
+    DELIBERATELY NOT applied to find_maintainer_approval's staleness anchor: that is a human-CONSENT
+    surface ("did the maintainer see the failure being retried?"), not a budget. Leaving a voided
+    attempt as the anchor fails CLOSED — it can only require a fresh human approval, never admit a
+    run the maintainer did not bless."""
+    outage = _worker_pr().is_credential_outage(exit_class)
+    _write_outputs({"voided": "true" if outage else "false"})
+    if not outage:
+        print(f"exit class {str(exit_class or '')!r} is not a credential outage — this worker "
+              "attempt stays CHARGED against the deferred-retry budget")
+        return False
+    comments = _paginated(repo, issue, "comments")
+    marker = f"{ATTEMPT_VOID_MARKER} run={run_key} -->"
+    for comment in comments:
+        if (str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
+                and marker in str(comment.get("body", ""))):
+            print(f"worker attempt already voided (run {run_key})")
+            return True
+    cls = str(exit_class).strip().lower()
+    body = (
+        f"> 🤖 SPARQ agent — this worker attempt was VOIDED: the model launch failed on the "
+        f"worker account's credential/capacity (`exit-class={cls}`) before the model ran, so it "
+        "is NOT charged against the deferred-retry budget and is NOT a model decline "
+        f"(registry #596).\n\n{marker}"
+    )
+    _gh_json(
+        ["api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
+        input_doc={"body": body},
+    )
+    print(f"worker attempt voided (run {run_key}, exit-class={cls})")
+    return True
 
 
 def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_login, issue_file):
@@ -627,6 +733,107 @@ def _self_test():
                                 log=ts_logs.append) == 2  # unparseable cutoff => full count
     assert any("not a parseable timestamp" in line and "FULL historical count" in line
                for line in ts_logs)
+    # ---- [registry #596] a CREDENTIAL-OUTAGE attempt is NOT charged to the retry budget ---------
+    # The attempt receipt is posted BEFORE the model launches, so a launch that died on acct01's
+    # hourly-expiring codex access token (`worker-live: model-exit-class=auth`) used to burn a full
+    # attempt and walk the issue to status:parked as if the model had declined the task.
+    bot = "sparq[bot]"
+    voided_pair = [
+        {"user": {"login": bot}, "body": f"x {ATTEMPT_MARKER} run=1 -->"},
+        {"user": {"login": bot}, "body": f"x {ATTEMPT_MARKER} run=2 -->"},
+        {"user": {"login": bot}, "body": f"y {ATTEMPT_VOID_MARKER} run=2 -->"},
+    ]
+    assert attempt_voids(voided_pair, bot) == {"2"}
+    assert count_attempts(voided_pair, bot) == 1        # run=2 subtracted
+    assert count_attempts_since(voided_pair, bot, None) == 1
+    # A void only cancels its EXACT run key, and only a BOT-authored one counts.
+    assert count_attempts(voided_pair + [
+        {"user": {"login": bot}, "body": f"y {ATTEMPT_VOID_MARKER} run=99 -->"}], bot) == 1
+    assert count_attempts([
+        {"user": {"login": bot}, "body": f"x {ATTEMPT_MARKER} run=1 -->"},
+        {"user": {"login": "mallory"}, "body": f"y {ATTEMPT_VOID_MARKER} run=1 -->"}], bot) == 1
+    # Void subtraction also applies inside the readmission window (global, like worker-pr).
+    windowed_void = [
+        {"user": {"login": bot}, "created_at": "2026-07-23T10:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=w1 -->"},
+        {"user": {"login": bot}, "created_at": "2026-07-23T10:05:00Z",
+         "body": f"y {ATTEMPT_VOID_MARKER} run=w1 -->"},
+    ]
+    assert count_attempts_since(windowed_void, bot, "2026-07-23T09:00:00Z") == 0
+
+    def simulate_attempts(exit_classes, max_attempts=3):
+        """Replay one worker run per exit class on ONE issue through the REAL control path:
+        record_attempt (pre-model, the last budget gate) then void_attempt_on_outage (post-model,
+        class-gated). Returns (charged_attempts, voided_outputs, posted_bodies)."""
+        store, outputs, posted = [], [], []
+        saved = (globals()["_paginated"], globals()["_gh_json"], globals()["_write_outputs"],
+                 globals()["_readmission_cutoff"])
+        globals()["_paginated"] = lambda repo, issue, resource: list(store)
+        globals()["_readmission_cutoff"] = lambda repo, issue: None
+
+        def fake_gh_json(args, input_doc=None):
+            body = (input_doc or {}).get("body", "")
+            posted.append(body)
+            store.append({"user": {"login": bot}, "body": body})
+            return {}
+
+        globals()["_gh_json"] = fake_gh_json
+        globals()["_write_outputs"] = lambda values: (
+            outputs.append(values["voided"]) if "voided" in values else None)
+        try:
+            for index, cls in enumerate(exit_classes, start=1):
+                run_key = f"{7000 + index}.1"
+                record_attempt("o/r", 5, max_attempts, bot, run_key)
+                void_attempt_on_outage("o/r", 5, bot, run_key, cls)
+        finally:
+            (globals()["_paginated"], globals()["_gh_json"], globals()["_write_outputs"],
+             globals()["_readmission_cutoff"]) = saved
+        return count_attempts(list(store), bot), outputs, posted
+
+    charged, outs, bodies = simulate_attempts(["auth"])
+    assert charged == 0, charged                       # the outage attempt is not charged
+    assert outs == ["true"], outs
+    assert any("exit-class=auth" in b and "registry #596" in b for b in bodies), bodies
+    # A genuine no-change/failed-but-ran attempt STILL charges — the budget/park ladder is intact.
+    assert simulate_attempts(["no_change"])[0] == 1
+    assert simulate_attempts(["success"])[0] == 1
+    # DOCUMENTED #596 DECISION: rate-limit is non-chargeable, exactly like auth.
+    assert simulate_attempts(["rate-limit"])[0] == 0
+    # ...but an UNATTRIBUTABLE failure still charges, so the bounded-crash accounting survives.
+    assert simulate_attempts(["unknown"])[0] == 1
+    assert simulate_attempts(["setup"])[0] == 1
+    # The live mixed window: two credential outages around one real attempt charge EXACTLY one.
+    mixed_charged, mixed_outs, _ = simulate_attempts(["auth", "no_change", "auth"])
+    assert mixed_charged == 1, mixed_charged
+    assert mixed_outs == ["true", "false", "true"], mixed_outs
+    # Budget consequence: three auth-class runs against max_attempts=3 leave the budget UNSPENT,
+    # where charging them exhausted it and parked the issue.
+    assert simulate_attempts(["auth", "auth", "auth"])[0] == 0
+    assert simulate_attempts(["no_change", "no_change", "no_change"])[0] == 3
+    # Idempotent: voiding the same run twice posts ONE void comment (not one per re-run).
+    once_store, once_posted = [], []
+    saved_pag, saved_json, saved_out = (globals()["_paginated"], globals()["_gh_json"],
+                                        globals()["_write_outputs"])
+    try:
+        globals()["_paginated"] = lambda repo, issue, resource: list(once_store)
+        globals()["_write_outputs"] = lambda values: None
+
+        def once_gh_json(args, input_doc=None):
+            body = (input_doc or {}).get("body", "")
+            once_posted.append(body)
+            once_store.append({"user": {"login": bot}, "body": body})
+            return {}
+
+        globals()["_gh_json"] = once_gh_json
+        assert void_attempt_on_outage("o/r", 5, bot, "8001.1", "auth") is True
+        assert void_attempt_on_outage("o/r", 5, bot, "8001.1", "auth") is True
+        assert len(once_posted) == 1, once_posted
+        assert void_attempt_on_outage("o/r", 5, bot, "8002.1", "unknown") is False
+        assert len(once_posted) == 1, once_posted   # a non-outage class posts nothing at all
+    finally:
+        (globals()["_paginated"], globals()["_gh_json"],
+         globals()["_write_outputs"]) = saved_pag, saved_json, saved_out
+
     assert body_sha("task") == hashlib.sha256(b"task").hexdigest()
     assert set(LABEL_COLOURS) == {"status:in-progress", "status:in-progress-review",
                                   "status:deferred", "status:parked", "status:ready",
@@ -1043,6 +1250,16 @@ def main():
     record.add_argument("--bot-login", required=True)
     record.add_argument("--run-key", required=True)
 
+    # [registry #596] Un-charge this run's attempt when the launch died on the account credential.
+    # The class gate lives in worker-pr.is_credential_outage (pure + self-tested), NOT in a workflow
+    # `if:` expression, so the non-chargeable rule is testable and shared with the review path.
+    avoid = subparsers.add_parser("void-attempt", parents=[common])
+    avoid.add_argument("--bot-login", required=True)
+    avoid.add_argument("--run-key", required=True)
+    avoid.add_argument("--exit-class", required=True,
+                       help="worker-live.sh exit class for THIS run; only a credential-outage "
+                            "class voids the attempt (every other value is a no-op)")
+
     trust = subparsers.add_parser("reverify", parents=[common])
     trust.add_argument("--expected-author", required=True)
     trust.add_argument("--expected-body-sha", required=True)
@@ -1075,6 +1292,9 @@ def main():
             attempt_check(args.repo, args.issue, args.max_attempts, args.bot_login)
         elif args.command == "record-attempt":
             record_attempt(args.repo, args.issue, args.max_attempts, args.bot_login, args.run_key)
+        elif args.command == "void-attempt":
+            void_attempt_on_outage(args.repo, args.issue, args.bot_login, args.run_key,
+                                   args.exit_class)
         elif args.command == "reverify":
             reverify(args.repo, args.issue, args.expected_author, args.expected_body_sha,
                      args.trust_gate, args.bot_login, args.issue_file)

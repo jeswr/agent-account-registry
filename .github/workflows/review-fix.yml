@@ -1217,6 +1217,37 @@ jobs:
             echo "outcome_attempt=${GITHUB_RUN_ATTEMPT:-}"
           } >> "$GITHUB_OUTPUT"
 
+      # [registry #596] A CREDENTIAL-OUTAGE launch failure must NOT consume a review round.
+      # The round marker is written BEFORE the model runs, and the `outcome` job that would void it
+      # is gated (job-level `if`) on a validated verdict / successful fix — so when the model launch
+      # itself dies on the account credential (acct01's codex OAuth access token expires hourly while
+      # the fleet stores a static snapshot of it; observed `model-exit-class=auth` on review-fix runs,
+      # 5 auth vs 5 success in one window, then 2 more) the outcome job is SKIPPED and the round
+      # stayed charged forever. Enough of those and a pure credential outage walked the PR through the
+      # bounded round budget into a capacity park as if the reviewer had declined.
+      #
+      # It runs HERE, in the same job that charged the round, because this is the only place that both
+      # sees the exit class and still runs when no verdict exists. The class gate lives in
+      # worker-pr.is_credential_outage (pure + self-tested), NOT in this `if:` — a non-outage class is
+      # a deliberate no-op, so `setup`/`unknown`/timeouts stay charged and the bounded-crash
+      # accounting is unchanged. The review-scoped App token already present in this job (issues +
+      # pull-requests write, NO target contents write) is exactly what round-record used, so no new
+      # capability is introduced, and in review mode this job executes no target code.
+      - name: Void the review round on a credential-outage exit (never a decline)
+        id: round-void
+        if: ${{ always() && inputs.mode == 'review' && steps.round.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+          EXIT_CLASS: ${{ steps.exit-class.outputs.class }}
+        run: |
+          python3 registry/scripts/worker-pr.py round-void \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "${{ inputs.review_round }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --exit-class "$EXIT_CLASS"
+
       - name: Ensure a Rust toolchain for the crate-scoped gate
         if: ${{ inputs.mode == 'fix' && steps.fix.outputs.fix_made_changes == 'true' && steps.fix.outputs.injection_detected != 'true' }}
         working-directory: target

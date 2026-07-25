@@ -70,6 +70,46 @@ ROUND_MARKER = "<!-- sparq-review-round:v1"
 # other durable marker: a model cannot forge one to un-charge rounds (post_findings defangs the
 # whole `<!-- sparq-` namespace in republished verdict text).
 ROUND_VOID_MARKER = "<!-- sparq-review-void:v1"
+# [registry #596] CREDENTIAL-OUTAGE exit classes: the SECOND void reason, alongside the #162
+# stale-head one above.
+#
+# WHY: the round marker is recorded BEFORE the model launches (bounded-crash accounting), and the
+# `outcome` job that would void it is gated on a validated verdict. So when a model launch dies on
+# the ACCOUNT's credential — acct01's codex OAuth access token expires hourly and the fleet stores
+# a static snapshot of it (registry #596) — the round stays CHARGED even though no review ever
+# happened. Observed live: `worker-live: model-exit-class=auth` on review-fix runs, 5 × auth against
+# 5 × success in one window for account fingerprint dc2d7519, then 2 more auth (+1 rate) in the
+# next. Each of those burns a review round, so a pure CREDENTIAL OUTAGE walks the PR through the
+# bounded round budget and into a capacity park exactly as if the reviewer had given up. That is the
+# inversion the #555 park policy exists to prevent: the park semantics are untouched here — we only
+# stop charging rounds nobody spent.
+#
+# WHICH classes. Exactly the classes worker-live.sh attributed to the PROVIDER, i.e. the raw
+# {auth, billing, session-limit, rate-limit} — the same set model-health.py folds into its
+# LAUNCH_FAIL_CLASSES ({auth, billing, limit, transient}). Both the raw worker-live spellings and
+# the folded decision-class names are accepted so either producer can be wired in. In every one of
+# them the CLI never reached the model, so there is no model judgment to charge a round for.
+#
+# `rate` (rate-limit) DECISION — deliberate, per #596: rate-limit is treated EXACTLY like auth
+# (non-chargeable). Reasoning: the round budget bounds how many times the MODEL gets to look at a
+# PR, and a 429/529/overloaded launch failure means it never looked. It is provider-side capacity,
+# not a decline, and it is already handled as a retryable condition by the reactive per-account
+# backoff (model-health.account_backoffs) — charging a round for it would make provider capacity
+# shortage indistinguishable from model non-productivity, which is the same category error as
+# charging for `auth`. `session-limit` and `billing` follow for the identical reason.
+#
+# DELIBERATELY EXCLUDED: `setup` (a runner/tooling fault) and `unknown` (a timeout, cancellation,
+# pre-launch abort, or unrecognised nonzero exit the host could NOT attribute to the provider).
+# Those keep the bounded-crash accounting the #162 comment above describes intact: a deterministic
+# crash must still exhaust the round budget and escalate, or a re-claim/re-crash loop becomes
+# unbounded. `unknown` in particular is the fail-safe fold target for every novel class, so making
+# it non-chargeable would silently un-charge everything.
+CREDENTIAL_OUTAGE_EXIT_CLASSES = frozenset({
+    # raw worker-live.sh classes
+    "auth", "billing", "session-limit", "rate-limit",
+    # model-health.py folded decision classes (same four conditions)
+    "limit", "transient",
+})
 MARKER_KINDS = {
     "nochange": "<!-- sparq-fix-nochange:v1",
     "gatefail": "<!-- sparq-fix-gatefail:v1",
@@ -240,6 +280,16 @@ def _bot_comments(comments, bot_login):
     bot = bot_login.casefold()
     return [c for c in comments
             if str(c.get("user", {}).get("login", "")).casefold() == bot]
+
+
+def is_credential_outage(exit_class):
+    """PURE: True when a worker-live.sh exit class is a CREDENTIAL/CAPACITY OUTAGE and therefore
+    must not be charged against the review round budget (registry #596 — full rationale on
+    CREDENTIAL_OUTAGE_EXIT_CLASSES). Case/whitespace tolerant because the value crosses a workflow
+    output; `success`, `setup`, `unknown`, `no_change`, an empty value, and every unrecognised class
+    are FALSE — the fail direction is toward CHARGING, so a novel class can never silently
+    un-charge a round."""
+    return str(exit_class or "").strip().lower() in CREDENTIAL_OUTAGE_EXIT_CLASSES
 
 
 def _round_voids(comments, bot_login):
@@ -1175,22 +1225,55 @@ def record_round(repo, pr_number, round_n, run_key, bot_login, head_sha):
     print(f"review round recorded: {round_n} @ {head_sha[:12]}")
 
 
-def record_round_void(repo, pr_number, round_n, run_key, bot_login):
-    """Void a stale-deferred review round (issue #162): the review outcome could not apply to the
-    live head (it moved off the reviewed commit), so the pre-model round marker for THIS (round,
-    run) must not be charged as a substantive round. Keyed to the same (round, run) the round
-    marker used; idempotent. count_rounds subtracts voided attempts, so the round number is reused
-    by the next valid re-review instead of silently consuming the global round budget."""
+STALE_HEAD_VOID_REASON = ("the live head moved off the reviewed commit before the outcome could "
+                          "apply, so it is not charged against the round budget (issue #162)")
+
+
+def record_round_void(repo, pr_number, round_n, run_key, bot_login,
+                      reason=STALE_HEAD_VOID_REASON):
+    """Void a review round that was recorded but never substantively spent. Keyed to the same
+    (round, run) the pre-model round marker used; idempotent. count_rounds subtracts voided
+    attempts, so the round number is reused by the next valid re-review instead of silently
+    consuming the global round budget.
+
+    Two void reasons exist, and the MARKER is identical for both (it is what count_rounds reads);
+    only the human-readable `reason` sentence differs:
+      * stale head (issue #162, the default) — the review outcome could not apply to the live head;
+      * credential outage (registry #596) — the model launch itself died on the account credential
+        (auth / rate-limit / session-limit / billing), so no review happened at all."""
     comments = _paginated_comments(repo, pr_number)
     marker = f"{ROUND_VOID_MARKER} n={round_n} run={run_key} -->"
     if any(marker in str(c.get("body", "")) for c in _bot_comments(comments, bot_login)):
         print(f"review round already voided: {round_n} (run {run_key})")
         return
     _comment(repo, pr_number,
-             f"> 🤖 SPARQ agent — review round {round_n} was voided: the live head moved off the "
-             "reviewed commit before the outcome could apply, so it is not charged against the "
-             f"round budget (issue #162).\n\n{marker}")
+             f"> 🤖 SPARQ agent — review round {round_n} was voided: {reason}.\n\n{marker}")
     print(f"review round voided: {round_n} (run {run_key})")
+
+
+def void_round_on_outage(repo, pr_number, round_n, run_key, bot_login, exit_class):
+    """Void the pre-model round marker when THIS run's model launch died on a credential/capacity
+    outage (registry #596). Called from the `run` job right after the exit class is captured —
+    NOT from `outcome`, which is skipped entirely when no verdict was produced (its job-level `if`
+    requires verdict_ok/fix_done success), which is precisely why an `auth` exit used to leave the
+    round charged forever.
+
+    Returns True iff a void was recorded (or already existed). A non-outage class is a NO-OP: the
+    round stays charged, so nothing about the ordinary bounded-crash / stale-head accounting moves.
+    Writes an output (`voided`) so the workflow can surface the decision."""
+    outage = is_credential_outage(exit_class)
+    _write_outputs({"voided": "true" if outage else "false"})
+    if not outage:
+        print(f"exit class {str(exit_class or '')!r} is not a credential outage — review round "
+              f"{round_n} stays CHARGED against the round budget")
+        return False
+    record_round_void(
+        repo, pr_number, round_n, run_key, bot_login,
+        reason=("the model launch failed on the worker account's credential/capacity "
+                f"(`exit-class={str(exit_class).strip().lower()}`) before any review ran, so it is "
+                "NOT charged against the round budget and is NOT a reviewer decline "
+                "(registry #596)"))
+    return True
 
 
 def record_marker(repo, pr_number, kind, round_n, run_key, bot_login):
@@ -3234,6 +3317,82 @@ def _self_test():
     check("defanged void does not cancel a round",
           count_rounds([sha_bound[1],
                         {"user": {"login": bot}, "body": defanged_void}], bot), 2)
+
+    # ---- [registry #596] a CREDENTIAL-OUTAGE exit class does not consume the round budget -------
+    # Live defect this pins: the round marker is written BEFORE the model launches, and the
+    # `outcome` job that would void it is skipped whenever no verdict was produced — so an
+    # `exit-class=auth` launch failure (acct01's hourly-expiring codex access token, fingerprint
+    # dc2d7519: 5 auth vs 5 success in one window, then 2 more) charged a full review round and
+    # walked the PR toward a capacity park exactly as if the reviewer had declined.
+    for outage_class in ("auth", "AUTH", " auth ", "rate-limit", "session-limit", "billing",
+                         "limit", "transient"):
+        check(f"exit class {outage_class!r} is a credential outage",
+              is_credential_outage(outage_class), True)
+    # The fail direction is toward CHARGING: anything the host could not attribute to the provider
+    # (including the fail-safe `unknown` fold target) keeps the bounded-crash accounting.
+    for charged_class in ("success", "no_change", "setup", "unknown", "other", "zero-dispatch",
+                         "", None, "auth-ish", "authorization"):
+        check(f"exit class {charged_class!r} is NOT a credential outage",
+              is_credential_outage(charged_class), False)
+
+    def simulate_rounds(exit_classes):
+        """Replay one review run per exit class on a single PR through the REAL control path, with
+        the REAL round numbering dispatch uses (dispatch-claim: round_number = count_rounds + 1, so
+        a voided round number is reused by the next run): record_round (pre-model, unconditional)
+        then void_round_on_outage (post-model, class-gated).
+        Returns (chargeable_rounds, voided_outputs, comment_bodies)."""
+        store, outputs = [], []
+        saved = (globals()["_paginated_comments"], globals()["_comment"],
+                 globals()["_write_outputs"])
+        globals()["_paginated_comments"] = lambda repo, pr: list(store)
+        globals()["_comment"] = lambda repo, pr, body: store.append(
+            {"user": {"login": bot}, "body": body})
+        globals()["_write_outputs"] = lambda values: outputs.append(values.get("voided"))
+        try:
+            for index, cls in enumerate(exit_classes, start=1):
+                run_key = f"{9000 + index}.1"
+                round_n = count_rounds(list(store), bot) + 1
+                record_round("o/r", 9, round_n, run_key, bot, f"{index:040x}")
+                void_round_on_outage("o/r", 9, round_n, run_key, bot, cls)
+        finally:
+            (globals()["_paginated_comments"], globals()["_comment"],
+             globals()["_write_outputs"]) = saved
+        return count_rounds(list(store), bot), outputs, [c["body"] for c in store]
+
+    auth_only = simulate_rounds(["auth"])
+    check("an auth-class run charges NO round", auth_only[0], 0)
+    check("an auth-class run reports voided=true", auth_only[1], ["true"])
+    check("the auth void names the credential outage, not the stale head",
+          any("exit-class=auth" in body and "registry #596" in body for body in auth_only[2]),
+          True)
+    check("the auth void does NOT claim the head moved",
+          any("live head moved off" in body for body in auth_only[2]), False)
+    # A genuine reviewer no-change DOES charge — this is what keeps the budget/decline ladder real.
+    check("a no_change run charges its round", simulate_rounds(["no_change"])[0], 1)
+    check("a successful review charges its round", simulate_rounds(["success"])[0], 1)
+    # DOCUMENTED #596 DECISION: `rate` (rate-limit) is non-chargeable, exactly like auth — the
+    # model never looked at the PR, so there is no judgment to charge a round for.
+    check("a rate-limit run charges NO round (documented #596 decision)",
+          simulate_rounds(["rate-limit"])[0], 0)
+    # ...while an UNATTRIBUTABLE failure still charges, preserving the bounded-crash accounting.
+    check("an unknown-class run still charges its round (bounded-crash accounting intact)",
+          simulate_rounds(["unknown"])[0], 1)
+    check("a setup-class run still charges its round", simulate_rounds(["setup"])[0], 1)
+    # The mixed sequence from the live window: two credential outages around one real decline
+    # charge EXACTLY ONE round.
+    mixed = simulate_rounds(["auth", "no_change", "auth"])
+    check("mixed auth/no_change/auth charges exactly one round", mixed[0], 1)
+    check("mixed sequence voided only the two outage runs", mixed[1], ["true", "false", "true"])
+    # Budget consequence, end to end: with base_rounds=3 a three-run auth outage must still read
+    # `continue`, where charging them would have hit exhaustion and started the park ladder.
+    check("3 auth runs leave decide_budget at continue (no budget park)",
+          decide_budget(simulate_rounds(["auth", "auth", "auth"])[0], [], None, "openai",
+                        base_rounds=3)["action"],
+          "continue")
+    check("3 no_change runs DO exhaust the base budget (the ladder still works)",
+          decide_budget(simulate_rounds(["no_change", "no_change", "no_change"])[0], [], None,
+                        "openai", base_rounds=3)["action"] != "continue",
+          True)
 
     # ---- count_rounds_since (the round-budget human-readmission window, sparq#2804/#3442):
     # only rounds recorded at/after the human's needs:user unlabel are charged to the budget ----
@@ -6062,6 +6221,18 @@ def main():
     # marker — --head-sha is required and must be a 40-hex commit id.
     rrec.add_argument("--head-sha", required=True)
 
+    # [registry #596] Void this run's round marker when the model launch died on the account
+    # credential (auth / rate-limit / session-limit / billing). The CLASS GATE lives in
+    # is_credential_outage (pure + self-tested), NOT in a workflow `if:` expression, so the
+    # non-chargeable rule is testable and cannot drift between the two workflows that call it.
+    rvoid = subparsers.add_parser("round-void", parents=[common])
+    rvoid.add_argument("--round", required=True, type=int)
+    rvoid.add_argument("--run-key", required=True)
+    rvoid.add_argument("--bot-login", required=True)
+    rvoid.add_argument("--exit-class", required=True,
+                       help="worker-live.sh exit class for THIS run; only a credential-outage "
+                            "class voids the round (every other value is a no-op)")
+
     rchk = subparsers.add_parser("round-check", parents=[common])
     rchk.add_argument("--max-rounds", required=True, type=int)
     rchk.add_argument("--bot-login", required=True)
@@ -6247,6 +6418,9 @@ def main():
         elif args.command == "round-record":
             record_round(args.repo, args.pr, args.round, args.run_key, args.bot_login,
                          args.head_sha)
+        elif args.command == "round-void":
+            void_round_on_outage(args.repo, args.pr, args.round, args.run_key, args.bot_login,
+                                 args.exit_class)
         elif args.command == "round-check":
             check_round(args.repo, args.pr, args.max_rounds, args.bot_login)
         elif args.command == "record-marker":
