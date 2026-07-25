@@ -21,11 +21,16 @@ Retry policy (all callers inherit it):
     same loud failure (the exact misclassification #558's postmortem calls out).
 
 HARD SCOPE RULE (do not widen):
-  * Wrap IDEMPOTENT READS only (``gh api`` GETs, --paginate list/search reads, actions-run reads).
-  * NEVER wrap compare-and-swap / ledger CAS writes (the contents-API PUTs on the ``ledger``
-    branch): their 409/422 conflict semantics are handled by the callers' own bounded re-read
-    loops (``ledger_retry.py`` + each writer's CAS loop) — a transparent replay here would
-    consume the very conflict signal those loops key on.
+  * ``run_gh`` wraps IDEMPOTENT READS only (``gh api`` GETs, --paginate list/search reads,
+    actions-run reads).
+  * NEVER call ``run_gh`` on a compare-and-swap / ledger CAS write (the contents-API PUTs on the
+    ``ledger`` branch): their 409/422 conflict semantics are handled by the callers' own bounded
+    re-read loops (``ledger_retry.py`` + each writer's CAS loop) — a transparent replay here would
+    consume the very conflict signal those loops key on, and it would replay a now-stale
+    expected-SHA. The CLASSIFIER and the SLEEP SCHEDULE below are nevertheless shared with those
+    writers via ``ledger_retry`` (issue #558): deciding whether an error is a throttle/availability
+    blip, and how long to wait, is provider knowledge with no CAS semantics in it, while the
+    re-read/re-derive step stays owned by each writer's own loop.
   * NEVER wrap mutations or mutation-confirmations (POST/PATCH/PUT/DELETE, ``gh workflow run``,
     label edits, comments): an ambiguous transient failure does not prove GitHub skipped the
     attempt — a replay duplicates comments, repeats state transitions, or double-dispatches a
@@ -62,20 +67,59 @@ _TRANSIENT_TEXT = (
     "connection reset", "remote end closed connection", "broken pipe", "unexpected eof",
     "connection closed before",
 )
-_SECONDARY_403 = ("secondary rate limit", "abuse detection", "retry-after", "retry later")
+# THROTTLE-shaped 403s. GitHub answers a *secondary* rate limit (the burst limiter that a fan-out
+# of concurrent contents-API PUTs to one branch trips — incident #558) with 403 and one of these
+# markers, and a *primary* limit exhaustion with 'API rate limit exceeded'. Both are throttle
+# signals that clear by waiting; a permission/credential 403 ('Resource not accessible by
+# integration', 'Bad credentials') carries none of them and stays FATAL.
+_THROTTLE_403 = (
+    "rate limit",           # 'secondary rate limit' (the #558 PUT-burst limiter) AND
+                            # 'API rate limit exceeded' (primary-window exhaustion)
+    "abuse detection",      # the legacy name for the secondary limiter
+    "temporarily blocked",  # '...temporarily blocked from content creation' — the PUT-burst form
+    "retry-after",          # any throttle that sent an explicit wait
+    "retry later",
+)
+_RETRY_AFTER_RE = re.compile(r"retry[-_ ]?after[\"'\s:=]+(\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
 def is_transient_stderr(text):
-    """Conservative transient classifier for `gh` CLI stderr. Fatal classes short-circuit."""
+    """Conservative transient classifier for `gh` CLI stderr. Fatal classes short-circuit.
+
+    Shared with the ledger CAS writers through ``ledger_retry.is_transient`` (issue #558) — one
+    classifier, so a throttle shape learned in one lane is understood in all of them. HTTP 409 is
+    deliberately NEITHER fatal nor transient here: it is the CAS-conflict signal each ledger writer
+    owns, and it must reach that writer's re-read loop unchanged.
+    """
     raw = text or ""
     lowered = raw.lower()
     if _FATAL_HTTP.search(raw):
-        # The one 403 exception: GitHub's secondary-rate-limit / Retry-After 403s are throttle
-        # signals, not permission verdicts. 401/404/422 have no such exception — NEVER retried.
-        return (("403" in raw) and any(marker in lowered for marker in _SECONDARY_403))
+        # The one 403 exception: GitHub's secondary/primary rate-limit and Retry-After 403s are
+        # throttle signals, not permission verdicts. 401/404/422 have no such exception — NEVER
+        # retried.
+        return (("403" in raw) and any(marker in lowered for marker in _THROTTLE_403))
     if _TRANSIENT_HTTP.search(raw):
         return True
     return any(marker in lowered for marker in _TRANSIENT_TEXT)
+
+
+def retry_after_seconds(text):
+    """The server's requested wait from a `gh` error body/headers, capped at RETRY_AFTER_CAP.
+
+    Returns None when absent, unparseable, or negative so the caller falls back to the exponential
+    schedule. HTTP-date Retry-After forms (rare from GitHub) are treated as absent rather than
+    mis-parsed into a wrong delay.
+    """
+    match = _RETRY_AFTER_RE.search(text or "")
+    if match is None:
+        return None
+    try:
+        seconds = float(match.group(1))
+    except (TypeError, ValueError):  # pragma: no cover - the regex already constrains the shape
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, RETRY_AFTER_CAP)
 
 
 def backoff_ceiling(attempt, base=BASE_DELAY, cap=MAX_DELAY):
@@ -131,6 +175,15 @@ def _self_test():
           is_transient_stderr("HTTP 403: You have exceeded a secondary rate limit"), True)
     check("Retry-After 403 transient",
           is_transient_stderr("HTTP 403: rate limited; Retry-After: 30"), True)
+    # The exact #558 shape: a burst of concurrent contents-API PUTs to one branch.
+    check("content-creation secondary-limit 403 transient",
+          is_transient_stderr("gh: You have exceeded a secondary rate limit and have been "
+                              "temporarily blocked from content creation. Please retry your "
+                              "request again later. (HTTP 403)"), True)
+    check("primary rate-limit 403 transient",
+          is_transient_stderr("HTTP 403: API rate limit exceeded for installation"), True)
+    check("abuse-detection 403 transient",
+          is_transient_stderr("HTTP 403: You have triggered an abuse detection mechanism"), True)
     check("timeout transient", is_transient_stderr("Post ...: net/http: TLS handshake timeout"), True)
     check("connection reset transient", is_transient_stderr("connection reset by peer"), True)
     check("RemoteDisconnected transient",
@@ -141,7 +194,22 @@ def _self_test():
     check("422 mentioning a gateway is still fatal",
           is_transient_stderr("HTTP 422: upstream 502 bad gateway text"), False)
     check("permission 403 fatal", is_transient_stderr("HTTP 403: Resource not accessible"), False)
+    check("bad-credentials 403 fatal", is_transient_stderr("HTTP 403: Bad credentials"), False)
     check("empty stderr not transient", is_transient_stderr(""), False)
+    # 409 is the ledger CAS-conflict signal: neither fatal nor transient here, so it reaches the
+    # writer's own re-read loop untouched (issue #558 / #179).
+    check("409 is NOT classified transient (CAS conflict belongs to the writer)",
+          is_transient_stderr("gh: Conflict (HTTP 409)"), False)
+
+    # ---- Retry-After extraction (shared with the ledger writers via ledger_retry) ----
+    check("Retry-After header parsed", retry_after_seconds("HTTP 403: ... Retry-After: 30"), 30.0)
+    check("retry_after JSON-ish form parsed",
+          retry_after_seconds('{"retry-after":"12"}'), 12.0)
+    check("Retry-After capped", retry_after_seconds("Retry-After: 9999"), RETRY_AFTER_CAP)
+    check("absent Retry-After is None", retry_after_seconds("HTTP 503: unavailable"), None)
+    check("HTTP-date Retry-After treated as absent",
+          retry_after_seconds("Retry-After: Wed, 21 Oct 2026 07:28:00 GMT"), None)
+    check("empty text Retry-After is None", retry_after_seconds(""), None)
 
     # ---- backoff: exponential 2->30 ceiling, monotonic, jitter bounded ----
     ceilings = [backoff_ceiling(i) for i in range(1, 7)]

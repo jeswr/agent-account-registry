@@ -14,6 +14,10 @@ account (serving a model in the chain, under its cap, cache-affinity-preferred) 
 a unique lease, then PUT the file with the read SHA. A concurrent writer changes the SHA → the PUT is
 rejected → retry. This serializes allocation across every codebase without reaction counting. Release
 and heartbeat are keyed by the unique claim_id.
+
+Every retry — conflict OR throttle (issue #558) — goes back through the transaction's own loop and
+RE-READS the ledger, re-deriving both the expected blob SHA and the lease payload. No path ever
+replays a stale expected-SHA, so the CAS guarantee is exactly as strong under retry as without it.
 """
 import argparse
 import base64
@@ -467,6 +471,129 @@ def _sleep_backoff(attempt):
     ledger_retry.sleep_backoff(attempt, sleeper=time.sleep, draw=random.uniform)
 
 
+# ---- throttle / availability CAS-PUT retries (issue #558) ---------------------------------------
+# LIVE 2026-07-24T00:21-00:22Z: four concurrent review-fix runs (claims 2baf8dcf / 493adb6a /
+# 7f7d4786 / e6f52629) ALL died on _write_ledger's non-conflict raise —
+#   "lease ledger CAS PUT failed with a non-conflict error (authorization, validation, missing
+#    branch, or availability)"
+# — while SIBLING writers landed ledger commits in the very same seconds (aa643bce0 00:22:30,
+# f08b0217d 00:22:21, 31f87d685 00:22:18). The branch was healthy and UNPROTECTED, so this was
+# never authorization: a BURST of concurrent contents-API PUTs against one branch trips GitHub's
+# SECONDARY rate limit, which answers 403 — an authorization-SHAPED status — or a brief 5xx.
+# Those clear by waiting, so they are now RETRYABLE alongside the 409-conflict path:
+#   * the classifier and the wait schedule are the fleet-shared ones (ledger_retry -> gh_retry,
+#     PR #564): bounded 5 attempts, exponential 2s->30s + jitter, capped Retry-After honour —
+#     NOT a third retry implementation, and NOT the sub-second contention schedule (a burst
+#     limiter blocks for seconds-to-a-minute; re-firing in 0.5s just re-trips it);
+#   * genuine 401 / 404 / non-race 422 / permission-403 stay FATAL and fail on the FIRST attempt;
+#   * CAS correctness is untouched: a throttle retry goes back through the CALLER's loop, which
+#     RE-READS the ledger and RE-DERIVES both the expected blob sha and the payload. Nothing ever
+#     replays a stale expected-SHA;
+#   * exhaustion still FAILS LOUD (LeaseIOError) — a silently-skipped lease write would let two
+#     workers share one credential.
+TRANSIENT_WRITE_ATTEMPTS = ledger_retry.TRANSIENT_MAX_ATTEMPTS
+
+# Process-wide ceiling on time spent SLEEPING on throttled ledger writes. The per-transaction budget
+# above bounds ONE transaction, but a dispatch fan-out runs one CAS transaction per candidate item:
+# if GitHub is throttling all of them, paying the full per-transaction wait on each would turn a
+# fast, honest "everything deferred" tick into a 15-minute job TIMEOUT. Once a process has waited
+# this long in aggregate, further throttle rejections fail loud IMMEDIATELY — the API is telling us
+# to stop, and the next scheduled tick re-reads fresh state anyway.
+THROTTLE_WAIT_CEILING_S = 90.0
+_throttle_wait = {"spent": 0.0}
+
+# Small pre-write de-synchronization jitter (issue #558 part b). Four review/fix lanes finishing
+# within the same second issue their ledger PUTs in the same second — that phase-lock is what trips
+# the burst limiter in the first place. A short random delay at the START of each CAS transaction
+# spreads the fleet's read-modify-write pairs apart. Deliberately BEFORE the first read, not
+# immediately before the PUT: sleeping between the read and the PUT would widen the CAS window and
+# manufacture conflicts, while jittering the whole pair costs nothing in correctness.
+PRE_WRITE_JITTER_S = 0.5
+
+
+def _pre_write_jitter(*, sleeper=time.sleep, draw=random.uniform):
+    """Sleep a bounded uniform [0, PRE_WRITE_JITTER_S) delay to de-phase concurrent lease writers
+    (module-level so the self-test can assert the bounds without sleeping)."""
+    sleeper(draw(0, PRE_WRITE_JITTER_S))
+
+
+def _is_transient_write_error(stderr):
+    """True for a NON-conflict PUT failure that can clear by waiting: a secondary/primary
+    rate-limit or Retry-After 403, HTTP 429, any 5xx, or a network timeout/reset. Everything else —
+    401, 404, non-race 422, permission/credential 403 — is permanent and must fail loud at once
+    (retrying a validation error just burns the budget to reach the same failure)."""
+    return ledger_retry.is_transient(stderr)
+
+
+_HTTP_STATUS_RE = re.compile(r"HTTP[ :]*(\d{3})\b|\((\d{3})\)")
+
+
+def _error_status(stderr):
+    """The HTTP status in a gh error, or 'unknown'.
+
+    The ONLY part of a raw API error quoted in a LeaseIOError message: that exception's contract is
+    that it never carries credential material, so the raw stderr is never interpolated — only the
+    status code, which is what an operator needs to tell a throttle from a protection change.
+    """
+    match = _HTTP_STATUS_RE.search(stderr or "")
+    if match is None:
+        return "unknown"
+    return match.group(1) or match.group(2)
+
+
+class TransientWriteBudget:
+    """Per-CAS-transaction budget for THROTTLE/AVAILABILITY PUT rejections (issue #558).
+
+    One instance per ledger transaction (claim / adopt / release / reclaim). ``note`` records a
+    rejection and sleeps the shared throttle schedule so the caller's loop can re-read and
+    re-derive; the ``attempts``-th rejection raises LeaseIOError instead, so a real outage or a
+    sustained throttle terminates loudly inside a bounded budget rather than spinning. Kept
+    SEPARATE from the conflict budget in both directions: a throttle blip must not consume the
+    contention retries, and contention must not consume the throttle budget. Every sleep is also
+    charged against the process-wide THROTTLE_WAIT_CEILING_S so a fan-out of transactions cannot
+    accumulate into a job timeout.
+    """
+
+    def __init__(self, attempts=None, sleep=None):
+        self.attempts = TRANSIENT_WRITE_ATTEMPTS if attempts is None else attempts
+        self._sleep = ledger_retry.sleep_transient if sleep is None else sleep
+        self.rejections = 0
+
+    def note(self, stderr):
+        """Absorb one transient rejection (sleeping the shared backoff), or fail loud when either
+        this transaction's bounded budget or the process-wide throttle-wait ceiling is spent."""
+        self.rejections += 1
+        if self.rejections >= self.attempts:
+            raise LeaseIOError(
+                f"lease ledger CAS PUT kept hitting a transient GitHub failure "
+                f"(HTTP {_error_status(stderr)}) through {self.attempts} attempts — a "
+                "rate-limit/availability condition that did not clear; failing loud rather than "
+                "skipping the lease write")
+        if _throttle_wait["spent"] >= THROTTLE_WAIT_CEILING_S:
+            raise LeaseIOError(
+                f"lease ledger CAS PUT is still throttled (HTTP {_error_status(stderr)}) and this "
+                f"process has spent its {THROTTLE_WAIT_CEILING_S:.0f}s throttle-wait ceiling — "
+                "failing loud now instead of stalling the run; the next scheduled tick re-reads "
+                "fresh state")
+        started = time.monotonic()
+        self._sleep(self.rejections, ledger_retry.retry_after_seconds(stderr))
+        _throttle_wait["spent"] += max(0.0, time.monotonic() - started)
+
+
+def _cas_attempts(retries, budget):
+    """Zero-based CAS attempt numbers for one ledger transaction.
+
+    `retries` attempts for the contention path, PLUS one extra for every throttle rejection already
+    absorbed: a secondary-rate-limit 403 is not contention and must not eat the conflict budget
+    (issue #558). Still strictly bounded — the budget itself fails loud on its `attempts`-th
+    rejection, so at most ``retries + budget.attempts - 1`` attempts are ever made.
+    """
+    attempt = 0
+    while attempt < retries + budget.rejections:
+        yield attempt
+        attempt += 1
+
+
 # GitHub's contents-PUT response when a sha-less (create-if-absent) write hits a file that
 # appeared concurrently: HTTP 422 with message 'Invalid request.\n\n"sha" wasn't supplied.'
 _CREATE_RACE_SIGNATURE = "\"sha\" wasn't supplied"
@@ -480,29 +607,53 @@ def _is_cas_conflict(stderr, create):
     return ledger_retry.is_cas_conflict(stderr, create=create)
 
 
-def _write_ledger(repo, leases, sha, message):
-    """PUT the ledger via CAS. Returns True on success and False ONLY on a genuine CAS conflict
-    (HTTP 409, or the create-race 422 on a sha-less PUT) so the caller retries with backoff. ANY
-    OTHER PUT failure — authorization (403), missing branch/file (404), request validation
-    (non-race 422), server (5xx) — raises LeaseIOError immediately instead of being collapsed into
-    a retryable conflict and mislabeled 'CAS kept conflicting' after six wasted, un-backed-off
-    attempts (issue #179)."""
+def _write_ledger(repo, leases, sha, message, budget=None):
+    """PUT the ledger via CAS. Returns True on success, or False when the caller must RE-READ,
+    RE-DERIVE and retry — which happens for exactly two classes:
+
+      * a genuine CAS conflict (HTTP 409, or the create-race 422 on a sha-less PUT): the tip moved;
+      * a THROTTLE/AVAILABILITY rejection (secondary/primary rate-limit or Retry-After 403, 429,
+        5xx, network timeout/reset) when a `budget` was supplied — GitHub's burst limiter answers
+        403, so the pre-#558 classifier read it as authorization and failed loud while sibling
+        writers were landing commits in the same seconds. `budget.note` sleeps the shared throttle
+        backoff and fails LOUD once its bounded attempts are spent.
+
+    A PERMANENT failure — 401, missing branch/file (404), non-race request validation (422),
+    permission/credential 403 — still raises LeaseIOError on the FIRST attempt: it can never clear
+    by waiting, and collapsing it into 'CAS kept conflicting' after six wasted attempts is exactly
+    what issue #179 removed. `budget=None` (the default, for callers with no retry loop) keeps that
+    fail-at-once behaviour for the transient class too, so nothing retries silently.
+
+    The retry is the CALLER's, never this function's: re-deriving the payload needs the caller's
+    own decision logic, and replaying this PUT in place would blind-retry a now-stale expected-SHA.
+    """
     body = base64.b64encode(json.dumps({"leases": leases}, indent=1).encode()).decode()
     r = subprocess.run(ledger_write_args(repo, message, body, sha), capture_output=True, text=True)
     if r.returncode == 0:
         return True
-    if _is_cas_conflict(r.stderr, create=sha is None):
+    error_text = r.stderr or r.stdout or ""
+    if _is_cas_conflict(error_text, create=sha is None):
         return False  # lost the CAS race → caller re-reads and retries
+    if budget is not None and _is_transient_write_error(error_text):
+        # Sleeps, or raises LeaseIOError when the bounded budget is spent. On return the caller
+        # re-reads the ledger and re-derives the expected revision before the next PUT.
+        budget.note(error_text)
+        return False
     raise LeaseIOError(
-        "lease ledger CAS PUT failed with a non-conflict error (authorization, validation, "
-        "missing branch, or availability) — failing loud rather than exhausting CAS retries")
+        f"lease ledger CAS PUT failed with a permanent non-conflict error "
+        f"(HTTP {_error_status(error_text)}: authorization, validation, or missing branch) — "
+        "failing loud rather than exhausting CAS retries")
 
 
 def reclaim(repo, now, retries=6):
     """CAS-remove expired leases from the ledger so crashed/cancelled workers free their slot.
-    Returns the number reclaimed, 0 if none, or -1 if the CAS kept conflicting. A non-conflict PUT
-    error (auth/validation/branch/5xx) raises LeaseIOError rather than masquerading as -1."""
-    for attempt in range(retries):
+    Returns the number reclaimed, 0 if none, or -1 if the CAS kept CONFLICTING. A permanent
+    non-conflict PUT error (auth/validation/branch) raises LeaseIOError rather than masquerading as
+    -1; a throttle/availability rejection is retried under its own bounded budget and only then
+    raises (issue #558)."""
+    budget = TransientWriteBudget()
+    _pre_write_jitter()
+    for attempt in _cas_attempts(retries, budget):
         if attempt:
             _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
@@ -510,7 +661,7 @@ def reclaim(repo, now, retries=6):
         n = len(leases) - len(live)
         if n == 0:
             return 0
-        if _write_ledger(repo, live, sha, f"reclaim {n} expired lease(s)"):
+        if _write_ledger(repo, live, sha, f"reclaim {n} expired lease(s)", budget):
             return n
     return -1
 
@@ -738,11 +889,13 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
     def result(value, reason=""):
         return (value, reason) if return_reason else value
 
+    budget = TransientWriteBudget()
+    _pre_write_jitter()
     accounts = read_accounts(repo)
     if account_pool is not None:
         allowed = set(account_pool)
         accounts = [account for account in accounts if account["handle"] in allowed]
-    for attempt in range(retries):
+    for attempt in _cas_attempts(retries, budget):
         if attempt:
             _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
@@ -771,7 +924,7 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         acct = a["handle"]
         cid = uuid.uuid4().hex
         live, _lease = apply_claim(leases, acct, holder, package, role, model, now, ttl, cid)
-        if _write_ledger(repo, live, sha, claim_commit_message(cid, package, role)):
+        if _write_ledger(repo, live, sha, claim_commit_message(cid, package, role), budget):
             return result({
                 "account": acct,
                 "secret_ref": a.get("secret_ref"),
@@ -788,9 +941,10 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
     # mislabeled "duplicate lease, repository cap, or account cap is active" for hours while
     # accounts were healthy and the lease ledger was empty.
     raise LeaseIOError(
-        f"lease ledger write kept failing after {retries} attempts (persistent CAS contention, "
-        f"or the {LEDGER_PATH} contents PUT is being rejected — e.g. branch protection with a "
-        "required status check on the ledger branch blocks github-actions pushes)")
+        f"lease ledger write kept CONFLICTING after {retries} attempts "
+        f"({budget.rejections} throttle rejection(s) absorbed separately) — persistent CAS "
+        f"contention, or the {LEDGER_PATH} contents PUT is being rejected (e.g. branch protection "
+        "with a required status check on the ledger branch blocks github-actions pushes)")
 
 
 def inspect_claim(repo, claim_id, now, expected_holder_prefix=""):
@@ -835,8 +989,12 @@ def adopt(repo, claim_id, new_holder, now, ttl, expected_holder_prefix="", retri
     so no two runs ever share a lease. Returns the transferred lease plus account metadata (exactly
     the shape inspect_claim returned) on success. Raises LeaseIOError when the ledger write kept
     failing — an infrastructure failure that must fail LOUD, never masquerade as not-adoptable
-    (mirrors claim()'s issue #28 contract)."""
-    for attempt in range(retries):
+    (mirrors claim()'s issue #28 contract). A throttle/availability rejection is retried under its
+    own bounded budget first (issue #558); adopt is idempotent for the SAME holder
+    (adoptable_holder), so a retry after an ambiguous transient failure re-adopts cleanly."""
+    budget = TransientWriteBudget()
+    _pre_write_jitter()
+    for attempt in _cas_attempts(retries, budget):
         if attempt:
             _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
@@ -863,7 +1021,7 @@ def adopt(repo, claim_id, new_holder, now, ttl, expected_holder_prefix="", retri
             transferred if row.get("claim_id") == claim_id else row
             for row in live
         ]
-        if _write_ledger(repo, next_leases, sha, f"adopt {claim_id[:8]} -> worker run"):
+        if _write_ledger(repo, next_leases, sha, f"adopt {claim_id[:8]} -> worker run", budget):
             return {
                 **transferred,
                 "account": account.get("handle"),
@@ -873,20 +1031,31 @@ def adopt(repo, claim_id, new_holder, now, ttl, expected_holder_prefix="", retri
                 "credential_format": account.get("credential_format"),
             }
     raise LeaseIOError(
-        f"lease ledger adopt CAS write kept failing after {retries} attempts (persistent CAS "
-        f"contention, or the {LEDGER_PATH} contents PUT is being rejected) — failing loud rather "
+        f"lease ledger adopt CAS write kept CONFLICTING after {retries} attempts "
+        f"({budget.rejections} throttle rejection(s) absorbed separately) — persistent CAS "
+        f"contention, or the {LEDGER_PATH} contents PUT is being rejected — failing loud rather "
         "than reporting an adoptable claim as not adoptable")
 
 
 def release(repo, claim_id, now, retries=6):
-    for attempt in range(retries):
+    """CAS-drop this claim so the slot frees immediately instead of waiting for the TTL.
+
+    Returns True once the claim is absent from the ledger (a write that landed, or a claim already
+    gone — release is idempotent), False when the CAS kept conflicting. A throttle/availability
+    rejection retries under its own bounded budget and then raises (issue #558: four concurrent
+    review-fix lanes releasing in the same second tripped the secondary limiter, so every one of
+    them failed its release job and STRANDED a scarce account slot until groom's dead-lease sweep);
+    a permanent PUT error still raises at once."""
+    budget = TransientWriteBudget()
+    _pre_write_jitter()
+    for attempt in _cas_attempts(retries, budget):
         if attempt:
             _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
         live = apply_release(leases, claim_id, now)
         if len(live) == len(leases):
             return True
-        if _write_ledger(repo, live, sha, f"release {claim_id[:8]}"):
+        if _write_ledger(repo, live, sha, f"release {claim_id[:8]}", budget):
             return True
     return False
 
@@ -898,6 +1067,12 @@ def _self_test():
     # allocation assertion exercise the hash-only ledger representation.
     original_selftest_salt = os.environ.get("PROVENANCE_SALT")
     os.environ["PROVENANCE_SALT"] = "select-and-claim-self-test"
+    # Every CAS transaction opens with the #558 de-synchronization jitter; the suite must never
+    # actually sleep, so it runs against a counting no-op. The REAL function's bounds (and its
+    # once-per-transaction, before-the-first-read position) are asserted explicitly further down.
+    original_pre_write_jitter = globals()["_pre_write_jitter"]
+    jitter_calls = []
+    globals()["_pre_write_jitter"] = lambda: jitter_calls.append(1)
 
     def check(n, got, want):
         nonlocal ok
@@ -1148,7 +1323,7 @@ def _self_test():
     saved_rl, saved_wl = globals()["_read_ledger"], globals()["_write_ledger"]
     globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
     globals()["_read_ledger"] = lambda repo: ([], "sha0")
-    globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg, budget=None: True
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             legacy_claim = claim("o/r", "p", "review", ["sol", "luna"],
@@ -1212,7 +1387,7 @@ def _self_test():
                   "claim_id": "ADOPTCID"}
     adopt_writes = {}
 
-    def _capture_adopt_write(repo, leases, sha, msg):
+    def _capture_adopt_write(repo, leases, sha, msg, budget=None):
         adopt_writes["leases"] = leases
         adopt_writes["msg"] = msg
         return True
@@ -1252,7 +1427,7 @@ def _self_test():
     other_adopted = {**disp_lease, "holder": "o/r#7@run8.1"}
     write_called = {"hit": False}
 
-    def _forbid_write(repo, leases, sha, msg):
+    def _forbid_write(repo, leases, sha, msg, budget=None):
         write_called["hit"] = True
         return True
 
@@ -1275,7 +1450,7 @@ def _self_test():
     expired_lease = {**disp_lease, "expires_at": now - 1}
     globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
     globals()["_read_ledger"] = lambda repo: ([dict(expired_lease)], "sha0")
-    globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg, budget=None: True
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             reject_expired = adopt("o/r", "ADOPTCID", WORKER_HOLDER, now, 3600,
@@ -1289,7 +1464,7 @@ def _self_test():
     # the claim_id exists but belongs to a DIFFERENT issue -> refused on the holder prefix.
     globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
     globals()["_read_ledger"] = lambda repo: ([dict(disp_lease)], "sha0")
-    globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg, budget=None: True
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             reject_prefix = adopt("o/r", "ADOPTCID", WORKER_HOLDER, now, 3600,
@@ -1303,7 +1478,7 @@ def _self_test():
     # masquerading as not-adoptable (claim()'s #28 fail-loud contract).
     globals()["_run"] = lambda args: SimpleNamespace(stdout=issue_rows)
     globals()["_read_ledger"] = lambda repo: ([dict(disp_lease)], "sha0")
-    globals()["_write_ledger"] = lambda repo, leases, sha, msg: False
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg, budget=None: False
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             adopt("o/r", "ADOPTCID", WORKER_HOLDER, now, 3600, expected_holder_prefix="o/r#7@")
@@ -1528,7 +1703,7 @@ def _self_test():
             globals()["read_accounts"] = lambda repo: self.accounts
             globals()["_read_ledger"] = lambda repo: (list(self.leases), "sha0")
 
-            def write(_repo, leases, _sha, _msg):
+            def write(_repo, leases, _sha, _msg, _budget=None):
                 self.written = list(leases)
                 return self.write_ok
 
@@ -1917,7 +2092,7 @@ def _self_test():
     with _StubClaim(claim_accounts):
         globals()["read_accounts"] = lambda repo: claim_accounts
         globals()["_read_ledger"] = lambda repo: ([], "sha0")
-        globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+        globals()["_write_ledger"] = lambda repo, leases, sha, msg, budget=None: True
         drained = claim("r", "p", "impl", ["haiku"], "o/r#1@run", now,
                         usage=drain_usage)
     check("claim picks soonest of three distinct eligible weekly resets",
@@ -1930,7 +2105,7 @@ def _self_test():
     with _StubClaim(dual):
         globals()["read_accounts"] = lambda repo: dual
         globals()["_read_ledger"] = lambda repo: ([], "sha0")
-        globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+        globals()["_write_ledger"] = lambda repo, leases, sha, msg, budget=None: True
         claimed = claim("r", "p", "impl", ["fable", "haiku"], "o/r#1@run", now,
                         account_pool=["acctdual"], usage=dual_usage, margin=0.15)
     check("claim assigns model consistent with the admitting pass (haiku, not fable)",
@@ -1974,14 +2149,18 @@ def _self_test():
 
     real_run = subprocess.run
     real_backoff = globals()["_sleep_backoff"]
+    real_jitter = globals()["_pre_write_jitter"]
     backoff_attempts = []
+    jitter_at_call = []
     subprocess.run = _fake_gh
     globals()["_sleep_backoff"] = lambda attempt: backoff_attempts.append(attempt)
+    globals()["_pre_write_jitter"] = lambda: jitter_at_call.append(len(fixture_calls))
     try:
         reclaimed = reclaim("o/r", now)
     finally:
         subprocess.run = real_run
         globals()["_sleep_backoff"] = real_backoff
+        globals()["_pre_write_jitter"] = real_jitter
     fixture_gets = [c for c in fixture_calls if "-X" not in c]
     fixture_puts = [c for c in fixture_calls if "-X" in c]
     check("fixture reclaim rides out one CAS conflict", reclaimed, 1)
@@ -1993,6 +2172,16 @@ def _self_test():
     # Backoff fires BETWEEN CAS attempts, never before the first read (issue #179): one conflict
     # here means exactly one jittered sleep, for retry attempt 1.
     check("fixture reclaim backs off once (only between attempts)", backoff_attempts, [1])
+    # De-synchronization jitter (#558 part b) fires EXACTLY ONCE per CAS transaction and BEFORE the
+    # first gh call — jittering between the read and the PUT would widen the CAS window instead.
+    check("pre-write jitter fires once, before the first ledger read", jitter_at_call, [0])
+    # The conflict retry RE-DERIVED its expected revision: each PUT carries the sha the read that
+    # PRECEDED it returned (the fixture mints a fresh `sha<call-index>` per read), so the second PUT
+    # is provably not a replay of the first, now-stale, expected-SHA.
+    fixture_get_shas = [f"sha{i + 1}" for i, c in enumerate(fixture_calls) if "-X" not in c]
+    check("conflict retry re-derives the expected sha from a fresh read",
+          [next(a for a in c if a.startswith("sha=")) for c in fixture_puts],
+          [f"sha={s}" for s in fixture_get_shas])
 
     # ---- CAS retry backoff schedule + typed PUT errors (issue #179) ----
     # Exponential, capped ceiling: dropping the exponent (linear) or the cap flips these red.
@@ -2029,12 +2218,17 @@ def _self_test():
         subprocess.run = lambda args, **_k: _Res(1, stderr=race_422)
         check("create-race 422 on a sha-less PUT is retryable (False)",
               _write_ledger("o/r", [], None, "m"), False)
-        loud_puts = [("non-conflict PUT 403 fails loud (not collapsed)",
-                      "gh: ... (HTTP 403)", "sha"),
+        # No `budget` is passed below, so EVERY non-conflict failure — including the transient
+        # classes — must still fail at once: the transient retry is opt-in per CAS transaction
+        # (issue #558), never a silent default for a caller that has no re-read loop.
+        loud_puts = [("permission PUT 403 fails loud (not collapsed)",
+                      "gh: Resource not accessible by integration (HTTP 403)", "sha"),
                      ("non-conflict PUT 404 fails loud (not collapsed)",
                       "gh: ... (HTTP 404)", "sha"),
-                     ("non-conflict PUT 500 fails loud (not collapsed)",
+                     ("PUT 500 with no transient budget fails loud (not collapsed)",
                       "gh: ... (HTTP 500)", "sha"),
+                     ("secondary-limit 403 with no transient budget fails loud",
+                      "gh: You have exceeded a secondary rate limit (HTTP 403)", "sha"),
                      ("non-race validation 422 fails loud (not a CAS conflict)",
                       "gh: Validation Failed (HTTP 422)", "sha"),
                      ("non-race validation 422 on a sha-less create fails loud",
@@ -2050,6 +2244,197 @@ def _self_test():
     finally:
         subprocess.run = real_run
 
+    # ---- throttle/availability CAS-PUT retries (issue #558) --------------------------------------
+    # LIVE 2026-07-24T00:21-00:22Z: four concurrent review-fix runs (claims 2baf8dcf / 493adb6a /
+    # 7f7d4786 / e6f52629) all died on the non-conflict raise while SIBLING writers landed ledger
+    # commits in the same seconds (aa643bce0 00:22:30, f08b0217d 00:22:21, 31f87d685 00:22:18) —
+    # healthy, unprotected branch. That is GitHub's SECONDARY rate limiter answering a PUT burst
+    # with a 403, i.e. an authorization-SHAPED throttle. It must retry; a real 401/404/422/
+    # permission-403 must not.
+    SECONDARY_403 = ("gh: You have exceeded a secondary rate limit and have been temporarily "
+                     "blocked from content creation. Please retry your request again later. "
+                     "(HTTP 403)")
+    check("secondary-rate-limit 403 is RETRYABLE (the #558 misclassification)",
+          _is_transient_write_error(SECONDARY_403), True)
+    check("Retry-After 403 is RETRYABLE",
+          _is_transient_write_error("gh: throttled; Retry-After: 30 (HTTP 403)"), True)
+    check("5xx is RETRYABLE", _is_transient_write_error("gh: Bad Gateway (HTTP 502)"), True)
+    check("429 is RETRYABLE", _is_transient_write_error("gh: (HTTP 429)"), True)
+    check("network timeout is RETRYABLE",
+          _is_transient_write_error("net/http: TLS handshake timeout"), True)
+    for fatal_label, fatal_text in (
+            ("permission 403", "gh: Resource not accessible by integration (HTTP 403)"),
+            ("credential 403", "gh: Bad credentials (HTTP 403)"),
+            ("401", "gh: Unauthorized (HTTP 401)"),
+            ("404", "gh: Not Found (HTTP 404)"),
+            ("validation 422", "gh: Validation Failed (HTTP 422)")):
+        check(f"{fatal_label} stays FATAL (never retried)",
+              _is_transient_write_error(fatal_text), False)
+    # LeaseIOError must never carry credential material, so only the STATUS of a raw API error is
+    # ever quoted in a loud message.
+    check("_error_status quotes the status only", _error_status(SECONDARY_403), "403")
+    check("_error_status of a status-less error", _error_status("boom"), "unknown")
+    check("_error_status of the gh parenthesised form", _error_status("gh: oops (HTTP 503)"), "503")
+
+    # The budget: bounded attempts, throttle-only sleeps, loud failure on exhaustion.
+    budget_sleeps = []
+    probe_budget = TransientWriteBudget(
+        attempts=3, sleep=lambda attempt, retry_after=None: budget_sleeps.append(
+            (attempt, retry_after)))
+    probe_budget.note("gh: throttled; Retry-After: 7 (HTTP 403)")
+    probe_budget.note(SECONDARY_403)
+    check("budget sleeps the shared throttle schedule and honours Retry-After",
+          budget_sleeps, [(1, 7.0), (2, None)])
+    try:
+        probe_budget.note(SECONDARY_403)
+        check("budget exhaustion raises LeaseIOError", "no exception", "LeaseIOError")
+    except LeaseIOError as exc:
+        check("budget exhaustion raises LeaseIOError", "LeaseIOError", "LeaseIOError")
+        check("exhaustion message names the transient class + status, not the raw body",
+              ("HTTP 403" in str(exc), "3 attempts" in str(exc),
+               "temporarily blocked" in str(exc)), (True, True, False))
+    check("budget does not sleep on the exhausting rejection", len(budget_sleeps), 2)
+    check("default budget bound is the fleet-shared gh_retry attempt bound",
+          (TransientWriteBudget().attempts, TRANSIENT_WRITE_ATTEMPTS), (5, 5))
+    # Process-wide throttle-wait ceiling: a dispatch fan-out runs one transaction PER candidate, so
+    # without this a fleet-wide throttle would spend the per-transaction wait N times and time the
+    # job out instead of deferring fast.
+    ceiling_sleeps, saved_spent = [], _throttle_wait["spent"]
+    _throttle_wait["spent"] = 0.0
+    slow_budget = TransientWriteBudget(
+        attempts=9, sleep=lambda attempt, retry_after=None: (
+            ceiling_sleeps.append(attempt), time.sleep(0.02))[0])
+    try:
+        slow_budget.note(SECONDARY_403)
+        check("throttle sleeps are charged to the process-wide ceiling",
+              _throttle_wait["spent"] >= 0.02, True)
+        _throttle_wait["spent"] = THROTTLE_WAIT_CEILING_S
+        try:
+            slow_budget.note(SECONDARY_403)
+            check("spent throttle-wait ceiling fails loud", "no exception", "LeaseIOError")
+        except LeaseIOError as exc:
+            check("spent throttle-wait ceiling fails loud",
+                  ("ceiling" in str(exc), len(ceiling_sleeps)), (True, 1))
+    finally:
+        _throttle_wait["spent"] = saved_spent
+    check("ceiling is bounded well inside the tightest job timeout",
+          0 < THROTTLE_WAIT_CEILING_S <= 300.0, True)
+
+    # A throttle rejection buys ONE extra CAS attempt instead of consuming the conflict budget —
+    # and the total stays bounded (retries + attempts - 1 at the very most).
+    fresh_budget = TransientWriteBudget(attempts=3, sleep=lambda *a, **k: None)
+    check("no throttle rejections → exactly `retries` attempts",
+          list(_cas_attempts(4, fresh_budget)), [0, 1, 2, 3])
+    grown, grow_budget = [], TransientWriteBudget(attempts=3, sleep=lambda *a, **k: None)
+    for grow_attempt in _cas_attempts(2, grow_budget):
+        grown.append(grow_attempt)
+        if grow_attempt == 0:
+            grow_budget.rejections = 1  # one throttle rejection absorbed
+    check("a throttle rejection buys one extra attempt (conflict budget untouched)", grown,
+          [0, 1, 2])
+    capped_budget = TransientWriteBudget(attempts=3, sleep=lambda *a, **k: None)
+    capped_budget.rejections = capped_budget.attempts - 1  # the most it can ever reach
+    check("attempts stay bounded by retries + attempts - 1",
+          len(list(_cas_attempts(2, capped_budget))), 2 + capped_budget.attempts - 1)
+
+    # Pre-write de-synchronization jitter (#558 part b): a bounded uniform draw, sleeping exactly
+    # what it drew — a fixed delay would neither de-phase writers nor stay bounded.
+    jitter_bounds, jitter_slept = [], []
+    original_pre_write_jitter(sleeper=jitter_slept.append,
+                              draw=lambda lo, hi: (jitter_bounds.append((lo, hi)), hi)[1])
+    check("pre-write jitter draws uniform(0, PRE_WRITE_JITTER_S)",
+          jitter_bounds, [(0, PRE_WRITE_JITTER_S)])
+    check("pre-write jitter sleeps the draw", jitter_slept, [PRE_WRITE_JITTER_S])
+    check("pre-write jitter bound is small (never a visible dispatch stall)",
+          0 < PRE_WRITE_JITTER_S <= 1.0, True)
+
+    # ---- end-to-end through the REAL reclaim() CAS loop over a fake gh -----------------------
+    def _drive_reclaim(put_errors, retries=6):
+        """Drive the REAL reclaim() transaction: `put_errors[i]` is attempt i's PUT stderr ("" =
+        success). Returns (result-or-'LeaseIOError', gh calls, throttle sleeps)."""
+        calls, sleeps = [], []
+        expired = make_lease("a1", "o/r#1@run", "p", "impl", "m", now - 100, 1)
+        expired["claim_id"] = "b" * 32
+
+        def fake_gh(args, **_kwargs):
+            calls.append(list(args))
+            if "-X" not in args:  # contents GET — FRESH sha per read, so a replay is detectable
+                meta = {"content": base64.b64encode(json.dumps(
+                    {"leases": [expired]}).encode()).decode(), "sha": f"rev{len(calls)}"}
+                return _Res(0, stdout=json.dumps(meta))
+            index = sum(1 for c in calls if "-X" in c) - 1
+            text = put_errors[index] if index < len(put_errors) else ""
+            return _Res(1 if text else 0, stderr=text)
+
+        saved = (subprocess.run, globals()["_sleep_backoff"], globals()["_pre_write_jitter"],
+                 ledger_retry.sleep_transient)
+        subprocess.run = fake_gh
+        globals()["_sleep_backoff"] = lambda attempt: None
+        globals()["_pre_write_jitter"] = lambda: None
+        ledger_retry.sleep_transient = (
+            lambda attempt, retry_after=None, **_k: sleeps.append((attempt, retry_after)))
+        try:
+            outcome = reclaim("o/r", now, retries=retries)
+        except LeaseIOError as exc:
+            outcome = f"LeaseIOError:{exc}"
+        finally:
+            (subprocess.run, globals()["_sleep_backoff"], globals()["_pre_write_jitter"],
+             ledger_retry.sleep_transient) = saved
+        return outcome, calls, sleeps
+
+    # (1) secondary-403 then success: retries, re-READS, re-DERIVES, and lands.
+    outcome, calls, sleeps = _drive_reclaim([SECONDARY_403, ""])
+    gets = [c for c in calls if "-X" not in c]
+    puts = [c for c in calls if "-X" in c]
+    check("secondary-403 then success: the reclaim lands", outcome, 1)
+    check("secondary-403 retry re-READ the ledger", len(gets), 2)
+    check("secondary-403 retry issued exactly two PUTs", len(puts), 2)
+    read_revs = [f"rev{i + 1}" for i, c in enumerate(calls) if "-X" not in c]
+    check("secondary-403 retry RE-DERIVED the expected sha (no stale-SHA replay)",
+          ([next(a for a in c if a.startswith("sha=")) for c in puts],
+           len(set(read_revs))),
+          ([f"sha={rev}" for rev in read_revs], 2))
+    check("secondary-403 retry slept the throttle schedule once", sleeps, [(1, None)])
+
+    # (2) a Retry-After 403 hands the server's own wait to the sleep.
+    _outcome, _calls, ra_sleeps = _drive_reclaim(["gh: slow down; Retry-After: 12 (HTTP 403)", ""])
+    check("Retry-After 403 sleeps the server's requested wait", ra_sleeps, [(1, 12.0)])
+
+    # (3) fatal classes are NOT retried: exactly one PUT, then loud.
+    for fatal_label, fatal_text in (("validation 422", "gh: Validation Failed (HTTP 422)"),
+                                    ("401", "gh: Unauthorized (HTTP 401)"),
+                                    ("permission 403",
+                                     "gh: Resource not accessible by integration (HTTP 403)")):
+        outcome, calls, sleeps = _drive_reclaim([fatal_text, ""])
+        check(f"{fatal_label} is NOT retried (one PUT, loud failure, no sleep)",
+              (str(outcome).startswith("LeaseIOError:"),
+               sum(1 for c in calls if "-X" in c), sleeps), (True, 1, []))
+
+    # (4) a persistent throttle exhausts the BOUNDED budget and fails LOUD — never silently
+    # skips the lease write (two workers on one credential) and never spins forever.
+    outcome, calls, sleeps = _drive_reclaim([SECONDARY_403] * 12)
+    check("persistent throttle fails loud after the bounded budget",
+          (str(outcome).startswith("LeaseIOError:"), "transient" in str(outcome)), (True, True))
+    check("persistent throttle spends exactly TRANSIENT_WRITE_ATTEMPTS PUTs",
+          sum(1 for c in calls if "-X" in c), TRANSIENT_WRITE_ATTEMPTS)
+    check("persistent throttle re-read before every retry",
+          sum(1 for c in calls if "-X" not in c), TRANSIENT_WRITE_ATTEMPTS)
+    check("persistent throttle slept between attempts only",
+          sleeps, [(i, None) for i in range(1, TRANSIENT_WRITE_ATTEMPTS)])
+
+    # (5) a throttle burst that clears does NOT consume the conflict budget: four throttles plus
+    # `retries` conflicts still leaves the final attempt to land (retries=2 here).
+    outcome, calls, _sleeps = _drive_reclaim(
+        [SECONDARY_403, "gh: ... (HTTP 409)", SECONDARY_403, ""], retries=2)
+    check("throttle rejections do not consume the conflict budget", outcome, 1)
+    check("throttle-plus-conflict mix issued four PUTs",
+          sum(1 for c in calls if "-X" in c), 4)
+
+    # Every CAS transaction driven above opened with the jitter (never zero — a lost call would mean
+    # a writer path that no longer de-synchronizes).
+    check("every CAS transaction in this suite opened with the de-sync jitter",
+          len(jitter_calls) > 0, True)
+    globals()["_pre_write_jitter"] = original_pre_write_jitter
     if original_selftest_salt is None:
         os.environ.pop("PROVENANCE_SALT", None)
     else:

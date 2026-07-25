@@ -317,9 +317,14 @@ from the `data/model-health.json` records the worker/review outcome jobs already
   `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`).
 - `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the `dispatch-secrets` environment secrets public-key read, then an authoritative `gh secret set --env dispatch-secrets` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only read access, so it would bless a read-only PAT that onboarding's env write still breaks on; a repo-scope canary would re-trip the secrets-guard weekly) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and a transient network blip never false-alarms — consecutive network-unknowns are counted in a repository variable (silent state: below the threshold no issue is touched, since GitHub creates every issue open and even a create-then-close would notify) and page via a separate rolling issue once a small threshold is crossed (issue #207), so a permanently-stalled probe cannot leave the PAT silently unverified.
 - Account metadata + selection logic: only in this private repo.
-- Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap CAS/ledger
-  writes or mutation-confirmations (their conflict/fail-loud semantics are caller-owned — a replayed
-  mutation can double-dispatch a worker, #559/#558).
+- Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap a CAS/ledger
+  write or a mutation-confirmation in `gh_retry.run_gh` (their conflict/fail-loud semantics are
+  caller-owned — a replayed mutation can double-dispatch a worker, #559/#558). A ledger CAS writer
+  that needs to survive a throttle/availability blip takes the **classification and the wait
+  schedule** from `scripts/ledger_retry.py` (which delegates both to `gh_retry`) and does the retry
+  in **its own loop**, re-reading the ledger and re-deriving the expected blob SHA every time —
+  `select-and-claim.py`'s lease writer is the reference implementation (#558). Never add a third
+  retry/sleep loop.
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
 
 ## Registering a new account (web-login broker)
