@@ -1541,6 +1541,19 @@ def outstanding_review_providers(trust_class, body, head_sha, worker_impl_provid
                  if provider not in done)
 
 
+def _review_class_input(trust_class, review_provider):
+    """The single `review_class` dispatch input review-fix.yml takes: the trust class, with the
+    review SIDE folded in for the self-declared class. One input rather than two because
+    workflow_dispatch is HARD-CAPPED at 10 inputs by GitHub and review-fix.yml sits at the cap
+    (actionlint flags an 11th; GitHub itself would reject the dispatch). Fails closed on an
+    unknown class rather than emitting a token the workflow will reject mid-dispatch."""
+    if trust_class == WORKER_RUN_TRUST_CLASS:
+        return WORKER_RUN_TRUST_CLASS
+    if trust_class == SELF_DECLARED_TRUST_CLASS and review_provider in IMPL_PROVIDERS:
+        return f"{SELF_DECLARED_TRUST_CLASS}-{review_provider}"
+    raise DispatchError("cannot encode the review class for dispatch (fail closed)")
+
+
 def review_lane_impl_provider(review_provider):
     """The implementer provider the review LANE runs under so that ``review_provider`` is the
     side that reviews — i.e. the inverse of the review side.
@@ -3538,13 +3551,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # honours it (review mode never carries a pin; the input is ladder-validated there).
             "-f", f"model_pin={(pin_floor or '') if mode == 'fix' else ''}",
             "-f", f"review_round={round_number}",
-            # [issue #657] The trust class and the review SIDE ride to review-fix.yml as
-            # explicit inputs. They are NOT trusted there: resolve re-derives both from the live
-            # PR + the registry record and refuses on any disagreement. They are carried so the
-            # lane knows which of the two self-declared reviews this run is, and so a
-            # worker-run run can never be silently reinterpreted as the weaker class.
-            "-f", f"trust_class={trust_class}",
-            "-f", f"review_provider={item['review_provider'] if mode == 'review' else ''}",
+            # [issue #657] The trust class and the review SIDE ride to review-fix.yml as ONE
+            # input (workflow_dispatch is hard-capped at 10 inputs and that lane is at the cap).
+            # It is NOT trusted there: resolve re-derives both halves from the live PR + the
+            # registry record and refuses on any disagreement. It is carried so the lane knows
+            # which of the two self-declared reviews this run is, and so a worker-run run can
+            # never be silently reinterpreted as the weaker class.
+            "-f", f"review_class={_review_class_input(trust_class, item['review_provider'])}",
             "-f", f"account={account}",
             "-f", f"claim_id={claim_id}",
         ], check=False)
@@ -6430,6 +6443,31 @@ def _self_test():
     _outcome_step = [step for step in _outcome_steps
                      if isinstance(step.get("run"), str) and "review-outcome" in step["run"]]
     assert len(_outcome_step) == 1 and "--trust-class" in _outcome_step[0]["run"], _outcome_step
+    # GitHub HARD-CAPS workflow_dispatch at 10 inputs, and this lane sits exactly at the cap —
+    # which is why the trust class and the review side ride as ONE `review_class` token. An
+    # 11th input is not a style question: actionlint rejects it and GitHub refuses the dispatch,
+    # so the whole review lane would go dark. Pin the cap here (the review-fix.yml `on:` key
+    # parses as the boolean True under YAML 1.1) and pin the encoder against the workflow's own
+    # declared option list, so the two cannot drift.
+    _rf_inputs = _rf[True]["workflow_dispatch"]["inputs"]
+    assert len(_rf_inputs) <= 10, (
+        f"review-fix.yml declares {len(_rf_inputs)} workflow_dispatch inputs; GitHub's hard cap "
+        "is 10 and an 11th makes every dispatch of the review lane fail")
+    _declared_classes = set(_rf_inputs["review_class"]["options"])
+    _encoded = {_review_class_input(WORKER_RUN_TRUST_CLASS, "openai")} | {
+        _review_class_input(SELF_DECLARED_TRUST_CLASS, side)
+        for side in DUAL_REVIEW_PROVIDERS}
+    assert _encoded == _declared_classes, (
+        f"the dispatcher encodes review_class values {sorted(_encoded)} but review-fix.yml "
+        f"declares {sorted(_declared_classes)}; a mismatch makes the dispatch fail input "
+        "validation and the PR silently never gets reviewed")
+    for _bad in ((WORKER_RUN_TRUST_CLASS[:-1], "openai"), (SELF_DECLARED_TRUST_CLASS, "mallory"),
+                 (SELF_DECLARED_TRUST_CLASS, ""), (None, "openai")):
+        try:
+            _review_class_input(*_bad)
+            raise AssertionError(f"_review_class_input encoded {_bad!r}")
+        except DispatchError:
+            pass
     print("  ok   #657 YAML seam: review-fix.yml's OWN trust-class resolution block executes "
           "correctly for both classes and fails closed; the arm/marker/bind steps are wired")
 

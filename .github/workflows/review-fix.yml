@@ -71,17 +71,17 @@ on:
         required: true
         default: '1'
         type: string
-      trust_class:
-        description: Provenance trust class (worker-run, or the weaker self-declared class for orchestrator PRs)
+      # ONE input, not two: workflow_dispatch is HARD-CAPPED at 10 inputs by GitHub, and this
+      # workflow is at the cap. The self-declared class dispatches BOTH providers (one run each),
+      # so the review SIDE must ride along — it is folded into the class token rather than
+      # spending a second input slot. A dispatch HINT only: resolve re-derives both halves from
+      # the live PR + the registry record and fails closed on any disagreement.
+      review_class:
+        description: Provenance trust class, with the review side for the weaker self-declared class
         required: false
         default: worker-run
         type: choice
-        options: [worker-run, self-declared]
-      review_provider:
-        description: Which provider side this review run is (self-declared class dispatches BOTH, one run each)
-        required: false
-        default: ''
-        type: string
+        options: [worker-run, self-declared-anthropic, self-declared-openai]
       account:
         description: Dispatcher-claimed account handle (verified against the adopted lease)
         required: true
@@ -144,8 +144,7 @@ jobs:
           FIX_CONTEXT: ${{ inputs.fix_context }}
           MODEL_PIN: ${{ inputs.model_pin }}
           REVIEW_ROUND: ${{ inputs.review_round }}
-          TRUST_CLASS: ${{ inputs.trust_class }}
-          REVIEW_PROVIDER: ${{ inputs.review_provider }}
+          REVIEW_CLASS: ${{ inputs.review_class }}
           ACCOUNT: ${{ inputs.account }}
           CLAIM_ID: ${{ inputs.claim_id }}
         run: |
@@ -189,22 +188,22 @@ jobs:
               raise SystemExit("fix_context must be short single-line printable ASCII")
           if not re.fullmatch(r"[1-9][0-9]{0,2}", review_round):
               raise SystemExit("review_round must be a small positive integer")
-          # [issue #657] The trust class + review side are DISPATCH HINTS, never trusted: the
-          # resolve step below re-derives BOTH from the live PR (head ref + author) and the
-          # registry provenance record, and fails closed on any disagreement. Validated here
-          # only to a closed set so nothing unsafe reaches a workflow output or a prompt.
-          trust_class = os.environ.get("TRUST_CLASS") or "worker-run"
-          review_provider = os.environ.get("REVIEW_PROVIDER", "")
-          if trust_class not in {"worker-run", "self-declared"}:
-              raise SystemExit("trust_class must be worker-run or self-declared")
-          if review_provider and review_provider not in {"anthropic", "openai"}:
-              raise SystemExit("review_provider must be empty, anthropic, or openai")
+          # [issue #657] The trust class + review side are ONE dispatch HINT, and it is never
+          # trusted: the resolve step below re-derives BOTH halves from the live PR (head ref +
+          # author) and the registry provenance record, and fails closed on any disagreement.
+          # Validated here only to a closed set so nothing unsafe reaches a workflow output or a
+          # prompt. (One input, not two: workflow_dispatch is hard-capped at 10 inputs.)
+          review_class = os.environ.get("REVIEW_CLASS") or "worker-run"
+          if review_class not in {"worker-run", "self-declared-anthropic",
+                                  "self-declared-openai"}:
+              raise SystemExit("review_class must be worker-run or self-declared-<provider>")
+          trust_class, _, review_provider = review_class.partition("-declared-")
+          if review_provider:
+              trust_class = "self-declared"
           # The weaker class is REVIEW-ONLY: it has no trusted implementer, so there is no
           # same-provider fixer to route to and no repair flavour may ride it.
           if trust_class == "self-declared" and mode != "review":
               raise SystemExit("the self-declared trust class has no fix lane")
-          if trust_class == "self-declared" and not review_provider:
-              raise SystemExit("a self-declared review must name its review provider")
           if not re.fullmatch(r"acct[0-9a-z]{2,}", account):
               raise SystemExit("account must be an acctNN registry handle")
           if claim_id and not re.fullmatch(r"[0-9a-f]{32}", claim_id):
@@ -251,8 +250,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           MODE: ${{ inputs.mode }}
           FIX_KIND: ${{ inputs.fix_kind }}
-          TRUST_CLASS: ${{ inputs.trust_class }}
-          REVIEW_PROVIDER: ${{ inputs.review_provider }}
+          REVIEW_CLASS: ${{ inputs.review_class }}
         run: |
           set -euo pipefail
           gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pull.json"
@@ -269,11 +267,14 @@ jobs:
           repo = os.environ["TARGET_REPO"]
           mode = os.environ["MODE"]
           fix_kind = os.environ.get("FIX_KIND") or "verdict"
-          # [issue #657] The DISPATCH HINTS. Nothing below trusts them: the class is re-derived
-          # from the live PR (head ref + author) and the registry record, and any disagreement
-          # with these hints is fatal.
-          hint_trust_class = os.environ.get("TRUST_CLASS") or "worker-run"
-          hint_review_provider = os.environ.get("REVIEW_PROVIDER", "")
+          # [issue #657] The DISPATCH HINT, re-split into its two halves. Nothing below trusts
+          # it: the class is re-derived from the live PR (head ref + author) and the registry
+          # record, and any disagreement with the hint is fatal. The closed-set validation ran
+          # in the inputs step above, so an unknown token never reaches here.
+          hint_trust_class, _, hint_review_provider = (
+              (os.environ.get("REVIEW_CLASS") or "worker-run").partition("-declared-"))
+          if hint_review_provider:
+              hint_trust_class = "self-declared"
           if pull.get("state") != "open":
               raise SystemExit("pull request is not open")
           head = pull.get("head") or {}
