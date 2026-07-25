@@ -1,17 +1,17 @@
 {
-  "generated_at": "2026-07-25T08:35:28Z",
+  "generated_at": "2026-07-25T09:05:11Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1107,
+      "issues_open": 1108,
       "issues_ready": 8,
-      "issues_closed_1h": 4,
+      "issues_closed_1h": 0,
       "issues_closed_24h": 39,
       "prs_open": 61,
       "prs_draft": 45,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 4,
+      "prs_merged_1h": 0,
       "prs_merged_24h": 19,
       "review_changes_backlog": 1,
       "needs_user_parked": 3,
@@ -20,29 +20,29 @@
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
-      "pr_close_rate": 4.0,
-      "net_pr_flow": -4.0
+      "pr_close_rate": 0.0,
+      "net_pr_flow": 0.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 264,
-      "issues_ready": 80,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 11,
-      "prs_open": 22,
-      "prs_draft": 20,
+      "issues_open": 261,
+      "issues_ready": 77,
+      "issues_closed_1h": 3,
+      "issues_closed_24h": 14,
+      "prs_open": 19,
+      "prs_draft": 17,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 0,
-      "prs_merged_24h": 14,
-      "review_changes_backlog": 7,
+      "prs_merged_1h": 3,
+      "prs_merged_24h": 17,
+      "review_changes_backlog": 4,
       "needs_user_parked": 3,
       "review_lane_health": "stalled",
       "review_lane_runs_1h": 6,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
-      "pr_close_rate": 0.0,
-      "net_pr_flow": 0.0
+      "pr_close_rate": 3.0,
+      "net_pr_flow": -3.0
     }
   },
   "alerts": [
@@ -54,18 +54,18 @@
       "metrics": {
         "review_changes_backlog": 1,
         "review_lane_runs_1h": 6,
-        "prs_merged_1h": 4
+        "prs_merged_1h": 0
       }
     },
     {
       "target": "jeswr/agent-account-registry",
       "classification": "review-lane-stalled",
       "fire": true,
-      "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=7 waits",
+      "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=4 waits",
       "metrics": {
-        "review_changes_backlog": 7,
+        "review_changes_backlog": 4,
         "review_lane_runs_1h": 6,
-        "prs_merged_1h": 0
+        "prs_merged_1h": 3
       }
     }
   ]
