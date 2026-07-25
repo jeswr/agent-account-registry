@@ -46,13 +46,8 @@ import re
 import subprocess
 import sys
 
-ROLE_LABELS = {
-    "docs": ("0e8a16", "Documentation work"),
-    "impl": ("1d76db", "Implementation work"),
-    "ci": ("5319e7", "CI and infrastructure work"),
-    "research": ("d4c5f9", "Research and design work"),
-    "site": ("fbca04", "Site and frontend work"),
-}
+ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
+
 # ---------------------------------------------------------------------------------------------------
 # TRUST-PLANE ROLE — INTERIM MAPPING (TODO: registry #582 / #225).
 #
@@ -234,7 +229,7 @@ def _role(labels, issue_type):
     # respect an EXPLICIT single role:* label (a seeded/migrated issue already carrying its role).
     explicit = sorted(lb[5:] for lb in labels if lb.startswith(ROLE_PREFIX))
     if len(explicit) == 1:
-        return explicit[0] if explicit[0] in ROLE_LABELS else None
+        return explicit[0]
     for lb in labels:
         if lb.startswith("kind:") and lb[5:] in ROLE_BY_KIND:
             return ROLE_BY_KIND[lb[5:]]
@@ -662,12 +657,11 @@ def _self_test():
     chk("dispatch -> trust-plane role", triage(["priority:P1", "area:dispatch"], "feature")["role"],
         TRUST_PLANE_ROLE)
     # The shared catalog pins every role this planner may derive. Every derivation source must
-    # remain representable, and an unknown explicit role must fail closed.
+    # remain representable.
     derived_roles = set(ROLE_BY_KIND.values()) | set(ROLE_BY_TYPE.values()) | {
         _role([label], "task") for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS
-    } | {_role(["area:dispatch"], "task")}
+    } | set(AREA_ROLE_DEFAULT.values())
     chk("all derived roles have labels", derived_roles <= set(ROLE_LABELS), True)
-    chk("unknown explicit role rejected", _role(["role:not-a-repo-label"], "task"), None)
     # Exact regression: applying the plan for a trust-surface issue which starts at role:impl
     # leaves exactly one representable role, never a transiently planned roleless end state.
     labels = {"role:impl", "area:worker", "priority:P2", "from:agent"}
@@ -675,7 +669,7 @@ def _self_test():
     final_labels = (labels | r["add"]) - r["remove"]
     final_roles = {lb for lb in final_labels if lb.startswith("role:")}
     chk("trust role replacement is exactly-one", final_roles, {f"role:{TRUST_PLANE_ROLE}"})
-    chk("trust role replacement adds before remove",
+    chk("trust role replacement plans no churn when the target is already present",
         (f"role:{TRUST_PLANE_ROLE}" in r["add"], "role:impl" in r["remove"]), (False, False))
     # [FABLE-5] UI-surface ownership: dashboard work derives role:site (codex-led chain, e4098b9);
     # kind:docs about the dashboard stays docs.
@@ -841,6 +835,9 @@ def _self_test():
             "area:dispatch", "area:worker", "area:usage", "area:docs", "area:ci",
             "area:workflows", "area:dashboard", "area:review-loop", "area:groom",
             "trust:untrusted"}
+    chk("catalog == the pinned live role labels",
+        {f"role:{role}" for role in ROLE_LABELS},
+        {label for label in REAL if label.startswith("role:")})
     chk("trust-plane role label EXISTS in the registry label set",
         f"role:{TRUST_PLANE_ROLE}" in REAL, True)
     chk("role:soundness is NOT a registry label (the #582 root cause)",
@@ -902,6 +899,16 @@ def _self_test():
         (1, True, True))
     chk("[#582] missing target label still leaves exactly one role on the issue",
         _roles_of((fixture | r["add"]) - r["remove"]), {"role:docs"})
+    # An explicit role on a NON-trust surface reaches the same live-label check. It is preserved
+    # verbatim and diagnosed when the repository does not have that label; a static catalog must
+    # never silently pre-empt this fail-closed path.
+    fixture = {"priority:P2", "role:soundness", "area:docs"}
+    r = triage(fixture, "task", known_labels=REAL)
+    warning = r["warnings"][0] if r["warnings"] else ""
+    chk("[#582] missing explicit role is preserved and warned on a non-trust surface",
+        (r["role"], _roles_of((fixture | r["add"]) - r["remove"]), len(r["warnings"]),
+         "role:soundness" in warning),
+        ("soundness", {"role:soundness"}, 1, True))
     # missing target AND no existing role -> NOT ready (recoverable untriaged), never ready+roleless.
     r = triage(["priority:P1", "area:dispatch"], "task",
                known_labels=REAL - {f"role:{TRUST_PLANE_ROLE}"})
@@ -1240,8 +1247,6 @@ def build_parser():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
-    ap.add_argument("--role-labels", action="store_true",
-                    help="print the canonical role-label catalog as name<TAB>color<TAB>description")
     ap.add_argument("--labels", default="", help="comma-separated current labels")
     ap.add_argument("--type", default="task")
     ap.add_argument("--untrusted", action="store_true")
@@ -1259,10 +1264,6 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
-    if a.role_labels:
-        for role, (color, description) in ROLE_LABELS.items():
-            print(f"role:{role}\t{color}\t{description}")
-        return 0
     if a.apply:
         if not a.repo or not a.number:
             ap.error("--apply requires --repo and --number")
