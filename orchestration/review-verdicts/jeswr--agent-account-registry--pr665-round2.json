@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e75d0d004a1a8f57740dfc00e4a11004faf339fc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_mark_model_launched` still runs before the host invokes `docker run`, not when the container-side provider CLI executes. A cancellation in that gap or any Docker startup failure therefore sets `launched=true` without a provider attempt. Case D explicitly proves this: it asserts `.cli-started` is absent while also requiring `launched=true` and `WORKER_EXIT_CLASS=unknown`. Downstream, the marker admits `model_health`, so the non-attempt is persisted as the same fabricated `unknown` this PR is intended to eliminate. Preserving old classification behavior for a completed Docker failure does not justify giving the new boolean a false meaning or admitting it as provider health.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Emit a trustworthy host-visible handshake only after the container-side wrapper has begun invoking the provider CLI, and gate provider-health admission on that handshake. Treat Docker/runtime startup failures as non-provider outcomes that do not set the provider-started marker. Replace case D's parity assertion with a non-vacuous assertion that no provider launch marker and no provider-health-admissible class are produced when Docker fails before the CLI starts; also cover cancellation at the handshake boundary.",
+    "severity": "major",
+    "title": "Launch marker still precedes actual provider CLI execution"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-1 major remains unresolved. `_mark_model_launched` is still appended before `docker run`, so it cannot establish the documented and workflow-consumed fact that a provider CLI process actually executed. The new case D now proves the counterexample: Docker startup fails, `.cli-started` is absent, yet `launched=true` and `WORKER_EXIT_CLASS=unknown` are emitted. Calling this master parity does not make the new launch marker sound; `model_health` admits that record via `model_started`, and the persistent-transient ledger still receives a fabricated provider-health `unknown` for a non-attempt. The cancellation window between the append and Docker startup also remains. Tests A/B/C are useful, but D pins the defective behavior instead of asserting the required fail-closed behavior. No reviewer-directed injection was detected in the diff.",
+  "verdict": "request_changes"
+ }
+}
