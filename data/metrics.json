@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-07-25T03:36:04Z",
+  "generated_at": "2026-07-25T03:48:17Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1107,
+      "issues_open": 1109,
       "issues_ready": 8,
       "issues_closed_1h": 6,
       "issues_closed_24h": 29,
@@ -16,7 +16,7 @@
       "review_changes_backlog": 0,
       "needs_user_parked": 2,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 4,
+      "review_lane_runs_1h": 2,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
@@ -24,25 +24,25 @@
       "net_pr_flow": 0.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 255,
+      "issues_open": 253,
       "issues_ready": 80,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 5,
+      "issues_closed_1h": 3,
+      "issues_closed_24h": 8,
       "prs_open": 19,
       "prs_draft": 18,
-      "prs_opened_1h": 8,
+      "prs_opened_1h": 6,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 5,
-      "prs_merged_24h": 10,
+      "prs_merged_1h": 4,
+      "prs_merged_24h": 11,
       "review_changes_backlog": 4,
       "needs_user_parked": 3,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 8,
-      "worker_attempts_1h": 4,
-      "worker_success_rate_1h": 0.75,
-      "pr_open_rate": 8.0,
-      "pr_close_rate": 5.0,
-      "net_pr_flow": 3.0
+      "review_lane_runs_1h": 7,
+      "worker_attempts_1h": 2,
+      "worker_success_rate_1h": 1.0,
+      "pr_open_rate": 6.0,
+      "pr_close_rate": 4.0,
+      "net_pr_flow": 2.0
     }
   },
   "alerts": [
@@ -50,12 +50,12 @@
       "target": "jeswr/agent-account-registry",
       "classification": "backlog-growing",
       "fire": true,
-      "summary": "open PRs 19 > 12 and net PR flow +3.0/hr (open 8.0 > close 5.0) sustained over 2 snapshots",
+      "summary": "open PRs 19 > 12 and net PR flow +2.0/hr (open 6.0 > close 4.0) sustained over 2 snapshots",
       "metrics": {
         "prs_open": 19,
-        "net_pr_flow": 3.0,
-        "pr_open_rate": 8.0,
-        "pr_close_rate": 5.0
+        "net_pr_flow": 2.0,
+        "pr_open_rate": 6.0,
+        "pr_close_rate": 4.0
       }
     }
   ]
