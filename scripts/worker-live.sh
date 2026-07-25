@@ -752,17 +752,17 @@ run_gate() {
 # advertised --self-test entrypoint enrolls it automatically instead of requiring a conflict-prone
 # edit here.
 SELFTEST_MANIFEST="$SCRIPT_DIR/selftest-suite.txt"
-SELFTEST_RETIREMENTS="$SCRIPT_DIR/selftest-retirements.txt"
 
 _read_selftest_list() {
   local file=$1
   [[ -f "$file" ]] || return 1
-  sed -e 's/[[:space:]]*#.*//' -e '/^[[:space:]]*$/d' "$file"
+  sed -e 's/[[:space:]]*#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    -e '/^[[:space:]]*$/d' "$file"
 }
 
 _derive_full_selftest_suite() {
   local scripts_dir=$1 manifest=$2 baseline_manifest=${3:-} baseline_retirements=${4:-}
-  local file base required enrolled advertised approved
+  local file base required enrolled advertised approved baseline
   local -a suite=()
   [[ -d "$scripts_dir" ]] || return 1
   enrolled=$(_read_selftest_list "$manifest") || {
@@ -798,21 +798,29 @@ _derive_full_selftest_suite() {
     }
   done
   if [[ -n "$baseline_manifest" ]]; then
+    baseline=$(_read_selftest_list "$baseline_manifest") || {
+      printf 'base-branch self-test manifest is unavailable: %s\n' "$baseline_manifest" >&2
+      return 1
+    }
     approved=$(_read_selftest_list "$baseline_retirements") || {
-      printf 'base-branch retirement approvals are unavailable\n' >&2; return 1;
+      printf 'base-branch retirement approvals are unavailable: %s\n' "$baseline_retirements" >&2
+      return 1
     }
     while IFS= read -r required; do
+      [[ -n "$required" ]] || continue
       grep -Fxq "$required" <<< "$enrolled" && continue
       grep -Fxq "$required" <<< "$approved" || {
         printf 'suite entry %s was removed without prior base-branch retirement approval\n' "$required" >&2
         return 1
       }
-    done < <(_read_selftest_list "$baseline_manifest")
+    done <<< "$baseline"
   fi
   ((${#suite[@]} > 0)) || return 1
   printf '%s\n' "$enrolled" | paste -sd' ' -
 }
 
+# Base-branch retirement authorization is enforced by pr-gate.yml, whose caller materializes both
+# protected baseline files. The local gate still validates discovery and current enrollment.
 FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST") ||
   die 'registry-selftest gate: self-test manifest validation failed (fail closed)'
 
@@ -2378,6 +2386,16 @@ PY
   printf '%s\n' advertised.sh > "$approvals_fixture"
   chk "base-approved retirement accepts atomic script-and-entry deletion" \
     "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" "$approvals_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "accepted"
+  chk "missing base manifest is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$tmp/missing-baseline" "$approvals_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  chk "missing base retirement approvals are refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" "$tmp/missing-approvals" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '  advertised.py  # enrolled python \n' > "$manifest_fixture"
+  chk "manifest entries with surrounding whitespace are normalized" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
     "accepted"
 
   # --- registry-selftest gate PURE selector (non-vacuous): classify a fixture diff into the

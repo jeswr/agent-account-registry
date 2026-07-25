@@ -80,15 +80,25 @@ jobs:
           set -euo pipefail
           base_manifest="$RUNNER_TEMP/base-selftest-suite.txt"
           base_retirements="$RUNNER_TEMP/base-selftest-retirements.txt"
+          base='${{ github.event.pull_request.base.sha }}'
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "::error::base commit $base is unresolvable; refusing to derive the self-test suite"
+            exit 1
+          fi
           # Bootstrap only: the introducing PR's base has no shared manifest yet, so its current
           # complete manifest is the protected baseline. Every later PR reads the base-branch copy.
-          if ! git show '${{ github.event.pull_request.base.sha }}:scripts/selftest-suite.txt' > "$base_manifest" 2>/dev/null; then
+          if git cat-file -e "$base:scripts/selftest-suite.txt" 2>/dev/null; then
+            git show "$base:scripts/selftest-suite.txt" > "$base_manifest"
+          else
             cp scripts/selftest-suite.txt "$base_manifest"
           fi
-          if ! git show '${{ github.event.pull_request.base.sha }}:scripts/selftest-retirements.txt' > "$base_retirements" 2>/dev/null; then
+          if git cat-file -e "$base:scripts/selftest-retirements.txt" 2>/dev/null; then
+            git show "$base:scripts/selftest-retirements.txt" > "$base_retirements"
+          else
             : > "$base_retirements"
           fi
           suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")
+          n=0
           for s in $suite; do
             echo "== self-test $s =="
             case "$s" in
@@ -97,7 +107,10 @@ jobs:
               *.sh) bash "scripts/$s" self-test ;;
               *) echo "::error::unsupported self-test suite entry: $s"; exit 1 ;;
             esac
+            ((n += 1))
           done
+          [[ "$n" -gt 0 ]] || { echo "::error::self-test suite ran vacuously"; exit 1; }
+          echo "ran $n self-tests"
 
       - name: bash -n every shell script
         run: |
