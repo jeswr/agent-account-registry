@@ -1156,7 +1156,7 @@ def _configured_stale_hours(args: argparse.Namespace) -> int:
 
 
 def _parked_pr_snapshot(
-    pull: dict[str, Any], now: int, stale_seconds: int
+    pull: dict[str, Any], now: int, stale_seconds: int, bot_login: str
 ) -> tuple[str, str] | None:
     """Return the stable head/activity fingerprint of a defuse candidate, absent its latches."""
     if pull.get("draft") is not False:
@@ -1178,8 +1178,23 @@ def _parked_pr_snapshot(
     #
     # Fail direction: unknown or malformed authorship SKIPS. The permissive answer here would be
     # to mutate a PR whose owner we could not establish, which is the wrong way round.
+    #
+    # The test is EXACT OWNERSHIP against the resolved App login — not `type == "Bot"`. Cross-
+    # provider review of the first cut reproduced the difference: a `type == "Bot"` check admits
+    # `dependabot[bot]`, `copilot`, and every other third-party App, and the reviewer drove one
+    # through live revalidation to an actual `gh pr ready --undo` plus an audit comment. The
+    # obligation this guard encodes is "OUR OWN parked PRs", which is a single login, so a
+    # predicate over the whole set of bot-authored PRs is the wrong quantifier scope.
+    #
+    # An unresolved bot_login therefore admits NOTHING: with no established identity to compare
+    # against, every PR is somebody else's.
+    if not bot_login:
+        return None
     user = pull.get("user")
-    if not isinstance(user, dict) or user.get("type") != "Bot":
+    if not isinstance(user, dict):
+        return None
+    login = user.get("login")
+    if not isinstance(login, str) or login.casefold() != bot_login.casefold():
         return None
     updated_at = pull.get("updated_at")
     updated = _epoch(updated_at, "parked pull request")
@@ -1238,11 +1253,12 @@ def _live_defuse_snapshot(
     pull: dict[str, Any],
     now: int,
     stale_seconds: int,
+    bot_login: str,
 ) -> tuple[str, str] | None:
     """The complete safe-class predicate, including both live merge latch surfaces."""
     if pull.get("state") != "open":
         return None
-    snapshot = _parked_pr_snapshot(pull, now, stale_seconds)
+    snapshot = _parked_pr_snapshot(pull, now, stale_seconds, bot_login)
     if snapshot is None:
         return None
     # REST auto_merge is intentionally an additional fail-closed signal. GraphQL is live and
@@ -1263,18 +1279,19 @@ def _collect_defuse_prs(
     pulls: dict[int, dict[str, Any]],
     now: int,
     stale_seconds: int,
+    bot_login: str,
 ) -> dict[tuple[str, int], tuple[str, str]]:
     """Collect live safe-class parked PRs; an unreadable latch skips only that PR."""
     candidates: dict[tuple[str, int], tuple[str, str]] = {}
     for number, listed in sorted(pulls.items()):
         try:
-            if _parked_pr_snapshot(listed, now, stale_seconds) is None:
+            if _parked_pr_snapshot(listed, now, stale_seconds, bot_login) is None:
                 continue
             detail = api.request("GET", f"/repos/{repo}/pulls/{number}", allow_404=True)
             if not isinstance(detail, dict):
                 continue
             snapshot = _live_defuse_snapshot(
-                api, repo, number, detail, now, stale_seconds
+                api, repo, number, detail, now, stale_seconds, bot_login
             )
         except GroomError as exc:
             print(f"ALERT PR {repo}#{number}: {exc} — defuse deferred")
@@ -1416,6 +1433,7 @@ def _execute_defuse_actions(
     tokens: dict[str, str],
     now: int,
     stale_seconds: int,
+    bot_login: str = "",
 ) -> DefuseOutcome:
     """Revalidate and redraft bounded safe-class actions, then write one audit comment.
 
@@ -1447,6 +1465,7 @@ def _execute_defuse_actions(
                     pull,
                     now,
                     stale_seconds,
+                    bot_login,
                 )
                 if isinstance(pull, dict)
                 else None
@@ -2034,7 +2053,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         pulls[repo] = _pulls(api, repo)
         defuse_prs.update(
             _collect_defuse_prs(
-                api, repo, pulls[repo], now, defuse_stale_seconds
+                api, repo, pulls[repo], now, defuse_stale_seconds, bot_login
             )
         )
         for number, issue in issues[repo].items():
@@ -2295,7 +2314,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     )
 
     defuse_outcome = _execute_defuse_actions(
-        pull_actions, groomable, target_tokens, now, defuse_stale_seconds
+        pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login
     )
 
     stale_count = 0
@@ -2724,6 +2743,10 @@ def _self_test() -> int:
     ).isoformat()
     recent_activity = datetime.fromtimestamp(defuse_now - 60, timezone.utc).isoformat()
 
+    # The App login these fixtures' PRs are authored by. Ownership is EXACT (a `type == "Bot"`
+    # check would admit dependabot and every other third-party App — see _parked_pr_snapshot).
+    DEFUSE_BOT_LOGIN = "app[bot]"   # the identity this module's harness resolves throughout
+
     def _defuse_pull(number: int, **changes: Any) -> dict[str, Any]:
         pull = {
             "number": number,
@@ -2732,9 +2755,9 @@ def _self_test() -> int:
             "labels": [{"name": "needs:user"}],
             "updated_at": old_activity,
             "head": {"sha": f"{number:040x}"},
-            # Defuse candidates are OUR OWN parked PRs. A human's PR is excluded by
-            # _parked_pr_snapshot and is covered separately below.
-            "user": {"login": "sparq-orchestrator[bot]", "type": "Bot"},
+            # Defuse candidates are OUR OWN parked PRs. A human's PR, and a FOREIGN bot's,
+            # are both excluded by _parked_pr_snapshot; both are covered separately below.
+            "user": {"login": DEFUSE_BOT_LOGIN, "type": "Bot"},
             "auto_merge": None,
         }
         pull.update(changes)
@@ -2758,6 +2781,17 @@ def _self_test() -> int:
         # Unknown/malformed authorship must fail toward NOT touching the PR.
         11: _defuse_pull(11, user=None),
         12: _defuse_pull(12, user={"login": "someone"}),  # no `type` at all
+        # A FOREIGN bot. `type == "Bot"` admitted these; cross-provider review drove
+        # dependabot[bot] all the way through live revalidation to a real `gh pr ready --undo`
+        # plus an audit comment. Ownership is a single login, not a category.
+        13: _defuse_pull(13, user={"login": "dependabot[bot]", "type": "Bot"}),
+        14: _defuse_pull(14, user={"login": "copilot[bot]", "type": "Bot"}),
+        15: _defuse_pull(15, user={"login": "github-actions[bot]", "type": "Bot"}),
+        # Logins that CONTAIN ours but are not ours — the App-name-squatting shape. Found by
+        # mutation: with only the fixtures above, relaxing the comparison to a substring test
+        # stayed GREEN, because none of them is a superstring of the bot login.
+        17: _defuse_pull(17, user={"login": "not-app[bot]", "type": "Bot"}),
+        18: _defuse_pull(18, user={"login": "app[bot]-lookalike", "type": "Bot"}),
     }
     del defuse_details[8]["auto_merge"]  # unknown REST latch state must fail closed
 
@@ -2790,6 +2824,7 @@ def _self_test() -> int:
         defuse_details,
         defuse_now,
         defuse_stale_seconds,
+        DEFUSE_BOT_LOGIN,
     )
     check(
         "#548 tripwire (b): a recently-active parked PR is NOT defused",
@@ -2812,6 +2847,55 @@ def _self_test() -> int:
         "#3427: unknown or malformed authorship fails toward NOT mutating the PR",
         {("owner/repo", number) in defuse_candidates for number in (11, 12)},
         {False},
+    )
+    # The first cut of this guard tested `user.type == "Bot"`, which admits EVERY GitHub App.
+    # Cross-provider review reproduced dependabot[bot] passing live revalidation and reaching a
+    # real `gh pr ready --undo` plus an audit comment. The obligation is exact ownership of a
+    # single login, so a predicate over the category of bot-authored PRs is the wrong scope.
+    check(
+        "#659 review: a FOREIGN bot's parked PR is NOT a defuse candidate (type == 'Bot' is "
+        "not ownership — dependabot/copilot/github-actions are other people's PRs)",
+        {("owner/repo", number) in defuse_candidates for number in (13, 14, 15)},
+        {False},
+    )
+    check(
+        "#659 review: a login that merely CONTAINS ours is NOT ours (equality, not substring "
+        "— an App-name squatter must not inherit our authority)",
+        {("owner/repo", number) in defuse_candidates for number in (17, 18)},
+        {False},
+    )
+    check(
+        "#659 review: ownership comparison is case-insensitive, as GitHub logins are",
+        _parked_pr_snapshot(
+            _defuse_pull(16, user={"login": DEFUSE_BOT_LOGIN.upper(), "type": "Bot"}),
+            defuse_now, defuse_stale_seconds, DEFUSE_BOT_LOGIN,
+        )
+        is not None,
+        True,
+    )
+    # An unresolved App identity must admit NOTHING: with nothing to compare against, every PR
+    # belongs to somebody else. Asserted against the SAME fixture that IS admitted with an
+    # identity, so this cannot pass merely because the fixture was unusable.
+    check(
+        "#659 review: an unresolved bot_login admits nothing (fail-closed), while the same "
+        "fixture IS admitted once the identity is known",
+        (
+            _parked_pr_snapshot(defuse_details[1], defuse_now, defuse_stale_seconds, "")
+            is None,
+            # The case the guard EXISTS for, found by mutation: without it, a degraded payload
+            # reporting an empty login would compare equal to an unresolved empty bot_login and
+            # be admitted. Two empty strings must not constitute a match.
+            _parked_pr_snapshot(
+                _defuse_pull(19, user={"login": "", "type": "Bot"}),
+                defuse_now, defuse_stale_seconds, "",
+            )
+            is None,
+            _parked_pr_snapshot(
+                defuse_details[1], defuse_now, defuse_stale_seconds, DEFUSE_BOT_LOGIN
+            )
+            is not None,
+        ),
+        (True, True, True),
     )
     check(
         "#548 tripwire (c): review:changes alone is NOT a terminal defuse hold",
@@ -2875,6 +2959,7 @@ def _self_test() -> int:
             {"owner": "owner-target-token"},
             defuse_now,
             defuse_stale_seconds,
+            DEFUSE_BOT_LOGIN,
         )
     finally:
         subprocess.run = real_subprocess_run
@@ -2995,6 +3080,7 @@ def _self_test() -> int:
                 {"owner": "owner-target-token"} if tokens is None else tokens,
                 defuse_now,
                 defuse_stale_seconds,
+                DEFUSE_BOT_LOGIN,
             ), False, drafted
         except GroomError:
             # Reached ONLY if a per-PR failure escapes the block — i.e. the defect is back.
@@ -4692,7 +4778,7 @@ def _self_test() -> int:
             # dedicated check further down. What this block still tests, and must keep testing, is
             # the head-of-line property: one un-redraftable candidate must not abort the phase.
             # A bot PR touching `.github/workflows/**` reaches that same failure legitimately.
-            "user": {"login": "sparq-orchestrator[bot]", "type": "Bot"},
+            "user": {"login": "app[bot]", "type": "Bot"},
             "body": "a worker PR touching .github/workflows/**",
             "auto_merge": None,
         }
