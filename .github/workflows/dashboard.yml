@@ -85,6 +85,11 @@ jobs:
       # travels with the snapshot as `usage-probe.json` and dashboard-gen (--usage-status) refuses
       # to render capacity from anything but an explicit, fresh `ok`.
       - name: Probe live account usage (tokens never printed)
+        # `id:` so dashboard-gen's self-test can EXTRACT and EXECUTE this exact step body
+        # (#612 review round 2, finding 4): `bash -n` and actionlint cannot see shell polarity, so
+        # dropping the `!` below — a nonzero probe left classified `ok` — used to survive the whole
+        # suite. The self-test now runs this body against a stubbed probe and asserts the outcome.
+        id: usage-probe
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -109,6 +114,25 @@ jobs:
           if [ "${SECRETS_STEP_OUTCOME}" != "success" ]; then
             outcome=failed
             detail=secret-materialization-failed
+          fi
+          # A `success` step outcome does not prove the filter WROTE anything (#612 review round 2,
+          # finding 4): a materialization step whose body were replaced by `true` reports success
+          # and leaves no ACCT_* file, _load_secrets returns {} for an unreadable one, and the probe
+          # then exits 0 having measured nothing — publishing a fresh `measured` sidecar. Worse, the
+          # probe-EXEMPT providers (openai/codex) do not need a token at all, so they would still be
+          # emitted and published as free capacity off a materialization that never ran. So the
+          # subset file is checked POSITIVELY, not merely inferred from a neighbour's outcome.
+          if [ "$outcome" = ok ] && [ ! -s "${SECRETS_FILE}" ]; then
+            outcome=failed
+            detail=secret-file-missing
+          fi
+          # ...and an EMPTY subset is measurement-equivalent to no file: every non-exempt account is
+          # fail-closed omitted for want of a token. `grep -q` prints nothing, so no token byte can
+          # reach the log (the reason this is not a python shape check whose traceback could echo
+          # part of the document).
+          if [ "$outcome" = ok ] && ! grep -q '"ACCT' "${SECRETS_FILE}"; then
+            outcome=failed
+            detail=secret-subset-empty
           fi
           if [ "$outcome" = ok ] && ! python3 scripts/account-usage.py --self-test; then
             outcome=failed
@@ -178,6 +202,9 @@ jobs:
           path: ${{ runner.temp }}
 
       - name: Generate privacy-safe dashboard
+        # `id:` so the self-test can assert the --usage/--usage-status pairing against THIS step
+        # rather than against the whole file (#612 review round 2, class E).
+        id: dashboard-build
         env:
           GH_TOKEN: ${{ github.token }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}

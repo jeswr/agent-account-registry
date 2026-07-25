@@ -499,6 +499,116 @@ def _provider_quota(accounts, usage, now):
     return rows
 
 
+# --- WIRING ASSERTIONS: reading the workflow / the page script without letting a comment or a
+# neighbouring occurrence stand in for the call site under test. ------------------------------------
+#
+# #612 cross-provider review round 2 (class E). A mutation harness found that 18/18 mutations
+# against this repo's PYTHON guards were caught while EVERY surviving mutation was a workflow `if:`,
+# a workflow step body, or a production call site. Concretely, on this PR: dropping the `!` from the
+# probe step's snapshot condition, replacing the materialization step's body with `true`, deleting
+# `probe_status=probe_status` from `main()`, and deleting `summary.append(probe)` /
+# `updateFreshness(..., data.usage_probe)` from the page script all left the suite green. These
+# helpers exist so the assertions below are scoped to ONE step or ONE function — a whole-file
+# substring search is satisfiable by prose or by any of several other occurrences — and so the
+# probe step's shell body can be EXECUTED rather than pattern-matched (`bash -n` and actionlint
+# cannot see polarity). Every helper raises DashboardError when it cannot resolve its target: a
+# wiring assertion that cannot find what it is asserting about must fail, never pass vacuously.
+def _repo_file(*parts):
+    """Text of a repository file addressed relative to the repo root, independent of cwd."""
+    path = Path(__file__).resolve().parent.parent.joinpath(*parts)
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DashboardError(f"wiring assertion cannot read {path}") from exc
+
+
+def _strip_yaml_comments(text):
+    """`text` with every whole-line `#` comment removed (YAML comments and, inside `run:` blocks,
+    shell/python comments alike). A claim in prose must never satisfy an assertion about code."""
+    return "\n".join(line for line in text.split("\n") if not line.lstrip().startswith("#"))
+
+
+def _workflow_step(text, step_id):
+    """The full YAML text of the ONE step whose `id:` is `step_id`, comments stripped.
+
+    Bounded by the enclosing `- ` sequence entry's indentation, so a call in a NEIGHBOURING step
+    cannot satisfy an assertion about this one."""
+    lines = text.split("\n")
+    marks = [index for index, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
+    if len(marks) != 1:
+        raise DashboardError(
+            f"expected exactly one workflow step with `id: {step_id}`, found {len(marks)} — "
+            "refusing to assert against a step that cannot be located (fail closed)")
+    starts = [index for index in range(marks[0], -1, -1) if lines[index].lstrip().startswith("- ")]
+    if not starts:
+        raise DashboardError(f"step `id: {step_id}` has no enclosing `- ` sequence entry — refusing")
+    start = starts[0]
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        here = len(line) - len(line.lstrip())
+        if here < indent or (here == indent and line.lstrip().startswith("- ")):
+            end = index
+            break
+    body = _strip_yaml_comments("\n".join(lines[start:end]))
+    if not body.strip():
+        raise DashboardError(f"step `id: {step_id}` extracted to an empty body — refusing")
+    return body
+
+
+def _workflow_step_script(text, step_id):
+    """The EXECUTABLE `run:` script of the step whose `id:` is `step_id`, dedented, comments kept.
+
+    Comments are kept here (unlike _workflow_step) because this text is handed to `bash`, not
+    pattern-matched. Raises when the step has no `run:` block or the block is empty — a step body
+    that cannot be recovered must not silently become a no-op the harness then 'passes'."""
+    lines = _workflow_step(text, step_id).split("\n")
+    starts = [index for index, line in enumerate(lines) if line.strip() in {"run: |", "run: |-"}]
+    if len(starts) != 1:
+        raise DashboardError(
+            f"step `id: {step_id}` has {len(starts)} block `run:` scripts, expected exactly 1")
+    head = starts[0]
+    indent = len(lines[head]) - len(lines[head].lstrip())
+    body = []
+    for line in lines[head + 1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        body.append(line[indent + 2:] if line.strip() else "")
+    script = "\n".join(body)
+    if not script.strip():
+        raise DashboardError(f"step `id: {step_id}` extracted to an empty `run:` script — refusing")
+    return script
+
+
+def _js_function_body(text, name):
+    """The brace-matched body of `function <name>(...)` in a JS source, or raise.
+
+    Scoping a call-site assertion to ONE function is the difference between "this file mentions
+    updateFreshness" and "render() passes the probe to it": `grant-account.py` appears 7× in its
+    own workflow, and whole-file greps on repeated tokens are exactly the vacuity #612 round 2
+    flagged."""
+    marks = [match.start() for match in re.finditer(rf"\bfunction\s+{re.escape(name)}\s*\(", text)]
+    if len(marks) != 1:
+        raise DashboardError(
+            f"expected exactly one `function {name}(` definition, found {len(marks)} — refusing")
+    open_brace = text.find("{", marks[0])
+    if open_brace < 0:
+        raise DashboardError(f"`function {name}(` has no body — refusing")
+    depth, index = 0, open_brace
+    while index < len(text):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace:index + 1]
+        index += 1
+    raise DashboardError(f"`function {name}(` body is unbalanced — refusing")
+
+
 def _probe_epoch(value):
     """`value` as a UTC epoch second, reusing _utc_iso's tolerant epoch/ISO parsing, or None."""
     iso = _utc_iso(value)
@@ -1666,6 +1776,183 @@ def _self_test():
             status_required = False
         check("a usage snapshot without --usage-status is refused (the #219 caller coupling)",
               status_required, True)
+
+    # --- #612 review round 2, finding 4 (MAJOR): the probe step's shell body is EXECUTED, not
+    # pattern-matched. `bash -n` and actionlint cannot see polarity, so dropping the `!` from
+    # `if [ "$outcome" = ok ] && ! python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json"`
+    # inverted the whole classification with the full suite green: a NONZERO probe stayed `ok` and
+    # published a fresh `measured` sidecar. The step body is extracted from the real workflow and
+    # run under bash against a stubbed probe, so each row below dies on a one-token change to the
+    # shell — including replacing the body with `true` (no sidecar is written at all).
+    # ------------------------------------------------------------------------------------------
+    dashboard_workflow = _repo_file(".github", "workflows", "dashboard.yml")
+    probe_script = _workflow_step_script(dashboard_workflow, "usage-probe")
+    # The stub prints a snapshot on stdout even when it EXITS NONZERO: real probes are incremental,
+    # so the `!`-dropped mutation must be caught by the recorded OUTCOME rather than by an
+    # accidentally-empty file.
+    probe_stub = ("import json, os, sys\n"
+                  "if '--self-test' in sys.argv:\n"
+                  "    sys.exit(int(os.environ['STUB_SELFTEST_EXIT']))\n"
+                  "json.dump({'acct-fixture': {'status': 'allowed'}}, sys.stdout)\n"
+                  "sys.exit(int(os.environ['STUB_PROBE_EXIT']))\n")
+
+    def run_probe_step(secrets_outcome="success", secrets_file="tokens",
+                       selftest_exit=0, probe_exit=0):
+        """Execute the REAL probe step body; return (exit code, sidecar dict|None, snapshot|None)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "account-usage.py").write_text(probe_stub, encoding="utf-8")
+            temp = root / "runner-temp"
+            temp.mkdir()
+            secrets_path = root / "acct-secrets.json"
+            if secrets_file == "tokens":
+                secrets_path.write_text('{"ACCT01_TOKEN": "redacted"}', encoding="utf-8")
+            elif secrets_file == "empty-subset":
+                secrets_path.write_text("{}", encoding="utf-8")
+            # secrets_file == "missing": the materialization step's body was replaced by `true` —
+            # it reports `success` and leaves no file behind.
+            environment = dict(os.environ,
+                               RUNNER_TEMP=str(temp),
+                               SECRETS_STEP_OUTCOME=secrets_outcome,
+                               SECRETS_FILE=str(secrets_path),
+                               STUB_SELFTEST_EXIT=str(selftest_exit),
+                               STUB_PROBE_EXIT=str(probe_exit),
+                               GH_TOKEN="", PROVENANCE_SALT="", REGISTRY_REPO="owner/repo",
+                               MODEL_HEALTH_FILE=str(root / "absent-model-health.json"))
+            completed = subprocess.run(["bash", "-c", probe_script], cwd=str(root),
+                                       env=environment, capture_output=True, text=True,
+                                       timeout=120, check=False)
+            sidecar_path, snapshot_path = temp / "usage-probe.json", temp / "usage.json"
+            sidecar = None
+            if sidecar_path.is_file():
+                try:
+                    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    sidecar = "MALFORMED"
+            return (completed.returncode, sidecar,
+                    snapshot_path.read_text(encoding="utf-8") if snapshot_path.is_file() else None)
+
+    def probe_step_view(**kwargs):
+        code, sidecar, snapshot = run_probe_step(**kwargs)
+        marker = sidecar if isinstance(sidecar, dict) else {}
+        return (code, marker.get("schema"), marker.get("outcome"), marker.get("detail"), snapshot)
+
+    check("[#612] probe step: a succeeding probe records ok and keeps its real snapshot",
+          probe_step_view(),
+          (0, PROBE_SCHEMA, "ok", "probe-succeeded",
+           '{"acct-fixture": {"status": "allowed"}}'))
+    # THE polarity mutation: without the `!` this row reads ("ok", "probe-succeeded", <stub json>).
+    check("[#612] probe step: a NONZERO probe is recorded failed and its output discarded",
+          probe_step_view(probe_exit=1),
+          (0, PROBE_SCHEMA, "failed", "probe-exited-nonzero", "{}"))
+    check("[#612] probe step: a failing probe self-test is recorded failed",
+          probe_step_view(selftest_exit=1),
+          (0, PROBE_SCHEMA, "failed", "probe-self-test-failed", "{}"))
+    check("[#612] probe step: a failed secret materialization is recorded failed",
+          probe_step_view(secrets_outcome="failure"),
+          (0, PROBE_SCHEMA, "failed", "secret-materialization-failed", "{}"))
+    # The `true`-body mutation on the materialization step: outcome `success`, no file. Pre-fix this
+    # row read ("ok", "probe-succeeded") — a false-healthy probe status with nothing measured, and
+    # the probe-EXEMPT providers published as free capacity off a materialization that never ran.
+    check("[#612] probe step: `success` with NO subset file is recorded failed, not measured",
+          probe_step_view(secrets_file="missing"),
+          (0, PROBE_SCHEMA, "failed", "secret-file-missing", "{}"))
+    check("[#612] probe step: an EMPTY token subset is recorded failed, not measured",
+          probe_step_view(secrets_file="empty-subset"),
+          (0, PROBE_SCHEMA, "failed", "secret-subset-empty", "{}"))
+    # The shell -> python contract itself: whatever the step actually wrote must parse HERE. This is
+    # what a scoped substring assertion could never do — it ties the printf's schema string, outcome
+    # vocabulary and stamp format to _probe_outcome's fail-closed parser.
+    step_now = int(time.time())
+    check("[#612] the sidecar the step really wrote is what _probe_outcome accepts/refuses",
+          [_probe_outcome(run_probe_step(**kwargs)[1], step_now)["measured"]
+           for kwargs in ({}, {"probe_exit": 1}, {"secrets_file": "missing"})],
+          [True, False, False])
+    build_step = _workflow_step(dashboard_workflow, "dashboard-build")
+    check("[#612] the build step passes the sidecar WITH the snapshot (scoped to that one step)",
+          ('--usage "$RUNNER_TEMP/usage.json"' in build_step,
+           '--usage-status "$RUNNER_TEMP/usage-probe.json"' in build_step),
+          (True, True))
+
+    # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
+    # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
+    # AND the missing-flag negative test above green, while production parsed a valid sidecar and
+    # then threw it away — publishing zero eligible capacity with an unmeasured warning on every
+    # healthy run. So main() is driven end to end here, and the assertion is a PAIR: the same
+    # entrypoint must publish capacity for a fresh sidecar and refuse it for a failed one, which no
+    # constant return value satisfies. `_fetch_dispatch_history` (a `gh` subprocess) is the only
+    # stub; the probe_status plumbing under test is the real code path.
+    # ------------------------------------------------------------------------------------------
+    live_now = int(time.time())
+    live_usage = {handle: {"status": "allowed", "5h_used": "10", "5h_util": "0.1",
+                           "5h_reset": live_now + 3600, "7d_used": "80", "7d_util": "0.8",
+                           "7d_reset": live_now + 86400}}
+
+    def main_document(sidecar):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, payload in (("issues.json", issues), ("usage.json", live_usage),
+                                  ("leases.json", leases),
+                                  ("model-health.json", {"records": []}),
+                                  ("usage-probe.json", sidecar)):
+                Path(root, name).write_text(json.dumps(payload), encoding="utf-8")
+            saved_history = globals()["_fetch_dispatch_history"]
+            saved_salt = os.environ.get("PROVENANCE_SALT")
+            globals()["_fetch_dispatch_history"] = lambda repo, count: []
+            os.environ["PROVENANCE_SALT"] = "fixture-salt"
+            try:
+                main(["--issues-file", str(root / "issues.json"),
+                      "--usage", str(root / "usage.json"),
+                      "--usage-status", str(root / "usage-probe.json"),
+                      "--leases", str(root / "leases.json"),
+                      "--model-health", str(root / "model-health.json"),
+                      "--assets", str(Path(__file__).resolve().parent.parent / "dashboard"),
+                      "--site", str(root / "site")])
+            finally:
+                globals()["_fetch_dispatch_history"] = saved_history
+                if saved_salt is None:
+                    os.environ.pop("PROVENANCE_SALT", None)
+                else:
+                    os.environ["PROVENANCE_SALT"] = saved_salt
+            published = json.loads(Path(root, "site", "data.json").read_text(encoding="utf-8"))
+            return ((published.get("usage_probe") or {}).get("measured"),
+                    published["accounts"][0]["availability"],
+                    published["fleet"]["capacity"])
+
+    check("[#612] main() forwards a FRESH sidecar, so a healthy run still publishes capacity",
+          main_document({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                         "attempted_at": live_now}),
+          (True, "available", {"anthropic": {"eligible": 1, "total": 1}}))
+    check("[#612] main() forwards a FAILED sidecar, so the same run publishes none",
+          main_document({"schema": PROBE_SCHEMA, "outcome": "failed",
+                         "detail": "probe-exited-nonzero", "attempted_at": live_now}),
+          (False, "unknown", {"anthropic": {"eligible": 0, "total": 1}}))
+
+    # --- #612 review round 2, finding 5 (MINOR), UI half: the page's call sites. Deleting
+    # `summary.append(probe)` or the SECOND argument of `updateFreshness(...)` removes the promised
+    # operator warning with no Python test affected. Each assertion below is scoped to the ONE
+    # function that must make the call — a whole-file search for `usage_probe` in app.js is
+    # satisfied by any of its several other occurrences, which is precisely the vacuity class here.
+    # ------------------------------------------------------------------------------------------
+    app_js = _repo_file("dashboard", "app.js")
+    check("[#612] renderSummary() builds the probe card from data.usage_probe AND appends it",
+          ("usageProbeCard(data.usage_probe)" in _js_function_body(app_js, "renderSummary"),
+           "summary.append(probe)" in _js_function_body(app_js, "renderSummary")),
+          (True, True))
+    check("[#612] render() hands the probe marker to updateFreshness (both arguments)",
+          "updateFreshness(data.generated_at, data.usage_probe)"
+          in _js_function_body(app_js, "render"),
+          True)
+    freshness = _js_function_body(app_js, "updateFreshness")
+    check("[#612] updateFreshness() actually consumes the marker it is handed",
+          ("probe.measured !== true" in freshness, "notices.push" in freshness),
+          (True, True))
+    probe_card = _js_function_body(app_js, "usageProbeCard")
+    check("[#612] the probe card degrades on anything but an explicit measured:true",
+          ('probe.measured === true' in probe_card,
+           'card.classList.add("degraded")' in probe_card),
+          (True, True))
 
     health = _normalize_model_health({
         "generated_at": now,
