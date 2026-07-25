@@ -36,6 +36,10 @@ jobs:
           set -euo pipefail
           tmp="$RUNNER_TEMP/retriage"
           mkdir -p "$tmp"
+          # registry #582: give the planner the repo's ACTUAL label set so it can never plan an add
+          # of a label that does not exist (nor a strip of the last role:* label for one). Without
+          # it, `role:soundness` — absent from this repo — stranded promoted issues role-less.
+          known=$(gh label list -R "$REPO" --limit 500 --json name --jq '[.[].name]|join(",")')
           gh issue list -R "$REPO" --state open --label status:untriaged --limit 40 \
             --json number,author,body,labels,updatedAt > "$tmp/untriaged.json"
           jq -c 'sort_by(.updatedAt) | .[]' "$tmp/untriaged.json" > "$tmp/issues.jsonl"
@@ -50,7 +54,7 @@ jobs:
             fi
             decision=$(python3 scripts/retriage.py \
               --maintainer "$MAINTAINER_LOGIN" --app-bot "$APP_BOT_LOGIN" \
-              --permission "$permission" <<<"$issue")
+              --permission "$permission" --known-labels "$known" <<<"$issue")
             action=$(jq -r .action <<<"$decision")
             if [ "$action" != promote ]; then
               echo "skip #$number: $(jq -r .reason <<<"$decision")"
@@ -63,5 +67,13 @@ jobs:
             while IFS= read -r label; do args+=(--remove-label "$label"); done \
               < <(jq -r '.remove[]' <<<"$decision")
             gh issue edit "$number" -R "$REPO" "${args[@]}"
+            # registry #582 POST-CONDITION: an issue must never leave triage status:ready with no
+            # role:* label (ready-issues.py needs one, retriage only revisits status:untriaged, so
+            # the state is terminal). Re-read and fail loudly rather than strand it.
+            post=$(gh issue view "$number" -R "$REPO" --json labels --jq '[.labels[].name]|join(",")')
+            if [[ ",$post," == *",status:ready,"* ]] && [[ ",$post," != *",role:"* ]]; then
+              echo "::error title=retriage #$number::promoted to status:ready with NO role:* label (registry #582): $post"
+              exit 1
+            fi
             echo "promoted #$number"
           done < "$tmp/issues.jsonl"

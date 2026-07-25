@@ -11,7 +11,13 @@ HOLD_MARKER = "<!-- orchestration:hold -->"
 TRUSTED_PERMISSIONS = {"admin", "maintain", "write"}
 
 
-def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
+def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
+         known_labels=None):
+    """`known_labels` (optional): the target repo's ACTUAL label set. Supplying it makes the role
+    transition fail-closed (registry #582) — the classifier never plans an add of a label the repo
+    does not have, and never plans a strip of the last role label for one. Without a role the
+    classifier reports not-ready, so this path skips the issue as `classifier-incomplete` rather
+    than promoting it to a role-less `status:ready` (silently undispatchable, unrecoverable)."""
     labels = {item["name"] if isinstance(item, dict) else item
               for item in issue.get("labels", [])}
     author = (issue.get("author") or {}).get("login", "")
@@ -29,13 +35,17 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
     if "status:untriaged" not in labels or "status:deferred" in labels:
         return {"action": "skip", "reason": "not-retriageable"}
     try:
-        result = classify(labels, "task", trusted=True)
+        result = classify(labels, "task", trusted=True, known_labels=known_labels)
     except Exception:
         return {"action": "skip", "reason": "classifier-failure"}
     if not result["ready"]:
         return {"action": "skip", "reason": "classifier-incomplete"}
     remove = set(result["remove"])
     remove.update(labels.intersection({"status:untriaged"}))
+    # registry #582 belt-and-braces: never emit a promotion whose post-state has no role:* label.
+    post = (labels | set(result["add"])) - remove
+    if not any(label.startswith("role:") for label in post):
+        return {"action": "skip", "reason": "role-invariant"}
     return {"action": "promote", "add": sorted(result["add"]), "remove": sorted(remove)}
 
 
@@ -68,6 +78,29 @@ def _self_test():
     checks.append(("hold marker rejected",
                    plan(issue("status:untriaged", body=HOLD_MARKER), "owner", "app[bot]", "none")
                    == {"action": "skip", "reason": "explicit-hold"}))
+
+    # [registry #582] the base fixture (priority:P2 + area:workflows) derives role:ci. If the target
+    # repo does NOT have that label, promoting would strip/skip the role and land a role-less
+    # status:ready — silently undispatchable and unrecoverable (retriage only revisits
+    # status:untriaged). Fail-closed: skip, leaving the issue retriageable next tick.
+    real = {"role:ci", "role:impl", "status:ready", "status:untriaged", "priority:P2",
+            "area:workflows"}
+    checks.append(("known label set present -> still promotes",
+                   plan(issue("status:untriaged"), "owner", "app[bot]", "none",
+                        known_labels=real)["action"] == "promote"))
+    checks.append(("[#582] missing role label -> fail-closed skip, never role-less ready",
+                   plan(issue("status:untriaged"), "owner", "app[bot]", "none",
+                        known_labels=real - {"role:ci"})
+                   == {"action": "skip", "reason": "classifier-incomplete"}))
+
+    def roleless(*_args, **_kwargs):
+        """A classifier that promotes while stripping the only role — the #582 shape."""
+        return {"add": {"status:ready"}, "remove": {"role:ci"}, "ready": True, "role": None,
+                "warnings": []}
+
+    checks.append(("[#582] role-invariant guard rejects a role-less promotion",
+                   plan(issue("status:untriaged", "role:ci"), "owner", "app[bot]", "none", roleless)
+                   == {"action": "skip", "reason": "role-invariant"}))
 
     def broken(*_args, **_kwargs):
         raise RuntimeError("fixture")

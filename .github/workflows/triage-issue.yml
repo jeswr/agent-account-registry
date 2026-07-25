@@ -65,13 +65,14 @@ jobs:
           gh issue comment "$NUM" -R "$REPO" \
             --body "> 🤖 SPARQ agent — this issue is from a non-collaborator, so it is **quarantined** (\`trust:untrusted\`) and its content is not acted on. A maintainer can approve it by adding a 👍 reaction." || true
 
+      # `--apply` owns the whole read -> plan -> mutate sequence FAIL-CLOSED (registry #582).
+      # It replaces the previous per-label `gh issue edit ... || true` loops, which applied the
+      # role ADD and the role STRIP independently and swallowed both failures: the add of the
+      # non-existent `role:soundness` failed, the strip of `role:impl` succeeded, and the issue
+      # landed `status:ready` with NO role — silently undispatchable and unrecoverable. The applier
+      # now adds + VERIFIES the replacement role label before stripping anything, and re-reads the
+      # issue afterwards to assert exactly one `role:*` survives. NO `|| true`: an invariant or
+      # post-condition failure must turn this step RED, not strand an issue quietly.
       - name: Static triage (trusted author)
         if: steps.trust.outputs.trusted == '1'
-        run: |
-          set -euo pipefail
-          labels=$(gh issue view "$NUM" -R "$REPO" --json labels --jq '[.labels[].name]|join(",")')
-          out=$(python3 scripts/triage.py --labels "$labels" --type task)
-          add=$(printf '%s\n' "$out" | sed -n 's/^ADD: //p')
-          rem=$(printf '%s\n' "$out" | sed -n 's/^REMOVE: //p')
-          for l in $add; do gh issue edit "$NUM" -R "$REPO" --add-label "$l" || true; done
-          for l in $rem; do gh issue edit "$NUM" -R "$REPO" --remove-label "$l" || true; done
+        run: python3 scripts/triage.py --apply --repo "$REPO" --number "$NUM" --type task
