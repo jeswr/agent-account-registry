@@ -559,17 +559,17 @@ def _workflow_step(text, step_id):
     return body
 
 
-def _workflow_step_script(text, step_id):
-    """The EXECUTABLE `run:` script of the step whose `id:` is `step_id`, dedented, comments kept.
+def _workflow_step_block(text, step_id, key):
+    """The dedented block-scalar value of `<key>: |` inside the step whose `id:` is `step_id`.
 
-    Comments are kept here (unlike _workflow_step) because this text is handed to `bash`, not
-    pattern-matched. Raises when the step has no `run:` block or the block is empty — a step body
-    that cannot be recovered must not silently become a no-op the harness then 'passes'."""
+    Raises when the step has no such block or the block is empty — a step body that cannot be
+    recovered must not silently become a no-op the harness then 'passes'."""
     lines = _workflow_step(text, step_id).split("\n")
-    starts = [index for index, line in enumerate(lines) if line.strip() in {"run: |", "run: |-"}]
+    wanted = {f"{key}: |", f"{key}: |-"}
+    starts = [index for index, line in enumerate(lines) if line.strip() in wanted]
     if len(starts) != 1:
         raise DashboardError(
-            f"step `id: {step_id}` has {len(starts)} block `run:` scripts, expected exactly 1")
+            f"step `id: {step_id}` has {len(starts)} block `{key}:` values, expected exactly 1")
     head = starts[0]
     indent = len(lines[head]) - len(lines[head].lstrip())
     body = []
@@ -577,10 +577,50 @@ def _workflow_step_script(text, step_id):
         if line.strip() and (len(line) - len(line.lstrip())) <= indent:
             break
         body.append(line[indent + 2:] if line.strip() else "")
-    script = "\n".join(body)
-    if not script.strip():
-        raise DashboardError(f"step `id: {step_id}` extracted to an empty `run:` script — refusing")
-    return script
+    value = "\n".join(body)
+    if not value.strip():
+        raise DashboardError(
+            f"step `id: {step_id}` extracted to an empty `{key}:` block — refusing")
+    return value
+
+
+def _workflow_step_script(text, step_id):
+    """The EXECUTABLE `run:` script of the step whose `id:` is `step_id`, dedented.
+
+    Comments are NOT kept — this text comes through _workflow_step, which strips them (the round-4
+    correction of an earlier docstring that claimed otherwise). That is harmless for execution and
+    is the point for pattern-matching, so the two uses share one extractor."""
+    return _workflow_step_block(text, step_id, "run")
+
+
+def _workflow_step_env(text, step_id):
+    """The `env:` mapping of the step whose `id:` is `step_id`, as {NAME: raw expression text}.
+
+    #612 review round 4: deleting `SECRETS_STEP_OUTCOME: ${{ steps.acct-secrets.outcome }}` from the
+    probe step survived the suite, because the executed body reads the variable from the process
+    environment the HARNESS supplies — execution can never see a missing workflow-level wiring. A
+    mapping (rather than a substring search) is what makes "this step defines this variable, from
+    that step's outcome" falsifiable, and resolving the step id it names is what stops the wiring
+    from pointing at a step that no longer exists."""
+    lines = _workflow_step(text, step_id).split("\n")
+    heads = [index for index, line in enumerate(lines) if line.strip() == "env:"]
+    if len(heads) != 1:
+        raise DashboardError(
+            f"step `id: {step_id}` has {len(heads)} `env:` mappings, expected exactly 1")
+    head = heads[0]
+    indent = len(lines[head]) - len(lines[head].lstrip())
+    mapping = {}
+    for line in lines[head + 1:]:
+        if not line.strip():
+            continue
+        if (len(line) - len(line.lstrip())) <= indent:
+            break
+        name, separator, value = line.strip().partition(":")
+        if separator:
+            mapping[name.strip()] = value.strip()
+    if not mapping:
+        raise DashboardError(f"step `id: {step_id}` has an empty `env:` mapping — refusing")
+    return mapping
 
 
 def _js_function_body(text, name):
@@ -607,6 +647,88 @@ def _js_function_body(text, name):
                 return text[open_brace:index + 1]
         index += 1
     raise DashboardError(f"`function {name}(` body is unbalanced — refusing")
+
+
+def _js_code_count(text, needle):
+    """Occurrences of `needle` at CODE positions of `text`: comments are blanked out first, and a
+    match that BEGINS inside a string/template literal does not count.
+
+    #612 review round 4 (MINOR, class E): the round-3 UI assertions were satisfiable by a COMMENT —
+    commenting out `summary.append(probe)` kept the suite green while the operator warning was gone —
+    and by any string literal that happened to contain the needle. Counting only code positions
+    closes both, and asserting an exact COUNT (rather than presence) is what stops a neighbouring
+    branch's occurrence from standing in for the one under test."""
+    chars = list(text)
+    in_string = [False] * len(text)
+    index, quote, comment = 0, None, None
+    while index < len(text):
+        char, pair = text[index], text[index:index + 2]
+        if comment == "line":
+            if char == "\n":
+                comment = None
+            else:
+                chars[index] = " "
+            index += 1
+        elif comment == "block":
+            if pair == "*/":
+                chars[index] = chars[index + 1] = " "
+                comment = None
+                index += 2
+                continue
+            if char != "\n":
+                chars[index] = " "
+            index += 1
+        elif quote:
+            in_string[index] = True
+            if char == "\\":
+                if index + 1 < len(text):
+                    in_string[index + 1] = True
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+        elif pair == "//":
+            comment = "line"
+        elif pair == "/*":
+            comment = "block"
+        elif char in "\"'`":
+            quote, in_string[index] = char, True
+            index += 1
+        else:
+            index += 1
+    code = "".join(chars)
+    hits, at = 0, code.find(needle)
+    while at >= 0:
+        if not in_string[at]:
+            hits += 1
+        at = code.find(needle, at + 1)
+    return hits
+
+
+def _node_json(script, payload):
+    """Run `script` under `node` with `payload` on stdin and parse its stdout as JSON, or raise.
+
+    #612 review round 4: the page's consumption of the probe marker was asserted LEXICALLY, so
+    flipping `if (!measured)` to `if (measured)` survived. `node` is present on every runner this
+    suite runs on (ubuntu-latest, and the worker image copies it in), so the two call sites are
+    EXECUTED instead — and a missing interpreter fails the suite loudly rather than skipping a
+    check, which would be the same false pass in a different costume."""
+    try:
+        completed = subprocess.run(["node", "-e", script], input=json.dumps(payload),
+                                   capture_output=True, text=True, timeout=120, check=False)
+    except OSError as exc:
+        raise DashboardError(
+            "`node` is required to EXECUTE the dashboard page's probe call sites — refusing to "
+            f"skip that assertion ({exc})") from exc
+    if completed.returncode != 0:
+        raise DashboardError(
+            f"the page-script harness exited {completed.returncode}: {completed.stderr.strip()}")
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise DashboardError(
+            f"the page-script harness printed no parseable result: {completed.stdout!r}") from exc
 
 
 def _probe_epoch(value):
@@ -640,8 +762,15 @@ def _probe_outcome(document, now):
         text = str(document.get("detail") or "").strip()
         detail = text if OBS_TOKEN_RE.fullmatch(text) else ""
         attempted = _probe_epoch(document.get("attempted_at"))
-    age = int(now - attempted) if attempted is not None else None
-    stale = age is None or age > PROBE_MAX_AGE_SECONDS or age < -PROBE_MAX_SKEW_SECONDS
+    # #612 review round 4 (MINOR): the freshness comparison runs on the EXACT age, not on a
+    # truncated one — `int()` rounds toward zero, so an attempt 3600.9s old (or 300.9s in the
+    # future) used to compare as 3600/-300 and stay `measured` at the nominal limit. Production
+    # writes integer epochs (`date -u +%s`) so nothing was mismeasured in practice, but the
+    # predicate now implements the boundary it documents. The PUBLISHED age stays an integer.
+    exact_age = (now - attempted) if attempted is not None else None
+    age = int(exact_age) if exact_age is not None else None
+    stale = (exact_age is None or exact_age > PROBE_MAX_AGE_SECONDS
+             or exact_age < -PROBE_MAX_SKEW_SECONDS)
     return {
         "outcome": outcome,
         "detail": detail,
@@ -1721,6 +1850,23 @@ def _self_test():
                            "attempted_at": now + skew}, now)["measured"]
            for skew in (PROBE_MAX_SKEW_SECONDS, PROBE_MAX_SKEW_SECONDS + 1)],
           [True, False])
+    # #612 review round 4 (MINOR): the comparison used to run on `int(now - attempted)`, which
+    # rounds toward zero — an age of 3600.9s (or a 300.9s future stamp) compared as 3600/-300 and
+    # stayed `measured` past the documented boundary. Production stamps are integers so nothing was
+    # mismeasured, but a caller with a float `now` was outside the predicate's own contract.
+    check("fractional ages obey the documented boundary (not a truncated one)",
+          [_probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                           "attempted_at": now - PROBE_MAX_AGE_SECONDS}, now + fraction)["measured"]
+           for fraction in (0.0, 0.9)]
+          + [_probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                             "attempted_at": now + PROBE_MAX_SKEW_SECONDS},
+                            now - fraction)["measured"]
+             for fraction in (0.0, 0.9)],
+          [True, False, True, False])
+    check("...while the PUBLISHED age stays an integer",
+          _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                          "attempted_at": now - 30}, now + 0.4)["age_seconds"],
+          30)
     # #612 review finding 2: this check used to assert "no degradation key" against `got` — a
     # DIFFERENT document built ~350 lines earlier — so that half would have stayed green even if the
     # sidecar-less build had started emitting a bogus marker; and its availability half deliberately
@@ -1795,10 +1941,26 @@ def _self_test():
                   "    sys.exit(int(os.environ['STUB_SELFTEST_EXIT']))\n"
                   "json.dump({'acct-fixture': {'status': 'allowed'}}, sys.stdout)\n"
                   "sys.exit(int(os.environ['STUB_PROBE_EXIT']))\n")
+    # Every document round 3's `grep -q '"ACCT'` accepted, next to the one it should. The last four
+    # are the round-4 measurement: they pass a substring search and still leave the probe with no
+    # usable token, so the exempt accounts were published as free capacity off an unusable subset.
+    SUBSET_FIXTURES = {
+        "tokens": '{"ACCT01_TOKEN": "redacted"}',
+        "empty-subset": "{}",
+        "empty-value": '{"ACCT01_TOKEN": ""}',
+        "blank-value": '{"ACCT01_TOKEN": "   "}',
+        "non-string-value": '{"ACCT01_TOKEN": 1234}',
+        "wrong-key": '{"NOT_AN_ACCT_TOKEN": "redacted", "ACCTLOOKALIKE": "redacted"}',
+        "truncated": '{"ACCT01_TOKEN":',
+        "not-an-object": '["ACCT01_TOKEN"]',
+    }
 
     def run_probe_step(secrets_outcome="success", secrets_file="tokens",
                        selftest_exit=0, probe_exit=0):
-        """Execute the REAL probe step body; return (exit code, sidecar dict|None, snapshot|None)."""
+        """Execute the REAL probe step body.
+
+        Returns (exit code, sidecar dict|"MALFORMED"|None, snapshot text|None, combined step log,
+        the names of the files the step left in RUNNER_TEMP)."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -1806,12 +1968,12 @@ def _self_test():
             temp = root / "runner-temp"
             temp.mkdir()
             secrets_path = root / "acct-secrets.json"
-            if secrets_file == "tokens":
-                secrets_path.write_text('{"ACCT01_TOKEN": "redacted"}', encoding="utf-8")
-            elif secrets_file == "empty-subset":
-                secrets_path.write_text("{}", encoding="utf-8")
-            # secrets_file == "missing": the materialization step's body was replaced by `true` —
-            # it reports `success` and leaves no file behind.
+            # "missing": the materialization step's body was replaced by `true` — it reports
+            # `success` and leaves no file behind. Every other shape below is a document that the
+            # round-3 `grep -q '"ACCT'` guard ACCEPTED while `_load_secrets` yielded no usable
+            # token (#612 review round 4, MAJOR).
+            if secrets_file != "missing":
+                secrets_path.write_text(SUBSET_FIXTURES[secrets_file], encoding="utf-8")
             environment = dict(os.environ,
                                RUNNER_TEMP=str(temp),
                                SECRETS_STEP_OUTCOME=secrets_outcome,
@@ -1831,10 +1993,12 @@ def _self_test():
                 except json.JSONDecodeError:
                     sidecar = "MALFORMED"
             return (completed.returncode, sidecar,
-                    snapshot_path.read_text(encoding="utf-8") if snapshot_path.is_file() else None)
+                    snapshot_path.read_text(encoding="utf-8") if snapshot_path.is_file() else None,
+                    completed.stdout + completed.stderr,
+                    sorted(item.name for item in temp.iterdir()))
 
     def probe_step_view(**kwargs):
-        code, sidecar, snapshot = run_probe_step(**kwargs)
+        code, sidecar, snapshot, _log, _produced = run_probe_step(**kwargs)
         marker = sidecar if isinstance(sidecar, dict) else {}
         return (code, marker.get("schema"), marker.get("outcome"), marker.get("detail"), snapshot)
 
@@ -1861,19 +2025,129 @@ def _self_test():
     check("[#612] probe step: an EMPTY token subset is recorded failed, not measured",
           probe_step_view(secrets_file="empty-subset"),
           (0, PROBE_SCHEMA, "failed", "secret-subset-empty", "{}"))
+    # --- #612 review round 4 (MAJOR): `grep -q '"ACCT'` proves NEITHER valid JSON NOR a non-empty
+    # token. Measured: `{"ACCT01_TOKEN":""}` and the truncated `{"ACCT01_TOKEN":` both passed it, so
+    # `outcome` stayed `ok`, the sidecar published `measured=True`, and the probe-EXEMPT accounts
+    # were published as fresh free capacity off a subset carrying no usable token — the SAME
+    # overgrant this PR exists to close, surviving the fix. Each row below reads
+    # ("ok", "probe-succeeded", <stub json>) under the grep guard and dies under the parsing one.
+    # ------------------------------------------------------------------------------------------
+    for subset_name, subset_detail in (("empty-value", "secret-subset-empty"),
+                                       ("blank-value", "secret-subset-empty"),
+                                       ("non-string-value", "secret-subset-empty"),
+                                       ("wrong-key", "secret-subset-empty"),
+                                       ("truncated", "secret-subset-malformed"),
+                                       ("not-an-object", "secret-subset-malformed")):
+        check(f"[#612] probe step: a `{subset_name}` subset is refused, not measured",
+              probe_step_view(secrets_file=subset_name),
+              (0, PROBE_SCHEMA, "failed", subset_detail, "{}"))
+    # ...and the refusal must stay SILENT about the document: the validator's only stdout is one of
+    # three fixed words (captured, never echoed) and it has no traceback path, so no fragment of a
+    # token can reach the step log. Asserted over the union of every stream, for every shape.
+    for subset_name in SUBSET_FIXTURES:
+        code, _sidecar, _snapshot, logged, _produced = run_probe_step(secrets_file=subset_name)
+        check(f"[#612] probe step: the `{subset_name}` refusal leaks no subset bytes to the log",
+              (code, "ACCT01_TOKEN" in logged, "redacted" in logged, "Traceback" in logged),
+              (0, False, False, False))
     # The shell -> python contract itself: whatever the step actually wrote must parse HERE. This is
     # what a scoped substring assertion could never do — it ties the printf's schema string, outcome
     # vocabulary and stamp format to _probe_outcome's fail-closed parser.
     step_now = int(time.time())
     check("[#612] the sidecar the step really wrote is what _probe_outcome accepts/refuses",
           [_probe_outcome(run_probe_step(**kwargs)[1], step_now)["measured"]
-           for kwargs in ({}, {"probe_exit": 1}, {"secrets_file": "missing"})],
-          [True, False, False])
+           for kwargs in ({}, {"probe_exit": 1}, {"secrets_file": "missing"},
+                          {"secrets_file": "empty-value"}, {"secrets_file": "truncated"})],
+          [True, False, False, False, False])
     build_step = _workflow_step(dashboard_workflow, "dashboard-build")
     check("[#612] the build step passes the sidecar WITH the snapshot (scoped to that one step)",
           ('--usage "$RUNNER_TEMP/usage.json"' in build_step,
            '--usage-status "$RUNNER_TEMP/usage-probe.json"' in build_step),
           (True, True))
+
+    # --- #612 review round 4: the four survivors in the WIRING seam around the probe step. Round 3
+    # executed the probe body; the PRODUCER of the file that body checks, the env wiring that hands
+    # it the producer's outcome, and the transport that carries the sidecar to the build job were all
+    # still assertion-free, so `run: true` on the materialization step, deleting `id: acct-secrets`,
+    # deleting the `SECRETS_STEP_OUTCOME` env line and dropping `usage-probe.json` from the upload
+    # each left the whole suite green.
+    #
+    # (i) The materialization step body is EXECUTED, against a fake complete secret map. This is the
+    # producer, and it is also the filter that keeps every NON-worker secret away from the probe — so
+    # the row asserts the exact subset, not merely that a file appeared. `run: true` writes no file.
+    # ------------------------------------------------------------------------------------------
+    materialize_script = _workflow_step_script(dashboard_workflow, "acct-secrets")
+
+    def run_materialize_step(all_secrets):
+        """Execute the REAL materialization step body; return (exit code, subset|None, mode|None)."""
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory, "runner-temp")
+            temp.mkdir()
+            completed = subprocess.run(
+                ["bash", "-c", materialize_script], cwd=directory, capture_output=True, text=True,
+                timeout=120, check=False,
+                env=dict(os.environ, RUNNER_TEMP=str(temp), ALL_SECRETS=json.dumps(all_secrets)))
+            written = temp / "acct-secrets.json"
+            if not written.is_file():
+                return completed.returncode, None, None, completed.stdout + completed.stderr
+            return (completed.returncode,
+                    json.loads(written.read_text(encoding="utf-8")),
+                    oct(written.stat().st_mode & 0o777),
+                    completed.stdout + completed.stderr)
+    all_secrets = {"ACCT01_TOKEN": "worker-one", "ACCT7X_TOKEN": "worker-two",
+                   "PROVENANCE_SALT": "not-a-worker-token", "GITHUB_TOKEN": "not-a-worker-token",
+                   "ACCT01_TOKEN_BACKUP": "not-exactly-the-shape", "ACCTLOOKALIKE": "no-suffix",
+                   "ACCT02_TOKEN": ["not", "a", "string"]}
+    code, subset, mode, materialize_log = run_materialize_step(all_secrets)
+    check("[#612] materialization step: EXECUTED, it writes exactly the ACCT*_TOKEN string subset",
+          (code, subset, mode),
+          (0, {"ACCT01_TOKEN": "worker-one", "ACCT7X_TOKEN": "worker-two"}, "0o600"))
+    check("[#612] materialization step: no secret VALUE of any kind reaches its own step log",
+          [value for value in ("worker-one", "worker-two", "not-a-worker-token")
+           if value in materialize_log],
+          [])
+    # A `{}` secret map is a real production shape (a repo with no worker tokens yet): the filter
+    # must still succeed, and the PROBE step must then refuse — the two halves of the seam meeting.
+    empty_code, empty_subset, _mode, _log = run_materialize_step({"PROVENANCE_SALT": "salt"})
+    with tempfile.TemporaryDirectory() as directory:
+        handoff = Path(directory, "acct-secrets.json")
+        handoff.write_text(json.dumps(empty_subset), encoding="utf-8")
+        handoff_state = subprocess.run(
+            ["bash", "-c", probe_script], cwd=str(directory), capture_output=True, text=True,
+            timeout=120, check=False,
+            env=dict(os.environ, RUNNER_TEMP=directory, SECRETS_STEP_OUTCOME="success",
+                     SECRETS_FILE=str(handoff), GH_TOKEN="", PROVENANCE_SALT="",
+                     REGISTRY_REPO="owner/repo",
+                     MODEL_HEALTH_FILE=str(Path(directory, "absent.json"))))
+        handoff_sidecar = json.loads(Path(directory, "usage-probe.json").read_text(encoding="utf-8"))
+    check("[#612] the two step bodies MEET: a token-less filter output is refused by the probe",
+          (empty_code, empty_subset, handoff_state.returncode,
+           handoff_sidecar["outcome"], handoff_sidecar["detail"]),
+          (0, {}, 0, "failed", "secret-subset-empty"))
+    # (ii) The env wiring. Execution can never catch its deletion — the harness supplies
+    # SECRETS_STEP_OUTCOME from the process environment — so the wiring is read as a MAPPING, and
+    # the step id it names must resolve in the same workflow. Deleting the env line makes the first
+    # element None; deleting `id: acct-secrets` makes _workflow_step raise its "found 0" refusal.
+    probe_env = _workflow_step_env(dashboard_workflow, "usage-probe")
+    wired = re.fullmatch(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outcome\s*\}\}",
+                         probe_env.get("SECRETS_STEP_OUTCOME") or "")
+    check("[#612] the probe step's gate is WIRED to the materialization step's outcome, by id",
+          (probe_env.get("SECRETS_STEP_OUTCOME"),
+           wired.group(1) if wired else None,
+           '"${SECRETS_STEP_OUTCOME}" != "success"' in probe_script,
+           bool(wired) and _workflow_step_script(dashboard_workflow, wired.group(1)) != ""),
+          ("${{ steps.acct-secrets.outcome }}", "acct-secrets", True, True))
+    # (iii) The transport. Deleting `usage-probe.json` from the upload path is invisible to every
+    # generator test — an absent sidecar fails CLOSED, so the loss looks like a healthy refusal
+    # instead of a broken pipeline. Asserted as a PROPERTY rather than a substring: every file the
+    # probe step actually produced (measured by running it) must be listed by the upload step, whose
+    # artifact is what the build step above was just shown to read both flags from.
+    produced = run_probe_step()[4]
+    uploaded = [line.strip().replace("${{ runner.temp }}/", "")
+                for line in _workflow_step_block(
+                    dashboard_workflow, "upload-usage", "path").split("\n") if line.strip()]
+    check("[#612] every file the probe step PRODUCES is carried by the artifact upload",
+          (produced, sorted(uploaded), sorted(set(produced) - set(uploaded))),
+          (["usage-probe.json", "usage.json"], ["usage-probe.json", "usage.json"], []))
 
     # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
     # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
@@ -1935,24 +2209,139 @@ def _self_test():
     # function that must make the call — a whole-file search for `usage_probe` in app.js is
     # satisfied by any of its several other occurrences, which is precisely the vacuity class here.
     # ------------------------------------------------------------------------------------------
+    # #612 review round 4 (MINOR, class E): the round-3 form of this block was COMMENT-satisfiable
+    # (`_js_function_body` strips nothing, so commenting the call out kept it green) and could not
+    # see polarity (flipping `if (!measured)` to `if (measured)` survived). Two changes: every
+    # lexical row now counts CODE positions only, with an exact count so a neighbouring branch's
+    # occurrence cannot stand in; and the page script is EXECUTED under node against the document
+    # this generator really builds, which is what actually pins polarity.
+    # ------------------------------------------------------------------------------------------
     app_js = _repo_file("dashboard", "app.js")
+    summary_body = _js_function_body(app_js, "renderSummary")
     check("[#612] renderSummary() builds the probe card from data.usage_probe AND appends it",
-          ("usageProbeCard(data.usage_probe)" in _js_function_body(app_js, "renderSummary"),
-           "summary.append(probe)" in _js_function_body(app_js, "renderSummary")),
-          (True, True))
+          (_js_code_count(summary_body, "usageProbeCard(data.usage_probe)"),
+           _js_code_count(summary_body, "if (probe) summary.append(probe);")),
+          (1, 1))
     check("[#612] render() hands the probe marker to updateFreshness (both arguments)",
-          "updateFreshness(data.generated_at, data.usage_probe)"
-          in _js_function_body(app_js, "render"),
-          True)
+          _js_code_count(_js_function_body(app_js, "render"),
+                         "updateFreshness(data.generated_at, data.usage_probe)"),
+          1)
     freshness = _js_function_body(app_js, "updateFreshness")
-    check("[#612] updateFreshness() actually consumes the marker it is handed",
-          ("probe.measured !== true" in freshness, "notices.push" in freshness),
-          (True, True))
+    check("[#612] updateFreshness() consumes the marker, on the unmeasured polarity",
+          (_js_code_count(freshness, 'probe.measured !== true'),
+           # NOT a bare `notices.push` count: the stale-generation branch supplies another
+           # occurrence, so deleting the probe branch's push used to pass (round-4 MINOR).
+           _js_code_count(freshness, "notices.push(`Usage probe did not measure the fleet"),
+           _js_code_count(freshness, "warning.hidden = notices.length === 0;")),
+          (1, 1, 1))
     probe_card = _js_function_body(app_js, "usageProbeCard")
     check("[#612] the probe card degrades on anything but an explicit measured:true",
-          ('probe.measured === true' in probe_card,
-           'card.classList.add("degraded")' in probe_card),
-          (True, True))
+          (_js_code_count(probe_card, "const measured = probe.measured === true;"),
+           _js_code_count(probe_card, 'if (!measured) card.classList.add("degraded");')),
+          (1, 1))
+    # A control on the matcher itself: a commented-out call and a call inside a string literal must
+    # BOTH read as zero, or the rows above are back to being satisfiable by prose.
+    check("[#612] the code-position matcher ignores comments and string literals",
+          (_js_code_count("// if (probe) summary.append(probe);\n", "summary.append(probe)"),
+           _js_code_count('const help = "summary.append(probe)";\n', "summary.append(probe)"),
+           _js_code_count("/* summary.append(probe) */\nsummary.append(probe);\n",
+                          "summary.append(probe)")),
+          (0, 0, 1))
+    # --- ...and the two call sites EXECUTED. The page is loaded into a minimal DOM shim under node
+    # and handed the real generated document, so `if (!measured)` -> `if (measured)`, dropping
+    # `summary.append(probe)`, or dropping updateFreshness's second argument each change an OUTCOME
+    # rather than a substring. `fetch` is stubbed to reject (the page's own load path is not under
+    # test) and `setInterval` to a no-op so node exits.
+    # ------------------------------------------------------------------------------------------
+    page_harness = r"""
+const fs = require("fs");
+const source = fs.readFileSync(__APP_JS__, "utf8");
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+function element(tag) {
+  const self = {
+    tagName: tag, children: [], attributes: {}, style: {}, hidden: false, textContent: "",
+    className: "", classes: new Set(),
+    append: (...kids) => { for (const kid of kids) self.children.push(kid); },
+    replaceChildren: (...kids) => { self.children = [...kids]; },
+    setAttribute: (name, value) => { self.attributes[name] = value; },
+    classList: { add: (name) => self.classes.add(name), remove: (name) => self.classes.delete(name),
+                 contains: (name) => self.classes.has(name) },
+  };
+  return self;
+}
+const ids = {};
+globalThis.document = {
+  getElementById: (id) => (ids[id] = ids[id] || element("div#" + id)),
+  createElement: element,
+  createElementNS: (_ns, tag) => element(tag),
+  createTextNode: (text) => ({ textContent: text, children: [] }),
+};
+globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
+globalThis.setInterval = () => 0;
+const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
+const text = (node) => flat(node).join(" ");
+const degraded = (node) =>
+  (node.classes && node.classes.has("degraded")) ||
+  (node.children || []).some(degraded);
+(async () => {
+  // Loading the page runs its own `refresh()`, whose stubbed fetch rejects into the page's catch
+  // and writes to #warning; the tick below lets that settle so it cannot be mistaken for the
+  // probe notice under test, and every render below starts from a fresh #warning element.
+  const scope = new Function(source + "; return { usageProbeCard, updateFreshness, render };")();
+  await new Promise((resolve) => setImmediate(resolve));
+  const cards = {};
+  for (const [name, probe] of Object.entries(input.probes)) {
+    const card = scope.usageProbeCard(probe);
+    cards[name] = card === null ? null : { text: text(card), degraded: degraded(card) };
+  }
+  const warnings = {};
+  for (const [name, document_] of Object.entries(input.documents)) {
+    ids.warning = element("div#warning");
+    ids.summary = element("div#summary");
+    scope.render(document_);
+    warnings[name] = {
+      hidden: ids.warning.hidden,
+      probeNotice: /Usage probe did not measure the fleet/.test(ids.warning.textContent),
+      summaryDegraded: ids.summary.children.some(degraded),
+    };
+  }
+  process.stdout.write(JSON.stringify({ cards, warnings }));
+})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
+"""
+    # A LIVE `now`: the page's own staleness notice fires on a year-old fixture stamp, and that
+    # notice would then mask the probe notice this block is about.
+    measured_document = build_dashboard(
+        issues, leases, live_usage, history, None, live_now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                      "attempted_at": live_now})
+    failed_document = build_dashboard(
+        issues, leases, live_usage, history, None, live_now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "failed",
+                      "detail": "secret-materialization-failed", "attempted_at": live_now})
+    page = _node_json(
+        page_harness.replace("__APP_JS__",
+                             json.dumps(str(Path(__file__).resolve().parent.parent
+                                            / "dashboard" / "app.js"))),
+        {"probes": {"measured": measured_document["usage_probe"],
+                    "failed": failed_document["usage_probe"],
+                    "absent": None},
+         "documents": {"measured": measured_document, "failed": failed_document}})
+    check("[#612] EXECUTED page script: the probe card degrades exactly when nothing was measured",
+          (page["cards"]["measured"]["degraded"],
+           "NOT MEASURED" in page["cards"]["measured"]["text"],
+           page["cards"]["failed"]["degraded"],
+           "NOT MEASURED" in page["cards"]["failed"]["text"],
+           "secret-materialization-failed" in page["cards"]["failed"]["text"],
+           page["cards"]["absent"]),
+          (False, False, True, True, True, None))
+    check("[#612] EXECUTED page script: render() raises the operator warning on a failed probe",
+          (page["warnings"]["measured"]["hidden"],
+           page["warnings"]["measured"]["probeNotice"],
+           page["warnings"]["measured"]["summaryDegraded"],
+           page["warnings"]["failed"]["hidden"],
+           page["warnings"]["failed"]["probeNotice"],
+           page["warnings"]["failed"]["summaryDegraded"]),
+          (True, False, False, False, True, True))
 
     health = _normalize_model_health({
         "generated_at": now,

@@ -126,13 +126,57 @@ jobs:
             outcome=failed
             detail=secret-file-missing
           fi
-          # ...and an EMPTY subset is measurement-equivalent to no file: every non-exempt account is
-          # fail-closed omitted for want of a token. `grep -q` prints nothing, so no token byte can
-          # reach the log (the reason this is not a python shape check whose traceback could echo
-          # part of the document).
-          if [ "$outcome" = ok ] && ! grep -q '"ACCT' "${SECRETS_FILE}"; then
+          # ...and a subset with no USABLE token is measurement-equivalent to no file: every
+          # non-exempt account is fail-closed omitted for want of a token.
+          #
+          # #612 review round 4 (MAJOR) measured that the previous `grep -q '"ACCT'` proved neither
+          # valid JSON nor a non-empty token: `{"ACCT01_TOKEN":""}` and the truncated
+          # `{"ACCT01_TOKEN":` both passed it, and _load_secrets then yields an empty token or (on
+          # JSONDecodeError) `{}` — so the probe measured nothing, kept `outcome=ok`, and published
+          # the probe-EXEMPT accounts as fresh free capacity. That is the very overgrant this step
+          # exists to close. A substring cannot express "at least one ACCT*_TOKEN key whose value is
+          # a non-empty string", so the subset is PARSED instead.
+          #
+          # The no-token-bytes-in-the-log constraint that motivated `grep -q` is kept BY
+          # CONSTRUCTION, not by luck: the validator's only stdout is one of the three fixed words
+          # ok/empty/malformed, that stdout is captured into a variable and never echoed, every
+          # failure is caught so there is no traceback to echo a fragment of the document, and its
+          # stderr is discarded anyway.
+          #
+          # SCOPING (round 4): an all-exempt fleet (openai/codex only — issue #29) needs no token at
+          # all, so a zero-usable-token subset would be a legitimate steady state and this guard
+          # would degrade the page unnecessarily. The catalog is anthropic-majority by construction
+          # (every non-exempt account needs a token), so today that configuration does not exist; if
+          # it ever becomes real, condition this guard on the catalog containing >=1 non-exempt
+          # account rather than weakening it.
+          subset_state=$(python3 -c '
+          import json
+          import re
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as handle:
+                  document = json.load(handle)
+          except Exception:
+              print("malformed")
+              sys.exit(0)
+          if not isinstance(document, dict):
+              print("malformed")
+              sys.exit(0)
+          usable = [key for key, value in document.items()
+                    if re.fullmatch(r"ACCT[A-Z0-9]+_TOKEN", str(key))
+                    and isinstance(value, str) and value.strip()]
+          print("ok" if usable else "empty")
+          ' "${SECRETS_FILE}" 2>/dev/null) || subset_state=malformed
+          if [ "$outcome" = ok ] && [ "$subset_state" != ok ]; then
             outcome=failed
             detail=secret-subset-empty
+            if [ "$subset_state" != empty ]; then
+              # Unparseable, truncated, or not a JSON object at all. Distinguished from `empty`
+              # because it is a different production defect (a broken filter, a truncated write)
+              # and both tokens are fixed literals — neither can carry document bytes.
+              detail=secret-subset-malformed
+            fi
           fi
           if [ "$outcome" = ok ] && ! python3 scripts/account-usage.py --self-test; then
             outcome=failed
@@ -157,6 +201,11 @@ jobs:
           echo "usage-probe: snapshot written (outcome=${outcome} detail=${detail})"
 
       - name: Upload privacy-safe usage snapshot + probe outcome (pinned)
+        # `id:` so the self-test can assert this step's `path:` against the files the probe step
+        # ACTUALLY produced when executed (#612 review round 4): dropping `usage-probe.json` from
+        # the transport left the whole suite green, because the generator's fail-closed handling of
+        # an absent sidecar makes the loss look like a healthy refusal instead of a broken pipeline.
+        id: upload-usage
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dashboard-usage-${{ github.run_id }}
