@@ -1,14 +1,14 @@
 {
  "leases": [
   {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "48934b89330b487fb2be5f931c3e0bfb",
-   "holder": "fix:sparq-org/sparq#3542@dispatch-30143280882.1",
-   "package": "sparq-zk-compose",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1784952811,
-   "expires_at": 1784959111
+   "account": "dc2d751954080e13",
+   "claim_id": "5260c19a511e4727ad4b1c1e306f9a06",
+   "holder": "review:sparq-org/sparq#3434@dispatch-30146870048.1",
+   "package": "sparq-zk",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1784959909,
+   "expires_at": 1784964109
   }
  ]
 }
