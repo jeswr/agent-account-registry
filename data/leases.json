@@ -32,16 +32,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "76b513a9927749da866da6a34879a7f0",
-   "holder": "sparq-org/sparq#3757@30180338232.1",
-   "package": "gui",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785023914,
-   "expires_at": 1785030214
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "5f366f2811474637821001ece9af247b",
    "holder": "sparq-org/sparq#3808@30180341280.1",
    "package": "sparq-conformance",
