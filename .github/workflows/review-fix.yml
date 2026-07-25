@@ -1571,10 +1571,19 @@ jobs:
       # (BOTH machine park labels — review:parked on the PR and status:parked on the source issue —
       # plus the human holds), RE-READS it immediately before writing, and ABORTS the whole hand-over
       # if any of them landed in between: the park WINS (issue #555) and is never converted into a
-      # human-owned review:needs-user. It is idempotent, so a re-run or a concurrent claim that
-      # already handed over writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>` lease
+      # human-owned review:needs-user. Every abort is decided BEFORE the first write, so it leaves no
+      # trace at all (#584 follow-up finding 2). It is idempotent, so a re-run or a concurrent claim
+      # that already handed over writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>` lease
       # enumerate_review_items single-flights on) is released unconditionally by the `release` job
       # below, which does not depend on this job — the slot is free before the next tick.
+      #
+      # A live `review:pass` STANDS THE HAND-OVER DOWN entirely (#584 follow-up finding 1) — no lane
+      # write, no marker write, no comment. The fix lane admits on a concluded-RED gate ALONE too
+      # (GAP-A `needs-ci-fix`, review-state-agnostic), so a NON-DRAFT, ARMED, passed PR reaches this
+      # step; retracting its reviewed-sha marker is precisely what makes dispatch-claim's disarm net
+      # read `marker != head` on an armed PR as a safety violation and disable-auto + dequeue +
+      # REDRAFT it. A passed PR has nothing to hand to the review lane either — the pass IS the
+      # verdict.
       #
       # `--head-sha` is REQUIRED and load-bearing (round-2 finding 1): the label flip ALONE only
       # relocates the spin, because a completed request-changes review left `sparq-reviewed-sha ==
