@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 593,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d51de793e95ffc06771a5e17a7f8101027af8ebb",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "After the flag and gate were dropped, ROLE_LABELS has no production consumer \u2014 both readers are inside `_self_test` (664, 839). Its content is, by the new `catalog == the pinned live role labels` assertion, definitionally identical to `{lb for lb in REAL if lb.startswith('role:')}`, which is already declared 790 lines lower.\n\nThis is fine as-is: the assertion makes the duplication safe (drift goes red), and having a short prefix-free name at the top of the file makes the `derived_roles` check readable. Recording it only so a future reader does not mistake ROLE_LABELS for a live catalog that something writes labels from \u2014 nothing does.",
+    "file": "scripts/triage.py",
+    "fix_hint": "No change required. If you want to shed the duplicate literal entirely, `derived_roles <= {lb[5:] for lb in REAL if lb.startswith('role:')}` expresses the same invariant against the already-pinned set and lets both ROLE_LABELS and the catalog-equality check go away. Either shape is defensible; keeping the named catalog plus the equality assertion is the more legible of the two.",
+    "severity": "nit",
+    "title": "ROLE_LABELS is now a test-only constant that duplicates REAL's role subset"
+   },
+   {
+    "body": "The diff removes `[OPUS-4.8]` from the scripts/triage.py and .github/workflows/triage-issue.yml headers, which is correct under the model-agnostic provenance rule. But `grep -c 'OPUS-5|FABLE-5|OPUS-4|SONNET'` still returns 9 in scripts/triage.py \u2014 e.g. the `[FABLE-5]` markers at 118/123 and the `[OPUS-5]` markers at 133/244. So the file is left half-swept.\n\nEntirely cosmetic and explicitly out of this PR's scope if the sweep is staged; not a reason to withhold approval.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Either finish the sweep in a follow-up (strip the remaining inline `[MODEL-X]` markers; the maintainer-decision dates and PR/issue numbers in those comments carry the provenance that actually matters), or add one line to the PR description saying the header removal is the first slice of a staged sweep so the inconsistency is not read as an oversight.",
+    "severity": "nit",
+    "title": "Model-marker sweep is partial \u2014 9 inline markers remain after the two header removals"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 resolves both round-2 majors and both minors. Verified against the checkout, not just the diff.\n\nMAJOR #1 (dead `--role-labels` flag + orphaned color/description payload) is GONE. `grep -rn 'role-labels|ROLE_LABELS' . --exclude-dir=.git` now returns exactly three hits, all in scripts/triage.py: the definition (49) and two self-test consumers (664, 839). No argparse flag, no printer, no tuple payload. ROLE_LABELS is a plain `frozenset({docs,impl,ci,research,site})` \u2014 the membership set it was always used as. Nothing claims label reconciliation any more, so the false promise is gone too.\n\nMAJOR #2 (silent explicit-role demotion) is GONE. scripts/triage.py:230-232 is back to `explicit = ...; if len(explicit) == 1: return explicit[0]` with no static catalog gate. The #582 warn-and-preserve contract at 285-295 is once again the sole authority, driven by the LIVE label set (`known = repo_label_set(repo)`), and it keeps the incumbent role plus a loud warning rather than returning None.\n\nMINOR #3 fixed: the check is renamed to `trust role replacement plans no churn when the target is already present`, which is exactly what `(False, False)` asserts. Traced by hand: `area:worker` hits SEC_KEYWORDS -> role impl, target already present, so add/remove are both empty after the `add - labels` / `remove & labels` narrowing. Name and body now agree.\n\nMINOR #4 fixed twice over. `derived_roles` now folds in `set(AREA_ROLE_DEFAULT.values())`, matching the producer set the neighbouring REAL check at 858 already used, and it derives the UI/INFRA roles by calling `_role()` rather than hard-coding {site, ci} \u2014 slightly stronger than its neighbour. More importantly the drift check now exists: `catalog == the pinned live role labels` binds `{role:<k> for k in ROLE_LABELS}` to `{lb for lb in REAL if lb.startswith('role:')}`, so the two hand-maintained literals can no longer disagree silently. Both sides are the same 5 labels today; the check is non-vacuous (one \u2026 [truncated 958 chars]",
+  "verdict": "approve"
+ }
+}
