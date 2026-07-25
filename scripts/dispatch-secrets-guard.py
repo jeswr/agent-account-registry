@@ -250,12 +250,14 @@ GATE_GUARD_JOB = "secrets-guard"
 # the FALSE atom of the polarity evaluation below, never as a bare substring test.
 GATE_SUCCESS_RE = re.compile(
     r"needs\s*\.\s*" + GATE_GUARD_JOB + r"\s*\.\s*result\s*==\s*['\"]success['\"]")
-# The guard job must EXECUTE the verifier. Matches `python3 [<prefix>/]scripts/dispatch-secrets-guard.py`
-# in a step's `run:` body — the live job uses the `registry/` sparse-checkout prefix, the synthetic
-# fixtures none. Group 1 is the argument tail, which separates the `--self-test` (static assertions)
-# invocation from the bare (live settings verification) one; BOTH are required.
-GATE_VERIFIER_RE = re.compile(
-    r"(?:^|[;&|]\s*|\s)python3\s+(?:[\w./$~{}-]*/)?scripts/dispatch-secrets-guard\.py([^\n]*)")
+# The guard job must EXECUTE the verifier. This FULLMATCHES the script word of a parsed simple
+# command (see shell_script_invocations) — the live job uses the `registry/` sparse-checkout prefix,
+# the synthetic fixtures none. The argument tail separates the `--self-test` (static assertions)
+# invocation from the bare (live settings verification) one; BOTH are required, and both must be
+# UNCONDITIONALLY REACHED. RETRO-REVIEW OF #629 (F2): the previous form was a text search whose left
+# context `(?:^|[;&|]\s*|\s)` a `#` comment and a `true || …` short-circuit both satisfied, so a guard
+# job whose only invocations were commented out PASSED — measured.
+GATE_VERIFIER_SCRIPT_RE = re.compile(r"(?:[\w./$~{}-]*/)?scripts/dispatch-secrets-guard\.py")
 
 
 def _yaml_module():
@@ -493,8 +495,137 @@ def _evaluate_if(tokens, value_of):
     return result
 
 
-# Atoms with a KNOWN constant truth value. Everything else is a FREE variable (see
-# if_condition_admits): `always()` genuinely is always true, and a bare `true`/`false` literal is
+# ---- ATOM STRUCTURE (POST-MERGE retro-review of #629, finding F1) --------------------------------
+# `if_condition_admits` used to answer "is this atom the obligation?" with
+# `false_atom_re.search(<the atom's RAW TEXT>)`, and `_tokenize_if` absorbs a whole function call —
+# INCLUDING its quoted string arguments — into a single opaque atom. So
+#
+#     if: ${{ always() && contains('needs.secrets-guard.result == "success"', 'success') }}
+#
+# pinned an ALWAYS-TRUE call to FALSE, the conjunction became unsatisfiable, and the checker reported
+# `admits=False` — a proof about a formula the workflow does not have. GitHub evaluates both operands
+# TRUE and runs the privileged job on a FAILED guard. MEASURED end to end through `guard_gate_verdict`
+# on the merged tree: `-> True`, i.e. #621's mutation (b) re-expressed in one line, and the gate
+# contract still defeatable.
+#
+# Pinning an atom FALSE is the ONLY unsound direction (an atom pinned FALSE that is really TRUE
+# shrinks the satisfying set and can turn a reachable world into a "proof" of unreachability; leaving
+# an atom FREE only ever adds worlds, which is the conservative direction for the gate). So an atom
+# may be pinned only when its STRUCTURE has been parsed and is a COMPARISON — string literals then
+# live inside the operand they belong to and are never re-scanned as condition text. Everything else
+# is a known constant, a free boolean, or — when the atom cannot be FULLY parsed — an UNDECIDED
+# verdict each caller fails closed on. There is no "search the raw atom text" path left anywhere.
+_IF_STRING_TERM_RE = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+_IF_NUMBER_TERM_RE = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+_IF_PATH_TERM_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_-]*(?:\s*\.\s*(?:[A-Za-z_][A-Za-z0-9_-]*|\*))*")
+_IF_CALL_TERM_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_IF_COMPARISON_OP_RE = re.compile(r"==|!=|<=|>=|<|>")
+
+
+def _skip_if_space(text, position):
+    while position < len(text) and text[position].isspace():
+        position += 1
+    return position
+
+
+def _parse_if_term(text, position):
+    """Pure: (kind, canonical, next_position) for ONE operand term of a GitHub expression.
+
+    kinds: "string" / "number" / "bool" / "null" / "path" / "call". `canonical` is the term with all
+    whitespace OUTSIDE string literals removed, so `needs . secrets-guard . result` and
+    `needs.secrets-guard.result` canonicalise identically while a string argument keeps its content
+    sealed inside its own quotes. Raises ValueError on anything this grammar does not cover — the
+    caller turns that into an UNDECIDED verdict rather than a guess."""
+    position = _skip_if_space(text, position)
+    if position >= len(text):
+        raise ValueError("an operand was expected")
+    match = _IF_STRING_TERM_RE.match(text, position)
+    if match:
+        return "string", match.group(0), match.end()
+    if not (text[position].isalpha() or text[position] == "_"):
+        match = _IF_NUMBER_TERM_RE.match(text, position)
+        if match:
+            return "number", match.group(0), match.end()
+        raise ValueError(f"unrecognised operand at offset {position}")
+    match = _IF_CALL_TERM_RE.match(text, position)
+    if match:
+        name, arguments, cursor = match.group(1), [], match.end()
+        cursor = _skip_if_space(text, cursor)
+        if cursor < len(text) and text[cursor] == ")":
+            cursor += 1
+        else:
+            while True:
+                _, argument, cursor = _parse_if_term(text, cursor)
+                arguments.append(argument)
+                cursor = _skip_if_space(text, cursor)
+                if cursor < len(text) and text[cursor] == ",":
+                    cursor += 1
+                    continue
+                if cursor < len(text) and text[cursor] == ")":
+                    cursor += 1
+                    break
+                raise ValueError(f"unterminated argument list of {name}(")
+        return "call", f"{name}({','.join(arguments)})", cursor
+    match = _IF_PATH_TERM_RE.match(text, position)
+    if match:
+        canonical = re.sub(r"\s+", "", match.group(0))
+        lowered = canonical.lower()
+        if lowered in ("true", "false"):
+            return "bool", lowered, match.end()
+        if lowered == "null":
+            return "null", lowered, match.end()
+        return "path", canonical, match.end()
+    raise ValueError(f"unrecognised operand at offset {position}")
+
+
+def _parse_if_atom(atom):
+    """Pure: ("cmp"|"opaque", canonical) for one absorbed operand of an `if:` expression.
+
+    "cmp" is a comparison of two parsed terms — the ONLY shape a caller's false-atom / world pattern
+    is ever matched against, and the fix for F1. "opaque" is a call or a context path whose truth
+    value is not derivable here. Raises ValueError when the atom is not fully covered by this grammar
+    (indexing, arithmetic, a comparison chain, a bare string/number used as a condition): the caller
+    reports the whole expression UNDECIDED and applies its own fail direction."""
+    kind, left, position = _parse_if_term(atom, 0)
+    position = _skip_if_space(atom, position)
+    if position == len(atom):
+        if kind in ("bool", "call", "path"):
+            return "opaque", left
+        raise ValueError(f"a bare {kind} literal is not a condition")
+    operator = _IF_COMPARISON_OP_RE.match(atom, position)
+    if not operator:
+        raise ValueError(f"unrecognised operator at offset {position} of {atom!r}")
+    _, right, position = _parse_if_term(atom, operator.end())
+    position = _skip_if_space(atom, position)
+    if position != len(atom):
+        raise ValueError(f"trailing text after the comparison in {atom!r}")
+    return "cmp", f"{left}{operator.group(0)}{right}"
+
+
+def _if_atom_map(tokens):
+    """Pure: {raw atom text: ("cmp"|"opaque", canonical)} for a tokenized `if:` expression.
+
+    Also rejects `!` applied DIRECTLY to a comparison: GitHub binds `!` tighter than `==`, so
+    `!needs.x.result == 'success'` is `(!needs.x.result) == 'success'` there and `!(needs.x.result ==
+    'success')` here. Rather than guess which reading the runtime takes, refuse the expression (the
+    parenthesised spelling is decided normally). Raises ValueError, which every caller surfaces as
+    UNDECIDED."""
+    atoms = {}
+    for index, token in enumerate(tokens):
+        if not isinstance(token, tuple):
+            continue
+        kind, canonical = _parse_if_atom(token[1])
+        atoms[token[1]] = (kind, canonical)
+        if index and tokens[index - 1] == "!" and kind == "cmp":
+            raise ValueError(
+                f"`!` is applied directly to the comparison {canonical} — GitHub binds `!` TIGHTER "
+                "than `==`, so this reading and the runtime's disagree; parenthesise it")
+    return atoms
+
+
+# Atoms with a KNOWN constant truth value, keyed by CANONICAL form. Everything else is a FREE variable
+# (see if_condition_admits): `always()` genuinely is always true, and a bare `true`/`false` literal is
 # what it says. Deliberately short — assuming a value for anything else is how a substring test gets
 # the answer wrong (`!cancelled()` runs on a FAILED dependency, so pinning `cancelled()` to either
 # constant would mis-decide it).
@@ -522,6 +653,10 @@ def if_condition_admits(condition, false_atom_re):
     though it gated. `admits=False` is therefore a proof of unreachability over all worlds, and
     `admits=True` exhibits at least one reaching world.
 
+    `false_atom_re` is matched against a PARSED COMPARISON's canonical text and nothing else (F1): an
+    opaque function call's string ARGUMENTS are not conditions, and an atom whose structure this
+    grammar does not cover is not silently abstracted — the whole expression comes back UNDECIDED.
+
     Callers pick their fail direction from `decided`: a gate that must NOT admit treats undecided as
     admitting (an unreadable gate is not a proven gate); a compensating action that MUST admit treats
     undecided as a refusal (an unprovable reachability is not reachability). Neither ever guesses."""
@@ -538,17 +673,17 @@ def if_condition_admits(condition, false_atom_re):
         tokens = _tokenize_if(inner)
     except ValueError as exc:
         return True, False, f"the `if:` expression could not be parsed ({exc})"
+    try:
+        atoms = _if_atom_map(tokens)
+    except ValueError as exc:
+        return True, False, (f"the `if:` expression carries an atom this decision procedure cannot "
+                             f"fully parse, so no satisfiability claim about it is sound ({exc})")
     fixed, free = {}, []
-    for token in tokens:
-        if not isinstance(token, tuple):
-            continue
-        atom = token[1]
-        if atom in fixed or atom in free:
-            continue
-        if false_atom_re.search(atom):
+    for atom, (kind, canonical) in atoms.items():
+        if canonical in _IF_CONSTANT_ATOMS:
+            fixed[atom] = _IF_CONSTANT_ATOMS[canonical]
+        elif kind == "cmp" and false_atom_re.search(canonical):
             fixed[atom] = False
-        elif atom.strip().lower() in _IF_CONSTANT_ATOMS:
-            fixed[atom] = _IF_CONSTANT_ATOMS[atom.strip().lower()]
         else:
             free.append(atom)
     if len(free) > _IF_MAX_FREE_ATOMS:
@@ -566,27 +701,344 @@ def if_condition_admits(condition, false_atom_re):
     return False, True, "ok"
 
 
+def if_condition_requires(condition, world):
+    """Pure: (holds, decided, detail) — does this `if:` expression evaluate TRUE in the ONE world
+    `world` pins, referencing nothing outside it?
+
+    THE UNIVERSAL COUNTERPART OF if_condition_admits, and the fix for POST-MERGE retro-review finding
+    F4. For a must-NOT-run gate, existential satisfiability is the right question. For a
+    must-BE-REACHABLE compensating action it is the wrong one: `if_condition_admits` pins only the one
+    atom the caller names and treats every OTHER atom as a freely satisfiable boolean — but on a
+    must-be-reachable obligation the other atoms are exactly the ones CAUSALLY CORRELATED with the
+    failure being compensated for, so "there exists a world where the write-back runs" was being
+    accepted as "the write-back runs on every path where a rotation may have happened". MEASURED on
+    the LIVE worker.yml: adding `&& steps.model.outcome == 'success'` — #596's ORIGINAL defect, the one
+    the step's own comment says must never come back — left `rotation_writeback_reachable_verdict`
+    returning `(True, 'ok')` and the whole enrolled suite GREEN. So did `steps.prepare.outcome !=
+    'failure'`, a prepare-OUTPUT atom, and `${{ success() }}`.
+
+    `world` is a tuple of (canonical-atom pattern, truth value) pairs describing the state of the
+    system on a path where the compensated-for event MAY ALREADY HAVE HAPPENED. Each atom of the
+    condition must FULLMATCH exactly one pattern; an atom outside the allowlist returns
+    decided=False NAMING it, because its value on that path is not knowable here. That allowlist —
+    rather than "enumerate the correlated atoms" — is what makes the obligation decidable: the
+    condition may only be keyed to facts settled BEFORE the compensated-for event."""
+    text = str(condition if condition is not None else "").strip()
+    if not text:
+        return False, False, "empty `if:` expression"
+    inner = text
+    if inner.startswith("${{") and inner.endswith("}}"):
+        inner = inner[3:-2].strip()
+    elif "${{" in inner:
+        return False, False, ("the `if:` value interleaves literal text with `${{ }}` expressions "
+                              "and cannot be evaluated statically")
+    try:
+        tokens = _tokenize_if(inner)
+        atoms = _if_atom_map(tokens)
+    except ValueError as exc:
+        return False, False, f"the `if:` expression could not be parsed ({exc})"
+    values = {}
+    for atom, (_kind, canonical) in atoms.items():
+        for pattern, value in world:
+            if pattern.fullmatch(canonical):
+                values[atom] = value
+                break
+        else:
+            return False, False, (
+                f"the condition references `{canonical}`, which is NOT one of the facts settled "
+                "before the compensated-for event; its value on a path where that event may already "
+                "have happened is unknowable here, so the obligation is unprovable")
+    try:
+        holds = _evaluate_if(tokens, values.__getitem__)
+    except ValueError as exc:
+        return False, False, f"the `if:` expression could not be evaluated ({exc})"
+    if not holds:
+        return False, True, ("the condition evaluates FALSE with "
+                             + ", ".join(f"{atom}={value}"
+                                         for atom, value in sorted(values.items())))
+    return True, True, "ok"
+
+
+# ---- SHELL REACHABILITY: a command's TEXT is not its EXECUTION (retro-review of #629, F2 + F3) ----
+# `GATE_VERIFIER_RE` and `WRITEBACK_STEP_RE` were text searches over a step's `run:` body whose left
+# context `(?:^|[;&|]\s*|\s)` is satisfied by a `#` COMMENT, a `true || …` short-circuit and a
+# here-doc body alike. MEASURED on the merged tree: a guard job whose only verifier invocations were
+# `# python3 …` returned `guard_gate_verdict ok=True` (F2), and commenting out
+# `run: bash registry/scripts/worker-live.sh write-back` in BOTH live lanes left the entire enrolled
+# suite GREEN (F3) — i.e. defect 3's production call site had no test at all. This is the same "a
+# comment satisfies the check" class #629 fixed for `needs:` by parsing, reintroduced in the same PR
+# for shell text, so the fix is the same: PARSE the left context instead of matching it.
+_SHELL_CONDITIONAL_OPENERS = frozenset({"if", "elif", "while", "until", "for", "case", "select"})
+_SHELL_CONDITIONAL_CLOSERS = frozenset({"fi", "done", "esac"})
+_SHELL_STRUCTURAL_WORDS = frozenset({"then", "else", "do", "in", "!", "time"})
+_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _shell_heredoc_delimiters(line):
+    """Pure: the here-document delimiter words one physical shell line opens, in order. Quote-aware,
+    so a `<<` inside quotes is ordinary text and a `<<<` here-STRING (which has no body) is skipped."""
+    delimiters, quote, escaped, index = [], None, False, 0
+    while index < len(line):
+        char = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if quote:
+            if char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if char in "'\"":
+            quote = char
+            index += 1
+            continue
+        if char == "#" and (index == 0 or line[index - 1] in " \t"):
+            break                                    # comment: nothing after it opens a here-doc
+        if line.startswith("<<<", index):
+            index += 3
+            continue
+        if line.startswith("<<", index):
+            cursor = index + 2
+            if cursor < len(line) and line[cursor] == "-":
+                cursor += 1
+            while cursor < len(line) and line[cursor] in " \t":
+                cursor += 1
+            opener = ""
+            if cursor < len(line) and line[cursor] in "'\"":
+                opener = line[cursor]
+                cursor += 1
+            start = cursor
+            while cursor < len(line) and (
+                    line[cursor].isalnum() or line[cursor] in "_-."
+                    or (opener and line[cursor] != opener)):
+                cursor += 1
+            word = line[start:cursor]
+            if opener and cursor < len(line) and line[cursor] == opener:
+                cursor += 1
+            if word:
+                delimiters.append(word)
+            index = cursor
+            continue
+        index += 1
+    return delimiters
+
+
+def strip_shell_heredocs(text):
+    """Pure: `text` with every here-document BODY (and its terminator line) removed; the `<<WORD`
+    redirection itself is kept so the command it belongs to still parses.
+
+    A here-doc body is DATA, not commands. `cat <<'PY' … python3 scripts/x.py … PY` contains the TEXT
+    of an invocation and executes none of it, and the retro-review measured exactly that counting as
+    the guard job "running the verifier"."""
+    lines = str(text or "").split("\n")
+    kept, index = [], 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        pending = _shell_heredoc_delimiters(line)
+        index += 1
+        while pending and index < len(lines):
+            if lines[index].strip() == pending[0]:
+                pending.pop(0)
+            index += 1
+    return "\n".join(kept)
+
+
+def _shell_tokens(text):
+    """Pure: [("word", raw) | ("op", operator)] for a shell body. Quote-aware; backslash-newline
+    continuations are joined. `(`/`)` are operators only in command position, so `$(...)` and
+    `${...}` stay inside their word."""
+    tokens, buffer, quote, escaped, index = [], "", None, False, 0
+    length = len(text)
+
+    def flush():
+        nonlocal buffer
+        if buffer:
+            tokens.append(("word", buffer))
+            buffer = ""
+
+    while index < length:
+        char = text[index]
+        if escaped:
+            buffer += char
+            escaped = False
+            index += 1
+            continue
+        if quote:
+            buffer += char
+            if char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            if index + 1 < length and text[index + 1] == "\n":
+                index += 2                                   # line continuation
+                continue
+            buffer += char
+            escaped = True
+            index += 1
+            continue
+        if char in "'\"":
+            buffer += char
+            quote = char
+            index += 1
+            continue
+        if char == "\n":
+            flush()
+            tokens.append(("op", "\n"))
+            index += 1
+            continue
+        if char in " \t":
+            flush()
+            index += 1
+            continue
+        if text.startswith(("||", "&&", ";;"), index):
+            flush()
+            tokens.append(("op", text[index:index + 2]))
+            index += 2
+            continue
+        if char in ";|&":
+            flush()
+            tokens.append(("op", char))
+            index += 1
+            continue
+        if char in "()" and not buffer:
+            tokens.append(("op", char))
+            index += 1
+            continue
+        buffer += char
+        index += 1
+    flush()
+    return tokens
+
+
+def unquote_shell_word(word):
+    """Pure: one shell word with its outer quoting removed (`'x'`, `"x"`, `x` -> `x`)."""
+    text = str(word or "")
+    out, quote, escaped = [], None, False
+    for char in text:
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if quote:
+            if char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+            else:
+                out.append(char)
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char in "'\"":
+            quote = char
+            continue
+        out.append(char)
+    return "".join(out)
+
+
+def shell_simple_commands(run_text):
+    """Pure: ((reachable, words), ...) — every simple command in a shell `run:` body, with
+    `reachable` False when the command is only CONDITIONALLY reached.
+
+    Comments (quote-awarely, via the one shared stripper) and here-document BODIES are removed first,
+    so neither can supply a command. A command is UNREACHABLE when it is the right-hand side of an
+    `&&`/`||` short-circuit or lies inside an `if`/`elif`/`while`/`until`/`for`/`case` construct.
+    Everything else — a plain line, a `;`-separated command, a pipeline stage, a subshell — runs
+    whenever the step runs. Leading `VAR=value` env prefixes and the structural keywords are skipped
+    so the COMMAND NAME is words[0]. Deliberately conservative: an unrecognised construct biases
+    toward UNREACHABLE, and every caller treats "textually present but not reachable" as a refusal."""
+    tokens = _shell_tokens(strip_shell_comments(strip_shell_heredocs(run_text)))
+    commands, words = [], []
+    guard_depth, short_circuited = 0, False
+
+    def finish():
+        nonlocal words
+        if words:
+            commands.append((guard_depth == 0 and not short_circuited, tuple(words)))
+        words = []
+
+    for kind, value in tokens:
+        if kind == "op":
+            finish()
+            if value in ("&&", "||"):
+                short_circuited = True
+            elif value in (";", "\n", "&", ";;"):
+                short_circuited = False
+            continue
+        if not words:
+            if value in _SHELL_CONDITIONAL_OPENERS:
+                guard_depth += 1
+                continue
+            if value in _SHELL_CONDITIONAL_CLOSERS:
+                guard_depth = max(0, guard_depth - 1)
+                continue
+            if value in _SHELL_STRUCTURAL_WORDS or _SHELL_ASSIGNMENT_RE.match(value):
+                continue
+        words.append(value)
+    finish()
+    return tuple(commands)
+
+
+def shell_script_invocations(run_text, interpreter, script_re, required_args=()):
+    """Pure: (reachable, unreachable) — the argument tails of every `<interpreter> <script> …` simple
+    command in a shell body, split by whether that command is UNCONDITIONALLY reached.
+
+    `script_re` must FULLMATCH the script word (so a quoted fixture string, a substring, or a mention
+    inside another argument is not an invocation), and every entry of `required_args` must appear as
+    its own argument word. This is what makes "the guard RUNS the verifier" and "the lane RUNS the
+    rotation write-back" assertions about execution rather than about text."""
+    reachable, unreachable = [], []
+    for is_reachable, words in shell_simple_commands(run_text):
+        if len(words) < 2 or unquote_shell_word(words[0]) != interpreter:
+            continue
+        if not script_re.fullmatch(unquote_shell_word(words[1])):
+            continue
+        arguments = [unquote_shell_word(word) for word in words[2:]]
+        if any(required not in arguments for required in required_args):
+            continue
+        (reachable if is_reachable else unreachable).append(" ".join(arguments))
+    return tuple(reachable), tuple(unreachable)
+
+
 def guard_verifier_invocations(guard_doc):
-    """Pure: (self_test_steps, verify_steps, guarded_steps) over a PARSED guard job — the step
-    indices whose `run:` invokes this script with `--self-test`, without it, and (third element) the
-    indices of ANY invoking step that carries a step-level `if:`.
+    """Pure: (self_test_steps, verify_steps, guarded_steps, unreachable_steps) over a PARSED guard
+    job — the step indices whose `run:` REALLY RUNS this script with `--self-test`, without it, the
+    indices of any invoking step that carries a step-level `if:`, and the indices of steps that
+    merely CONTAIN the text of an invocation which never executes.
 
     A step-level `if:` is reported because it is the same bypass as #621 mutation (a) wearing a
     different hat: `if: false` (or any condition) on the invoking step leaves the job green, the
-    dependency satisfied, and the verifier unrun."""
-    self_tests, verifies, conditional = [], [], []
+    dependency satisfied, and the verifier unrun. The fourth element is the retro-review's F2: a
+    commented-out, `||`-short-circuited or here-doc'd invocation used to satisfy the same check."""
+    self_tests, verifies, conditional, unreachable = [], [], [], []
     for index, step in enumerate(_job_steps(guard_doc)):
         run = step.get("run")
         if not isinstance(run, str):
             continue
-        tails = GATE_VERIFIER_RE.findall(run)
-        if not tails:
+        reached, blocked = shell_script_invocations(run, "python3", GATE_VERIFIER_SCRIPT_RE)
+        if not reached and (blocked or GATE_VERIFIER_SCRIPT_RE.search(run)):
+            # The step MENTIONS the verifier and does not run it: commented out, short-circuited,
+            # here-doc'd, quoted, or inside a conditional. Reported so the refusal can say so.
+            unreachable.append(index)
+        if not reached:
             continue
-        for tail in tails:
-            (self_tests if "--self-test" in tail else verifies).append(index)
+        for tail in reached:
+            (self_tests if "--self-test" in tail.split() else verifies).append(index)
         if step.get("if") is not None:
             conditional.append(index)
-    return tuple(self_tests), tuple(verifies), tuple(conditional)
+    return tuple(self_tests), tuple(verifies), tuple(conditional), tuple(unreachable)
 
 
 def guard_gate_verdict(workflow_text):
@@ -651,7 +1103,7 @@ def guard_gate_verdict(workflow_text):
             "`needs." + GATE_GUARD_JOB + ".result == 'success'` gate passes while the secret-exfil "
             "settings are UNVERIFIED (issue #618: the control is fail-OPEN). Put any non-blocking "
             "diagnostic in a separate advisory job instead")
-    self_tests, verifies, conditional = guard_verifier_invocations(guard_doc)
+    self_tests, verifies, conditional, unreachable = guard_verifier_invocations(guard_doc)
     if not verifies or not self_tests:
         missing = " and ".join(
             part for part, present in (("`dispatch-secrets-guard.py` (the live settings "
@@ -659,10 +1111,14 @@ def guard_gate_verdict(workflow_text):
                                        ("`dispatch-secrets-guard.py --self-test` (the static "
                                         "workflow-shape assertions)", self_tests)) if not present)
         return False, (
-            f"`{GATE_GUARD_JOB}` never invokes {missing} in any step's `run:` — the job exists, is "
+            f"`{GATE_GUARD_JOB}` never RUNS {missing} in any step's `run:` — the job exists, is "
             "gated on, and is green, and it VERIFIES NOTHING. Every other property of this contract "
             "is satisfied by an empty job of the right name, which is why replacing these "
-            "invocations with `true` had to become a red tick")
+            "invocations with `true` had to become a red tick"
+            + (f". Step(s) {list(unreachable)} CONTAIN the text of an invocation that never "
+               "executes — commented out, short-circuited behind `||`/`&&`, or inside a here-doc or "
+               "conditional construct (retro-review of #629: textual presence is not execution)"
+               if unreachable else ""))
     if conditional:
         return False, (
             f"`{GATE_GUARD_JOB}` invokes the verifier from `if:`-conditional step(s) "
@@ -1326,31 +1782,74 @@ def privileged_script_coverage_verdict(workflow_docs, surface_paths):
 # compensate for skipped it. Here the compensation for a consumed grant is gated on the success of
 # the very step that consumes it. So the invariant is asserted structurally, in the workflow YAML —
 # the seam the retro-review found vacuity concentrated in — and in BOTH lanes.
-WRITEBACK_STEP_RE = re.compile(
-    r"(?:^|[;&|]\s*|\s)bash\s+(?:\S*/)?scripts/worker-live\.sh\s+write-back\b")
+WRITEBACK_SCRIPT_RE = re.compile(r"(?:[\w./$~{}-]*/)?scripts/worker-live\.sh")
+WRITEBACK_SUBCOMMAND = "write-back"
+# Textual presence of the call site, used ONLY to tell "the step mentions the write-back and does not
+# run it" (a refusal that names the fact) apart from "this step has nothing to do with the write-back".
+WRITEBACK_TEXT_RE = re.compile(r"scripts/worker-live\.sh\s+" + WRITEBACK_SUBCOMMAND + r"\b")
+# Every lane that MUST carry the production write-back call site. RETRO-REVIEW OF #629 (F3): defect
+# 3's production call site had NO test — commenting out `run: bash registry/scripts/worker-live.sh
+# write-back` in BOTH live lanes (keeping the text, so `WRITEBACK_STEP_RE` still matched and the
+# "zero write-back steps => refuse" non-vacuity guard stayed satisfied) left the entire enrolled suite
+# GREEN while every rotated grant would be silently discarded. Presence is now required PER LANE and
+# proven through shell_script_invocations, so a comment-out in EITHER lane is a red tick on its own.
+WRITEBACK_REQUIRED_LANES = ("worker.yml", "review-fix.yml")
 # The atom whose falsity must NOT make the write-back unreachable: "the credential-prepare step
 # succeeded". Matches `steps.<id>.outcome == 'success'` / `.conclusion == 'success'` for the prepare
-# step under either quote style, with or without spaces.
+# step under either quote style, with or without spaces. Retained to NAME #614's original defect in
+# the refusal; the obligation itself is now decided by the allowlist below, not by this pattern.
 PREPARE_SUCCESS_RE = re.compile(
     r"steps\s*\.\s*prepare\s*\.\s*(?:outcome|conclusion)\s*==\s*['\"]success['\"]")
+# The ONLY atoms the rotation write-back's `if:` may reference, each paired with the value it takes on
+# a path where A ROTATION MAY ALREADY HAVE HAPPENED. Every one of them is settled BEFORE the
+# credential pre-flight runs, which is exactly what makes it legitimate to gate on:
+#   * `always()` is a constant;
+#   * `inputs.dry_run` is a workflow INPUT (and a dry run never exchanges the grant at all —
+#     worker.yml passes WORKER_PREFLIGHT_REFRESH=skip — so a rotation cannot have happened);
+#   * `needs.claim.outputs.acquired` is an UPSTREAM JOB output (no account claimed, no grant used);
+#   * `steps.selected.*` is the account-SELECTION step, which precedes prepare.
+# Anything else — the prepare step's own outcome, the MODEL step's outcome, a prepare OUTPUT,
+# `success()` — is correlated with or downstream of the very failure the write-back compensates for,
+# so referencing it is a REFUSAL naming the atom rather than a freely-satisfiable boolean (F4).
+WRITEBACK_ROTATION_POSSIBLE_WORLD = (
+    (re.compile(r"always\(\)"), True),
+    (re.compile(r"(?:github\.event\.)?inputs\.dry_run"), False),
+    (re.compile(r"(?:github\.event\.)?inputs\.dry_run==(?:['\"]true['\"]|true)"), False),
+    (re.compile(r"(?:github\.event\.)?inputs\.dry_run==(?:['\"]false['\"]|false)"), True),
+    (re.compile(r"needs\.claim\.outputs\.acquired==['\"]true['\"]"), True),
+    (re.compile(r"steps\.selected\.(?:outcome|conclusion)==['\"]success['\"]"), True),
+)
 
 
-def rotation_writeback_reachable_verdict(workflow_docs):
-    """Pure: (ok, reason). In EVERY workflow that runs `worker-live.sh write-back`, that step's `if:`
-    must still be able to run when the credential-prepare step did NOT succeed.
+def rotation_writeback_reachable_verdict(workflow_docs, required_lanes=()):
+    """Pure: (ok, reason). Every workflow that runs `worker-live.sh write-back` must run it on EVERY
+    path where a credential rotation may already have happened — and each lane in `required_lanes`
+    must actually carry the call site.
 
-    Evaluated with the same polarity primitive as the secret-exfil gate, in the opposite direction:
-    set `steps.prepare.outcome == 'success'` FALSE, leave every other atom TRUE, and require the
-    condition to remain satisfiable. Fail directions, both deliberate:
-      * a step whose condition cannot be PARSED is a refusal (unlike the gate, where unparseable
-        means "cannot prove it gates"; here unparseable means "cannot prove the compensation is
-        reachable", and an unpersisted rotation is unrecoverable);
+    THE OBLIGATION IS UNIVERSAL, NOT EXISTENTIAL (retro-review of #629, F4). #629 asked
+    `if_condition_admits` whether there EXISTS a world in which the write-back runs while
+    `steps.prepare.outcome == 'success'` is false, leaving every other atom free. That is the right
+    question for a must-not-run gate and the WRONG one here, because the free atoms are precisely the
+    ones correlated with prepare failing. MEASURED on the LIVE worker.yml, whole suite green:
+    `&& steps.model.outcome == 'success'` (#596's original defect, which the step's own comment says
+    must never come back), `&& steps.prepare.outcome != 'failure'` (defect 3 one token differently
+    spelled), a prepare-output atom and `${{ success() }}` all passed. The obligation is now
+    `if_condition_requires` over WRITEBACK_ROTATION_POSSIBLE_WORLD: the condition must evaluate TRUE
+    on the rotation-possible path, and may reference NOTHING whose value that path leaves open.
+
+    Fail directions, all deliberate:
+      * an `if:` that cannot be decided, or that references an atom outside the allowlist, is a
+        refusal (unlike the gate, where undecided means "cannot prove it gates"; here it means
+        "cannot prove the compensation is reachable", and an unpersisted rotation is unrecoverable);
+      * a step whose `run:` CONTAINS the write-back command but never executes it — commented out,
+        short-circuited, inside a here-doc — is a refusal naming that fact (F3);
+      * a required lane with no reachable call site is a refusal naming the lane (F3);
       * finding ZERO write-back steps across the documents is a refusal — the step was renamed or
         removed and this assertion would otherwise pass vacuously, which is exactly how #614's gap
         survived its own review."""
     if not workflow_docs:
         return False, "no workflow documents to scan (fail closed)"
-    found = []
+    found = {}
     for filename in sorted(workflow_docs):
         jobs = workflow_job_docs(workflow_docs[filename])
         if jobs is None:
@@ -1358,31 +1857,56 @@ def rotation_writeback_reachable_verdict(workflow_docs):
         for job_name, job_doc in sorted(jobs.items()):
             for index, step in enumerate(_job_steps(job_doc)):
                 run = step.get("run")
-                if not isinstance(run, str) or not WRITEBACK_STEP_RE.search(run):
+                if not isinstance(run, str):
                     continue
+                reached, blocked = shell_script_invocations(
+                    run, "bash", WRITEBACK_SCRIPT_RE, (WRITEBACK_SUBCOMMAND,))
                 where = f"{filename}::{job_name} step {index}"
-                found.append(where)
+                if not reached and (blocked or WRITEBACK_TEXT_RE.search(run)):
+                    return False, (
+                        f"{where}: the step CONTAINS the text of `worker-live.sh "
+                        f"{WRITEBACK_SUBCOMMAND}` but never RUNS it (commented out, short-circuited "
+                        "behind `||`/`&&`, or inside a here-doc or conditional construct). Every "
+                        "host-side-rotated grant would be silently discarded while this assertion "
+                        "passed on the text alone (retro-review of #629: the production call site "
+                        "must be deletable ONLY at the cost of a red tick)")
+                if not reached:
+                    continue
+                found.setdefault(filename, []).append(where)
                 condition = step.get("if")
                 if condition is None:
                     continue        # unconditional: maximally reachable
-                admits, parsed, detail = if_condition_admits(condition, PREPARE_SUCCESS_RE)
-                if not parsed:
+                holds, decided, detail = if_condition_requires(
+                    condition, WRITEBACK_ROTATION_POSSIBLE_WORLD)
+                if not decided:
                     return False, (
-                        f"{where}: the rotation write-back's `if:` ({condition!r}) cannot be "
-                        f"evaluated ({detail}), so its reachability from the credential-prepare "
-                        "FAILURE path is unprovable (fail closed)")
-                if not admits:
+                        f"{where}: the rotation write-back's `if:` ({condition!r}) cannot be proven "
+                        f"to hold on every path where a rotation may already have happened "
+                        f"({detail})"
+                        + (" — this is #596's ORIGINAL defect, a guard on the very step whose "
+                           "pre-flight CONSUMES the one-time-use grant"
+                           if PREPARE_SUCCESS_RE.search(str(condition)) else "")
+                        + ". The condition may only be keyed to facts settled BEFORE the pre-flight "
+                        "(always(), the dry-run input, the claim outputs, the account SELECTION "
+                        "step); let worker-live.sh's rotation MARKER decide whether there is "
+                        "anything to persist (fail closed)")
+                if not holds:
                     return False, (
-                        f"{where}: the rotation write-back can ONLY run when the credential-prepare "
-                        f"step succeeded (`if:` = {condition!r}). The host-side pre-flight consumes "
-                        "the stored ONE-TIME-USE refresh token EARLY inside that step, so every "
-                        "later failure in it (the no-leak assertion, the tamper baseline, the pinned "
-                        "CLI install, the $GITHUB_ENV export) discards a grant the provider has "
-                        "already rotated — old one spent, new one thrown away, account permanently "
-                        "dead until an interactive re-mint (#614; same class as #604's root cause). "
-                        "Key the condition to `always()` plus the account SELECTION, and let "
-                        "worker-live.sh's rotation marker decide whether there is anything to "
-                        "persist")
+                        f"{where}: the rotation write-back does NOT run on a path where the "
+                        f"credential pre-flight may already have rotated the grant (`if:` = "
+                        f"{condition!r}; {detail}). The host-side pre-flight consumes the stored "
+                        "ONE-TIME-USE refresh token EARLY inside the prepare step, so every later "
+                        "failure in it (the no-leak assertion, the tamper baseline, the pinned CLI "
+                        "install, the $GITHUB_ENV export) discards a grant the provider has already "
+                        "rotated — old one spent, new one thrown away, account permanently dead "
+                        "until an interactive re-mint (#614; same class as #604's root cause)")
+    missing_lanes = [lane for lane in required_lanes if lane not in found]
+    if missing_lanes:
+        return False, (
+            "lane(s) " + ", ".join(missing_lanes) + " carry NO reachable `worker-live.sh "
+            f"{WRITEBACK_SUBCOMMAND}` step — the production call site of the rotation write-back is "
+            "gone from a lane that runs the host-side credential pre-flight, so every grant that "
+            "lane rotates is discarded with the runner (fail closed)")
     if not found:
         return False, ("found ZERO `worker-live.sh write-back` steps in any workflow — the rotation "
                        "write-back was renamed or removed, and this reachability assertion would "
@@ -2030,6 +2554,79 @@ def _self_test():
             "python3 scripts/dispatch-secrets-guard.py",
             "python3 registry/scripts/dispatch-secrets-guard.py")), (True, "ok"))
 
+    # ---- POST-MERGE RETRO-REVIEW OF #629, F2: TEXTUAL PRESENCE IS NOT EXECUTION -----------------
+    # `GATE_VERIFIER_RE`'s left context `(?:^|[;&|]\s*|\s)` was satisfied by a `#` comment, a
+    # `true ||` short-circuit and a here-doc body. MEASURED on the merged tree: a guard job whose ONLY
+    # verifier invocations were `# python3 …` returned `guard_gate_verdict ok=True`, and so did one
+    # whose only invocations were `true || python3 …`. The commented-out shape is a PLAUSIBLE ACCIDENT
+    # (comment an invocation out while debugging; nothing goes red). Each mutation below is applied to
+    # the SAME fixture whose honest form passes above, so these reds are the guard firing.
+    for label, mutate in (
+            ("COMMENTED OUT",
+             lambda body: "\n".join("          # " + line.strip() if line.strip().startswith("python3")
+                                    else line for line in body.split("\n"))),
+            ("SHORT-CIRCUITED behind `true ||`",
+             lambda body: body.replace("          python3", "          true || python3")),
+            ("SHORT-CIRCUITED behind `false &&`",
+             lambda body: body.replace("          python3", "          false && python3")),
+            ("inside a HERE-DOC body",
+             lambda body: body.replace(
+                 "      - run: |\n", "      - run: |\n          cat <<'SH' > /dev/null\n")
+             + "\n          SH"),
+            ("inside an `if` construct",
+             lambda body: body.replace(
+                 "      - run: |\n", "      - run: |\n          if [ -n \"${DEBUG:-}\" ]; then\n")
+             + "\n          fi"),
+            ("quoted as an argument to `echo`",
+             lambda body: body.replace("          python3", "          echo python3"))):
+        mutant = guard_gate_verdict(gate_ok_sample.replace(guard_run_block, mutate(guard_run_block)))
+        chk(f"GATE (F2): the guard's verifier invocations are {label} -> REFUSE (the job is gated, "
+            "green, and VERIFIES NOTHING; the text of a command is not its execution)",
+            (gate_ok_sample.replace(guard_run_block, mutate(guard_run_block)) != gate_ok_sample,
+             mutant[0], "VERIFIES NOTHING" in mutant[1]),
+            (True, False, True))
+    commented_guard = {"steps": [{"run": "# python3 scripts/dispatch-secrets-guard.py --self-test\n"
+                                        "# python3 scripts/dispatch-secrets-guard.py\n"}]}
+    chk("GATE (F2): guard_verifier_invocations reports a commented-out invocation as UNREACHABLE, "
+        "never as an invocation", guard_verifier_invocations(commented_guard),
+        ((), (), (), (0,)))
+    chk("GATE (F2): ...and the honest form is reported as reachable",
+        guard_verifier_invocations(
+            {"steps": [{"run": "set -euo pipefail\n"
+                               "python3 registry/scripts/dispatch-secrets-guard.py --self-test\n"
+                               "python3 registry/scripts/dispatch-secrets-guard.py\n"}]}),
+        ((0,), (0,), (), ()))
+    # The shell reachability primitive, directly — the parse that replaced the left-context regex.
+    for body, expected, label in (
+            ("python3 scripts/dispatch-secrets-guard.py --self-test", (("--self-test",), ()),
+             "a plain line RUNS"),
+            ("set -e; python3 scripts/dispatch-secrets-guard.py --self-test", (("--self-test",), ()),
+             "a `;`-separated command RUNS"),
+            ("# python3 scripts/dispatch-secrets-guard.py --self-test", ((), ()),
+             "a full-line comment is not a command at all"),
+            ("true # python3 scripts/dispatch-secrets-guard.py --self-test", ((), ()),
+             "a trailing comment is not a command"),
+            ("true || python3 scripts/dispatch-secrets-guard.py --self-test",
+             ((), ("--self-test",)), "a `||` right-hand side is UNREACHABLE"),
+            ("false && python3 scripts/dispatch-secrets-guard.py --self-test",
+             ((), ("--self-test",)), "an `&&` right-hand side is UNREACHABLE"),
+            ("if true; then python3 scripts/dispatch-secrets-guard.py --self-test; fi",
+             ((), ("--self-test",)), "an `if` body is UNREACHABLE"),
+            ("cat <<'SH'\npython3 scripts/dispatch-secrets-guard.py --self-test\nSH",
+             ((), ()), "a here-doc BODY is data, not commands"),
+            ("echo python3 scripts/dispatch-secrets-guard.py", ((), ()),
+             "an argument to another command is not an invocation"),
+            ('echo "python3 scripts/dispatch-secrets-guard.py --self-test"', ((), ()),
+             "a quoted string is not an invocation"),
+            ("true || python3 scripts/dispatch-secrets-guard.py --self-test\n"
+             "python3 scripts/dispatch-secrets-guard.py --self-test",
+             (("--self-test",), ("--self-test",)),
+             "a short-circuit does not poison the NEXT line"),
+            ("VAR=1 python3 scripts/dispatch-secrets-guard.py --self-test", (("--self-test",), ()),
+             "a leading env assignment still leaves the command in command position")):
+        chk(f"shell reachability: {label}",
+            shell_script_invocations(body, "python3", GATE_VERIFIER_SCRIPT_RE), expected)
+
     # ---- RETRO-REVIEW OF #621, MUTATION (b): the success condition's POLARITY -------------------
     # Flipping `always() && needs.secrets-guard.result == 'success'` to `||` at dispatch.yml:1227
     # left the suite green — the old check was a SUBSTRING search, and the comparison is still
@@ -2068,6 +2665,59 @@ def _self_test():
     chk("if-polarity: a bare (unwrapped) expression is evaluated too",
         if_condition_admits("always() && needs.secrets-guard.result == 'success'",
                             GATE_SUCCESS_RE)[0], False)
+
+    # ---- POST-MERGE RETRO-REVIEW OF #629, F1: THE STRING-EMBEDDED BYPASS ------------------------
+    # `_tokenize_if` absorbs a whole function call INCLUDING its quoted string arguments into one
+    # opaque atom, and the atom used to be pinned FALSE whenever `false_atom_re` matched ANYWHERE in
+    # that raw text. So MENTIONING the guard comparison inside a string literal pinned an ALWAYS-TRUE
+    # call to FALSE, the conjunction became unsatisfiable, and `admits=False` was a proof about a
+    # formula the workflow does not have. MEASURED end to end on the merged tree:
+    #     honest gate -> True | the `||` inversion -> False | STRING-EMBEDDED bypass -> True
+    # i.e. GitHub runs the privileged job on a FAILED guard while the gate contract reports ok. The
+    # atom is now PARSED: only a real comparison can be pinned, so the call is a FREE atom, the
+    # expression is satisfiable with the guard failed, and the gate REFUSES.
+    string_bypass = ("${{ always() && contains('needs.secrets-guard.result == \"success\"', "
+                     "'success') }}")
+    chk("if-polarity (F1): a call whose STRING ARGUMENT mentions the guard comparison does NOT "
+        "satisfy the gate — the argument is not a condition",
+        if_condition_admits(string_bypass, GATE_SUCCESS_RE)[:2], (True, True))
+    bypass_sample = gate_ok_sample.replace(
+        "    if: ${{ always() && needs.secrets-guard.result == 'success' }}",
+        "    if: " + string_bypass)
+    verdict_bypass = guard_gate_verdict(bypass_sample)
+    chk("GATE (F1): the string-embedded bypass -> REFUSE (GitHub evaluates always() and contains() "
+        "both TRUE and runs the privileged job on a FAILED guard)",
+        (bypass_sample != gate_ok_sample, verdict_bypass[0],
+         "can evaluate TRUE" in verdict_bypass[1]),
+        (True, False, True))
+    # The same shape in every other place a string can hide the comparison.
+    for hider in (
+            "contains('needs.secrets-guard.result == \"success\"', 'success')",
+            # GitHub escapes a single quote inside a single-quoted string by DOUBLING it
+            "startsWith('needs.secrets-guard.result == ''success''', 'needs')",
+            "format('{0}', 'needs.secrets-guard.result == \"success\"')",
+            "contains(github.event.head_commit.message, "
+            "'needs.secrets-guard.result == ''success''')"):
+        chk(f"if-polarity (F1): `{hider}` is a FREE atom, never the guard requirement",
+            if_condition_admits("${{ always() && " + hider + " }}", GATE_SUCCESS_RE)[:2],
+            (True, True))
+    # ...and the accept direction still holds, so the fix is not "refuse every call".
+    chk("if-polarity (F1): a genuine comparison alongside an unrelated call still GATES",
+        if_condition_admits(
+            "${{ contains(github.ref, 'main') && needs.secrets-guard.result == 'success' }}",
+            GATE_SUCCESS_RE)[:2], (False, True))
+    # FAIL CLOSED on anything the grammar cannot fully decide: no atom is silently abstracted.
+    for undecidable, why in (
+            ("${{ always() && secrets[format('ACCT{0}_TOKEN', '01')] != '' }}", "index expression"),
+            ("${{ always() && 1 + 1 == 2 }}", "arithmetic"),
+            ("${{ always() && 'literal' }}", "a bare string used as a condition"),
+            ("${{ always() && !needs.secrets-guard.result == 'success' }}",
+             "`!` binds tighter than `==` in GitHub, so the two readings disagree"),
+            ("${{ always() && needs.secrets-guard.result == 'success' == true }}",
+             "a comparison chain")):
+        decided = if_condition_admits(undecidable, GATE_SUCCESS_RE)
+        chk(f"if-polarity (F1): {why} -> UNDECIDED and ADMITS (the gate fails CLOSED rather than "
+            "reasoning over an atom it cannot parse)", decided[:2], (True, False))
 
     # ---- RETRO-REVIEW OF #621: the five PERMISSIVE MISPARSES of regex-over-YAML -----------------
     # Each of these was verified GREEN against the merged #621 file. All five are now parse events,
@@ -2250,36 +2900,82 @@ def _self_test():
     # LIVE, both lanes: worker.yml and review-fix.yml each gated this step on
     # `steps.prepare.outcome == 'success'` — the success of the very step whose pre-flight CONSUMES
     # the one-time-use refresh token. This is the assertion that makes restoring that guard red.
-    chk("WRITE-BACK (LIVE): the rotation write-back is reachable when the credential-prepare step "
-        "FAILED, in every lane that runs it (#614: a compensating action gated on the success of "
-        "the step it compensates for is no compensation at all)",
-        rotation_writeback_reachable_verdict(live_docs), (True, "ok"))
+    chk("WRITE-BACK (LIVE): the rotation write-back RUNS on every path where the credential "
+        "pre-flight may already have rotated the grant, and BOTH lanes carry the call site (#614: a "
+        "compensating action gated on the success of the step it compensates for is no compensation "
+        "at all)",
+        rotation_writeback_reachable_verdict(live_docs, WRITEBACK_REQUIRED_LANES), (True, "ok"))
     # THE MUTANT: success-only reachability, exactly as #614 shipped it. Both lanes, independently.
-    for lane in ("worker.yml", "review-fix.yml"):
+    for lane in WRITEBACK_REQUIRED_LANES:
         mutant_docs = dict(live_docs)
         mutant_docs[lane] = mutant_docs[lane].replace(
             "steps.selected.outcome == 'success'", "steps.prepare.outcome == 'success'")
-        chk(f"WRITE-BACK: {lane} reverted to `steps.prepare.outcome == 'success'` -> REFUSE "
-            "(one-time-use grant spent, rotated grant discarded, account permanently dead)",
-            rotation_writeback_reachable_verdict(mutant_docs)[0], False)
-    # A step-level `if:` that merely MENTIONS the prepare step is not the same as requiring it — the
-    # polarity evaluation, not a substring test, decides (same primitive as the gate contract).
+        reverted = rotation_writeback_reachable_verdict(mutant_docs, WRITEBACK_REQUIRED_LANES)
+        chk(f"WRITE-BACK: {lane} reverted to `steps.prepare.outcome == 'success'` -> REFUSE, naming "
+            "the LANE and #596's original defect (one-time-use grant spent, rotated grant "
+            "discarded, account permanently dead)",
+            (reverted[0], lane in reverted[1], "ORIGINAL defect" in reverted[1]),
+            (False, True, True))
+    # ---- RETRO-REVIEW OF #629, F4: THE QUANTIFIER. Each of these mutations ADDS an atom to the LIVE
+    # lane while KEEPING `steps.selected.outcome == 'success'`, so the per-lane mutant fixtures above
+    # still apply and their `replace()` search string is still present. Under #629's EXISTENTIAL check
+    # every one of them measured `(True, 'ok')` on the live worker.yml with the whole enrolled suite
+    # green — including `&& steps.model.outcome == 'success'`, which is #596's ORIGINAL defect verbatim
+    # and which the step's own comment says must never come back. These reds are the guard FIRING on
+    # the defect, not a fixture string going missing. ----
+    for extra_atom, why in (
+            ("steps.model.outcome == 'success'",
+             "#596's ORIGINAL defect: a MODEL-step guard on the write-back"),
+            ("steps.prepare.outcome != 'failure'",
+             "defect 3 one token differently spelled: deterministically false on a prepare failure"),
+            ("steps.prepare.outputs.rotated == 'true'",
+             "a prepare OUTPUT is empty when prepare aborted mid-rotation"),
+            ("steps.prepare.outcome == 'skipped'",
+             "a prepare outcome atom of any spelling")):
+        for lane in WRITEBACK_REQUIRED_LANES:
+            mutant_docs = dict(live_docs)
+            mutant_docs[lane] = mutant_docs[lane].replace(
+                "steps.selected.outcome == 'success' }}",
+                "steps.selected.outcome == 'success' && " + extra_atom + " }}")
+            chk(f"WRITE-BACK (LIVE, F4): {lane} + `&& {extra_atom}` -> REFUSE, naming the atom "
+                f"({why})",
+                (mutant_docs[lane] != live_docs[lane],)
+                + rotation_writeback_reachable_verdict(mutant_docs, WRITEBACK_REQUIRED_LANES)[:1]
+                + (extra_atom.split()[0].replace(" ", "") in rotation_writeback_reachable_verdict(
+                    mutant_docs, WRITEBACK_REQUIRED_LANES)[1],),
+                (True, False, True))
+    # ...and the shapes the retro-review measured as passing, as a direct table on the primitive.
     for condition, reachable in (
             (None, True),
             ("${{ always() }}", True),
             ("${{ always() && steps.selected.outcome == 'success' }}", True),
+            ("${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && "
+             "steps.selected.outcome == 'success' }}", True),
+            # F4, all four measured as GREEN under the existential check:
+            ("${{ always() && steps.selected.outcome == 'success' && "
+             "steps.model.outcome == 'success' }}", False),
+            ("${{ always() && steps.selected.outcome == 'success' && "
+             "steps.prepare.outcome != 'failure' }}", False),
+            ("${{ always() && steps.selected.outcome == 'success' && "
+             "steps.prepare.outputs.rotated == 'true' }}", False),
+            ("${{ success() }}", False),
+            # #614's shipped defect and its close spellings:
             ("${{ always() && steps.prepare.outcome == 'success' }}", False),
             ("${{ steps.prepare.conclusion == 'success' }}", False),
-            ("${{ always() && steps.prepare.outcome != 'success' }}", True),
+            # runs ONLY when prepare did NOT succeed: a rotation on the SUCCESS path is discarded
+            ("${{ always() && steps.prepare.outcome != 'success' }}", False),
             ("${{ always() && (steps.prepare.outcome == 'success' || "
-             "steps.preflight.outputs.rotated == 'true') }}", True)):
+             "steps.preflight.outputs.rotated == 'true') }}", False),
+            # a dry run cannot have rotated anything, so gating it out is legitimate
+            ("${{ always() && !inputs.dry_run }}", True),
+            ("${{ always() && inputs.dry_run }}", False)):
         synthetic = ["jobs:", "  run:", "    steps:"]
         if condition is not None:
             synthetic.append(f"      - if: {condition}")
             synthetic.append("        run: bash registry/scripts/worker-live.sh write-back")
         else:
             synthetic.append("      - run: bash registry/scripts/worker-live.sh write-back")
-        chk(f"WRITE-BACK: `if: {condition}` keeps the write-back reachable on a prepare FAILURE",
+        chk(f"WRITE-BACK: `if: {condition}` runs the write-back on EVERY rotation-possible path",
             rotation_writeback_reachable_verdict({"w.yml": "\n".join(synthetic)})[0], reachable)
     chk("WRITE-BACK: zero write-back steps anywhere -> REFUSE (a renamed step must not make this "
         "assertion pass vacuously)",
@@ -2293,6 +2989,37 @@ def _self_test():
                                  "      - if: ${{ always() && ( }}",
                                  "        run: bash scripts/worker-live.sh write-back"])})[0],
         False)
+    # ---- RETRO-REVIEW OF #629, F3: THE PRODUCTION CALL SITE, PER LANE. Commenting the `run:` out in
+    # BOTH lanes (keeping the text) left the whole enrolled suite green — defect 3's call site had no
+    # test at all. Each lane is now asserted INDEPENDENTLY, and the refusal names the lane. ----
+    for lane in WRITEBACK_REQUIRED_LANES:
+        for label, replacement in (
+                ("COMMENTED OUT",
+                 "        run: |\n          : # bash registry/scripts/worker-live.sh write-back"),
+                ("DELETED", "        run: 'true'"),
+                ("SHORT-CIRCUITED behind `true ||`",
+                 "        run: true || bash registry/scripts/worker-live.sh write-back"),
+                ("moved into a HERE-DOC",
+                 "        run: |\n          cat <<'SH' > /dev/null\n"
+                 "          bash registry/scripts/worker-live.sh write-back\n          SH")):
+            mutant_docs = dict(live_docs)
+            mutant_docs[lane] = mutant_docs[lane].replace(
+                "        run: bash registry/scripts/worker-live.sh write-back", replacement)
+            verdict = rotation_writeback_reachable_verdict(mutant_docs, WRITEBACK_REQUIRED_LANES)
+            chk(f"WRITE-BACK (LIVE, F3): {lane}'s write-back call site {label} -> REFUSE, naming "
+                "the lane (every rotated grant would be silently discarded)",
+                (mutant_docs[lane] != live_docs[lane], verdict[0], lane in verdict[1]),
+                (True, False, True))
+    chk("WRITE-BACK: a required lane with no write-back step at all -> REFUSE, lane NAMED",
+        (rotation_writeback_reachable_verdict(
+            {"worker.yml": "jobs:\n  run:\n    steps:\n      - run: true\n"},
+            ("worker.yml",))[0],
+         "worker.yml" in rotation_writeback_reachable_verdict(
+             {"worker.yml": "jobs:\n  run:\n    steps:\n      - run: true\n"},
+             ("worker.yml",))[1]),
+        (False, True))
+    chk("WRITE-BACK: the required-lane list is NON-EMPTY, so the per-lane assertions above are not "
+        "vacuous", len(WRITEBACK_REQUIRED_LANES) >= 2, True)
 
     # IDEMPOTENT-RESUME credential-existence contract (#211; review round 1 of #533): the
     # reconcile step must NEVER grant resume=true on the say-so of a secret_ref LINE — an
