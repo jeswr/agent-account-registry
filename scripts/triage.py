@@ -63,6 +63,19 @@ import sys
 # label's own chain is NEVER consulted for these issues, so the role label only has to (a) exist
 # and (b) be a configured role route so route-resolve does not raise UnknownRoleError.
 #
+# THE ARGUMENT IS ONLY TRUE IF *EVERY* PRODUCER OF THIS CONSTANT IS PHASE-1 MATCHED — PR #595
+# review finding 1 found a producer that was NOT. `ROLE_BY_KIND["security"]` mapped `kind:security`
+# to TRUST_PLANE_ROLE while `security` was NOT a SEC_KEYWORD, so an issue labelled
+# {priority:P1, area:usage, kind:security} matched no Phase-1 rule and BOTH resolvers returned the
+# plain impl route — model_chain ["sol", "opus5", "fable", "opus"], agent registry-impl,
+# escalate=FALSE — i.e. trust-plane work on a non-escalated, AUTO-ARMABLE chain. The fix makes the
+# argument true rather than weakening it: every kind that denotes trust-plane work
+# (TRUST_PLANE_KINDS below) is now a Phase-1 keyword in BOTH SEC_KEYWORDS and routing.toml's
+# `match_labels`, and the self-test ENUMERATES every producer of TRUST_PLANE_ROLE (each
+# TRUST_PLANE_KINDS entry and each SEC_KEYWORD) and asserts each one resolves to the escalated
+# soundness chain through route-resolve AND policy-resolve — so a new kind added without Phase-1
+# coverage turns the enrolled suite RED.
+#
 # Among the role labels that EXIST in this repository today — role:impl, role:ci, role:docs,
 # role:research, role:site — `impl` is the honest description of trust-plane work items and has a
 # configured route. `role:review`/`role:soundness` exist in sparq-org/sparq but NOT here, so
@@ -73,8 +86,17 @@ import sys
 # triage() means the flip is safe even if the label lands later than the code.
 TRUST_PLANE_ROLE = "impl"
 
+# The `kind:*` values that DENOTE TRUST-PLANE WORK (as opposed to the generic implementation work
+# ROLE_BY_TYPE derives). Declaring them explicitly — instead of inferring "trust-plane" from the
+# mapped role — matters because TRUST_PLANE_ROLE is currently the same string as the generic impl
+# role, so `value == TRUST_PLANE_ROLE` cannot discriminate. INVARIANT (self-test enforced, PR #595
+# finding 1): every entry here MUST be matched by Phase 1, i.e. `kind:<entry>` must contain some
+# SEC_KEYWORD as a substring, and the set of ROLE_BY_KIND keys mapped to TRUST_PLANE_ROLE must be
+# EXACTLY this tuple — adding a trust-plane kind without Phase-1 coverage fails the suite.
+TRUST_PLANE_KINDS = ("security",)
+
 ROLE_BY_KIND = {"docs": "docs", "research": "research", "ci": "ci", "site": "site",
-                "security": TRUST_PLANE_ROLE}
+                **{kind: TRUST_PLANE_ROLE for kind in TRUST_PLANE_KINDS}}
 ROLE_BY_TYPE = {"feature": "impl", "bug": "impl", "task": "impl", "chore": "ci",
                 "spike": "research", "epic": "impl"}
 # The registry IS the orchestration trust plane: an issue touching these sections is a soundness
@@ -82,8 +104,15 @@ ROLE_BY_TYPE = {"feature": "impl", "bug": "impl", "task": "impl", "chore": "ci",
 # are IDENTICAL, which is what makes TRUST_PLANE_ROLE's posture argument above hold). A substring
 # match forces the trust-plane lane so the review of its eventual PR is human-armed, never
 # auto-armed.
+# `security` (PR #595 finding 1) covers the OTHER producer of TRUST_PLANE_ROLE — the
+# `kind:security` label in ROLE_BY_KIND/TRUST_PLANE_KINDS. Without it that label derived the
+# trust-plane role but matched NO Phase-1 rule, so the issue resolved to the plain, non-escalated,
+# auto-armable impl chain. Every keyword here is also a `match_labels` keyword in
+# orchestration/routing.toml (equality asserted by the self-test), so it is ALSO read by the
+# arm-side security classifier (worker-pr.py live_security_flagged / dispatch-claim.py
+# _security_flagged) — a matched issue's PR is HUMAN-armed, never auto-armed.
 SEC_KEYWORDS = ("dispatch", "worker", "set-up-account", "review-loop", "groom",
-                "zk", "mpc", "crypto", "auth", "e2ee")
+                "zk", "mpc", "crypto", "auth", "e2ee", "security")
 # [FABLE-5] STANDING RULE (maintainer decision 2026-07-17): UI/front-end surfaces route role:site
 # -> the openai/codex chain in orchestration/routing.toml (original-builder ownership: GPT-5.6
 # codex built the registry dashboard, e4098b9). EXACT labels, not substrings — UI keywords must
@@ -218,12 +247,13 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
 # ---------------------------------------------------------------------------------------------------
 # LIVE APPLICATION — the fail-closed, order-controlled mutation (#582).
 
-def apply_triage(current, result, edit, view, warn=None):
+def apply_triage(current, result, edit, view, warn=None, read_state=None):
     """Apply a triage `result` to a live issue FAIL-CLOSED. Returns {"ok":bool,"warnings":[...]}.
 
     `edit(add, remove)` performs ONE label mutation and MUST RAISE on failure (never `|| true`);
-    `view()` re-reads and returns the issue's live label set. Both are injected so the self-test
-    drives the whole sequence against a fake GitHub.
+    `view()` re-reads and returns the issue's live label set; optional `read_state()` returns
+    ``(labels, revision)`` — the issue's label set AND an opaque revision token (its `updatedAt`).
+    All are injected so the self-test drives the whole sequence against a fake GitHub.
 
     Sequence — the invariant is enforced by ORDER plus VERIFICATION, not by hope:
       1. the target `role:*` label is added FIRST and its presence VERIFIED by a re-read;
@@ -231,14 +261,30 @@ def apply_triage(current, result, edit, view, warn=None):
          strips are dropped from the plan and, if the projected post-state has no role at all,
          `status:ready` is withheld (the issue stays `status:untriaged`, which retriage recovers);
       3. the remaining adds/removes are applied;
-      4. POST-CONDITION: the issue is re-read and must carry exactly one `role:*`. A role-less
-         `status:ready` post-state restores the previous role label (or demotes to
-         `status:untriaged` when there is none to restore) and reports ok=False, loudly.
+      4. POST-CONDITION (REVISION-BOUND): the issue is re-read and must carry EXACTLY ONE `role:*`.
+
+    Phase 4 is where PR #595 findings 3 + 4 land:
+      * REVISION-BOUND verification. The old check verified ONE unbound snapshot, so a role
+        deletion landing immediately after the read passed GREEN. The snapshot is now confirmed by
+        a second read; if the labels or the revision token moved, the NEWER snapshot governs.
+      * NO TERMINAL STATE. A violated post-condition is REPAIRED, never merely reported: zero roles
+        restores the incumbent role; an AMBIGUOUS role set (e.g. a concurrent actor injecting
+        `role:ci` during a docs->impl transition) is repaired down to the single intended role. If
+        the intended role cannot be determined safely — or the repair does not land — `status:ready`
+        is DEMOTED to `status:untriaged` so retriage (which only revisits `status:untriaged`) owns
+        the issue. An ambiguous `status:ready` issue is otherwise terminal: route-resolve rejects it
+        (AmbiguousRoleError), ready-issues keeps it ready, and retriage never looks at it.
+    ok=False is returned on every violation, so the caller's exit status turns the workflow RED.
     """
     warns = list(result.get("warnings", ()))
-    warn = warn or (lambda _m: None)
+    emit = warn or (lambda _m: None)
+
+    def note(message):
+        warns.append(message)
+        emit(message)
+
     for message in warns:
-        warn(message)
+        emit(message)
     current = set(current)
     prev_roles = _roles_of(current)
     add, remove = set(result["add"]), set(result["remove"])
@@ -253,26 +299,20 @@ def apply_triage(current, result, edit, view, warn=None):
         try:
             edit([target], [])
         except Exception as exc:                                  # noqa: BLE001 — report, never die
-            message = (f"role label add {target!r} FAILED ({exc}) — refusing to strip the existing "
-                       f"role (registry #582)")
-            warns.append(message)
-            warn(message)
+            note(f"role label add {target!r} FAILED ({exc}) — refusing to strip the existing "
+                 f"role (registry #582)")
         else:
             if target in view():
                 target_ok = True
             else:
-                message = (f"role label add {target!r} reported success but did NOT land — "
-                           f"refusing to strip the existing role (registry #582)")
-                warns.append(message)
-                warn(message)
+                note(f"role label add {target!r} reported success but did NOT land — "
+                     f"refusing to strip the existing role (registry #582)")
         add.discard(target)
 
     # 2. never strip the last/only role without a verified replacement.
     if role_rm and not target_ok:
-        message = (f"refusing to strip {sorted(role_rm)}: replacement {target!r} is not in place "
-                   f"(registry #582)")
-        warns.append(message)
-        warn(message)
+        note(f"refusing to strip {sorted(role_rm)}: replacement {target!r} is not in place "
+             f"(registry #582)")
         remove -= role_rm
         role_rm = set()
         ok = False
@@ -280,10 +320,8 @@ def apply_triage(current, result, edit, view, warn=None):
     if not projected_roles:
         # THE INVARIANT: never status:ready with no role. Withhold the promotion instead.
         if "status:ready" in add or "status:ready" in current:
-            message = ("withholding status:ready: the issue would have NO role:* label "
-                       "(registry #582) — leaving it status:untriaged for retriage")
-            warns.append(message)
-            warn(message)
+            note("withholding status:ready: the issue would have NO role:* label "
+                 "(registry #582) — leaving it status:untriaged for retriage")
             ok = False
         add.discard("status:ready")
         remove.discard("status:untriaged")
@@ -296,35 +334,76 @@ def apply_triage(current, result, edit, view, warn=None):
         try:
             edit(sorted(add), sorted(remove))
         except Exception as exc:                                  # noqa: BLE001
-            message = f"label mutation failed ({exc}); post-condition check follows"
-            warns.append(message)
-            warn(message)
+            note(f"label mutation failed ({exc}); post-condition check follows")
             ok = False
 
-    # 4. POST-CONDITION — re-read and assert exactly one role:*; restore + fail loudly otherwise.
-    live = view()
-    live_roles = _roles_of(live)
-    if not live_roles and "status:ready" in live:
-        message = ("POST-CONDITION VIOLATED (registry #582): issue is status:ready with NO role:* "
-                   f"label; restoring {sorted(prev_roles) or 'status:untriaged'}")
-        warns.append(message)
-        warn(message)
+    # 4. POST-CONDITION — revision-bound re-read, then REPAIR (never leave a terminal state).
+    reader = read_state if read_state else (lambda: (view(), None))
+
+    def snapshot():
+        """A CONFIRMED (labels, revision) reading: a second read decides whether the issue moved
+        under us, and the NEWER state governs the verdict (PR #595 finding 4 — a single unbound
+        snapshot let a post-read role deletion pass green)."""
+        labels, revision = reader()
+        labels2, revision2 = reader()
+        if (revision2, sorted(labels2)) != (revision, sorted(labels)):
+            note(f"issue moved during verification ({sorted(labels)} @{revision} -> "
+                 f"{sorted(labels2)} @{revision2}); verifying against the NEWER snapshot")
+            labels, revision = labels2, revision2
+        return labels, revision
+
+    def violation(labels):
+        roles = _roles_of(labels)
+        if not roles and "status:ready" in labels:
+            return "zero-role"
+        if len(roles) > 1:
+            return "ambiguous-role"
+        return None
+
+    def repair_plan(problem, labels, attempt):
+        """(add, remove) for ONE repair mutation. Attempt 1 repairs PRECISELY — restore the
+        incumbent role, or drop the roles that are not the intended target. Attempt 2, and any case
+        where the intended role is not determinable, DEMOTES status:ready -> status:untriaged so
+        retriage revisits the issue instead of it sitting ready-and-undispatchable forever."""
+        roles = _roles_of(labels)
+        if problem == "zero-role" and attempt == 1 and prev_roles:
+            note(f"POST-CONDITION VIOLATED (registry #582): status:ready with NO role:* label; "
+                 f"restoring {sorted(prev_roles)}")
+            return sorted(prev_roles), []
+        if problem == "ambiguous-role" and attempt == 1 and target_ok and target in roles:
+            note(f"POST-CONDITION VIOLATED (registry #582): ambiguous role set {sorted(roles)} "
+                 f"survives triage (route-resolve would raise AmbiguousRoleError); REPAIRING to "
+                 f"the single intended role {target!r}")
+            return [], sorted(roles - {target})
+        note(f"POST-CONDITION VIOLATED (registry #582): {problem} {sorted(roles)} cannot be "
+             "repaired safely; DEMOTING status:ready -> status:untriaged so retriage owns it")
+        return ["status:untriaged"], ["status:ready"]
+
+    live, _revision = snapshot()
+    for attempt in (1, 2):
+        problem = violation(live)
+        if problem is None:
+            break
         ok = False
+        fix_add, fix_remove = repair_plan(problem, live, attempt)
+        fix_add = [lb for lb in fix_add if lb not in live]
+        fix_remove = [lb for lb in fix_remove if lb in live]
+        if not fix_add and not fix_remove:
+            # Nothing left to mutate: the issue is already NOT status:ready, so it is retriageable
+            # (retriage revisits status:untriaged) rather than terminal. Still ok=False.
+            note(f"{problem} {sorted(_roles_of(live))} remains but the issue is not status:ready — "
+                 "retriage will revisit it; no repair mutation is possible here")
+            break
         try:
-            if prev_roles:
-                edit(sorted(prev_roles), [])
-            else:
-                edit(["status:untriaged"], ["status:ready"])
+            edit(fix_add, fix_remove)
         except Exception as exc:                                  # noqa: BLE001
-            message = f"RESTORE FAILED ({exc}) — issue needs manual repair (registry #582)"
-            warns.append(message)
-            warn(message)
-    elif len(live_roles) > 1:
-        message = (f"POST-CONDITION: ambiguous role set {sorted(live_roles)} survives triage — "
-                   "route-resolve will reject this issue (AmbiguousRoleError)")
-        warns.append(message)
-        warn(message)
-        ok = False
+            note(f"REPAIR FAILED ({exc}) — issue needs manual repair (registry #582)")
+            break
+        live, _revision = snapshot()
+    else:
+        if violation(live) is not None:
+            note(f"REPAIR DID NOT HOLD: {sorted(live)} still violates the single-role invariant — "
+                 "issue needs manual repair (registry #582)")
     return {"ok": ok, "warnings": warns}
 
 
@@ -353,30 +432,55 @@ def repo_label_set(repo):
     return {item["name"] for item in json.loads(out)}
 
 
-def _apply_cli(repo, number, issue_type):
-    """`--apply`: read the live issue + label set, plan, and mutate fail-closed. Exit 1 loudly on
-    any invariant/post-condition failure so the workflow step turns red instead of silently
-    stranding the issue (the `|| true` per-label loop this replaces is exactly how #582 happened).
+def live_gh(repo, number, title="triage"):
+    """Return the (read_state, view, edit, warn) quadruple bound to ONE live issue.
+
+    SHARED by `triage.py --apply` and `retriage.py --apply` (PR #595 finding 3) so both mutate
+    through the exact same fail-closed sequence in apply_triage. retriage used to send its adds AND
+    removals through one opaque `gh issue edit` in the workflow shell — no add-first verification,
+    no incumbent-role protection, and a post-read the shell could short-circuit past.
+
+    READS go through the shared bounded-retry layer (gh_retry); the label MUTATION is
+    SINGLE-ATTEMPT and FAIL-LOUD (gh_retry's hard scope rule: never replay a mutation).
+    `read_state` returns (labels, revision) — the `updatedAt` token that makes apply_triage's
+    post-condition revision-bound.
     """
+    def read_state():
+        out = _gh_read(["issue", "view", str(number), "-R", repo, "--json", "labels,updatedAt"])
+        doc = json.loads(out)
+        return {lb["name"] for lb in doc["labels"]}, doc.get("updatedAt")
+
     def view():
-        out = _gh_read(["issue", "view", str(number), "-R", repo, "--json", "labels"])
-        return {lb["name"] for lb in json.loads(out)["labels"]}
+        return read_state()[0]
 
     def edit(add, remove):
+        # A flag-less `gh issue edit <n> -R <repo>` is a USAGE ERROR, so an empty mutation must not
+        # be issued at all. (The old `len(args) == 4` guard could never fire — the base argv is 5
+        # tokens — so an empty edit would have raised a spurious mutation failure. apply_triage
+        # happens to guard every call site, but the invariant belongs here; self-test pinned.)
+        if not add and not remove:
+            return
         args = ["issue", "edit", str(number), "-R", repo]
         for label in add:
             args += ["--add-label", label]
         for label in remove:
             args += ["--remove-label", label]
-        if len(args) == 4:
-            return
         proc = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or "").strip() or f"gh exited {proc.returncode}")
 
     def warn(message):
-        print(f"::warning title=triage #{number}::{message}")
+        print(f"::warning title={title} #{number}::{message}")
 
+    return read_state, view, edit, warn
+
+
+def _apply_cli(repo, number, issue_type):
+    """`--apply`: read the live issue + label set, plan, and mutate fail-closed. Exit 1 loudly on
+    any invariant/post-condition failure so the workflow step turns red instead of silently
+    stranding the issue (the `|| true` per-label loop this replaces is exactly how #582 happened).
+    """
+    read_state, view, edit, warn = live_gh(repo, number)
     current = view()
     known = repo_label_set(repo)
     try:
@@ -384,10 +488,68 @@ def _apply_cli(repo, number, issue_type):
     except RoleInvariantError as exc:
         print(f"::error title=triage #{number}::{exc}")
         return 1
-    outcome = apply_triage(current, result, edit, view, warn)
+    outcome = apply_triage(current, result, edit, view, warn, read_state=read_state)
     print(f"triage #{number}: role={result['role']} ready={result['ready']} "
           f"add={sorted(result['add'])} remove={sorted(result['remove'])}")
     return 0 if outcome["ok"] else 1
+
+
+def _repo_root():
+    import os
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_sibling(filename, name):
+    """Import a hyphenated sibling script (route-resolve.py, policy-resolve.py) by path."""
+    import importlib.util
+    import os
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(os.path.dirname(os.path.abspath(__file__)), filename))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# WORKFLOW/CLI SIGNATURE PINNING (PR #595 finding 2 — the TEST-VACUITY class). retriage.yml passed
+# `--known-labels` to a parser that never declared it: a workflow-shaped invocation exited 2 with
+# "unrecognized arguments", yet the enrolled suite was GREEN because every self-test called plan()
+# DIRECTLY. The fix is not just the missing option — it is deriving the argument list under test
+# from the WORKFLOW FILE, so a future workflow/CLI drift cannot hide behind a direct-call test.
+_SHELL_STOP = re.compile(r"<<<|<<|\||>|;|&&|\)")
+
+
+def workflow_argvs(workflow_path, script, subst=None):
+    """Every ARGV a workflow passes to `scripts/<script>`, read from the workflow FILE.
+
+    Shell line-continuations are joined, quotes stripped, and `$VAR` / `${VAR}` references replaced
+    from `subst` (default: a `<var>` placeholder) so the list can be fed straight to a parser.
+    Returns a list of token lists — one per invocation site. Used by BOTH triage.py's and
+    retriage.py's self-tests.
+    """
+    import shlex
+    subst = subst or {}
+    # COMMENT lines are dropped first: this must read the workflow's EXECUTABLE invocations, and
+    # both YAML and shell comments in these files legitimately quote example command lines.
+    text = "\n".join(line for line in open(workflow_path, encoding="utf-8").read().splitlines()
+                     if not line.strip().startswith("#")).replace("\\\n", " ")
+    argvs = []
+    for match in re.finditer(rf"scripts/{re.escape(script)}\s+([^\n]*)", text):
+        tail = match.group(1)
+        stop = _SHELL_STOP.search(tail)
+        if stop:
+            tail = tail[:stop.start()]
+        tokens = []
+        for token in shlex.split(tail, posix=True):
+            for name in re.findall(r"\$\{?(\w+)\}?", token):
+                token = re.sub(rf"\$\{{?{name}\}}?", subst.get(name, f"<{name.lower()}>"), token)
+            tokens.append(token)
+        argvs.append(tokens)
+    return argvs
+
+
+def declared_options(parser):
+    """Every option string an argparse parser accepts — the other half of the pinning check."""
+    return {option for action in parser._actions for option in action.option_strings}  # noqa: SLF001
 
 
 def _self_test():
@@ -481,7 +643,9 @@ def _self_test():
         import tomllib
     except ModuleNotFoundError:                                   # pragma: no cover
         import tomli as tomllib
-    doc = tomllib.load(open("orchestration/routing.toml", "rb"))
+    import os
+    root = _repo_root()                     # cwd-independent: the gate runs from the repo root, a
+    doc = tomllib.load(open(os.path.join(root, "orchestration/routing.toml"), "rb"))  # dev may not
     sec_rules = [route for route in doc.get("route", []) if "match_labels" in route]
     chk("SEC_KEYWORDS == routing.toml security match_labels (posture invariant)",
         sorted(SEC_KEYWORDS), sorted({k for rule in sec_rules for k in rule["match_labels"]}))
@@ -548,18 +712,30 @@ def _self_test():
 
     # (3b) the LIVE post-condition catches an INDUCED zero-role state and RESTORES it.
     class FakeGh:
-        """A GitHub that drops adds of labels outside `known` — the live #582 failure mode."""
+        """A GitHub that drops adds of labels outside `known` — the live #582 failure mode.
+
+        `rev` models the issue's `updatedAt` revision token (bumped by every mutation) so the
+        revision-bound post-condition (PR #595 finding 4) can be driven from a fixture.
+        """
 
         def __init__(self, labels, known):
             self.labels, self.known, self.calls = set(labels), set(known), []
+            self.rev = 0
 
         def edit(self, add, remove):
             self.calls.append(("edit", sorted(add), sorted(remove)))
+            before = set(self.labels)
             for label in add:
                 if label not in self.known:
                     raise RuntimeError(f"'{label}' not found")
                 self.labels.add(label)
             self.labels -= set(remove)
+            if self.labels != before:
+                self.rev += 1
+
+        def read_state(self):
+            self.calls.append(("read_state",))
+            return set(self.labels), self.rev
 
         def view(self):
             self.calls.append(("view",))
@@ -621,17 +797,223 @@ def _self_test():
     # (4) a HAPPY-path live application: one mutation, exactly one role, promoted to ready.
     gh = FakeGh({"priority:P1", "area:dispatch", "status:untriaged", "role:docs"}, REAL)
     plan = triage(gh.labels, "task", known_labels=REAL)
-    out = apply_triage(set(gh.labels), plan, gh.edit, gh.view)
+    out = apply_triage(set(gh.labels), plan, gh.edit, gh.view, read_state=gh.read_state)
     chk("[#582] happy path: one role, ready, ok",
         (out["ok"], _roles_of(gh.labels), "status:ready" in gh.labels,
          "status:untriaged" in gh.labels),
         (True, {f"role:{TRUST_PLANE_ROLE}"}, True, False))
 
+    # -----------------------------------------------------------------------------------------------
+    # [PR #595 finding 4] A CONCURRENT EDIT MUST NOT STRAND A TERMINAL AMBIGUOUS ISSUE.
+    # Injecting role:ci during a docs->impl transition used to leave {status:ready, role:impl,
+    # role:ci}: apply_triage reported failure but the issue stayed LIVE and undispatchable —
+    # route-resolve raises AmbiguousRoleError on it, ready-issues keeps it ready, and retriage only
+    # revisits status:untriaged, so NOTHING recovers it. The post-condition must now REPAIR it down
+    # to the single intended role. Non-vacuous: the pre-fix phase 4 only warned, so gh.labels kept
+    # BOTH roles here.
+    class InjectingGh(FakeGh):
+        """A concurrent actor adds `role:ci` the moment the role transition lands."""
+
+        def __init__(self, labels, known):
+            super().__init__(labels, known)
+            self.injected = False
+
+        def edit(self, add, remove):
+            super().edit(add, remove)
+            if not self.injected and any(lb.startswith(ROLE_PREFIX) for lb in add):
+                self.injected = True
+                self.labels.add("role:ci")
+                self.rev += 1
+
+    start = {"priority:P1", "role:docs", "area:dispatch", "status:untriaged"}
+    gh = InjectingGh(start, REAL)
+    plan = triage(start, "task", known_labels=REAL)
+    out = apply_triage(set(start), plan, gh.edit, gh.view, read_state=gh.read_state)
+    chk("[#595 f4] a concurrently injected role is REPAIRED to the single intended role",
+        (out["ok"], _roles_of(gh.labels), "status:ready" in gh.labels),
+        (False, {f"role:{TRUST_PLANE_ROLE}"}, True))
+    chk("[#595 f4] the ambiguity repair is reported loudly",
+        any("ambiguous role set" in w and "REPAIRING to the single intended role" in w
+            for w in out["warnings"]), True)
+    # ... and when the intended role CANNOT be determined safely, the issue is DEMOTED to
+    # status:untriaged (which retriage revisits) instead of being left ready-and-ambiguous.
+    ambiguous = {"priority:P1", "role:docs", "role:research", "area:usage", "status:ready"}
+    gh = FakeGh(ambiguous, REAL)
+    out = apply_triage(set(ambiguous), {"add": set(), "remove": set(), "ready": True, "role": None,
+                                        "warnings": []}, gh.edit, gh.view,
+                       read_state=gh.read_state)
+    chk("[#595 f4] an unrepairable ambiguity DEMOTES status:ready -> status:untriaged",
+        (out["ok"], _roles_of(gh.labels), "status:ready" in gh.labels,
+         "status:untriaged" in gh.labels),
+        (False, {"role:docs", "role:research"}, False, True))
+    # the demoted issue is genuinely retriageable: triage() now plans it down to ONE role.
+    demoted = triage(gh.labels, "task", known_labels=REAL)
+    chk("[#595 f4] the demoted issue is repairable by the next triage/retriage pass",
+        _roles_of((set(gh.labels) | demoted["add"]) - demoted["remove"]), {"role:impl"})
+
+    # [PR #595 finding 4] the final verification is REVISION-BOUND: a role deletion landing right
+    # AFTER the snapshot must not pass green. Non-vacuous: with a single unbound read (the pre-fix
+    # code) this fixture returns ok=True with NO role label on a status:ready issue — the exact #582
+    # terminal state, certified green.
+    class RacyGh(FakeGh):
+        """A concurrent actor deletes every role label immediately AFTER the verification read."""
+
+        def __init__(self, labels, known):
+            super().__init__(labels, known)
+            self.reads = 0
+
+        def read_state(self):
+            self.reads += 1
+            state = (set(self.labels), self.rev)
+            if self.reads == 1:                  # lands between the read and the verdict
+                self.labels -= _roles_of(self.labels)
+                self.rev += 1
+            return state
+
+    gh = RacyGh(start, REAL)
+    plan = triage(start, "task", known_labels=REAL)
+    out = apply_triage(set(start), plan, gh.edit, gh.view, read_state=gh.read_state)
+    chk("[#595 f4] a post-snapshot role deletion is CAUGHT (revision-bound) and restored",
+        (out["ok"], _roles_of(gh.labels)), (False, {"role:docs"}))
+    chk("[#595 f4] the moved revision is reported",
+        any("moved during verification" in w for w in out["warnings"]), True)
+
+    # -----------------------------------------------------------------------------------------------
+    # [PR #595 finding 1] EVERY PRODUCER OF TRUST_PLANE_ROLE RESOLVES TO AN ESCALATED CHAIN.
+    # The posture argument for TRUST_PLANE_ROLE = "impl" (see the constant's comment) is only true
+    # if the label expression that FORCED the trust-plane role is itself matched by Phase 1 of the
+    # resolvers. `kind:security` was NOT: it mapped to TRUST_PLANE_ROLE via ROLE_BY_KIND while
+    # matching no SEC_KEYWORD, so {priority:P1, area:usage, kind:security} resolved to
+    # (["sol","opus5","fable","opus"], registry-impl, escalate=FALSE) in BOTH resolvers — security
+    # work on an auto-armable chain, and the old pinning test never looked at this consumer.
+    # Enumerated PROGRAMMATICALLY from the mappings, end-to-end through triage -> the post-triage
+    # label set -> route-resolve.resolve AND policy-resolve.resolve, so a new trust-plane kind (or a
+    # widened SEC_KEYWORDS) that Phase 1 does not cover turns this RED.
+    route_resolve = load_sibling("route-resolve.py", "registry_route_resolve")
+    policy_resolve = load_sibling("policy-resolve.py", "registry_policy_resolve")
+    policy_doc = tomllib.load(open(os.path.join(root, "policy/repos.toml"), "rb"))
+    SELF_REPO = "jeswr/agent-account-registry"
+    SOUNDNESS = (["opus5", "opus"], "registry-reviewer", True)
+
+    def resolved(labels):
+        """(derived role, route-resolve verdict, policy-resolve verdict) for a POST-TRIAGE label
+        set — the real consumer chain: triage writes the labels, both resolvers read them."""
+        result = triage(labels, "task", known_labels=REAL)
+        post = (set(labels) | result["add"]) - result["remove"]
+        row = policy_resolve.resolve(SELF_REPO, post, policy_doc, doc)
+        return (result["role"], route_resolve.resolve(post, doc),
+                (row["model_chain"], row["agent"], row["escalate"]))
+
+    # the review's EXACT fixture: a trust-plane KIND on a non-trust area.
+    chk("[#595 f1] {P1, area:usage, kind:security} escalates in BOTH resolvers",
+        resolved(["priority:P1", "area:usage", "kind:security"]),
+        (TRUST_PLANE_ROLE, SOUNDNESS, SOUNDNESS))
+    # the ROLE_BY_KIND entries that denote trust-plane work are EXACTLY TRUST_PLANE_KINDS, so a new
+    # kind mapped to TRUST_PLANE_ROLE cannot escape the enumeration below.
+    chk("[#595 f1] TRUST_PLANE_KINDS == the ROLE_BY_KIND entries mapped to the trust-plane role",
+        sorted(kind for kind, value in ROLE_BY_KIND.items() if value == TRUST_PLANE_ROLE),
+        sorted(TRUST_PLANE_KINDS))
+    for kind in sorted(TRUST_PLANE_KINDS):
+        label = f"kind:{kind}"
+        chk(f"[#595 f1] {label} is a Phase-1 trigger (a SEC_KEYWORD is a substring of it)",
+            any(keyword in label for keyword in SEC_KEYWORDS), True)
+        chk(f"[#595 f1] {label} derives the trust-plane role AND escalates in both resolvers",
+            resolved(["priority:P1", "area:usage", label]),
+            (TRUST_PLANE_ROLE, SOUNDNESS, SOUNDNESS))
+    # the OTHER producer of TRUST_PLANE_ROLE: every SEC_KEYWORD, on a representative area label.
+    for keyword in sorted(SEC_KEYWORDS):
+        chk(f"[#595 f1] area:{keyword} derives the trust-plane role AND escalates in both resolvers",
+            resolved(["priority:P1", f"area:{keyword}"]),
+            (TRUST_PLANE_ROLE, SOUNDNESS, SOUNDNESS))
+    # DISCRIMINATION: the enumeration above is not vacuously true — a NON-trust-plane kind must NOT
+    # escalate (otherwise the check would pass even if every issue were force-escalated).
+    chk("[#595 f1] a non-trust-plane kind is NOT escalated (the enumeration discriminates)",
+        [resolved(["priority:P1", "area:usage", "kind:docs"])[1][2],
+         resolved(["priority:P1", "area:usage", "kind:research"])[1][2]], [False, False])
+
+    # -----------------------------------------------------------------------------------------------
+    # [PR #595 finding 2] THE ARGV ENTRYPOINT IS PINNED TO THE WORKFLOW'S OWN ARGUMENT LIST.
+    # Every check above calls triage()/apply_triage() DIRECTLY, so a CLI/workflow signature drift is
+    # invisible to them — exactly how retriage.yml shipped `--known-labels` against a parser that
+    # never declared it (exit 2 live, enrolled suite green). Derived from the workflow FILE so it
+    # cannot drift back.
+    triage_wf = os.path.join(root, ".github/workflows/triage-issue.yml")
+    argvs = workflow_argvs(triage_wf, "triage.py", {"REPO": "o/r", "NUM": "7"})
+    options = declared_options(build_parser())
+    chk("[#595 f2] triage-issue.yml invokes scripts/triage.py at least once", len(argvs) >= 1, True)
+    chk("[#595 f2] every flag triage-issue.yml passes is DECLARED by the parser",
+        sorted({token for argv in argvs for token in argv
+                if token.startswith("--")} - options), [])
+    apply_argv = next((argv for argv in argvs if "--apply" in argv), None)
+    chk("[#595 f2] the workflow's --apply invocation is present", apply_argv is not None, True)
+    dispatched = {}
+    real_apply_cli = globals()["_apply_cli"]
+    globals()["_apply_cli"] = lambda repo, number, issue_type: dispatched.update(
+        repo=repo, number=number, type=issue_type) or 0
+    try:
+        code = main(list(apply_argv or []))
+    finally:
+        globals()["_apply_cli"] = real_apply_cli
+    chk("[#595 f2] the workflow-shaped ARGV parses and reaches _apply_cli with its values",
+        (code, dispatched), (0, {"repo": "o/r", "number": "7", "type": "task"}))
+    # the pure (non---apply) CLI path also round-trips, --known-labels included.
+    import contextlib
+    import io
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = main(["--labels", "priority:P1,role:docs,area:dispatch",
+                     "--known-labels", ",".join(sorted(REAL)), "--type", "task"])
+    chk("[#595 f2] the --labels/--known-labels ARGV path exits 0 and plans the swap",
+        (code, "ADD: " in buffer.getvalue(),
+         f"role:{TRUST_PLANE_ROLE}" in buffer.getvalue()), (0, True, True))
+
+    # -----------------------------------------------------------------------------------------------
+    # [PR #595 finding 5] THE QUARANTINE LABEL WRITE IS FAIL-LOUD. `gh issue edit ... || true` on the
+    # trust:untrusted/status:untriaged write meant a failed mutation left third-party content
+    # UN-QUARANTINED while the job reported success — the worst failure mode on this surface, and
+    # invisible to retriage (which only revisits status:untriaged). Pinned statically so it cannot
+    # regress: the label mutation carries no `|| true`, the step runs under `set -e`, and a post-read
+    # proves both labels landed. (Only the courtesy comment may be best-effort.)
+    quarantine = re.search(r"\n {6}- name: Quarantine.*?(?=\n {6}- name: |\Z)",
+                           "\n".join(line for line in open(triage_wf, encoding="utf-8").read()
+                                     .splitlines() if not line.strip().startswith("#")), re.S)
+    quarantine_body = quarantine.group(0) if quarantine else ""
+    chk("[#595 f5] the quarantine step exists and runs under set -e",
+        bool(quarantine_body) and "set -euo pipefail" in quarantine_body, True)
+    chk("[#595 f5] no `|| true` on the quarantine LABEL mutation",
+        [line.strip() for line in quarantine_body.splitlines()
+         if "issue edit" in line and "|| true" in line], [])
+    chk("[#595 f5] the quarantine labels are verified by a post-read before success",
+        all(token in quarantine_body for token in ("--json labels", "trust:untrusted",
+                                                   "refusing to report success")), True)
+
+    # -----------------------------------------------------------------------------------------------
+    # THE LIVE `gh` ARGV live_gh builds (shared by triage --apply and retriage --apply): an EMPTY
+    # mutation must issue NO call at all — `gh issue edit <n> -R <repo>` with no flags is a usage
+    # error, so emitting it would report a spurious mutation failure and drive the post-condition's
+    # repair path over a healthy issue. Stubbed subprocess; no live gh.
+    calls = []
+    real_run = subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kwargs: calls.append(list(cmd)) or (
+            __import__("subprocess").CompletedProcess(cmd, 0, stdout="", stderr=""))
+        _rs, _view, live_edit, _warn = live_gh("o/r", 7)
+        live_edit([], [])
+        chk("an empty label mutation issues NO gh call", calls, [])
+        live_edit(["role:impl"], ["role:docs"])
+    finally:
+        subprocess.run = real_run
+    chk("the label mutation argv is one `gh issue edit` with per-label flags",
+        calls, [["gh", "issue", "edit", "7", "-R", "o/r", "--add-label", "role:impl",
+                 "--remove-label", "role:docs"]])
+
     print("triage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
 
-def main():
+def build_parser():
+    """The CLI contract. Built by a named function so the self-test can assert that every flag
+    .github/workflows/triage-issue.yml passes is actually DECLARED here (PR #595 finding 2)."""
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
@@ -644,7 +1026,12 @@ def main():
     ap.add_argument("--number", default="")
     ap.add_argument("--known-labels", default="",
                     help="comma-separated repo label set; enables the #582 existence check")
-    a = ap.parse_args()
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
     if a.apply:

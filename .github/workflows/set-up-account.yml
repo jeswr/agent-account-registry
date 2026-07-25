@@ -7,6 +7,16 @@
 # (a provider:* label, no silent default); the token is never echoed (only `gh secret set < file`);
 # an always() step shreds all auth state.
 #
+# `|| true` DISPOSITION (PR #595 finding 5 audit — the repo-wide sweep for swallowed label/state
+# mutations). Every remaining `|| true` in this workflow is on a NOTIFICATION COMMENT, never on a
+# label/state mutation: each one sits inside a fail-closed `fail()`/`reject()` helper that follows it
+# with an explicit `exit 1`, or reports an outcome whose STATE transition is separately fail-loud and
+# post-read verified (the status:pending -> status:available flip below fails the step and then
+# PROVES the flip landed). A comment that cannot post must not resurrect an aborted enrollment or
+# mask a verified transition. The two courtesy `gh issue close` calls and the label-create
+# ensure-exists pair carry their own inline justifications. NO label mutation in this repo is
+# `|| true`-swallowed any more (triage-issue.yml's quarantine write was the last one).
+#
 # COMPLETION fixes (audit-2026-07-17): the captured secret is stored on THIS registry repo — the
 # only place any consumer reads it (worker.yml `secrets[secret_ref]`, the dispatch usage probe,
 # fingerprint-accounts; the old sparq-org/sparq write registered accounts nothing could use). The
@@ -618,6 +628,11 @@ jobs:
           printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
             --validate-account-record --account-handle "$HANDLE"
           # gh issue create needs the label to pre-exist; ensure it idempotently.
+          # PR #595 finding 5 audit — `|| true` JUSTIFIED here: `gh label create` fails when the
+          # label ALREADY exists (the normal case), which is precisely the state we want, and the
+          # outcome is VERIFIED downstream and fail-loud — the `gh issue create --label` call below
+          # (no `|| true`) fails the step if either label is genuinely absent. This is an idempotent
+          # ensure-exists, not a state transition, so nothing is silently swallowed.
           gh label create status:pending -R "${{ github.repository }}" \
             -c EBECA4 -d "account captured, awaiting account_pool PR merge before activation" 2>/dev/null || true
           gh label create account -R "${{ github.repository }}" \
@@ -836,9 +851,16 @@ jobs:
               *)
                 echo "::error::issue #$num for $HANDLE is neither status:pending nor status:available (labels: $labels) — refusing to activate (fail closed)"; exit 1 ;;
             esac
+            # PR #595 finding 5 audit — the STATE transition that matters (status:pending ->
+            # status:available) is fail-loud AND post-read verified above. What remains here is the
+            # courtesy close of the REQUEST issue: a failure leaves it OPEN, which is the safe
+            # direction (visible, hand-closable, and it never un-quarantines or un-labels anything),
+            # so it stays non-fatal — but it now emits a ::warning instead of vanishing silently.
             gh issue comment "$ISSUE" -R "${{ github.repository }}" \
-              --body "✅ Account **$HANDLE** registered and activated: secret \`$SECRET\` (format \`$fmt\`), \`models: $MODELS\`, already present in \`policy/repos.toml\` account_pool — flipped to \`status:available\`. Closing." || true
-            gh issue close "$ISSUE" -R "${{ github.repository }}" || true
+              --body "✅ Account **$HANDLE** registered and activated: secret \`$SECRET\` (format \`$fmt\`), \`models: $MODELS\`, already present in \`policy/repos.toml\` account_pool — flipped to \`status:available\`. Closing." \
+              || echo "::warning title=set-up-account::activation notice comment failed to post on #$ISSUE"
+            gh issue close "$ISSUE" -R "${{ github.repository }}" \
+              || echo "::warning title=set-up-account::could not close request issue #$ISSUE (it stays open — close it by hand)"
           else
             gh issue comment "$ISSUE" -R "${{ github.repository }}" \
               --body "⏳ Account **$HANDLE** captured (secret \`$SECRET\` stored, format \`$fmt\`, \`models: $MODELS\`) and registered **status:pending** — NOT yet allocatable. Policy PR #$PR adds \`$HANDLE\` to \`policy/repos.toml\` account_pool; **merge #$PR to activate** — the \`activate\` job then flips it to \`status:available\` and closes this request. This stays open until then." || true
@@ -977,7 +999,12 @@ jobs:
           req=$(gh issue view "$num" -R "$REPO" --json body --jq '.body' \
                   | sed -n 's/^request_issue:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
           if [ -n "$req" ]; then
+            # PR #595 finding 5 audit: same disposition as the activate path above — the label flip
+            # is fail-loud, the request-issue close is a courtesy whose failure leaves the issue OPEN
+            # (the safe direction) and is now surfaced as a ::warning rather than swallowed.
             gh issue comment "$req" -R "$REPO" \
-              --body "✅ Account **$handle** activated: added to \`policy/repos.toml\` account_pool (PR #$PR_NUMBER merged) and flipped to \`status:available\`. Closing." || true
-            gh issue close "$req" -R "$REPO" || true
+              --body "✅ Account **$handle** activated: added to \`policy/repos.toml\` account_pool (PR #$PR_NUMBER merged) and flipped to \`status:available\`. Closing." \
+              || echo "::warning title=set-up-account::activation notice comment failed to post on #$req"
+            gh issue close "$req" -R "$REPO" \
+              || echo "::warning title=set-up-account::could not close request issue #$req (it stays open — close it by hand)"
           fi

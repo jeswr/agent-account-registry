@@ -132,6 +132,82 @@ jobs:
           echo "== actionlint =="
           actionlint -color
 
+      - name: Assert every workflow-passed CLI flag is declared by its script
+        run: |
+          set -euo pipefail
+          # PR #595 finding 2 (the TEST-VACUITY class, repo-wide): retriage.yml passed
+          # `--known-labels` to a parser that never declared it, so EVERY scheduled sweep exited 2
+          # with "unrecognized arguments" — invisible to the enrolled suite, whose self-tests called
+          # the planner function directly. Nothing structural stopped the whole class, so assert it
+          # statically: every `--flag` a workflow (or a workflow-invoked shell script) passes to a
+          # `scripts/*.py` must be DECLARED there — an argparse add_argument or one of the argv-style
+          # membership tests this repo uses. A literal merely mentioned in a docstring or a test
+          # assertion does not count (that is why the check is AST-based, not a grep). Scanning zero
+          # invocations is itself a failure (fail closed), mirroring the pin check below.
+          python3 - <<'PY'
+          import ast, glob, pathlib, re, sys
+
+          INVOCATION = re.compile(
+              r"python3\s+(?:\"?\$?\{?[\w./$-]*\}?/)?(?:registry(?:-snapshot)?/)?"
+              r"scripts/([\w.-]+\.py)([^\n]*)")
+          FLAG = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
+          # A PASSTHROUGH subcommand hands the rest of its argv verbatim to another program, so the
+          # flags after it are not the script's own contract: `gh_retry.py read <gh args...>`.
+          PASSTHROUGH = {("gh_retry.py", "read")}
+
+          def declared_flags(source):
+              flags, tree = set(), ast.parse(source)
+
+              def literals(nodes):
+                  return {n.value for n in nodes if isinstance(n, ast.Constant)
+                          and isinstance(n.value, str) and n.value.startswith("--")}
+
+              def mentions_argv(node):
+                  return any((isinstance(n, ast.Attribute) and n.attr == "argv")
+                             or (isinstance(n, ast.Name) and n.id == "argv")
+                             for n in ast.walk(node))
+
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Call):
+                      name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                      if name == "add_argument" or (name in {"index", "count"}
+                                                    and mentions_argv(node.func)):
+                          flags |= literals(node.args)
+                  elif isinstance(node, ast.Compare) and mentions_argv(node):
+                      flags |= literals([node.left, *node.comparators])
+              return flags
+
+          pairs, bad, cache = set(), [], {}
+          for path in sorted(glob.glob(".github/workflows/*.yml")) + sorted(glob.glob("scripts/*.sh")):
+              text = "\n".join(
+                  line for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+                  if not line.strip().startswith("#")).replace("\\\n", " ")
+              for match in INVOCATION.finditer(text):
+                  script, tail = match.group(1), match.group(2)
+                  if (script, (tail.split() or [""])[0]) in PASSTHROUGH:
+                      continue
+                  for flag in FLAG.findall(tail):
+                      pairs.add((script, flag, path))
+          for script, flag, path in sorted(pairs):
+              source = pathlib.Path("scripts") / script
+              if not source.exists():
+                  bad.append(f"{path} invokes scripts/{script}, which does not exist")
+                  continue
+              if script not in cache:
+                  cache[script] = declared_flags(source.read_text(encoding="utf-8"))
+              if flag not in cache[script]:
+                  bad.append(f"{path}: scripts/{script} is passed {flag}, "
+                             "which the script never declares")
+          for entry in bad:
+              print(f"::error::workflow/CLI signature drift — {entry}")
+          if bad:
+              sys.exit(1)
+          if not pairs:
+              print("::error::CLI flag check scanned zero workflow script invocations (fail closed)")
+              sys.exit(1)
+          print(f"CLI flag check OK: {len(pairs)} workflow-passed flags are declared by their scripts")
+          PY
+
       - name: Assert every non-local action reference is pinned to a 40-hex commit
         run: |
           set -euo pipefail
