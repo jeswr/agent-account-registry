@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 590,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f0bd29a71a3e0f30c625748e20a22c59c8bfdc99",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The run block uses `set -uo pipefail` rather than `set -euo pipefail`. Consequently, a nonzero exit from `alert_route.py --self-test` or `retriage-alert.py --self-test` does not stop the step; the following command runs, and if that final command returns zero the step is green. A broken routing or alert regression can therefore pass the production alert job despite the explicit preflight checks.",
+    "file": ".github/workflows/retriage.yml",
+    "fix_hint": "Enable errexit for this run block (or explicitly chain/check each command) so either self-test failure prevents the emitter invocation from producing an apparently successful step.",
+    "severity": "major",
+    "title": "Alert script and router self-test failures are swallowed"
+   },
+   {
+    "body": "The only alert step has `continue-on-error: true`. When `retriage-alert.py` returns 1 because listing, creating, editing, commenting, or closing failed, GitHub permits the job to complete successfully. That contradicts the script's stated fail-loud contract and leaves the original silent-outage mode intact: retriage can fail while its alert delivery also fails, yet no alert job/run failure is exposed as a durable signal.",
+    "file": ".github/workflows/retriage.yml",
+    "fix_hint": "Remove step-level `continue-on-error` so delivery failures make `retriage-alert` fail. Job isolation is already provided by the separate `needs`/`always()` alert job; failing this job cannot retroactively affect the retriage sweep.",
+    "severity": "major",
+    "title": "continue-on-error makes hard alert failures invisible at job level"
+   }
+  ],
+  "progress": null,
+  "summary": "The new alert path is not actually fail-loud. Its workflow shell deliberately omits errexit, so either self-test can fail without preventing the emitter from running, and the whole step is marked continue-on-error, which converts even a checked emitter failure into a successful job conclusion. This defeats the stated purpose of making a broken retriage alert leg observable. The routing, decision matrix, dedupe marker, and wiring tests are otherwise substantive.",
+  "verdict": "request_changes"
+ }
+}
