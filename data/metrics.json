@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-25T00:01:35Z",
+  "generated_at": "2026-07-25T00:03:14Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -45,18 +45,5 @@
       "net_pr_flow": 0.0
     }
   },
-  "alerts": [
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "backlog-growing",
-      "fire": true,
-      "summary": "open PRs 24 > 12 and net PR flow +0.0/hr (open 2.0 > close 2.0) sustained over 2 snapshots",
-      "metrics": {
-        "prs_open": 24,
-        "net_pr_flow": 0.0,
-        "pr_open_rate": 2.0,
-        "pr_close_rate": 2.0
-      }
-    }
-  ]
+  "alerts": []
 }
