@@ -1530,11 +1530,20 @@ jobs:
       # an account claim + a runner) until a human flipped the five labels. Hand the PR over here.
       #
       # This is a MACHINE LANE transition, NOT a park: worker-pr.py reads the live hold surface first
-      # and mutates nothing when a human hold (needs:user / review:needs-user) or the #555 machine
-      # capacity park (review:parked) is live. It is idempotent, so a re-run or a concurrent claim
-      # that already flipped the label writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>`
-      # lease enumerate_review_items single-flights on) is released unconditionally by the `release`
-      # job below, which does not depend on this job — the slot is free before the next tick.
+      # (BOTH machine park labels — review:parked on the PR and status:parked on the source issue —
+      # plus the human holds), RE-READS it immediately before writing, and ABORTS the whole hand-over
+      # if any of them landed in between: the park WINS (issue #555) and is never converted into a
+      # human-owned review:needs-user. It is idempotent, so a re-run or a concurrent claim that
+      # already handed over writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>` lease
+      # enumerate_review_items single-flights on) is released unconditionally by the `release` job
+      # below, which does not depend on this job — the slot is free before the next tick.
+      #
+      # `--head-sha` is REQUIRED and load-bearing (round-2 finding 1): the label flip ALONE only
+      # relocates the spin, because a completed request-changes review left `sparq-reviewed-sha ==
+      # head` and a DRAFTED PR carrying that marker is not re-emitted as needs-review — a green gate
+      # instead dispatches a review run whose resolve step exits `already_done` with no work done,
+      # and a pending gate leaves NO lane owning the PR. This is the head the verdict was proved NOT
+      # bound to, so its reviewed-sha assertion is retracted and the review lane provably takes over.
       - name: Hand a deferred fix back to the review lane (unbound/stale verdict)
         if: ${{ inputs.mode == 'fix' && needs.run.outputs.verdict_staged == 'false' && needs.run.outputs.verdict_stale_reason != '' }}
         env:
@@ -1547,6 +1556,7 @@ jobs:
             --repo "${{ inputs.target_repo }}" \
             --pr "${{ inputs.pr_number }}" \
             --issue "${{ needs.resolve.outputs.issue }}" \
+            --head-sha "${{ needs.resolve.outputs.head_sha }}" \
             --stale-reason "$STALE_REASON"
 
   # Escalate an unresolvable inverse chain to a human immediately (never silent-queue): if the

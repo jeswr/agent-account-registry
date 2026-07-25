@@ -3905,6 +3905,14 @@ def _review_fix_workflow_values():
             "verdict_stale_reason: ${{ steps.stage-verdict.outputs.stale_reason }}" in run_span,
         "outcome_if": outcome_if.group(1),
         "outcome_hands_over": "worker-pr.py fix-lane-defer" in outcome_span,
+        # Round-2 finding 1: the hand-over must also be told WHICH head the verdict was not bound
+        # to, or it can only flip the label and the spin relocates into the review lane's
+        # already_done exit. The CLI makes --head-sha required, so a workflow that stops passing it
+        # fails the step loudly — but pin the wiring statically too, since a red step every tick is
+        # still a regression this gate should catch before merge.
+        "outcome_passes_head_sha": bool(re.search(
+            r"fix-lane-defer(?:[^\n]|\n)*?--head-sha \"\$\{\{ needs\.resolve\.outputs\.head_sha "
+            r"\}\}\"", outcome_span)),
         "release_if": release_if.group(1),
         "release_needs": release_needs.group(1),
     }
@@ -3978,6 +3986,10 @@ def _self_test():
         f"{_wf['outcome_if']}")
     assert _wf["outcome_hands_over"], (
         "review-fix.yml outcome job must invoke worker-pr.py fix-lane-defer (#560)")
+    assert _wf["outcome_passes_head_sha"], (
+        "review-fix.yml outcome job must pass --head-sha to fix-lane-defer (#560 round-2 finding "
+        "1): without the disproved head the stale reviewed-sha assertion cannot be retracted and "
+        "the hand-over only RELOCATES the spin into the review lane's already_done exit")
     # The claim/lease release must not depend on the hand-over: it frees `fix:<repo>#<pr>` on
     # EVERY path (always() + acquired) from a job that does not `needs:` the outcome job, so a
     # deferred fix never holds the per-PR single-flight lease into the next tick.
@@ -4980,45 +4992,114 @@ def _self_test():
                     login="human", labels=["review:changes"])],
         provenance, [], issue_labels, now) == []
 
-    # ---- issue #560 SPIN CLOSURE (cross-script, end-to-end) --------------------------------
+    # ---- issue #560 OWNERSHIP TRANSFER (cross-script, end-to-end, across every CI state) -----
     # The FIX lane spun on unbound legacy verdicts: the fixer refused to stage a verdict that is
     # not bound to the live head, deferred "to a fresh review", and left review:changes on the
     # PR — so THIS enumerator re-admitted it as needs-fix on every ~8min dispatch tick while the
     # review lane (keyed on review:needs) never saw it. Live 2026-07-24: sparq#3523/#3542/#3572/
     # #3573/#3608 burned ~35 fix runs/hour that way until the labels were flipped by hand.
-    # Drive the REAL post-defer label projection out of worker-pr.py and assert this enumerator's
-    # verdict on it: the fix lane must NOT re-admit the PR, and the review lane must own it.
-    # Deleting the transition from worker-pr.fix_lane_defer* flips these red.
+    #
+    # ROUND-2 FINDING 1: a LABEL FLIP ALONE ONLY RELOCATES THAT SPIN. The production state is a
+    # COMPLETED request-changes review, so the PR body carries `sparq-reviewed-sha == head` (the
+    # marker is bound LAST in review-fix.yml's outcome job). A DRAFTED PR whose marker matches the
+    # live head is NOT re-emitted as needs-review by the block above; what happens instead depends
+    # entirely on CI — green becomes `stranded` (whose review dispatch then exits `already_done`
+    # with no work done: the same successful spin one lane over), red becomes needs-ci-fix (the fix
+    # lane again), and pending/unknown matches nothing at all, leaving NO lane owning the PR.
+    #
+    # So assert OWNERSHIP, not a label: drive the REAL post-defer PR state (labels AND reviewed-sha
+    # marker) out of worker-pr.py's projections and require, for EVERY CI state, exactly ONE item
+    # owned by the REVIEW lane. Every fixture carries the marker. The label-only counterfactual is
+    # asserted right below it, so none of this is vacuous: deleting either half of the hand-over —
+    # the label transition or the marker retraction — flips these red.
     _worker_pr = _load_module(
         "registry_worker_pr", Path(__file__).resolve().with_name("worker-pr.py"))
+    _bound_body = f"desc\n\n<!-- sparq-reviewed-sha:{sha_a} -->\n"
+
+    def _ci_states():
+        """The four CI postures the ownership proof must hold over. `None` is the UNKNOWN posture
+        (no snapshot at all — a degraded/absent check-run read); a stale head_sha collapses to the
+        same thing inside the enumerator."""
+        base = {"head_sha": sha_a, "conflicting": False, "armed": False, "failing_legs": []}
+        return {
+            "green": {41: {**base, "gate": "success"}},
+            "red": {41: {**base, "gate": "failure", "failing_legs": ["workspace clippy"]}},
+            "pending": {41: {**base, "gate": "pending"}},
+            "unknown": None,
+        }
+
     _spun = pull(41, "sparq-agent/issue-7-1-1", sha_a,
-                 labels=[_worker_pr.FIX_LANE_PR_LABEL])
-    assert [item["state"] for item in enumerate_review_items(
-        repo, [_spun], provenance, [], issue_labels, now)] == ["needs-fix"], "pre-defer lane"
+                 labels=[_worker_pr.FIX_LANE_PR_LABEL], body=_bound_body)
+    for _ci, _status in _ci_states().items():
+        assert [item["state"] for item in enumerate_review_items(
+            repo, [_spun], provenance, [], issue_labels, now, pr_status=_status)] == \
+            ["needs-fix"], ("pre-defer lane", _ci)
     for _reason in _worker_pr.FIX_LANE_DEFER_REASONS:
         _action = _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL})
         _after = sorted(_worker_pr.fix_lane_defer_labels(
             {_worker_pr.FIX_LANE_PR_LABEL}, _action))
-        # The hand-over removed the fix lane's admission label...
+        _marker = _worker_pr.fix_lane_defer_marker_action(_action, sha_a, sha_a)
+        # The hand-over removed the fix lane's admission label AND retracted the stale marker.
         assert _worker_pr.FIX_LANE_PR_LABEL not in _after, (_reason, _after)
-        _handed = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=_after)
-        _states = [item["state"] for item in enumerate_review_items(
-            repo, [_handed], provenance, [], issue_labels, now)]
-        # ...so the next enumeration pass never re-admits it to the FIX lane (the spin closes),
-        # and the REVIEW lane picks it up to produce the head-bound verdict the fixer needs.
-        assert "needs-fix" not in _states, (_reason, _after, _states)
-        assert _states == ["needs-review"], (_reason, _after, _states)
-    # A hold/park defers WITHOUT a lane change (the park itself already excludes the PR from both
-    # lanes, so the spin cannot recur): review:parked keeps it out of this enumerator entirely.
+        assert _marker == "invalidate", (_reason, _marker)
+        _handed_sha = _worker_pr.UNBOUND_REVIEWED_SHA
+        _handed = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=_after,
+                       body=f"desc\n\n<!-- sparq-reviewed-sha:{_handed_sha} -->\n")
+        for _ci, _status in _ci_states().items():
+            _items = enumerate_review_items(repo, [_handed], provenance, [], issue_labels, now,
+                                            pr_status=_status)
+            _states = [item["state"] for item in _items]
+            # EXACTLY ONE lane owns the PR, and it is the REVIEW lane — the only lane that can
+            # mint the head-bound verdict the fixer refuses to run without. No CI state may leave
+            # the PR ownerless, and none may hand it back to the fix lane.
+            assert _states == ["needs-review"], (_reason, _ci, _after, _states)
+            assert _review_item_lane(_states[0]) == "review", (_reason, _ci, _states)
+            assert "needs-fix" not in _states, (_reason, _ci, _after, _states)
+        # The review lane then provably TAKES ownership at review-fix.yml's own admission
+        # boundary: execute the ACTUAL `already_done` predicate embedded in its resolve step
+        # against the post-defer body. A retained marker would make it skip without working.
+        _rf_source = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                      / "review-fix.yml").read_text(encoding="utf-8")
+        _ad_start = _rf_source.index("          already_done = False\n")
+        _ad_end = _rf_source.index("\n          # REGISTRY provenance", _ad_start)
+        _ad_src = textwrap.dedent(_rf_source[_ad_start:_ad_end])
+        for _body, _want in ((_bound_body, True), (_handed["body"], False)):
+            _ns = {"re": re, "mode": "review", "head_sha": sha_a, "pull": {"body": _body}}
+            exec(_ad_src, _ns)  # noqa: S102 — repository-owned workflow source
+            assert _ns["already_done"] is _want, (_reason, _want, _body)
+    # NON-VACUITY / counterfactual: the round-1 fix (flip the label, KEEP the marker) does NOT
+    # transfer ownership. It only moves the spin — green strands (whose review dispatch exits
+    # already_done), red returns to the fix lane, and pending/unknown owns nothing at all.
+    _label_only = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                       labels=[_worker_pr.REVIEW_LANE_PR_LABEL], body=_bound_body)
+    _relocated = {_ci: [item["state"] for item in enumerate_review_items(
+        repo, [_label_only], provenance, [], issue_labels, now, pr_status=_status)]
+        for _ci, _status in _ci_states().items()}
+    assert _relocated == {"green": ["stranded"], "red": ["needs-ci-fix"],
+                          "pending": [], "unknown": []}, _relocated
+    # A hold/park defers WITHOUT a lane change or a marker write (the park itself already excludes
+    # the PR from both lanes, so the spin cannot recur): review:parked keeps it out entirely.
     _parked_after = sorted(_worker_pr.fix_lane_defer_labels(
         {_worker_pr.FIX_LANE_PR_LABEL}, "hold"))
     assert _parked_after == [_worker_pr.FIX_LANE_PR_LABEL], _parked_after
-    assert enumerate_review_items(
-        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a,
-                    labels=_parked_after + [MACHINE_PARK_PR_LABEL])],
-        provenance, [], issue_labels, now) == []
-    print("  ok   #560: the unbound-verdict defer hand-over closes the fix-lane spin "
-          "(review:changes -> review:needs; no needs-fix re-admission)")
+    assert _worker_pr.fix_lane_defer_marker_action("hold", sha_a, sha_a) == "keep"
+    for _ci, _status in _ci_states().items():
+        assert enumerate_review_items(
+            repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, body=_bound_body,
+                        labels=_parked_after + [MACHINE_PARK_PR_LABEL])],
+            provenance, [], issue_labels, now, pr_status=_status) == [], _ci
+    # ...and finding 2's abort leaves the parked PR byte-identical on BOTH axes: the park is never
+    # converted into review:needs-user and the marker is never touched.
+    _aborted = sorted(_worker_pr.fix_lane_defer_labels(
+        {_worker_pr.FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL},
+        _worker_pr.FIX_LANE_ABORT_ACTION))
+    assert _aborted == [_worker_pr.FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL], _aborted
+    assert "review:needs-user" not in _aborted, _aborted
+    assert _worker_pr.fix_lane_defer_marker_action(
+        _worker_pr.FIX_LANE_ABORT_ACTION, sha_a, sha_a) == "keep"
+    print("  ok   #560: the unbound-verdict defer transfers OWNERSHIP to the review lane in every "
+          "CI state (label flip + stale reviewed-sha retraction; no needs-fix re-admission, no "
+          "already_done skip, no ownerless posture) and a park aborts it untouched")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
