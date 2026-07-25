@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 630,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0e681cbe3b491528e73125c0c16bd3c4fd1360ef",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The reverify step unsets LD_PRELOAD and LD_LIBRARY_PATH inside its run block, which is too late: the runner must start bash before executing that line, and the dynamic loader processes a persisted LD_PRELOAD first. An attacker-controlled constructor can read GITHUB_OUTPUT, hash the readable pinned trust-gate snapshot to obtain the expected value, append verified=<digest>, and exit the shell successfully before reverify. That satisfies outcome == success, verified != '', and equality with the pin output. The gate-step quarantine does not establish otherwise: GITHUB_ENV/GITHUB_PATH are runner-provided GITHUB_* default variables and a YAML step env assignment is not demonstrated to replace the runner's actual file-command paths. The added test only greps for those assignments; it never runs a real Actions step and observes that writes are excluded from later-step state.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Make the verifier launch immune before its first process starts: run it through a trusted wrapper/process boundary whose environment is constructed by the runner with LD_PRELOAD/LD_LIBRARY_PATH and other loader/interpreter startup variables absent, or isolate target-controlled gate execution so it cannot access any runner command channel. Do not rely on overriding protected GITHUB_ENV/GITHUB_PATH names without an end-to-end Actions-runner proof. Add a negative test at the actual runner boundary that has gate code attempt to persist LD_PRELOAD and proves the next step neither loads the library nor produces the verified output unless live reverify completes.",
+    "severity": "blocker",
+    "title": "Pre-shell LD_PRELOAD can forge the positive publish attestation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The positive attestation closes the earlier BASH_ENV exit-zero shape, but the execution context is still not independently trustworthy. The hardened block clears LD_PRELOAD only after the runner has already started the step shell. If target-controlled gate code persists LD_PRELOAD, its constructor runs before the first line, can read GITHUB_OUTPUT and the pinned snapshot, append the expected verified=<sha256> attestation, and terminate successfully; all publish predicates then pass without live reverification. The proposed GITHUB_ENV/GITHUB_PATH quarantine is not a sufficient root of trust: GITHUB_* default variables are runner-managed/protected, so a step-level env override cannot be assumed to replace the runner file-command path, and the tests merely inspect YAML text rather than exercising an Actions runner to prove that replacement. The prior execution-context blocker therefore remains at blocker severity.",
+  "verdict": "request_changes"
+ }
+}
