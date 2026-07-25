@@ -4002,6 +4002,65 @@ def _review_fix_workflow_values():
     }
 
 
+# The `already_done` idempotence predicate embedded in review-fix.yml's resolve step, addressed by
+# LINE-ANCHORED regexes rather than by exact indentation-bearing literals (#584 follow-up finding 3).
+_RF_ALREADY_DONE_ANCHOR = r"(?m)^[ \t]*already_done = False$"
+_RF_ALREADY_DONE_END = r"(?m)^[ \t]*#[ \t]*REGISTRY provenance"
+
+
+def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None):
+    """Extract a python block VERBATIM out of a review-fix.yml step's `run:` script so a
+    cross-script self-test can execute the WORKFLOW's real predicate instead of a re-implemented
+    copy that can silently drift from it.
+
+    PARSED, not text-sliced (#584 follow-up finding 3). The previous implementation sliced the raw
+    file with two `str.index()` calls on indentation-bearing literals ("          already_done =
+    False\\n"), so ANY reflow of that YAML — re-indenting the job, changing the block-scalar style,
+    moving the step — killed the REQUIRED `gate` check with a bare `ValueError: substring not found`
+    that named neither the file, the anchor, nor what to update. Loading the YAML makes block-scalar
+    indentation the parser's problem (a `run:` scalar comes back already de-indented, so a reflow
+    that preserves the script is invisible here) and EVERY failure mode now raises an ACTIONABLE
+    AssertionError naming the anchor and the edit that fixes it.
+
+    PyYAML is already a hard dependency of the enrolled self-test suite (resolve-conflicts.py's
+    validate_syntax_blob imports it, and its --self-test exercises that path), and pr-gate.yml
+    installs it version+hash-locked BEFORE running the suite — so this adds no new gate dependency.
+
+    `source` (the workflow text) exists so the self-test can feed a REFLOWED copy through and prove
+    the extraction survives it."""
+    import yaml  # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
+    if source is None:
+        path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
+        assert path.is_file(), f"review-fix.yml not found for the {what} pin: {path}"
+        source = path.read_text(encoding="utf-8")
+    try:
+        document = yaml.safe_load(source)
+    except yaml.YAMLError as exc:
+        raise AssertionError(
+            f"review-fix.yml does not parse as YAML, so the {what} pin cannot be derived: "
+            f"{exc}") from None
+    steps = (((document or {}).get("jobs") or {}).get(job) or {}).get("steps")
+    assert isinstance(steps, list), (
+        f"review-fix.yml exposes no jobs.{job}.steps list, so the {what} pin cannot be derived — "
+        f"if the `{job}` job was renamed, re-point the `job=` argument in dispatch-claim.py")
+    matches = [step["run"] for step in steps
+               if isinstance(step, dict) and isinstance(step.get("run"), str)
+               and re.search(anchor, step["run"])]
+    assert len(matches) == 1, (
+        f"expected EXACTLY ONE `run:` step in review-fix.yml's `{job}` job to match the {what} "
+        f"anchor {anchor!r}; found {len(matches)}. The workflow's {what} was moved, renamed or "
+        f"rewritten — re-point the anchor constant in dispatch-claim.py so this cross-script pin "
+        f"keeps EXECUTING the workflow's real code instead of failing on a text address.")
+    run = matches[0]
+    begin = re.search(anchor, run)
+    end = re.search(end_anchor, run[begin.start():])
+    assert end, (
+        f"review-fix.yml's {what} block starts at {anchor!r} but no longer ends at "
+        f"{end_anchor!r} — re-point the end-anchor constant in dispatch-claim.py so the extracted "
+        f"block still stops before the code that follows it.")
+    return textwrap.dedent(run[begin.start():begin.start() + end.start()])
+
+
 def _self_test():
     # _run_gh_target_api MUST return the CompletedProcess on success — callers read .stdout
     # (decline reroute re-read, #505). A missing `return result` made it fall off to None and
@@ -5135,6 +5194,11 @@ def _self_test():
             "unknown": None,
         }
 
+    # ---- #584 FOLLOW-UP FINDING 3: the `already_done` predicate is PARSED out of review-fix.yml,
+    # not text-sliced. Extract it ONCE (the old code re-sliced the raw file inside the reason loop).
+    _ad_src = _review_fix_step_python(
+        _RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END, "already_done idempotence predicate")
+    assert "already_done = False" in _ad_src and "sparq-reviewed-sha" in _ad_src, _ad_src
     _spun = pull(41, "sparq-agent/issue-7-1-1", sha_a,
                  labels=[_worker_pr.FIX_LANE_PR_LABEL], body=_bound_body)
     for _ci, _status in _ci_states().items():
@@ -5165,11 +5229,8 @@ def _self_test():
         # The review lane then provably TAKES ownership at review-fix.yml's own admission
         # boundary: execute the ACTUAL `already_done` predicate embedded in its resolve step
         # against the post-defer body. A retained marker would make it skip without working.
-        _rf_source = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
-                      / "review-fix.yml").read_text(encoding="utf-8")
-        _ad_start = _rf_source.index("          already_done = False\n")
-        _ad_end = _rf_source.index("\n          # REGISTRY provenance", _ad_start)
-        _ad_src = textwrap.dedent(_rf_source[_ad_start:_ad_end])
+        # (Extracted via the PARSED helper — #584 follow-up finding 3 — so a reflow of that YAML
+        # can no longer red this REQUIRED gate with a bare `ValueError: substring not found`.)
         for _body, _want in ((_bound_body, True), (_handed["body"], False)):
             _ns = {"re": re, "mode": "review", "head_sha": sha_a, "pull": {"body": _body}}
             exec(_ad_src, _ns)  # noqa: S102 — repository-owned workflow source
@@ -5207,6 +5268,129 @@ def _self_test():
     print("  ok   #560: the unbound-verdict defer transfers OWNERSHIP to the review lane in every "
           "CI state (label flip + stale reviewed-sha retraction; no needs-fix re-admission, no "
           "already_done skip, no ownerless posture) and a park aborts it untouched")
+
+    # ---- #584 FOLLOW-UP FINDING 1, CROSS-SCRIPT: THE HAND-OVER MUST NOT DISARM A PASSED PR. ------
+    # The fix lane does NOT only admit review:changes: GAP-A emits `needs-ci-fix` from a
+    # concluded-RED gate on the current head alone, review-state-AGNOSTIC. So a NON-DRAFT,
+    # review:pass, ARMED PR with a red gate is routed into the FIX lane, stage-verdict finds no
+    # head-bound FIX verdict and defers — and the pre-fix hand-over retracted the reviewed-sha
+    # marker on it (action "noop": review:changes was never live). enumerate_disarm_items reads
+    # `marker != head` on an ARMED PR as a safety violation, so the very next tick would
+    # disable-auto + dequeue + REDRAFT a passed, armed, ready PR. LIVE at the time of this fix:
+    # sparq#2521 (review:pass + trust-surface, non-draft, --auto armed, `docs-quality quick-gates`
+    # genuinely failing) was the ONLY review:pass PR in the sparq repo and sat on exactly this path.
+    # The hand-over's REAL projection over this namespace drives the fixture — nothing here is
+    # hard-coded to the fixed behaviour, so a regression in worker-pr.py reaches the consequence
+    # assertion below instead of being caught by a restatement of the fix.
+    _pass_labels = {_worker_pr.PASS_LANE_PR_LABEL}
+    _pass_decided = _worker_pr.fix_lane_defer_action(_pass_labels)
+    _pass_after = sorted(_worker_pr.fix_lane_defer_labels(_pass_labels, _pass_decided))
+    _pass_marker = _worker_pr.fix_lane_defer_marker_action(_pass_decided, sha_a, sha_a)
+    _pass_body_sha = (_worker_pr.UNBOUND_REVIEWED_SHA if _pass_marker == "invalidate" else sha_a)
+
+    def _armed_pass_pull(reviewed, labels=None):
+        """The live sparq#2521 posture: non-draft, review:pass, auto-merge armed, marker `reviewed`."""
+        return pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                    labels=_pass_after if labels is None else labels,
+                    body=f"desc\n\n<!-- sparq-reviewed-sha:{reviewed} -->\n")
+
+    _armed_status = {41: {"head_sha": sha_a, "conflicting": False, "armed": True,
+                          "gate": "failure", "failing_legs": ["docs-quality quick-gates"]}}
+    # THE CONSEQUENCE, through the real projection: the post-hand-over PR must NOT be emitted for
+    # disarm. If the hand-over retracts this PR's marker, `_pass_body_sha` becomes `none` and the
+    # safety net fires — disable-auto + dequeue + REDRAFT on a passed, armed, ready PR.
+    _pass_disarm = enumerate_disarm_items(repo, [_armed_pass_pull(_pass_body_sha)], _armed_status,
+                                          provenance, bot_login=bot)
+    assert _pass_disarm == [], (
+        "the fix-lane hand-over's own projection would DISARM + REDRAFT a passed armed PR "
+        f"(marker action {_pass_marker!r} -> reviewed_sha {_pass_body_sha!r}): {_pass_disarm}")
+    assert _pass_decided == _worker_pr.FIX_LANE_PASS_ACTION, _pass_decided
+    assert _pass_after == [_worker_pr.PASS_LANE_PR_LABEL], _pass_after
+    assert _pass_marker == "keep", _pass_marker
+    # NON-VACUITY: the SAME enumerator DOES emit the PR once the marker is retracted, so the
+    # assertion above is a live property of this fixture and not a quiet no-op. This is also the
+    # exact pre-fix behaviour — the old projection took `noop` on this namespace and `noop`
+    # retracts — so the counterfactual is the history, not a straw man.
+    _would_disarm = enumerate_disarm_items(
+        repo, [_armed_pass_pull(_worker_pr.UNBOUND_REVIEWED_SHA)], _armed_status, provenance,
+        bot_login=bot)
+    assert [(item["pr_number"], item["reviewed_sha"]) for item in _would_disarm] == \
+        [(41, _worker_pr.UNBOUND_REVIEWED_SHA)], _would_disarm
+    assert _worker_pr.fix_lane_defer_marker_action("noop", sha_a, sha_a) == "invalidate"
+    # The route in: GAP-A admits this PR to the FIX lane on the red gate ALONE, with no review:changes
+    # anywhere — which is why the hand-over ever ran on it. (Asserted so a future enumerator change
+    # that stops routing passed PRs into the fix lane makes this whole block visibly moot instead of
+    # quietly vacuous.)
+    _pass_admission = [item["state"] for item in enumerate_review_items(
+        repo, [_armed_pass_pull(sha_a)], provenance, [], issue_labels, now,
+        pr_status=_armed_status)]
+    assert _pass_admission == ["needs-ci-fix"], _pass_admission
+    assert _review_item_lane("needs-ci-fix") == "fix", "needs-ci-fix must be a FIX-lane state"
+    # The DISCRIMINATION: the normal review:changes namespace still retracts (asserted above as
+    # _marker == "invalidate"), so the guard is scoped to the pass and did not disable the fix.
+    assert _worker_pr.fix_lane_defer_marker_action(
+        _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL}), sha_a, sha_a) == \
+        "invalidate"
+    print("  ok   #584 f1: the lane hand-over stands down on review:pass — the marker survives, so "
+          "enumerate_disarm_items does NOT disarm+redraft a passed armed PR (the retracted-marker "
+          "counterfactual does), while review:changes still retracts")
+
+    # ---- #584 FOLLOW-UP FINDING 3: A REFLOW OF review-fix.yml MUST NOT RED THIS GATE WITH A BARE
+    # `ValueError: substring not found`. The old extraction addressed the block by two exact
+    # indentation-bearing literals via str.index(). Round-trip the workflow through the YAML parser
+    # to produce a REFLOWED-BUT-EQUIVALENT document (a different serialisation entirely — the old
+    # slice literal is gone from the text) and require the SAME block back. ----
+    import yaml as _yaml  # already a hard self-test-suite dependency (resolve-conflicts.py)
+    _rf_text = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                / "review-fix.yml").read_text(encoding="utf-8")
+    _rf_reflowed = _yaml.safe_dump(_yaml.safe_load(_rf_text), default_flow_style=False, width=4096)
+    assert "          already_done = False\n" not in _rf_reflowed, \
+        "the reflow fixture is vacuous — the old text-slice literal survived it"
+    assert _review_fix_step_python(
+        _RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END, "already_done idempotence predicate",
+        source=_rf_reflowed) == _ad_src, "a reflowed-but-equivalent workflow changed the extraction"
+    # ...and when the anchor is GENUINELY gone the failure is an ACTIONABLE AssertionError naming
+    # the anchor and the edit — never a bare ValueError, and never a silent skip.
+    _rf_broken = _rf_text.replace("already_done = False", "already_done = bool(0)")
+    _rf_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate", source=_rf_broken)
+    except AssertionError as _exc:
+        _rf_error = ("actionable", str(_exc))
+    except ValueError as _exc:                       # the pre-fix failure mode
+        _rf_error = ("bare-valueerror", str(_exc))
+    assert _rf_error is not None, "a missing anchor must FAIL, never pass silently"
+    assert _rf_error[0] == "actionable", _rf_error
+    assert "already_done" in _rf_error[1] and "re-point the anchor" in _rf_error[1] \
+        and "review-fix.yml" in _rf_error[1], _rf_error
+    # A second matching step (an ambiguous address) is just as loud as none.
+    _rf_dupe = _rf_text.replace("          already_done = False\n",
+                                "          already_done = False\n          already_done = False\n")
+    _rf_dupe_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate", source=_rf_dupe)
+        _rf_dupe_extract = "extracted"
+    except AssertionError as _exc:
+        _rf_dupe_error, _rf_dupe_extract = str(_exc), "raised"
+    # Two anchors inside ONE step is still one matching step, so extraction succeeds — the
+    # ambiguity that must be loud is two matching STEPS.
+    assert _rf_dupe_extract == "extracted", _rf_dupe_error
+    _rf_two_steps = _yaml.safe_load(_rf_text)
+    _rf_two_steps["jobs"]["resolve"]["steps"].append(
+        {"name": "a copy of the predicate", "run": _ad_src})
+    _rf_two_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate",
+                                source=_yaml.safe_dump(_rf_two_steps, width=4096))
+    except AssertionError as _exc:
+        _rf_two_error = str(_exc)
+    assert _rf_two_error and "found 2" in _rf_two_error, _rf_two_error
+    print("  ok   #584 f3: review-fix.yml's already_done predicate is PARSED (a reflowed-equivalent "
+          "workflow yields the identical block) and every missing/ambiguous anchor raises an "
+          "actionable AssertionError instead of a bare ValueError")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
