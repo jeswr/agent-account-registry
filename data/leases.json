@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "dc2d751954080e13",
-   "claim_id": "a07f80445112449197e4b53984d6fda4",
-   "holder": "review:jeswr/agent-account-registry#626@dispatch-30161706167.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1784989948,
-   "expires_at": 1784994148
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "612d3e67636b4978b20a935e54963abf",
    "holder": "review:jeswr/agent-account-registry#630@dispatch-30161706167.1",
    "package": "worker",
