@@ -31,10 +31,23 @@ jobs:
       - name: Verify retriage planner
         run: python3 scripts/retriage.py --self-test
 
+      # BOTH directions of the drift sweep (#586) share ONE snapshot and ONE apply path, so the
+      # promotion lane and the re-park lane can never drift apart:
+      #   * status:untriaged -> promote once the label set is triage-complete (#415).
+      #   * status:ready     -> re-park/repair once the readiness engine provably cannot enumerate
+      #                         it (the label-lost half of #178: nothing on master recovered it).
+      # The board is fetched page by page with an explicit REQUEST ceiling (max_pages below), and
+      # completeness is proved by reading until a page comes back short — a board too large for the
+      # ceiling fails the step closed rather than being swept partially. `retriage.py --snapshot`
+      # then validates the SHAPE of those pages (fail closed, non-zero, so `set -e` aborts before
+      # any write) and hands back THIS run's window: an explicit per-run cap whose offset ROTATES
+      # by the run number, so a capped board cannot starve its tail (#605 review findings 1 + 2).
+      #
       # PR #595 findings 3 + 6. The sweep no longer touches labels itself: it plans NOTHING and
       # mutates NOTHING in shell. `scripts/retriage.py --apply` owns the whole
       # read -> plan -> add-and-verify -> strip -> revision-bound post-read -> repair sequence
-      # (the same applier `triage.py --apply` uses), because the previous shell version:
+      # for EVERY lane above (the same applier `triage.py --apply` uses), because the previous
+      # shell version:
       #   * sent the adds AND removals through ONE opaque `gh issue edit` with no proof that the
       #     replacement `role:*` label exists or landed before the incumbent was stripped — the
       #     exact #582 shape (add fails, strip succeeds, issue ends status:ready with no role);
@@ -47,14 +60,19 @@ jobs:
       # the loop. Every READ goes through the shared bounded-retry layer; MUTATIONS stay
       # single-attempt + fail-loud inside the applier (gh_retry's hard scope rule).
       # scripts/retriage.py --self-test statically asserts all of this against this file.
-      - name: Sweep at most 40 untriaged issues
+      - name: Sweep the untriaged and status:ready boards (at most 80 issues)
+        # `id:` so retriage.py's self-test can EXTRACT and EXECUTE this exact step body against a
+        # stubbed `gh_retry`/applier (#605 review round 2): the pagination ceiling, the
+        # completeness proof, the page-shape guard and the truncation break are SHELL guards, and
+        # every one of them survived the previous purely-textual assertions.
+        id: sweep
         run: |
           set -euo pipefail
           tmp="$RUNNER_TEMP/retriage"
           mkdir -p "$tmp"
           # Shared bounded-retry layer for IDEMPOTENT READS (scripts/gh_retry.py — one tuned copy,
           # registry #563 item 4): a transient 5xx/429/secondary-403 blip on the label-set oracle,
-          # the issue list, or a permission probe costs a bounded retry instead of the whole tick.
+          # the board pages, or a permission probe costs a bounded retry instead of the whole tick.
           # Its `read` CLI structurally refuses anything that is not a read, so a mutation can never
           # acquire replay semantics by being routed through this wrapper.
           gh_read() { python3 scripts/gh_retry.py read "$@"; }
@@ -62,9 +80,54 @@ jobs:
           # of a label that does not exist (nor a strip of the last role:* label for one). Without
           # it, `role:soundness` — absent from this repo — stranded promoted issues role-less.
           known=$(gh_read label list -R "$REPO" --limit 500 --json name --jq '[.[].name]|join(",")')
-          gh_read issue list -R "$REPO" --state open --label status:untriaged --limit 40 \
-            --json number,author,body,labels,updatedAt > "$tmp/untriaged.json"
-          jq -c 'sort_by(.updatedAt) | .[]' "$tmp/untriaged.json" > "$tmp/issues.jsonl"
+          # #605 review finding 2: `--paginate --slurp` pulled EVERY page into a file BEFORE any
+          # ceiling could look at it, so the "runaway ceiling" bounded neither requests nor memory
+          # — it only refused to mutate afterwards — and a genuinely TRUNCATED sequence was
+          # undetectable (a well-formed board missing its last page reads exactly like a short
+          # board). Page explicitly instead, with a REAL request ceiling, and prove completeness the
+          # only way the API offers: keep going until a page comes back short. A board that does not
+          # fit inside the ceiling fails the step CLOSED — a board we could not read completely must
+          # never be mistaken for "nothing to do".
+          max_pages=20     # retriage.SWEEP_MAX_PAGES * 100 issues per label lane
+          for label in status:untriaged status:ready; do
+            lane=${label#status:}
+            page=1
+            while : ; do
+              out="$tmp/page-$lane-$page.json"
+              gh_read api "repos/$REPO/issues?state=open&labels=$label&per_page=100&page=$page" \
+                > "$out"
+              # #605 review round 2: the previous claim here — "a non-array payload fails here,
+              # under set -e" — was simply FALSE. `jq 'length'` accepts objects, strings and null
+              # (2 / 9 / 0 respectively), so an error document like {"message":"Not Found"} scored
+              # 2, compared `-lt 100`, broke out of the loop and was swept as a complete board.
+              # The type IS the guard now, and it is asserted by an executed self-test row.
+              if ! jq -e 'type == "array"' "$out" > /dev/null; then
+                echo "::error::the $label board page $page is not a JSON array — refusing to sweep a board this run could not read (fail closed)"
+                exit 1
+              fi
+              got=$(jq 'length' "$out")
+              if [ "$got" -lt 100 ]; then
+                break
+              fi
+              if [ "$page" -ge "$max_pages" ]; then
+                echo "::error::the $label board is larger than ${max_pages} pages (>= $((max_pages * 100)) issues) — refusing to sweep a board this run could not read completely (fail closed)"
+                exit 1
+              fi
+              page=$((page + 1))
+            done
+          done
+          # Each page file is already a JSON array, so slurping them yields the list-of-pages shape
+          # `--snapshot` validates. Glob order is irrelevant: it flattens and re-orders by number.
+          jq -s '.' "$tmp"/page-*.json > "$tmp/pages.json"
+          # --rotation makes the per-run window ROTATE (#605 review finding 1): a fixed
+          # oldest-updated window filled with permanent no-op skips and starved the rest of the
+          # board forever. GITHUB_RUN_NUMBER is monotonic per workflow, so consecutive runs advance
+          # the window over a stable (issue-number) ordering with no cursor state to persist. The
+          # windows are NOT disjoint unless the cap divides the board (#605 review round 4): the
+          # wrapping window re-visits the head. What is guaranteed is coverage of an unchanged board
+          # within ceil(total/cap) runs — progress, not a per-issue deadline.
+          python3 scripts/retriage.py --snapshot --cap 80 --rotation "$GITHUB_RUN_NUMBER" \
+            < "$tmp/pages.json" > "$tmp/issues.jsonl"
 
           failed=0
           while IFS= read -r issue; do
@@ -75,6 +138,9 @@ jobs:
               permission=$(gh_read api "repos/$REPO/collaborators/$author/permission" \
                 --jq .permission 2>/dev/null || echo none)
             fi
+            # ONE call per issue for ALL THREE lanes: the applier re-reads the live labels, plans
+            # (promote / repark / repair, else skip) and mutates fail-closed. It PRINTS the decision,
+            # so a skip stays attributable without the shell ever deciding anything itself.
             if python3 scripts/retriage.py --apply --repo "$REPO" --number "$number" \
                  --maintainer "$MAINTAINER_LOGIN" --app-bot "$APP_BOT_LOGIN" \
                  --permission "$permission" --known-labels "$known" <<<"$issue"; then
