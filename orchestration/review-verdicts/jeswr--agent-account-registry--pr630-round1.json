@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 630,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ce09bed71f1ba6394e40ad1b05fa05bff511833d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The local gate runs target-controlled cargo build scripts directly on the host, and the diff itself acknowledges those scripts can rewrite runner files. After that gate, republish-trust invokes `python3 registry/scripts/worker-issue.py reverify`. Only the nested `trust-gate.py` argument was snapshotted and digest-checked; the Python driver that performs all live author/body/label/claim checks and decides whether to invoke that verifier remains in `registry/` and is writable by the hostile build script via `../registry/scripts/worker-issue.py`. Replacing it with a program that exits zero makes `steps.republish-trust.outcome` successful and opens the PR with no re-attestation. The self-tests check that the pinned verifier path appears, but contain no assertion proving the reverify driver and its imported policy dependencies are immutable after target code executes.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Make the complete pre-publish verifier trust root unavailable to target-controlled host code: for example, snapshot and integrity-bind the reverify driver plus every imported policy dependency before the model/gate, then execute only those verified bytes from a protected context; or isolate the target gate so it cannot write the registry checkout or verifier snapshot. Add a negative test that simulates target code replacing `registry/scripts/worker-issue.py` (and relevant imports) after the gate and proves publication remains blocked.",
+    "severity": "blocker",
+    "title": "Pre-publish reverification executes an unpinned, target-writable driver"
+   }
+  ],
+  "progress": null,
+  "summary": "The new live re-attestation is bypassable by the candidate code it is intended to constrain. Although trust-gate.py is copied and digest-bound before the model runs, the pre-publish step still executes registry/scripts/worker-issue.py from the mutable runner filesystem after a target-controlled host-side cargo gate. A malicious target build script can replace that driver and make the subsequent reverify command succeed without checking the issue, claim, or pinned verifier. The added tests assert only the trust-gate path and therefore do not exercise this trust-root gap.",
+  "verdict": "request_changes"
+ }
+}
