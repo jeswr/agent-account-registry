@@ -310,6 +310,35 @@ from the `data/model-health.json` records the worker/review outcome jobs already
   `::warning::`), never the exemption — the backoff is an optimization and must not reintroduce
   fail-closed starvation.
 
+### Credential-outage exits are not declines (issue #596)
+
+A model launch that dies on the **worker account's credential or capacity** — exit class `auth`,
+`rate-limit`, `session-limit`, or `billing` — is a **credential outage**, not a model decline. The
+model never read the task or the diff, so there is no judgment to charge for. Two consequences,
+both wired through machinery that already existed:
+
+- **No round or attempt is consumed.** The review round marker (`worker-pr.py round-record`) and
+  the worker attempt receipt (`worker-issue.py record-attempt`) are both written *before* the model
+  launches, for bounded-crash accounting. On a credential-outage exit the run now records a **void**
+  for its own `(round, run)` / run key (`round-void` / `void-attempt`, gated by the single shared
+  predicate `worker-pr.is_credential_outage`), and `count_rounds` / `count_attempts` subtract it —
+  so `decide_budget` and the deferred-retry budget see that **no round happened**. `setup` and
+  `unknown` are deliberately **still charged**: an unattributable failure must keep exhausting the
+  budget, or a deterministic crash loop becomes unbounded.
+- **No ladder advances.** The repeated-decline escalation (`DECLINE_ESCALATION_MIN`) and the
+  capped-account discriminator (`NO_CHANGE_LIMIT_MIN`) both key strictly on `no_change`, so `auth`
+  records can never reach them — and `make_record` refuses to attach the no-change evidence fields
+  to an `auth` record at all.
+
+After `AUTH_COOLDOWN_MIN` (**2**) consecutive `auth` outcomes for one account with no interleaved
+success, `model-health.auth_cooldowns` puts that account into a **bounded credential cooldown** —
+delivered through the *same* `account_backoffs` → `backoff_until` overlay described above, for
+`AUTH_COOLDOWN_SECONDS` (**15 min**, single-step, never doubling) — and raises the `ops-alert`
+condition `account-auth-cooldown`, naming the **salted fingerprint only** plus the required
+maintainer action (re-mint the setup-token). It is deliberately a **cooldown, not a disable**: the
+account may be the fleet's only cross-provider review account, and zero reviews is worse than a
+partial success rate.
+
 ## Security posture
 
 - Tokens: only in GitHub secrets (encrypted at rest, masked in logs), and only in the

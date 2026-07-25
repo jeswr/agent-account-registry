@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan one safe, idempotent retriage mutation from an issue JSON document.
+"""Plan AND apply one safe, idempotent retriage mutation from an issue JSON document.
 
 TWO DIRECTIONS, ONE CLASSIFIER (issue #586). The sweep that shipped for #415 was one-directional
 — it only promoted `status:untriaged` — so an issue that LOST a required triage label while
@@ -24,6 +24,21 @@ no-op skip. Park policy is load-bearing and checked BEFORE any classification: a
 any `needs:*` / `trust:untrusted` gate, an `<!-- orchestration:hold -->` marker, the
 dispatcher-owned `status:deferred`, the machine-owned `status:parked`, a claim-owned
 `status:in-progress[-review]`, and `kind:epic` are all skipped, never re-parked.
+
+ONE APPLIER FOR ALL THREE ACTIONS (PR #595 finding 3). `--apply` owns the whole
+read -> plan -> mutate -> verify sequence for every accepted action above, through the SAME
+fail-closed applier `triage.py --apply` uses (triage.apply_triage). retriage.yml previously
+sent the additions AND removals through one opaque `gh issue edit` in the workflow shell:
+  * nothing verified that the replacement `role:*` label EXISTS or LANDED before the strip;
+  * on a partial failure `set -e` exited the step, SKIPPING the post-read entirely;
+  * when the post-read did fire and saw zero roles it merely `exit 1`-ed — leaving the issue
+    `status:ready` with no role, the terminal #582 state retriage itself cannot revisit;
+  * its check ACCEPTED multiple roles, which route-resolve rejects (AmbiguousRoleError).
+The applier now adds + verifies the replacement first, keeps the incumbent role on any failure,
+asserts EXACTLY ONE role in a revision-bound post-read, and repairs — or demotes `status:ready` to
+`status:untriaged` so the next retriage tick owns the issue — instead of stranding it. The re-park
+and repair lanes ride the very same sequence: a repair ADDS the re-derived `role:*`, which is
+exactly the add-must-land-first shape #582 is about.
 """
 import argparse
 import importlib.util
@@ -53,6 +68,9 @@ TRUSTED_PERMISSIONS = {"admin", "maintain", "write"}
 # Claim-owned states: groom's orphan/lease repair owns these, never this sweep (a re-park here
 # would race a live worker and strip the claim its PR is bound to).
 CLAIM_OWNED = {"status:in-progress", "status:in-progress-review"}
+# The actions that WRITE. `--apply` mutates for each of them through the one shared applier; every
+# other verdict is a no-op skip (fail-closed: an unknown action never becomes a write).
+WRITING_ACTIONS = ("promote", "repark", "repair")
 NON_DISPATCHABLE = _ready.NON_DISPATCHABLE            # kind:epic
 # Bounded, rate-limit-safe sweep: an explicit per-run write cap and a runaway ceiling on the
 # paginated snapshot. A partial page must never be mistaken for the whole board.
@@ -64,7 +82,13 @@ class SweepError(RuntimeError):
     """A snapshot this sweep refuses to act on (runaway size, or a partial/malformed page)."""
 
 
-def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
+def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
+         known_labels=None):
+    """`known_labels` (optional): the target repo's ACTUAL label set. Supplying it makes the role
+    transition fail-closed (registry #582) — the classifier never plans an add of a label the repo
+    does not have, and never plans a strip of the last role label for one. Without a role the
+    classifier reports not-ready, so this path skips the issue as `classifier-incomplete` rather
+    than promoting it to a role-less `status:ready` (silently undispatchable, unrecoverable)."""
     labels = {item["name"] if isinstance(item, dict) else item
               for item in issue.get("labels", [])}
     author = (issue.get("author") or {}).get("login", "")
@@ -94,10 +118,15 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
     if not untriaged and "status:ready" not in labels:
         return {"action": "skip", "reason": "not-retriageable"}
     try:
-        result = classify(labels, "task", trusted=True)
+        result = classify(labels, "task", trusted=True, known_labels=known_labels)
     except Exception:
         return {"action": "skip", "reason": "classifier-failure"}
     add, remove = set(result["add"]), set(result["remove"])
+    # `role` is the INTENDED single role and rides EVERY accepted action: `--apply` needs it to add
+    # and VERIFY the replacement before any strip (PR #595 findings 3 + 4). It is load-bearing on
+    # the #586 lanes too — the repair lane's whole job is writing back the `role:*` the issue lost,
+    # and the re-park lane may re-route an incumbent role on its way out of `status:ready`.
+    role = result["role"]
     if untriaged:
         if not result["ready"]:
             # A CONTRADICTORY dual-status issue (`status:untriaged` alongside a stale
@@ -106,10 +135,16 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
             # promotion lane only ever writes when the classifier says complete. Strip it, from
             # the SAME classifier verdict the re-park lane uses.
             if "status:ready" in remove:
-                return {"action": "repark", "add": [], "remove": sorted(remove)}
+                return {"action": "repark", "add": [], "remove": sorted(remove), "role": role}
             return {"action": "skip", "reason": "classifier-incomplete"}
         remove.update(labels.intersection({"status:untriaged"}))
-        return {"action": "promote", "add": sorted(add), "remove": sorted(remove)}
+        # registry #582 belt-and-braces: never emit a promotion whose post-state has no role:*
+        # label — that state is silently undispatchable and, once `status:untriaged` is gone,
+        # unreachable by the promotion lane that would repair it.
+        post = (labels | add) - remove
+        if not any(label.startswith("role:") for label in post):
+            return {"action": "skip", "reason": "role-invariant"}
+        return {"action": "promote", "add": sorted(add), "remove": sorted(remove), "role": role}
 
     # ---- the #586 lane: a `status:ready` issue the readiness engine cannot enumerate ----
     if _ready.exclusion_reason(labels) is None and result["ready"]:
@@ -131,7 +166,7 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
         # re-derives the role). Repair in place — strictly better than a re-park, which would need
         # a human to do what the classifier already proved. Non-empty by construction: an empty
         # drift would leave `projected == labels`, which the branch above already returned on.
-        return {"action": "repair", "add": sorted(add), "remove": sorted(remove)}
+        return {"action": "repair", "add": sorted(add), "remove": sorted(remove), "role": role}
     if not result["ready"]:
         # `needs:area` is deliberately NOT minted here even though triage() parks a no-area issue
         # with it: this sweep SKIPS every gated issue, so writing that gate would strand the issue
@@ -142,7 +177,7 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage):
             # triage() always parks a not-ready issue this way; a drifted classifier that does not
             # is unproven input, so do nothing.
             return {"action": "skip", "reason": "classifier-inconsistent"}
-        return {"action": "repark", "add": sorted(add), "remove": sorted(remove)}
+        return {"action": "repark", "add": sorted(add), "remove": sorted(remove), "role": role}
     # The classifier calls the label set complete yet the engine still cannot enumerate it (e.g.
     # `status:blocked`, or an open blocker). Nothing is PROVEN about triage, so do nothing.
     return {"action": "skip", "reason": "unprovable"}
@@ -200,6 +235,47 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING):
     return issues[:cap], max(0, len(issues) - cap)
 
 
+def apply_decision(current, decision, edit, view, read_state=None, warn=None):
+    """Apply an ACCEPTED decision through the SHARED fail-closed applier (triage.apply_triage).
+
+    Every writing action goes through here — `promote`, and the #586 `repark`/`repair` lanes — so
+    the two directions of the sweep cannot drift into two mutation paths. `ready` is the projected
+    attestation (a re-park is on its way OUT of `status:ready`); `role` is the intended single role,
+    which the applier adds and VERIFIES before it strips any incumbent.
+
+    Returns {"ok": bool, "warnings": [...]}. ok=False must turn the workflow step RED — never
+    swallow it, and never let the shell short-circuit past the post-condition (PR #595 finding 3).
+    """
+    result = {"add": set(decision.get("add", ())), "remove": set(decision.get("remove", ())),
+              "ready": decision.get("action") != "repark", "role": decision.get("role"),
+              "warnings": []}
+    return static_triage.apply_triage(current, result, edit, view, warn, read_state=read_state)
+
+
+def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_labels):
+    """`--apply`: re-read the LIVE labels, plan against them, and mutate fail-closed.
+
+    Planning against the live read (not the possibly-stale board snapshot the sweep passed on
+    stdin) means a gate added since the list read — needs:design, trust:untrusted, a concurrent
+    promotion — is honoured. Reads go through gh_retry; the mutation is single-attempt + fail-loud.
+    """
+    read_state, view, edit, warn = static_triage.live_gh(repo, number, title="retriage")
+    live, _revision = read_state()
+    fresh = dict(issue)
+    fresh["labels"] = sorted(live)
+    known = list(known_labels) if known_labels else static_triage.repo_label_set(repo)
+    decision = plan(fresh, maintainer, app_bot, permission, known_labels=known)
+    print(json.dumps(decision, sort_keys=True))
+    if decision["action"] not in WRITING_ACTIONS:
+        return 0
+    outcome = apply_decision(live, decision, edit, view, read_state, warn)
+    if not outcome["ok"]:
+        print(f"::error title=retriage #{number}::{decision['action']} did not satisfy the "
+              f"single-role post-condition (registry #582): {'; '.join(outcome['warnings'])}")
+        return 1
+    return 0
+
+
 def _self_test():
     base = {"author": {"login": "owner"}, "body": "",
             "labels": [{"name": "priority:P2"}, {"name": "area:workflows"}]}
@@ -248,6 +324,29 @@ def _self_test():
         plan(issue("status:untriaged", body=HOLD_MARKER), "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "explicit-hold"})
 
+    # [registry #582] the base fixture (priority:P2 + area:workflows) derives role:ci. If the target
+    # repo does NOT have that label, promoting would strip/skip the role and land a role-less
+    # status:ready — silently undispatchable and unrecoverable (retriage only revisits
+    # status:untriaged). Fail-closed: skip, leaving the issue retriageable next tick.
+    real = {"role:ci", "role:impl", "status:ready", "status:untriaged", "priority:P2",
+            "area:workflows"}
+    checks.append(("known label set present -> still promotes",
+                   plan(issue("status:untriaged"), "owner", "app[bot]", "none",
+                        known_labels=real)["action"] == "promote"))
+    checks.append(("[#582] missing role label -> fail-closed skip, never role-less ready",
+                   plan(issue("status:untriaged"), "owner", "app[bot]", "none",
+                        known_labels=real - {"role:ci"})
+                   == {"action": "skip", "reason": "classifier-incomplete"}))
+
+    def roleless(*_args, **_kwargs):
+        """A classifier that promotes while stripping the only role — the #582 shape."""
+        return {"add": {"status:ready"}, "remove": {"role:ci"}, "ready": True, "role": None,
+                "warnings": []}
+
+    checks.append(("[#582] role-invariant guard rejects a role-less promotion",
+                   plan(issue("status:untriaged", "role:ci"), "owner", "app[bot]", "none", roleless)
+                   == {"action": "skip", "reason": "role-invariant"}))
+
     def broken(*_args, **_kwargs):
         raise RuntimeError("fixture")
 
@@ -260,10 +359,18 @@ def _self_test():
         {"action": "skip", "reason": "untrusted-author"})
     chk("write collaborator accepted", plan(foreign, "owner", "app[bot]", "write")["action"],
         "promote")
+    chk("a promotion carries the INTENDED single role for the applier",
+        plan(issue("status:untriaged"), "owner", "app[bot]", "none",
+             known_labels=real).get("role"), "ci")
 
     # ---- #586: the label-lost half. A `status:ready` issue the readiness engine cannot
     # enumerate is re-parked; a healthy one is left completely untouched. ----
-    HEALTHY = ("status:ready", "priority:P2", "role:soundness", "area:groom")
+    # `area:groom` is a TRUST-SURFACE keyword, so triage() derives the trust-plane role for it
+    # (triage.TRUST_PLANE_ROLE, ahead of any explicit `role:*`). The fixtures below therefore carry
+    # that same role: the lane under test is the LOST-LABEL drift, not an incidental re-route.
+    ROLE = static_triage.TRUST_PLANE_ROLE
+    ROLE_LABEL = f"role:{ROLE}"
+    HEALTHY = ("status:ready", "priority:P2", ROLE_LABEL, "area:groom")
     healthy = labelled(*HEALTHY)
     chk("POSITIVE CONTROL: a fully-labelled status:ready issue is untouched",
         plan(healthy, "owner", "app[bot]", "none"),
@@ -277,22 +384,27 @@ def _self_test():
              "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "ready-consistent"})
 
-    lost_priority = labelled("status:ready", "role:soundness", "area:groom")
+    lost_priority = labelled("status:ready", ROLE_LABEL, "area:groom")
+    # Every WRITING decision carries the intended `role` (the applier's add-before-strip input),
+    # so an accidental drop of it — which would disarm the #582 verification on these lanes —
+    # fails this suite rather than shipping silently.
     chk("lost priority is re-parked", plan(lost_priority, "owner", "app[bot]", "none"),
-        {"action": "repark", "add": ["status:untriaged"], "remove": ["status:ready"]})
-    ambiguous = labelled("status:ready", "priority:P1", "priority:P2", "role:soundness",
-                         "area:groom")
+        {"action": "repark", "add": ["status:untriaged"], "remove": ["status:ready"],
+         "role": ROLE})
+    ambiguous = labelled("status:ready", "priority:P1", "priority:P2", ROLE_LABEL, "area:groom")
     chk("ambiguous priority is re-parked", plan(ambiguous, "owner", "app[bot]", "none"),
-        {"action": "repark", "add": ["status:untriaged"], "remove": ["status:ready"]})
-    lost_area = labelled("status:ready", "priority:P2", "role:soundness")
+        {"action": "repark", "add": ["status:untriaged"], "remove": ["status:ready"],
+         "role": ROLE})
+    lost_area = labelled("status:ready", "priority:P2", ROLE_LABEL)
     chk("lost area is re-parked", plan(lost_area, "owner", "app[bot]", "none"),
-        {"action": "repark", "add": ["status:untriaged"], "remove": ["status:ready"]})
+        {"action": "repark", "add": ["status:untriaged"], "remove": ["status:ready"],
+         "role": ROLE})
     chk("the re-park never MINTS a needs:* gate it would then refuse to cross",
         "needs:area" in plan(lost_area, "owner", "app[bot]", "none").get("add", []), False)
     lost_role = labelled("status:ready", "priority:P2", "area:groom")
     chk("lost role is repaired in place (the classifier re-derives it)",
         plan(lost_role, "owner", "app[bot]", "none"),
-        {"action": "repair", "add": ["role:soundness"], "remove": []})
+        {"action": "repair", "add": [ROLE_LABEL], "remove": [], "role": ROLE})
 
     # Park policy stays load-bearing on the NEW lane too — none of these is re-parked.
     for park, reason in ((park_policy.MACHINE_PARK_LABEL, "machine-parked"),
@@ -301,19 +413,19 @@ def _self_test():
                          ("kind:epic", "epic"),
                          ("status:deferred", "not-retriageable")):
         chk(f"status:ready + {park} is not re-parked",
-            plan(labelled("status:ready", "role:soundness", "area:groom", park),
+            plan(labelled("status:ready", ROLE_LABEL, "area:groom", park),
                  "owner", "app[bot]", "none"),
             {"action": "skip", "reason": reason})
     chk("status:ready + needs:user is not re-parked (human-owned park)",
-        plan(labelled("status:ready", "role:soundness", "area:groom", "needs:user"),
+        plan(labelled("status:ready", ROLE_LABEL, "area:groom", "needs:user"),
              "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "gated:needs:user"})
     chk("an untrusted author is never inspected on the re-park lane",
-        plan(labelled("status:ready", "role:soundness", "area:groom", author="outsider"),
+        plan(labelled("status:ready", ROLE_LABEL, "area:groom", author="outsider"),
              "owner", "app[bot]", "read"),
         {"action": "skip", "reason": "untrusted-author"})
     chk("an orchestration hold is honoured on the re-park lane",
-        plan(labelled("status:ready", "role:soundness", "area:groom", body=HOLD_MARKER),
+        plan(labelled("status:ready", ROLE_LABEL, "area:groom", body=HOLD_MARKER),
              "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "explicit-hold"})
     chk("classifier failure never re-parks",
@@ -322,19 +434,19 @@ def _self_test():
     # FAIL CLOSED: the classifier calls it complete but the engine still cannot enumerate it
     # (`status:blocked` is a busy status triage() knows nothing about) -> no write.
     chk("an unprovable exclusion is left alone",
-        plan(labelled("status:ready", "status:blocked", "priority:P2", "role:soundness",
+        plan(labelled("status:ready", "status:blocked", "priority:P2", ROLE_LABEL,
                       "area:groom"), "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "unprovable"})
 
-    dual = labelled("status:untriaged", "status:ready", "role:soundness", "area:groom")
+    dual = labelled("status:untriaged", "status:ready", ROLE_LABEL, "area:groom")
     chk("a contradictory dual-status issue loses its stale status:ready",
         plan(dual, "owner", "app[bot]", "none"),
-        {"action": "repark", "add": [], "remove": ["status:ready"]})
+        {"action": "repark", "add": [], "remove": ["status:ready"], "role": ROLE})
     chk("a second sweep over the de-contradicted board plans ZERO writes",
         plan(applied(dual, plan(dual, "owner", "app[bot]", "none")), "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "classifier-incomplete"})
     chk("an incomplete untriaged issue with NO stale attestation is still left alone",
-        plan(labelled("status:untriaged", "role:soundness", "area:groom"),
+        plan(labelled("status:untriaged", ROLE_LABEL, "area:groom"),
              "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "classifier-incomplete"})
 
@@ -390,6 +502,262 @@ def _self_test():
         except SweepError:
             chk(f"snapshot refuses {label}", "raised", "raised")
 
+    # -------------------------------------------------------------------------------------------
+    # [PR #595 finding 3] THE LIVE TRANSITION IS FAIL-CLOSED — verified against a fake GitHub, not
+    # against the shell. The workflow used to issue ONE `gh issue edit` carrying the adds AND the
+    # removals, with no add-first verification: when the add failed (the #582 shape — a role label
+    # the repo does not have) the strip still landed and the issue went ready-and-role-less.
+    class FakeGh:
+        """Drops adds of labels outside `known` (the live #582 failure mode) + tracks a revision."""
+
+        def __init__(self, labels, known):
+            self.labels, self.known, self.rev, self.calls = set(labels), set(known), 0, []
+
+        def edit(self, add, remove):
+            self.calls.append((sorted(add), sorted(remove)))
+            before = set(self.labels)
+            for label in add:
+                if label not in self.known:
+                    raise RuntimeError(f"'{label}' not found")
+                self.labels.add(label)
+            self.labels -= set(remove)
+            if self.labels != before:
+                self.rev += 1
+
+        def view(self):
+            return set(self.labels)
+
+        def read_state(self):
+            return set(self.labels), self.rev
+
+    def roles_of(labels):
+        return {label for label in labels if label.startswith("role:")}
+
+    def live_plan(gh, known):
+        doc = {"author": {"login": "owner"}, "body": "",
+               "labels": [{"name": name} for name in sorted(gh.labels)]}
+        return plan(doc, "owner", "app[bot]", "none", known_labels=known)
+
+    # A trust-surface area is the one input that RE-ROUTES an incumbent role (an explicit role:*
+    # otherwise wins), so it is the fixture that exercises the add-then-strip transition.
+    start = {"priority:P2", "area:dispatch", "role:docs", "status:untriaged"}
+    known = real | {"role:docs", "area:dispatch"}
+    gh = FakeGh(start, known)
+    outcome = apply_decision(set(gh.labels), live_plan(gh, known), gh.edit, gh.view, gh.read_state)
+    checks.append(("[#595 f3] happy path: exactly one role, promoted, ok",
+                   (outcome["ok"], roles_of(gh.labels), "status:ready" in gh.labels,
+                    "status:untriaged" in gh.labels) == (True, {"role:impl"}, True, False)))
+    # The target role label does NOT exist in the repo: the ADD fails, so NOTHING may be stripped.
+    # plan() already fails closed on that input, so the applier is driven with the PRE-FIX plan
+    # shape — the blind add-role/strip-role mutation the workflow shell used to send in one edit.
+    gh = FakeGh(start, known - {"role:impl"})
+    outcome = apply_decision(set(gh.labels),
+                              {"action": "promote", "add": ["role:impl", "status:ready"],
+                               "remove": ["role:docs", "status:untriaged"], "role": "impl"},
+                              gh.edit, gh.view, gh.read_state)
+    checks.append(("[#595 f3] a non-existent replacement role NEVER strips the incumbent",
+                   (outcome["ok"], roles_of(gh.labels)) == (False, {"role:docs"})))
+    checks.append(("[#595 f3] the refusal names the label and #582",
+                   any("role:impl" in w and "#582" in w for w in outcome["warnings"])))
+    # a post-read that finds ZERO roles on a status:ready issue RESTORES the incumbent — the old
+    # workflow check merely `exit 1`-ed here, leaving the terminal state live.
+    class RoleEatingGh(FakeGh):
+        def edit(self, add, remove):
+            super().edit(add, remove)
+            if not any(label.startswith("role:") for label in add):
+                self.labels -= roles_of(self.labels)
+                self.rev += 1
+
+    gh = RoleEatingGh(start, known)
+    outcome = apply_decision(set(gh.labels), live_plan(gh, known), gh.edit, gh.view, gh.read_state)
+    checks.append(("[#595 f3] a zero-role post-state is RESTORED, not merely reported",
+                   (outcome["ok"], roles_of(gh.labels), "status:ready" in gh.labels)
+                   == (False, {"role:docs"}, True)))
+    # MULTIPLE roles are rejected by route-resolve (AmbiguousRoleError), so the post-read must not
+    # accept them: the old workflow check (`,$post,` != *",role:"*) PASSED an ambiguous set, leaving
+    # a terminal undispatchable issue. Repair down to the single intended role instead.
+    class InjectingGh(FakeGh):
+        """A concurrent actor injects a THIRD role label once, mid-transition."""
+
+        def __init__(self, labels, known, persistent=False):
+            super().__init__(labels, known)
+            self.persistent, self.injected = persistent, False
+
+        def edit(self, add, remove):
+            super().edit(add, remove)
+            if (self.persistent or not self.injected) and "role:ci" not in self.labels:
+                self.injected = True
+                self.labels.add("role:ci")
+                self.rev += 1
+
+    gh = InjectingGh(start, known)
+    outcome = apply_decision(set(gh.labels), live_plan(gh, known), gh.edit, gh.view, gh.read_state)
+    checks.append(("[#595 f3] an ambiguous post-state is repaired to ONE role, never accepted",
+                   (outcome["ok"], roles_of(gh.labels), "status:ready" in gh.labels)
+                   == (False, {"role:impl"}, True)))
+    # ... and when the repair CANNOT hold (a persistent concurrent writer), status:ready is DEMOTED
+    # to status:untriaged so the next retriage tick owns the issue — never left ready-and-ambiguous,
+    # which route-resolve rejects and nothing else revisits.
+    gh = InjectingGh(start, known, persistent=True)
+    outcome = apply_decision(set(gh.labels), live_plan(gh, known), gh.edit, gh.view, gh.read_state)
+    checks.append(("[#595 f3] an unrepairable ambiguity DEMOTES to status:untriaged, never terminal",
+                   (outcome["ok"], "status:ready" in gh.labels, "status:untriaged" in gh.labels)
+                   == (False, False, True)))
+
+    # -------------------------------------------------------------------------------------------
+    # [PR #595 finding 2] THE ARGV ENTRYPOINT, PINNED TO THE WORKFLOW'S OWN ARGUMENT LIST.
+    # Every check above calls plan()/apply_decision() DIRECTLY, which is precisely why
+    # `--known-labels` could ship undeclared: the workflow-shaped invocation exited 2 with
+    # "unrecognized arguments" on every scheduled sweep while this suite reported PASSED. The
+    # argument list below is READ OUT OF THE WORKFLOW FILE and driven through the REAL entrypoint
+    # (main -> _apply_cli -> plan -> apply_decision) against a fake GitHub, so a workflow/CLI drift
+    # turns the enrolled suite red instead of hiding behind a direct call.
+    import io
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    workflow = os.path.join(root, ".github/workflows/retriage.yml")
+    argvs = static_triage.workflow_argvs(
+        workflow, "retriage.py",
+        {"MAINTAINER_LOGIN": "owner", "APP_BOT_LOGIN": "app[bot]", "permission": "write",
+         "known": ",".join(sorted(known)), "REPO": "o/r", "number": "7"})
+    options = static_triage.declared_options(build_parser())
+    passed = sorted({token for argv in argvs for token in argv if token.startswith("--")})
+    checks.append(("[#595 f2] retriage.yml invokes scripts/retriage.py (self-test + apply)",
+                   len(argvs) >= 2))
+    checks.append((f"[#595 f2] every flag retriage.yml passes is DECLARED by the parser: {passed}",
+                   not set(passed) - options))
+    checks.append(("[#595 f2] the workflow still passes --known-labels", "--known-labels" in passed))
+
+    apply_argv = next((argv for argv in argvs if "--apply" in argv), [])
+    stale = {"author": {"login": "owner"}, "body": "", "labels": [{"name": "stale:snapshot"}]}
+
+    def run_apply_argv(gh, stdin_doc=None):
+        """Drive main(apply_argv) end-to-end against a fake GitHub. Returns (exit code, spied)."""
+        seen = {}
+        saved_plan = globals()["plan"]
+        saved_live_gh, saved_labels = static_triage.live_gh, static_triage.repo_label_set
+        saved_stdin, saved_stdout = sys.stdin, sys.stdout
+
+        def spy_plan(issue_doc, maintainer, app_bot, permission,
+                     classify=static_triage.triage, known_labels=None):
+            seen.update(known_labels=known_labels, maintainer=maintainer, permission=permission,
+                        labels=list(issue_doc.get("labels", ())))
+            return saved_plan(issue_doc, maintainer, app_bot, permission, classify, known_labels)
+
+        try:
+            globals()["plan"] = spy_plan
+            static_triage.live_gh = lambda repo, number, title="triage": (
+                gh.read_state, gh.view, gh.edit, lambda _message: None)
+            static_triage.repo_label_set = lambda repo: (_ for _ in ()).throw(
+                AssertionError("--known-labels must be used; the live label read is a fallback"))
+            sys.stdin = io.StringIO(json.dumps(stdin_doc if stdin_doc is not None else stale))
+            sys.stdout = io.StringIO()
+            try:
+                code = main(apply_argv)
+            except SystemExit as exc:  # argparse exits 2 on an undeclared flag — that is the defect
+                code = exc.code
+        finally:
+            globals()["plan"] = saved_plan
+            static_triage.live_gh, static_triage.repo_label_set = saved_live_gh, saved_labels
+            sys.stdin, sys.stdout = saved_stdin, saved_stdout
+        return code, seen
+
+    gh = FakeGh(start, known)
+    code, seen = run_apply_argv(gh)
+    checks.append(("[#595 f2] the workflow-shaped ARGV exits 0 (it exited 2: unrecognized args)",
+                   code == 0))
+    checks.append(("[#595 f2] --known-labels reaches plan() as a parsed label list",
+                   seen.get("known_labels") == sorted(known)))
+    checks.append(("[#595 f2] the other workflow-passed values reach plan() too",
+                   (seen.get("maintainer"), seen.get("permission")) == ("owner", "write")))
+    checks.append(("[#595 f2] --apply plans against the LIVE labels, not the stdin snapshot",
+                   "stale:snapshot" not in (seen.get("labels") or [])))
+    checks.append(("[#595 f2] the workflow-shaped invocation actually applied the promotion",
+                   (roles_of(gh.labels), "status:ready" in gh.labels) == ({"role:impl"}, True)))
+
+    # -------------------------------------------------------------------------------------------
+    # [issue #586 x PR #595 finding 3] BOTH DIRECTIONS OF THE SWEEP GO THROUGH THAT SAME APPLIER.
+    # The promotion lane above is only half the sweep; a re-park/repair applied by any other path
+    # would re-open exactly the #582 hole the applier closes, so the two remaining lanes are driven
+    # through the REAL entrypoint too (a `--apply` that silently no-op'ed on them would leave the
+    # stranded `status:ready` issues #586 is about untouched, and this check red).
+    stranded = FakeGh({"status:ready", "role:docs", "area:dispatch"}, known)   # lost its priority
+    code, _seen = run_apply_argv(stranded)
+    checks.append(("[#586] the workflow-shaped ARGV RE-PARKS a stranded status:ready issue",
+                   (code, "status:ready" in stranded.labels, "status:untriaged" in stranded.labels)
+                   == (0, False, True)))
+    checks.append(("[#586] the re-park ADDS + verifies the replacement role before any strip",
+                   (stranded.calls[:1], roles_of(stranded.labels))
+                   == ([(["role:impl"], [])], {"role:impl"})))
+
+    # The REPAIR lane is the purest #582 shape: its whole mutation is writing back the `role:*` the
+    # issue lost while KEEPING `status:ready`. When that label does not exist in the repo the add
+    # fails, and the issue must be demoted rather than left ready-and-role-less (terminal).
+    repair = plan(labelled("status:ready", "priority:P2", "area:dispatch"),
+                  "owner", "app[bot]", "none")
+    checks.append(("[#586] a lost role is planned as a repair carrying the intended role",
+                   (repair["action"], repair["add"], repair["role"])
+                   == ("repair", ["role:impl"], "impl")))
+    gh = FakeGh({"status:ready", "priority:P2", "area:dispatch"}, known)
+    outcome = apply_decision(set(gh.labels), repair, gh.edit, gh.view, gh.read_state)
+    checks.append(("[#586] a repair restores the role and KEEPS the issue enumerable",
+                   (outcome["ok"], roles_of(gh.labels), "status:ready" in gh.labels)
+                   == (True, {"role:impl"}, True)))
+    gh = FakeGh({"status:ready", "priority:P2", "area:dispatch"}, known - {"role:impl"})
+    outcome = apply_decision(set(gh.labels), repair, gh.edit, gh.view, gh.read_state)
+    checks.append(("[#586] a repair whose role label does not exist DEMOTES, never stays role-less",
+                   (outcome["ok"], roles_of(gh.labels), "status:ready" in gh.labels,
+                    "status:untriaged" in gh.labels) == (False, set(), False, True)))
+    # The one lane that is BOTH: a role-less issue whose target role label the repo does not have.
+    # triage() keeps it role-less (#582), so the sweep can only re-park it — and it must still do
+    # so LOUDLY: the park lands (the issue leaves the frontier it cannot be dispatched from) while
+    # the step turns red, because a repo missing its own routed role label is a config defect.
+    roleless_known = known - {ROLE_LABEL}
+    repark = plan(labelled("status:ready", "priority:P2", "area:dispatch"), "owner", "app[bot]",
+                  "none", known_labels=roleless_known)
+    checks.append(("[#582 x #586] a missing role label downgrades the repair to a re-park",
+                   (repark["action"], repark["role"]) == ("repark", None)))
+    gh = FakeGh({"status:ready", "priority:P2", "area:dispatch"}, roleless_known)
+    outcome = apply_decision(set(gh.labels), repark, gh.edit, gh.view, gh.read_state)
+    checks.append(("[#582 x #586] that re-park still LANDS, and still fails the step LOUDLY",
+                   (outcome["ok"], "status:ready" in gh.labels, "status:untriaged" in gh.labels,
+                    roles_of(gh.labels)) == (False, False, True, set())))
+
+    # -------------------------------------------------------------------------------------------
+    # [PR #595 findings 3 + 6] STATIC WORKFLOW CONTRACT. The sweep must mutate ONLY through the
+    # fail-closed applier, route every READ through the shared bounded-retry layer (gh_retry —
+    # mutations stay single-attempt/fail-loud per its hard scope rule), and never short-circuit out
+    # of the loop before the post-condition. Comment lines are stripped first so these assertions
+    # read the executable text only.
+    body = "\n".join(line for line in open(workflow, encoding="utf-8").read().splitlines()
+                     if not line.strip().startswith("#"))
+    checks.append(("[#595 f3] the sweep mutates only via `retriage.py --apply`",
+                   "scripts/retriage.py --apply" in body.replace("\\\n", " ")))
+    checks.append(("[#595 f3] no raw `gh issue edit` label mutation remains in the workflow",
+                   "gh issue edit" not in body))
+    import re
+    checks.append(("[#595 f6] every workflow `gh` READ goes through the gh_retry wrapper",
+                   not re.findall(r"(?<![\w./-])gh\s+(?:api|issue|label|pr|run|search)\b", body)))
+    checks.append(("[#595 f6] the wrapper is the shared layer, not a hand-rolled retry loop",
+                   "scripts/gh_retry.py read" in body))
+    loop = re.search(r"while IFS=.*?done <", body, re.S)
+    checks.append(("[#595 f3] the sweep loop cannot short-circuit past the post-read",
+                   loop is not None and not re.search(r"\bexit\b", loop.group(0))))
+    checks.append(("[#595 f3] a failed apply still fails the STEP after the sweep completes",
+                   loop is not None and re.search(r"exit\s+1", body[loop.end():]) is not None))
+    # [#586] ...and the board the sweep feeds that applier is BOTH lanes, bounded by the fail-closed
+    # snapshot. A workflow that lists only `status:untriaged` re-opens the label-lost half of #178:
+    # nothing else recovers a `status:ready` issue that dropped a required label. The step's `name:`
+    # is excluded so a DESCRIPTION of the ready lane can never stand in for querying it.
+    executable = "\n".join(line for line in body.splitlines()
+                           if not line.strip().startswith("- name:"))
+    checks.append(("[#586] the sweep board is built from BOTH the untriaged AND ready lanes",
+                   "status:untriaged" in executable and "status:ready" in executable))
+    snapshot_argv = next((argv for argv in argvs if "--snapshot" in argv), [])
+    cap = (snapshot_argv[snapshot_argv.index("--cap") + 1] if "--cap" in snapshot_argv else "")
+    checks.append(("[#586] the board goes through the fail-closed, per-run-capped snapshot",
+                   bool(snapshot_argv) and cap.isdigit() and 0 < int(cap) <= SWEEP_CEILING))
+
     ok = all(result for _, result in checks)
     for name, result in checks:
         print(f"  {'ok  ' if result else 'FAIL'} {name}")
@@ -397,7 +765,12 @@ def _self_test():
     return 0 if ok else 1
 
 
-def main():
+def build_parser():
+    """The CLI contract. A named builder so the self-test can assert that every flag
+    .github/workflows/retriage.yml passes is actually DECLARED (PR #595 finding 2: `--known-labels`
+    was passed by the workflow and declared NOWHERE — a workflow-shaped invocation exited 2 with
+    "unrecognized arguments" on every sweep, while the enrolled suite stayed green because every
+    self-test called plan() directly)."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--snapshot", action="store_true",
@@ -408,7 +781,19 @@ def main():
     parser.add_argument("--maintainer", default="")
     parser.add_argument("--app-bot", default="")
     parser.add_argument("--permission", default="none")
-    args = parser.parse_args()
+    parser.add_argument("--known-labels", default="",
+                        help="comma-separated target-repo label set; enables the registry #582 "
+                             "existence check so a non-existent role:* label is never planned")
+    parser.add_argument("--apply", action="store_true",
+                        help="plan AND apply the promotion FAIL-CLOSED (needs --repo/--number)")
+    parser.add_argument("--repo", default="")
+    parser.add_argument("--number", default="")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.self_test:
         return _self_test()
     if args.snapshot:
@@ -423,8 +808,15 @@ def main():
         for issue in issues:
             print(json.dumps(issue, sort_keys=True))
         return 0
+    known = [item for item in args.known_labels.split(",") if item.strip()] or None
     issue = json.load(sys.stdin)
-    print(json.dumps(plan(issue, args.maintainer, args.app_bot, args.permission), sort_keys=True))
+    if args.apply:
+        if not args.repo or not args.number:
+            parser.error("--apply requires --repo and --number")
+        return _apply_cli(args.repo, args.number, issue, args.maintainer, args.app_bot,
+                          args.permission, known)
+    print(json.dumps(plan(issue, args.maintainer, args.app_bot, args.permission,
+                          known_labels=known), sort_keys=True))
     return 0
 
 

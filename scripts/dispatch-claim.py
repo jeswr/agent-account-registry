@@ -282,6 +282,10 @@ def _lease_ttl(mode):
 REVIEW_TTL = _lease_ttl("review")   # 10+10+25+10+15 = 70m (was 20m — shorter than the 25m run job)
 FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly the run job, no slack)
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
+# "not probed yet" sentinel for the per-PR readmission-cutoff memo (#555 recurrence gap): the
+# cutoff's own falsy value (None = no proven human gesture) is a MEANINGFUL result, so it cannot
+# double as the not-yet-read marker.
+_UNPROBED = object()
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -1886,18 +1890,27 @@ def _run_target_helper(script_dir, repo, script, args):
 
 
 def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="question",
-                   bot_login=""):
+                   bot_login="", head_sha="", attempt_key=""):
     """Stop the loop for a PR. `park_class` picks the label PAIR (park_policy.py ownership):
     "question" (default) -> the human-owned pair (review:needs-user on the PR, needs:user on
     the source issue) for genuine human questions; "capacity" -> the machine-owned soft-hold
     pair (review:parked on the PR, status:parked on the source issue) for capacity/decline/
     budget-driven stops — veto-gated, receipted per readmission window, and escalating to the
     question class after PARK_ESCALATION_GENERATIONS consumed windows (worker-pr needs_user
-    owns all of that; `bot_login` feeds its receipt parser's trust filter)."""
+    owns all of that; `bot_login` feeds its receipt parser's trust filter).
+
+    `head_sha` + `attempt_key` are the capacity park's ATTEMPT FINGERPRINT (#555 recurrence
+    gap; park_policy.park_fingerprint): the live head plus a MONOTONE counter of work
+    attempted. EVERY capacity park on this path supplies them, so an exhaustion re-derived
+    from unchanged per-PR state is skipped quietly instead of consuming the readmission window
+    a human just granted (the live sparq #3488 7-minute bounce). Question-class parks are
+    unconditional human holds and pass neither."""
     args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason,
             "--park-class", park_class]
     if bot_login:
         args += ["--bot-login", bot_login]
+    if head_sha and attempt_key:
+        args += ["--head-sha", head_sha, "--attempt-key", attempt_key]
     if isinstance(issue, int) and issue > 0:
         args += ["--issue", str(issue)]
     _run_target_helper(script_dir, repo, "worker-pr.py", args)
@@ -2307,6 +2320,47 @@ def _chain_probe_exempt(chain, routing):
     return True
 
 
+def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, repo, number):
+    """The MISSED-FIX-dispatch budget as (charged, lifetime) counts — the #555 RECURRENCE fix
+    for the second exhaustion branch.
+
+    THE BUG: `missed` markers are durable per-round state that nothing resets, and the
+    MISSED_FIX_LIMIT capacity park read the LIFETIME count. #555 windowed the ROUND budget by
+    the human-readmission cutoff but left this counter unwindowed — so a re-admitted PR
+    re-derived "N consecutive fix dispatches missed for round R" from the very same markers on
+    the very next tick, with an UNCHANGED head and no work attempted, and (with a gen-1 receipt
+    already standing) the ladder went straight to its question-class terminal. That is the
+    observed bounce: sparq PR #3488 re-admitted 2026-07-22T16:36:56Z, re-escalated 16:44:10Z;
+    PR #3472 re-escalated seconds later with byte-identical boilerplate, five days after the
+    last commit or review round on either PR. This counter is the purest case of it: it needs
+    NO head advance and NO review round to grow — it grows purely from allocator starvation,
+    identically across every PR in a sweep.
+
+    THE FIX: the LIMIT decision charges only markers recorded at or after `cutoff` (the same
+    readmission window the round budget uses — one timeline read per PR per tick), so a human
+    readmission grants real dispatch capacity. The LIFETIME count is still returned: it is the
+    monotone axis of the park's attempt fingerprint (a window-relative count resets and would
+    read as "unchanged" across two genuinely distinct windows).
+
+    `cutoff_fn` is the PR's memoized readmission-cutoff getter, called ONLY once the LIFETIME
+    count has reached the limit — below it the decision is the same either way, exactly like the
+    round budget's `rounds >= max_rounds` gate — so no extra timeline read is spent on the
+    common case."""
+    lifetime = len(worker_pr.marker_runs(comments, bot_login, "missed", round_number))
+    if lifetime < MISSED_FIX_LIMIT:
+        return lifetime, lifetime
+    cutoff = cutoff_fn()
+    if not cutoff:
+        return lifetime, lifetime
+    charged = len(worker_pr.marker_runs_since(
+        comments, bot_login, "missed", round_number, cutoff))
+    if charged != lifetime:
+        print(f"readmission window open for {repo}#{number}: a human unlabeled a park label "
+              f"at {cutoff}; the missed-fix budget for round {round_number} charges {charged} "
+              f"of {lifetime} recorded miss(es)")
+    return charged, lifetime
+
+
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
                            defer_reasons, lanes=None, ledger_root="", fix_dispatch=None):
@@ -2604,11 +2658,23 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # stays the global count everywhere else: round numbering, the pending-fix lookup,
             # the latest-progress read and the pin round all keep marker/verdict identity.
             # Probed only at/above the base budget: below it decide_budget continues either way.
+            # LAZY + MEMOIZED (#555 recurrence gap): the SAME cutoff also windows the missed-fix
+            # marker budget further down, and both call sites must agree on one readmission
+            # window per PR per tick — so the timeline is read at most once, and only when a
+            # park decision actually hangs on it.
+            readmission_cutoff = _UNPROBED
+
+            def _readmission_cutoff(_repo=repo, _number=number, _issue=issue_number):
+                nonlocal readmission_cutoff
+                if readmission_cutoff is _UNPROBED:
+                    readmission_cutoff = _park_policy.readmission_cutoff(
+                        _repo, _number, _issue, _issue_timeline_events,
+                        is_human=lambda login: _target_is_human_maintainer(_repo, login))
+                return readmission_cutoff
+
             budget_rounds = rounds
             if rounds >= max_rounds:
-                cutoff = _park_policy.readmission_cutoff(
-                    repo, number, issue_number, _issue_timeline_events,
-                    is_human=lambda login: _target_is_human_maintainer(repo, login))
+                cutoff = _readmission_cutoff()
                 if cutoff:
                     budget_rounds = worker_pr.count_rounds_since(comments, bot_login, cutoff)
                     if budget_rounds != rounds:
@@ -2664,6 +2730,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # receipt trust filter). `budget_rounds` is the charged count —
                 # post-readmission when a human unlabeled a park label (sparq#2804/PR#3442),
                 # the full history otherwise.
+                #
+                # The park's ATTEMPT FINGERPRINT (#555 recurrence gap) is the live head plus
+                # the GLOBAL round count `rounds` — deliberately NOT the window-relative
+                # `budget_rounds`, which resets on every readmission and would therefore read
+                # as "unchanged" across two genuinely distinct windows.
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the review round budget is exhausted at {budget_rounds} "
                                f"round(s) "
@@ -2671,7 +2742,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "with no extension left — the top fix tier has run, the latest "
                                "verdict does not grade the PR improving, and no pushed fix at "
                                "or above the pinned floor awaits re-review; a human must "
-                               "decide", park_class="capacity", bot_login=bot_login)
+                               "decide", park_class="capacity", bot_login=bot_login,
+                               head_sha=head_sha, attempt_key=f"rounds={rounds}")
                 continue
             if budget["action"] == "extend-model-pin" and budget["pin"]:
                 # Converge the durable pin marker (normally recorded by the review outcome; this
@@ -2731,14 +2803,21 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # ping-pong therefore always terminates in review:needs-user.
                 mode, role = "fix", "fix"
                 round_number = max(rounds, 1)
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
-                if len(missed) >= MISSED_FIX_LIMIT:
+                missed, missed_total = _missed_fix_budget(
+                    worker_pr, comments, bot_login, round_number, _readmission_cutoff,
+                    repo, number)
+                if missed >= MISSED_FIX_LIMIT:
                     # Missed dispatches ARE capacity starvation (the allocator found no slot
-                    # every tick) -> the machine-owned park, never a fake human question.
+                    # every tick) -> the machine-owned park, never a fake human question. The
+                    # charge is WINDOWED by the readmission cutoff (#555 recurrence gap) so a
+                    # human unpark grants real dispatch capacity; the fingerprint carries the
+                    # LIFETIME count, which is monotone across windows.
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   f"{len(missed)} consecutive fix dispatches missed for round "
+                                   f"{missed} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR",
-                                   park_class="capacity", bot_login=bot_login)
+                                   park_class="capacity", bot_login=bot_login,
+                                   head_sha=head_sha,
+                                   attempt_key=f"missed{round_number}={missed_total}")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
@@ -2748,13 +2827,18 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # corresponds to the clean synthetic round-0 budget posture; the trusted verdict
                 # record is still required below before a verdict-seeded fixer may run.
                 round_number = max(rounds, 1)
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
-                if len(missed) >= MISSED_FIX_LIMIT:
-                    # Same capacity-starvation classification as the repair-state branch above.
+                missed, missed_total = _missed_fix_budget(
+                    worker_pr, comments, bot_login, round_number, _readmission_cutoff,
+                    repo, number)
+                if missed >= MISSED_FIX_LIMIT:
+                    # Same capacity-starvation classification — and the same readmission
+                    # windowing + attempt fingerprint — as the repair-state branch above.
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   f"{len(missed)} consecutive fix dispatches missed for round "
+                                   f"{missed} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR",
-                                   park_class="capacity", bot_login=bot_login)
+                                   park_class="capacity", bot_login=bot_login,
+                                   head_sha=head_sha,
+                                   attempt_key=f"missed{round_number}={missed_total}")
                     continue
                 verdict_file = record_file_path(ledger_root, registry_root,
                                                 worker_pr.verdict_path(repo, number, round_number))
@@ -3878,6 +3962,19 @@ def _review_fix_workflow_values():
     ttl_review = re.search(r'prefix="review:";[^\n]*\bttl=(\d+)', claim_span)
     ttl_fix = re.search(r'prefix="fix:";[^\n]*\bttl=(\d+)', claim_span)
     assert ttl_review and ttl_fix, "claim job local review/fix ttl= literals not found"
+    # Issue #560 lane-hand-over wiring, pinned to the WORKFLOW (the python halves cannot see it):
+    # the `run` job must EXPORT stage-verdict's staged/stale_reason, the `outcome` job must ADMIT
+    # the staged-nothing path (its old `if` skipped the whole job, which is why review:changes was
+    # never cleared), it must INVOKE worker-pr.py fix-lane-defer, and the `release` job that frees
+    # the `fix:<repo>#<pr>` claim must stay UNCONDITIONAL and independent of the outcome job.
+    release_span = spans.get("release")
+    assert release_span is not None, "review-fix.yml is missing the release job"
+    outcome_span = spans.get("outcome")
+    assert outcome_span is not None, "review-fix.yml is missing the outcome job"
+    release_if = re.search(r"(?m)^    if: (.+)$", release_span)
+    release_needs = re.search(r"(?m)^    needs: (.+)$", release_span)
+    outcome_if = re.search(r"(?m)^    if: (.+)$", outcome_span)
+    assert release_if and release_needs and outcome_if, "review-fix.yml if/needs not parsable"
     return {
         "resolve_s": _fixed_minutes("resolve") * 60,
         "claim_s": _fixed_minutes("claim") * 60,
@@ -3886,6 +3983,22 @@ def _review_fix_workflow_values():
         "run_fix_s": int(run_m.group(2)) * 60,
         "local_review_ttl": int(ttl_review.group(1)),
         "local_fix_ttl": int(ttl_fix.group(1)),
+        "run_exports_staged": "verdict_staged: ${{ steps.stage-verdict.outputs.staged }}"
+                              in run_span,
+        "run_exports_stale_reason":
+            "verdict_stale_reason: ${{ steps.stage-verdict.outputs.stale_reason }}" in run_span,
+        "outcome_if": outcome_if.group(1),
+        "outcome_hands_over": "worker-pr.py fix-lane-defer" in outcome_span,
+        # Round-2 finding 1: the hand-over must also be told WHICH head the verdict was not bound
+        # to, or it can only flip the label and the spin relocates into the review lane's
+        # already_done exit. The CLI makes --head-sha required, so a workflow that stops passing it
+        # fails the step loudly — but pin the wiring statically too, since a red step every tick is
+        # still a regression this gate should catch before merge.
+        "outcome_passes_head_sha": bool(re.search(
+            r"fix-lane-defer(?:[^\n]|\n)*?--head-sha \"\$\{\{ needs\.resolve\.outputs\.head_sha "
+            r"\}\}\"", outcome_span)),
+        "release_if": release_if.group(1),
+        "release_needs": release_needs.group(1),
     }
 
 
@@ -3946,6 +4059,32 @@ def _self_test():
     # would hold the same account for different windows.
     assert _wf["local_review_ttl"] == REVIEW_TTL, _wf["local_review_ttl"]
     assert _wf["local_fix_ttl"] == FIX_TTL, _wf["local_fix_ttl"]
+    # Issue #560 lane-hand-over wiring (see _review_fix_workflow_values). Without these the fix
+    # lane silently re-acquires the SAME deferred PR every dispatch tick: the enumerator's bucket
+    # is the review:changes label, and only this wiring clears it.
+    assert _wf["run_exports_staged"], "review-fix.yml run job must export verdict_staged (#560)"
+    assert _wf["run_exports_stale_reason"], (
+        "review-fix.yml run job must export verdict_stale_reason (#560)")
+    assert "needs.run.outputs.verdict_stale_reason != ''" in _wf["outcome_if"], (
+        "review-fix.yml outcome job must ADMIT the staged-nothing fix path (#560): "
+        f"{_wf['outcome_if']}")
+    assert _wf["outcome_hands_over"], (
+        "review-fix.yml outcome job must invoke worker-pr.py fix-lane-defer (#560)")
+    assert _wf["outcome_passes_head_sha"], (
+        "review-fix.yml outcome job must pass --head-sha to fix-lane-defer (#560 round-2 finding "
+        "1): without the disproved head the stale reviewed-sha assertion cannot be retracted and "
+        "the hand-over only RELOCATES the spin into the review lane's already_done exit")
+    # The claim/lease release must not depend on the hand-over: it frees `fix:<repo>#<pr>` on
+    # EVERY path (always() + acquired) from a job that does not `needs:` the outcome job, so a
+    # deferred fix never holds the per-PR single-flight lease into the next tick.
+    assert "always()" in _wf["release_if"] \
+        and "needs.claim.outputs.acquired == 'true'" in _wf["release_if"], _wf["release_if"]
+    assert "outcome" not in _wf["release_needs"], (
+        "review-fix.yml release must not depend on the outcome job (#560 lease release): "
+        f"{_wf['release_needs']}")
+    print("  ok   #560: review-fix.yml exports the defer reason, admits the staged-nothing "
+          "outcome path, invokes fix-lane-defer, and still releases the fix lease "
+          "unconditionally")
 
     # #500 round-2: execute the REAL dispatch() call site for every decline-escalation tripwire.
     # The round-1 helper-only checks could stay green if dispatch stopped calling the helper; this
@@ -4201,6 +4340,29 @@ def _self_test():
     assert [call[0] for call in forged["api_calls"]] == ["POST"], forged
     assert len(forged["helper_calls"]) == 1 and forged["claim_calls"] == 0, forged
     print("  ok   decline tripwire (e): bot marker is idempotent; third-party forgery is ignored")
+
+    # (f) [registry #596] `auth` is NOT a decline. A whole window of credential-outage outcomes for
+    # the SAME issue — more than DECLINE_ESCALATION_MIN of them — must perform NO escalation: no
+    # marker, no impl->research reroute, no park, and the ordinary deferred claim stays live.
+    # This is the ladder half of #596: acct01's hourly-expiring codex token produced runs of `auth` outcomes
+    # that must never read as "the model gave up on this task".
+    auth_records = [
+        model_health.make_record("openai", "a" * 16, "codex", "auth", f"600{i}.1",
+                                 decline_now - 60 + (i * 10))
+        for i in range(DECLINE_ESCALATION_MIN + 3)
+    ]
+    assert len(auth_records) > DECLINE_ESCALATION_MIN, auth_records
+    assert {r["exit_class"] for r in auth_records} == {model_health.CLASS_AUTH}, auth_records
+    trip_f = run_decline_tripwire(auth_records)
+    assert trip_f["api_calls"] == [] and trip_f["helper_calls"] == [], trip_f
+    assert trip_f["claim_calls"] == 1, trip_f
+    assert DECLINE_ESCALATION_MARKER not in trip_f["output"], trip_f["output"]
+    # The evidence selector itself is the guard: auth rows never enter the decline window, while a
+    # genuine no_change pair still does (so the ladder is not disabled, only made honest).
+    assert _issue_no_change_outcomes(model_health, auth_records, 500) == [], auth_records
+    assert len(_issue_no_change_outcomes(
+        model_health, auth_records + [no_change_a, no_change_b], 500)) == 2
+    print("  ok   decline tripwire (f): a run of auth outcomes never advances the decline ladder")
 
     fixture = {
         "schema": SCHEMA,
@@ -4936,6 +5098,115 @@ def _self_test():
         repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
                     login="human", labels=["review:changes"])],
         provenance, [], issue_labels, now) == []
+
+    # ---- issue #560 OWNERSHIP TRANSFER (cross-script, end-to-end, across every CI state) -----
+    # The FIX lane spun on unbound legacy verdicts: the fixer refused to stage a verdict that is
+    # not bound to the live head, deferred "to a fresh review", and left review:changes on the
+    # PR — so THIS enumerator re-admitted it as needs-fix on every ~8min dispatch tick while the
+    # review lane (keyed on review:needs) never saw it. Live 2026-07-24: sparq#3523/#3542/#3572/
+    # #3573/#3608 burned ~35 fix runs/hour that way until the labels were flipped by hand.
+    #
+    # ROUND-2 FINDING 1: a LABEL FLIP ALONE ONLY RELOCATES THAT SPIN. The production state is a
+    # COMPLETED request-changes review, so the PR body carries `sparq-reviewed-sha == head` (the
+    # marker is bound LAST in review-fix.yml's outcome job). A DRAFTED PR whose marker matches the
+    # live head is NOT re-emitted as needs-review by the block above; what happens instead depends
+    # entirely on CI — green becomes `stranded` (whose review dispatch then exits `already_done`
+    # with no work done: the same successful spin one lane over), red becomes needs-ci-fix (the fix
+    # lane again), and pending/unknown matches nothing at all, leaving NO lane owning the PR.
+    #
+    # So assert OWNERSHIP, not a label: drive the REAL post-defer PR state (labels AND reviewed-sha
+    # marker) out of worker-pr.py's projections and require, for EVERY CI state, exactly ONE item
+    # owned by the REVIEW lane. Every fixture carries the marker. The label-only counterfactual is
+    # asserted right below it, so none of this is vacuous: deleting either half of the hand-over —
+    # the label transition or the marker retraction — flips these red.
+    _worker_pr = _load_module(
+        "registry_worker_pr", Path(__file__).resolve().with_name("worker-pr.py"))
+    _bound_body = f"desc\n\n<!-- sparq-reviewed-sha:{sha_a} -->\n"
+
+    def _ci_states():
+        """The four CI postures the ownership proof must hold over. `None` is the UNKNOWN posture
+        (no snapshot at all — a degraded/absent check-run read); a stale head_sha collapses to the
+        same thing inside the enumerator."""
+        base = {"head_sha": sha_a, "conflicting": False, "armed": False, "failing_legs": []}
+        return {
+            "green": {41: {**base, "gate": "success"}},
+            "red": {41: {**base, "gate": "failure", "failing_legs": ["workspace clippy"]}},
+            "pending": {41: {**base, "gate": "pending"}},
+            "unknown": None,
+        }
+
+    _spun = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                 labels=[_worker_pr.FIX_LANE_PR_LABEL], body=_bound_body)
+    for _ci, _status in _ci_states().items():
+        assert [item["state"] for item in enumerate_review_items(
+            repo, [_spun], provenance, [], issue_labels, now, pr_status=_status)] == \
+            ["needs-fix"], ("pre-defer lane", _ci)
+    for _reason in _worker_pr.FIX_LANE_DEFER_REASONS:
+        _action = _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL})
+        _after = sorted(_worker_pr.fix_lane_defer_labels(
+            {_worker_pr.FIX_LANE_PR_LABEL}, _action))
+        _marker = _worker_pr.fix_lane_defer_marker_action(_action, sha_a, sha_a)
+        # The hand-over removed the fix lane's admission label AND retracted the stale marker.
+        assert _worker_pr.FIX_LANE_PR_LABEL not in _after, (_reason, _after)
+        assert _marker == "invalidate", (_reason, _marker)
+        _handed_sha = _worker_pr.UNBOUND_REVIEWED_SHA
+        _handed = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=_after,
+                       body=f"desc\n\n<!-- sparq-reviewed-sha:{_handed_sha} -->\n")
+        for _ci, _status in _ci_states().items():
+            _items = enumerate_review_items(repo, [_handed], provenance, [], issue_labels, now,
+                                            pr_status=_status)
+            _states = [item["state"] for item in _items]
+            # EXACTLY ONE lane owns the PR, and it is the REVIEW lane — the only lane that can
+            # mint the head-bound verdict the fixer refuses to run without. No CI state may leave
+            # the PR ownerless, and none may hand it back to the fix lane.
+            assert _states == ["needs-review"], (_reason, _ci, _after, _states)
+            assert _review_item_lane(_states[0]) == "review", (_reason, _ci, _states)
+            assert "needs-fix" not in _states, (_reason, _ci, _after, _states)
+        # The review lane then provably TAKES ownership at review-fix.yml's own admission
+        # boundary: execute the ACTUAL `already_done` predicate embedded in its resolve step
+        # against the post-defer body. A retained marker would make it skip without working.
+        _rf_source = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                      / "review-fix.yml").read_text(encoding="utf-8")
+        _ad_start = _rf_source.index("          already_done = False\n")
+        _ad_end = _rf_source.index("\n          # REGISTRY provenance", _ad_start)
+        _ad_src = textwrap.dedent(_rf_source[_ad_start:_ad_end])
+        for _body, _want in ((_bound_body, True), (_handed["body"], False)):
+            _ns = {"re": re, "mode": "review", "head_sha": sha_a, "pull": {"body": _body}}
+            exec(_ad_src, _ns)  # noqa: S102 — repository-owned workflow source
+            assert _ns["already_done"] is _want, (_reason, _want, _body)
+    # NON-VACUITY / counterfactual: the round-1 fix (flip the label, KEEP the marker) does NOT
+    # transfer ownership. It only moves the spin — green strands (whose review dispatch exits
+    # already_done), red returns to the fix lane, and pending/unknown owns nothing at all.
+    _label_only = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                       labels=[_worker_pr.REVIEW_LANE_PR_LABEL], body=_bound_body)
+    _relocated = {_ci: [item["state"] for item in enumerate_review_items(
+        repo, [_label_only], provenance, [], issue_labels, now, pr_status=_status)]
+        for _ci, _status in _ci_states().items()}
+    assert _relocated == {"green": ["stranded"], "red": ["needs-ci-fix"],
+                          "pending": [], "unknown": []}, _relocated
+    # A hold/park defers WITHOUT a lane change or a marker write (the park itself already excludes
+    # the PR from both lanes, so the spin cannot recur): review:parked keeps it out entirely.
+    _parked_after = sorted(_worker_pr.fix_lane_defer_labels(
+        {_worker_pr.FIX_LANE_PR_LABEL}, "hold"))
+    assert _parked_after == [_worker_pr.FIX_LANE_PR_LABEL], _parked_after
+    assert _worker_pr.fix_lane_defer_marker_action("hold", sha_a, sha_a) == "keep"
+    for _ci, _status in _ci_states().items():
+        assert enumerate_review_items(
+            repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, body=_bound_body,
+                        labels=_parked_after + [MACHINE_PARK_PR_LABEL])],
+            provenance, [], issue_labels, now, pr_status=_status) == [], _ci
+    # ...and finding 2's abort leaves the parked PR byte-identical on BOTH axes: the park is never
+    # converted into review:needs-user and the marker is never touched.
+    _aborted = sorted(_worker_pr.fix_lane_defer_labels(
+        {_worker_pr.FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL},
+        _worker_pr.FIX_LANE_ABORT_ACTION))
+    assert _aborted == [_worker_pr.FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL], _aborted
+    assert "review:needs-user" not in _aborted, _aborted
+    assert _worker_pr.fix_lane_defer_marker_action(
+        _worker_pr.FIX_LANE_ABORT_ACTION, sha_a, sha_a) == "keep"
+    print("  ok   #560: the unbound-verdict defer transfers OWNERSHIP to the review lane in every "
+          "CI state (label flip + stale reviewed-sha retraction; no needs-fix re-admission, no "
+          "already_done skip, no ownerless posture) and a park aborts it untouched")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
@@ -5902,6 +6173,119 @@ def _self_test():
             # (2) wrote a LEGACY round-7 verdict; the ledger-first resolution tests below
             # depend on the legacy round-7 copy being absent — remove the fixture residue.
             (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 7)).unlink()
+
+            # ---- #555 RECURRENCE GAP: the MISSED-FIX exhaustion branch must honour the
+            # readmission window and be IDEMPOTENT against an unchanged head.
+            #
+            # THE DEFECT (live): sparq PR #3488 was re-admitted 2026-07-22T16:36:56Z and
+            # re-escalated at 16:44:10Z — ~7 minutes later, UNCHANGED head, no work attempted;
+            # re-admitted again 19:37:39Z and re-escalated 2026-07-23T09:48:39Z. PR #3472
+            # re-escalated seven seconds after #3488's with byte-identical boilerplate, five
+            # days after the last commit or review round on either PR. `missed` markers are
+            # durable per-round state that NOTHING resets and this branch read the LIFETIME
+            # count — so the very next tick after any re-admission re-derived the same
+            # exhaustion and (with a gen-1 receipt standing) went straight to the ladder's
+            # question-class terminal. It needs no head advance and no review round to fire,
+            # which is exactly why it hit every PR in a sweep identically. ----
+            def stamped_missed(count, created, round_n, start=1):
+                return [dict(bot_comment(
+                    f"x {wiring_worker_pr.MARKER_KINDS['missed']} round={round_n} "
+                    f"run={i}.1 -->"), created_at=created)
+                    for i in range(start, start + count)]
+
+            def needs_user_flag(flag):
+                return [args[args.index(flag) + 1] for script, args in helper_calls
+                        if script == "worker-pr.py" and args[0] == "needs-user"
+                        and flag in args]
+
+            def label_event(kind, label, ts, login):
+                return {"event": kind, "label": {"name": label},
+                        "created_at": ts, "actor": {"login": login}}
+
+            # rounds=2 keeps the ROUND budget (base 3) out of the way, so the missed-fix branch
+            # is the one under test; round_number = max(rounds, 1) = 2.
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
+            write_verdict(2, None)
+            burned_misses = stamped_rounds(2, "2026-07-22T05:00:00Z") + stamped_missed(
+                MISSED_FIX_LIMIT, "2026-07-22T05:30:00Z", 2)
+            # (baseline, unchanged behaviour) no readmission gesture => the lifetime count
+            # parks, and the park carries its attempt fingerprint (live head + LIFETIME count).
+            fake["comments"] = burned_misses
+            fake.pop("timeline", None)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert [f"{MISSED_FIX_LIMIT} consecutive fix dispatches missed for round 2"
+                    in reason for reason in needs_user_reasons()] == [True], helper_calls
+            assert needs_user_flag("--head-sha") == [sha_a], helper_calls
+            assert needs_user_flag("--attempt-key") == [
+                f"missed2={MISSED_FIX_LIMIT}"], helper_calls
+            # (e) THE 7-MINUTE BOUNCE, reproduced: the maintainer re-admits (a proven-human
+            # unlabel of the machine park at the observed 16:36:56Z) and the sweep ticks again
+            # with an UNCHANGED head and NO new work attempted. Pre-fix the lifetime count
+            # re-derived the same exhaustion and re-escalated. It must now grant REAL capacity:
+            # zero chargeable misses in the window => NO park, and the fix chain is offered
+            # again (the trailing record-marker is the allocator saying "no slot", which is a
+            # fresh miss inside the new window — not an escalation).
+            fake["timeline"] = {41: [label_event("labeled", "review:parked",
+                                                "2026-07-22T16:00:00Z",
+                                                "sparq-orchestrator[bot]"),
+                                     label_event("unlabeled", "review:parked",
+                                                "2026-07-22T16:36:56Z", "jeswr")], 7: []}
+            alloc = FakeAllocator()
+            bounce_log = io.StringIO()
+            with contextlib.redirect_stdout(bounce_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert needs_user_reasons() == [], helper_calls
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert "the missed-fix budget for round 2 charges 0 of " \
+                f"{MISSED_FIX_LIMIT}" in bounce_log.getvalue(), bounce_log.getvalue()
+            # (c) a re-admission grants a FRESH allowance, not an unbounded one: once the
+            # WINDOW itself accumulates MISSED_FIX_LIMIT misses the park fires again — charged
+            # on the window (6), fingerprinted on the LIFETIME count (12, monotone across
+            # windows so two genuinely distinct windows can never read as "unchanged").
+            fake["comments"] = burned_misses + stamped_missed(
+                MISSED_FIX_LIMIT, "2026-07-23T10:00:00Z", 2, start=MISSED_FIX_LIMIT + 1)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert [f"{MISSED_FIX_LIMIT} consecutive fix dispatches missed for round 2"
+                    in reason for reason in needs_user_reasons()] == [True], helper_calls
+            assert needs_user_flag("--attempt-key") == [
+                f"missed2={MISSED_FIX_LIMIT * 2}"], helper_calls
+            # (3'/5') a BOT unlabel opens no window and a timeline read failure keeps the FULL
+            # count — the missed-fix budget fails in the SAME conservative direction as the
+            # round budget (never a fresh allowance on unproven data).
+            fake["comments"] = burned_misses
+            fake["timeline"] = {41: [label_event("unlabeled", "review:parked",
+                                                "2026-07-22T16:36:56Z",
+                                                "sparq-orchestrator[bot]")], 7: []}
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [] and needs_user_reasons(), (alloc.chains, helper_calls)
+            fake["timeline_error"] = True
+            alloc = FakeAllocator()
+            missed_probe_log = io.StringIO()
+            with contextlib.redirect_stdout(missed_probe_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [] and needs_user_reasons(), (alloc.chains, helper_calls)
+            assert "timeline read failed" in missed_probe_log.getvalue(), \
+                missed_probe_log.getvalue()
+            fake.pop("timeline_error", None)
+            # The ROUND-budget park on this same path also carries its fingerprint (live head +
+            # the GLOBAL round count — never the window-relative charge, which resets).
+            fake["comments"] = burned_era
+            fake.pop("timeline", None)
+            write_verdict(5, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            assert (needs_user_flag("--head-sha"), needs_user_flag("--attempt-key")) == (
+                [sha_a], ["rounds=5"]), helper_calls
+            (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 2)).unlink()
 
             # ---- finding A CLAIM glue: a review:parked item that PLAN re-admitted on label
             # STATE must re-prove the human gesture on the label TIMELINES here. No gesture

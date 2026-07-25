@@ -31,6 +31,13 @@ HARD SCOPE RULE (do not widen):
     attempt — a replay duplicates comments, repeats state transitions, or double-dispatches a
     worker (incident #559's storm class). Their fail-loud semantics are deliberate (#558).
 
+SHELL CALLERS (PR #595 finding 6): `python3 scripts/gh_retry.py read <gh args...>` runs ONE
+idempotent read through this same policy and exits with gh's own status, so a workflow step gets the
+bounded backoff without hand-rolling (and drifting from) the loop in bash. The subcommand is
+STRUCTURALLY reads-only — `read_cli_reject` refuses any non-read verb, any `gh api` with a
+non-GET method, and any request-body flag — so the hard scope rule above cannot be violated by
+routing a mutation through the wrapper.
+
 Vendored mechanics, NOT tenacity: the scheduler workflows (dispatch/groom/metrics/curate/...)
 run ``python3 scripts/<x>.py`` on the bare runner with NO pip-install step, so tenacity is not
 importable there. This module therefore vendors the small stdlib-only equivalent of
@@ -113,6 +120,50 @@ def run_gh(args, *, env=None, input=None, attempts=MAX_ATTEMPTS,
         if attempt < attempts:
             sleep(attempt)
     return result
+
+
+# ---------------------------------------------------------------------------------------------------
+# `read` CLI for SHELL callers (PR #595 finding 6). Reads-only BY CONSTRUCTION: the allowlist below
+# is the complete set of gh read verbs a workflow may route through this layer, and `gh api` is
+# admitted only for GET without a request body. Anything else is a usage error, never a retried call.
+_READ_VERBS = frozenset({
+    ("api",), ("issue", "view"), ("issue", "list"), ("pr", "view"), ("pr", "list"),
+    ("pr", "checks"), ("pr", "diff"), ("label", "list"), ("run", "view"), ("run", "list"),
+    ("search", "issues"), ("search", "prs"), ("release", "view"), ("release", "list"),
+})
+_BODY_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field", "--input"})
+
+
+def read_cli_reject(args):
+    """Return a rejection reason for `args`, or None when it is an admissible IDEMPOTENT READ."""
+    if not args:
+        return "usage: gh_retry.py read <gh read args...>"
+    key = (args[0],) if args[0] == "api" else tuple(args[:2])
+    if key not in _READ_VERBS:
+        return (f"refusing to retry {' '.join(args[:2])!r}: the read wrapper admits only "
+                f"{sorted(' '.join(verb) for verb in _READ_VERBS)} (mutations must stay "
+                "single-attempt and fail loud — see this module's hard scope rule)")
+    for index, arg in enumerate(args):
+        if arg in {"-X", "--method"}:
+            method = args[index + 1] if index + 1 < len(args) else ""
+            if method.upper() != "GET":
+                return f"refusing to retry a non-GET gh api call (--method {method!r})"
+        if arg in _BODY_FLAGS or any(arg.startswith(f"{flag}=") for flag in _BODY_FLAGS):
+            return f"refusing to retry a gh api call carrying a request body ({arg})"
+    return None
+
+
+def read_cli(args, runner=None, out=None, err=None):
+    """`gh_retry.py read <args>`: one bounded-retry READ; returns gh's exit status."""
+    out, err = out if out is not None else sys.stdout, err if err is not None else sys.stderr
+    reason = read_cli_reject(args)
+    if reason:
+        print(f"gh_retry read: {reason}", file=err)
+        return 2
+    result = (runner or run_gh)(list(args))
+    out.write(result.stdout or "")
+    err.write(result.stderr or "")
+    return result.returncode
 
 
 def _self_test():
@@ -201,6 +252,45 @@ def _self_test():
     finally:
         subprocess.run = real_run
 
+    # ---- `read` CLI: reads retry, everything else is REFUSED (never retried) ----
+    import io
+
+    class _Stub:
+        def __init__(self, code=0):
+            self.calls, self.code = [], code
+
+        def __call__(self, args):
+            self.calls.append(list(args))
+            return subprocess.CompletedProcess(["gh", *args], self.code, stdout="{}", stderr="")
+
+    stub, out, err = _Stub(), io.StringIO(), io.StringIO()
+    code = read_cli(["label", "list", "-R", "o/r", "--limit", "500", "--json", "name"],
+                    runner=stub, out=out, err=err)
+    check("read CLI runs an admissible read through run_gh",
+          (code, stub.calls, out.getvalue()), (0, [["label", "list", "-R", "o/r", "--limit", "500",
+                                                    "--json", "name"]], "{}"))
+    stub2, out2 = _Stub(1), io.StringIO()
+    check("read CLI propagates gh's exit status",
+          read_cli(["issue", "view", "7", "-R", "o/r", "--json", "labels"], runner=stub2, out=out2,
+                   err=io.StringIO()), 1)
+    check("read CLI admits a plain gh api GET",
+          read_cli_reject(["api", "repos/o/r/collaborators/x/permission", "--jq", ".permission"]),
+          None)
+    # the HARD SCOPE RULE, enforced structurally: a mutation routed through the wrapper is refused
+    # (not retried), so a workflow cannot give a label edit / comment / dispatch replay semantics.
+    mutating = _Stub()
+    for argv in (["issue", "edit", "7", "-R", "o/r", "--add-label", "role:impl"],
+                 ["issue", "comment", "7", "-R", "o/r", "--body", "x"],
+                 ["pr", "merge", "7"], ["workflow", "run", "dispatch.yml"],
+                 ["api", "-X", "PATCH", "repos/o/r/issues/7"],
+                 ["api", "--method", "PUT", "repos/o/r/contents/x"],
+                 ["api", "repos/o/r/issues/7/labels", "-f", "labels[]=role:impl"],
+                 ["label", "create", "x"], []):
+        refused = read_cli_reject(argv) is not None
+        code = read_cli(argv, runner=mutating, out=io.StringIO(), err=io.StringIO())
+        check(f"read CLI refuses {' '.join(argv) or '(empty)'}", (refused, code), (True, 2))
+    check("a refused call never reached gh", mutating.calls, [])
+
     ok = all(checks)
     print("gh-retry self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
@@ -209,4 +299,7 @@ def _self_test():
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         raise SystemExit(_self_test())
-    raise SystemExit("gh_retry is an import-only helper; use --self-test")
+    # `read <gh args...>`: the SHELL entrypoint for one bounded-retry idempotent READ (finding 6).
+    if len(sys.argv) > 1 and sys.argv[1] == "read":
+        raise SystemExit(read_cli(sys.argv[2:]))
+    raise SystemExit("gh_retry is an import-first helper; use --self-test or `read <gh args...>`")
