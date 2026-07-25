@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 673,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "db29709351cb042853ac0109fcf1814f1d60843a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly moves target publication onto a fresh runner and carries model output across the hostile gate boundary as a pre-gate, digest-bound inert bundle. Verification is fail-closed and precedes token minting; repository, issue, deterministic branch, base SHA, artifact size, required members, digest, and patch path shape are checked, with the resolved routing SHA independently matched. The publisher re-verifies before applying, checks out the recorded base, neutralizes hooks, reconstructs a single rooted commit, and publishes only on gate success. Follow-ups retain their intended failed-gate behavior but are sourced only from the verified pre-gate bundle. Final-state, provenance, and lease-release dependencies are correctly rewired around the isolated publisher. The added tests exercise successful sealing/reconstruction and concrete tamper, drift, missing-artifact, size, token-ordering, post-gate-token, gate-vacuity, and hook-execution mutants; they are non-vacuous. No diff text appears to be an instruction directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
