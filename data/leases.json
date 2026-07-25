@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "305719a42da944e0b16bee38959b360d",
-   "holder": "review:jeswr/agent-account-registry#634@30161639035.1",
-   "package": "dispatch",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1784989616,
-   "expires_at": 1784993816
-  }
- ]
+ "leases": []
 }
