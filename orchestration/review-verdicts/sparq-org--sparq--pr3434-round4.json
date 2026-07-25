@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3434,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e23837529ebebacc891f7a002a45edf1d67e3638",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff changes the canonical hidden_issuer_d4 baseline to 24,452 and updates several mirrors, but research/zk-verification-and-costs.md still states that the deterministic committed snapshot is 16,946, repeats 16,946 in its per-member table, and describes two scalar multiplications rather than the four now attributed here. That document also claims the snapshot, bench mirror, catalog, and regression gate cannot drift, so the merged repository would contain mutually contradictory audit/evidence records. This is material for a ZK cost and soundness-adjacent change, not a cosmetic stale number.",
+    "file": "crates/sparq-zk-compose/tests/gate_count_snapshot.json",
+    "fix_hint": "Update research/zk-verification-and-costs.md in this PR to use the 24,452 canonical gate count and accurately describe the two added subgroup-check scalar multiplications, while retaining the research-grade/not-externally-audited caveat. Check any directly generated or cited cost table derived from that record in the same regeneration pass.",
+    "severity": "major",
+    "title": "Hidden-issuer rebaseline leaves the ZK cost record stale"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The new toolchain-present CI step is correctly targeted and makes the non-ignored gate-count regression execute on the real nargo/bb path; the catalog test also checks the updated snapshot joins. The hidden-issuer rebaseline is internally consistent across the changed snapshot, bench, catalog, and site data, and its caveat correctly avoids claiming external soundness. However, this round adds the 16,946 -> 24,452 rebaseline without updating the repository's dedicated ZK verification-and-costs record, which still describes 16,946 as the deterministic committed snapshot and says CI prevents these artifacts from drifting. That leaves a material, user-facing evidence source contradicted by the changed canonical artifacts. Round 3 had no findings, so this new major consistency finding makes progress regressing.",
+  "verdict": "request_changes"
+ }
+}
