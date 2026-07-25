@@ -426,6 +426,12 @@ jobs:
           LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
         run: |
           set -euo pipefail
+          # >>> provider-label — EXECUTED by scripts/grant-account.py --self-test. #616 review round
+          # 2 (MAJOR): this predicate had NO test at all, so replacing the body with `true`,
+          # restoring last-label-wins (`.[-1]` instead of the length-1 requirement) or dropping the
+          # `unique` all passed. These sentinels delimit the fragment the self-test extracts and runs
+          # against label fixtures; removing either makes that extraction FAIL CLOSED. `$LABELS_JSON`
+          # is its only input and `$prov` its only output.
           prov=$(printf '%s' "$LABELS_JSON" | jq -r '
             [.[] | select(. == "provider:openai" or . == "provider:anthropic")] | unique
             | if length == 1 then (.[0] | ltrimstr("provider:")) else "" end')
@@ -434,6 +440,7 @@ jobs:
               --body "❌ Add exactly one \`provider:openai\` or \`provider:anthropic\` label (never both), then re-apply \`set-up-account\`." || echo "::warning title=set-up-account::the provider-label refusal explanation failed to post — the refusal/outcome above is the authoritative record"
             exit 1
           fi
+          # <<< provider-label
           # The models line the allocator requires (read_accounts drops model-less accounts),
           # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
           # openai mints the FULL codex alias set [sol, luna, terra]: select-and-claim's
@@ -958,9 +965,34 @@ jobs:
               # irreversible, so recovery is forward, never a silent inline activation).
               pulls = gh_pages([f"repos/{repo}/pulls?head={owner}:{branch}&state=all&per_page=100"])
               merged = proven(grant.merged_grant_prs, pulls, handle)
-              evidence = merged[-1]
-              proven(grant.require_grant_pr_scope, evidence,
-                     gh_pages([f"repos/{repo}/pulls/{evidence}/files?per_page=100"]), path)
+              # #616 review round 2: the branch name plus the changed-file list prove the SHAPE of
+              # the provenance, NOT that the PR added THIS handle — and picking `merged[-1]` assumed
+              # the newest merged PR on the branch was the grant. Every merged candidate is now
+              # examined and one must be provably the grant that ADDED the handle: its diff touches
+              # only the policy document, and that diff adds this handle to account_pool lines and
+              # moves nothing else. If none is, the membership is still unaccounted for and this
+              # enrollment refuses rather than activating inline.
+              evidence, refusals = None, []
+              for candidate in merged:
+                  changed = gh_pages([f"repos/{repo}/pulls/{candidate}/files?per_page=100"])
+                  try:
+                      grant.require_grant_pr_scope(candidate, changed, path)
+                      diffs = [entry.get("patch") for entry in changed
+                               if isinstance(entry, dict) and entry.get("filename") == path]
+                      if len(diffs) != 1:
+                          raise grant.GrantError(
+                              f"carries {len(diffs)} diffs of {path}, expected exactly 1")
+                      grant.verify_grant_patch(diffs[0], handle)
+                  except grant.GrantError as exc:
+                      refusals.append(f"#{candidate}: {exc}")
+                      continue
+                  evidence = candidate
+                  break
+              if evidence is None:
+                  raise SystemExit(
+                      "::error::account_pool grant refused (fail closed): no merged "
+                      f"`{branch}` pull request is provably the grant that ADDED {handle} to the "
+                      f"policy account_pool — {'; '.join(refusals) or 'no candidates'}")
               print(f"{handle} already granted to exactly {targets} in master account_pool "
                     f"by merged PR #{evidence} — no new PR needed")
               set_output("pr", "none")
@@ -1233,8 +1265,24 @@ jobs:
                  -H "Accept: application/vnd.github.raw" > "$before"; then
             echo "::error::could not read policy/repos.toml at the pre-merge commit $parent — refusing to activate $handle (fail closed)"; exit 1
           fi
-          HANDLE="$handle" ACCOUNT_BODY="$body" BEFORE_POLICY_FILE="$before" python3 - <<'PY'
-          import importlib.util, os, sys
+          # #616 review round 2, BOTH MAJORS. The first-parent read above is master-immediately-before
+          # for a merge commit, a squash and a SINGLE-commit rebase — but this repo has
+          # `allow_rebase_merge: true`, and for a MULTI-COMMIT rebase the final commit's first parent
+          # is an earlier commit OF THE SAME PR, hiding that PR's earlier policy edits from the
+          # comparison. And `verify_grant` used to accept a NO-DELTA pair, so a PR that established
+          # nothing could activate a credential. Both are closed by proving the PR'S OWN DIFF:
+          # `pulls/N/files` is computed against the merge base, so it sees every commit of the PR
+          # whatever strategy merged it, and an absent/empty patch is a refusal. Fully paginated —
+          # a truncated file listing would let an extra file hide from require_grant_pr_scope, which
+          # is the one direction that fails OPEN. `--slurp` keeps `--paginate` a single document.
+          files="$RUNNER_TEMP/merged-pr-files.json"
+          if ! gh api "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" --paginate --slurp \
+                 > "$files"; then
+            echo "::error::could not read the changed-file listing for merged PR #$PR_NUMBER, so it cannot be proven that the grant edited only policy/repos.toml — refusing to activate $handle (fail closed)"; exit 1
+          fi
+          HANDLE="$handle" ACCOUNT_BODY="$body" BEFORE_POLICY_FILE="$before" \
+            PR_FILES_FILE="$files" python3 - <<'PY'
+          import importlib.util, json, os, sys
           spec = importlib.util.spec_from_file_location(
               "registry_grant_account", "scripts/grant-account.py")
           grant = importlib.util.module_from_spec(spec)
@@ -1244,15 +1292,32 @@ jobs:
               policy = fh.read()
           with open(os.environ["BEFORE_POLICY_FILE"], encoding="utf-8") as fh:
               before = fh.read()
+          with open(os.environ["PR_FILES_FILE"], encoding="utf-8") as fh:
+              pages = json.load(fh)
+          changed = [entry for page in pages for entry in page]
+          path = "policy/repos.toml"
           try:
               targets = grant.parse_record_line(os.environ["ACCOUNT_BODY"])
               grant.verify_membership(policy, handle, targets)
               grant.verify_grant(before, policy, handle, targets)
+              # The merged PR touched EXACTLY the policy document (nothing sits outside the proof)...
+              grant.require_grant_pr_scope(int(os.environ["PR_NUMBER"]), changed, path)
+              # ...and its OWN diff ADDED this handle and moved nothing else. Strategy-independent,
+              # so a multi-commit rebase cannot hide an earlier commit's policy edit behind the
+              # first-parent read, and a no-delta PR can never license an activation.
+              patches = [entry.get("patch") for entry in changed
+                         if isinstance(entry, dict) and entry.get("filename") == path]
+              if len(patches) != 1:
+                  raise grant.GrantError(
+                      f"merged PR #{os.environ['PR_NUMBER']} carries {len(patches)} diffs of {path}, "
+                      "expected exactly 1 — refusing")
+              grant.verify_grant_patch(patches[0], handle)
           except grant.GrantError as exc:
               print(f"::error::refusing to activate {handle}: {exc}", file=sys.stderr)
               sys.exit(1)
-          print(f"{handle} confirmed granted to exactly {targets} in the merged account_pool, "
-                "and every other row is byte-identical to the pre-merge policy")
+          print(f"{handle} confirmed granted to exactly {targets} in the merged account_pool; every "
+                "other row is byte-identical to the pre-merge policy, and PR "
+                f"#{os.environ['PR_NUMBER']}'s own diff touched only {path} and ADDED {handle}")
           PY
           granted=$(printf '%s\n' "$body" | sed -n 's/^grant_targets:[[:space:]]*\(.*\)$/\1/p' | head -1 | tr -d '\r')
           labels=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
@@ -1262,6 +1327,19 @@ jobs:
             *) echo "::error::issue #$num for $handle is neither pending nor available (labels: $labels) — refusing"; exit 1 ;;
           esac
           gh issue edit "$num" -R "$REPO" --remove-label status:pending --add-label status:available
+          # #616 review round 2 (MINOR): this file's header claims the status:pending ->
+          # status:available flip "fails the step and then PROVES the flip landed", and no
+          # post-mutation read existed — the claim was true of the OTHER transitions in this
+          # workflow, not of this one. It is true here now: a label write that reported success but
+          # did not land must never be followed by a success notice on the issue.
+          post=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
+          case " $post " in
+            *" status:available "*) : ;;
+            *) echo "::error::the status:available flip on issue #$num did NOT land (labels: $post) — refusing to report an activation that did not happen (fail closed)"; exit 1 ;;
+          esac
+          case " $post " in
+            *" status:pending "*) echo "::error::issue #$num still carries status:pending after the flip (labels: $post) — the account is in an ambiguous state; refusing (fail closed)"; exit 1 ;;
+          esac
           gh issue comment "$num" -R "$REPO" \
             --body "✅ Activated: \`$handle\` is now \`status:available\` for its authorized targets \`$granted\` (account_pool PR #$PR_NUMBER merged; the merged policy was re-proved against the pre-merge commit — the handle appears exactly once in each authorized row, and every other row and field is byte-identical)." || echo "::warning title=set-up-account::the activation notice failed to post — the refusal/outcome above is the authoritative record"
           # Close the linked request issue (request_issue: <n> in the account issue body).

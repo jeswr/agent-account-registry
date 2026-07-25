@@ -46,9 +46,11 @@
 
 import argparse
 import importlib.util
+import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -274,7 +276,12 @@ def render_grant(policy_text, handle, targets):
         separator = ", " if items.strip() else ""
         lines[index] = f"{match.group(1)}{items}{separator}{quoted}{match.group(3)}"
     new_text = "\n".join(lines)
-    verify_grant(policy_text, new_text, handle, resolved)
+    # The ONE opt-out from the grant-delta requirement, and the reason it is safe: this function is
+    # idempotent per row BY CONTRACT, so a handle already present in every requested row must return
+    # a byte-identical document for the caller's no-op path to recognize. That path then proves
+    # provenance separately (verify_membership + merged_grant_prs + require_grant_pr_scope +
+    # verify_grant_patch) rather than treating no-change as a grant.
+    verify_grant(policy_text, new_text, handle, resolved, require_delta=False)
     return new_text
 
 
@@ -288,9 +295,22 @@ def _changed_line_indexes(before_text, after_text):
     return [index for index in range(len(before)) if before[index] != after[index]]
 
 
-def verify_grant(before_text, after_text, handle, targets):
+def verify_grant(before_text, after_text, handle, targets, require_delta=True):
     """The EXACT, per-target postcondition on a proposed grant (invariant 4). Returns the sorted
     target set; raises GrantError otherwise.
+
+    `require_delta=True` (the DEFAULT, and the fail-closed posture) additionally requires that this
+    pair actually ESTABLISHED part of the grant: at least one requested target row must have gone
+    from not-listing `handle` to listing it. #616 review round 2 (MAJOR): without it an empty
+    changed-line set was a SUCCESS, so a byte-identical (or formatting-only, or
+    different-file-only) pair passed both this check and verify_membership — pre-seeded membership
+    plus a non-grant `account-pool/<handle>` PR could flip status:pending -> status:available. The
+    partial case still passes: a handle already present in target A and added to target B has one
+    added row, which is exactly "this diff established part of the grant".
+
+    The ONE legitimate opt-out is render_grant's idempotent per-row contract, where a byte-identical
+    result is a meaningful outcome the CALLER then handles as the no-op path (and which carries its
+    own merged-grant-PR provenance proof). Callers must opt out explicitly; nothing defaults to it.
 
     Proved by PARSING both documents (never from a substitution count):
       * every requested target row lists `handle` EXACTLY once,
@@ -311,6 +331,7 @@ def verify_grant(before_text, after_text, handle, targets):
     missing = [target for target in resolved if target not in after]
     if missing:
         raise GrantError(f"requested targets {missing} are not rows of the policy — refusing")
+    established = []
     for name in sorted(after):
         base_row, new_row = before[name], after[name]
         if not isinstance(base_row, dict) or not isinstance(new_row, dict):
@@ -324,6 +345,8 @@ def verify_grant(before_text, after_text, handle, targets):
                 f"the proposed policy changes fields other than account_pool on row {name!r} — "
                 "an account grant must touch nothing else (fail closed)")
         if name in resolved:
+            if handle not in base_pool:
+                established.append(name)
             count = new_pool.count(handle)
             if count != 1:
                 raise GrantError(
@@ -352,7 +375,97 @@ def verify_grant(before_text, after_text, handle, targets):
             raise GrantError(
                 f'line {index + 1} in [repos."{owner}"] is not an account_pool assignment on both '
                 "sides — refusing")
+    if require_delta and not established:
+        raise GrantError(
+            f"this policy pair does not ADD {handle} to any requested target row — every requested "
+            f"row of {resolved} already listed it, so nothing here established the grant. A "
+            "byte-identical or formatting-only change is not a grant, and a PR that did not "
+            "establish the membership must never license activating a credential (fail closed)")
     return resolved
+
+
+def _pool_entries(pool_line):
+    """The quoted entries of a single-line `account_pool = [...]` assignment, or None."""
+    match = _POOL_LINE_RE.match(pool_line)
+    if not match:
+        return None
+    return [entry.strip() for entry in match.group(2).split(",") if entry.strip()]
+
+
+def verify_grant_patch(patch, handle):
+    """Prove from a PULL REQUEST'S OWN unified diff of the policy document that the PR ADDED
+    `handle` to one or more `account_pool` assignments and changed nothing else there.
+
+    WHY THIS EXISTS AND WHAT IT REPLACES — #616 review round 2, both MAJORs.
+
+    (1) The post-merge two-document proof reads the pre-merge policy from the merge commit's FIRST
+    PARENT. That is master-immediately-before for a merge commit, a squash and a SINGLE-commit
+    rebase — but this repository reports `allow_rebase_merge: true`, and for a MULTI-COMMIT rebase
+    the final commit's first parent is an earlier commit OF THE SAME PR, so earlier unrelated policy
+    edits carried by that PR are INVISIBLE to the comparison. A PR's `files[].patch` is computed
+    against the MERGE BASE, so it covers every commit of the PR whatever strategy merged it: this
+    check is strategy-independent and closes that hole. Re-reading the whole document at the merge
+    base instead would have reintroduced false refusals — a concurrent enrollment landing between
+    the merge base and the merge legitimately adds ANOTHER handle to the same rows — which is why
+    the fix is a diff-level proof rather than a different base for the document-level one.
+
+    (2) It is also the grant-DELTA proof at the PR level: an absent or empty patch (a
+    byte-identical, formatting-only or other-file-only PR) is a REFUSAL, so a non-grant PR on the
+    `account-pool/<handle>` branch can no longer stand in for a reviewed grant.
+
+    Requirements, all of them refusals otherwise: the patch is readable and non-empty; every removed
+    and added line is a single-line `account_pool` assignment; no removed line already lists
+    `handle`; every added line lists `handle` exactly once; and stripping `handle` from each added
+    line's entries reproduces the removed lines' entry lists EXACTLY (as a multiset, so hunk order
+    is irrelevant). Any other policy edit — a different handle added or removed, a reordered pool, a
+    non-pool field, a comment rewrite — therefore fails. Pure; unit-tested by --self-test.
+
+    ROW SCOPING IS NOT THIS FUNCTION'S JOB: the diff carries no row identity. verify_grant (line
+    spans, against the merged document) and verify_membership (handle in no non-target row) own that,
+    and the three together are what make the proof complete."""
+    _require_handle(handle)
+    quoted = f'"{handle}"'
+    if not isinstance(patch, str) or not patch.strip():
+        raise GrantError(
+            f"the merged pull request carries no readable diff of the policy document, so it cannot "
+            f"be proven that it ADDED {handle} to any account_pool — refusing (fail closed)")
+    removed, added = [], []
+    for line in patch.split("\n"):
+        if line.startswith(("+++", "---", "@@", "\\")) or not line[:1] in {"+", "-"}:
+            continue
+        body = line[1:]
+        entries = _pool_entries(body)
+        if entries is None:
+            raise GrantError(
+                f"the grant diff changes {body.strip()!r}, which is not a single-line account_pool "
+                "assignment — a grant PR rewrites account_pool lines and nothing else (fail closed)")
+        (added if line.startswith("+") else removed).append(entries)
+    if not added:
+        raise GrantError(
+            f"the grant diff adds no account_pool line, so it did not establish {handle}'s "
+            "membership — refusing (fail closed)")
+    if len(added) != len(removed):
+        raise GrantError(
+            f"the grant diff rewrites {len(removed)} account_pool line(s) into {len(added)}; a grant "
+            "replaces each pool line it touches one-for-one — refusing (fail closed)")
+    for entries in removed:
+        if quoted in entries:
+            raise GrantError(
+                f"the grant diff REMOVES an account_pool line that already listed {handle}; a grant "
+                "adds the handle, it never rewrites a row that already had it (fail closed)")
+    stripped = []
+    for entries in added:
+        if entries.count(quoted) != 1:
+            raise GrantError(
+                f"an added account_pool line lists {handle} {entries.count(quoted)} time(s); the "
+                "grant postcondition is EXACTLY once (fail closed)")
+        stripped.append([entry for entry in entries if entry != quoted])
+    if sorted(stripped) != sorted(removed):
+        raise GrantError(
+            f"the grant diff changes account_pool members other than {handle} (before {removed}, "
+            f"after {stripped} once {handle} is set aside) — a grant adds ONE handle and moves "
+            "nothing else, so this PR carries an edit outside its grant (fail closed)")
+    return len(added)
 
 
 def verify_membership(policy_text, handle, targets):
@@ -541,6 +654,12 @@ def strip_yaml_comments(text):
     return "\n".join(line for line in text.split("\n") if not line.lstrip().startswith("#"))
 
 
+def workflow_step_raw(text, step_id):
+    """The ONE workflow step whose `id:` is `step_id`, WITH its comments — for the paths that must
+    execute a delimited region of the step (the sentinels are comments, so they must survive)."""
+    return _workflow_step_slice(text, step_id)
+
+
 def workflow_step(text, step_id):
     """The full YAML text of the ONE workflow step whose `id:` is `step_id`, comments stripped.
 
@@ -548,6 +667,14 @@ def workflow_step(text, step_id):
     NEIGHBOURING step (or in a header comment) cannot satisfy an assertion about this one. Raises
     GrantError when no such step exists or the extracted body is empty — a wiring assertion that
     cannot find its step must fail, never pass vacuously."""
+    body = strip_yaml_comments(_workflow_step_slice(text, step_id))
+    if not body.strip():
+        raise GrantError(f"step `id: {step_id}` extracted to an empty body — refusing")
+    return body
+
+
+def _workflow_step_slice(text, step_id):
+    """The raw lines of the ONE step whose `id:` is `step_id` (shared by both extractors above)."""
     if not isinstance(text, str):
         raise GrantError("cannot extract a step from a non-text workflow — refusing")
     lines = text.split("\n")
@@ -570,10 +697,82 @@ def workflow_step(text, step_id):
         if here < indent or (here == indent and line.lstrip().startswith("- ")):
             end = index
             break
-    body = strip_yaml_comments("\n".join(lines[start:end]))
-    if not body.strip():
+    slice_text = "\n".join(lines[start:end])
+    if not slice_text.strip():
         raise GrantError(f"step `id: {step_id}` extracted to an empty body — refusing")
-    return body
+    return slice_text
+
+
+def workflow_block(text, step_id, marker):
+    """The dedented fragment between `# >>> <marker>` and `# <<< <marker>` inside the ONE step whose
+    `id:` is `step_id` — a region meant to be EXECUTED, so its comments are preserved.
+
+    #616 review round 2 (MAJOR): the provider-label predicate had no test at all. Executing it needs
+    a delimited fragment; the sentinels are part of the workflow, and removing either makes this
+    raise rather than silently extracting something else."""
+    body = workflow_step_raw(text, step_id).split("\n")
+    opens = [index for index, line in enumerate(body)
+             if line.strip().startswith(f"# >>> {marker}")]
+    closes = [index for index, line in enumerate(body) if line.strip() == f"# <<< {marker}"]
+    if len(opens) != 1 or len(closes) != 1 or closes[0] <= opens[0]:
+        raise GrantError(
+            f"step `id: {step_id}` must carry exactly one `# >>> {marker}` ... `# <<< {marker}` "
+            f"pair, found {len(opens)}/{len(closes)} — refusing to assert vacuously")
+    kept = [line for line in body[opens[0] + 1:closes[0]]
+            if line.strip() and not line.lstrip().startswith("#")]
+    if not kept:
+        raise GrantError(f"the `{marker}` block extracted to nothing — refusing")
+    pad = min(len(line) - len(line.lstrip()) for line in kept)
+    return "\n".join(line[pad:] for line in kept)
+
+
+def _condition_at(lines, start, end, indent):
+    """The single-space-normalized `if:` expression declared at `indent` between `start` and `end`.
+
+    #616 review round 2 (MAJOR): workflow_step validates step BODIES only, never the enclosing
+    job/event/workflow `if:` — so flipping the condition that restricts activation to a MERGED
+    `account-pool/*` pull request left every test green. Folded (`>-`) and inline forms are both
+    handled; a missing or duplicated `if:` raises, so a control condition that cannot be located
+    can never be asserted vacuously."""
+    marks = [index for index in range(start, end)
+             if (len(lines[index]) - len(lines[index].lstrip())) == indent
+             and lines[index].lstrip().startswith("if:")]
+    if len(marks) != 1:
+        raise GrantError(f"expected exactly one `if:` at indent {indent}, found {len(marks)}")
+    head = lines[marks[0]].lstrip()[len("if:"):].strip()
+    collected = [] if head in {">-", ">", "|", "|-"} else [head]
+    for index in range(marks[0] + 1, end):
+        if not lines[index].strip():
+            continue
+        if (len(lines[index]) - len(lines[index].lstrip())) <= indent:
+            break
+        collected.append(lines[index].strip())
+    condition = " ".join(" ".join(collected).split())
+    if not condition:
+        raise GrantError(f"the `if:` at indent {indent} extracted to an empty expression")
+    return condition
+
+
+def job_condition(text, job_id):
+    """The `if:` expression guarding the WORKFLOW JOB `job_id`, whitespace-normalized."""
+    lines = text.split("\n")
+    marks = [index for index, line in enumerate(lines) if line == f"  {job_id}:"]
+    if len(marks) != 1:
+        raise GrantError(
+            f"expected exactly one job `{job_id}:` at the jobs indent, found {len(marks)}")
+    end = len(lines)
+    for index in range(marks[0] + 1, len(lines)):
+        line = lines[index]
+        if line.strip() and (len(line) - len(line.lstrip())) <= 2:
+            end = index
+            break
+    return _condition_at(lines, marks[0] + 1, end, 4)
+
+
+def step_condition(text, step_id):
+    """The `if:` expression guarding the STEP whose `id:` is `step_id`, whitespace-normalized."""
+    body = workflow_step(text, step_id).split("\n")
+    return _condition_at(body, 0, len(body), len(body[0]) - len(body[0].lstrip()) + 2)
 
 
 FIXTURE = '''# a policy comment that must survive every grant byte-identical
@@ -903,6 +1102,94 @@ def _self_test():
               refuses(verify_grant, live_policy, _legacy_global_append(live_policy, "acct99"),
                       "acct99", [first], needle="NON-TARGET row"), True)
 
+    # ------------------------------------------------------------------------------------------
+    # [#616 review ROUND 2, MAJOR 1] AUTHORIZATION: A NO-DELTA PAIR IS NOT A GRANT. verify_grant
+    # returned SUCCESS on a byte-identical (or formatting-only, or other-file-only) pair, because
+    # _changed_line_indexes returns [] and nothing required the pair to have ADDED the handle. With
+    # membership pre-seeded by any other means, a non-grant `account-pool/<handle>` PR therefore
+    # passed BOTH verify_membership and verify_grant and could flip status:pending ->
+    # status:available. These rows assert the REFUSAL, so a mutant that drops the requirement is
+    # caught ADMITTING the non-grant pair, not merely missing a call.
+    # ------------------------------------------------------------------------------------------
+    seeded = render_grant(FIXTURE, "acct07", ["o/target"])
+    check("[#616 r2] a byte-identical policy pair is REFUSED as a grant (no delta established)",
+          refuses(verify_grant, seeded, seeded, "acct07", ["o/target"],
+                  needle="does not ADD acct07"), True)
+    check("[#616 r2] ...and so is a pair whose every requested row already listed the handle",
+          refuses(verify_grant, seeded, seeded, "acct07", ["o/target"],
+                  needle="already listed it"), True)
+    check("[#616 r2] a PARTIAL pre-existing grant still passes (one row added is a real delta)",
+          verify_grant(seeded, render_grant(seeded, "acct07", ["o/target", "o/second"]),
+                       "acct07", ["o/target", "o/second"]),
+          ["o/second", "o/target"])
+    check("[#616 r2] render_grant keeps its idempotent per-row contract (the ONE opt-out)",
+          render_grant(seeded, "acct07", ["o/target"]), seeded)
+
+    # ------------------------------------------------------------------------------------------
+    # [#616 review ROUND 2, MAJOR 2] THE REBASE-MERGE BASE HOLE. The post-merge proof reads the
+    # pre-merge policy from the merge commit's FIRST PARENT; this repository reports
+    # `allow_rebase_merge: true`, so for a MULTI-COMMIT rebase that parent is an earlier commit OF
+    # THE SAME PR and the PR's earlier policy edits are invisible to the comparison. The PR's own
+    # `files[].patch` is computed against the MERGE BASE, so it sees every commit of the PR whatever
+    # strategy merged it: verify_grant_patch is the strategy-independent proof. Each row asserts a
+    # REFUSAL of a diff a rebase could otherwise have hidden.
+    # ------------------------------------------------------------------------------------------
+    good_patch = ('@@ -3,3 +3,3 @@\n'
+                  ' routing = "r.toml"\n'
+                  '-account_pool = ["acct01", "acct02"]\n'
+                  '+account_pool = ["acct01", "acct02", "acct07"]\n')
+    check("[#616 r2] a real grant diff is accepted and counts the rows it granted",
+          verify_grant_patch(good_patch, "acct07"), 1)
+    # Split into separate rows on purpose: each must be able to go red and PRINT independently, so a
+    # mutant that removes the readability guard reports a legible refusal-became-acceptance rather
+    # than taking the suite down on the `None` row before the string row is shown.
+    check("[#616 r2] an EMPTY diff is refused — a no-delta PR never licenses activation",
+          refuses(verify_grant_patch, "", "acct07", needle="no readable diff"), True)
+    check("[#616 r2] an ABSENT diff (patch omitted by the API) is refused the same way",
+          refuses(verify_grant_patch, None, "acct07", needle="no readable diff"), True)
+    check("[#616 r2] a context-only diff is refused (it establishes nothing)",
+          refuses(verify_grant_patch, "@@ -1,1 +1,1 @@\n context only\n", "acct07",
+                  needle="adds no account_pool line"), True)
+    check("[#616 r2] a diff that ALSO edits a non-pool policy line is refused (the rebase payload)",
+          refuses(verify_grant_patch,
+                  good_patch + '-max_concurrent = 2\n+max_concurrent = 9\n', "acct07",
+                  needle="not a single-line account_pool assignment"), True)
+    check("[#616 r2] a diff that ALSO adds a DIFFERENT handle elsewhere is refused",
+          (refuses(verify_grant_patch,
+                   good_patch
+                   + '-account_pool = ["acct01"]\n+account_pool = ["acct01", "acct99", "acct07"]\n',
+                   "acct07", needle="members other than acct07"),
+           # ...and a second changed pool line that does not carry the handle at all is refused too
+           refuses(verify_grant_patch,
+                   good_patch + '-account_pool = ["acct01"]\n+account_pool = ["acct01", "acct99"]\n',
+                   "acct07", needle="EXACTLY once")),
+          (True, True))
+    check("[#616 r2] a diff that REMOVES another handle while adding this one is refused",
+          refuses(verify_grant_patch,
+                  '-account_pool = ["acct01", "acct02"]\n+account_pool = ["acct01", "acct07"]\n',
+                  "acct07", needle="members other than acct07"), True)
+    check("[#616 r2] a diff that rewrites a row ALREADY listing the handle is refused",
+          refuses(verify_grant_patch,
+                  '-account_pool = ["acct07"]\n+account_pool = ["acct07", "acct07"]\n',
+                  "acct07", needle="already listed"), True)
+    check("[#616 r2] a diff adding the handle TWICE is refused (exactly once, at diff level too)",
+          refuses(verify_grant_patch,
+                  '-account_pool = ["acct01"]\n+account_pool = ["acct01", "acct07", "acct07"]\n',
+                  "acct07", needle="EXACTLY once"), True)
+    check("[#616 r2] a pure DELETION of a pool line is refused (nothing was established)",
+          refuses(verify_grant_patch, '-account_pool = ["acct01", "acct07"]\n', "acct07",
+                  needle="adds no account_pool line"), True)
+    # Two granted rows in two hunks, emitted in either hunk order: the proof is a multiset, so hunk
+    # ordering cannot make a correct grant false-refuse.
+    two_rows = ('@@ -5,1 +5,1 @@\n-account_pool = ["acct01", "acct02"]\n'
+                '+account_pool = ["acct01", "acct02", "acct07"]\n'
+                '@@ -14,1 +14,1 @@\n-account_pool = ["acct01"]\n'
+                '+account_pool = ["acct01", "acct07"]\n')
+    check("[#616 r2] a two-row grant is accepted in either hunk order",
+          (verify_grant_patch(two_rows, "acct07"),
+           verify_grant_patch("\n".join(reversed(two_rows.strip().split("\n"))), "acct07")),
+          (2, 2))
+
     # #616 findings 3 + 4 (TEST VACUITY on the wiring). Every assertion below used to be a
     # WHOLE-FILE substring check, and every one of those was satisfiable by a prose comment or by
     # the same call in a DIFFERENT step: deleting the post-login `grant.authorize(...)` from the
@@ -926,8 +1213,14 @@ def _self_test():
           [line for line in write.split("\n") if line.lstrip().startswith("#")], [])
     check("an absent/renamed step id fails LOUDLY instead of asserting vacuously",
           refuses(workflow_step, workflow, "no_such_step", needle="found 0"), True)
-    check("set-up-account.yml loads this helper",
-          "scripts/grant-account.py" in executable, True)
+    # #616 review round 2: `"scripts/grant-account.py" in executable` was a WHOLE-FILE grep and the
+    # path appears 7 times, so deleting the import from any single step left it green. Assert it
+    # PER STEP, on each step that must load the helper to make a decision.
+    check("[#616 r2] every DECIDING step loads this helper (per step, not whole-file)",
+          {name: "scripts/grant-account.py" in body
+           for name, body in (("grant", preflight), ("policy_pr", write),
+                              ("register", register), ("activate_merged", activated))},
+          {"grant": True, "policy_pr": True, "register": True, "activate_merged": True})
     check("[#579] the pre-login preflight authorizes from the request's own grant labels",
           "grant.authorize" in preflight, True)
     check("[#579/#616] the PRIVILEGED WRITE STEP re-proves authorization live against the snapshot",
@@ -937,9 +1230,28 @@ def _self_test():
     check("[#616] the no-op path proves membership AND merged-grant-PR provenance",
           ("grant.verify_membership" in write, "grant.merged_grant_prs" in write,
            "grant.require_grant_pr_scope" in write), (True, True, True))
+    # #616 review round 2: branch name + filename prove the SHAPE of the provenance, not that the PR
+    # ADDED THIS HANDLE. The no-op path must prove that from the candidate PR's own diff, and must
+    # not just take the newest merged PR on the branch on trust.
+    check("[#616 r2] the no-op path proves the evidence PR's diff ADDED this handle",
+          ("grant.verify_grant_patch" in write, "merged[-1]" in write,
+           "for candidate in merged" in write), (True, False, True))
     check("[#616] the ACTIVATE step re-proves the record, membership AND the two-document scope",
           ("grant.parse_record_line" in activated, "grant.verify_membership" in activated,
            "grant.verify_grant" in activated), (True, True, True))
+    # #616 review round 2: activation omitted require_grant_pr_scope entirely (additional files in
+    # the merged PR sat outside the final proof) and had no strategy-independent delta proof, so the
+    # multi-commit-rebase first-parent hole was load-bearing. Both calls are asserted IN that step.
+    check("[#616 r2] the ACTIVATE step also scopes the merged PR's FILES and proves its own diff",
+          ("grant.require_grant_pr_scope" in activated,
+           "grant.verify_grant_patch" in activated,
+           "--paginate" in activated), (True, True, True))
+    check("[#616 r2] the ACTIVATE step POST-READS the labels it flipped (the header's own claim)",
+          ("did NOT land" in activated,
+           # ...and the read comes AFTER the write, not before it. `find` (not `index`) so a deleted
+           # post-read reports a legible False instead of taking the suite down on a ValueError.
+           0 <= activated.find("gh issue edit") < activated.find("did NOT land")),
+          (True, True))
     check("[#579] the account record stamp happens in the REGISTER step",
           "grant.format_record_line" in register, True)
     check("[#579] the policy write never substitutes over the document",
@@ -947,9 +1259,72 @@ def _self_test():
           False)
     check("[#579] set-up-account.yml no longer carries an existential pool check",
           "any(handle in" in executable, False)
+    # #616 review round 2: the transport assertion was whole-file and `toJSON(...labels...)` appears
+    # twice, so deleting one left it green. Scope it to the TWO steps that consume label names.
+    meta = workflow_step(workflow, "meta")                  # the provider-label predicate
+    check("[#616 r2] untrusted labels cross as JSON DATA in each consuming step, never interpolated",
+          {name: ("${{ toJSON(github.event.issue.labels.*.name) }}" in body,
+                  "${{ join(github.event.issue.labels" in body)
+           for name, body in (("meta", meta), ("grant", preflight))},
+          {"meta": (True, False), "grant": (True, False)})
     check("untrusted issue labels cross into the shell as JSON data, not interpolation",
-          "${{ toJSON(github.event.issue.labels.*.name) }}" in executable
-          and "${{ join(github.event.issue.labels" not in executable, True)
+          "${{ join(github.event.issue.labels" not in executable, True)
+
+    # ------------------------------------------------------------------------------------------
+    # [#616 review ROUND 2, MAJOR] WORKFLOW CONTROL CONDITIONS. workflow_step validates step BODIES
+    # only, so flipping the condition that restricts activation to a MERGED `account-pool/*` pull
+    # request left every test green — that condition IS the trust boundary of the activate job. Both
+    # the job `if:` and the resume-gated step `if:` are now pinned EXACTLY, whitespace-normalized.
+    # ------------------------------------------------------------------------------------------
+    check("[#616 r2] the activate job fires ONLY for a MERGED account-pool/* pull request",
+          job_condition(workflow, "activate"),
+          "github.event_name == 'pull_request' && github.event.pull_request.merged == true && "
+          "startsWith(github.event.pull_request.head.ref, 'account-pool/')")
+    check("[#616 r2] the enrollment job fires only on the set-up-account label event",
+          job_condition(workflow, "login"),
+          "github.event_name == 'issues' && github.event.label.name == 'set-up-account'")
+    check("[#616 r2] the provider-label step's resume condition is pinned",
+          step_condition(workflow, "meta"), "steps.reconcile.outputs.resume != 'true'")
+    check("[#616 r2] the privileged policy write runs only after a real login or a resume",
+          step_condition(workflow, "policy_pr"),
+          "steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true'")
+    check("an absent/renamed job fails LOUDLY instead of asserting vacuously",
+          (refuses(job_condition, workflow, "no_such_job", needle="found 0"),
+           refuses(step_condition, workflow, "register", needle="found 0")
+           or step_condition(workflow, "register") != ""),
+          (True, True))
+
+    # ------------------------------------------------------------------------------------------
+    # [#616 review ROUND 2, MAJOR] THE PROVIDER-LABEL PREDICATE IS EXECUTED. It had no test at all,
+    # so `run:` -> `true`, restoring last-label-wins, or dropping `unique` all passed. The fragment
+    # between its sentinels is extracted and RUN against label fixtures. `${{ }}` expressions are
+    # neutralized (they are not shell) — documented, and the only substitution made.
+    # ------------------------------------------------------------------------------------------
+    provider_fragment = re.sub(r"\$\{\{.*?\}\}", "<gha>",
+                               workflow_block(workflow, "meta", "provider-label"))
+
+    def provider_of(labels):
+        """(exit code, resolved provider) from the REAL predicate fragment."""
+        script = ("set -euo pipefail\n" + provider_fragment
+                  + '\nprintf "PROV=%s\\n" "$prov"\n')
+        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env={**os.environ, "LABELS_JSON": json.dumps(labels)},
+                              timeout=120, check=False)
+        match = re.search(r"^PROV=(.*)$", done.stdout, re.M)
+        return done.returncode, (match.group(1) if match else None)
+
+    check("[#616 r2] exactly one provider label resolves that provider",
+          [provider_of(["provider:openai", "status:pending"]),
+           provider_of(["area:ci", "provider:anthropic"])],
+          [(0, "openai"), (0, "anthropic")])
+    check("[#616 r2] BOTH provider labels are REFUSED — last-label-wins must never come back",
+          [provider_of(["provider:openai", "provider:anthropic"])[0],
+           provider_of(["provider:anthropic", "provider:openai"])[0]],
+          [1, 1])
+    check("[#616 r2] NO provider label is refused (there is no silent default)",
+          (provider_of([])[0], provider_of(["area:ci"])[0]), (1, 1))
+    check("[#616 r2] a REPEATED single provider label still resolves (unique, not count)",
+          provider_of(["provider:openai", "provider:openai"]), (0, "openai"))
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
     check("the request form documents the grant label (in the form itself, not a comment)",
           GRANT_LABEL_PREFIX in strip_yaml_comments(template), True)
