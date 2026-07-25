@@ -90,10 +90,20 @@ agent = "registry-impl"
 # (needs:user) rather than degrading to a weaker/cross-provider model. `escalate = true` is
 # consumed by dispatch (escalate_starved) AND the substring keywords here are read by the review
 # lane's arm-side classifier so an approved trust-surface PR is HUMAN-armed, never auto-armed.
+#
+# `security` (PR #595 review finding 1) is a Phase-1 trigger in its OWN right, not only via an
+# area:* section: scripts/triage.py maps the `kind:security` label to the trust-plane role
+# (TRUST_PLANE_ROLE), and before this keyword existed such an issue matched NO security rule — so
+# {priority:P1, area:usage, kind:security} resolved to the plain impl route (["sol", "opus5",
+# "fable", "opus"] / registry-impl / escalate = false): trust-plane work on a non-escalated,
+# AUTO-ARMABLE chain. The label is the durable signal, so the trigger belongs here (Phase 1),
+# where BOTH resolvers and the arm-side classifier read it. triage.py's SEC_KEYWORDS must stay
+# IDENTICAL to this list — its self-test asserts the equality and enumerates every trust-plane
+# kind, so dropping this keyword turns the enrolled suite red.
 [[route]]
 match_labels = [
   "dispatch", "worker", "set-up-account", "review-loop", "groom",
-  "zk", "mpc", "crypto", "auth", "e2ee",
+  "zk", "mpc", "crypto", "auth", "e2ee", "security",
 ]
 model_chain = ["opus5", "opus"]
 agent = "registry-reviewer"

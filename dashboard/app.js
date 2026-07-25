@@ -64,12 +64,45 @@ function renderSummary(data) {
   }
   if (!providers.length) lines.append(node("p", "summary-meta", "No provider records"));
   capacity.append(lines);
+  // The `eligible` figure is exactly the number a failed probe used to overstate (issue #580): with
+  // nothing measured it reads 0 for every provider, which alone looks like a fleet-wide outage.
+  // Say which of the two it is, right where the misleading number is rendered.
+  if (data.usage_probe && typeof data.usage_probe === "object"
+      && data.usage_probe.measured !== true) {
+    capacity.append(node("p", "summary-meta", "Eligible capacity unmeasured — see the notice above"));
+  }
   summary.append(capacity);
   summary.append(summaryCard(
     "Last dispatch sweep", data.fleet.last_sweep_at ? relative(data.fleet.last_sweep_at) : "unknown",
     data.fleet.last_sweep_at ? utc(data.fleet.last_sweep_at) : "No completed sweep data",
   ));
+  const probe = usageProbeCard(data.usage_probe);
+  if (probe) summary.append(probe);
   summary.append(summaryCard("Data freshness", relative(data.generated_at), utc(data.generated_at)));
+}
+
+// --- Usage-probe freshness (issue #219). The probe job's secret materialization and probe steps
+// are continue-on-error, and a failed probe publishes an EMPTY snapshot; without this marker the
+// page could not distinguish "nothing is running" from "nothing was measured", so a broken probe
+// read as a fully idle, fully available fleet. dashboard-gen only sets `measured` for an explicit,
+// FRESH `ok` outcome, and renders every account unknown / zero eligible capacity otherwise — this
+// card says WHY. An absent key (older data.json) simply hides the card. --------------------------
+function usageProbeCard(probe) {
+  if (!probe || typeof probe !== "object") return null;
+  const measured = probe.measured === true;
+  const age = num(probe.age_seconds);
+  const detail = typeof probe.detail === "string" && probe.detail ? ` · ${probe.detail}` : "";
+  const card = summaryCard(
+    "Usage probe",
+    probe.attempted_at ? relative(probe.attempted_at) : "never recorded",
+    measured
+      ? `Measured ok · ${utc(probe.attempted_at)}`
+      : `NOT MEASURED — ${String(probe.outcome || "unknown")}${probe.stale ? " · stale" : ""}${detail}`
+        + `${age === null ? "" : ` · ${age}s old`}`
+        + " · availability shown as unknown, capacity not counted as free",
+  );
+  if (!measured) card.classList.add("degraded");
+  return card;
 }
 
 function renderWindow(windowData) {
@@ -377,20 +410,31 @@ function renderHealth(health) {
   }
 }
 
-function updateFreshness(generatedAt) {
+function updateFreshness(generatedAt, probe) {
   const generated = parseTime(generatedAt);
   const warning = byId("warning");
   byId("freshness").textContent = generated
     ? `Generated ${relative(generatedAt)} · ${utc(generatedAt)}` : "Generation time unknown";
+  const notices = [];
   if (!generated || Date.now() - generated.getTime() > STALE_MS) {
-    warning.hidden = false;
-    warning.textContent = generated
+    notices.push(generated
       ? `Stale data: this snapshot is ${relative(generatedAt)}. The dashboard pipeline may need attention.`
-      : "Data freshness is unknown. The dashboard pipeline may need attention.";
-  } else {
-    warning.hidden = true;
-    warning.textContent = "";
+      : "Data freshness is unknown. The dashboard pipeline may need attention.");
   }
+  // Issue #219: a freshly GENERATED page can still carry an unmeasured fleet — the generation
+  // stamp above says only that the build ran, never that the probe succeeded. Say so explicitly,
+  // because "generated 2 minutes ago" was exactly what made a failed probe look healthy.
+  if (probe && typeof probe === "object" && probe.measured !== true) {
+    notices.push(`Usage probe did not measure the fleet (${String(probe.outcome || "unknown")}`
+      + `${probe.stale ? ", stale" : ""}): account availability and provider capacity below are`
+      + " shown as unknown, not as free capacity.");
+  }
+  warning.hidden = notices.length === 0;
+  // Staleness and the probe verdict are INDEPENDENT degradations (issue #580) and both can fire at
+  // once — a failed probe still publishes a FRESH generated_at, so neither notice implies the
+  // other. One `.warning-line` paragraph each (styles.css spaces them); run together in a single
+  // text blob the two read as one confused sentence.
+  warning.replaceChildren(...notices.map((notice) => node("p", "warning-line", notice)));
 }
 
 // --- Throughput panel (backlog-vs-drain). Consumes site/metrics.json, emitted by the separate
@@ -943,7 +987,7 @@ function render(data) {
   renderOutcomes(data.fleet.dispatch_outcomes || []);
   renderHealth(data.model_health);
   renderObservability(data.observability);
-  updateFreshness(data.generated_at);
+  updateFreshness(data.generated_at, data.usage_probe);
 }
 
 async function refresh() {
