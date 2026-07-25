@@ -13,6 +13,14 @@ account to use; the registry applies per-account limits, a cross-codebase concur
 fallback chains, and prompt-cache affinity, and hands back a claim. When the worker finishes it
 releases the claim.
 
+## Registry self-test suite
+
+`scripts/selftest-suite.txt` is the authoritative self-test manifest and is checked in both
+directions against scripts that advertise a self-test entrypoint. Enroll a new self-testing script
+in that manifest in the same PR. Retiring a script or manifest entry requires two PRs: first add its
+filename to `scripts/selftest-retirements.txt` on the base branch, then remove the script and its
+manifest entry in a later PR. The gate refuses an unapproved same-PR retirement.
+
 ## One issue per account
 
 Each model account is a GitHub **issue** in this repo. The issue **body** is structured YAML

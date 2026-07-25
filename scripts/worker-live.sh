@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# [GPT-5.6] REG-3 live harness, local policy gate, target DRAFT-PR publisher, cross-provider
+# REG-3 live harness, local policy gate, target DRAFT-PR publisher, cross-provider
 # review/fix runners, and rotation write-back.
 # Secrets are accepted only through the environment/private files; xtrace must never be enabled.
 # The model container NEVER receives a GitHub token in any mode (see _run_headless_harness).
@@ -750,20 +750,28 @@ run_gate() {
 # The registry-selftest gate body is extracted so the host self-test can exercise its PURE
 # selectors without a live cargo/gh call. Derive the full suite so adding a script with an
 # advertised --self-test entrypoint enrolls it automatically instead of requiring a conflict-prone
-# edit here. Keep exclusions explicit and exceptional: a denylisted self-test gets no trust credit.
-SELFTEST_DENYLIST=""
-EXPECTED_SELFTEST_SUITE="account-usage.py backfill-provenance.py broker-refresh.py \
-curate-frontier.py dashboard-gen.py dispatch-claim.py dispatch-plan.py dispatch-secrets-guard.py \
-gh_retry.py groom-alert.py groom.py ledger-invariant.py ledger_retry.py metrics.py migrate-secrets.sh \
-model-health.py park_policy.py pat-validity.py plan-alert.py plan-snapshot.py policy-resolve.py ready-issues.py \
-resolve-conflicts.py retriage.py route-resolve.py select-and-claim.py triage.py trust-gate.py \
-usage-alert.py worker-issue.py worker-live.sh worker-pr.py"
+# edit here.
+SELFTEST_MANIFEST="$SCRIPT_DIR/selftest-suite.txt"
+
+_read_selftest_list() {
+  local file=$1
+  [[ -f "$file" ]] || return 1
+  sed -e 's/[[:space:]]*#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    -e '/^[[:space:]]*$/d' "$file"
+}
 
 _derive_full_selftest_suite() {
-  local scripts_dir=$1 denylist=${2:-$SELFTEST_DENYLIST} expected=${3-$EXPECTED_SELFTEST_SUITE}
-  local file base required
+  local scripts_dir=$1 manifest=$2 baseline_manifest=${3:-} baseline_retirements=${4:-}
+  local file base required enrolled advertised approved baseline
   local -a suite=()
   [[ -d "$scripts_dir" ]] || return 1
+  enrolled=$(_read_selftest_list "$manifest") || {
+    printf 'self-test manifest is missing: %s\n' "$manifest" >&2; return 1;
+  }
+  [[ -n "$enrolled" ]] || { printf 'self-test manifest is empty\n' >&2; return 1; }
+  [[ "$(printf '%s\n' "$enrolled" | sort -u | wc -l)" -eq "$(printf '%s\n' "$enrolled" | wc -l)" ]] || {
+    printf 'self-test manifest contains duplicate entries\n' >&2; return 1;
+  }
   for file in "$scripts_dir"/*.py "$scripts_dir"/*.sh; do
     [[ -f "$file" ]] || continue
     case "$file" in
@@ -775,21 +783,46 @@ _derive_full_selftest_suite() {
         ;;
     esac
     base=${file##*/}
-    case " $denylist " in *" $base "*) continue ;; esac
     suite+=("$base")
   done
-  for required in $expected; do
+  advertised=$(printf '%s\n' "${suite[@]}" | sort)
+  for required in $enrolled; do
     case " ${suite[*]} " in
       *" $required "*) ;;
-      *) printf 'suite script %s lost its self-test entrypoint\n' "$required" >&2; return 1 ;;
+      *) printf 'enrolled suite script %s is missing or lost its self-test entrypoint\n' "$required" >&2; return 1 ;;
     esac
   done
+  for required in $advertised; do
+    grep -Fxq "$required" <<< "$enrolled" || {
+      printf 'advertising script %s is not enrolled in the manifest\n' "$required" >&2; return 1;
+    }
+  done
+  if [[ -n "$baseline_manifest" ]]; then
+    baseline=$(_read_selftest_list "$baseline_manifest") || {
+      printf 'base-branch self-test manifest is unavailable: %s\n' "$baseline_manifest" >&2
+      return 1
+    }
+    approved=$(_read_selftest_list "$baseline_retirements") || {
+      printf 'base-branch retirement approvals are unavailable: %s\n' "$baseline_retirements" >&2
+      return 1
+    }
+    while IFS= read -r required; do
+      [[ -n "$required" ]] || continue
+      grep -Fxq "$required" <<< "$enrolled" && continue
+      grep -Fxq "$required" <<< "$approved" || {
+        printf 'suite entry %s was removed without prior base-branch retirement approval\n' "$required" >&2
+        return 1
+      }
+    done <<< "$baseline"
+  fi
   ((${#suite[@]} > 0)) || return 1
-  printf '%s\n' "${suite[*]}"
+  printf '%s\n' "$enrolled" | paste -sd' ' -
 }
 
-FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR") ||
-  die 'registry-selftest gate: no advertised self-tests found (fail closed)'
+# Base-branch retirement authorization is enforced by pr-gate.yml, whose caller materializes both
+# protected baseline files. The local gate still validates discovery and current enrollment.
+FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST") ||
+  die 'registry-selftest gate: self-test manifest validation failed (fail closed)'
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
@@ -2310,33 +2343,60 @@ PY
   chk "both sides survive the resolution" \
     "$(git -C "$fixture" show HEAD:f.txt | paste -sd'+' -)" "feature side+main side"
 
-  # --- derived full suite: an advertised entrypoint is auto-enrolled, while a script without the
-  # marker and an explicitly denied script stay out. These fixture checks fail if discovery becomes
-  # vacuous, over-broad, or stops honoring the denylist. ---
-  local suite_fixture="$tmp/selftest-suite" derived_fixture
+  # --- authoritative suite manifest: discovery and enrollment must match in both directions, and
+  # removals require an approval already present on the base branch. ---
+  local suite_fixture="$tmp/selftest-suite" derived_fixture manifest_fixture baseline_fixture approvals_fixture
   mkdir -p "$suite_fixture"
+  manifest_fixture="$tmp/manifest"
+  baseline_fixture="$tmp/baseline-manifest"
+  approvals_fixture="$tmp/base-retirements"
   printf '%s\n' 'if "--self-test" in sys.argv: run_tests()' > "$suite_fixture/advertised.py"
   printf '%s\n' 'print("ordinary helper")' > "$suite_fixture/helper.py"
   printf '%s\n' '# supports --self-test' > "$suite_fixture/comment-only.py"
   printf '%s\n' 'case "$1" in' '  self-test) run_tests ;;' 'esac' > "$suite_fixture/advertised.sh"
-  printf '%s\n' 'case "$1" in' '  self-test) run_tests ;;' 'esac' > "$suite_fixture/denied.sh"
-  derived_fixture=$(_derive_full_selftest_suite "$suite_fixture" "denied.sh" "advertised.py")
-  chk "derived suite enrolls an advertised self-test" \
+  printf '%s\n' advertised.py advertised.sh > "$manifest_fixture"
+  cp "$manifest_fixture" "$baseline_fixture"
+  : > "$approvals_fixture"
+  derived_fixture=$(_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture")
+  chk "manifest suite enrolls an advertised self-test" \
     "$(grep -cw 'advertised.py' <<< "$derived_fixture" || true)" "1"
-  chk "derived suite enrolls an advertised shell self-test" \
+  chk "manifest suite enrolls an advertised shell self-test" \
     "$(grep -cw 'advertised.sh' <<< "$derived_fixture" || true)" "1"
-  chk "derived suite rejects a script without a self-test entrypoint" \
+  chk "manifest excludes a script without a self-test entrypoint" \
     "$(grep -cw 'helper.py' <<< "$derived_fixture" || true)" "0"
-  chk "derived suite rejects a comment-only self-test mention" \
+  chk "manifest excludes a comment-only self-test mention" \
     "$(grep -cw 'comment-only.py' <<< "$derived_fixture" || true)" "0"
-  chk "derived suite honors its explicit denylist" \
-    "$(grep -cw 'denied.sh' <<< "$derived_fixture" || true)" "0"
-  chk "derived suite fails closed when no advertised self-test exists" \
-    "$( (_derive_full_selftest_suite "$suite_fixture" "advertised.py advertised.sh denied.sh" "" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+  printf '%s\n' advertised.py > "$manifest_fixture"
+  chk "addition without enrollment is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
     "refused"
-  chk "derived suite fails closed when a baseline script loses its self-test entrypoint" \
-    "$( (_derive_full_selftest_suite "$suite_fixture" "" "helper.py" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+  printf '%s\n' advertised.py advertised.sh helper.py > "$manifest_fixture"
+  chk "manifest entry without an advertising script is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
     "refused"
+  printf '%s\n' advertised.py advertised.sh > "$manifest_fixture"
+  rm "$suite_fixture/advertised.sh"
+  chk "deletion with stale enrollment is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '%s\n' advertised.py > "$manifest_fixture"
+  chk "atomic script-and-entry deletion without prior approval is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" "$approvals_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '%s\n' advertised.sh > "$approvals_fixture"
+  chk "base-approved retirement accepts atomic script-and-entry deletion" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" "$approvals_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "accepted"
+  chk "missing base manifest is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$tmp/missing-baseline" "$approvals_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  chk "missing base retirement approvals are refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" "$tmp/missing-approvals" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '  advertised.py  # enrolled python \n' > "$manifest_fixture"
+  chk "manifest entries with surrounding whitespace are normalized" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "accepted"
 
   # --- registry-selftest gate PURE selector (non-vacuous): classify a fixture diff into the
   # self-test / bash / workflow targets the gate must run. Proves a touched suite script is run,
@@ -2773,6 +2833,10 @@ case "${1:-}" in
   fix) run_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
+  print-selftest-suite)
+    [[ $# -eq 3 ]] || die 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements>'
+    _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
+    ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|print-selftest-suite|self-test>' ;;
 esac
