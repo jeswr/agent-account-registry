@@ -121,8 +121,11 @@ jobs:
           jq -s '.' "$tmp"/page-*.json > "$tmp/pages.json"
           # --rotation makes the per-run window ROTATE (#605 review finding 1): a fixed
           # oldest-updated window filled with permanent no-op skips and starved the rest of the
-          # board forever. GITHUB_RUN_NUMBER is monotonic per workflow, so consecutive runs walk
-          # disjoint windows with no cursor state to persist.
+          # board forever. GITHUB_RUN_NUMBER is monotonic per workflow, so consecutive runs advance
+          # the window over a stable (issue-number) ordering with no cursor state to persist. The
+          # windows are NOT disjoint unless the cap divides the board (#605 review round 4): the
+          # wrapping window re-visits the head. What is guaranteed is coverage of an unchanged board
+          # within ceil(total/cap) runs — progress, not a per-issue deadline.
           python3 scripts/retriage.py --snapshot --cap 80 --rotation "$GITHUB_RUN_NUMBER" \
             < "$tmp/pages.json" > "$tmp/issues.jsonl"
 

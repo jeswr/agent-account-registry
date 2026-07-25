@@ -210,9 +210,14 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING, rotation=0):
     `status:ready` = 202 open issues against a cap of 80, i.e. 122 permanently unreachable.
 
     So the window now rotates: the board is ordered by ISSUE NUMBER — immutable, so the ordering is
-    stable across runs and the windows really do partition it — and the start offset advances by
-    `cap` per `rotation` (the workflow passes its run number), with NO persistent cursor state to
-    keep. Within the run the board is handed over oldest-updated first, which is a fairness ORDER
+    stable across runs — and the start offset advances by `cap` per `rotation` (the workflow passes
+    its run number), with NO persistent cursor state to keep. NOT a partition: the offsets advance
+    modulo `total`, so consecutive windows are disjoint only while `cap` divides `total`; otherwise
+    the wrapping window re-visits the head (#605 review round 4 — the suite's own 7/3 fixture wraps
+    and overlaps issues 1 and 2, so "disjoint"/"partition" was the wrong word). What IS guaranteed
+    is COVERAGE: any ceil(total/cap) consecutive rotations visit every issue on an unchanged board,
+    which is the property the starvation fix needs. Within the run the board is handed over
+    oldest-updated first, which is a fairness ORDER
     only, never a decision input.
 
     WHAT THE ROTATION DOES AND DOES NOT GUARANTEE (#605 review round 2). For a board of UNCHANGED
@@ -247,8 +252,17 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING, rotation=0):
         seen.add(number)
         user = item.get("user")
         login = user.get("login") if isinstance(user, dict) else ""
+        # #605 review round 4 (MINOR): `item.get("labels") or []` was inside the "every malformed
+        # snapshot fails closed" claim while itself normalizing a missing key, `null`, `""` and
+        # several malformed containers to "no labels". The REST issue payload always carries a
+        # `labels` array, so the tolerance bought nothing and softened the claim; the container is
+        # now validated like every other decision-shaped field.
+        raw_labels = item.get("labels")
+        if not isinstance(raw_labels, list):
+            raise SweepError(f"issue #{number} carries a malformed `labels` container "
+                             f"({type(raw_labels).__name__}) — refusing to act on a partial view")
         names = []
-        for label in item.get("labels") or []:
+        for label in raw_labels:
             name = label.get("name") if isinstance(label, dict) else label
             if not isinstance(name, str) or not name:
                 raise SweepError(f"issue #{number} carries a malformed label")
@@ -264,9 +278,10 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING, rotation=0):
                        "author": {"login": login if isinstance(login, str) else ""},
                        "labels": names,
                        "updatedAt": str(item.get("updated_at") or "")})
-    # Stable ordering for the partition: the issue NUMBER never changes, so consecutive rotations
-    # really do walk disjoint windows (an `updatedAt` ordering re-shuffles between runs and can
-    # skip past an issue entirely).
+    # Stable ordering for the rotation: the issue NUMBER never changes, so consecutive rotations
+    # advance over the SAME ordering and cover the board (an `updatedAt` ordering re-shuffles
+    # between runs and can skip past an issue entirely). Windows are not disjoint in general — see
+    # the docstring: the wrap re-visits the head whenever `cap` does not divide `total`.
     issues.sort(key=lambda issue: issue["number"])
     total = len(issues)
     if total <= cap:
@@ -345,22 +360,53 @@ def workflow_step_script(text, step_id):
 
 
 def read_live_body(repo, number):
-    """The issue's LIVE body text, through the shared bounded-retry READ layer.
+    """The issue's LIVE `{"body": str, "state": "OPEN"|"CLOSED"}`, through the shared bounded-retry
+    READ layer. RAISES on anything it cannot positively interpret.
 
     #605 review round 2 (a fail-OPEN race): `_apply_cli` refreshed only `labels` from the live
     read, while the `body` that decides the `<!-- orchestration:hold -->` park still came from the
     board snapshot taken BEFORE pagination. A hold added between the list read and the apply was
     therefore ignored and the issue could still be promoted or repaired — on a deliberately
     load-bearing park policy, and against a docstring claiming planning happened against the live
-    read. An unreadable issue RAISES: the caller must fail closed, never silently fall back to the
-    stale snapshot value (that fallback IS the defect).
+    read.
 
-    A module-level function on purpose — the self-test substitutes it to drive the live-vs-snapshot
-    divergence through the REAL entrypoint."""
-    document = json.loads(static_triage._gh_read(          # noqa: SLF001 — the one shared read layer
-        ["issue", "view", str(number), "-R", repo, "--json", "body"]))
-    body = document.get("body")
-    return body if isinstance(body, str) else ""
+    #605 review round 4 (MAJOR): the first fix RAISED only for a transport failure. A SUCCESSFUL
+    read whose document was malformed still fell open to "no hold" — measured with `{}` (key
+    missing), a non-string body, and schema drift (`{"data": {"body": ...}}`), each of which
+    returned `""` and let the write proceed. So the unsafe side is now unreachable BY SHAPE: only a
+    document that positively carries a string `body` (or an explicit JSON `null`, which is how
+    GitHub renders an empty body — the one tolerated shape, tolerated deliberately and named here)
+    yields a value at all. Every other shape raises, and `_apply_cli` treats a raise as
+    "the hold could not be verified, so assume it is there".
+
+    The `state` half closes round 4's stale-eligibility MINOR at zero extra cost — open/closed was
+    the last decision input still coming from the pre-pagination board query, so a concurrently
+    CLOSED issue could still receive promote/repair/repark label mutations. It rides the same read.
+
+    A module-level function on purpose — the self-test substitutes the READ under it
+    (`triage._gh_read`) so this function's own parsing and validation are the code under test, not
+    a stub that replaces them (round-4 MAJOR: stubbing this function left `return ""` and a read of
+    issue `1` both green)."""
+    raw = static_triage._gh_read(                          # noqa: SLF001 — the one shared read layer
+        ["issue", "view", str(number), "-R", repo, "--json", "body,state"])
+    try:
+        document = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise SweepError(f"issue #{number}: the live read is not JSON ({exc})") from exc
+    if not isinstance(document, dict):
+        raise SweepError(f"issue #{number}: the live read is not a JSON object")
+    if "body" not in document:
+        raise SweepError(f"issue #{number}: the live read carries no `body` key (schema drift) — "
+                         "an orchestration hold cannot be ruled out from this document")
+    body = document["body"]
+    if body is None:
+        body = ""                    # GitHub renders an empty body as JSON null
+    if not isinstance(body, str):
+        raise SweepError(f"issue #{number}: the live `body` is {type(body).__name__}, not a string")
+    state = document.get("state")
+    if not isinstance(state, str) or state.strip().upper() not in {"OPEN", "CLOSED"}:
+        raise SweepError(f"issue #{number}: the live read carries no usable `state` ({state!r})")
+    return {"body": body, "state": state.strip().upper()}
 
 
 def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_labels):
@@ -368,23 +414,39 @@ def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_label
 
     Planning against the live read (not the possibly-stale board snapshot the sweep passed on
     stdin) means a gate added since the list read — needs:design, trust:untrusted, a concurrent
-    promotion, an `<!-- orchestration:hold -->` marker added to the BODY — is honoured. Reads go
-    through gh_retry; the mutation is single-attempt + fail-loud. Nothing from the stdin snapshot
-    reaches a decision: the snapshot supplies only the author/number the shell already read.
+    promotion, an `<!-- orchestration:hold -->` marker added to the BODY, a close — is honoured.
+    Reads go through gh_retry; the mutation is single-attempt + fail-loud.
+
+    WHICH INPUTS ARE LIVE, stated exactly (#605 review round 4 corrected two words here). Labels,
+    body and open/closed state are re-read LIVE immediately before planning. The snapshot supplies
+    the issue NUMBER (immutable) and the AUTHOR login — the author DOES reach a decision (it is
+    compared against the maintainer/app-bot for trust) but is immutable on GitHub, and a missing
+    author reads as untrusted, so a stale copy cannot widen trust. Permission is read fresh per
+    issue by the shell and a failed read collapses to `none`. So no MUTABLE snapshot field reaches
+    a decision — which is a narrower claim than the earlier "nothing from the snapshot reaches a
+    decision", and it is the true one.
     """
     read_state, view, edit, warn = static_triage.live_gh(repo, number, title="retriage")
     live, _revision = read_state()
     fresh = dict(issue)
     fresh["labels"] = sorted(live)
     # The hold marker lives in the BODY, so the body is refreshed too or the hold is checked
-    # against pre-pagination state (#605 review round 2). Fail CLOSED on an unreadable body: a
-    # park we cannot verify must stop the write, not be assumed absent.
+    # against pre-pagination state (#605 review round 2). Fail CLOSED on a body that cannot be
+    # read OR cannot be interpreted (#605 review round 4): a park we cannot verify must stop the
+    # write, not be assumed absent.
     try:
-        fresh["body"] = read_live_body(repo, number)
+        document = read_live_body(repo, number)
     except (RuntimeError, ValueError, OSError) as exc:
         print(f"::error title=retriage #{number}::cannot read the live issue body, so the "
               f"orchestration hold cannot be honoured — refusing to act (fail closed): {exc}")
         return 1
+    fresh["body"] = document["body"]
+    if document["state"] != "OPEN":
+        # #605 review round 4 (MINOR): open/closed was the last eligibility input still taken from
+        # the pre-pagination board query, so an issue closed during the sweep could still be
+        # promoted/repaired/re-parked. Not an error — the board was simply right when it was read.
+        print(json.dumps({"action": "skip", "reason": "closed-since-snapshot"}, sort_keys=True))
+        return 0
     known = list(known_labels) if known_labels else static_triage.repo_label_set(repo)
     decision = plan(fresh, maintainer, app_bot, permission, known_labels=known)
     print(json.dumps(decision, sort_keys=True))
@@ -560,6 +622,28 @@ def _self_test():
     chk("classifier failure never re-parks",
         plan(lost_priority, "owner", "app[bot]", "none", broken),
         {"action": "skip", "reason": "classifier-failure"})
+    # #605 review round 4 (MINOR): the re-park lane's classifier-CONSISTENCY guard had no fixture —
+    # every real classifier verdict happens to carry both halves of the park, so deleting
+    # `if "status:untriaged" not in add or "status:ready" not in remove` stayed green while a drifted
+    # classifier could drive a re-park that strips `status:ready` WITHOUT adding `status:untriaged`
+    # (terminally unenumerable) or adds the park without leaving the ready lane (a contradiction).
+    # Both halves, from a stub whose verdict is otherwise well-formed.
+    def drifted(add, remove):
+        def classify(labels, kind, trusted=True, known_labels=None):
+            return {"ready": False, "add": list(add), "remove": list(remove), "role": None,
+                    "warnings": []}
+        return classify
+
+    chk("[#605 r4] a re-park verdict missing status:untriaged is refused, never applied",
+        plan(lost_priority, "owner", "app[bot]", "none", drifted([], ["status:ready"])),
+        {"action": "skip", "reason": "classifier-inconsistent"})
+    chk("[#605 r4] a re-park verdict that never leaves the ready lane is refused too",
+        plan(lost_priority, "owner", "app[bot]", "none", drifted(["status:untriaged"], [])),
+        {"action": "skip", "reason": "classifier-inconsistent"})
+    chk("[#605 r4] ...while a well-formed park verdict still re-parks (not over-refusing)",
+        plan(lost_priority, "owner", "app[bot]", "none",
+             drifted(["status:untriaged"], ["status:ready"]))["action"],
+        "repark")
     # FAIL CLOSED: the classifier calls it complete but the engine still cannot enumerate it
     # (`status:blocked` is a busy status triage() knows nothing about) -> no write.
     chk("an unprovable exclusion is left alone",
@@ -635,6 +719,17 @@ def _self_test():
         windows, [[1, 2, 3], [4, 5, 6], [1, 2, 7], [3, 4, 5]])
     chk("[#605] every issue on the board is covered within ceil(total/cap) runs",
         sorted({number for window in windows[:3] for number in window}), [1, 2, 3, 4, 5, 6, 7])
+    # #605 review round 4 (MINOR, an F-class wording defect): the docstring and the workflow comment
+    # called consecutive windows "disjoint"/"a partition". They are not, whenever `cap` does not
+    # divide `total` — this very fixture wraps and re-visits 1 and 2. The claim is now COVERAGE, and
+    # the overlap is asserted so nobody re-derives the stronger wording from a passing suite.
+    chk("[#605 r4] the wrapping window OVERLAPS the head when the cap does not divide the board",
+        (sorted(set(windows[0]) & set(windows[2])), len(board[0]) % 3), ([1, 2], 1))
+    divides = [{i["number"] for i in snapshot([board[0][:6]], cap=3, rotation=r)[0]}
+               for r in range(2)]
+    chk("[#605 r4] ...and it IS a partition exactly when the cap divides the board",
+        (sorted(divides[0] & divides[1]), sorted(divides[0] | divides[1])),
+        ([], [1, 2, 3, 4, 5, 6]))
     chk("[#605] the cap and the outside-the-window count are exact at every rotation",
         {(len(window), snapshot(board, cap=3, rotation=r)[1])
          for r, window in enumerate(windows)}, {(3, 4)})
@@ -671,6 +766,16 @@ def _self_test():
              "no integer issue number"),
             ("a malformed label", [[{"number": 1, "labels": [{"colour": "red"}]}]],
              "malformed label"),
+            # #605 review round 4 (MINOR): `item.get("labels") or []` normalized every one of these
+            # to "no labels" while sitting inside the fail-closed claim.
+            ("an ABSENT labels container", [[{"number": 1, "user": {"login": "o"}}]],
+             "malformed `labels` container"),
+            ("a null labels container", [[{"number": 1, "labels": None}]],
+             "malformed `labels` container"),
+            ("a string labels container", [[{"number": 1, "labels": "status:ready"}]],
+             "malformed `labels` container"),
+            ("an object labels container", [[{"number": 1, "labels": {"name": "x"}}]],
+             "malformed `labels` container"),
             ("a non-list payload", {"pages": []}, "payload is not a list of pages")):
         try:
             snapshot(payload, ceiling=10)
@@ -807,15 +912,23 @@ def _self_test():
     apply_argv = next((argv for argv in argvs if "--apply" in argv), [])
     stale = {"author": {"login": "owner"}, "body": "", "labels": [{"name": "stale:snapshot"}]}
 
-    def run_apply_argv(gh, stdin_doc=None, live_body="", body_error=None):
+    def run_apply_argv(gh, stdin_doc=None, live_body="", body_error=None, live_document=None,
+                       live_state="OPEN"):
         """Drive main(apply_argv) end-to-end against a fake GitHub. Returns (exit code, spied).
 
+        THE STUB BOUNDARY IS `triage._gh_read`, NOT `read_live_body` (#605 review round 4, MAJOR).
+        The round-3 form substituted `read_live_body` itself, which proved only that `_apply_cli`
+        consults that name: replacing the function's whole body with `return ""`, or pointing it at
+        issue `1`, left every row green. Stubbing the READ under it puts the production call site —
+        the argv it builds, the JSON parse, and the fail-closed shape validation — inside the test.
+
         `live_body` is what the LIVE issue body read returns — distinct from the stdin snapshot's
-        body, which is how the #605 round-2 fail-open hold race is exercised. `body_error` makes
-        that read fail, which must stop the write."""
+        body, which is how the #605 round-2 fail-open hold race is exercised. `live_document`
+        overrides the whole RAW response text (a malformed success). `body_error` makes the read
+        fail like the real `_gh_read` does, which must stop the write."""
         seen = {}
         saved_plan = globals()["plan"]
-        saved_body = globals()["read_live_body"]
+        saved_read = static_triage._gh_read                # noqa: SLF001 — the seam under test
         saved_live_gh, saved_labels = static_triage.live_gh, static_triage.repo_label_set
         saved_stdin, saved_stdout = sys.stdin, sys.stdout
 
@@ -825,14 +938,19 @@ def _self_test():
                         labels=list(issue_doc.get("labels", ())), body=issue_doc.get("body"))
             return saved_plan(issue_doc, maintainer, app_bot, permission, classify, known_labels)
 
-        def fake_body(repo, number):
+        def fake_read(args):
+            """The one shared read layer, faked at the boundary the production code really calls."""
+            seen.setdefault("reads", []).append(list(args))
             if body_error is not None:
-                raise RuntimeError(body_error)
-            return live_body
+                # Exactly how the real _gh_read reports a failed read.
+                raise RuntimeError(f"gh {' '.join(args)} failed: {body_error}")
+            if live_document is not None:
+                return live_document
+            return json.dumps({"body": live_body, "state": live_state})
 
         try:
             globals()["plan"] = spy_plan
-            globals()["read_live_body"] = fake_body
+            static_triage._gh_read = fake_read             # noqa: SLF001 — the seam under test
             static_triage.live_gh = lambda repo, number, title="triage": (
                 gh.read_state, gh.view, gh.edit, lambda _message: None)
             static_triage.repo_label_set = lambda repo: (_ for _ in ()).throw(
@@ -843,9 +961,11 @@ def _self_test():
                 code = main(apply_argv)
             except SystemExit as exc:  # argparse exits 2 on an undeclared flag — that is the defect
                 code = exc.code
+            finally:
+                seen["stdout"] = sys.stdout.getvalue()
         finally:
             globals()["plan"] = saved_plan
-            globals()["read_live_body"] = saved_body
+            static_triage._gh_read = saved_read            # noqa: SLF001 — the seam under test
             static_triage.live_gh, static_triage.repo_label_set = saved_live_gh, saved_labels
             sys.stdin, sys.stdout = saved_stdin, saved_stdout
         return code, seen
@@ -944,9 +1064,86 @@ def _self_test():
                    (code, roles_of(lifted.labels), "status:ready" in lifted.labels)
                    == (0, {"role:impl"}, True)))
     unreadable = FakeGh(start, known)
-    code, _seen = run_apply_argv(unreadable, body_error="gh issue view failed: HTTP 503")
+    code, _seen = run_apply_argv(unreadable, body_error="HTTP 503")
     checks.append(("[#605 r2 f3] an UNREADABLE live body REFUSES to act; it never assumes 'no hold'",
                    (code, unreadable.calls, unreadable.labels == set(start)) == (1, [], True)))
+
+    # -------------------------------------------------------------------------------------------
+    # [#605 review ROUND 4, MAJOR 1] THE PRODUCTION READ ITSELF. The rows above stub
+    # `triage._gh_read`, so `read_live_body`'s own argv construction, JSON parse and validation are
+    # under test rather than replaced. These two rows are what make the round-4 survivors die:
+    # `read_live_body() -> return ""` never reaches the read layer at all, and a read pointed at
+    # issue `1` (or at the wrong fields) records different argv.
+    probe = FakeGh(start, known)
+    code, seen = run_apply_argv(probe, live_body=f"prose\n{HOLD_MARKER}\n")
+    body_reads = [args for args in seen.get("reads", []) if args[:2] == ["issue", "view"]]
+    checks.append(("[#605 r4 M1] the live body read really goes through the shared read layer, "
+                   "for THIS issue, asking for body+state",
+                   (code, probe.calls, body_reads)
+                   == (0, [], [["issue", "view", "7", "-R", "o/r", "--json", "body,state"]])))
+    checks.append(("[#605 r4 M1] ...and its RESULT is what planning saw (not a constant)",
+                   seen.get("body") == f"prose\n{HOLD_MARKER}\n"))
+
+    # [#605 review ROUND 4, MAJOR 2] A MALFORMED *SUCCESSFUL* READ FAILS CLOSED. Measured on the
+    # round-3 head: `{}` (key missing), `{"body": 123}` and `{"data": {"body": ...}}` each returned
+    # `""` from `read_live_body`, so "no orchestration hold" was inferred from a document that said
+    # nothing about the body at all and the write proceeded. Every shape below must now refuse; the
+    # ONE tolerated shape (`"body": null`, how GitHub renders an empty body) is pinned separately so
+    # the tolerance is a decision rather than a leftover.
+    for shape_name, shape in (
+            ("key MISSING", '{"state": "OPEN"}'),
+            ("non-string body", '{"body": 123, "state": "OPEN"}'),
+            ("schema drift", '{"data": {"body": "' + HOLD_MARKER + '"}, "state": "OPEN"}'),
+            ("not an object", '["' + HOLD_MARKER + '"]'),
+            ("not JSON at all", 'Not Found'),
+            ("state MISSING", '{"body": ""}'),
+            ("alien state", '{"body": "", "state": "MERGED"}')):
+        malformed = FakeGh(start, known)
+        code, seen = run_apply_argv(malformed, live_document=shape)
+        checks.append((f"[#605 r4 M2] a malformed live read ({shape_name}) refuses to act, "
+                       "it never reads as 'no hold'",
+                       (code, malformed.calls, malformed.labels == set(start))
+                       == (1, [], True)))
+    nulled = FakeGh(start, known)
+    code, seen = run_apply_argv(nulled, live_document='{"body": null, "state": "OPEN"}')
+    checks.append(("[#605 r4 M2] an explicit JSON null body IS an empty body (the one tolerance)",
+                   (code, seen.get("body"), roles_of(nulled.labels),
+                    "status:ready" in nulled.labels) == (0, "", {"role:impl"}, True)))
+    # [#605 review ROUND 4, MINOR] open/closed is no longer a stale input: it rides the same read.
+    closed = FakeGh(start, known)
+    code, seen = run_apply_argv(closed, live_state="CLOSED")
+    checks.append(("[#605 r4] an issue CLOSED since the board snapshot is skipped, never mutated",
+                   (code, closed.calls, closed.labels == set(start),
+                    "closed-since-snapshot" in seen.get("stdout", ""))
+                   == (0, [], True, True)))
+
+    # [#605 review ROUND 4, MAJOR 3] THE LIVE LANE-MEMBERSHIP REFUSAL. Deleting
+    # `if not untriaged and "status:ready" not in labels: return skip` from plan() left the whole
+    # suite green. In production the board selects an issue that carries a lane label and the label
+    # can be REMOVED before the apply's live read; without that guard the repair lane happily writes
+    # `status:ready` back, overriding a concurrent removal nobody asked it to undo. Stdin still says
+    # `status:ready`; the LIVE labels carry neither lane.
+    departed = FakeGh({"priority:P2", "area:dispatch"}, known)
+    code, seen = run_apply_argv(
+        departed, stdin_doc={"author": {"login": "owner"}, "body": "",
+                             "labels": [{"name": "status:ready"}, {"name": "priority:P2"}]})
+    checks.append(("[#605 r4 M3] an issue that left BOTH lanes before the live read is not "
+                   "retriageable, and nothing is written",
+                   (code, departed.calls, departed.labels == {"priority:P2", "area:dispatch"},
+                    "not-retriageable" in seen.get("stdout", ""))
+                   == (0, [], True, True)))
+    checks.append(("[#605 r4 M3] ...planned against the LIVE labels, which carry neither lane",
+                   ({"status:ready", "status:untriaged"} & set(seen.get("labels") or []), )
+                   == (set(), )))
+    # The same predicate, directly: the guard's own truth table, so a deletion is caught even if the
+    # entrypoint row above were ever weakened.
+    checks.append(("[#605 r4 M3] plan() refuses a lane-less issue and admits each lane",
+                   [plan(labelled(*names, author="owner"), "owner", "app[bot]", "write",
+                         known_labels=known)["action"]
+                    for names in (("priority:P2", "area:dispatch", "role:impl"),
+                                  ("status:ready", "priority:P2", "area:dispatch"),
+                                  ("status:untriaged", "priority:P2", "area:dispatch"))]
+                   == ["skip", "repair", "promote"]))
 
     # -------------------------------------------------------------------------------------------
     # [PR #595 findings 3 + 6] STATIC WORKFLOW CONTRACT. The sweep must mutate ONLY through the
