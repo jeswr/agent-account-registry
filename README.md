@@ -281,7 +281,7 @@ Edit `policy/repos.toml` for each target repo that should be allowed to use this
 
 ```toml
 [repos."sparq-org/sparq"]
-account_pool = ["acct01", "acct02", "acct04", "acct05", "acct08"]   # add the new handle
+account_pool = ["acct01", "acct02", "acct04", "acct05"]   # add the handle from the steps above
 max_concurrent = 5                                                  # optional: allow more parallelism
 ```
 
