@@ -1,3 +1,14 @@
 {
- "leases": []
+ "leases": [
+  {
+   "account": "9e13ea21abf27e68",
+   "claim_id": "86dd6d2b79e14f4d92a8e24ea2e16c74",
+   "holder": "fix:sparq-org/sparq#3434@dispatch-30136255475.1",
+   "package": "sparq-zk",
+   "role": "fix",
+   "model": "opus5",
+   "issued_at": 1784939877,
+   "expires_at": 1784946177
+  }
+ ]
 }
