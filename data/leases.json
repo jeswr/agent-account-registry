@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "dc2d751954080e13",
-   "claim_id": "7e51694f215948a1a5337d898d1bc47b",
-   "holder": "review:sparq-org/sparq#3434@dispatch-30151328730.1",
-   "package": "sparq-zk",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1784968690,
-   "expires_at": 1784972890
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "3fc30759f80c4edaa96fd8981329e0a2",
    "holder": "review:sparq-org/sparq#3436@dispatch-30151328730.1",
    "package": "sparq-substrate",
