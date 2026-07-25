@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 630,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "70ebbbe4a7ee64d8484ff857e82f6f62f5b0b1ee",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The host-side gate runs target-controlled build scripts that inherit GITHUB_ENV and GITHUB_PATH. They can append BASH_ENV=/attacker/file to GITHUB_ENV, with that file containing `exit 0`; the next non-interactive bash invocation can then exit successfully before the republish-trust run block performs either digest check or calls reverify. The step outcome is success, so the PR step is enabled. Alternatively, GITHUB_PATH can place attacker-controlled sha256sum/find/python3 ahead of the system tools, and PYTHONPATH can hijack imports made by the digest-bound worker-issue.py. Pinning the two files and checking their directory contents does not bind the interpreter, shell startup, imported modules, or verification utilities. The added rendered-block test supplies a clean environment and therefore does not exercise this bypass.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Run the pre-publish verifier in an execution context that target code cannot influence. At minimum, clear/override BASH_ENV, ENV, PYTHONPATH, PYTHONHOME and related Python variables; use absolute trusted paths for bash, sha256sum, find, wc, and the Python interpreter; invoke Python in isolated mode; and reset PATH to an allowlisted system value. Prefer isolating the target-controlled gate so it cannot write runner command files or any verifier execution state. Add a negative test that simulates malicious GITHUB_ENV/GITHUB_PATH persistence (especially BASH_ENV causing an early successful exit) and proves republish-trust cannot report success without the live reverify actually running.",
+    "severity": "blocker",
+    "title": "Target-controlled persisted environment can bypass the pinned reverify step"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The driver bytes are now snapshotted and digest-bound, but the prior blocker remains at the execution-context level: target-controlled host build scripts can persist environment changes through GitHub's command files, and the pre-publish step inherits them. In particular, setting BASH_ENV can make the step shell exit successfully before any digest or live-trust check runs; PATH/PYTHONPATH poisoning can also replace the checking utilities or hijack the pinned Python driver. Because the PR step gates only on republish-trust.outcome == success, these paths allow publication with no re-attestation. The new behavioral tests execute a clean rendered environment and do not simulate persisted runner-command-file poisoning.",
+  "verdict": "request_changes"
+ }
+}
