@@ -18,8 +18,10 @@ Trust posture (locked decisions, review blueprint):
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -55,6 +57,13 @@ LABEL_COLOURS = {
 # wins; park_policy.READMISSION_LABELS). Kept in REVIEW_LABELS so set_review_state's
 # mutually-exclusive namespace machinery converges it like any other review state.
 MACHINE_PARK_PR_LABEL = "review:parked"
+# The MACHINE-owned SOURCE-ISSUE twin of the park (park_policy.py invariant 2). Named here so the
+# write side can apply the SAME "ONE park predicate" dispatch-claim.enumerate_review_items applies
+# — capacity-parked iff EITHER machine label is live. live_human_holds only ever saw the PR-side
+# label, so a half-cleared pair (issue-side park alive, PR-side write veto-suppressed) read as "no
+# park" to every mutation path while the enumerator still treated the PR as parked.
+MACHINE_PARK_ISSUE_LABEL = "status:parked"
+MACHINE_PARK_LABELS = (MACHINE_PARK_PR_LABEL, MACHINE_PARK_ISSUE_LABEL)
 # Run-keyed durable markers (bot comments). Each carries the round + the workflow run key so a
 # re-run of the same phase is idempotent (mirror worker-issue record_attempt) and stop conditions
 # are computed from ordered, run-keyed markers — never raw comment counts.
@@ -122,6 +131,12 @@ ESCALATION_LADDERS = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna"
 PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
+# The UNBOUND marker value (the value worker-live.sh seeds into every fresh worker PR body). The
+# marker is an ASSERTION — "a review of THIS head completed end-to-end, so its outcome artifacts
+# (the head-bound registry verdict record) exist" — and `none` is the honest way to say no such
+# review exists for the live head. Writing it is how a lane hand-over RETRACTS a marker the
+# registry itself has just disproved (issue #560 round-2 finding 1).
+UNBOUND_REVIEWED_SHA = "none"
 # Reserved bot-marker namespace (issue #137). EVERY durable control marker this script writes and
 # later parses back out of BOT-AUTHORED comments — the review-round budget, per-round fix-outcome
 # counters, fix-model / model-pin escalation records, the progress grade, and the reviewed-sha
@@ -1087,8 +1102,13 @@ def _live_review_labels(repo, pr_number):
     return {label["name"] for label in labels} & set(REVIEW_LABELS)
 
 
-def set_review_state(repo, pr_number, state):
+def set_review_state(repo, pr_number, state, abort_on_machine_park=False):
     """Apply the mutually-exclusive review:* label for `state` and drop the OTHER review:* labels.
+
+    Returns WHAT ACTUALLY HAPPENED so a caller can log honestly instead of asserting its intent:
+    "applied" (the requested state landed), "refused-hold" (a live human hold vetoed it),
+    "converged" (an ambiguous namespace resolved to review:needs-user instead of `state`), or
+    "park-abort" (`abort_on_machine_park` and a live machine park won — nothing was written).
 
     Issue #138 — a review-state stamp must NEVER erase a human terminal hold. Re-read the LIVE
     review labels immediately before mutating and:
@@ -1117,19 +1137,39 @@ def set_review_state(repo, pr_number, state):
     the whole outcome step down to this primitive. To keep that window fail-closed, the removes
     delete only the stale labels OBSERVED in the validated snapshot: a review:needs-user (or any
     review:* label) that lands AFTER the live read is never in `live_review`, so it is never
-    deleted — it survives to be converged on the next read instead of being silently erased."""
+    deleted — it survives to be converged on the next read instead of being silently erased.
+
+    `abort_on_machine_park=True` (issue #555 park semantics, #560 round-2 finding 2) makes the
+    MACHINE capacity park WIN over this transition instead of being resolved away by the ambiguity
+    rule above. A machine park is a review:* label, so {review:changes, review:parked} is an
+    "ambiguous namespace" to the guard above and would converge to review:needs-user — DELETING the
+    park and converting a capacity hold into a HUMAN-owned terminal hold, the exact inversion #555
+    exists to prevent. An opt-in caller (a machine LANE hand-over, which is not itself a park and
+    has no business adjudicating one) asks instead for the transition to stand down. Critically the
+    check rides the SAME validated `live_review` read that drives the removes below, so a park
+    landing in a caller's own probe-to-call gap is still caught: this closes the window rather than
+    moving it. Park-as-the-requested-state (`state="parked"`) is exempt — it is not a transition
+    away from the park."""
     label = f"review:{state}"
     if label not in REVIEW_LABELS:
         raise WorkerPrError(f"unknown review state {state}")
     live_review = _live_review_labels(repo, pr_number)
+    if (abort_on_machine_park and MACHINE_PARK_PR_LABEL in live_review
+            and label != MACHINE_PARK_PR_LABEL):
+        print(f"review state '{state}' ABORTED: {MACHINE_PARK_PR_LABEL} is a live MACHINE "
+              "capacity park and this caller asked for the park to WIN (issue #555) — no label "
+              "mutation applied; the park is untouched and still owns the PR")
+        return "park-abort"
     if "review:needs-user" in live_review and label != "review:needs-user":
         print(f"review state '{state}' REFUSED: review:needs-user is a live human hold "
               "(issue #138) — no label mutation applied")
-        return
+        return "refused-hold"
+    converged = False
     if len(live_review) > 1 and label != "review:needs-user":
         print(f"ambiguous live review labels {sorted(live_review)} — converging to the "
               f"fail-closed human hold review:needs-user instead of '{state}' (issue #138)")
         label, state = "review:needs-user", "needs-user"
+        converged = True
     _ensure_label(repo, label)
     _gh_json(
         ["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels", "--input", "-"],
@@ -1139,6 +1179,7 @@ def set_review_state(repo, pr_number, state):
         if other != label:
             _remove_label(repo, pr_number, other)
     print(f"PR review state: {state}")
+    return "converged" if converged else "applied"
 
 
 def get_review_state(repo, pr_number):
@@ -1869,12 +1910,14 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
         detail = ("unbound legacy record" if bound is None
                   else f"reviewed {bound[:12]} != live head {expected_sha[:12]}")
         print(f"verdict NOT staged for the fixer ({detail}); deferring to a fresh review")
+        print(_FIX_LANE_DEFER_NOTICE)
         return
     if not envelope_identity_matches(record, expected_repo, expected_pr, expected_round):
         _write_outputs({"staged": False, "stale_reason": "identity-mismatch"})
         print("verdict NOT staged for the fixer (envelope repo/pr/round does not name "
               f"{expected_repo}#{expected_pr} round {expected_round}); "
               "deferring to a fresh review")
+        print(_FIX_LANE_DEFER_NOTICE)
         return
     path = Path(out_file)
     path.write_text(json.dumps(envelope_verdict(record), indent=1, sort_keys=True) + "\n",
@@ -1882,6 +1925,320 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
     os.chmod(path, 0o600)
     _write_outputs({"staged": True})
     print(f"verdict staged for the fixer (bound to {expected_sha[:12]})")
+
+
+# ---- issue #560: the defer-to-fresh-review LANE TRANSITION ---------------------------------------
+# dispatch-claim.enumerate_review_items buckets a worker PR into a lane by ONE label:
+# `review:changes` -> the FIX lane (item state `needs-fix`), `review:needs` -> the REVIEW lane
+# (`needs-review`). When stage_verdict_for_fix defers above it stages NOTHING, review-fix.yml skips
+# the fix step, and the run produces no fix, no push, and no new verdict — so before this transition
+# existed the PR kept `review:changes` and the FIX lane re-admitted it on EVERY dispatch tick while
+# the REVIEW lane, which keys on `review:needs`, never saw it. That is a permanent wrong-lane spin,
+# not a retry: nothing in the fix lane can ever mint the head-bound verdict the fixer refuses to run
+# without. LIVE 2026-07-24: from 08:02Z sparq#3523/#3542/#3572/#3573/#3608 each launched a fix run
+# per ~8min tick, every one completing "success" on `verdict NOT staged for the fixer (unbound legacy
+# record); deferring to a fresh review` (e.g. run 30082079950 at 09:19Z) — ~35 wasted runs/hour
+# across five PRs (each burning an account claim + a runner) until the orchestrator flipped the five
+# labels by hand.
+#
+# The defer therefore HANDS THE PR TO THE REVIEW LANE — the only lane that can produce a verdict
+# bound to the current head. The transition is applied by review-fix.yml's `outcome` job (the job
+# that runs no target code and owns every PR label mutation), keyed off the `stale_reason` this
+# defer branch emits.
+#
+# ROUND-2 FINDING 1 — a LABEL ALONE ONLY RELOCATES THE SPIN; the hand-over must transfer OWNERSHIP.
+# The production state #560 targets is a COMPLETED request-changes review: it bound
+# `sparq-reviewed-sha == head` (review-fix.yml's outcome job binds the marker LAST) and only THEN
+# recorded a verdict the fixer later refuses. Flipping the label alone leaves a DRAFTED PR carrying
+# review:needs AND a marker matching the live head, and enumerate_review_items' drafted no-repeat
+# guard (`if not draft or not reviewed_match`) then does NOT emit needs-review. What it does instead
+# depends on CI: a concluded-RED gate becomes needs-ci-fix (the fix lane again, no verdict minted); a
+# concluded-GREEN gate becomes `stranded` — which dispatches a REVIEW run whose resolve step sees the
+# same matching marker, sets `already_done=true`, RELEASES the claim and exits "success" with no work
+# done, i.e. the identical successful spin one lane over; and a PENDING/UNKNOWN gate matches nothing
+# at all, leaving the PR with NO owning lane.
+#
+# The hand-over therefore also RETRACTS the marker. The marker is an ASSERTION — "a review of this
+# exact head completed end-to-end" — whose whole operational meaning is "its outcome artifacts
+# exist, so do not spend a reviewer slot on this head again". A `stale_reason` defer is the
+# REGISTRY's own proof that the artifact that assertion promises does not exist for this head (no
+# envelope at all, an envelope bound to a different sha, or an envelope naming another repo/PR/
+# round). So the marker is FALSE, and it is exactly the false part that suppresses re-review.
+# Writing `none` restores the marker's invariant (marker == head IFF a head-bound verdict record
+# exists) and is the honest state: no consumable review exists for this head.
+#
+# Why retract rather than teach the review lane "marker matches but no bound verdict => re-review":
+# enumerate_review_items is a PURE function of the pulls listing + provenance + leases + CI status.
+# It has no registry access and does not even receive the round number, so verdict-record existence
+# is not derivable there; threading a per-PR registry read into the enumerator would add an unbounded
+# number of reads per dispatch tick AND would have to be duplicated in review-fix.yml's resolve
+# `already_done` check — two places re-deriving a fact this defer already holds. Retraction writes
+# the fact ONCE, at the moment it is proven, into the single field every consumer already reads.
+#
+# The retraction is TARGETED and ORDERED:
+#   * targeted — the marker is cleared only when it equals the head the defer disproved. A marker
+#     naming some OTHER sha is either already stale to the enumerator (so re-review is already
+#     admitted) or belongs to a NEWER completed review that this defer has said nothing about, and
+#     clobbering that would burn a genuine reviewer slot.
+#   * marker BEFORE label — the crash-safe order. Crashing after the retraction leaves
+#     {review:changes, marker=none}: the fix lane re-admits and the idempotent defer simply retries,
+#     i.e. the pre-fix behaviour, no worse. Crashing after a label flip that had NOT yet retracted
+#     leaves {review:needs, marker==head} on a draft — precisely the no-owner / already_done state
+#     above. Same discipline as the receipt-first park ladder.
+FIX_LANE_PR_LABEL = "review:changes"
+REVIEW_LANE_PR_LABEL = "review:needs"
+# The hand-over ABORTED because a machine park / human hold was live at the RE-READ taken
+# immediately before the write (round-2 finding 2). Distinct from "hold" (the park was already
+# visible on the FIRST read) so the log and the `action` output can say which actually happened.
+FIX_LANE_ABORT_ACTION = "abort-park"
+# Every `stale_reason` stage_verdict_for_fix can emit on a defer (staged=false). All three mean the
+# same thing for lane ownership — no verdict is bound to the live head — so all three hand over.
+FIX_LANE_DEFER_REASONS = ("unbound", "head-moved", "identity-mismatch")
+_FIX_LANE_DEFER_NOTICE = (
+    f"fix lane releasing this PR: the outcome job applies the {FIX_LANE_PR_LABEL} -> "
+    f"{REVIEW_LANE_PR_LABEL} lane transition AND retracts the stale reviewed-sha assertion for "
+    "this head (issue #560), so fix-enumeration stops re-admitting this PR on every dispatch tick "
+    "and the review lane provably owns producing the fresh head-bound verdict")
+
+
+def fix_lane_defer_action(live_review, holds=()):
+    """PURE (issue #560): what the defer-to-fresh-review hand-over must do, given the LIVE
+    `review:*` label set and the LIVE hold set — the union of live_human_holds (the PR's own
+    needs:user / review:needs-user / review:parked, else the source issue's needs:*) and
+    live_machine_parks (the ONE park predicate over BOTH surfaces: review:parked on the PR OR
+    status:parked on the source issue, which live_human_holds' short-circuit could not see).
+
+    - "hold" — a human hold OR the #555 MACHINE capacity park is live: mutate NOTHING. A lane
+      transition is not a park and must never displace one; a park already excludes the PR from
+      BOTH lanes (enumerate_review_items rejects review:parked and every human hold outright), so
+      there is no spin to close and nothing to hand over.
+    - "noop" — `review:changes` is not live: already handed over (a re-run of this step, or a
+      concurrent claim that got there first). Idempotent by construction.
+    - "drop-fix-label" — `review:needs` is ALREADY live beside `review:changes` (a review outcome
+      landed while this fix run was in flight, or a crash between set_review_state's add and its
+      removes). The review lane already owns the PR, so the hand-over completes by removing ONLY
+      the stale FIX-lane label. That is monotone (it adds nothing) and reaches the same single
+      clean state without escalating a machine lane hand-over into a human question — the
+      resolution is not a guess here, because the defer itself is authoritative that the fix lane
+      must not own this PR.
+    - "transition" — the normal case: set_review_state(.., "needs"). Its own issue #138 machinery
+      then applies unchanged (a live review:needs-user refuses the write; any OTHER ambiguous split
+      converges to the fail-closed human hold rather than a guessed clean value) — this function
+      deliberately does not second-guess it.
+    """
+    if holds:
+        return "hold"
+    live = set(live_review)
+    if FIX_LANE_PR_LABEL not in live:
+        return "noop"
+    if live == {FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL}:
+        return "drop-fix-label"
+    return "transition"
+
+
+def fix_lane_defer_labels(live_review, action):
+    """PURE (issue #560): the `review:*` label set the transition LEAVES BEHIND. Exists so the
+    SPIN-CLOSURE property can be asserted end-to-end without touching GitHub: dispatch-claim.py's
+    --self-test imports this, projects the post-defer label set, and feeds it straight back into
+    enumerate_review_items to prove the fix lane no longer re-admits the PR. worker-pr.py's own
+    --self-test pins this projection to the IMPERATIVE path (the stubbed mutation must produce
+    exactly this set), so the two can never drift."""
+    live = set(live_review)
+    if action in ("hold", "noop", FIX_LANE_ABORT_ACTION):
+        return frozenset(live)
+    if action == "drop-fix-label":
+        return frozenset(live - {FIX_LANE_PR_LABEL})
+    if action == "transition":
+        # set_review_state(.., abort_on_machine_park=True): a single clean review:changes becomes
+        # review:needs; a live MACHINE park makes the park WIN and writes nothing (round-2 finding
+        # 2 — the pre-fix code let {review:changes, review:parked} converge to review:needs-user,
+        # DELETING a machine park and inventing a human hold); any OTHER ambiguous namespace still
+        # converges to the fail-closed human hold (issue #138).
+        if live & set(MACHINE_PARK_LABELS):
+            return frozenset(live)
+        if live == {FIX_LANE_PR_LABEL}:
+            return frozenset({REVIEW_LANE_PR_LABEL})
+        return frozenset({"review:needs-user"})
+    raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
+
+
+def fix_lane_defer_marker_action(action, live_marker, proven_head):
+    """PURE (issue #560 round-2 finding 1): whether the hand-over must RETRACT the reviewed-sha
+    marker, given the decided `action`, the marker value read live off the PR body, and
+    `proven_head` — the head sha stage-verdict proved has NO head-bound verdict record.
+
+    - "keep" on every non-writing action (`hold` / the pre-write park abort): a park or human hold
+      owns the PR and a lane hand-over mutates NOTHING on either surface.
+    - "keep" when the live marker does not name `proven_head`: either it is already stale to
+      enumerate_review_items (so re-review is already admitted and there is nothing to fix) or it
+      belongs to a NEWER completed review this defer has said nothing about — retracting that would
+      throw away a genuine reviewer slot.
+    - "invalidate" otherwise: the marker asserts that a review of `proven_head` completed
+      end-to-end, and the defer is the registry's own proof that the head-bound verdict record that
+      assertion promises does not exist. The assertion is false; writing UNBOUND_REVIEWED_SHA
+      retracts it so the review lane re-admits the head instead of exiting `already_done`."""
+    if action in ("hold", FIX_LANE_ABORT_ACTION):
+        return "keep"
+    if action not in ("noop", "drop-fix-label", "transition"):
+        raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
+    if live_marker != proven_head:
+        return "keep"
+    return "invalidate"
+
+
+def fix_lane_defer_abort(action, recheck_review, recheck_holds):
+    """PURE (issue #560 round-2 finding 2): given the `action` decided from the FIRST reads and the
+    label/hold state RE-READ immediately before the first write, must the hand-over ABORT?
+
+    #555 splits ownership: `review:parked`/`status:parked` is the MACHINE capacity hold,
+    `review:needs-user`/`needs:user` the HUMAN terminal hold. A hold landing between this
+    function's caller's initial probe and its write used to be resolved AWAY: the park is a
+    `review:*` label, so {review:changes, review:parked} looked merely "ambiguous" to
+    set_review_state, which converged it to review:needs-user — DELETING a machine capacity park
+    and converting it into a human-owned terminal hold, the precise inversion #555 exists to
+    prevent, while the caller logged a successful review-lane hand-over. THE PARK WINS: a lane
+    transition is not a park adjudication, so it stands down and leaves the hold untouched.
+
+    True for any live hold (machine park or human) on any action that would still WRITE — including
+    `noop`, which writes no label but does retract the reviewed-sha marker. Only the two actions
+    that mutate nothing at all (`hold`, and an abort already decided) have nothing to abort."""
+    if action in ("hold", FIX_LANE_ABORT_ACTION):
+        return False
+    if action not in ("noop", "drop-fix-label", "transition"):
+        raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
+    return bool((set(recheck_review) & (set(MACHINE_PARK_LABELS) | set(HUMAN_OWNED_LABELS)))
+                | set(recheck_holds))
+
+
+def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
+    """Issue #560: hand a deferred PR from the FIX lane to the REVIEW lane, transferring OWNERSHIP.
+
+    Called from review-fix.yml's `outcome` job when stage-verdict refused to seed the fixer
+    (`staged=false`) because no recorded verdict is bound to the live head. `proven_head` is that
+    head — the sha stage-verdict proved has NO head-bound verdict record.
+
+    Two writes, in this order, both through the SHARED primitives (set_reviewed_sha /
+    set_review_state / _remove_label) — never a raw label or body API call — so the issue #138 hold
+    guard, the #158 marker CAS loop and the #555 park ownership split all keep applying underneath:
+
+    1. RETRACT the reviewed-sha marker when it names `proven_head` (round-2 finding 1). Without this
+       the label flip only MOVES the spin: a drafted PR whose marker matches the live head is not
+       re-emitted as needs-review, and review-fix.yml's resolve step would exit `already_done` on a
+       green gate (successful run, no work) or nothing would own the PR at all on a pending gate.
+    2. Apply the lane label per fix_lane_defer_action.
+
+    Marker first is the crash-safe order (see the module comment above). Between the decision reads
+    and the first write the hold surface is RE-READ and any live machine park / human hold ABORTS
+    the whole hand-over (round-2 finding 2) — the park WINS; a lane transition never adjudicates
+    one. The transition additionally passes abort_on_machine_park so that guard rides the same
+    validated read that drives set_review_state's own removes, closing rather than moving the
+    window. The `action`/`marker`/`applied` outputs and every log line report what ACTUALLY
+    happened, not the intent.
+
+    Fails closed on an unrecognised `stale_reason` or a malformed `proven_head` (nothing is read or
+    written on inputs this code does not understand) and is idempotent under the concurrent-claim
+    semantics: a re-run, or a tick that already handed over, writes nothing (the marker retraction
+    is a no-op once the marker is already `none` — set_reviewed_sha issues no PATCH at all).
+
+    The LEASE is deliberately not touched here. The per-PR fix lease is the claim itself, keyed
+    `fix:<repo>#<pr>` (select-and-claim holder prefix; the exact key enumerate_review_items
+    single-flights on), and review-fix.yml's `release` job releases it by claim id on EVERY path
+    (`if: always() && needs.claim.outputs.acquired == 'true'`, a job that does not depend on the
+    outcome job) — so the fix claim is already freed before the next dispatch tick reads the
+    ledger. dispatch-claim.py's --self-test pins that unconditional release statically."""
+    if stale_reason not in FIX_LANE_DEFER_REASONS:
+        raise WorkerPrError(
+            f"unknown verdict defer reason {stale_reason!r} (expected one of "
+            f"{', '.join(FIX_LANE_DEFER_REASONS)}); refusing to touch any label")
+    if not re.fullmatch(r"[0-9a-f]{40}", proven_head or ""):
+        raise WorkerPrError(
+            "fix-lane defer requires the 40-hex --head-sha the verdict was NOT bound to; "
+            "without it the reviewed-sha assertion cannot be retracted and the hand-over would "
+            "only relocate the spin (refusing to touch anything)")
+    holds = live_human_holds(repo, pr_number, issue)
+    parks = live_machine_parks(repo, pr_number, issue)
+    live_review = _live_review_labels(repo, pr_number)
+    decided = fix_lane_defer_action(live_review, sorted(set(holds) | set(parks)))
+    action = decided
+    if action == "hold":
+        print(f"fix-lane defer ({stale_reason}): live hold(s) "
+              f"{sorted(set(holds) | set(parks))} own {repo}#{pr_number} — NO lane transition and "
+              "NO marker retraction. A machine lane hand-over never displaces a human hold or the "
+              "capacity park (issue #555), and a park already excludes the PR from both lanes.")
+        _write_outputs({"action": action, "decided": decided, "marker": "keep",
+                        "applied": "none"})
+        return
+    # ---- PARK WINS: re-read BOTH surfaces immediately before the first write (round-2 finding 2).
+    recheck_holds = live_human_holds(repo, pr_number, issue)
+    recheck_parks = live_machine_parks(repo, pr_number, issue)
+    recheck_review = _live_review_labels(repo, pr_number)
+    landed = sorted(set(recheck_holds) | set(recheck_parks)
+                    | (set(recheck_review)
+                       & (set(MACHINE_PARK_LABELS) | set(HUMAN_OWNED_LABELS))))
+    if fix_lane_defer_abort(action, recheck_review,
+                            sorted(set(recheck_holds) | set(recheck_parks))):
+        print(f"fix-lane defer ({stale_reason}): ABORTED the '{action}' hand-over for "
+              f"{repo}#{pr_number} — hold(s) {landed} landed after the decision read. NOTHING "
+              "was written: the park/hold WINS over a lane transition (issue #555) and is left "
+              "exactly as it is. No review-lane hand-over happened, no reviewed-sha retraction, "
+              "and no review:needs-user was synthesised; the PR is re-derived once the hold "
+              "clears.")
+        _write_outputs({"action": FIX_LANE_ABORT_ACTION, "decided": decided, "marker": "keep",
+                        "applied": "none"})
+        return
+    # ---- 1. retract the reviewed-sha assertion the registry just disproved (round-2 finding 1).
+    live_marker = reviewed_sha_of(
+        _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"]).get("body") or "")
+    marker_action = fix_lane_defer_marker_action(action, live_marker, proven_head)
+    if marker_action == "invalidate":
+        print(f"fix-lane defer ({stale_reason}): the reviewed-sha marker asserts "
+              f"{proven_head[:12]} was reviewed end-to-end, but no verdict record is bound to that "
+              f"head — retracting the assertion to '{UNBOUND_REVIEWED_SHA}' so the review lane "
+              "re-admits this head instead of exiting already_done with no work done")
+        set_reviewed_sha(repo, pr_number, UNBOUND_REVIEWED_SHA)
+    else:
+        print(f"fix-lane defer ({stale_reason}): reviewed-sha marker "
+              f"{live_marker or 'absent'!r} does not name the disproved head "
+              f"{proven_head[:12]} — left untouched (it is either already stale to review "
+              "enumeration or bound to a newer completed review)")
+    # ---- 2. apply the lane label.
+    applied = "none"
+    if action == "noop":
+        print(f"fix-lane defer ({stale_reason}): {FIX_LANE_PR_LABEL} is not live on "
+              f"{repo}#{pr_number} — no lane label to flip (idempotent)")
+    elif action == "drop-fix-label":
+        _remove_label(repo, pr_number, FIX_LANE_PR_LABEL)
+        applied = "applied"
+        print(f"fix-lane defer ({stale_reason}): {REVIEW_LANE_PR_LABEL} already owns "
+              f"{repo}#{pr_number}; dropped the stale {FIX_LANE_PR_LABEL} so fix-enumeration "
+              "stops re-admitting it")
+    else:
+        applied = set_review_state(repo, pr_number, "needs", abort_on_machine_park=True)
+        if applied == "park-abort":
+            # A park landed inside set_review_state's own read->write window. It wrote nothing, so
+            # report the abort — never the hand-over.
+            action = FIX_LANE_ABORT_ACTION
+            print(f"fix-lane defer ({stale_reason}): ABORTED for {repo}#{pr_number} — a machine "
+                  f"capacity park landed inside the label write window. No lane transition, no "
+                  f"review:needs-user, park untouched (issue #555). The reviewed-sha retraction "
+                  f"already applied is safe on its own: it only widens re-review admission and "
+                  f"the park excludes the PR from both lanes until a human clears it.")
+        elif applied == "refused-hold":
+            print(f"fix-lane defer ({stale_reason}): NO hand-over for {repo}#{pr_number} — "
+                  "review:needs-user is a live human hold and refused the write (issue #138)")
+        elif applied == "converged":
+            print(f"fix-lane defer ({stale_reason}): {repo}#{pr_number} was NOT handed to the "
+                  f"review lane — an ambiguous live review namespace converged to the fail-closed "
+                  f"human hold review:needs-user (issue #138) instead of {REVIEW_LANE_PR_LABEL}")
+        else:
+            print(f"fix-lane defer ({stale_reason}): handed {repo}#{pr_number} to the review lane "
+                  f"({FIX_LANE_PR_LABEL} -> {REVIEW_LANE_PR_LABEL}) so a fresh head-bound verdict "
+                  "is produced; the fix lane no longer re-admits it every tick")
+    # `action` is what happened to the LABELS (the decision, or the abort that displaced it);
+    # `marker` what happened to the reviewed-sha assertion; `decided` the pre-write decision the
+    # marker projection is a function of. Honest reporting, not intent.
+    _write_outputs({"action": action, "decided": decided, "marker": marker_action,
+                    "applied": applied})
 
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
@@ -2095,6 +2452,46 @@ def live_human_holds(repo, pr_number, issue=None, live=None):
             "source issue hold state is unreadable; refusing to mutate (fail closed)")
     return sorted({label["name"] for label in probe["labels"]
                    if label["name"].startswith("needs:")})
+
+
+def live_machine_parks(repo, pr_number, issue=None, live=None):
+    """The LIVE MACHINE capacity park across BOTH surfaces — dispatch-claim's ONE park predicate
+    ("capacity-parked iff EITHER machine label is live") applied on the WRITE side.
+
+    live_human_holds short-circuits: it returns the PR's own hold labels and only falls through to
+    the source issue when the PR carries none, and on the issue it looks at `needs:*` only. So a
+    HALF-CLEARED park pair — `status:parked` still live on the source issue while the PR-side
+    `review:parked` write was veto-suppressed or triage-dismissed — reads as "no hold" to every
+    mutation path even though enumerate_review_items still excludes the PR as parked. Any caller
+    that must let a park WIN has to probe both surfaces unconditionally, which is what this does.
+
+    Returns the sorted list of live machine park labels (a subset of MACHINE_PARK_LABELS), else [].
+    FAIL CLOSED on ambiguity exactly like live_human_holds: a malformed PR read, a malformed/hostile
+    label payload, or an unreadable source-issue probe RAISES, so the caller mutates nothing."""
+    if live is None:
+        live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    if not isinstance(live, dict):
+        raise WorkerPrError("live PR park state is unreadable; refusing to mutate (fail closed)")
+    raw_labels = live.get("labels")
+    if not isinstance(raw_labels, list) or any(
+            not isinstance(label, dict) or not isinstance(label.get("name"), str)
+            for label in raw_labels):
+        raise WorkerPrError(
+            "live PR label payload is malformed; refusing to mutate (fail closed)")
+    parks = {label["name"] for label in raw_labels} & {MACHINE_PARK_PR_LABEL}
+    source_issue = issue
+    if not source_issue:
+        ref_match = WORKER_HEAD_RE.fullmatch(str((live.get("head") or {}).get("ref", "")))
+        source_issue = int(ref_match.group(1)) if ref_match else None
+    if source_issue:
+        probe = _gh_json(["api", f"repos/{repo}/issues/{source_issue}"])
+        if not isinstance(probe, dict) or not isinstance(probe.get("labels"), list) or any(
+                not isinstance(label, dict) or not isinstance(label.get("name"), str)
+                for label in probe["labels"]):
+            raise WorkerPrError(
+                "source issue park state is unreadable; refusing to mutate (fail closed)")
+        parks |= ({label["name"] for label in probe["labels"]} & {MACHINE_PARK_ISSUE_LABEL})
+    return sorted(parks)
 
 
 # Issue #153: a synthetic audit hit for the LIVE label-derived security posture. The path-based
@@ -3490,6 +3887,40 @@ def _self_test():
         check("the away transition still removes only the stale label it observed",
               srs_state["removed"], ["review:needs"])
         srs_globals["_gh_json"] = srs_gh
+
+        # ---- #555 / #560 round-2 finding 2: the MACHINE capacity park must WIN over an opt-in
+        # caller's transition. review:parked IS a review:* label, so {review:changes,
+        # review:parked} looks merely "ambiguous" to the #138 rule and converges to
+        # review:needs-user — DELETING a machine capacity park and inventing a HUMAN-owned
+        # terminal hold, the inversion #555 exists to prevent. Pin BOTH sides: the default
+        # (unchanged) behaviour, and the opt-in that stands the transition down instead. The guard
+        # rides the SAME validated read that drives the removes, so a park landing in a caller's
+        # probe-to-call gap is caught here rather than one layer later.
+        srs_state["live"] = [{"name": "review:changes"}, {"name": MACHINE_PARK_PR_LABEL}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        srs_park = set_review_state("o/r", 5, "needs", abort_on_machine_park=True)
+        check("a live machine park WINS over an opt-in transition (nothing written)",
+              (srs_park, srs_state["posted"], srs_state["removed"]), ("park-abort", [], []))
+        srs_state["live"] = [{"name": "review:changes"}, {"name": MACHINE_PARK_PR_LABEL}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        srs_default = set_review_state("o/r", 5, "needs")
+        check("without the opt-in the same split still converges (unchanged #138 default)",
+              (srs_default, srs_state["posted"]), ("converged", [["review:needs-user"]]))
+        # Writing the park AS the requested state is not a transition away from it — never aborted.
+        srs_state["live"] = [{"name": "review:changes"}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        check("the park write itself is never park-aborted",
+              (set_review_state("o/r", 5, "parked", abort_on_machine_park=True),
+               srs_state["posted"]), ("applied", [[MACHINE_PARK_PR_LABEL]]))
+        # The returned status is what ACTUALLY happened, so callers can log honestly.
+        srs_state["live"] = [{"name": "review:needs-user"}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        check("set_review_state reports a hold refusal",
+              set_review_state("o/r", 5, "needs"), "refused-hold")
+        srs_state["live"] = [{"name": "review:needs"}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        check("set_review_state reports a clean apply",
+              set_review_state("o/r", 5, "changes"), "applied")
 
         # A malformed live label payload fails closed (RAISES) instead of reading as no-hold.
         malformed_failed_closed = False
@@ -5350,6 +5781,12 @@ def _self_test():
             stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 3)
             check("stage-verdict unwraps a matching record",
                   (_stage_out.get("staged"), json.loads(_out.read_text())), (True, _env_doc))
+            # Issue #560: a BOUND verdict proceeds to the fixer normally — staged=true and NO
+            # stale_reason, so review-fix.yml's `outcome` job never reaches the lane hand-over
+            # step (its `if` requires verdict_staged == 'false' AND a non-empty reason) and the
+            # PR keeps review:changes for the fix it is about to receive.
+            check("#560: a bound verdict emits no defer reason (fix proceeds, no relabel)",
+                  ("stale_reason" in _stage_out, _stage_out.get("staged")), (False, True))
             _out.unlink()
             _stage_out.clear()
             stage_verdict_for_fix(str(_rec), str(_out), "b" * 40, "o/r", 41, 3)
@@ -5394,6 +5831,324 @@ def _self_test():
                           ("raised", _out.exists()), ("raised", False))
         finally:
             globals()["_write_outputs"] = _real_wo
+
+    # ---- issue #560: the defer-to-fresh-review LANE TRANSITION -------------------------------
+    # The fix lane SPUN because an unbound/stale-verdict defer left review:changes on the PR:
+    # fix-enumeration re-admitted it every ~8min dispatch tick (live 2026-07-24 — sparq#3523/
+    # #3542/#3572/#3573/#3608, ~35 wasted runs/hour) while review-enumeration, which keys on
+    # review:needs, never saw it. Assert the pure decision, the pure post-state projection, and
+    # that the IMPERATIVE path applies exactly that projection through the shared label
+    # primitives. The end-to-end SPIN-CLOSURE property (a subsequent enumeration pass no longer
+    # emits needs-fix) is asserted in dispatch-claim.py's --self-test against this same
+    # projection, so neither half can drift from the other.
+    check("#560: every stage-verdict defer reason is a legal hand-over reason",
+          sorted(FIX_LANE_DEFER_REASONS), ["head-moved", "identity-mismatch", "unbound"])
+    check("#560: a clean review:changes hands over to the review lane",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL}), "transition")
+    check("#560: review:needs already live -> drop only the stale fix-lane label",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL}), "drop-fix-label")
+    check("#560: no review:changes -> idempotent no-op",
+          fix_lane_defer_action({REVIEW_LANE_PR_LABEL}), "noop")
+    check("#560: an empty review namespace -> idempotent no-op",
+          fix_lane_defer_action(set()), "noop")
+    check("#560: the hand-over leaves exactly review:needs",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "transition")),
+          {REVIEW_LANE_PR_LABEL})
+    check("#560: the drop leaves exactly review:needs",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL},
+                                    "drop-fix-label")),
+          {REVIEW_LANE_PR_LABEL})
+    # An ambiguous namespace that is NOT the review:needs pair still converges to the fail-closed
+    # human hold: set_review_state's issue #138 policy is honoured, never second-guessed.
+    check("#560: an ambiguous split still converges to the human hold",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, "review:pass"}, "transition")),
+          {"review:needs-user"})
+    try:
+        fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "invent")
+        check("#560: an unknown projection action fails closed", "no error", "raised")
+    except WorkerPrError:
+        check("#560: an unknown projection action fails closed", "raised", "raised")
+    # #555 park ownership + #138 human holds: a MACHINE lane hand-over never displaces either.
+    for _hold in (MACHINE_PARK_PR_LABEL, "review:needs-user", "needs:user"):
+        check(f"#560: a live {_hold} keeps the hand-over out",
+              fix_lane_defer_action({FIX_LANE_PR_LABEL}, holds=[_hold]), "hold")
+        check(f"#560: a live {_hold} leaves the label set untouched",
+              set(fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "hold")), {FIX_LANE_PR_LABEL})
+
+    # ROUND-2 FINDING 2 (#555 park semantics under a RACE), at the pure level: a machine park that
+    # is live when the transition projects must leave the namespace ALONE — never converge it to
+    # review:needs-user, which would DELETE the park and invent a human-owned terminal hold.
+    check("#560 f2: a park in the live namespace makes the transition a no-write",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL}, "transition")),
+          {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL})
+    check("#560 f2: the abort action leaves every label untouched",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL},
+                                    FIX_LANE_ABORT_ACTION)),
+          {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL})
+    for _writing in ("transition", "drop-fix-label", "noop"):
+        for _landed in (MACHINE_PARK_PR_LABEL, "review:needs-user"):
+            check(f"#560 f2: a {_landed} at the re-read aborts '{_writing}'",
+                  fix_lane_defer_abort(_writing, {FIX_LANE_PR_LABEL, _landed}, []), True)
+        for _landed in (MACHINE_PARK_ISSUE_LABEL, "needs:user"):
+            check(f"#560 f2: a source-issue {_landed} at the re-read aborts '{_writing}'",
+                  fix_lane_defer_abort(_writing, {FIX_LANE_PR_LABEL}, [_landed]), True)
+        check(f"#560 f2: a clean re-read does NOT abort '{_writing}'",
+              fix_lane_defer_abort(_writing, {FIX_LANE_PR_LABEL}, []), False)
+    check("#560 f2: nothing to abort once the decision was already 'hold'",
+          fix_lane_defer_abort("hold", {MACHINE_PARK_PR_LABEL}, [MACHINE_PARK_PR_LABEL]), False)
+    try:
+        fix_lane_defer_abort("invent", set(), [])
+        check("#560 f2: an unknown action fails closed in the abort predicate",
+              "no error", "raised")
+    except WorkerPrError:
+        check("#560 f2: an unknown action fails closed in the abort predicate",
+              "raised", "raised")
+    check("#560 f2: ONE park predicate covers BOTH surfaces",
+          sorted(MACHINE_PARK_LABELS), ["review:parked", "status:parked"])
+
+    # ROUND-2 FINDING 1 (the spin was RELOCATED, not closed), at the pure level: the hand-over must
+    # RETRACT the reviewed-sha assertion for the head the registry just disproved, and must leave a
+    # marker naming any OTHER sha alone (already stale to the enumerator, or a newer real review).
+    _f1_head, _f1_other = "a" * 40, "b" * 40
+    for _writing in ("transition", "drop-fix-label", "noop"):
+        check(f"#560 f1: '{_writing}' retracts a marker naming the disproved head",
+              fix_lane_defer_marker_action(_writing, _f1_head, _f1_head), "invalidate")
+        check(f"#560 f1: '{_writing}' keeps a marker naming another head",
+              fix_lane_defer_marker_action(_writing, _f1_other, _f1_head), "keep")
+        check(f"#560 f1: '{_writing}' keeps an already-unbound marker",
+              fix_lane_defer_marker_action(_writing, UNBOUND_REVIEWED_SHA, _f1_head), "keep")
+        check(f"#560 f1: '{_writing}' keeps an absent marker",
+              fix_lane_defer_marker_action(_writing, None, _f1_head), "keep")
+    for _quiet in ("hold", FIX_LANE_ABORT_ACTION):
+        check(f"#560 f1: '{_quiet}' never touches the marker",
+              fix_lane_defer_marker_action(_quiet, _f1_head, _f1_head), "keep")
+    try:
+        fix_lane_defer_marker_action("invent", _f1_head, _f1_head)
+        check("#560 f1: an unknown action fails closed in the marker projection",
+              "no error", "raised")
+    except WorkerPrError:
+        check("#560 f1: an unknown action fails closed in the marker projection",
+              "raised", "raised")
+
+    # ---- The IMPERATIVE path over a FAITHFUL stubbed GitHub surface: the PR body (which IS the
+    # reviewed-sha store), the PR labels, and the SOURCE ISSUE labels. Nothing touches the network,
+    # but the REAL live_human_holds / live_machine_parks probes, the REAL set_reviewed_sha CAS loop
+    # and the REAL set_review_state all execute, and the stub APPLIES every write so a later read
+    # observes it. `inject` lands a label at an exact (path, nth-read) so a park can be made to
+    # arrive inside a specific window.
+    fld_globals = globals()
+    fld_real = {name: fld_globals[name] for name in
+                ("_gh_json", "_ensure_label", "_remove_label", "_write_outputs")}
+    try:
+        fld = {"labels": set(), "issue_labels": set(), "body": "", "posted": [], "removed": [],
+               "patched": [], "output": {}, "counts": {}, "inject": None,
+               "inject_label": MACHINE_PARK_PR_LABEL, "malformed": False}
+        _fld_pr = "repos/o/r/pulls/5"
+        _fld_pr_labels = "repos/o/r/issues/5/labels"
+        _fld_issue = "repos/o/r/issues/7"
+
+        def fld_gh(args, **kwargs):
+            if "-X" in args and "POST" in args:            # the label ADD
+                names = list(kwargs.get("input_doc", {}).get("labels") or [])
+                fld["posted"].append(names)
+                fld["labels"] |= set(names)
+                return {}
+            if "-X" in args and "PATCH" in args:           # the PR-body (reviewed-sha) write
+                fld["body"] = kwargs.get("input_doc", {}).get("body") or ""
+                fld["patched"].append(fld["body"])
+                return {}
+            path = args[1] if len(args) > 1 else ""
+            fld["counts"][path] = fld["counts"].get(path, 0) + 1
+            if fld["inject"] == (path, fld["counts"][path]):
+                fld["labels"].add(fld["inject_label"])     # a park lands INSIDE this window
+            if path == _fld_pr_labels:
+                return "nope" if fld["malformed"] else [
+                    {"name": name} for name in sorted(fld["labels"])]
+            if path == _fld_pr:
+                return {"state": "open", "draft": True, "body": fld["body"],
+                        "head": {"ref": "sparq-agent/issue-7-1-1", "sha": _f1_head},
+                        "user": {"login": "sparq[bot]"},
+                        "labels": [{"name": name} for name in sorted(fld["labels"])]}
+            if path == _fld_issue:
+                return {"labels": [{"name": name} for name in sorted(fld["issue_labels"])]}
+            raise AssertionError(f"unstubbed gh read {args}")
+
+        def fld_remove(repo, pr, other):
+            fld["removed"].append(other)
+            fld["labels"].discard(other)
+
+        fld_globals["_gh_json"] = fld_gh
+        fld_globals["_ensure_label"] = lambda repo, label: None
+        fld_globals["_remove_label"] = fld_remove
+        fld_globals["_write_outputs"] = lambda values: fld["output"].update(values)
+
+        def fld_reset(live, issue_labels=(), marker=None, inject=None,
+                      inject_label=MACHINE_PARK_PR_LABEL, malformed=False):
+            fld["labels"] = set(live)
+            fld["issue_labels"] = set(issue_labels)
+            fld["body"] = ("desc\n\n<!-- sparq-reviewed-sha:"
+                           f"{_f1_head if marker is None else marker} -->\n")
+            fld["posted"], fld["removed"], fld["patched"] = [], [], []
+            fld["output"], fld["counts"] = {}, {}
+            fld["inject"], fld["inject_label"] = inject, inject_label
+            fld["malformed"] = malformed
+
+        def run_defer(live, reason="unbound", **kwargs):
+            fld_reset(live, **kwargs)
+            fix_lane_defer("o/r", 5, reason, _f1_head, issue=7)
+            return {
+                "action": fld["output"].get("action"),
+                "decided": fld["output"].get("decided"),
+                "marker": fld["output"].get("marker"),
+                "applied": fld["output"].get("applied"),
+                "labels": set(fld["labels"]) & set(REVIEW_LABELS),
+                "reviewed_sha": reviewed_sha_of(fld["body"]),
+                "posted": [list(names) for names in fld["posted"]],
+                "removed": list(fld["removed"]),
+                "body_writes": len(fld["patched"]),
+            }
+
+        # THE round-1 regression: an unbound-record defer must REMOVE review:changes and ADD
+        # review:needs. Leaving review:changes behind IS the live spin.
+        _r = run_defer({FIX_LANE_PR_LABEL}, "unbound")
+        check("#560: an unbound-record defer flips review:changes -> review:needs",
+              (_r["action"], _r["labels"]), ("transition", {REVIEW_LANE_PR_LABEL}))
+        # ...and THE round-2 finding-1 regression, in the SAME run: the stale reviewed-sha
+        # assertion for the disproved head is retracted, so the review lane can actually re-admit
+        # the head instead of exiting already_done. A label-only flip leaves this at _f1_head.
+        check("#560 f1: the hand-over retracts the disproved reviewed-sha assertion",
+              (_r["marker"], _r["reviewed_sha"], _r["body_writes"]),
+              ("invalidate", UNBOUND_REVIEWED_SHA, 1))
+        # The stubbed mutation must equal BOTH pure projections for every reason/namespace pair, so
+        # dispatch-claim's ownership test is asserting the real post-defer PR state.
+        for _live in ({FIX_LANE_PR_LABEL},
+                      {FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL},
+                      {FIX_LANE_PR_LABEL, "review:pass"},
+                      {REVIEW_LANE_PR_LABEL},
+                      set()):
+            for _reason in FIX_LANE_DEFER_REASONS:
+                _r = run_defer(_live, _reason)
+                check(f"#560: the applied labels match the projection "
+                      f"({sorted(_live)} / {_reason})",
+                      _r["labels"], set(fix_lane_defer_labels(_live, _r["action"])))
+                check(f"#560: the applied marker matches the projection "
+                      f"({sorted(_live)} / {_reason})",
+                      (_r["marker"], _r["reviewed_sha"]),
+                      (fix_lane_defer_marker_action(_r["decided"], _f1_head, _f1_head),
+                       UNBOUND_REVIEWED_SHA))
+        # A marker bound to a DIFFERENT sha belongs to a newer completed review — never clobbered.
+        _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", marker=_f1_other)
+        check("#560 f1: a marker naming another head survives the hand-over",
+              (_r["marker"], _r["reviewed_sha"], _r["body_writes"], _r["labels"]),
+              ("keep", _f1_other, 0, {REVIEW_LANE_PR_LABEL}))
+        # A live hold mutates NOTHING on EITHER surface — no label write, no body write. Both
+        # machine park labels count, on either surface (the ONE park predicate).
+        for _hold, _where in ((MACHINE_PARK_PR_LABEL, "pr"), ("review:needs-user", "pr"),
+                              ("needs:user", "issue"), (MACHINE_PARK_ISSUE_LABEL, "issue")):
+            _r = run_defer({FIX_LANE_PR_LABEL} | ({_hold} if _where == "pr" else set()),
+                           "unbound", issue_labels=() if _where == "pr" else (_hold,))
+            check(f"#560: a live {_hold} on the {_where} blocks every write",
+                  (_r["action"], _r["posted"], _r["removed"], _r["body_writes"],
+                   _r["marker"], _r["reviewed_sha"]),
+                  ("hold", [], [], 0, "keep", _f1_head))
+        # Idempotence: replaying the defer on a FULLY handed-over PR writes nothing at all.
+        _r = run_defer({REVIEW_LANE_PR_LABEL}, "unbound", marker=UNBOUND_REVIEWED_SHA)
+        check("#560: replaying the defer after a complete hand-over writes nothing",
+              (_r["action"], _r["posted"], _r["removed"], _r["body_writes"], _r["labels"],
+               _r["reviewed_sha"]),
+              ("noop", [], [], 0, {REVIEW_LANE_PR_LABEL}, UNBOUND_REVIEWED_SHA))
+        # ...but a HALF-done hand-over (marker-first crash order: label flipped, marker still
+        # bound — or an external relabel) is COMPLETED, not skipped. That state is exactly the
+        # no-owner posture finding 1 describes, so the replay must still retract the marker.
+        _r = run_defer({REVIEW_LANE_PR_LABEL}, "unbound")
+        check("#560 f1: a label-only hand-over is completed by the marker retraction",
+              (_r["action"], _r["posted"], _r["removed"], _r["marker"], _r["reviewed_sha"]),
+              ("noop", [], [], "invalidate", UNBOUND_REVIEWED_SHA))
+
+        # ---- ROUND-2 FINDING 2, THE RACE. #555 splits ownership: review:parked/status:parked is
+        # the MACHINE capacity hold. Pre-fix, a park landing after live_human_holds() but before
+        # the transition made set_review_state see {review:changes, review:parked} — merely
+        # "ambiguous" — and converge it to review:needs-user, DELETING the machine park and
+        # synthesising a HUMAN-owned terminal hold, while the caller logged a successful
+        # review-lane hand-over. Drive the park in at each window and require: park preserved,
+        # NO review:needs-user, transition aborted, and an honest log.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr, 2))
+        check("#560 f2: a park landing after the hold probe is seen by the park probe (hold)",
+              (_r["action"], _r["labels"], _r["posted"], _r["removed"], _r["body_writes"]),
+              ("hold", {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL}, [], [], 0))
+        check("#560 f2: ...and no review:needs-user is synthesised",
+              "review:needs-user" in _r["labels"], False)
+        # The window the finding names: the park is invisible to ALL THREE decision reads and only
+        # appears at the pre-write RE-READ. The hand-over must ABORT, not transition.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr, 3))
+        check("#560 f2: a park at the pre-write re-read ABORTS the hand-over",
+              (_r["action"], _r["decided"], _r["labels"], _r["posted"], _r["removed"],
+               _r["body_writes"], _r["marker"], _r["reviewed_sha"]),
+              (FIX_LANE_ABORT_ACTION, "transition",
+               {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL}, [], [], 0, "keep", _f1_head))
+        check("#560 f2: the aborted hand-over never creates review:needs-user",
+              "review:needs-user" in _r["labels"], False)
+        check("#560 f2: the abort is logged HONESTLY (no hand-over claim)",
+              ("ABORTED" in _log.getvalue()
+               and "WINS over a lane transition" in _log.getvalue()
+               and "handed o/r#5 to the review lane" not in _log.getvalue()), True)
+        # The residual sub-window: the park lands after the re-read, so ONLY set_review_state's own
+        # validated read sees it. The abort_on_machine_park guard rides THAT read, so the window is
+        # closed rather than moved — the park still survives and no human hold is invented.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr_labels, 3))
+        check("#560 f2: a park inside set_review_state's own read window still WINS",
+              (_r["action"], _r["applied"], _r["labels"], _r["posted"], _r["removed"]),
+              (FIX_LANE_ABORT_ACTION, "park-abort",
+               {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL}, [], []))
+        check("#560 f2: the inner abort is logged honestly too",
+              ("ABORTED" in _log.getvalue()
+               and "handed o/r#5 to the review lane" not in _log.getvalue()), True)
+        # A HUMAN hold landing in the same window aborts identically (never a silent unpark).
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr, 3),
+                           inject_label="review:needs-user")
+        check("#560 f2: a human hold at the pre-write re-read aborts too",
+              (_r["action"], _r["posted"], _r["removed"], _r["body_writes"]),
+              (FIX_LANE_ABORT_ACTION, [], [], 0))
+
+        # An unrecognised reason fails closed: raises BEFORE any read or write.
+        fld_reset({FIX_LANE_PR_LABEL})
+        try:
+            fix_lane_defer("o/r", 5, "made-up-reason", _f1_head, issue=7)
+            check("#560: an unknown defer reason fails closed", "no error", "raised")
+        except WorkerPrError:
+            check("#560: an unknown defer reason fails closed",
+                  ("raised", fld["posted"], fld["removed"], fld["patched"], fld["counts"]),
+                  ("raised", [], [], [], {}))
+        # A missing/malformed --head-sha fails closed the same way: without it the reviewed-sha
+        # assertion cannot be retracted and the hand-over would only RELOCATE the spin.
+        for _bad in (None, "", "nope", "A" * 40, "a" * 39):
+            fld_reset({FIX_LANE_PR_LABEL})
+            try:
+                fix_lane_defer("o/r", 5, "unbound", _bad, issue=7)
+                check(f"#560 f1: --head-sha {_bad!r} fails closed", "no error", "raised")
+            except WorkerPrError:
+                check(f"#560 f1: --head-sha {_bad!r} fails closed",
+                      ("raised", fld["posted"], fld["removed"], fld["patched"], fld["counts"]),
+                      ("raised", [], [], [], {}))
+        # A malformed live label payload fails closed (never "no labels" -> no hand-over).
+        fld_reset({FIX_LANE_PR_LABEL}, malformed=True)
+        try:
+            fix_lane_defer("o/r", 5, "unbound", _f1_head, issue=7)
+            check("#560: a malformed live label payload fails closed", "no error", "raised")
+        except WorkerPrError:
+            check("#560: a malformed live label payload fails closed",
+                  ("raised", fld["posted"], fld["removed"], fld["patched"]),
+                  ("raised", [], [], []))
+    finally:
+        fld_globals.update(fld_real)
 
     # Privacy (locked decision 22a): salted hash is 16-hex, deterministic, salt-sensitive, and
     # never the raw handle; missing salt fails closed.
@@ -6146,6 +6901,23 @@ def main():
     svrec.add_argument("--pr", required=True, type=int)
     svrec.add_argument("--round", required=True, type=int)
 
+    # Issue #560: stage-verdict deferred (staged=false), so the fix lane must release the PR to the
+    # REVIEW lane — otherwise fix-enumeration re-claims it every dispatch tick forever.
+    fldefer = subparsers.add_parser("fix-lane-defer", parents=[common])
+    fldefer.add_argument("--stale-reason", required=True,
+                         choices=FIX_LANE_DEFER_REASONS,
+                         help="the stage-verdict stale_reason that caused the defer")
+    # REQUIRED (round-2 finding 1): the head stage-verdict proved has no head-bound verdict record.
+    # Without it the stale reviewed-sha assertion cannot be retracted and the hand-over would only
+    # RELOCATE the spin into the review lane's already_done exit, so a missing value must fail the
+    # step loudly rather than silently degrade to a label-only flip.
+    fldefer.add_argument("--head-sha", required=True,
+                         help="the 40-hex head the deferred verdict was NOT bound to; its stale "
+                              "reviewed-sha assertion is retracted so the review lane re-admits it")
+    fldefer.add_argument("--issue", type=int,
+                         help="the source issue (its needs:*/status:parked labels are part of the "
+                              "hold surface)")
+
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
@@ -6290,6 +7062,9 @@ def main():
         elif args.command == "stage-verdict":
             stage_verdict_for_fix(args.record_file, args.out_file, args.expected_sha,
                                   args.target_repo, args.pr, args.round)
+        elif args.command == "fix-lane-defer":
+            fix_lane_defer(args.repo, args.pr, args.stale_reason, args.head_sha,
+                           issue=args.issue)
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
