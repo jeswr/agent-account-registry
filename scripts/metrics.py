@@ -1953,9 +1953,16 @@ def _test_publish_cas_and_wiring(chk):
 
     kick_script = dg._workflow_step_script(collector_workflow, "dashboard-publish")
     decision_script = dg._workflow_step_script(dashboard_workflow, "publish-decision")
-    sent = re.search(r"-f reason=(\S+)", kick_script)
+    # NESTED, not flat. Verified against an echo server: `gh api -f reason=x` builds the FLAT body
+    # {"ref":...,"reason":"x"}, which the dispatch API does not read as an input — the kicked run
+    # would start with an EMPTY reason, be indistinguishable from a keepalive dispatch, and be
+    # deduped away, so the causal publish would silently never happen. gh's documented nesting
+    # syntax is `key[subkey]=value`, and this assertion is the only thing standing between the two.
+    sent = re.search(r"-f\s+'inputs\[reason\]=([^']+)'", kick_script)
     marker = sent.group(1) if sent else ""
-    chk("the publish kick carries a causal-leg marker at all", bool(marker), True)
+    chk("the publish kick carries a causal-leg marker, sent as a NESTED workflow_dispatch input "
+        "(a flat `-f reason=` is accepted by gh, ignored by the API, and fails silently)",
+        bool(marker), True)
     chk("dashboard DECLARES the input the kick sends — an undeclared input makes the dispatch POST "
         "a 422 and the whole causal path a silent no-op",
         marker and marker != "" and "reason" in dispatch_inputs, True)
@@ -2048,9 +2055,10 @@ def _test_publish_cas_and_wiring(chk):
             "turns a freshness fix into a freshness outage)", (rc, published), (0, "true"), log)
 
     rc, calls, log = _run_publish_kick(kick_script, metrics_result="success")
-    chk("a SUCCESSFUL metrics job kicks dashboard.yml exactly once, carrying the causal marker",
+    chk("a SUCCESSFUL metrics job kicks dashboard.yml exactly once, carrying the causal marker in "
+        "the nested-input form the dispatch API actually reads",
         (rc, len(calls), calls and "dashboard.yml/dispatches" in calls[0],
-         calls and f"reason={marker}" in calls[0]), (0, 1, True, True), log)
+         calls and f"inputs[reason]={marker}" in calls[0]), (0, 1, True, True), log)
     rc, calls, log = _run_publish_kick(kick_script, metrics_result="failure", last_run_age=60)
     chk("a FAILED metrics job publishes nothing and does not fake a causal kick",
         (rc, [c for c in calls if "dispatches" in c]), (0, []), log)

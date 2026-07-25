@@ -170,9 +170,15 @@ jobs:
             # singleton concurrency group queues this behind any live run, and its own
             # publish-decision job drops the run if another has already deployed this content — so
             # the #559 dup-dispatch storm is closed by the CONSUMER, not by guessing here.
+            # `inputs[reason]=`, NOT `reason=`. Verified against an echo server: `gh api -f
+            # reason=x` builds the FLAT body {"ref":...,"reason":"x"}, which the dispatch API does
+            # not read as an input — the run would start with an EMPTY reason, be indistinguishable
+            # from a keepalive kick, and get deduped away by the dashboard's own freshness check.
+            # The causal publish would then silently never happen, which is the exact failure this
+            # whole change exists to remove. gh's documented nesting syntax is `key[subkey]=value`.
             gh api -X POST \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/dashboard.yml/dispatches" \
-              -f ref=master -f reason=metrics-publish
+              -f ref=master -f 'inputs[reason]=metrics-publish'
             echo "dashboard-publish: kicked dashboard.yml for the fresh snapshot"
             exit 0
           fi
