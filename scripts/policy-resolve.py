@@ -520,6 +520,28 @@ agent = "docs-agent"
     check("the retired registry holds the known retirements (emptying it must not silently "
           "disable every check below)",
           sorted(RETIRED_ACCOUNTS), ["acct03", "acct06"])
+    # The README's enrolment runbook says it can be followed VERBATIM, and #660 review r4 found
+    # that its `account_pool` example still listed a retired handle — so following it produced a
+    # PolicyError. Fixing that instance is not enough: any future retirement or handle-shape
+    # change can silently invalidate the runbook again. So the DOCUMENTED examples are validated
+    # against the live rules here. Doc drift becomes a test failure instead of a maintainer's
+    # wasted afternoon.
+    _readme = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+    _doc_pools = re.findall(r'account_pool\s*=\s*\[([^\]]*)\]', _readme.read_text(encoding="utf-8"))
+    check("the README documents at least one account_pool example (a zero-example scan would "
+          "make the checks below vacuously pass)",
+          len(_doc_pools) > 0, True)
+    _doc_bad = []
+    for _raw in _doc_pools:
+        for _entry in (x.strip().strip('"').strip("'") for x in _raw.split(",")):
+            if not _entry:
+                continue
+            if ACCOUNT_HANDLE_RE.fullmatch(_entry) is None or _entry in RETIRED_ACCOUNTS:
+                _doc_bad.append(_entry)
+    check("every account_pool example in README.md is a pool the resolver would ACCEPT "
+          "(no retired and no non-canonical handles in a runbook marked follow-verbatim)",
+          sorted(set(_doc_bad)), [])
+
     # NON-CANONICAL handles are refused outright (#660 review r3). Padding is the case that
     # bit us: `" acct03"` was a legal handle to the old validation AND invisible to the raw
     # retirement intersection, and downstream select-and-claim strips before matching, so it
