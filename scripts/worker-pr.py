@@ -2768,6 +2768,61 @@ def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
 
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
+def _park_retract(action, node_id):
+    """One latch-retraction mutation for `disarm_before_park` (issue #684).
+
+    Both forms go through GraphQL, unconditionally — NOT the REST `gh pr merge --disable-auto`
+    that disarm() uses for an unqueued PR. `--disable-auto` fails outright on a queued PR, and a
+    park path must behave identically whether or not the PR happens to be in the queue at the
+    moment it is parked; the queue-membership races that made the REST/GraphQL split matter in
+    disarm() (issue #69 half 2) are exactly the races a park is most likely to hit, because a
+    park is applied to PRs that have been sitting around long enough to be enqueued."""
+    node = str(node_id or "")
+    if not node:
+        raise WorkerPrError("park disarm has no pull request node id")
+    if action == _park_policy().PARK_DISARM_DEQUEUE:
+        _queue_disarm_mutation("dequeuePullRequest", node)
+    elif action == _park_policy().PARK_DISARM_DISABLE_AUTO:
+        _queue_disarm_mutation("disablePullRequestAutoMerge", node)
+    else:
+        raise WorkerPrError(f"unknown park disarm action {action}")
+
+
+def disarm_before_park(repo, pr_number, park):
+    """Apply `park` (a zero-argument park-label writer) only after PROVING `repo#pr_number` has
+    no live auto-merge latch — issue #684, park_policy invariant 4.
+
+    Every PR-side park in this module routes through here. `_merge_latch_state` is the
+    AUTHORITATIVE read (GraphQL mergeQueueEntry + autoMergeRequest); the REST `auto_merge`
+    field is deliberately not consulted, because it lags after a disable and reading it would
+    reintroduce #487's already-unarmed loop from the other direction.
+
+    NOTE the draft case is NOT short-circuited. disarm() skips the GraphQL probe for a drafted
+    PR on the theory that a draft can be neither queued nor auto-merge-latched. That is a
+    reasonable optimisation for a sweep that runs on every tick; it is the wrong trade here,
+    because this is the ONE read standing between a released crate partition and a merge, it
+    runs only on the rare park path, and `draft` is itself a live field that can have moved.
+    One authoritative read, always.
+
+    On failure the park is NOT applied and the PR is left UNPARKED-AND-ARMED: still reserving its
+    crates, exactly as before the attempt. The ParkDisarmError is re-raised as a WorkerPrError —
+    `_park_policy()` re-executes the module on every call, so its exception CLASS identity is not
+    stable across loads and `except ParkDisarmError` in a caller would silently not match. The
+    message is carried through verbatim (it names the surviving latch form and says NOT parking),
+    which is what every consumer actually keys on: main() exits non-zero and the workflow step
+    goes red. No in-process caller needs to distinguish this from other park failures — every one
+    of them wants the same outcome, which is to write nothing and retry next tick."""
+    try:
+        return _park_policy().disarm_before_park(
+            repo, pr_number, lambda: _merge_latch_state(repo, pr_number), _park_retract, park)
+    except WorkerPrError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — park_policy.ParkDisarmError (unstable identity)
+        if type(exc).__name__ != "ParkDisarmError":
+            raise
+        raise WorkerPrError(" ".join(str(exc).split())) from exc
+
+
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
                maintainer=None, park_class="question", bot_login="", head_sha="",
                attempt_key=""):
@@ -2888,16 +2943,35 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                           "\n\nNOTE: the `review:needs-user` label write was SUPPRESSED by "
                           "a standing human unlabel (sticky veto) — no label was applied; "
                           "this receipt alone records the terminal escalation.")
-            _comment(repo, pr_number,
-                     f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
-                     f"This PR was human-readmitted and exhausted its budget again — "
-                     f"{generation} budget window(s) consumed (latest readmission "
-                     f"{window_key}); repeated post-readmission failure is escalated as a "
-                     f"human question. @{handle} this pull request needs a human decision. "
-                     f"It remains a DRAFT and will not be auto-armed."
-                     f"{label_note}{generation_marker}")
-            if not vetoed:
-                set_review_state(repo, pr_number, "needs-user")
+
+            def apply_terminal_park():
+                _comment(repo, pr_number,
+                         f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
+                         f"This PR was human-readmitted and exhausted its budget again — "
+                         f"{generation} budget window(s) consumed (latest readmission "
+                         f"{window_key}); repeated post-readmission failure is escalated as a "
+                         f"human question. @{handle} this pull request needs a human decision. "
+                         f"It remains a DRAFT and will not be auto-armed."
+                         f"{label_note}{generation_marker}")
+                if not vetoed:
+                    set_review_state(repo, pr_number, "needs-user")
+
+            # #684 PARK PATH 1 of 3 (capacity ladder terminal). The latch retraction is ordered
+            # AFTER the veto probe and BEFORE every durable park artifact — the RECEIPT included,
+            # not just the label. Receipt-first (round-4 finding 2) is preserved INSIDE the
+            # callback, so the two orderings compose rather than compete. Disarming ahead of the
+            # receipt matters because the ladder is fingerprint-idempotent: a park that consumed
+            # a receipt and then failed would re-derive `unchanged` on the next tick and skip
+            # QUIETLY forever, leaving the PR permanently unparked-and-armed with no retry. This
+            # way a ParkDisarmError leaves NOTHING written — no comment, no receipt, no label, no
+            # generation consumed — so the next tick retries the whole park cleanly.
+            # A VETOED park writes no PR label, so it releases no crate and needs no disarm:
+            # retracting an arm on a PR a human has just explicitly unparked would be the machine
+            # overriding the human, which is what invariant 2 exists to prevent.
+            if vetoed:
+                apply_terminal_park()
+            else:
+                disarm_before_park(repo, pr_number, apply_terminal_park)
             if issue:
                 _load_worker_issue().set_status(repo, issue, "needs-user")
             _ops_alert(alert_repo, alert_token,
@@ -2923,17 +2997,27 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                       "\n\nNOTE: the `review:parked` label write was SUPPRESSED by a "
                       "standing human unlabel (sticky veto); this receipt records the "
                       "consumed budget window without a label.")
-        _comment(repo, pr_number,
-                 f"> 🤖 SPARQ agent — the autonomous review loop parked this PR: {reason}\n\n"
-                 f"This is the MACHINE-owned capacity park (`{MACHINE_PARK_PR_LABEL}`), not a "
-                 f"human question: it remains a DRAFT and will not be auto-armed. A human can "
-                 f"re-admit it by removing the live machine park label(s) — "
-                 f"`{MACHINE_PARK_PR_LABEL}` here and `status:parked` on the source issue "
-                 f"(whichever are present; a `needs:user` unlabel on either surface also "
-                 f"opens the budget window) — the budget restarts from the latest gesture."
-                 f"{label_note}{generation_marker}")
+
+        def apply_capacity_park():
+            _comment(repo, pr_number,
+                     f"> 🤖 SPARQ agent — the autonomous review loop parked this PR: {reason}\n\n"
+                     f"This is the MACHINE-owned capacity park (`{MACHINE_PARK_PR_LABEL}`), not a "
+                     f"human question: it remains a DRAFT and will not be auto-armed. A human can "
+                     f"re-admit it by removing the live machine park label(s) — "
+                     f"`{MACHINE_PARK_PR_LABEL}` here and `status:parked` on the source issue "
+                     f"(whichever are present; a `needs:user` unlabel on either surface also "
+                     f"opens the budget window) — the budget restarts from the latest gesture."
+                     f"{label_note}{generation_marker}")
+            if parked:
+                set_review_state(repo, pr_number, "parked")
+
+        # #684 PARK PATH 2 of 3 (capacity park — the review:parked machine soft hold, and the
+        # class the sparq#3628 __global__ wedge was in). Same ordering and same rationale as the
+        # terminal park above: disarm after the veto probe, before receipt AND label.
         if parked:
-            set_review_state(repo, pr_number, "parked")
+            disarm_before_park(repo, pr_number, apply_capacity_park)
+        else:
+            apply_capacity_park()
         if issue:
             _load_worker_issue().set_status(repo, issue, "parked")
         _ops_alert(alert_repo, alert_token,
@@ -2943,11 +3027,22 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
         print(f"capacity park recorded (generation {generation}"
               f"{', label suppressed' if not parked else ''}): {reason}")
         return
-    set_review_state(repo, pr_number, "needs-user")
-    _comment(repo, pr_number,
-             f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
-             f"@{handle} this pull request needs a human decision. It remains a DRAFT and will "
-             "not be auto-armed.")
+    # #684 PARK PATH 3 of 3 (the question-class stop: injection flag, corrupt markers, an
+    # unresolvable model chain, a failed draft-undo). This class writes review:needs-user
+    # UNCONDITIONALLY — no veto probe — so it always disarms first. It is also the class reached
+    # from a workflow FAILURE path (review-fix.yml's `unresolvable` job, and dispatch-claim's
+    # seven `_pr_needs_user` escalations), which is precisely why the retraction lives here in
+    # the same process call that writes the label rather than in a separate workflow step that
+    # some `if:` would have to select: registry #604 shipped a compensating action gated on
+    # `verdict_ok == 'success'` and it never ran on the path that needed it.
+    def apply_question_park():
+        set_review_state(repo, pr_number, "needs-user")
+        _comment(repo, pr_number,
+                 f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
+                 f"@{handle} this pull request needs a human decision. It remains a DRAFT and "
+                 "will not be auto-armed.")
+
+    disarm_before_park(repo, pr_number, apply_question_park)
     if issue:
         _load_worker_issue().set_status(repo, issue, "needs-user")
     # Reuse the rolling ops-alert posture (usage-alert.py): one deduped registry issue.
@@ -5494,7 +5589,34 @@ def _self_test():
     park_route_state = {"comments": [], "timelines": {}}
     real_park_route = {name: wiring_globals[name] for name in (
         "set_review_state", "_comment", "_load_worker_issue", "_ops_alert",
-        "_issue_timeline", "_is_human_maintainer", "_paginated_comments")}
+        "_issue_timeline", "_is_human_maintainer", "_paginated_comments",
+        "_merge_latch_state", "_park_retract")}
+    # Issue #684 ordering journal. SEPARATE from park_route_calls (which stays exactly as the
+    # park-class/ladder tests above wrote it) and strictly richer: it records the authoritative
+    # latch reads and the retraction mutations INTERLEAVED with the durable park artifacts, so
+    # "the label landed before the latch was proven gone" is a red assertion rather than a code
+    # reading. Every park path below is asserted against this list.
+    park_order = []
+    park_latch = {"queued": False, "auto": False, "sticky": False, "read_raises": False}
+
+    def _fake_merge_latch_state(repo, pr_number):
+        park_order.append(("latch-read", pr_number))
+        if park_latch["read_raises"]:
+            raise WorkerPrError("merge-latch state query returned a malformed pull request")
+        return (f"PR_node{pr_number}", park_latch["queued"], park_latch["auto"])
+
+    def _fake_park_retract(action, node_id):
+        park_order.append(("retract", action, node_id))
+        if park_latch["sticky"]:
+            return          # a latch that survives its own retraction (queue already merging)
+        park_latch["queued"] = False
+        park_latch["auto"] = False
+
+    def arm_park_latch(**state):
+        park_order.clear()
+        park_latch.update({"queued": False, "auto": False, "sticky": False,
+                           "read_raises": False})
+        park_latch.update(state)
 
     class _ParkRouteIssueModule:
         # Round-3 finding 1 (test defect): the old mock recorded EVERY issue write
@@ -5518,12 +5640,18 @@ def _self_test():
     # label-posted-receipt-missing crash window impossible by construction.
     def _record_park_comment(repo, pr, body):
         park_route_calls.append(("receipt",))
+        park_order.append(("receipt",))
         park_route_comments.append(body)
 
+    def _record_park_state(repo, pr, state):
+        park_route_calls.append(("pr-state", state))
+        park_order.append(("PR-PARK-LABEL", state))
+
     try:
-        wiring_globals["set_review_state"] = (
-            lambda repo, pr, state: park_route_calls.append(("pr-state", state)))
+        wiring_globals["set_review_state"] = _record_park_state
         wiring_globals["_comment"] = _record_park_comment
+        wiring_globals["_merge_latch_state"] = _fake_merge_latch_state
+        wiring_globals["_park_retract"] = _fake_park_retract
         wiring_globals["_load_worker_issue"] = lambda: _ParkRouteIssueModule
         wiring_globals["_ops_alert"] = lambda *a: None
         wiring_globals["_issue_timeline"] = (
@@ -5810,6 +5938,147 @@ def _self_test():
                    head_sha="", attempt_key="rounds=5")
         check("(k) an unknown fingerprint parks exactly as before (no `head=` in the receipt)",
               (bool(park_route_calls), "head=" in park_route_comments[-1]), (True, False))
+
+        # ================= issue #684: disarm-on-park, per park path =================
+        # Once #683 lands, `busy_packages_of_pulls` frees a parked PR's crates on the `parked`
+        # label ALONE. Every one of needs_user's three PR-park exits must therefore have PROVEN
+        # the auto-merge latch gone BEFORE its label becomes visible, or the park hands a crate
+        # to a sibling while the parked PR can still merge into it. Each path is named
+        # separately so deleting the disarm from ONE of them cannot hide behind the others.
+        park_route_state["timelines"].clear()
+        park_route_state["comments"] = []
+
+        def park_capacity(**latch):
+            arm_park_latch(**latch)
+            park_route_state["comments"] = []
+            park_route_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot)
+
+        def park_question(**latch):
+            arm_park_latch(**latch)
+            park_route_calls.clear()
+            needs_user("o/r", 41, "human question", issue=7)
+
+        # --- PARK PATH 2 of 3: the capacity park (review:parked) — sparq#3628's class ---
+        park_capacity(auto=True)
+        check("#684 path 2/3 (capacity park): the auto-merge latch is retracted and PROVEN "
+              "gone BEFORE review:parked lands",
+              park_order,
+              [("latch-read", 41), ("retract", "disable-auto", "PR_node41"),
+               ("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "parked")])
+        park_capacity(queued=True, auto=True)
+        check("#684 path 2/3 (capacity park): a MERGE-QUEUE member is dequeued first, then "
+              "un-armed, then parked",
+              park_order,
+              [("latch-read", 41), ("retract", "dequeue", "PR_node41"),
+               ("retract", "disable-auto", "PR_node41"), ("latch-read", 41),
+               ("receipt",), ("PR-PARK-LABEL", "parked")])
+        # The idempotent case is the common one: an unarmed PR costs ONE read, no mutation.
+        park_capacity()
+        check("#684 path 2/3 (capacity park): an unarmed PR parks after one read, no mutation",
+              park_order, [("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "parked")])
+
+        # --- PARK PATH 3 of 3: the question-class park (review:needs-user, unconditional) ---
+        park_question(auto=True)
+        check("#684 path 3/3 (question park): the latch is retracted and PROVEN gone BEFORE "
+              "review:needs-user lands",
+              park_order,
+              [("latch-read", 41), ("retract", "disable-auto", "PR_node41"),
+               ("latch-read", 41), ("PR-PARK-LABEL", "needs-user"), ("receipt",)])
+        park_question()
+        check("#684 path 3/3 (question park): an unarmed PR parks after one read, no mutation",
+              park_order, [("latch-read", 41), ("PR-PARK-LABEL", "needs-user"), ("receipt",)])
+
+        # --- PARK PATH 1 of 3: the capacity-ladder TERMINAL escalation ---
+        # Drive the ladder to its terminal generation: a human readmission window plus one
+        # already-consumed receipt makes the next exhaustion the question-class terminal.
+        arm_park_latch(auto=True)
+        park_route_state["timelines"][41] = [labeled("review:parked", "2026-07-22T16:00:00Z"),
+                                             unlabel("review:parked", "2026-07-22T16:36:56Z")]
+        park_route_state["comments"] = [
+            {"user": {"login": bot},
+             "body": f"x {PARK_GENERATION_MARKER} gen=1 cutoff={PARK_WINDOW_NONE} -->"}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("#684 path 1/3 (ladder terminal): the terminal escalation reached its "
+              "question-class park", "readmitted and exhausted its budget again"
+              in park_route_comments[-1], True)
+        check("#684 path 1/3 (ladder terminal): the latch is retracted and PROVEN gone BEFORE "
+              "the terminal review:needs-user lands",
+              park_order,
+              [("latch-read", 41), ("retract", "disable-auto", "PR_node41"),
+               ("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "needs-user")])
+
+        # --- THE HAZARD ITSELF: a latch that cannot be retracted must leave the PR
+        # UNPARKED-AND-ARMED (still reserving its crates), never parked-and-armed. This is the
+        # assertion that goes red if the disarm is made "success-path only" — i.e. if a failed
+        # or ineffective retraction is swallowed and the park proceeds regardless. ---
+        # The abort surfaces as a WorkerPrError carrying the ParkDisarmError message verbatim
+        # (see disarm_before_park: _park_policy() re-executes the module, so the exception CLASS
+        # is a different object on every load and identity-matching it would silently never fire).
+        park_disarm_error = WorkerPrError
+        for path, call in (
+            ("capacity park", lambda: needs_user("o/r", 41, "budget spent", issue=7,
+                                                 park_class="capacity", bot_login=bot)),
+            ("question park", lambda: needs_user("o/r", 41, "human question", issue=7)),
+        ):
+            park_route_state["timelines"].clear()
+            park_route_state["comments"] = []
+            park_route_calls.clear()
+            arm_park_latch(queued=True, sticky=True)
+            try:
+                call()
+            except park_disarm_error as exc:
+                raised = " ".join(str(exc).split())
+            else:
+                raised = ""
+            check(f"#684 ({path}): a merge-queue entry that CANNOT be dequeued aborts the "
+                  "park — nothing durable is written and the PR stays unparked-and-armed",
+                  (bool(raised),
+                   any(entry[0] in ("PR-PARK-LABEL", "receipt") for entry in park_order),
+                   park_route_calls),
+                  (True, False, []))
+            check(f"#684 ({path}): the un-retractable latch is REPORTED loudly, naming the "
+                  "surviving latch form and that no park was applied",
+                  ("merge-queue latch still live" in raised and "NOT parking" in raised
+                   and "still reserving its crates" in raised), True)
+            # An unreadable latch is not an absent latch: fail toward NOT parking.
+            park_route_calls.clear()
+            arm_park_latch(auto=True, read_raises=True)
+            try:
+                call()
+            except park_disarm_error:
+                raised_read = True
+            else:
+                raised_read = False
+            check(f"#684 ({path}): an UNREADABLE latch state aborts the park rather than "
+                  "assuming the PR is unarmed",
+                  (raised_read,
+                   any(entry[0] in ("PR-PARK-LABEL", "receipt") for entry in park_order),
+                   park_route_calls),
+                  (True, False, []))
+
+        # A VETOED park writes no PR label, so it releases no crate — and must therefore NOT
+        # strip an arm from a PR a human has just explicitly unparked (invariant 2 is not
+        # weakened by invariant 4). Red if the disarm is hoisted above the veto probe.
+        park_route_state["timelines"][41] = [
+            labeled("review:parked", "2026-07-22T16:00:00Z"),
+            unlabel("review:parked", "2026-07-25T09:00:00Z")]
+        park_route_state["comments"] = []
+        park_route_calls.clear()
+        arm_park_latch(auto=True)
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
+        check("#684: a sticky-veto-SUPPRESSED park applies no PR label and therefore performs "
+              "NO retraction (the machine never disarms a PR the human just unparked)",
+              ([entry for entry in park_order if entry[0] != "receipt"],
+               any(call[0] == "pr-state" for call in park_route_calls)),
+              ([], False))
+        park_route_state["timelines"].clear()
+        park_route_state["comments"] = []
+        arm_park_latch()
     finally:
         wiring_globals.update(real_park_route)
 
