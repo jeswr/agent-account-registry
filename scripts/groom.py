@@ -1218,13 +1218,19 @@ def _parked_pr_snapshot(
     return head_sha, updated_at
 
 
-def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[bool, bool]:
-    """Return live ``(queued, auto_merge_requested)`` state, failing closed on shape errors."""
+def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[str, bool, bool]:
+    """Return live ``(node_id, queued, auto_merge_requested)`` state, failing closed on shape
+    errors.
+
+    The node id was added for issue #684: the defuse path only ever needed to KNOW a latch was
+    live (it declines to redraft a latched PR), but the age-park path has to RETRACT one, and
+    both `dequeuePullRequest` and `disablePullRequestAutoMerge` address the PR by node id. Same
+    single query, same fail-closed shape check — an unreadable latch is never an absent latch."""
     owner, name = repo.split("/", 1)
     query = (
         "query($owner:String!,$name:String!,$number:Int!){"
         "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-        "mergeQueueEntry{id} autoMergeRequest{enabledAt}}}}"
+        "id mergeQueueEntry{id} autoMergeRequest{enabledAt}}}}"
     )
     document = api.request(
         "POST",
@@ -1241,6 +1247,8 @@ def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[bool, bo
         pull = repository.get("pullRequest") if isinstance(repository, dict) else None
     if (
         not isinstance(pull, dict)
+        or not isinstance(pull.get("id"), str)
+        or not pull["id"]
         or "mergeQueueEntry" not in pull
         or "autoMergeRequest" not in pull
         or (
@@ -1253,7 +1261,49 @@ def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[bool, bo
         )
     ):
         raise GroomError("parked pull request merge-latch state is unknown")
-    return pull["mergeQueueEntry"] is not None, pull["autoMergeRequest"] is not None
+    return (
+        pull["id"],
+        pull["mergeQueueEntry"] is not None,
+        pull["autoMergeRequest"] is not None,
+    )
+
+
+def _park_retract(api: GitHubAPI, action: str, node_id: str) -> None:
+    """One latch-retraction mutation for `park_policy.disarm_before_park` (issue #684).
+
+    groom has never retracted a latch before — `_live_defuse_snapshot` only DECLINES to redraft
+    a latched PR. The age-park has to, because it labels stale NON-DRAFT PRs (`needs:user` on a
+    PR wedged in a BAD_MERGE_STATE), and once #683 lands that label releases the PR's crate
+    partitions while its auto-merge latch would still fire on green CI."""
+    if action == park_policy.PARK_DISARM_DEQUEUE:
+        query = "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}"
+    elif action == park_policy.PARK_DISARM_DISABLE_AUTO:
+        query = (
+            "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id})"
+            "{clientMutationId}}"
+        )
+    else:
+        raise GroomError(f"unknown park disarm action {action}")
+    api.request("POST", "/graphql", {"query": query, "variables": {"id": node_id}})
+
+
+def _disarm_before_park(api: GitHubAPI, repo: str, number: int, park: Any) -> tuple[str, ...]:
+    """Apply `park` only after PROVING PR `repo#number` carries no live auto-merge latch (#684).
+
+    Raises GroomError when the latch cannot be proven gone — the caller then leaves the PR
+    UNPARKED-AND-ARMED, which is the prior, known-safe state (an unparked PR still reserves its
+    crate partitions, so nothing can be handed the crate underneath it) rather than the
+    PARKED-AND-ARMED state a label-first ordering produces."""
+    try:
+        return park_policy.disarm_before_park(
+            repo,
+            number,
+            lambda: _merge_latch_state(api, repo, number),
+            lambda action, node_id: _park_retract(api, action, node_id),
+            park,
+        )
+    except park_policy.ParkDisarmError as exc:
+        raise GroomError(" ".join(str(exc).split())) from exc
 
 
 def _live_defuse_snapshot(
@@ -1277,7 +1327,7 @@ def _live_defuse_snapshot(
         raise GroomError("parked pull request auto_merge state is unknown")
     if pull["auto_merge"] is not None:
         return None
-    queued, auto_merge_requested = _merge_latch_state(api, repo, number)
+    _node_id, queued, auto_merge_requested = _merge_latch_state(api, repo, number)
     if queued or auto_merge_requested:
         return None
     return snapshot
@@ -2403,15 +2453,34 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     print(f"SKIP PR {action.repo}#{action.number}: needs:user park suppressed "
                           "(sticky human unpark)")
                     continue
-                _ensure_label(api, action.repo, "needs:user")
-                api.request(
-                    "POST",
-                    f"/repos/{action.repo}/issues/{action.number}/labels",
-                    {"labels": ["needs:user"]},
-                )
-                print(
-                    f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
-                )
+
+                def apply_age_park(repo: str = action.repo, number: int = action.number) -> None:
+                    _ensure_label(api, repo, "needs:user")
+                    api.request(
+                        "POST",
+                        f"/repos/{repo}/issues/{number}/labels",
+                        {"labels": ["needs:user"]},
+                    )
+                    print(
+                        f"WRITE add labels repo={repo} issue={number} labels=needs:user"
+                    )
+
+                # #684: THE age-park is the sharpest parked-and-armed exposure in the tree — it is
+                # the one park writer that labels NON-DRAFT PRs (case 1 of stale_worker_pr_reason:
+                # a worker PR wedged in a BAD_MERGE_STATE), and `blocked`/`unstable`/`unknown` all
+                # match a PR whose CI is simply mid-run. Once #683 lands, that `needs:user` frees
+                # the PR's crate partitions on the label alone, so an auto-merge latch surviving
+                # the park merges into a crate the partition has just handed to a sibling.
+                # The retraction is ordered AFTER the sticky-unpark veto (a suppressed park writes
+                # no label, releases no crate, and must not strip an arm from a PR the human just
+                # unparked) and BEFORE the label write, which is why the write is a callback:
+                # there is no ordering of statements here that can land the label first.
+                # A latch that cannot be proven gone raises GroomError, which this loop's
+                # per-PR handler turns into an ALERT + deferral — the PR stays UNPARKED-AND-ARMED
+                # (still reserving its crates) and the next sweep retries. Note the handler is on
+                # the loop body, not on a success path: the deferral runs for this park exactly as
+                # it does for an unreachable PR or an un-labellable one (issue #647).
+                _disarm_before_park(api, action.repo, action.number, apply_age_park)
                 label_changed = True
             comments = _comments(api, action.repo, action.number)
             already_commented = any(
@@ -2820,10 +2889,12 @@ def _self_test() -> int:
                 number = body["variables"]["number"]
                 if number == 9:
                     return {"data": {"repository": {"pullRequest": {
+                        "id": f"PR_node{number}",
                         "mergeQueueEntry": None,
                         # Missing autoMergeRequest is UNKNOWN, never safely absent.
                     }}}}
                 return {"data": {"repository": {"pullRequest": {
+                    "id": f"PR_node{number}",
                     "mergeQueueEntry": {"id": "queue-5"} if number == 5 else None,
                     "autoMergeRequest": {"enabledAt": old_activity}
                     if number == 7 else None,
@@ -3043,7 +3114,7 @@ def _self_test() -> int:
                 return self.pulls.get(int(path.rsplit("/", 1)[1]))
             if path == "/graphql":
                 return {"data": {"repository": {"pullRequest": {
-                    "mergeQueueEntry": None, "autoMergeRequest": None}}}}
+                    "id": "PR_node", "mergeQueueEntry": None, "autoMergeRequest": None}}}}
             number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
             if number in self.comment_failures:
                 raise GroomError("issue comment write failed")
@@ -4626,10 +4697,34 @@ def _self_test() -> int:
             if method == "GET":
                 return terminal_sweep_env.get("gets", {}).get(path)
             if path == "/graphql":
-                # Both live merge latches absent, so a defuse candidate stays safe-class and the
-                # ONLY thing that can fail in the phase is the redraft itself (issue #644).
+                query = (body or {}).get("query", "")
+                # Issue #684: the age-park's latch RETRACTIONS are recorded into the SAME
+                # ordered `writes` journal as the label POST, so "the label landed before the
+                # latch was retracted" is a red assertion. The default `latch` is empty =
+                # unlatched, which keeps every pre-#684 fixture byte-identical: both merge
+                # latches absent, a defuse candidate stays safe-class, and the ONLY thing that
+                # can fail in the phase is the redraft itself (issue #644).
+                latches = terminal_sweep_env.get("latch") or {}
+                if query.startswith("mutation"):
+                    node = (body or {}).get("variables", {}).get("id") or ""
+                    action = ("dequeue" if "dequeuePullRequest" in query
+                              else "disable-auto")
+                    terminal_sweep_env["writes"].append(("GRAPHQL", action, node))
+                    latch = latches.get(int(node.removeprefix("PR_node") or 0), {})
+                    if not latch.get("sticky"):
+                        latch["queued"] = False
+                        latch["auto"] = False
+                    return {}
+                number = (body or {}).get("variables", {}).get("number")
+                terminal_sweep_env["writes"].append(("GRAPHQL", "latch-read", number))
+                latch = latches.get(number, {})
+                if latch.get("read_raises"):
+                    return {"data": {"repository": {"pullRequest": None}}}
                 return {"data": {"repository": {"pullRequest": {
-                    "mergeQueueEntry": None, "autoMergeRequest": None}}}}
+                    "id": f"PR_node{number}",
+                    "mergeQueueEntry": {"id": "MQE"} if latch.get("queued") else None,
+                    "autoMergeRequest": ({"enabledAt": "2026-07-25T00:00:00Z"}
+                                         if latch.get("auto") else None)}}}}
             terminal_sweep_env["writes"].append((method, path))
             return {}
 
@@ -4901,6 +4996,7 @@ def _self_test() -> int:
             pulls: tuple[dict[str, Any], ...] = (),
             issues: tuple[dict[str, Any], ...] = (),
             details: tuple[dict[str, Any], ...] | None = None,
+            latch: dict[str, Any] | None = None,
         ) -> tuple[str, str, list[set[str]]]:
             """Run the REAL run_sweep with the given per-object refusals; report (log, error, releases).
 
@@ -4924,6 +5020,7 @@ def _self_test() -> int:
                 },
                 writes=[],
                 http_failures=dict(refusals),
+                latch=dict(latch or {}),
             )
             terminal_sweep_releases.clear()
             log = io.StringIO()
@@ -4937,7 +5034,8 @@ def _self_test() -> int:
             finally:
                 sys.stdout = saved
                 terminal_sweep_env.update(
-                    pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={}
+                    pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={},
+                    latch={}
                 )
             return log.getvalue(), error, [set(claims) for claims in terminal_sweep_releases]
 
@@ -4993,6 +5091,105 @@ def _self_test() -> int:
             ),
             ("", True, True, True),
         )
+        # ============ issue #684: the age-park retracts the auto-merge latch ============
+        # groom's age-park is the ONLY park writer that labels NON-DRAFT PRs, so it is the
+        # sharpest parked-and-armed exposure: once #683 frees a parked PR's crates on the
+        # `needs:user` label alone, a surviving latch merges into a crate the partition has
+        # just handed to a sibling. These run the REAL run_sweep, and every assertion is on
+        # the ORDERED write journal, so the ordering itself is what is pinned.
+        park_label_post = ("POST", "/repos/owner/repo/issues/31/labels")
+        disarm_log, disarm_error, _ = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),), latch={31: {"auto": True}})
+        disarm_writes = terminal_sweep_env["writes"]
+        check(
+            "#684 (groom age-park): the auto-merge latch is retracted and PROVEN gone BEFORE "
+            "needs:user lands on the stale NON-DRAFT PR (reorder the label write above the "
+            "disarm, or drop the proof re-read, and this reds)",
+            (
+                [entry for entry in disarm_writes
+                 if entry[0] == "GRAPHQL" or entry == park_label_post],
+                disarm_error,
+            ),
+            (
+                [("GRAPHQL", "latch-read", 31), ("GRAPHQL", "disable-auto", "PR_node31"),
+                 ("GRAPHQL", "latch-read", 31), park_label_post],
+                "",
+            ),
+        )
+        _, _, _ = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),), latch={31: {"queued": True, "auto": True}})
+        queued_writes = terminal_sweep_env["writes"]
+        check(
+            "#684 (groom age-park): a MERGE-QUEUE member is dequeued FIRST, then un-armed, "
+            "then parked",
+            [entry for entry in queued_writes
+             if entry[0] == "GRAPHQL" or entry == park_label_post],
+            [("GRAPHQL", "latch-read", 31), ("GRAPHQL", "dequeue", "PR_node31"),
+             ("GRAPHQL", "disable-auto", "PR_node31"), ("GRAPHQL", "latch-read", 31),
+             park_label_post],
+        )
+        # THE HAZARD: a latch that survives its retraction must leave the PR
+        # UNPARKED-AND-ARMED. Red if a failed/ineffective disarm is swallowed and the park
+        # proceeds anyway (the "disarm only counts on the success path" mutation).
+        stuck_log, stuck_error, stuck_releases = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+            latch={31: {"queued": True, "sticky": True}})
+        stuck_writes = terminal_sweep_env["writes"]
+        check(
+            "#684 (groom age-park): a merge-queue entry that CANNOT be dequeued is NOT parked "
+            "and NOT commented — the PR stays unparked-and-armed, still reserving its crates",
+            (
+                park_label_post in stuck_writes,
+                ("POST", "/repos/owner/repo/issues/31/comments") in stuck_writes,
+            ),
+            (False, False),
+        )
+        check(
+            "#684 (groom age-park): the un-retractable latch is REPORTED loudly as a per-PR "
+            "deferral, naming the surviving latch form — never a silent skip",
+            (
+                "ALERT PR owner/repo#31:" in stuck_log,
+                "merge-queue latch still live" in stuck_log,
+                "NOT parking" in stuck_log,
+                "stale PR hand-off deferred" in stuck_log,
+                "stale_pr_deferred=1" in stuck_log,
+            ),
+            (True, True, True, True, True),
+        )
+        check(
+            "#684 (groom age-park): the aborted park defers only ITS OWN PR — #32 still parks "
+            "and the dead lease is still reclaimed (the disarm sits INSIDE the per-PR "
+            "try/except, not on a success-only path)",
+            (
+                ("POST", "/repos/owner/repo/issues/32/labels") in stuck_writes,
+                stuck_releases,
+                stuck_error,
+            ),
+            (True, [{"e" * 32}], ""),
+        )
+        # An unreadable latch is not an absent latch.
+        unread_log, _, _ = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),), latch={31: {"auto": True, "read_raises": True}})
+        check(
+            "#684 (groom age-park): an UNREADABLE latch state defers the park rather than "
+            "assuming the PR is unarmed",
+            (
+                park_label_post in terminal_sweep_env["writes"],
+                "merge-latch state is unknown" in unread_log,
+                "NOT parking" in unread_log,
+            ),
+            (False, True, True),
+        )
+        # An UNLATCHED park is the common case: one read, no mutation, and it parks.
+        _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        check(
+            "#684 (groom age-park): an unarmed stale PR parks after ONE latch read and no "
+            "retraction (idempotent — disarming an unarmed PR is a no-op, not an error)",
+            [entry for entry in terminal_sweep_env["writes"]
+             if entry[0] == "GRAPHQL" or entry == park_label_post],
+            [("GRAPHQL", "latch-read", 31), park_label_post],
+        )
+
         # (1b) EVERY candidate refused: per-object leniency must not make a whole-phase failure
         # green. Reclaim still runs FIRST — the exit status is the report, never the control flow.
         park_all_log, park_all_error, park_all_releases = _sweep_with_refusals(
