@@ -182,12 +182,35 @@ title (GitHub does not enforce unique titles).
     format, and the rotation marker at the moment the rotation happens, so a write-back reached with
     no mount and no exported environment still knows what to persist and how to validate it;
     `dispatch-secrets-guard.rotation_writeback_reachable_verdict` asserts that reachability in both
-    worker lanes.
-  - **A lost response never re-sends the grant.** `_post_token_endpoint` distinguishes "provably
-    never transmitted" (DNS failure, connection refused, failed TLS handshake — retried) from "may
-    have been delivered, no response observed" (timeout, reset, broken pipe). The second is classed
-    `credential-remint-required` and raises immediately: re-POSTing a grant the provider may already
-    have consumed trips its replay detection and kills the account, so this fails loudly instead.
+    worker lanes, and the obligation is **universal, not existential**: the step's `if:` must evaluate
+    TRUE on every path where a rotation may already have happened, and may reference only facts settled
+    *before* the pre-flight (`always()`, the dry-run input, the claim outputs, the account selection
+    step). Anything else — the prepare step's own outcome, the model step's outcome, a prepare output,
+    `success()` — is refused by name. An existential "there is *some* world where it runs" check
+    accepted all of those, which is how a model-step guard could have been reintroduced. Each lane's
+    call site is also required to be a **reachable** command, so commenting the `run:` out is a red
+    tick rather than a silently discarded grant.
+  - **A grant is re-sent only when the previous attempt provably did not deliver it.**
+    `_post_token_endpoint` drives the exchange through `http.client` with an explicit `connect()`, so
+    the pre-send / post-send boundary is a property of the code's STRUCTURE rather than a guess from
+    the exception's type (`ssl.SSLError` is an `OSError` raised from *both* the handshake and the
+    response read, and urllib's `URLError` conflates connect with send — no type test can be sound in
+    both directions). A fault raised strictly before the request write — malformed URL, DNS failure,
+    refused connection, connect timeout, failed TLS handshake — is `STATUS_NOT_SENT` and keeps its
+    bounded retry; a fault raised at or after the write — send/response timeout, reset, broken pipe, a
+    TLS fault from `response.read()`, a truncated body — is `STATUS_INDETERMINATE`, classed
+    `credential-remint-required`, and raises on the spot.
+    The two questions are deliberately separate. `classify_refresh_failure` answers "is a LATER
+    attempt worth making?", which is why 429 and 5xx stay `credential-refresh-transient`: a later
+    attempt re-reads the stored secret, and a grant the provider did consume then fails closed with
+    `invalid_grant`. `_RESEND_SAFE_STATUSES` answers the narrower "may THIS run POST the same grant
+    again?" and admits only `STATUS_NOT_SENT` plus a documented 429 throttle. A **2xx with an unusable
+    body** (truncated, unparseable, or missing `access_token`) is the strongest available evidence that
+    the rotation *did* commit, so it raises instead of retrying.
+  - **The remint class carries two causes, and the operator message says so.** `worker-prep.sh`'s
+    `::error::` line for `credential-remint-required` must not assert the grant "is dead": the class
+    covers both a provider-confirmed dead grant and an indeterminate outcome whose fate is unknown and
+    which was deliberately not re-sent.
 - On this work box, pre-provisioned Anthropic setup-tokens already exist as files
   `~/.claude-acctN-token` (one per account). Read the file; do not echo it.
 
@@ -341,12 +364,26 @@ A model launch that dies on the **worker account's credential or capacity** — 
 `rate-limit`, `session-limit`, `billing`, or either of `worker-prep.sh`'s host-side credential
 pre-flight classes `credential-remint-required` / `credential-refresh-transient` — is a **credential
 outage**, not a model decline. The model never read the task or the diff, so there is no judgment to
-charge for. The set is **locked to `model-health.py`'s fold map**, not maintained by hand: a
-set-equality assertion in `worker-pr.py --self-test` requires
-`CREDENTIAL_OUTAGE_EXIT_CLASSES` to equal every raw exit class whose fold target is one of
-model-health's outage decision classes, so a new class can never be non-chargeable on one side only
-(the drift that made the two pre-flight classes chargeable for the whole acct01 outage). Two
-consequences, both wired through machinery that already existed:
+charge for.
+
+The set is held by **two locks with distinct scopes** — stated precisely, because #629's "the class is
+closed" was an overstatement of the first one:
+
+1. **The consumer lock**, bidirectional between the two *constants*. A set-equality assertion in
+   `worker-pr.py --self-test` requires `CREDENTIAL_OUTAGE_EXIT_CLASSES` to equal every raw exit class
+   whose fold target is one of `model-health.py`'s outage decision classes, so a class can never be
+   non-chargeable on one side only (the drift that made the two pre-flight classes chargeable for the
+   whole acct01 outage). Its non-vacuity anchor is a required-**subset** check, so a legitimate third
+   `credential-*` class does not misfire it.
+2. **The emitter lock**, producer → consumer. The consumer lock alone says nothing about the
+   *producers*: `broker-refresh.py` could start emitting a new raw class with it still green (folding
+   to `unknown`, and therefore CHARGED — fail-safe, but the same shape of drift).
+   `worker-pr._emitted_credential_exit_classes` parses `broker-refresh.py` with `ast` and requires
+   every `CLASS_* = "credential-…"` constant it can emit to be a key of the fold map.
+
+Neither lock claims the vocabulary is closed against a *new* emitter script this derivation does not
+read; what they close are the two directions that actually caused #604 and #614. Two consequences,
+both wired through machinery that already existed:
 
 - **No round or attempt is consumed.** The review round marker (`worker-pr.py round-record`) and
   the worker attempt receipt (`worker-issue.py record-attempt`) are both written *before* the model
@@ -384,6 +421,22 @@ partial success rate.
   "Environments" permission, whose read half covers the env public-key read. Store it with
   `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`).
 - `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the `dispatch-secrets` environment secrets public-key read, then an authoritative `gh secret set --env dispatch-secrets` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only read access, so it would bless a read-only PAT that onboarding's env write still breaks on; a repo-scope canary would re-trip the secrets-guard weekly) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and a transient network blip never false-alarms — consecutive network-unknowns are counted in a repository variable (silent state: below the threshold no issue is touched, since GitHub creates every issue open and even a create-then-close would notify) and page via a separate rolling issue once a small threshold is crossed (issue #207), so a permanently-stalled probe cannot leave the PAT silently unverified.
+- **The exfil gate contract is decided, and fails closed when it cannot be.**
+  `dispatch-secrets-guard.guard_gate_verdict` proves that a failing `secrets-guard` prevents every
+  secret-consuming job in `dispatch.yml` from running. Two properties carry the weight, and both are
+  *parses*, not text searches:
+  - **Polarity.** A job-level `if:` is decided by exhaustive satisfiability over a propositional
+    abstraction, and the guard requirement may be pinned FALSE only when it is a genuinely parsed
+    **comparison**. A function call's quoted string ARGUMENTS are not conditions — recognising the
+    comparison inside a string literal is how the gate was defeatable in one line — and any atom the
+    grammar cannot fully parse (indexing, arithmetic, a `!` whose precedence differs from GitHub's,
+    a bare string used as a condition) is reported UNDECIDED, which the gate treats as admitting: an
+    unreadable gate is not a proven gate.
+  - **Execution.** The guard must actually RUN both verifier invocations. Reachability is decided by
+    parsing the step's shell body — comments and here-document bodies removed, `&&`/`||`
+    short-circuits and `if`/`while`/`case` constructs treated as unreachable — so a commented-out or
+    short-circuited invocation is a refusal that names the fact. The text of a command is not its
+    execution.
 - Account metadata + selection logic: only in this private repo.
 - Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap CAS/ledger
   writes or mutation-confirmations (their conflict/fail-loud semantics are caller-owned — a replayed

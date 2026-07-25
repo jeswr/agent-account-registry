@@ -98,13 +98,24 @@ trap cleanup_source EXIT INT TERM
 # model_health job, which holds PROVENANCE_SALT and records the salted account hash.
 credential_preflight_failed() {
   local cls
-  cls=$(head -n1 -- "$REFRESH_CLASS_FILE" 2>/dev/null | tr -cd 'a-z-') || cls=''
+  # Read VERBATIM (bar trailing whitespace), never `tr -cd`-sanitised: a delete-the-bad-characters
+  # read MANUFACTURES a valid value out of an invalid one instead of failing closed on it
+  # (post-merge retro-review of #629, F6). An unrecognised value falls to the `*)` arm below.
+  cls=$(head -n1 -- "$REFRESH_CLASS_FILE" 2>/dev/null | tr -d '\r' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//') || cls=''
   case "$cls" in
     credential-remint-required)
-      printf '::error::worker-prep: model-exit-class=%s — the stored refresh token for the selected account is dead (expired, revoked, or already used). An INTERACTIVE re-mint is required; retrying cannot fix it.\n' "$cls"
+      # The message must NOT assert the grant "is dead": `credential-remint-required` now carries TWO
+      # causes (post-merge retro-review of #629, F6). One is a provider-confirmed dead grant
+      # (invalid_grant / refresh_token_reused / a grant-rejecting status); the other is an
+      # INDETERMINATE outcome — the request was written and the response was lost, or the provider
+      # returned a success status with an unusable body — where the grant's fate is UNKNOWN and it was
+      # deliberately not re-sent. broker-refresh's own RefreshFailure message says which; this line
+      # used to override it with "retrying cannot fix it", which is exactly wrong for the second cause.
+      printf '::error::worker-prep: model-exit-class=%s — the host-side refresh could not produce a usable credential and this run must NOT re-send the stored one-time-use grant. Either the grant is dead (expired, revoked, already used) or its fate is unknown because the exchange was not observed to fail before delivery. See the classified broker-refresh message above for which; a MAINTAINER re-mint is the safe resolution and an unattended retry cannot be relied on to fix it.\n' "$cls"
       ;;
     credential-refresh-transient)
-      printf '::error::worker-prep: model-exit-class=%s — the provider token endpoint could not be reached within the bounded retry. The stored credential is probably fine; retry later.\n' "$cls"
+      printf '::error::worker-prep: model-exit-class=%s — the token exchange did not complete (the endpoint was unreachable, throttled, or returned a server error). The stored credential is probably fine; a LATER attempt re-reads it, and a grant the provider did consume will then fail closed as a dead grant. Retry later.\n' "$cls"
       ;;
     *)
       # Not a refresh failure at all (e.g. a malformed stored credential). Keep the PRE-#596

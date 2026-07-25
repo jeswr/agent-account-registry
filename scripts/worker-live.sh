@@ -1882,11 +1882,20 @@ write_back() {
   # The FORMAT normally arrives through $GITHUB_ENV, which worker-prep exports at the very END — long
   # after the pre-flight consumed the grant. Fall back to the host-side record worker-prep writes
   # alongside the rotation marker, so an early prepare abort still knows how to validate the material
-  # it is persisting. An unrecognised value still fails closed in the case statement below.
+  # it is persisting.
+  #
+  # READ VERBATIM, NEVER SANITISED (post-merge retro-review of #629, F6). This was
+  # `head -n1 | tr -cd 'a-z-'`, and `tr -cd` DELETES the offending characters rather than rejecting
+  # the value — so `codex-auth-json!` and `codex-auth-json2` both MANUFACTURED the accepted
+  # `codex-auth-json`, and the old comment's claim that "an unrecognised value still fails closed in
+  # the case statement below" was not true of a value the read itself repaired. Trailing carriage
+  # return / whitespace is still tolerated (it is a line-oriented file), but nothing else: any other
+  # character leaves the value unrecognised and the `case` below dies.
   if [[ -z "$format" ]]; then
     local format_file="$worker_root/.credential-format"
     if [[ -f "$format_file" && ! -L "$format_file" ]]; then
-      format=$(head -n1 -- "$format_file" | tr -cd 'a-z-')
+      format=$(head -n1 -- "$format_file" | tr -d '\r' | sed -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//')
     fi
   fi
   if [[ -z "$pat" ]]; then
@@ -3067,6 +3076,52 @@ FAKE
     "$([[ "$wb8_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
   chk "write_back unrecognised-format path never invokes gh" \
     "$([[ -e "$tmp/wbcap8/argv" ]] && printf called || printf uncalled)" "uncalled"
+  # POST-MERGE RETRO-REVIEW OF #629 (F6): the format record used to be read through
+  # `tr -cd 'a-z-'`, which DELETES the offending characters instead of rejecting the value — so
+  # `codex-auth-json!` and `codex-auth-json2` both MANUFACTURED the accepted `codex-auth-json` and
+  # smuggled unvalidated material past the format gate. Each of these must fail closed, and each is
+  # a value the OLD sanitising read accepted.
+  local badfmt_n=0 badfmt
+  for badfmt in 'codex-auth-json!' 'codex-auth-json2' 'codex-auth-json;rm -rf /' \
+                'CODEX-AUTH-JSON' 'xcodex-auth-jsonx'; do
+    badfmt_n=$((badfmt_n + 1))
+    local wbrootS="$tmp/wbroot-sanitise-$badfmt_n" wb_outS="$tmp/wbS-$badfmt_n-github-output" wbS_rc
+    mkdir -p "$wbrootS" "$tmp/wbcapS$badfmt_n"
+    printf '%s\n' "$badfmt" > "$wbrootS/.credential-format"
+    printf 'ROTATED-SENTINEL-SANITISE' > "$wbrootS/.credential-durable"
+    printf 'rotated\n' > "$wbrootS/.credential-rotated"
+    : > "$wb_outS"
+    if (
+      export WORKER_ROOT="$wbrootS" \
+             WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+             REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+             GITHUB_OUTPUT="$wb_outS" WORKER_GH_BIN="$tmp/wb-gh" \
+             WB_CAPTURE="$tmp/wbcapS$badfmt_n"
+      unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+      write_back
+    ) > "$tmp/wbS$badfmt_n.log" 2>&1; then wbS_rc=0; else wbS_rc=$?; fi
+    chk "write_back FAILS closed on the format record '$badfmt' (the old sanitising read would have MANUFACTURED a valid format from it)" \
+      "$([[ "$wbS_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+    chk "write_back never invokes gh for the format record '$badfmt'" \
+      "$([[ -e "$tmp/wbcapS$badfmt_n/argv" ]] && printf called || printf uncalled)" "uncalled"
+  done
+  # ...and the accept direction, with the trailing whitespace a line-oriented file really carries.
+  local wbrootT="$tmp/wbroot-fmt-ws" wb_outT="$tmp/wbT-github-output" wbT_rc
+  mkdir -p "$wbrootT" "$tmp/wbcapT"
+  printf 'codex-auth-json  \r\n' > "$wbrootT/.credential-format"
+  printf '{"tokens":{"access_token":"A"}}' > "$wbrootT/.credential-durable"
+  printf 'rotated\n' > "$wbrootT/.credential-rotated"
+  : > "$wb_outT"
+  if (
+    export WORKER_ROOT="$wbrootT" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_outT" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcapT"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wbT.log" 2>&1; then wbT_rc=0; else wbT_rc=$?; fi
+  chk "write_back still ACCEPTS a format record with trailing whitespace/CR (the strict read is not simply 'refuse everything')" \
+    "$([[ "$wbT_rc" -eq 0 ]] && printf ok || printf fail)" "ok"
 
   # --- HOST-SIDE PRE-FLIGHT, end to end through the REAL worker-prep.sh (issue #596). Hermetic:
   # a stubbed CLI binary skips the npm install, and every fixture reaches its outcome with ZERO
@@ -3158,6 +3213,19 @@ print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/h
     "$(grep -c '^WORKER_EXIT_CLASS=credential-remint-required$' "$pf2_env" || true)" "1"
   chk "(e) the loud class names NO account handle (locked decision 22b)" \
     "$(grep -ci 'acctexample' "$tmp/pf-remint.log" || true)" "0"
+  # POST-MERGE RETRO-REVIEW OF #629 (F6): `credential-remint-required` carries TWO causes — a
+  # provider-confirmed dead grant, and an INDETERMINATE outcome where the request WAS delivered and no
+  # usable response came back (a lost response, or a 2xx with an unusable body), so the grant's fate is
+  # UNKNOWN and it was deliberately not re-sent. The old line asserted "the stored refresh token ... is
+  # dead ... retrying cannot fix it", which OVERRODE broker-refresh's own correct message on the second
+  # cause. These three assertions pin the corrected wording.
+  chk "(e) the remint line says the one-time-use grant must NOT be re-sent" \
+    "$(grep -c 'must NOT re-send' "$tmp/pf-remint.log" || true)" "1"
+  chk "(e) the remint line covers the INDETERMINATE cause instead of asserting the grant IS dead" \
+    "$(grep -c 'its fate is unknown' "$tmp/pf-remint.log" || true)" "1"
+  chk "(e) the remint line no longer makes the unconditional 'retrying cannot fix it' claim" \
+    "$(grep -c 'An INTERACTIVE re-mint is required; retrying cannot fix it' "$tmp/pf-remint.log" \
+      || true)" "0"
 
   # (f) a TRANSIENT endpoint failure: bounded retry, then the transient class (never remint).
   local pfroot3="$tmp/pf-transient" pf3_rc pf3_env="$tmp/pf-transient.env"
@@ -3179,6 +3247,13 @@ print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/h
     "$(grep -c 'credential-remint-required' "$tmp/pf-transient.log" || true)" "0"
   chk "(f) the transient class reaches GITHUB_ENV" \
     "$(grep -c '^WORKER_EXIT_CLASS=credential-refresh-transient$' "$pf3_env" || true)" "1"
+  # F6, the AVAILABILITY property this case proves: a closed local port is refused during CONNECT, so
+  # nothing was transmitted, the grant is untouched, and the bounded retry is preserved rather than
+  # paging a maintainer re-mint on attempt 1. #629's type-based phase test could not tell this apart
+  # from a lost response. The corrected line must also stop asserting the endpoint was merely
+  # "unreachable" when a throttle or a server error lands here too.
+  chk "(f) the transient line explains that a LATER attempt is safe (a spent grant then fails closed)" \
+    "$(grep -c 'fail closed as a dead grant' "$tmp/pf-transient.log" || true)" "1"
 
   # --- (h) a SUCCESSFUL host-side ROTATION, end to end through the REAL worker-prep.sh, then the
   # REAL write_back over the artifacts it left behind (retro-review of #614). Until this case the
