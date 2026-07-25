@@ -657,6 +657,10 @@ async function refreshThroughput() {
     const metrics = await response.json();
     if (typeof metrics !== "object" || !metrics || !metrics.targets) { renderThroughput(null); return; }
     renderThroughput(metrics);
+    // Hand the live layer the snapshot's own target list, so the two can never drift apart and
+    // no repository name is duplicated into live.js. Optional: if live.js failed to load, the
+    // snapshot panels above are unaffected.
+    if (window.registryLive) window.registryLive.setRepos(Object.keys(metrics.targets));
   } catch (error) {
     // The throughput panel is optional and independently sourced — a fetch/parse failure hides it
     // rather than tripping the dashboard-wide warning banner.
