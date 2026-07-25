@@ -1,0 +1,2 @@
+# A suite entry may be removed only when its basename was approved here on the
+# base branch before the removal PR. Add approval and retire the test in separate PRs.
