@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 626,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b325ca96667a11fba134cb46cc7ca624a28a6f6d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly distinguishes independent generation-staleness and usage-probe degradations, renders each as a separate alert line, and annotates the otherwise misleading eligible-capacity figure whenever the published probe marker is unmeasured. The executed DOM-harness assertions are non-vacuous: they cover healthy, fresh-failed, and stale-plus-failed documents; verify exact line counts and both notice texts; and pin the capacity annotation's positive and negative cases. The CSS change matches the new paragraph structure without weakening any trust-plane check or introducing unsafe data handling.",
+  "verdict": "approve"
+ }
+}
