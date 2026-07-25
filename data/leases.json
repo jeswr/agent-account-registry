@@ -12,16 +12,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "cf4092a02d6347e7b1977a214f50e341",
-   "holder": "review:sparq-org/sparq#3436@dispatch-30146056063.1",
-   "package": "sparq-substrate",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1784958686,
-   "expires_at": 1784962886
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "418eca70248448c1ba631f94b6e5ae9d",
    "holder": "review:sparq-org/sparq#3542@dispatch-30146056063.1",
    "package": "sparq-zk-compose",
