@@ -848,6 +848,46 @@ jobs:
           print(f"selected account resolved: model={model}, harness={values['harness']}")
           PY
 
+      # OSS adoption 5 (registry #563): OPT-IN execution-harness switch for the CLAUDE lane only.
+      # The registry Actions variable WORKER_HARNESS selects which harness runs the
+      # implementation step:
+      #   unset / 'cli'                      (default) the containerized headless CLI in
+      #                                      worker-live.sh — unchanged.
+      #   'action'                           the pinned anthropics/claude-code-action runs the
+      #                                      SAME brief in the same prepared checkout.
+      #   'action:owner/repo[,owner/repo]'   as above, but only for the listed target repos —
+      #                                      the staged-rollout form (pilot one lane first).
+      # Fail-closed narrowing: the action lane only ever activates for LIVE claude-harness runs
+      # whose credential format is the raw OAuth token the action's claude_code_oauth_token
+      # input expects. Codex lanes, review-fix, and dry runs are structurally unaffected — any
+      # other combination resolves to cli. The SCHEDULER stays bespoke either way: claim, prep,
+      # trust/budget guards, gates, publish, provenance, and lease release are shared steps.
+      - name: Resolve execution-harness lane (opt-in claude-code-action pilot)
+        id: harness-mode
+        if: ${{ steps.selected.outcome == 'success' }}
+        env:
+          HARNESS_FLAG: ${{ vars.WORKER_HARNESS }}
+          SELECTED_HARNESS: ${{ steps.selected.outputs.harness }}
+          CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          mode=cli
+          if [[ "$DRY_RUN" != true && "$SELECTED_HARNESS" == claude \
+                && "$CREDENTIAL_FORMAT" == claude-oauth-token ]]; then
+            if [[ "$HARNESS_FLAG" == action ]]; then
+              mode=action
+            elif [[ "$HARNESS_FLAG" == action:* ]]; then
+              IFS=',' read -r -a pilot_repos <<< "${HARNESS_FLAG#action:}"
+              for pilot_repo in "${pilot_repos[@]}"; do
+                if [[ "$pilot_repo" == "$TARGET_REPO" ]]; then mode=action; break; fi
+              done
+            fi
+          fi
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+          printf 'worker: execution-harness lane resolved to %s\n' "$mode"
+
       # Round-4 finding 1 (windowed-vs-lifetime split brain): attempt-check re-derives the SAME
       # human-readmission cutoff CLAIM granted the retry on (park_policy.readmission_cutoff over
       # the live label timeline, strict maintainer probe) and charges the WINDOWED attempt
@@ -938,9 +978,9 @@ jobs:
             --bot-login "${{ steps.target.outputs.bot_login }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
 
-      - name: Run routed model headless on a fresh target branch
+      - name: Run routed model headless on a fresh target branch (containerized CLI lane)
         id: model
-        if: ${{ !inputs.dry_run && steps.attempt.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && steps.attempt.outcome == 'success' && steps.harness-mode.outputs.mode != 'action' }}
         working-directory: target
         env:
           # Deliberately NO GH_TOKEN here: the model container must never see a GitHub token
@@ -957,6 +997,129 @@ jobs:
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: bash ../registry/scripts/worker-live.sh model
 
+      # ---- OPT-IN claude-code-action execution harness (registry #563, OSS adoption 5) ----
+      # Three steps replacing ONLY the execution MIDDLE of the CLI lane (the `model` step):
+      # brief construction and outcome classification stay in worker-live.sh for BOTH lanes.
+      # Phase 1: the SAME brief the CLI lane builds (worker-live.sh `model-prompt` adds only a
+      # static cwd preamble + records the base sha), exported as a step output under a RANDOM
+      # heredoc delimiter so hostile issue-body content cannot terminate the block early and
+      # inject further outputs.
+      - name: Build the action-lane task brief (same brief the CLI lane builds)
+        id: model-action-brief
+        if: ${{ !inputs.dry_run && steps.attempt.outcome == 'success' && steps.harness-mode.outputs.mode == 'action' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_ISSUE_FILE: ${{ runner.temp }}/verified-issue.json
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
+          WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
+          WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+        run: |
+          set -euo pipefail
+          bash ../registry/scripts/worker-live.sh model-prompt
+          delim="WORKER_PROMPT_$(openssl rand -hex 16)"
+          {
+            printf 'prompt<<%s\n' "$delim"
+            cat "$WORKER_ROOT/task-prompt.txt"
+            printf '\n%s\n' "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+      # Phase 2: the pinned action runs the claude CLI on the prepared checkout. Permission
+      # parity audit (scope item 4):
+      #   - github_token is THIS job's github.token, whose job-level permissions are
+      #     `contents: read` on the REGISTRY only (a checkout already on this runner's disk) —
+      #     it holds ZERO permissions on the target repo, so the action structurally cannot
+      #     push to the target's default branch (or any branch) or write issues/PRs; the
+      #     worker branch is pushed host-side in `publish` with the target-scoped App token,
+      #     exactly as on the CLI lane. Passing an explicit github_token also disables the
+      #     action's Claude-GitHub-App OIDC exchange (this job grants no id-token: write).
+      #   - claude_code_oauth_token is the SAME claimed-account secret the prepare step
+      #     materializes for the CLI lane (dynamic secrets[...] read inside this
+      #     dispatch-secrets-bound job, mirroring `prepare` — dispatch-secrets-guard.py
+      #     enforces that binding).
+      #   - claude_args mirror the CLI lane's argv (worker-live.sh _run_headless_harness):
+      #     same model id, same acceptEdits/allowedTools posture, same routed-agent
+      #     append-system-prompt file, no session persistence.
+      #   - Known parity DELTA (documented, why this lane is opt-in): the action runs the CLI
+      #     on the runner host, not inside the hardened container (no cap-drop / read-only .git
+      #     mount). The brief forbids git/GitHub mutations either way; the shared postcheck
+      #     enforces the same edits-only contract (HEAD unmoved, .beads untouched) and replaces
+      #     the read-only .git mount with a fail-closed .git/config+hooks fingerprint check
+      #     (worker-live.sh _git_state_fingerprint) so a planted hook/fsmonitor can never reach
+      #     the App-token-bearing publish git.
+      - name: Run claude-code-action execution harness (opt-in lane)
+        id: model-action
+        if: ${{ !inputs.dry_run && steps.model-action-brief.outcome == 'success' && steps.harness-mode.outputs.mode == 'action' }}
+        uses: anthropics/claude-code-action@e0cf66d1d257526b5d07f141838c338921cb8455 # v1.0.182
+        with:
+          claude_code_oauth_token: ${{ secrets[steps.selected.outputs.secret_ref] }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.model-action-brief.outputs.prompt }}
+          claude_args: >-
+            --model ${{ steps.selected.outputs.provider_model }}
+            --permission-mode acceptEdits
+            --allowedTools Bash,Edit,Read,Write,Glob,Grep
+            --append-system-prompt-file ${{ github.workspace }}/target/.claude/agents/${{ needs.resolve.outputs.agent }}.md
+            --no-session-persistence
+
+      # Phase 3: the SAME post-run contract as the CLI lane (worker-live.sh `model-postcheck`):
+      # follow-up lift, edits-only + .beads guards, no_change classification (derived from git
+      # status exactly as run_model does — the action cannot express it), and the deterministic
+      # worker-branch creation provenance reconciles by name. The action's execution_file is
+      # the claude stream-json log, so the standard numeric-only telemetry extractor applies.
+      - name: Classify action-harness result on the prepared checkout (shared outcome contract)
+        id: model-action-post
+        if: ${{ !inputs.dry_run && steps.model-action.outcome == 'success' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_ISSUE_FILE: ${{ runner.temp }}/verified-issue.json
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
+          WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
+          WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+          WORKER_ACTION_EXECUTION_FILE: ${{ steps.model-action.outputs.execution_file }}
+        run: bash ../registry/scripts/worker-live.sh model-postcheck
+
+      # ONE downstream contract for both harness lanes: every later step keys on this unified
+      # outcome instead of steps.model.outcome. cli lane -> the model step's outcome verbatim
+      # (cancelled passes through as-is and classifies like today). action lane -> success only
+      # when the action AND the shared postcheck both succeeded; a skipped action step means the
+      # pre-launch abort class; anything else is a failure (a postcheck no_change failure has
+      # already exported WORKER_EXIT_CLASS=no_change for the exit-class step, like the CLI lane).
+      - name: Resolve unified model outcome across harness lanes
+        id: model-outcome
+        if: ${{ always() && !inputs.dry_run }}
+        env:
+          MODE: ${{ steps.harness-mode.outputs.mode }}
+          CLI_OUTCOME: ${{ steps.model.outcome }}
+          ACTION_OUTCOME: ${{ steps.model-action.outcome }}
+          ACTION_POST_OUTCOME: ${{ steps.model-action-post.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == action ]]; then
+            if [[ "$ACTION_POST_OUTCOME" == success ]]; then
+              outcome=success
+            elif [[ "$ACTION_OUTCOME" == skipped ]]; then
+              outcome=skipped
+            else
+              outcome=failure
+            fi
+          else
+            outcome="$CLI_OUTCOME"
+          fi
+          printf 'outcome=%s\n' "$outcome" >> "$GITHUB_OUTPUT"
+          printf 'worker: unified model outcome (%s lane) = %s\n' "${MODE:-cli}" "$outcome"
+
       # Model-access health (registry #32): capture the sanitized exit CLASS so the separate
       # no-target-code `model_health` job can record it. worker-live.sh sets WORKER_EXIT_CLASS
       # (+ WORKER_RESET_HINT on session-limit) in $GITHUB_ENV on a FAILED launch only; a
@@ -964,11 +1127,15 @@ jobs:
       # a pre-launch abort (prep/attempt failure) or a job timeout/cancellation leaves the model
       # step skipped/cancelled with no host-observed CLI exit — that records class=unknown
       # (counted toward persistence, never a provider-outage) instead of recording nothing.
+      # Harness lanes (#563): MODEL_OUTCOME is the unified outcome above. The action lane has no
+      # host-separated CLI stderr to classify from, so its launch failures record class=unknown
+      # (an accepted pilot observability delta — worker-live.sh's postcheck still classifies
+      # no_change identically for both lanes via the WORKER_EXIT_CLASS env handoff).
       - name: Capture model exit class
         id: exit-class
         if: ${{ always() && !inputs.dry_run }}
         env:
-          MODEL_OUTCOME: ${{ steps.model.outcome }}
+          MODEL_OUTCOME: ${{ steps.model-outcome.outputs.outcome }}
         run: |
           set -uo pipefail
           if [[ "$MODEL_OUTCOME" == "success" ]]; then
@@ -1013,6 +1180,10 @@ jobs:
           # branches touching .github/workflows/* (role:ci issues were structurally blocked).
           permission-workflows: write
 
+      # Write-back stays keyed on the CLI lane's model step (#563): the action lane never hands
+      # the materialized credential FILE to the model (the token goes to the action input
+      # directly) and only ever runs on the non-rotating claude-oauth-token format, so there is
+      # nothing to write back — on that lane steps.model is skipped and this step skips with it.
       - name: Write back a rotated full account credential
         id: writeback
         if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' && steps.model.outcome != 'skipped' }}
@@ -1029,7 +1200,7 @@ jobs:
         # have rustup with NO default toolchain set (and the target may pin one via rust-toolchain.toml),
         # which fails the gate with "rustup could not choose a version of cargo". Set one up in the target
         # dir so a rust-toolchain.toml pin is honoured; harmless for non-cargo gate profiles.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && steps.model-outcome.outputs.outcome == 'success' }}
         working-directory: target
         run: |
           set -uo pipefail
@@ -1041,7 +1212,7 @@ jobs:
 
       - name: Run policy-selected local gate
         id: gate
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && steps.model-outcome.outputs.outcome == 'success' }}
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
@@ -1070,7 +1241,7 @@ jobs:
       # the `|| app-token-post || app-token-live` fallbacks below keep a mint hiccup no worse than before.
       - name: Mint pre-publish target-scoped App token (post-gate TTL guard)
         id: app-token-publish
-        if: ${{ always() && !inputs.dry_run && steps.model.outcome == 'success' }}
+        if: ${{ always() && !inputs.dry_run && steps.model-outcome.outputs.outcome == 'success' }}
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -1114,7 +1285,7 @@ jobs:
         # step creates de-duplicated, labelled, back-linked issues. Best-effort; never fails the worker.
         # `always()` is load-bearing: without a status function the `if` is implicitly success()-gated,
         # so a FAILED gate would skip the very followups-only run the post-gate token mint refreshes for.
-        if: ${{ always() && !inputs.dry_run && steps.model.outcome == 'success' }}
+        if: ${{ always() && !inputs.dry_run && steps.model-outcome.outputs.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
@@ -1161,7 +1332,7 @@ jobs:
         continue-on-error: true
         env:
           GATE_OUTCOME: ${{ steps.gate.outcome }}
-          MODEL_OUTCOME: ${{ steps.model.outcome }}
+          MODEL_OUTCOME: ${{ steps.model-outcome.outputs.outcome }}
           PR_OUTCOME: ${{ steps.pr.outcome }}
           RESOLVED_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: |
