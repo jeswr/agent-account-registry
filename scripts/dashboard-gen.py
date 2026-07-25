@@ -515,8 +515,11 @@ def _probe_outcome(document, now):
     unparseable or missing stamp, a stamp older than PROBE_MAX_AGE_SECONDS or implausibly far in
     the future — is "we did not measure", and build_dashboard then refuses to publish ANY account
     as usable capacity on the strength of a snapshot nobody produced. Pure — unit-tested by
-    --self-test. Callers pass `None` to say "no sidecar was supplied at all"; anything else,
-    including `{}`, is a supplied-but-unusable sidecar and degrades."""
+    --self-test.
+
+    `None` (no sidecar supplied at all) is the WEAKEST evidence of the lot and normalizes to the
+    same unmeasured verdict as `{}` — #612 review finding 1: treating it as measured was a
+    fail-open branch inside the capacity decision itself."""
     outcome, detail, attempted = "unknown", "probe outcome was not persisted", None
     if isinstance(document, dict) and document.get("schema") == PROBE_SCHEMA:
         raw = str(document.get("outcome") or "").strip().lower()
@@ -1023,12 +1026,20 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
     # Issue #219: a snapshot the probe did not actually produce is not evidence of anything. When
     # the persisted outcome is not a fresh `ok`, the usage map is DISCARDED for every rendering
     # decision — accounts, per-provider aggregates and eligible capacity all fall back to
-    # "unknown" — rather than being published as fresh available capacity. `probe` is None only
-    # when the caller supplied no sidecar at all, in which case the usage map is taken at face
-    # value (and an absent measurement is still "unknown" via _availability).
-    probe = _probe_outcome(probe_status, now) if probe_status is not None else None
-    measured = probe is None or probe["measured"]
-    usage_rendered = usage if measured else {}
+    # "unknown" — rather than being published as fresh available capacity.
+    #
+    # #612 review finding 1: NO SIDECAR AT ALL IS THE WEAKEST EVIDENCE OF THE LOT, so it degrades
+    # exactly like an unusable one. The first form made `probe_status=None` mean MEASURED, which put
+    # a fail-OPEN branch inside the very function that decides capacity: a caller could hand
+    # build_dashboard a (possibly stale) non-empty usage map with no sidecar and get every account
+    # rendered "available", `fleet.capacity.eligible` positive, and — because the degradation key was
+    # omitted in that same branch — NO warning anywhere on the page. That is the #219 failure mode
+    # reachable through a different door. `main()`'s `--usage-status`-is-required check guards only
+    # the CLI; the invariant belongs here, where the decision is made. The sidecar is now the ONLY
+    # thing that can license publishing usage as capacity, and the marker is ALWAYS emitted so no
+    # code path can drop the page's degradation notice.
+    probe = _probe_outcome(probe_status, now)
+    usage_rendered = usage if probe["measured"] else {}
 
     rows = []
     capacity = {}
@@ -1072,10 +1083,11 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         "active_by_repository": _repository_activity(live),
         "model_health": _normalize_model_health(model_health),
     }
-    if probe is not None:
-        # Degradation marker (issue #219): the page renders probe age + failure so a stale or
-        # failed measurement is visible instead of silently looking like a fresh, idle fleet.
-        document["usage_probe"] = probe
+    # Degradation marker (issue #219): the page renders probe age + failure so a stale or failed
+    # measurement is visible instead of silently looking like a fresh, idle fleet. ALWAYS present
+    # (#612 review finding 1) — it used to be omitted on exactly the branch that also trusted the
+    # usage map unconditionally, so the one state that most needed a warning carried none.
+    document["usage_probe"] = probe
     observability = _normalize_observability(observability)
     if observability is not None:
         # Optional key (absent => the dashboard hides the Observability panels), placed INSIDE the
@@ -1124,6 +1136,16 @@ def _self_test():
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
 
     now = 1_750_000_000
+    # #612 review finding 1: since a build with NO sidecar publishes nothing as capacity (correct —
+    # an unsupplied measurement is the weakest evidence of all), every fixture below that means to
+    # exercise the real CAPACITY/rendering path must SAY the probe measured. That this whole golden
+    # block previously ran through the sidecar-less branch is itself the evidence that the fail-open
+    # branch was load-bearing for the suite: the tests were mostly exercising the unguarded path.
+    measured_sidecar = {"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                        "attempted_at": now - 30}
+    measured_marker = {"outcome": "ok", "detail": "probe-succeeded",
+                       "attempted_at": _utc_iso(now - 30), "age_seconds": 30, "stale": False,
+                       "measured": True}
     handle = "acct-fixture"
     email = "private@example.invalid"
     issues = [{
@@ -1145,7 +1167,8 @@ def _self_test():
                       "7d_util": "0.8", "7d_reset": now + 86400}}
     history = [{"at": "2025-06-15T15:05:00Z", "conclusion": "success",
                 "dispatched": 2, "deferred": 3}]
-    got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt")
+    got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                          probe_status=measured_sidecar)
     expected = {
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
@@ -1186,6 +1209,10 @@ def _self_test():
             "repositories": [{"repository": "owner/repo", "counts": {"opus": 1}}],
         },
         "model_health": None,
+        # The degradation marker is now on EVERY document (#612 review finding 1), so the golden
+        # fixture carries it too — and a measured build must say `measured: True` rather than omit
+        # the key, which is what let a sidecar-less build look indistinguishable from a healthy one.
+        "usage_probe": measured_marker,
     }
     check("fixture leases + limits -> expected JSON", got, expected)
     check("dispatch log counts", _parse_dispatch_log(
@@ -1276,7 +1303,8 @@ def _self_test():
          "model_alias": "", "exit_class": "zero-dispatch", "run_id": "r4"},
     ]}
     ordered = build_dashboard(
-        ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt")
+        ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt",
+        probe_status=measured_sidecar)
     check("canonical records ledger -> per-provider/model checks", ordered["model_health"], {
         "generated_at": _utc_iso(now - 120),
         "checks": [
@@ -1506,10 +1534,19 @@ def _self_test():
     # --- usage-probe outcome (issue #219): dashboard.yml's secret-materialization + probe steps
     # are continue-on-error and a failed probe was replaced by `{}`, so precisely WHEN measurement
     # failed the public page showed every catalog-available account as fresh usable capacity. Every
-    # case below feeds the IDENTICAL complete usage entry and varies only the persisted outcome —
-    # so the accept path (fresh `ok` still publishes real capacity) and each reject path (failed /
-    # stale / unstamped / alien / absent sidecar) are both non-vacuous: dropping the gate turns the
-    # reject rows red, over-rejecting turns the accept row red. ------------------------------------
+    # case below feeds the IDENTICAL complete usage entry and varies only the persisted outcome.
+    #
+    # WHICH MUTATION EACH ROW KILLS (#612 review finding 3 asked for this to be stated precisely
+    # rather than claimed in aggregate):
+    #   * the REJECT rows (failed / stale / alien schema / unstamped / unknown word / NO sidecar)
+    #     go red on ANY weakening of the gate — including the narrow one that keeps the marker and
+    #     only stops discarding the usage map.
+    #   * the ACCEPT row (fresh `ok`) kills the WHOLE-GATE deletion, because its expected tuple
+    #     includes `usage_probe.measured is True` and a build with no gate emits no marker at all
+    #     (`.get("measured")` -> None). It does NOT — and cannot — kill the narrow "always trust
+    #     usage" mutation: by construction a passing gate and an absent gate agree on a fresh probe.
+    #     Its job there is over-rejection regression cover, which is a real but different job.
+    # -----------------------------------------------------------------------------------------
     fresh_probe = {"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
                    "attempted_at": now - 30}
     failed_probe = {"schema": PROBE_SCHEMA, "outcome": "failed",
@@ -1532,6 +1569,11 @@ def _self_test():
             ("failed", failed_probe),
             ("stale ok", stale_probe),
             ("empty/absent sidecar", {}),
+            # #612 review finding 1: NO sidecar at all used to mean MEASURED — the usage map was
+            # taken at face value, capacity went positive AND the degradation key was omitted, so
+            # the page carried no warning. Non-vacuous: pre-fix this row read
+            # ("available", eligible 1, 1, 0, None).
+            ("no sidecar supplied at all", None),
             ("alien schema", {"schema": "wrong/v0", "outcome": "ok", "attempted_at": now}),
             ("unstamped ok", {"schema": PROBE_SCHEMA, "outcome": "ok"}),
             ("unknown outcome word", {"schema": PROBE_SCHEMA, "outcome": "maybe",
@@ -1569,11 +1611,30 @@ def _self_test():
                            "attempted_at": now + skew}, now)["measured"]
            for skew in (PROBE_MAX_SKEW_SECONDS, PROBE_MAX_SKEW_SECONDS + 1)],
           [True, False])
-    check("no sidecar supplied at all: usage is taken at face value, no degradation key",
-          (build_dashboard(issues, leases, usage, history, None, now,
-                           "fixture-salt")["accounts"][0]["availability"],
-           "usage_probe" in got),
-          ("available", False))
+    # #612 review finding 2: this check used to assert "no degradation key" against `got` — a
+    # DIFFERENT document built ~350 lines earlier — so that half would have stayed green even if the
+    # sidecar-less build had started emitting a bogus marker; and its availability half deliberately
+    # pinned the pre-fix PERMISSIVE behaviour, locking in the fail-open of finding 1. It now asserts
+    # against the document the adjacent call actually builds, and pins the fail-CLOSED behaviour:
+    # a build with no sidecar publishes nothing as capacity AND carries the degradation marker.
+    sidecarless = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt")
+    # `.get` on purpose: under the pre-fix code the key is ABSENT, and this check must then go red
+    # with a legible value rather than take the suite down with a KeyError.
+    sidecarless_marker = sidecarless.get("usage_probe") or {}
+    check("[#612] NO sidecar: nothing published as capacity, and the marker IS on the document",
+          (sidecarless["accounts"][0]["availability"],
+           sidecarless["fleet"]["capacity"],
+           sidecarless["provider_quota"][0]["accounts_available"],
+           sidecarless["provider_quota"][0]["accounts_unknown"],
+           "usage_probe" in sidecarless,
+           (sidecarless_marker.get("outcome"), sidecarless_marker.get("measured"),
+            sidecarless_marker.get("stale"), sidecarless_marker.get("attempted_at"))),
+          ("unknown", {"anthropic": {"eligible": 0, "total": 1}}, 0, 1, True,
+           ("unknown", False, True, None)))
+    check("[#612] and no window numbers or weekly reset leak from the untrusted snapshot",
+          [(row["weekly_reset_at"], [window["used_percent"] for window in row["windows"]])
+           for row in sidecarless["accounts"]],
+          [(None, [None, None])])
     # The core misreport (issue #219): a catalog-available account the probe never reported on used
     # to render "available" and count toward eligible capacity. It is the allocator's INELIGIBLE
     # shape, so it is "unknown" and eligible 0 — even with a perfectly healthy probe.
@@ -1822,9 +1883,10 @@ def main(argv=None):
     probe_status = None
     if args.usage_status:
         try:
-            # A missing or malformed sidecar degrades to the "unknown" outcome (`{}` is a supplied
-            # -but-unusable document, NOT the None "no sidecar" case) instead of taking the whole
-            # public page down over one unreadable status file.
+            # A missing or malformed sidecar degrades to the "unknown" outcome instead of taking
+            # the whole public page down over one unreadable status file. `{}` and `None` are both
+            # unmeasured verdicts (#612 review finding 1), so this degradation cannot publish
+            # capacity either way.
             probe_status = _read_json(args.usage_status, default={})
         except DashboardError:
             probe_status = {}
