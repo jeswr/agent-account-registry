@@ -161,8 +161,18 @@ title (GitHub does not enforce unique titles).
   the interactive session refreshes (this broke the canary once). If you prefer a Console API key,
   that also works: `credential_format: anthropic-api-key` (value is the `sk-ant-api…` key).
 - **OpenAI** (codex/GPT models): the codex CLI OAuth from `~/.codex/auth.json`
-  (`credential_format: codex-auth-json`). (This one does rotate — used only as a cross-provider
-  fallback.)
+  (`credential_format: codex-auth-json`). Its access token expires and its **refresh token is
+  ONE-TIME-USE with server-side replay detection** (`refresh_token_reused`), so the worker refreshes
+  it HOST-SIDE before the model container starts and writes the rotated credential back to the secret
+  (issue #596; the container only ever sees a fresh access token, never the refresh token). Two
+  operational consequences:
+  - **Give the registry its OWN codex login.** Refresh chains are per-authorization, not per-account.
+    If the stored secret and an interactive `~/.codex` login share one chain, whichever refreshes
+    second is killed with `refresh_token_reused` — so run the device-code login once *for the
+    registry* and enrol that credential rather than copying a box's live `~/.codex/auth.json`.
+  - **`REGISTRY_SECRETS_PAT` must be present** for the account to self-heal indefinitely. Without it
+    the write-back warns and skips, the rotated refresh token is lost, and the account needs a
+    re-mint the next time its access token expires.
 - On this work box, pre-provisioned Anthropic setup-tokens already exist as files
   `~/.claude-acctN-token` (one per account). Read the file; do not echo it.
 

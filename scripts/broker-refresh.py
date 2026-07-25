@@ -23,14 +23,31 @@
 The security invariant, asserted by --self-test: the returned capability NEVER contains the refresh
 token (or any key whose name implies a refresh/long-lived secret)."""
 import argparse
+import base64
+import datetime
+import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 
 PROVIDERS = ("openai", "anthropic")
+
+# Shared bounded-retry MECHANICS only (registry #563 item 4): the exponential-with-jitter ceiling
+# and the sleep helper. The domain classifier below stays here, exactly as gh_retry's module
+# docstring prescribes ("callers KEEP their own domain error-classification predicates"). No new
+# retry stack is invented for this path.
+_gh_retry_spec = importlib.util.spec_from_file_location(
+    "registry_gh_retry", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh_retry.py"))
+if _gh_retry_spec is None or _gh_retry_spec.loader is None:
+    raise RuntimeError("cannot load shared bounded-retry mechanics")
+gh_retry = importlib.util.module_from_spec(_gh_retry_spec)
+_gh_retry_spec.loader.exec_module(gh_retry)
 
 
 # ---- pure core (unit-tested; no network, no live tokens) ----------------------------------------
@@ -72,6 +89,350 @@ def assert_no_refresh_leak(capability):
                 walk(v)
     walk(capability)
     return True
+
+
+def _refresh_token_key(key):
+    """Whether a key NAMES a refresh token, in any of the casings/separators the two provider
+    layouts use (`refresh_token`, `refreshToken`, `REFRESH-TOKEN`). Deliberately narrower than
+    `_REFRESH_HINTS`: a credential legitimately carries a `last_refresh` TIMESTAMP, which is not
+    secret material and must not trip the guard."""
+    normalized = "".join(char for char in str(key).lower() if char.isalnum())
+    return "refreshtoken" in normalized or "refreshsecret" in normalized
+
+
+def assert_no_refresh_material(document, refresh_token):
+    """Fail closed on BOTH leak channels for a credential that is about to be handed to the model
+    container: a refresh-shaped KEY carrying a value (`assert_no_refresh_leak`'s check, but here the
+    empty-string CLI placeholder is permitted — see `minimal_worker_credential`), and the literal
+    refresh-token VALUE appearing anywhere in the serialized document under any key name.
+
+    The value check is what makes the guard non-vacuous: a regression that renames the field, nests
+    it, or copies the refresh token into `access_token` still turns this red."""
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if _refresh_token_key(key) and value not in ("", None):
+                    raise AssertionError(
+                        f"refresh secret leaked into the worker credential via key {key!r}")
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(document)
+    if refresh_token:
+        # Serialized-form check: catches the value under ANY key name, at any depth.
+        if str(refresh_token) in json.dumps(document):
+            raise AssertionError("refresh-token VALUE is present in the worker credential")
+    return True
+
+
+# ---- host-side pre-flight refresh (P0: registry issue #596) -------------------------------------
+# WHY this exists: the selected account credential is bind-mounted READ-ONLY into the model
+# container (issue #134, and that control is correct). A subscription-CLI credential holds a
+# SHORT-LIVED access token that the CLI refreshes IN PLACE — which the read-only mount forbids
+# (reproduced: `codex_login::auth::manager: Failed to refresh token: Read-only file system (os error
+# 30)`). The stored ACCTNN_TOKEN secret is a point-in-time snapshot, so once its access token
+# expires EVERY run dies seconds in, and `write_back`'s "did the mounted file change?" rotation
+# trigger can never fire (the mount makes change impossible). Deterministic permanent outage.
+#
+# The fix: refresh on the HOST, before the container starts, and materialize a MINIMAL credential
+# for the mount that carries a fresh access token and NO refresh token. The refresh token — the
+# durable secret, strictly worse to leak than a short-lived access token — stays host-side, so a
+# prompt-injected model with Bash/Read can no longer read it out of the mounted HOME.
+TOKEN_ENDPOINTS = {"openai": "https://auth.openai.com/oauth/token"}
+# Self-test seam ONLY, and deliberately LOOPBACK-ONLY: it lets the hermetic self-test exercise the
+# transient-retry path against a closed local port with no network egress. Because a non-loopback
+# value is REFUSED, this seam cannot be used to redirect a refresh token to an attacker's endpoint —
+# unlike an unrestricted override it crosses no trust boundary at all (and an actor who controls this
+# process's environment already holds the stored credential itself, the same argument the
+# WORKER_GH_BIN seam documents).
+TOKEN_ENDPOINT_OVERRIDE_ENV = "REGISTRY_TOKEN_ENDPOINT_OVERRIDE"
+_LOOPBACK_ENDPOINT = re.compile(r"^http://(127\.0\.0\.1|\[::1\]|localhost)(:\d{1,5})?(/.*)?$")
+# Public OAuth client id of the codex CLI. Not a secret: it is the `aud` claim of every id_token
+# the CLI already stores, and a public/PKCE client id by construction.
+OAUTH_CLIENT_IDS = {"openai": "app_EMoamEEZ73f0CkXaXp7hrann"}
+OAUTH_SCOPE = "openid profile email"
+# Refresh when the stored access token expires within this margin. Deliberately generous: a worker
+# run can last 90 minutes, and refreshing early costs nothing while an expiry mid-run is fatal
+# (the container cannot refresh — that is the whole point of this module).
+REFRESH_LEEWAY_SECONDS = 2 * 3600
+REFRESH_TIMEOUT_SECONDS = 20      # per-socket-operation timeout on the token exchange
+REFRESH_MAX_BYTES = 1 << 20       # response-size bound (a token response is a few KB)
+REFRESH_ATTEMPTS = 3              # total attempts; only TRANSIENT classes are retried
+
+# The two NEW, deliberately distinct failure classes. Neither is `auth` — `auth` is already
+# overloaded (worker-live's classifier matches the substring `oauth`, so ANY in-container refresh
+# diagnostic lands there) and it reads as "the provider rejected the model call".
+CLASS_REMINT = "credential-remint-required"       # MAINTAINER ACTION: interactive re-mint needed
+CLASS_REFRESH_TRANSIENT = "credential-refresh-transient"   # retried, still failing; retry later
+
+# A 4xx from the token endpoint means the GRANT is bad — the refresh token is expired, revoked, or
+# (OpenAI rotates refresh tokens and detects replay) ALREADY USED. No amount of retrying fixes it;
+# only an interactive re-login can. 429 and 5xx are throttle/availability and ARE retried.
+_REMINT_STATUSES = frozenset({400, 401, 403})
+# Fixed allowlist of provider error codes safe to echo into a PUBLIC log. Anything outside it is
+# never printed (no provider free text, no token material, ever reaches a log line).
+_REMINT_CODES = frozenset({
+    "invalid_grant", "refresh_token_reused", "invalid_client", "unauthorized_client",
+    "invalid_token", "access_denied", "invalid_request",
+})
+# Codes that are DECISIVE on their own: they name a dead grant regardless of the HTTP status the
+# provider chose to wrap it in. `invalid_request` is excluded — on its own it can equally mean the
+# request shape is wrong (our bug), so it is left to the status to classify.
+_DECISIVE_REMINT_CODES = _REMINT_CODES - {"invalid_request"}
+
+
+class RefreshFailure(Exception):
+    """A host-side refresh failure carrying its CLASS (`CLASS_REMINT` / `CLASS_REFRESH_TRANSIENT`)
+    and, when the provider returned one from the fixed allowlist, its error `code`. The message is
+    assembled from fixed strings + the allowlisted code ONLY — never provider free text, never any
+    token material."""
+
+    def __init__(self, kind, code=None):
+        self.kind = kind
+        self.code = code if code in _REMINT_CODES else None
+        detail = f" (provider code: {self.code})" if self.code else ""
+        super().__init__(f"host-side credential refresh failed: {kind}{detail}")
+
+
+def _jwt_claims(token):
+    """Best-effort UNVERIFIED claim read of a JWT payload. Signature verification is neither
+    possible nor needed here: the only claim used is `exp`, and it drives a local "should I refresh
+    now?" decision. A forged/short `exp` can only cause an EXTRA refresh, never an auth bypass."""
+    try:
+        segments = str(token).split(".")
+        if len(segments) < 2:
+            return {}
+        payload = segments[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def access_token_expiry(provider, cred):
+    """Epoch seconds at which the stored access token expires, or None when undeterminable."""
+    if provider == "openai":
+        exp = _jwt_claims((cred.get("tokens") or {}).get("access_token")).get("exp")
+        return int(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
+    if provider == "anthropic":
+        expires_at = (cred.get("claudeAiOauth") or {}).get("expiresAt")
+        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+            return int(expires_at / 1000)  # anthropic stamps milliseconds
+        return None
+    raise ValueError(f"unknown provider {provider!r}")
+
+
+def needs_refresh(provider, cred, now, leeway=REFRESH_LEEWAY_SECONDS):
+    """True when the stored access token is expired or expires within `leeway`. An UNREADABLE expiry
+    returns True (fail towards refreshing: the container cannot recover from a stale token, so the
+    cost of an unnecessary refresh is a round trip while the cost of skipping a needed one is a
+    dead run)."""
+    expiry = access_token_expiry(provider, cred)
+    if expiry is None:
+        return True
+    return expiry - leeway <= now
+
+
+def extract_refresh_token(provider, cred):
+    """The DURABLE refresh secret from a stored credential. Host-side callers only."""
+    if provider == "openai":
+        return (cred.get("tokens") or {}).get("refresh_token")
+    if provider == "anthropic":
+        return (cred.get("claudeAiOauth") or {}).get("refreshToken")
+    raise ValueError(f"unknown provider {provider!r}")
+
+
+def minimal_worker_credential(provider, cred):
+    """Build the credential that is bind-mounted into the model container: everything the CLI needs
+    to RUN, and no durable secret.
+
+    `refresh_token` is emitted as an EMPTY STRING rather than omitted: codex's credential
+    deserializer requires the field (verified — omitting it fails the run outright with
+    `missing field 'refresh_token'`), and an empty string satisfies the shape while carrying no
+    secret and being unmistakable for a real token. Verified end-to-end: the codex CLI completes a
+    turn from this exact document under the production read-only bind mount."""
+    if provider != "openai":
+        raise ValueError(f"minimal worker credential is only defined for openai, not {provider!r}")
+    tokens = cred.get("tokens") or {}
+    for field in ("access_token", "id_token", "account_id"):
+        if not isinstance(tokens.get(field), str) or not tokens[field]:
+            raise ValueError(f"stored openai credential is missing tokens.{field}")
+    minimal = {
+        "OPENAI_API_KEY": cred.get("OPENAI_API_KEY"),
+        "auth_mode": cred.get("auth_mode"),
+        "tokens": {
+            "id_token": tokens["id_token"],
+            "access_token": tokens["access_token"],
+            "refresh_token": "",   # CLI-required field, deliberately empty (see docstring)
+            "account_id": tokens["account_id"],
+        },
+        "last_refresh": cred.get("last_refresh"),
+    }
+    assert_no_refresh_material(minimal, extract_refresh_token(provider, cred))
+    return minimal
+
+
+def merge_refreshed(provider, stored, response, now):
+    """Fold a token-endpoint response into a NEW DURABLE credential in the CLI's own on-disk shape.
+
+    Fail-closed identity check: when the response's id_token names a chatgpt account, it must be the
+    SAME account as the stored credential — the registry must never write a different account's
+    material into an ACCTNN_TOKEN secret."""
+    if provider != "openai":
+        raise ValueError(f"host-side refresh is only implemented for openai, not {provider!r}")
+    tokens = dict(stored.get("tokens") or {})
+    for field, value in (("access_token", response.get("access_token")),
+                         ("refresh_token", response.get("refresh_token")),
+                         ("id_token", response.get("id_token"))):
+        if isinstance(value, str) and value:
+            tokens[field] = value
+    if not tokens.get("access_token"):
+        raise RefreshFailure(CLASS_REFRESH_TRANSIENT)
+    claims = _jwt_claims(tokens.get("id_token"))
+    auth_claim = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claim, dict):
+        account = auth_claim.get("chatgpt_account_id")
+        if isinstance(account, str) and account:
+            if tokens.get("account_id") and account != tokens["account_id"]:
+                raise AssertionError("refreshed credential names a DIFFERENT account; refusing it")
+            tokens["account_id"] = account
+    refreshed = dict(stored)
+    refreshed["tokens"] = tokens
+    refreshed["last_refresh"] = (
+        datetime.datetime.fromtimestamp(int(now), datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%S.000000000Z"))
+    return refreshed
+
+
+def classify_refresh_failure(status, body=""):
+    """Map a token-endpoint failure onto exactly one of the two new classes.
+
+    `status` is the HTTP status, or 0 for "no response" (DNS/TCP/TLS/timeout). A recognised remint
+    error CODE wins over the status so a provider that reports `invalid_grant` with an unusual
+    status is still routed to the maintainer instead of being retried forever."""
+    if refresh_error_code(body) in _DECISIVE_REMINT_CODES:
+        return CLASS_REMINT
+    if int(status) in _REMINT_STATUSES:
+        return CLASS_REMINT
+    return CLASS_REFRESH_TRANSIENT
+
+
+def refresh_error_code(body):
+    """The provider error code from a token-endpoint error body, but ONLY when it is on the fixed
+    allowlist — so nothing a provider (or a hostile intermediary) puts in that body can reach a
+    public log. Returns None otherwise."""
+    try:
+        document = json.loads(body or "")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    candidates = []
+    error = document.get("error")
+    if isinstance(error, dict):
+        candidates.extend([error.get("code"), error.get("type")])
+    elif isinstance(error, str):
+        candidates.append(error)
+    candidates.append(document.get("code"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate in _REMINT_CODES:
+            return candidate
+    return None
+
+
+def _post_token_endpoint(url, payload, timeout=REFRESH_TIMEOUT_SECONDS):
+    """One token-endpoint exchange. Returns (status, body_text). Never raises for an HTTP error
+    status, and never logs: the body may echo request material, so only the CALLER's allowlisted
+    code extraction ever looks at it."""
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 (fixed https URL)
+            return response.status, response.read(REFRESH_MAX_BYTES).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read(REFRESH_MAX_BYTES).decode("utf-8", "replace")
+        except OSError:
+            body = ""
+        return exc.code, body
+    except (urllib.error.URLError, OSError, ValueError):
+        return 0, ""   # no response at all: DNS / TCP / TLS / timeout => transient
+
+
+def token_endpoint(provider, environ=None):
+    """The token endpoint for `provider`, honouring the LOOPBACK-ONLY self-test override. A
+    non-loopback override is REFUSED (fail closed) rather than silently ignored, so a
+    misconfiguration can never quietly ship a refresh token to an unexpected host."""
+    url = TOKEN_ENDPOINTS.get(provider)
+    override = (environ if environ is not None else os.environ).get(TOKEN_ENDPOINT_OVERRIDE_ENV)
+    if override:
+        if not _LOOPBACK_ENDPOINT.match(override):
+            raise ValueError(f"{TOKEN_ENDPOINT_OVERRIDE_ENV} must be a loopback http:// URL")
+        return override
+    return url
+
+
+def refresh_access_token(provider, refresh_token, *, poster=_post_token_endpoint,
+                         attempts=REFRESH_ATTEMPTS, sleeper=None, environ=None):
+    """Exchange a refresh token for fresh material against the provider's token endpoint.
+
+    Bounded retry on TRANSIENT classes only, reusing gh_retry's exponential-with-jitter sleep
+    mechanics. A remint class fails immediately — retrying a dead grant just delays the maintainer
+    signal (the exact misclassification gh_retry's docstring calls out)."""
+    url = token_endpoint(provider, environ)
+    client_id = OAUTH_CLIENT_IDS.get(provider)
+    if not url or not client_id:
+        raise ValueError(f"no host-side token endpoint is configured for provider {provider!r}")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise RefreshFailure(CLASS_REMINT)   # nothing to exchange: the stored snapshot is unusable
+    sleep = sleeper if sleeper is not None else gh_retry.sleep_backoff
+    payload = {"client_id": client_id, "grant_type": "refresh_token",
+               "refresh_token": refresh_token, "scope": OAUTH_SCOPE}
+    last = RefreshFailure(CLASS_REFRESH_TRANSIENT)
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        status, body = poster(url, payload)
+        if 200 <= int(status) < 300:
+            try:
+                document = json.loads(body or "")
+            except (ValueError, TypeError):
+                document = None
+            if isinstance(document, dict) and document.get("access_token"):
+                return document
+            last = RefreshFailure(CLASS_REFRESH_TRANSIENT)
+        else:
+            kind = classify_refresh_failure(status, body)
+            failure = RefreshFailure(kind, refresh_error_code(body))
+            if kind == CLASS_REMINT:
+                raise failure
+            last = failure
+        if attempt < max(1, int(attempts)):
+            sleep(attempt)
+    raise last
+
+
+def refresh_credential_host_side(provider, stored, *, now, force=False, **kwargs):
+    """The whole host-side pre-flight in one call.
+
+    Returns {"mount", "durable", "refreshed", "rotated"}:
+      * mount    — the MINIMAL credential to bind-mount (fresh access token, NO refresh token);
+      * durable  — the full credential to persist back to the account secret, or None;
+      * refreshed— whether a token exchange actually happened;
+      * rotated  — whether the exchange produced NEW DURABLE material (a rotated refresh token).
+                   THIS, not "did the model mutate the mounted file?", is the rotation trigger.
+    Raises RefreshFailure when a needed refresh could not be completed."""
+    if not force and not needs_refresh(provider, stored, now):
+        # Still valid: mount it as-is (minus the refresh token) and exchange nothing. With OpenAI's
+        # one-time-use refresh tokens this matters — an unnecessary exchange would burn the stored
+        # grant for no gain.
+        return {"mount": minimal_worker_credential(provider, stored),
+                "durable": None, "refreshed": False, "rotated": False}
+    response = refresh_access_token(provider, extract_refresh_token(provider, stored), **kwargs)
+    durable = merge_refreshed(provider, stored, response, now)
+    rotated = extract_refresh_token(provider, durable) != extract_refresh_token(provider, stored)
+    return {"mount": minimal_worker_credential(provider, durable),
+            "durable": durable, "refreshed": True, "rotated": rotated}
 
 
 # ---- isolation + live refresh (registry Actions only; not in --self-test) -----------------------
@@ -188,6 +549,190 @@ def _self_test():
     chk("leak detector fires on a refresh_token key (non-vacuous)", leaked)
     chk("cred_relpath openai", cred_relpath("openai") == ".codex/auth.json")
     chk("cred_relpath anthropic", cred_relpath("anthropic") == ".claude/.credentials.json")
+
+    # ---- host-side pre-flight refresh (registry issue #596) ------------------------------------
+    # Fixtures: real key layouts, fake values. The access token is a real JWT SHAPE (header.payload
+    # .signature, unverified payload) because the refresh decision reads its `exp` claim.
+    def _jwt(exp):
+        head = base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+        body = base64.urlsafe_b64encode(
+            json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
+        return f"{head}.{body}.sig"
+
+    now = 1_800_000_000
+    fresh = {"OPENAI_API_KEY": None, "auth_mode": "chatgpt",
+             "tokens": {"id_token": "ID_v1", "access_token": _jwt(now + 10 * 24 * 3600),
+                        "refresh_token": "REFRESH_long", "account_id": "acct-uuid"},
+             "last_refresh": "2026-07-25T00:00:00.000000000Z"}
+    stale = json.loads(json.dumps(fresh))
+    stale["tokens"]["access_token"] = _jwt(now - 3600)   # already expired
+
+    # (a) the MOUNTED credential carries NO refresh material — asserted on the PARSED keys.
+    mount = minimal_worker_credential("openai", fresh)
+    chk("mounted credential parses to the exact CLI-required key set",
+        sorted(mount) == ["OPENAI_API_KEY", "auth_mode", "last_refresh", "tokens"]
+        and sorted(mount["tokens"]) == ["access_token", "account_id", "id_token", "refresh_token"])
+    chk("mounted credential's refresh_token key is the empty CLI placeholder",
+        mount["tokens"]["refresh_token"] == "")
+    chk("mounted credential carries NO refresh-token VALUE anywhere",
+        "REFRESH_long" not in json.dumps(mount))
+    chk("mounted credential keeps the access token the CLI must present",
+        mount["tokens"]["access_token"] == fresh["tokens"]["access_token"])
+    # non-vacuity of (a): the FULL stored credential must be REJECTED as a mount document.
+    rejected = False
+    try:
+        assert_no_refresh_material(fresh, "REFRESH_long")
+    except AssertionError:
+        rejected = True
+    chk("materialization guard REJECTS a full auth.json as a mount document (non-vacuous)", rejected)
+    # ...and it catches the value under a renamed/nested key too (the regression that a key-name-only
+    # check would wave through).
+    renamed = False
+    try:
+        assert_no_refresh_material({"tokens": {"access_token": "REFRESH_long"}}, "REFRESH_long")
+    except AssertionError:
+        renamed = True
+    chk("materialization guard catches the refresh VALUE under a DIFFERENT key (non-vacuous)",
+        renamed)
+
+    # (b) refresh-need decision: a comfortable expiry exchanges nothing (OpenAI refresh tokens are
+    # one-time-use, so a needless exchange burns the stored grant); a stale one must refresh.
+    chk("fresh access token needs no refresh", needs_refresh("openai", fresh, now) is False)
+    chk("expired access token needs a refresh", needs_refresh("openai", stale, now) is True)
+    chk("access token inside the leeway window needs a refresh",
+        needs_refresh("openai", {"tokens": dict(fresh["tokens"],
+                                                access_token=_jwt(now + 60))}, now) is True)
+    chk("undeterminable expiry fails towards refreshing",
+        needs_refresh("openai", {"tokens": {"access_token": "not-a-jwt"}}, now) is True)
+    chk("anthropic expiry is read from millisecond expiresAt",
+        access_token_expiry("anthropic", {"claudeAiOauth": {"expiresAt": 1_800_000_000_000}})
+        == 1_800_000_000)
+
+    # (c) failure classification: dead grant => MAINTAINER ACTION, never `auth`, never transient.
+    reused = json.dumps({"error": {"code": "refresh_token_reused", "type": "invalid_request_error",
+                                   "message": "Your refresh token has already been used."}})
+    chk("refresh_token_reused (the live OpenAI reuse body) classifies as remint-required",
+        classify_refresh_failure(400, reused) == CLASS_REMINT)
+    chk("invalid_grant classifies as remint-required",
+        classify_refresh_failure(400, json.dumps({"error": "invalid_grant"})) == CLASS_REMINT)
+    chk("a decisive remint CODE wins over an odd status",
+        classify_refresh_failure(500, reused) == CLASS_REMINT)
+    chk("401 classifies as remint-required", classify_refresh_failure(401, "") == CLASS_REMINT)
+    chk("500 classifies as transient", classify_refresh_failure(500, "") == CLASS_REFRESH_TRANSIENT)
+    chk("503 classifies as transient", classify_refresh_failure(503, "") == CLASS_REFRESH_TRANSIENT)
+    chk("429 classifies as transient (throttle, not a dead grant)",
+        classify_refresh_failure(429, "") == CLASS_REFRESH_TRANSIENT)
+    chk("no response at all (DNS/TCP/TLS/timeout) classifies as transient",
+        classify_refresh_failure(0, "") == CLASS_REFRESH_TRANSIENT)
+    chk("the two new classes are distinct from `auth`",
+        CLASS_REMINT != "auth" and CLASS_REFRESH_TRANSIENT != "auth"
+        and CLASS_REMINT != CLASS_REFRESH_TRANSIENT)
+    # only allowlisted codes may reach a log line
+    chk("a non-allowlisted provider code is never surfaced",
+        refresh_error_code(json.dumps({"error": {"code": "acct-sk-live-DEADBEEF"}})) is None)
+    chk("provider free text is never surfaced", refresh_error_code("total garbage") is None)
+    chk("RefreshFailure message carries the class + allowlisted code and NO token material",
+        "refresh_token_reused" in str(RefreshFailure(CLASS_REMINT, "refresh_token_reused"))
+        and "REFRESH_long" not in str(RefreshFailure(CLASS_REMINT, "REFRESH_long"))
+        and RefreshFailure(CLASS_REMINT, "REFRESH_long").code is None)
+
+    # (d) the exchange loop: transient retries then succeeds; remint fails IMMEDIATELY (retrying a
+    # dead grant only delays the maintainer signal); a persistent transient exhausts the bound.
+    calls, sleeps = [], []
+    def flaky(url, payload):
+        calls.append(payload["grant_type"])
+        if len(calls) < 3:
+            return 503, ""
+        return 200, json.dumps({"access_token": _jwt(now + 864000), "refresh_token": "REFRESH_v2",
+                                "id_token": "ID_v2"})
+    response = refresh_access_token("openai", "REFRESH_long", poster=flaky,
+                                    sleeper=lambda attempt: sleeps.append(attempt))
+    chk("transient token-endpoint failures retry then succeed",
+        (len(calls), sleeps, response["refresh_token"]) == (3, [1, 2], "REFRESH_v2"))
+    calls.clear(); sleeps.clear()
+    kind = None
+    try:
+        refresh_access_token("openai", "REFRESH_long",
+                            poster=lambda url, payload: (calls.append(1), (400, reused))[1],
+                            sleeper=lambda attempt: sleeps.append(attempt))
+    except RefreshFailure as exc:
+        kind = exc.kind
+    chk("a dead grant fails on the FIRST attempt with the remint class",
+        (kind, len(calls), sleeps) == (CLASS_REMINT, 1, []))
+    calls.clear(); sleeps.clear()
+    kind = None
+    try:
+        refresh_access_token("openai", "REFRESH_long",
+                            poster=lambda url, payload: (calls.append(1), (503, ""))[1],
+                            sleeper=lambda attempt: sleeps.append(attempt))
+    except RefreshFailure as exc:
+        kind = exc.kind
+    chk("a persistent transient exhausts the bounded retry then reports transient",
+        (kind, len(calls), sleeps) == (CLASS_REFRESH_TRANSIENT, REFRESH_ATTEMPTS,
+                                      list(range(1, REFRESH_ATTEMPTS))))
+    calls.clear()
+    kind = None
+    try:
+        refresh_access_token("openai", "", poster=lambda url, payload: (calls.append(1), (200, ""))[1])
+    except RefreshFailure as exc:
+        kind = exc.kind
+    chk("an absent stored refresh token is a remint condition and contacts nothing",
+        (kind, calls) == (CLASS_REMINT, []))
+
+    # (e) the whole pre-flight: fresh => no exchange; stale => exchange + rotation flagged, with the
+    # rotated refresh token in DURABLE material only and NEVER in the mount document.
+    preflight = refresh_credential_host_side("openai", fresh, now=now,
+                                             poster=lambda url, payload: (500, ""))
+    chk("pre-flight on a fresh credential performs NO exchange",
+        (preflight["refreshed"], preflight["rotated"], preflight["durable"]) == (False, False, None))
+    def rotating(url, payload):
+        return 200, json.dumps({"access_token": _jwt(now + 864000),
+                                "refresh_token": "REFRESH_v2", "id_token": "ID_v2"})
+    preflight = refresh_credential_host_side("openai", stale, now=now, poster=rotating)
+    chk("pre-flight on a stale credential refreshes and flags rotation",
+        (preflight["refreshed"], preflight["rotated"]) == (True, True))
+    chk("durable material carries the ROTATED refresh token (host-side only)",
+        extract_refresh_token("openai", preflight["durable"]) == "REFRESH_v2")
+    chk("the MOUNT document carries neither the old nor the new refresh token",
+        "REFRESH_long" not in json.dumps(preflight["mount"])
+        and "REFRESH_v2" not in json.dumps(preflight["mount"]))
+    chk("the mount document carries the FRESH access token",
+        preflight["mount"]["tokens"]["access_token"] == preflight["durable"]["tokens"]["access_token"]
+        != stale["tokens"]["access_token"])
+    chk("durable material keeps the CLI's on-disk shape",
+        sorted(preflight["durable"]) == ["OPENAI_API_KEY", "auth_mode", "last_refresh", "tokens"]
+        and preflight["durable"]["last_refresh"].endswith("Z"))
+    def non_rotating(url, payload):
+        return 200, json.dumps({"access_token": _jwt(now + 864000),
+                                "refresh_token": "REFRESH_long"})
+    preflight = refresh_credential_host_side("openai", stale, now=now, poster=non_rotating)
+    chk("a provider that returns the SAME refresh token does not claim rotation",
+        (preflight["refreshed"], preflight["rotated"]) == (True, False))
+    # fail closed: refreshed material must never name a DIFFERENT account
+    foreign = base64.urlsafe_b64encode(json.dumps(
+        {"https://api.openai.com/auth": {"chatgpt_account_id": "SOMEONE-ELSE"}}).encode()
+    ).rstrip(b"=").decode()
+    crossed = False
+    try:
+        merge_refreshed("openai", stale, {"access_token": _jwt(now + 10),
+                                          "id_token": f"h.{foreign}.s"}, now)
+    except AssertionError:
+        crossed = True
+    chk("refreshed material naming a DIFFERENT account is refused (fail closed)", crossed)
+    # (f) the self-test endpoint seam is LOOPBACK-ONLY: it can never redirect a refresh token off-box.
+    chk("default token endpoint is the provider's own https endpoint",
+        token_endpoint("openai", {}) == TOKEN_ENDPOINTS["openai"])
+    chk("a loopback override is accepted (hermetic self-test seam)",
+        token_endpoint("openai", {TOKEN_ENDPOINT_OVERRIDE_ENV: "http://127.0.0.1:1/oauth/token"})
+        == "http://127.0.0.1:1/oauth/token")
+    for hostile in ("https://evil.example/oauth/token", "http://127.0.0.1.evil.example/t",
+                    "http://localhost.evil.example/t", "file:///etc/passwd"):
+        refused = False
+        try:
+            token_endpoint("openai", {TOKEN_ENDPOINT_OVERRIDE_ENV: hostile})
+        except ValueError:
+            refused = True
+        chk(f"a NON-loopback endpoint override is refused: {hostile}", refused)
     # the live capability is written to a private file, NEVER printed (the #193 invariant)
     d = tempfile.mkdtemp(prefix="broker-selftest-")
     try:

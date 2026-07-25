@@ -75,8 +75,9 @@ FUTURE_SKEW_SECONDS = 5 * 60
 
 # --- exit-class taxonomy. worker-live.sh emits {session-limit, rate-limit, auth, setup, unknown}
 # from nonzero HOST-observable signals, plus `no_change` after a clean model exit with no tree edit;
-# never model-authored stdout. A changed-tree run records `success`. We fold those into decision
-# classes.
+# never model-authored stdout. A changed-tree run records `success`. worker-prep.sh additionally
+# emits {credential-remint-required, credential-refresh-transient} from the host-side credential
+# pre-flight, before any model runs. We fold those into decision classes.
 # `limit` == the account's usage window is exhausted (maintainer must RESET it, not retry);
 # `transient` == a retryable API blip (429/529/overloaded); `auth`/`billing` == a credential/credit
 # problem (rotate/top up); `unknown` == the host observed a failure but could not attribute it to
@@ -104,6 +105,15 @@ _EXIT_CLASS_MAP = {
     "session-limit": CLASS_LIMIT,
     "rate-limit": CLASS_TRANSIENT,
     "auth": CLASS_AUTH,
+    # Host-side credential pre-flight classes (issue #596). worker-prep.sh emits these BEFORE any
+    # model runs, so they are deliberately distinct RAW classes — `auth` is the bucket every
+    # in-container provider rejection lands in and reads as "the provider refused the model call".
+    # They fold onto the existing decision classes so the whole health/backoff/outage machinery
+    # applies unchanged: a dead stored grant IS an auth-class inability to reach a working model
+    # (maintainer-actionable, counts toward a provider-outage page), while an unreachable token
+    # endpoint IS transient (earns the reactive backoff, never pages a re-mint).
+    "credential-remint-required": CLASS_AUTH,
+    "credential-refresh-transient": CLASS_TRANSIENT,
     "billing": CLASS_BILLING,
     "setup": CLASS_SETUP,
     "no_change": CLASS_NO_CHANGE,

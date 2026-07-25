@@ -208,9 +208,17 @@ _extract_reset_hint() {
 # just that file (the same parent-rw + child-ro pattern as the read-only .git mount in
 # _run_headless_harness) makes the overwrite impossible at the source: the file becomes an active
 # mountpoint that cannot be written, unlinked, or renamed over from inside the container, so the
-# post-run credential write_back reads is always exactly what worker-prep materialized. Fail closed:
-# every supported credential format materializes UNDER $worker_root/home; a credential anywhere else
-# is an unexpected layout we refuse to run with rather than leave writable.
+# post-run credential is always exactly what worker-prep materialized — write_back asserts that
+# byte-identity and refuses to persist anything when it is violated. Fail closed: every supported
+# credential format materializes UNDER $worker_root/home; a credential anywhere else is an
+# unexpected layout we refuse to run with rather than leave writable.
+#
+# Issue #596: because this mount is (correctly) immutable, the CLI's own in-place token refresh
+# cannot happen in the container either — so for codex-auth-json the credential is refreshed on the
+# HOST before the container starts, and what is mounted here is a MINIMAL derived document carrying
+# a fresh access token and NO refresh token (see worker-prep.sh + broker-refresh.py). That closes a
+# second hole this mount never covered: `readonly` stops writes, not READS, and the model has
+# Bash/Read while it processes hostile PR content.
 _credential_mount_args() {
   local worker_root=$1 credential_path=$2
   local home_prefix="$worker_root/home/"
@@ -1800,6 +1808,15 @@ push_fix() {
   printf 'worker-live: pushed %s fix for round %s to %s\n' "$fix_kind" "$fix_round" "$head_branch"
 }
 
+# Persist a HOST-SIDE-ROTATED account credential back to its ACCTNN_TOKEN secret.
+#
+# Rotation is decided by whether worker-prep's pre-flight refresh produced NEW DURABLE MATERIAL —
+# NOT by whether the mounted credential file changed (issue #596). The old baseline-vs-current
+# comparison was structurally incapable of ever reporting rotation: the credential file is
+# bind-mounted READ-ONLY (issue #134), so it cannot change, so `rotated` was pinned to false and a
+# provider that rotates its refresh token could never be tracked. That comparison is KEPT here as a
+# containment assertion (a mutated mounted file means the read-only mount was defeated => refuse to
+# write anything back), just no longer as the trigger.
 write_back() {
   local worker_root=${WORKER_ROOT:-}
   local current=${WORKER_CREDENTIAL_PATH:-}
@@ -1817,20 +1834,39 @@ write_back() {
   [[ "$account" =~ ^acct[0-9a-z]{2,}$ ]] || die 'unsafe account handle'
   [[ "$secret_ref" == "${account^^}_TOKEN" ]] || die 'secret reference does not match claimed account'
   [[ "$registry_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe registry repo'
-  if cmp -s -- "$baseline" "$current"; then
+  # --- TAMPER CHECK (issue #134, KEPT and now standalone). The mounted credential is bind-mounted
+  # read-only, so it MUST come back byte-identical to what worker-prep materialized. If it does not,
+  # the containment that stops a prompt-injected model from poisoning the central ACCTNN_TOKEN secret
+  # has failed — refuse to write ANYTHING back. This check is no longer the rotation TRIGGER (it
+  # could never fire as one: the read-only mount makes change impossible, so `rotated` was
+  # structurally pinned to false and the lane could never self-heal — issue #596). It remains
+  # load-bearing as a containment assertion. ---
+  if ! cmp -s -- "$baseline" "$current"; then
     write_output rotated false
-    printf 'worker-live: account credential unchanged; write-back not needed\n'
+    die 'mounted account credential was MUTATED during the run; refusing any write-back (containment failure)'
+  fi
+  # --- ROTATION TRIGGER (issue #596): whether the HOST-SIDE pre-flight produced NEW DURABLE
+  # material. worker-prep writes the rotated credential + its marker directly under WORKER_ROOT
+  # (never under $WORKER_ROOT/home, the only part of the tree the container sees), so the refresh
+  # token being persisted here was never reachable from inside the model container. ---
+  local durable="$worker_root/.credential-durable"
+  local rotated_marker="$worker_root/.credential-rotated"
+  if [[ ! -f "$rotated_marker" || -L "$rotated_marker" ]]; then
+    write_output rotated false
+    printf 'worker-live: no rotated account credential to persist; write-back not needed\n'
     return 0
   fi
+  [[ -f "$durable" && ! -L "$durable" ]] ||
+    die 'rotation marker is present but the durable credential is missing or unsafe'
   if [[ -z "$pat" ]]; then
     write_output rotated true
-    printf '%s\n' '::warning::Account credential changed, but REGISTRY_SECRETS_PAT is absent; skipping write-back.'
+    printf '%s\n' '::warning::Account credential rotated host-side, but REGISTRY_SECRETS_PAT is absent; skipping write-back. This run authenticates, but the rotated refresh token is NOT persisted — provider refresh tokens are one-time-use, so the NEXT run on this account will need a re-mint (or the PAT).'
     return 0
   fi
   printf '::add-mask::%s\n' "$pat"
   case "$format" in
     codex-auth-json | claude-credentials-json)
-      python3 - "$current" <<'PY'
+      python3 - "$durable" <<'PY'
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -1840,8 +1876,8 @@ if not isinstance(credential, dict) or not credential:
 PY
       ;;
     claude-oauth-token | anthropic-api-key)
-      [[ -s "$current" ]] || die 'refreshed opaque credential is empty'
-      [[ "$(wc -l < "$current")" -eq 0 ]] || die 'refreshed opaque credential is multiline'
+      [[ -s "$durable" ]] || die 'refreshed opaque credential is empty'
+      [[ "$(wc -l < "$durable")" -eq 0 ]] || die 'refreshed opaque credential is multiline'
       ;;
     *) die 'unsafe credential format for write-back' ;;
   esac
@@ -1858,7 +1894,7 @@ PY
   # relayed, and on failure surface only a fixed, identifier-free line — do NOT report rotated=true
   # (fail closed: the central env copy stays un-rotated rather than being reported as rotated).
   local wb_gh_output
-  if ! wb_gh_output=$(GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$current" 2>&1); then
+  if ! wb_gh_output=$(GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$durable" 2>&1); then
     die 'write-back to the account secret failed (env dispatch-secrets); see private registry logs'
   fi
   write_output rotated true
@@ -2753,8 +2789,13 @@ printf '%s\n' "${GH_TOKEN:-}" > "$WB_CAPTURE/token"
 printf 'gh: Set secret %s\n' "$*" >&2
 FAKE
   chmod +x "$tmp/wb-gh"
-  printf 'sk-ant-oat-ROTATED-SENTINEL' > "$wbroot/current"
-  printf 'sk-ant-oat-old-baseline' > "$wbroot/baseline"
+  # Issue #596: the mounted credential comes back byte-identical (the read-only mount guarantees
+  # it), and ROTATION is signalled by worker-prep's host-side durable material + marker. The durable
+  # file — never the mounted one — is what streams to `gh secret set`.
+  printf 'sk-ant-oat-mounted' > "$wbroot/current"
+  printf 'sk-ant-oat-mounted' > "$wbroot/baseline"
+  printf 'sk-ant-oat-ROTATED-SENTINEL' > "$wbroot/.credential-durable"
+  printf 'rotated\n' > "$wbroot/.credential-rotated"
   : > "$wb_out"
   # Subshell so the fixture env never leaks; `if` so a die() surfaces as a red chk, not a silent
   # set -e abort of the whole self-test.
@@ -2816,6 +2857,241 @@ FAKE
     "$(grep -c 'ACCTEXAMPLE_TOKEN\|acctexample' "$tmp/wb-fail.log" || true)" "0"
   chk "write_back failure does NOT report rotated=true (fail closed)" \
     "$(grep -c '^rotated=true$' "$wb_fail_out" || true)" "0"
+
+  # --- issue #596 write_back contract changes. Three distinct behaviours, each hermetic. ---
+  # (1) NO rotation: the host-side pre-flight produced no new durable material (the stored access
+  # token was still valid, so nothing was exchanged). Nothing to persist, and `gh` must not be
+  # invoked at all.
+  local wbroot2="$tmp/wbroot-norot" wb_out2="$tmp/wb2-github-output" wb2_rc
+  mkdir -p "$wbroot2" "$tmp/wbcap2"
+  printf 'sk-ant-oat-mounted' > "$wbroot2/current"
+  printf 'sk-ant-oat-mounted' > "$wbroot2/baseline"
+  : > "$wb_out2"
+  if (
+    export WORKER_ROOT="$wbroot2" WORKER_CREDENTIAL_PATH="$wbroot2/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot2/baseline" \
+           WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out2" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap2"
+    write_back
+  ) > "$tmp/wb2.log" 2>&1; then wb2_rc=0; else wb2_rc=$?; fi
+  chk "write_back (no host-side rotation) succeeds" "$wb2_rc" "0"
+  chk "write_back (no host-side rotation) reports rotated=false" \
+    "$(grep -c '^rotated=false$' "$wb_out2" || true)" "1"
+  chk "write_back (no host-side rotation) never invokes gh at all" \
+    "$([[ -e "$tmp/wbcap2/argv" ]] && printf called || printf uncalled)" "uncalled"
+
+  # (2) MISSING PAT: the lane must still WORK (this run already holds a fresh access token) — warn,
+  # report rotated=true, exit 0, and touch no secret. A missing PAT is NEVER fatal.
+  local wbroot3="$tmp/wbroot-nopat" wb_out3="$tmp/wb3-github-output" wb3_rc
+  mkdir -p "$wbroot3" "$tmp/wbcap3"
+  printf 'sk-ant-oat-mounted' > "$wbroot3/current"
+  printf 'sk-ant-oat-mounted' > "$wbroot3/baseline"
+  printf 'sk-ant-oat-ROTATED-SENTINEL' > "$wbroot3/.credential-durable"
+  printf 'rotated\n' > "$wbroot3/.credential-rotated"
+  : > "$wb_out3"
+  if (
+    export WORKER_ROOT="$wbroot3" WORKER_CREDENTIAL_PATH="$wbroot3/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot3/baseline" \
+           WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r GITHUB_OUTPUT="$wb_out3" \
+           WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap3"
+    unset REGISTRY_SECRETS_PAT
+    write_back
+  ) > "$tmp/wb3.log" 2>&1; then wb3_rc=0; else wb3_rc=$?; fi
+  chk "write_back with a MISSING PAT still succeeds (never fatal)" "$wb3_rc" "0"
+  chk "write_back with a MISSING PAT warns" \
+    "$(grep -c '^::warning::Account credential rotated host-side' "$tmp/wb3.log" || true)" "1"
+  chk "write_back with a MISSING PAT reports rotated=true" \
+    "$(grep -c '^rotated=true$' "$wb_out3" || true)" "1"
+  chk "write_back with a MISSING PAT never invokes gh" \
+    "$([[ -e "$tmp/wbcap3/argv" ]] && printf called || printf uncalled)" "uncalled"
+  chk "write_back with a MISSING PAT never echoes the durable credential" \
+    "$(grep -c 'ROTATED-SENTINEL' "$tmp/wb3.log" || true)" "0"
+
+  # (3) TAMPER (issue #134 containment, KEPT): the mounted credential came back DIFFERENT from what
+  # worker-prep materialized, so the read-only mount was defeated. Refuse everything: non-zero, no
+  # rotated=true, and `gh` never invoked — a poisoned document must never reach the central secret.
+  local wbroot4="$tmp/wbroot-tamper" wb_out4="$tmp/wb4-github-output" wb4_rc
+  mkdir -p "$wbroot4" "$tmp/wbcap4"
+  printf 'POISONED-BY-THE-MODEL' > "$wbroot4/current"
+  printf 'sk-ant-oat-mounted' > "$wbroot4/baseline"
+  printf 'POISONED-BY-THE-MODEL' > "$wbroot4/.credential-durable"
+  printf 'rotated\n' > "$wbroot4/.credential-rotated"
+  : > "$wb_out4"
+  if (
+    export WORKER_ROOT="$wbroot4" WORKER_CREDENTIAL_PATH="$wbroot4/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot4/baseline" \
+           WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out4" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap4"
+    write_back
+  ) > "$tmp/wb4.log" 2>&1; then wb4_rc=0; else wb4_rc=$?; fi
+  chk "write_back FAILS closed when the mounted credential was tampered with" \
+    "$([[ "$wb4_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "write_back tamper path never invokes gh (no poisoned secret write)" \
+    "$([[ -e "$tmp/wbcap4/argv" ]] && printf called || printf uncalled)" "uncalled"
+  chk "write_back tamper path does NOT report rotated=true" \
+    "$(grep -c '^rotated=true$' "$wb_out4" || true)" "0"
+  chk "write_back tamper path reports rotated=false" \
+    "$(grep -c '^rotated=false$' "$wb_out4" || true)" "1"
+
+  # --- HOST-SIDE PRE-FLIGHT, end to end through the REAL worker-prep.sh (issue #596). Hermetic:
+  # a stubbed CLI binary skips the npm install, and every fixture reaches its outcome with ZERO
+  # network egress (a comfortably-valid access token exchanges nothing; an empty stored refresh token
+  # is a remint condition that contacts nothing; the transient case points the LOOPBACK-ONLY endpoint
+  # seam at a closed local port). ---
+  _preflight_fixture() {
+    local root=$1 exp_offset=$2 refresh_value=$3
+    rm -rf -- "$root"
+    mkdir -p "$root/cli/node_modules/.bin"
+    printf '#!/bin/sh\nexit 0\n' > "$root/cli/node_modules/.bin/codex"
+    chmod +x "$root/cli/node_modules/.bin/codex"
+    python3 - "$exp_offset" "$refresh_value" <<'PY'
+import base64
+import json
+import sys
+import time
+
+offset, refresh_value = int(sys.argv[1]), sys.argv[2]
+enc = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+access = (f"{enc(b'{\"alg\":\"RS256\"}')}."
+          f"{enc(json.dumps({'exp': int(time.time()) + offset}).encode())}.sig")
+print(json.dumps({"OPENAI_API_KEY": None, "auth_mode": "chatgpt",
+                  "tokens": {"id_token": "ID_TOKEN_FIXTURE", "access_token": access,
+                             "refresh_token": refresh_value,
+                             "account_id": "00000000-0000-4000-8000-000000000000"},
+                  "last_refresh": "2026-07-25T00:00:00.000000000Z"}))
+PY
+  }
+
+  # (a) VALID stored access token: no exchange, and the MOUNTED file carries NO refresh material.
+  local pfroot="$tmp/pf-valid" pf_cred pf_rc pf_env="$tmp/pf-valid.env"
+  pf_cred=$(_preflight_fixture "$pfroot" 864000 'REFRESH-TOKEN-SENTINEL-VALID')
+  : > "$pf_env"
+  if (
+    export WORKER_ROOT="$pfroot" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf_env"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-valid.log" 2>&1; then pf_rc=0; else pf_rc=$?; fi
+  chk "(a) pre-flight on a valid stored access token succeeds" "$pf_rc" "0"
+  chk "(a) the MOUNTED credential's parsed key set is exactly what the CLI requires" \
+    "$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(",".join(sorted(d)), "|", ",".join(sorted(d["tokens"])))' "$pfroot/home/.codex/auth.json" 2>&1)" \
+    "OPENAI_API_KEY,auth_mode,last_refresh,tokens | access_token,account_id,id_token,refresh_token"
+  chk "(a) the MOUNTED credential's refresh_token key is EMPTY (parsed, not grepped)" \
+    "$(python3 -c '
+import json, sys
+print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/home/.codex/auth.json" 2>&1)" \
+    "''"
+  chk "(a) the refresh-token VALUE appears NOWHERE under the mounted worker HOME" \
+    "$(grep -rlc 'REFRESH-TOKEN-SENTINEL-VALID' "$pfroot/home" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  chk "(a) a valid access token performs NO exchange and leaves NO rotation marker" \
+    "$([[ -e "$pfroot/.credential-rotated" || -e "$pfroot/.credential-durable" ]] \
+      && printf rotated || printf clean)" "clean"
+  chk "(a) the pre-flight reports refreshed=false rotated=false" \
+    "$(grep -c 'pre-flight complete (refreshed=false, rotated=false)' "$tmp/pf-valid.log" || true)" "1"
+  chk "(b) the mounted credential is still mode 600 under the worker HOME" \
+    "$(stat -c '%a %n' "$pfroot/home/.codex/auth.json" 2>/dev/null | sed "s#$pfroot#ROOT#")" \
+    "600 ROOT/home/.codex/auth.json"
+  # (b) the read-only mount contract for that exact path is unchanged.
+  local pf_mount=()
+  mapfile -t pf_mount < <(_credential_mount_args "$pfroot" "$pfroot/home/.codex/auth.json")
+  chk "(b) the materialized path still builds the READ-ONLY in-HOME mount" \
+    "${pf_mount[*]}" \
+    "--mount type=bind,src=$pfroot/home/.codex/auth.json,dst=/home/worker/.codex/auth.json,readonly"
+
+  # (e) a DEAD stored grant (nothing to exchange) => the maintainer-action class, NOT `auth`.
+  local pfroot2="$tmp/pf-remint" pf2_rc pf2_env="$tmp/pf-remint.env"
+  pf_cred=$(_preflight_fixture "$pfroot2" -3600 '')
+  : > "$pf2_env"
+  if (
+    export WORKER_ROOT="$pfroot2" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf2_env"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-remint.log" 2>&1; then pf2_rc=0; else pf2_rc=$?; fi
+  chk "(e) a dead stored grant FAILS the pre-flight (fail closed)" \
+    "$([[ "$pf2_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "(e) it emits the credential-remint-required class, loudly" \
+    "$(grep -c '^::error::worker-prep: model-exit-class=credential-remint-required' "$tmp/pf-remint.log" || true)" "1"
+  chk "(e) it is NOT classified as auth" \
+    "$(grep -c 'model-exit-class=auth' "$tmp/pf-remint.log" || true)" "0"
+  chk "(e) the class reaches GITHUB_ENV for the health/alert machinery" \
+    "$(grep -c '^WORKER_EXIT_CLASS=credential-remint-required$' "$pf2_env" || true)" "1"
+  chk "(e) the loud class names NO account handle (locked decision 22b)" \
+    "$(grep -ci 'acctexample' "$tmp/pf-remint.log" || true)" "0"
+
+  # (f) a TRANSIENT endpoint failure: bounded retry, then the transient class (never remint).
+  local pfroot3="$tmp/pf-transient" pf3_rc pf3_env="$tmp/pf-transient.env"
+  pf_cred=$(_preflight_fixture "$pfroot3" -3600 'REFRESH-TOKEN-SENTINEL-TRANSIENT')
+  : > "$pf3_env"
+  if (
+    export WORKER_ROOT="$pfroot3" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf3_env" \
+           REGISTRY_TOKEN_ENDPOINT_OVERRIDE='http://127.0.0.1:1/oauth/token'
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-transient.log" 2>&1; then pf3_rc=0; else pf3_rc=$?; fi
+  chk "(f) an unreachable token endpoint FAILS the pre-flight after the bounded retry" \
+    "$([[ "$pf3_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "(f) it emits the credential-refresh-transient class" \
+    "$(grep -c '^::error::worker-prep: model-exit-class=credential-refresh-transient' "$tmp/pf-transient.log" || true)" "1"
+  chk "(f) a transient failure is NOT reported as remint-required" \
+    "$(grep -c 'credential-remint-required' "$tmp/pf-transient.log" || true)" "0"
+  chk "(f) the transient class reaches GITHUB_ENV" \
+    "$(grep -c '^WORKER_EXIT_CLASS=credential-refresh-transient$' "$pf3_env" || true)" "1"
+
+  # HONESTY of the classification: a prep failure that is NOT a refresh failure (here a malformed
+  # stored credential) must classify NOTHING — downstream then records the truthful `unknown`
+  # rather than a refresh class nobody observed.
+  local pfroot4="$tmp/pf-malformed" pf4_rc pf4_env="$tmp/pf-malformed.env"
+  _preflight_fixture "$pfroot4" 864000 'unused' >/dev/null
+  : > "$pf4_env"
+  if (
+    export WORKER_ROOT="$pfroot4" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL='not json at all' GITHUB_ENV="$pf4_env"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-malformed.log" 2>&1; then pf4_rc=0; else pf4_rc=$?; fi
+  chk "a NON-refresh prep failure still fails closed" \
+    "$([[ "$pf4_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "a NON-refresh prep failure classifies NOTHING (no invented refresh class)" \
+    "$(grep -c 'model-exit-class' "$tmp/pf-malformed.log" || true):$(grep -c 'WORKER_EXIT_CLASS' "$pf4_env" || true)" \
+    "0:0"
+
+  # (g) NO token material in ANY captured output of ANY pre-flight/write-back path above. Every
+  # fixture uses a distinctive sentinel, so this grep is non-vacuous: materializing the full
+  # auth.json, echoing the durable file, or logging the provider body all turn it red.
+  chk "(g) no refresh-token material in any captured pre-flight output" \
+    "$(grep -rlc 'REFRESH-TOKEN-SENTINEL' \
+        "$tmp/pf-valid.log" "$tmp/pf-remint.log" "$tmp/pf-transient.log" \
+        "$pf_env" "$pf2_env" "$pf3_env" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  chk "(g) no credential material in any captured write-back output" \
+    "$(grep -rlc 'ROTATED-SENTINEL\|POISONED-BY-THE-MODEL' \
+        "$tmp/wb.log" "$tmp/wb-fail.log" "$tmp/wb2.log" "$tmp/wb3.log" "$tmp/wb4.log" \
+        "$wb_out" "$wb_out2" "$wb_out3" "$wb_out4" "$wb_fail_out" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  # The PAT is a DELIBERATE exception and only in one shape: `::add-mask::<pat>` is the workflow
+  # command that makes the runner redact it everywhere after. Assert it appears ONLY there — a
+  # regression that printed it in a diagnostic would show up as a non-add-mask occurrence.
+  chk "(g) the registry PAT appears only inside ::add-mask:: workflow commands" \
+    "$(cat "$tmp/wb.log" "$tmp/wb-fail.log" "$tmp/wb2.log" "$tmp/wb3.log" "$tmp/wb4.log" \
+        "$wb_out" "$wb_out2" "$wb_out3" "$wb_out4" "$wb_fail_out" 2>/dev/null \
+        | grep -c 'fake-pat-value' || true):$(cat "$tmp/wb.log" "$tmp/wb-fail.log" "$tmp/wb2.log" \
+        "$tmp/wb3.log" "$tmp/wb4.log" "$wb_out" "$wb_out2" "$wb_out3" "$wb_out4" "$wb_fail_out" \
+        2>/dev/null | grep -c '^::add-mask::fake-pat-value$' || true)" "2:2"
+  chk "(g) the sentinel grep is NON-VACUOUS (it finds the durable file it is meant to guard)" \
+    "$(grep -lc 'ROTATED-SENTINEL' "$wbroot/.credential-durable" 2>/dev/null | wc -l | tr -d ' ')" "1"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
