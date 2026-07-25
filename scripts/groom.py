@@ -125,8 +125,11 @@ BAD_MERGE_STATES = {
 LABELS = {
     "status:ready": ("0e8a16", "Ready for trusted automated dispatch"),
     "status:deferred": ("d4c5f9", "Private-registry worker orchestration state"),
+    # Keep in sync with park_policy.MACHINE_PARK_DESCRIPTION: a machine park clears on a human
+    # unlabel OR on proven cause-recovery (registry #614 — the automatic re-admission path).
     "status:parked": ("1d76db",
-                      "Machine-owned capacity park (soft hold; cleared on readmission)"),
+                      "Machine-owned capacity park (soft hold; cleared by a human unlabel or "
+                      "proven recovery)"),
     "needs:user": ("b60205", "Human attention required"),
 }
 

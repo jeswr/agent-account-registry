@@ -2110,6 +2110,133 @@ def _read_model_health_window(model_health, registry_repo, now, api=None):
         return None
 
 
+def _capacity_recovery_probe(model_health, health_window, now):
+    """The recovery-evidence probe park_policy.capacity_park_admission calls with the canonical
+    stamp of the latest park application: model-health's per-account cause-recovery predicate over
+    the SAME validated health window the decline ladder and #604's auth cooldowns read (never a
+    parallel store). An unreadable window (None) or an unparseable park stamp yields no evidence,
+    which the admission reads as STAY PARKED."""
+    def probe(parked_at):
+        if health_window is None or not parked_at:
+            return None
+        parked_epoch = int(_park_policy.parse_ts(parked_at).timestamp())
+        return model_health.capacity_recovery_evidence(health_window, parked_epoch, now)
+
+    return probe
+
+
+def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_login, script_dir,
+                            worker_pr, evidence_probe, comments_fn=None, timeline_fn=None,
+                            post_comment=None, clear_labels=None, log=print):
+    """AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause has demonstrably
+    cleared (registry #614) — the sweep that closes the structural stall: a MACHINE-owned park
+    could only ever be cleared by a HUMAN, so a capacity outage stranded every PR it parked even
+    after the outage ended. Live evidence 2026-07-25: acct01 (the fleet's only cross-provider
+    review account) failed every review with exit-class=auth (#596) and capacity-parked registry
+    PRs #587/#590/#585/#593 + issues #574/#577/#582/#572 and 6 sparq PRs; the credential fix
+    restores capacity but recovers NONE of those parks without a hand-unlabel of each one.
+
+    Runs over the LIVE pull listing CLAIM already fetched, and only ever touches a MACHINE park:
+    a PR carrying a human-owned hold on either surface, or whose LATEST park application was made
+    by a proven human, is skipped by park_policy.capacity_park_admission itself. Ordering is
+    RECEIPT-FIRST like every other park write (#610 round-4 finding 2): the durable
+    AUTO_READMIT_MARKER receipt is posted BEFORE any label is cleared, so a crash between them
+    leaves receipt-no-label — which the receipt-driven proof gate admits and this sweep converges
+    on the next tick — never label-no-receipt, which would erase the re-admission from every proof
+    surface and re-strand the PR. Every failure is PER-PR: one unreadable PR never stops the rest.
+
+    Returns the number of PRs re-admitted this tick."""
+    comments_fn = comments_fn or _pr_comments
+    timeline_fn = timeline_fn or _issue_timeline_events
+    post_comment = post_comment or _run_gh_target_comment
+    if clear_labels is None:
+        def clear_labels(pr_number, issue_number):
+            # The SAME label writes a human readmission gesture triggers on the CLAIM path:
+            # review:parked -> review:needs on the PR, and status:parked cleared on the source
+            # issue. Both helpers are idempotent, so converging a crashed strip is safe.
+            _run_target_helper(script_dir, repo, "worker-pr.py", [
+                "review-state", "set", "--repo", repo, "--pr", str(pr_number),
+                "--state", "needs"])
+            if issue_number:
+                _run_target_helper(script_dir, repo, "worker-issue.py", [
+                    "status", "--repo", repo, "--issue", str(issue_number),
+                    "--status", "readmitted"])
+
+    rows = []
+    for page in pull_pages if isinstance(pull_pages, list) else []:
+        if isinstance(page, list):
+            rows.extend(row for row in page if isinstance(row, dict))
+    readmitted = 0
+    for row in sorted(rows, key=lambda row: row.get("number") or 0):
+        number = row.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        if row.get("state") != "open":
+            continue
+        head = row.get("head") or {}
+        if (head.get("repo") or {}).get("full_name") != repo \
+                or not HEAD_REF_RE.match(str(head.get("ref", ""))):
+            continue                      # not a same-repo worker branch — never ours to re-admit
+        login = str((row.get("user") or {}).get("login", ""))
+        if not bot_login or login != bot_login:
+            continue                      # only the trusted App bot's own worker PRs
+        try:
+            # EVERYTHING that can fail on hostile/degraded data lives inside the per-PR try: a
+            # malformed label list, an unreadable comments page, or a failed timeline read must
+            # skip THIS PR (its park simply stands) and never abort the sweep — the whole tick's
+            # claim runs under this call.
+            labels = set(_labels(row))
+            record = provenance.get(number)
+            issue_number = record.get("issue") if isinstance(record, dict) else None
+            if not isinstance(issue_number, int) or isinstance(issue_number, bool) \
+                    or issue_number <= 0:
+                issue_number = None
+            source_labels = set(issue_labels.get(issue_number, []) if issue_number else [])
+            if MACHINE_PARK_PR_LABEL not in labels and "status:parked" not in source_labels:
+                continue                  # no live machine park — nothing to re-admit
+            holds = sorted((HUMAN_HOLD_PR_LABELS & labels)
+                           | {label for label in source_labels
+                              if isinstance(label, str) and label.startswith("needs:")})
+            comments = comments_fn(repo, number)
+            # ONE timeline read per surface per PR: the admission consults the timelines several
+            # times (the human cutoff, the park applications, the ownership probe) and every read
+            # must see the SAME view anyway — a mid-decision change would mix two worlds.
+            timelines = {}
+
+            def cached_timeline(_repo, timeline_number, _cache=timelines):
+                if timeline_number not in _cache:
+                    _cache[timeline_number] = timeline_fn(_repo, timeline_number)
+                return _cache[timeline_number]
+
+            action, evidence, detail = _park_policy.capacity_park_admission(
+                repo, number, issue_number, cached_timeline,
+                is_human=lambda probe_login: _target_is_human_maintainer(repo, probe_login),
+                consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
+                auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
+                auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
+                auto_evidence=evidence_probe, live_holds=holds, log=log)
+            if action == "auto-mint":
+                # RECEIPT FIRST, then the labels (see the docstring).
+                post_comment(repo, number, worker_pr.auto_readmission_receipt(
+                    evidence["key"], evidence["at"]))
+                clear_labels(number, issue_number)
+                readmitted += 1
+                log(f"auto-readmit {repo}#{number}: machine capacity park cleared — {detail}")
+            elif action == "auto-receipt":
+                clear_labels(number, issue_number)
+                readmitted += 1
+                log(f"auto-readmit {repo}#{number}: converging an already-receipted automatic "
+                    f"re-admission — {detail}")
+            else:
+                log(f"park stands {repo}#{number}: {detail}"
+                    + (" (a human readmission gesture is proven; the CLAIM proof gate owns it)"
+                       if action == "human" else ""))
+        except (DispatchError, worker_pr.WorkerPrError) as exc:
+            log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
+                "park stands")
+    return readmitted
+
+
 def _issue_no_change_outcomes(model_health, records, issue):
     """Validated, in-window no_change rows for one target issue, newest last."""
     rows = [record for record in records
@@ -2355,9 +2482,10 @@ def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, 
     charged = len(worker_pr.marker_runs_since(
         comments, bot_login, "missed", round_number, cutoff))
     if charged != lifetime:
-        print(f"readmission window open for {repo}#{number}: a human unlabeled a park label "
-              f"at {cutoff}; the missed-fix budget for round {round_number} charges {charged} "
-              f"of {lifetime} recorded miss(es)")
+        print(f"readmission window open for {repo}#{number}: a park label was cleared at "
+              f"{cutoff} (a human unlabel or a proven automatic re-admission); the missed-fix "
+              f"budget for round {round_number} charges {charged} of {lifetime} recorded "
+              f"miss(es)")
     return charged, lifetime
 
 
@@ -2512,13 +2640,25 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # state can re-enumerate, but it can never mint budget or strip the park.
                 # Round-4 finding 2 pairs this with RECEIPT-FIRST park writers: a crash
                 # mid-park leaves receipt-no-label, which this gate still catches.
-                if not _park_policy.capacity_park_readmitted(
+                # The proof admits on EITHER authority (registry #614): an unconsumed
+                # proven-human readmission gesture (unchanged), or a bot-authored AUTOMATIC
+                # re-admission receipt that is newer than every park application — the durable
+                # gesture the readmission sweep left behind when it proved the starvation cause
+                # had cleared. Nothing is MINTED here (auto_evidence is not passed): this gate
+                # only reads proof, so re-admission still requires the sweep's evidence-gated,
+                # receipted decision.
+                park_action, _park_evidence, park_detail = \
+                    _park_policy.capacity_park_admission(
                         repo, number, issue_number, _issue_timeline_events,
                         is_human=lambda login: _target_is_human_maintainer(repo, login),
-                        consumed=park_receipts):
+                        consumed=park_receipts,
+                        auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
+                        auto_marker_count=worker_pr.auto_readmission_marker_count(
+                            comments, bot_login),
+                        live_holds=sorted(HUMAN_HOLD_PR_LABELS & set(labels)))
+                if not park_action:
                     print(f"defer review {repo}#{number}: machine capacity park stands "
-                          "(durable receipts/label; no unconsumed proven-human readmission "
-                          "gesture)")
+                          f"(durable receipts/label; {park_detail})")
                     continue
                 if MACHINE_PARK_PR_LABEL in labels:
                     # Proven gesture: converge the stale PR-side park back into the loop (the
@@ -2528,8 +2668,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "review-state", "set", "--repo", repo, "--pr", str(number),
                         "--state", "needs"])
-                    print(f"re-admit review {repo}#{number}: human readmission gesture "
-                          "proven; review:parked converged to review:needs")
+                    print(f"re-admit review {repo}#{number}: {park_detail}; review:parked "
+                          "converged to review:needs")
             if opened_sha != head_sha:
                 compare = _gh_json(["api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"])
                 if compare.get("status") not in {"identical", "ahead"}:
@@ -2662,14 +2802,24 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # marker budget further down, and both call sites must agree on one readmission
             # window per PR per tick — so the timeline is read at most once, and only when a
             # park decision actually hangs on it.
+            # [registry #614] The window is the LATER of the human gesture and any AUTOMATIC
+            # re-admission receipt on this PR. Clearing a machine park WITHOUT granting a budget
+            # window would leave the PR enumerable but permanently un-dispatchable: the missed-fix
+            # marker budget grows purely from allocator starvation, so an outage pins it and every
+            # later tick would re-derive the SAME exhausted lifetime count and quietly re-defer
+            # forever. An automatic re-admission therefore grants exactly the window a human
+            # gesture grants — bounded by the same two things that bound the re-admission itself
+            # (fresh unconsumed recovery evidence, and park_policy.AUTO_READMISSION_MAX).
             readmission_cutoff = _UNPROBED
 
             def _readmission_cutoff(_repo=repo, _number=number, _issue=issue_number):
                 nonlocal readmission_cutoff
                 if readmission_cutoff is _UNPROBED:
-                    readmission_cutoff = _park_policy.readmission_cutoff(
-                        _repo, _number, _issue, _issue_timeline_events,
-                        is_human=lambda login: _target_is_human_maintainer(_repo, login))
+                    readmission_cutoff = _park_policy.effective_readmission_cutoff(
+                        _park_policy.readmission_cutoff(
+                            _repo, _number, _issue, _issue_timeline_events,
+                            is_human=lambda login: _target_is_human_maintainer(_repo, login)),
+                        worker_pr.auto_readmission_stamps(comments, bot_login))
                 return readmission_cutoff
 
             budget_rounds = rounds
@@ -2678,8 +2828,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 if cutoff:
                     budget_rounds = worker_pr.count_rounds_since(comments, bot_login, cutoff)
                     if budget_rounds != rounds:
-                        print(f"readmission window open for {repo}#{number}: a human "
-                              f"unlabeled a park label at {cutoff}; the round budget charges "
+                        print(f"readmission window open for {repo}#{number}: a park label "
+                              f"was cleared at {cutoff} (a human unlabel or a proven "
+                              f"automatic re-admission); the round budget charges "
                               f"{budget_rounds} of {rounds} recorded round(s)")
             impl_provider = record["impl_provider"]
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
@@ -3381,9 +3532,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # labels, and the local provenance checkouts BEFORE anything launches; an item
         # whose crate re-reads busy (a parked draft went ready, a new worker PR opened)
         # defers to the next tick instead of racing a PR that can now merge into it.
+        # ONE live view per repo per tick, shared by the busy revalidation and the capacity-park
+        # readmission sweep below (they must not disagree about the live hold/linkage state, and
+        # the issue listing is a paginated API read worth spending once).
+        live_issue_labels = _live_issue_labels(repo)
+        claim_provenance = _claim_provenance_map(repo, registry_root, ledger_root)
         live_dispatchable = revalidate_items_against_live_pulls(
-            repository["items"], repo, pull_pages, _live_issue_labels(repo),
-            _claim_provenance_map(repo, registry_root, ledger_root),
+            repository["items"], repo, pull_pages, live_issue_labels, claim_provenance,
             # [round-5 P1] the cross-lane lease partition reads the ledger-branch checkout;
             # an unreadable ledger view yields None and the partition fails toward exclusion.
             leases=_ledger_leases(ledger_root), now=int(time.time()))
@@ -3395,6 +3550,29 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         _apply_disarm_items(
             [entry for entry in plan["disarm_items"] if entry["repo"] == repo],
             repo, script_dir, bot_login, lanes["disarm"])
+
+        # [registry #614] AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause
+        # has demonstrably cleared. It runs on the LIVE listing because PLAN's pure walk excludes
+        # every parked PR outright (nothing downstream can see them), and it re-admits by doing
+        # exactly what a human gesture does — receipt FIRST, then clear the machine label(s) — so
+        # the PR re-enters the ordinary enumeration next tick with a real budget window. Skipped
+        # without the App bot login or the target token: the receipts are bot-authored and the
+        # label writes need that token, and a re-admission that cannot be receipted must not
+        # happen. An unreadable health window re-admits NOTHING (fail closed).
+        if bot_login and _target_token(repo):
+            if not health_window_loaded:
+                health_window = _read_model_health_window(
+                    model_health, registry_repo, int(time.time()))
+                health_window_loaded = True
+            if health_window is None:
+                print(f"::warning::auto-readmit skipped for {repo}: the model-health window is "
+                      "unreadable, so no capacity park can prove its cause cleared — every park "
+                      "stands (fail closed)")
+            else:
+                _readmit_capacity_parks(
+                    repo, pull_pages, live_issue_labels, claim_provenance, bot_login,
+                    script_dir, worker_pr,
+                    _capacity_recovery_probe(model_health, health_window, int(time.time())))
 
         for item in repository["items"]:
             number = item["number"]
@@ -7563,6 +7741,157 @@ def _self_test():
     assert capacity_park_proof_required(["review:parked"], {"none"}) is True
     assert capacity_park_proof_required(["review:needs"], set()) is False
     assert capacity_park_proof_required([], set()) is False
+
+    # ---- [registry #614] the AUTOMATIC re-admission sweep: a MACHINE capacity park whose
+    # starvation cause has demonstrably cleared re-admits ITSELF, receipt-first. THE DEFECT it
+    # closes: only a HUMAN could clear a MACHINE-owned park, so the acct01 auth outage (#596)
+    # parked PRs that the credential fix could not recover — each needed a hand-unlabel. ----
+    model_health_mod = _load_module(
+        "registry_model_health_readmit", Path(__file__).resolve().parent / "model-health.py")
+    worker_pr_mod = _load_module(
+        "registry_worker_pr_readmit", Path(__file__).resolve().parent / "worker-pr.py")
+    readmit_bot = "sparq-orchestrator[bot]"
+    readmit_salt = "s3cret"
+    readmit_account = model_health_mod.account_hash("acct01", readmit_salt)
+    readmit_now = 1_800_000
+    park_epoch = readmit_now - 3600                 # the park landed an hour ago
+    park_stamp = model_health_mod._iso_z(park_epoch)
+
+    def health_record(cls, dt, run):
+        return model_health_mod.make_record("openai", readmit_account, "sol", cls, run,
+                                            readmit_now + dt)
+
+    # The live shape: the sole review account failed `auth` before the park, then recorded a
+    # SUCCESSFUL run after it (the credential fix landed).
+    recovered_window = [health_record("auth", -4000, "6001.1"),
+                        health_record("auth", -3800, "6002.1"),
+                        health_record(model_health_mod.SUCCESS, -600, "6003.1")]
+    still_broken_window = recovered_window[:2]
+    parked_row = {
+        "number": 41, "state": "open", "draft": True,
+        "user": {"login": readmit_bot},
+        "head": {"sha": "a" * 40, "ref": "sparq-agent/issue-7-abc",
+                 "repo": {"full_name": "example/repo"}},
+        "labels": [{"name": MACHINE_PARK_PR_LABEL}],
+    }
+    park_timeline = {
+        41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+              "created_at": park_stamp, "actor": {"login": readmit_bot},
+              "performed_via_github_app": None}],
+        7: [],
+    }
+
+    def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None):
+        """Run the sweep with every GitHub seam injected; returns (count, posted, cleared)."""
+        posted, cleared = [], []
+        count = _readmit_capacity_parks(
+            "example/repo", rows if rows is not None else [[parked_row]],
+            labels if labels is not None else {7: ["status:in-progress-review"]},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, window, readmit_now),
+            comments_fn=lambda _repo, _number: list(comments),
+            timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
+            post_comment=lambda _repo, number, body: posted.append((number, body)),
+            clear_labels=lambda pr, issue: cleared.append((pr, issue)),
+            log=lambda _line: None)
+        return count, posted, cleared
+
+    # A(a): the machine park + a post-park success on the failing account => re-admitted ONCE,
+    # RECEIPT FIRST, and the receipt names the evidence the admission consumed.
+    prev_target_probe = globals()["_target_is_human_maintainer"]
+    globals()["_target_is_human_maintainer"] = lambda _repo, login: login == "jeswr"
+    try:
+        count, posted, cleared = readmit_sweep(recovered_window)
+        assert count == 1 and cleared == [(41, 7)], (count, cleared)
+        assert len(posted) == 1 and posted[0][0] == 41, posted
+        receipt_body = posted[0][1]
+        assert worker_pr_mod.AUTO_READMIT_MARKER in receipt_body, receipt_body
+        assert f"openai/{readmit_account}/6003.1" in receipt_body, receipt_body
+        assert "acct01" not in receipt_body, receipt_body
+        print("  ok   auto-readmit (a): proven cause-recovery re-admits a machine park, "
+              "receipt-first")
+        # A(b): the SAME evidence, now receipted, never re-admits again — and because the receipt
+        # is not superseded by a NEWER park it converges the label strip idempotently instead.
+        receipted = [{"user": {"login": readmit_bot}, "body": receipt_body}]
+        count, posted, cleared = readmit_sweep(recovered_window, comments=receipted)
+        assert count == 1 and posted == [] and cleared == [(41, 7)], (count, posted, cleared)
+        print("  ok   auto-readmit (b): a receipted re-admission consumes NO new evidence "
+              "(converge only)")
+        # ... and once a NEWER park application supersedes that receipt, the same evidence is
+        # refused outright: a fresh park needs a fresh outage-and-recovery pair.
+        superseded = {41: park_timeline[41] + [
+            {"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+             "created_at": model_health_mod._iso_z(readmit_now - 60),
+             "actor": {"login": readmit_bot}, "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(recovered_window, comments=receipted,
+                                              timeline=superseded)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (b): the SAME evidence cannot re-earn a re-admission after a "
+              "NEW park")
+        # A(c): no post-park success => the park stands, nothing is written.
+        count, posted, cleared = readmit_sweep(still_broken_window)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (c): no proven recovery => the park stands, no mutation")
+        # A(d): an unreadable health window => the park stands (the probe yields no evidence).
+        count, posted, cleared = readmit_sweep(None)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        # ... as does a malformed record inside the window.
+        poisoned = recovered_window + [dict(recovered_window[-1], exit_class="totally-new")]
+        count, posted, cleared = readmit_sweep(poisoned)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (d): an unreadable/ambiguous health record => the park stands")
+        # A(e): a HUMAN-owned hold on EITHER surface is never auto-re-admitted.
+        human_pr = dict(parked_row, labels=[{"name": MACHINE_PARK_PR_LABEL},
+                                            {"name": "review:needs-user"}])
+        count, posted, cleared = readmit_sweep(recovered_window, rows=[[human_pr]])
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(
+            recovered_window, labels={7: ["status:parked", "needs:user"]})
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a human-owned hold on either surface is never "
+              "auto-re-admitted")
+        # A(e'): a park the MAINTAINER applied is human-owned — only a human clears it.
+        human_park = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                            "created_at": park_stamp, "actor": {"login": "jeswr"},
+                            "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(recovered_window, timeline=human_park)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a MAINTAINER-applied park is never auto-re-admitted")
+        # A(g): the per-PR cap terminates — AUTO_READMISSION_MAX markers (well-formed or not)
+        # refuse the next re-admission even with fresh evidence.
+        capped = [{"user": {"login": readmit_bot},
+                   "body": f"x {worker_pr_mod.AUTO_READMIT_MARKER} evidence=openai/x/{i} "
+                           f"at=zzz -->"}
+                  for i in range(_park_policy.AUTO_READMISSION_MAX)]
+        count, posted, cleared = readmit_sweep(recovered_window, comments=capped)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (g): the per-PR automatic cap terminates the loop")
+        # Trust boundary: a NON-bot PR, a fork head, and a PR with no live machine park are all
+        # invisible to the sweep.
+        for invisible in (dict(parked_row, user={"login": "drive-by"}),
+                          dict(parked_row, head={**parked_row["head"],
+                                                 "repo": {"full_name": "fork/repo"}}),
+                          dict(parked_row, labels=[{"name": "review:needs"}]),
+                          dict(parked_row, state="closed")):
+            count, posted, cleared = readmit_sweep(recovered_window, rows=[[invisible]],
+                                                   labels={7: []})
+            assert (count, posted, cleared) == (0, [], []), (invisible, count, posted, cleared)
+        print("  ok   auto-readmit: non-bot / fork / unparked / closed PRs are invisible")
+        # A per-PR failure never stops the sweep: an unreadable comments read skips ONE PR.
+        def boom_comments(_repo, _number):
+            raise DispatchError("comments unavailable")
+
+        skipped = _readmit_capacity_parks(
+            "example/repo", [[parked_row]], {7: []}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            worker_pr_mod, _capacity_recovery_probe(model_health_mod, recovered_window,
+                                                    readmit_now),
+            comments_fn=boom_comments,
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None)
+        assert skipped == 0, skipped
+        print("  ok   auto-readmit: an unreadable PR skips only itself (per-PR resilience)")
+    finally:
+        globals()["_target_is_human_maintainer"] = prev_target_probe
 
     # ---- round-3 Opus finding: a maintainer probe-CALL failure emits the distinct loud
     # ::warning:: diagnostic (and still fails toward not-human); a genuine not-a-maintainer
