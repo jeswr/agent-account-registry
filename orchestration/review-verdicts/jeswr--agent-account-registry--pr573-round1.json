@@ -1,0 +1,65 @@
+{
+ "host_envelope": {
+  "pr": 573,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3a2d7b34cc23b09b0a75017bf4ca7b5ee0eef25b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Lines 85-87:\n\n  if ! git show '<base.sha>:scripts/selftest-suite.txt' > \"$base_manifest\" 2>/dev/null; then\n    cp scripts/selftest-suite.txt \"$base_manifest\"\n  fi\n\n`git show <sha>:<path>` fails identically for two very different causes: (a) the base commit resolves but does not contain the path (the real bootstrap), and (b) the base commit is not resolvable at all -- base branch force-pushed after the pull_request event fired, a partial/failed fetch, or any transient git error. In case (b) the workflow substitutes the PR's OWN head manifest as the protected baseline, so every enrolled entry is trivially found and the removal check becomes a tautology: a PR deleting suite entries passes with no base-branch approval.\n\nThe comment asserts \"Bootstrap only\", but nothing enforces that -- and the condition stays permanently live in the workflow after this PR merges. This is the same silent-fall-through-to-permissive class the PR is otherwise deleting (the `[[ -f ]]` skip removed six lines above). A trust check must DIE on an unresolvable base, not fall back to a self-supplied baseline.\n\nSame reasoning applies to the retirements fallback on lines 88-90, though `: > \"$base_retirements\"` fails closed (empty approvals) and is fine on its own -- it is only neutered because the manifest fallback removes anything for it to reject.",
+    "file": ".github/workflows/pr-gate.yml",
+    "fix_hint": "Distinguish the two failure causes before falling back. e.g.\n\n  base='${{ github.event.pull_request.base.sha }}'\n  git cat-file -e \"$base^{commit}\" 2>/dev/null || {\n    echo \"::error::base commit $base is unresolvable - refusing to derive the self-test suite\"; exit 1; }\n  if git cat-file -e \"$base:scripts/selftest-suite.txt\" 2>/dev/null; then\n    git show \"$base:scripts/selftest-suite.txt\" > \"$base_manifest\"\n  else\n    cp scripts/selftest-suite.txt \"$base_manifest\"   # genuine bootstrap only\n  fi\n\nand the same `cat-file -e` split for the retirements file. Better still, file a follow-up to delete the bootstrap branch entirely once this PR is on master, so an absent base manifest becomes a hard failure.",
+    "severity": "major",
+    "title": "Bootstrap fallback silently disables the retirement gate on ANY git show failure, not just the bootstrap case"
+   },
+   {
+    "body": "Lines 800-811:\n\n  if [[ -n \"$baseline_manifest\" ]]; then\n    approved=$(_read_selftest_list \"$baseline_retirements\") || { ...; return 1; }\n    while IFS= read -r required; do\n      ...\n    done < <(_read_selftest_list \"$baseline_manifest\")\n  fi\n\n`_read_selftest_list` returns 1 when the file does not exist, but inside `< <(...)` that status is unobservable -- the while loop simply iterates zero times and the function falls through to success. So passing a non-empty path that does not exist (or is unreadable) disables the entire retirement check silently, while the caller believes it requested baseline enforcement. The line immediately above proves the author knew to check this status for the retirements file; the manifest read gets no such check.\n\nThis is unreachable from today's pr-gate.yml only because that workflow always materializes the file -- but `print-selftest-suite` is now a public subcommand taking both paths as argv, and the guard should hold for any caller. It is also untested: no self-test exercises a missing baseline_manifest or a missing baseline_retirements file.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Read the baseline into a variable with a checked status, mirroring the `approved=` line:\n\n  baseline=$(_read_selftest_list \"$baseline_manifest\") || {\n    printf 'base-branch self-test manifest is unavailable: %s\\n' \"$baseline_manifest\" >&2; return 1; }\n\nthen iterate `while IFS= read -r required; do ...; done <<< \"$baseline\"` (guarding the empty case). Add two self-test cases: baseline_manifest pointing at a nonexistent path is REFUSED, and baseline_retirements pointing at a nonexistent path is REFUSED.",
+    "severity": "major",
+    "title": "_derive_full_selftest_suite discards the baseline-manifest read status: a missing baseline silently passes the removal check"
+   },
+   {
+    "body": "`FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite \"$SCRIPT_DIR\" \"$SELFTEST_MANIFEST\")` (line 816) supplies no baseline, so `registry_selftest_gate` -- the local pre-PR gate a worker runs before publishing -- accepts a suite entry removal that pr-gate.yml would refuse. A `.txt`-only diff also produces zero `targets`, so the `direct == #targets` non-vacuity assertion is 0-eq-0 and the change lands green locally with nothing but the regression backstop.\n\nNot a blocker (pr-gate.yml is the REQUIRED check and does enforce it), but it means the failure surfaces only after the PR is opened, and it leaves the enforcement in exactly one place. `SELFTEST_RETIREMENTS` is assigned at line 755 and then never read by anything, which reads as an intent that was not wired up.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Either wire the local gate to the merge-base (e.g. derive base_manifest/base_retirements from `git show \"$(git merge-base HEAD origin/master)\":scripts/...` when a base ref is available, and skip only when it demonstrably is not), or drop the unused `SELFTEST_RETIREMENTS` assignment and add a comment stating explicitly that removal approval is enforced only by pr-gate.yml.",
+    "severity": "minor",
+    "title": "The worker-side registry_selftest_gate never passes a baseline, so the two gates disagree on removals"
+   },
+   {
+    "body": "The discovery regex in `_derive_full_selftest_suite` accepts a shell script advertising either `self-test)` or `--self-test|self-test)`. The pr-gate dispatch (lines 94-99) instead hardcodes `migrate-secrets.sh` -> `--self-test` and `*.sh` -> `self-test`. A newly enrolled shell script that advertises only `--self-test)` will therefore be auto-enrolled by discovery and then invoked as `bash scripts/x.sh self-test`, hitting its usage/`*)` branch.\n\nIt fails closed, so this is not a security hole -- but it fails for the wrong reason with a confusing message, and it is a per-script special case in a file the PR is otherwise trying to make data-driven.",
+    "file": ".github/workflows/pr-gate.yml",
+    "fix_hint": "Normalize the convention instead of special-casing the name: either try `bash \"scripts/$s\" self-test || bash \"scripts/$s\" --self-test` (with both failures fatal), or tighten the .sh discovery regex to require the bare `self-test)` form and change migrate-secrets.sh to accept it, so discovery and invocation agree by construction.",
+    "severity": "minor",
+    "title": "Shell dispatch hardcodes migrate-secrets.sh by name; a future --self-test-only script is invoked with the wrong argv"
+   },
+   {
+    "body": "`for s in $suite; do ... done` runs zero iterations and exits 0 if `$suite` is ever empty. Today `_derive_full_selftest_suite` guarantees a non-empty result (empty-manifest guard at line 771 and `((${#suite[@]} > 0))` at line 812), so this is currently safe -- but the list is now DATA supplied by the PR under review rather than a literal in the workflow, and the step itself no longer asserts that it actually ran anything. The old hardcoded list had the same shape, but it could not be shrunk by the diff.",
+    "file": ".github/workflows/pr-gate.yml",
+    "fix_hint": "Count and assert inside the step, e.g. increment `n` per iteration and finish with:\n\n  [ \"$n\" -eq \"$(printf '%s\\n' $suite | wc -l)\" ] && [ \"$n\" -gt 0 ] || { echo '::error::self-test suite ran vacuously'; exit 1; }\n  echo \"ran $n self-tests\"\n\nso the step is non-vacuous by construction regardless of what the manifest says.",
+    "severity": "minor",
+    "title": "The suite loop has no non-vacuity assertion of its own"
+   },
+   {
+    "body": "`sed -e 's/[[:space:]]*#.*//' -e '/^[[:space:]]*$/d'` strips a trailing comment and blank lines but never trims leading/trailing whitespace on a bare entry. An entry written as `advertised.py ` (trailing space) survives verbatim; the forward loop (`for required in $enrolled`) word-splits and passes, but the reverse `grep -Fxq \"$required\" <<< \"$enrolled\"` compares whole lines and fails, so the gate refuses a correct manifest with the misleading message \"advertising script X is not enrolled in the manifest\". Fails closed, but diagnoses the wrong thing.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Add trims to the sed program: `-e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'` before the blank-line delete.",
+    "severity": "nit",
+    "title": "_read_selftest_list does not trim surrounding whitespace"
+   },
+   {
+    "body": "The new control -- \"add the approval on the base branch in one PR, retire the test in a later PR\" -- is a real process rule for every future contributor, but it is recorded only as a two-line comment inside the approvals file itself. Nothing in the README or the runbooks mentions scripts/selftest-suite.txt or scripts/selftest-retirements.txt (I grepped; there are no other references anywhere in the repo), so a contributor first meets it as a gate failure.",
+    "file": "scripts/selftest-retirements.txt",
+    "fix_hint": "Add a short paragraph to the contributor/runbook docs covering: the manifest is authoritative and bidirectionally checked against discovery, adding a self-testing script requires enrolling it in the same PR, and removing one requires a prior base-branch approval line in selftest-retirements.txt.",
+    "severity": "nit",
+    "title": "The two-PR retirement procedure is documented only in this file's header comment"
+   }
+  ],
+  "progress": null,
+  "summary": "Solid direction and the manifest content is correct: I recomputed the advertised set with the exact discovery regexes over the checkout and it is EXACTLY the 33 entries in scripts/selftest-suite.txt (31 .py + migrate-secrets.sh + worker-live.sh), a strict superset of the 28 the old hardcoded pr-gate.yml list ran, and account-login.sh/worker-prep.sh correctly stay out. The bidirectional manifest<->discovery check is real, the new self-tests are NON-VACUOUS (both refuse and accept legs; deleting the approval logic flips 'atomic script-and-entry deletion without prior approval is refused' red), no dangling references to the removed EXPECTED_SELFTEST_SUITE/SELFTEST_DENYLIST remain, and both new .txt files sit under the scripts/ prefix of DEFAULT_TRUST_SURFACE_PATHS so they are trust-surface-audited. Two fail-OPEN paths block approval. (1) pr-gate.yml's bootstrap `cp scripts/selftest-suite.txt` fires on ANY `git show` failure, not just the genuine bootstrap: an unresolvable base.sha (base-branch force-push after the event, partial fetch, transient git error) makes baseline == head, turning the removal check into a tautology. (2) `_derive_full_selftest_suite` discards the exit status of `_read_selftest_list \"$baseline_manifest\"` in the process substitution, so a missing/unreadable baseline silently yields zero iterations and passes -- the line directly above it checks the same call's status for the retirements file. Both are the exact silent-skip class this PR is otherwise removing (the `[[ -f ]]` skip), and neither is covered by a test. Note also that the suite is now a single list derived by head-controlled code, so the retirement rule is a guard against accidental removal, not a hostile one -- fine, but it makes the fail-open paths matter more.",
+  "verdict": "request_changes"
+ }
+}
