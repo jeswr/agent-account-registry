@@ -141,7 +141,11 @@ INFRA_SURFACE_LABELS = ("area:ci", "area:workflows")
 # The first three groups are REDUNDANT today — an earlier lane short-circuits before the fallback
 # is reached — and are listed anyway so this table is the one complete registry-area map, and so a
 # future narrowing of SEC_KEYWORDS/UI/INFRA cannot silently reopen the roleless hole. `_self_test`
-# asserts each entry AGREES with the lane that actually wins, so the redundancy can never drift.
+# asserts each entry AGREES with the lane that actually wins, so the redundancy can never drift, and
+# (#597 review finding 3) pins this map — keys and values — to an INDEPENDENT literal plus a
+# per-area lane attribution, so neither an added/removed row nor a re-pointed value can pass by
+# supplying its own expectation. An area OUTSIDE this map makes the whole derivation fail closed
+# (see _area_default): a surface the map cannot classify is unresolved, not absent.
 # Trust-plane entries reference TRUST_PLANE_ROLE rather than a literal: #582 established that
 # `role:soundness` DOES NOT EXIST in this repository, and that constant is the single place that
 # decision lands. Hard-coding the literal here would let this table write a nonexistent label and
@@ -181,11 +185,27 @@ def _valid_priority(labels):
 
 
 def _area_default(labels):
-    """The role ALL of the issue's known `area:<value>` labels agree on; None when they disagree
-    (fail-closed: never an arbitrary pick — an ambiguous issue stays `status:untriaged` for a
-    human) or when no area is in the table."""
-    roles = {AREA_ROLE_DEFAULT[lb[5:]] for lb in labels
-             if lb.startswith("area:") and lb[5:] in AREA_ROLE_DEFAULT}
+    """The role ALL of the issue's `area:<value>` labels agree on; None whenever that cannot be
+    established — the mapped areas disagree, no `area:*` label is present, or ANY `area:*` label is
+    OUTSIDE the table.
+
+    FAIL-CLOSED ON PARTIAL CLASSIFICATION TOO (#597 cross-provider review finding 1). The first
+    form of this predicate SILENTLY DROPPED unmapped `area:*` labels and let the single mapped role
+    win, so `["area:usage", "area:mystery"]` derived `impl`: an issue spanning one understood surface
+    and one this map does not describe was admitted to `status:ready` under a role nobody chose for
+    the unknown half. That is an admission predicate failing toward the PERMISSIVE side, which is
+    the opposite of the posture the rest of this module holds — and it is the direction that hurts,
+    because the fail-closed outcome (stay `status:untriaged` until a human labels it) is cheap and
+    reversible while a mis-routed dispatch is not. An area this table cannot classify is an
+    UNRESOLVED area, not an absent one."""
+    areas = [lb[len("area:"):] for lb in labels if lb.startswith("area:")]
+    if not areas:
+        return None
+    roles = set()
+    for area in areas:
+        if area not in AREA_ROLE_DEFAULT:
+            return None
+        roles.add(AREA_ROLE_DEFAULT[area])
     return next(iter(roles)) if len(roles) == 1 else None
 
 
@@ -633,10 +653,52 @@ def _self_test():
         triage(["priority:P1", "area:ci", "area:dispatch"], "feature")["role"], TRUST_PLANE_ROLE)
     # [OPUS-5] issue #225: EVERY registry area derives a role even when the issue TYPE is unknown
     # (an untyped issue fell through `ROLE_BY_TYPE.get(...)` to None, and a roleless issue is
-    # invisible to the dispatch enumerator). Each check ALSO asserts the table agrees with the lane
-    # that actually wins for that area — SEC_KEYWORDS/INFRA/UI short-circuit before the fallback,
-    # so a divergent entry here would flip the check red rather than sit unnoticed. Non-vacuous:
-    # pre-fix, area:usage/area:docs returned None for an unknown type.
+    # invisible to the dispatch enumerator).
+    #
+    # #597 review finding 3: the inventory AND the expectations used to come from AREA_ROLE_DEFAULT
+    # itself — deleting an entry deleted its own test, and changing a value changed actual and
+    # expected together — so it substantiated neither "the one complete registry-area map" nor the
+    # redundancy claim in the table's comment. The map is therefore PINNED to an INDEPENDENT literal
+    # here: adding, removing or re-pointing an area now requires editing this test deliberately.
+    # (The trust-plane rows are pinned to TRUST_PLANE_ROLE by NAME on purpose — #582 established
+    # that `role:soundness` does not exist and that constant is the single place that decision
+    # lands; the "every derivable role is a real label" check below is what proves it names a label
+    # this repository actually has.)
+    chk("[#225] AREA_ROLE_DEFAULT is exactly this map (pinned independently of the table)",
+        dict(sorted(AREA_ROLE_DEFAULT.items())),
+        {"ci": "ci", "dashboard": "site", "dispatch": TRUST_PLANE_ROLE, "docs": "docs",
+         "groom": TRUST_PLANE_ROLE, "review-loop": TRUST_PLANE_ROLE,
+         "set-up-account": TRUST_PLANE_ROLE, "usage": "impl", "workflows": "ci",
+         "worker": TRUST_PLANE_ROLE})
+
+    # The table's comment claims the first three groups are REDUNDANT TODAY (an earlier lane
+    # short-circuits before the fallback is reached) and that only the residual surfaces are
+    # reachable THROUGH the table. That claim is now asserted, not asserted-about: this is which
+    # lane actually decides each area for an untyped issue. A future narrowing of
+    # SEC_KEYWORDS/UI/INFRA moves a row here and flips this check red — which is precisely the
+    # drift the comment says the redundancy guards against.
+    def _lane(area):
+        label = f"area:{area}"
+        if any(keyword in label for keyword in SEC_KEYWORDS):
+            return "trust"
+        if label in UI_SURFACE_LABELS:
+            return "ui"
+        if label in INFRA_SURFACE_LABELS:
+            return "infra"
+        return "fallback"
+
+    chk("[#225] exactly which areas REACH the fallback (the rest short-circuit earlier)",
+        {area: _lane(area) for area in sorted(AREA_ROLE_DEFAULT)},
+        {"ci": "infra", "dashboard": "ui", "dispatch": "trust", "docs": "fallback",
+         "groom": "trust", "review-loop": "trust", "set-up-account": "trust",
+         "usage": "fallback", "workflows": "infra", "worker": "trust"})
+    # Every row exercises the TABLE itself (not just the two rows that reach the fallback in
+    # _role()), so a wrong value cannot hide behind an earlier lane...
+    for _area, _want in sorted(AREA_ROLE_DEFAULT.items()):
+        chk(f"_area_default resolves area:{_area} through the table",
+            _area_default([f"area:{_area}"]), _want)
+    # ...and each area still derives the SAME role end to end through triage(), so the table can
+    # never disagree with the lane that actually wins.
     for _area, _want in sorted(AREA_ROLE_DEFAULT.items()):
         chk(f"area:{_area} derives a role when untyped",
             triage(["priority:P2", f"area:{_area}"], "")["role"], _want)
@@ -647,6 +709,20 @@ def _self_test():
     # AMBIGUOUS area defaults -> no role at all (fail closed), never an arbitrary pick.
     chk("conflicting area defaults -> no role",
         triage(["priority:P2", "area:usage", "area:docs"], "")["role"], None)
+    # #597 review finding 1: a MIXED mapped/unmapped area set is ALSO ambiguous. The first form let
+    # the one mapped role win here (`impl`) — an admission predicate failing toward the permissive
+    # side on PARTIAL classification. Non-vacuous: it derived "impl" before the fix, and the issue
+    # therefore went `status:ready` under a role nobody chose for its unknown surface.
+    chk("[#597] mapped + UNMAPPED area -> no role (partial classification fails closed)",
+        (triage(["priority:P2", "area:usage", "area:mystery"], "")["role"],
+         triage(["priority:P2", "area:usage", "area:mystery"], "")["ready"]),
+        (None, False))
+    chk("[#597] and _area_default itself refuses the mixed set, in both label orders",
+        (_area_default(["area:usage", "area:mystery"]),
+         _area_default(["area:mystery", "area:usage"]),
+         _area_default(["area:usage", "area:usage"]),
+         _area_default(["area:"]), _area_default([])),
+        (None, None, "impl", None, None))
     # the area default is LAST: an explicit role, a kind, the UI/infra lanes and the type map win.
     chk("type map wins over area default",
         triage(["priority:P3", "area:usage"], "spike")["role"], "research")

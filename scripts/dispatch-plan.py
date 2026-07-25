@@ -12,6 +12,7 @@ PURE, read-only planner: walks the conflict-free, priority-ordered ready frontie
 triggers a worker (the credential-gated seam lives in the registry's dispatch-claim.py).
 """
 import argparse
+import io
 import os
 import sys
 
@@ -259,7 +260,7 @@ def _self_test():
         iss(25, R + ["priority:P1", "area:dispatch"], state="CLOSED"),     # closed
         iss(26, R + ["priority:P1", "area:review-loop"], blk=1),           # open blocker
     ]
-    chk("roleless-ready reported", roleless_ready(invisible), [20])
+    chk("roleless-ready computes the invisible set", roleless_ready(invisible), [20])
     # non-vacuous pairing: #20 is EXACTLY the issue the frontier cannot see for want of a role —
     # the only ready row it plans is the role-carrying #21.
     chk("roleless-ready is the frontier's blind spot",
@@ -267,6 +268,67 @@ def _self_test():
     # a fully-labelled ready frontier reports NOTHING (no false alarm on a healthy tick).
     chk("healthy frontier -> no roleless", roleless_ready(
         [iss(27, R + ["priority:P1", "role:impl", "area:usage"])]), [])
+
+    # #597 review finding 2: the LOUD half of this fix — the half issue #225 actually asks for —
+    # had NO coverage. `roleless_ready(invisible) == [20]` tests the PURE computation; delete the
+    # `::warning::` block from dispatch.yml and `_print_roleless(...)` from main() and every check
+    # above stays green while the silent-invisibility failure is fully restored. So assert the
+    # REPORTING: the rendered text, at a nonzero AND a zero count, through the real main()
+    # entrypoint, plus the workflow-side wiring.
+    def _captured(fn, *args):
+        buffer, saved = io.StringIO(), sys.stdout
+        try:
+            sys.stdout = buffer
+            fn(*args)
+        finally:
+            sys.stdout = saved
+        return buffer.getvalue()
+
+    loud = _captured(_print_roleless, [20, 26])
+    chk("[#225] the roleless report NAMES the count, the issues and the consequence",
+        ("2 status:ready issue(s) carry NO role:* label" in loud, "#20" in loud, "#26" in loud,
+         "INVISIBLE" in loud, "role:* label" in loud),
+        (True, True, True, True, True))
+    quiet = _captured(_print_roleless, [])
+    chk("[#225] the roleless report is printed even at ZERO (never a silent healthy tick)",
+        ("ready-but-roleless issues: 0" in quiet, quiet.strip() != ""), (True, True))
+
+    # ...and through main() --dry-run itself, so "the planner can compute it" can never stand in for
+    # "the plan EMITS it". The two live reads (`gh` issue fetch, routing.toml) are the only things
+    # stubbed; main()'s own code path is the real one.
+    def _main_dry_run(issues):
+        saved = (sys.argv, _ready._fetch, globals()["_routing_doc"])
+        try:
+            sys.argv = ["dispatch-plan.py", "--dry-run"]
+            _ready._fetch = lambda repo, *a, **k: list(issues)
+            globals()["_routing_doc"] = lambda: doc
+            return _captured(main)
+        finally:
+            sys.argv, _ready._fetch, globals()["_routing_doc"] = saved
+
+    reported = _main_dry_run(invisible)
+    chk("[#225] main() --dry-run REPORTS the invisible issues alongside the plan",
+        ("1 status:ready issue(s) carry NO role:* label" in reported, "#20" in reported,
+         "would be dispatched" in reported), (True, True, True))
+    healthy = _main_dry_run([iss(28, R + ["priority:P1", "role:impl", "area:usage"])])
+    chk("[#225] main() --dry-run prints the zero line on a healthy board",
+        "ready-but-roleless issues: 0" in healthy, True)
+
+    # The scheduled path is dispatch.yml's PLAN job, not main(): assert IT calls the planner's
+    # roleless enumeration and emits the loud annotation. Comments are stripped first — this file's
+    # own prose mentions `roleless_ready`, and a claim in a comment must never satisfy a wiring
+    # check (the same vacuity class as #616 findings 3-4).
+    workflow = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            ".github", "workflows", "dispatch.yml")
+    with open(workflow, encoding="utf-8") as fh:
+        executable = "\n".join(line for line in fh.read().splitlines()
+                               if not line.lstrip().startswith("#"))
+    chk("[#225] the PLAN job calls the planner's roleless enumeration and reports it LOUDLY",
+        ('getattr(dispatch, "roleless_ready"' in executable,
+         "roleless_fn(readiness_input)" in executable,
+         "are INVISIBLE to dispatch" in executable,
+         "ready-but-roleless issues: 0" in executable),
+        (True, True, True, True))
 
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
     # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
