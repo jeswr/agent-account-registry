@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 573,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6afd81112dcef3a1e93a359bfd4820aefb4a9039",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Line 2393-2395 asserts REFUSED for manifest=advertised.py, baseline={advertised.py, advertised.sh}, approvals=$tmp/missing-approvals.\n\nThat fixture already contains a removal (advertised.sh is on the baseline and not in the manifest). With the `approved=... || return 1` guard deleted, `approved` is empty and the removal loop refuses anyway -- and because the file has `set -euo pipefail`, an unguarded failing assignment would abort the subshell, which the `|| echo refused` also turns into \"refused\". So the assertion cannot distinguish the guard's presence from its absence; it is non-discriminating for the behaviour its name claims.\n\nThis is not a correctness problem -- the guard is present and the path is fail-closed either way -- but the sibling `missing base manifest is refused` case IS discriminating, and this one silently is not, so a future regression on the approvals read would land green.\n\n(Note the underlying asymmetry: a missing approvals file and an empty approvals file are outcome-identical because empty approvals deny everything. The guard's real value is diagnosing a pr-gate plumbing failure, which is worth keeping.)",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Make the fixture a NO-REMOVAL case so the guard is the only thing that can refuse:\n\n  printf '%s\\n' advertised.py > \"$manifest_fixture\"\n  cp \"$manifest_fixture\" \"$baseline_fixture\"   # baseline == manifest, nothing retired\n  chk \"missing base retirement approvals are refused\" \\\n    \"$( (_derive_full_selftest_suite \"$suite_fixture\" \"$manifest_fixture\" \"$baseline_fixture\" \"$tmp/missing-approvals\" >/dev/null 2>&1 && echo accepted) || echo refused)\" \\\n    \"refused\"\n\nWithout the guard that call reaches the loop with zero removals to check and returns SUCCESS, so the assertion flips red. Restore $baseline_fixture afterwards if later cases depend on it.",
+    "severity": "nit",
+    "title": "The \"missing base retirement approvals are refused\" test passes whether or not the guard it names exists"
+   },
+   {
+    "body": "Carried over from round 1 at reduced severity. Line 106 special-cases `migrate-secrets.sh) bash \"scripts/$s\" --self-test`, but scripts/migrate-secrets.sh:2747 is `--self-test | self-test) self_test ;;` -- it accepts the bare form, so the generic `*.sh)` branch on line 107 would handle it identically. The branch is dead.\n\nThe residual gap is the one round 1 named: the .sh discovery regex in worker-live.sh accepts `--self-test)` OR `self-test)`, while invocation always passes bare `self-test` (once the dead branch is gone). A future script advertising only `--self-test)` is auto-enrolled by discovery, passes the bidirectional manifest check, and then fails at invocation with a usage error rather than a self-test failure. It fails CLOSED, so this is diagnostics quality, not a hole -- and worker-live.sh:1090 has the same coupling for the local gate, so the convention is at least consistent across both callers.",
+    "file": ".github/workflows/pr-gate.yml",
+    "fix_hint": "Drop line 106 (it is unreachable given migrate-secrets.sh accepts the bare form) and make discovery and invocation agree by construction: tighten the .sh discovery regex in `_derive_full_selftest_suite` to require the bare `self-test)` form, so a `--self-test)`-only script is never enrolled in the first place. Alternatively keep the regex and try `bash \"scripts/$s\" self-test || bash \"scripts/$s\" --self-test`, treating both failures as fatal.",
+    "severity": "nit",
+    "title": "The migrate-secrets.sh dispatch branch is now dead code, and the .sh convention is still enforced only by convention"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Both round-1 majors are genuinely fixed, and I re-verified the manifest independently rather than trusting the diff. (1) pr-gate.yml now hard-fails on an unresolvable base (`git cat-file -e \"$base^{commit}\"` -> exit 1) and adds `fetch-depth: 0`, so the `cp scripts/selftest-suite.txt` bootstrap can only fire when the base commit RESOLVES and genuinely lacks the path -- the baseline==head tautology is gone. (2) `_derive_full_selftest_suite` now reads the baseline manifest into a variable with a checked status (`baseline=$(_read_selftest_list ...) || return 1`) and iterates `<<< \"$baseline\"`, closing the process-substitution status-discard. The `missing base manifest is refused` case is DISCRIMINATING: with that fixture (manifest=advertised.py, advertised.sh already rm'd) the call would return SUCCESS under the old `< <(...)` form, so deleting the guard flips it red. Round-1 minors/nits are all closed too: non-vacuity counter `n` in the gate step (correctly `((n += 1))`, which cannot trip set -e the way `((n++))` would), `SELFTEST_RETIREMENTS` dead assignment removed with an explicit comment stating pr-gate.yml owns retirement authorization, leading/trailing whitespace trims in `_read_selftest_list` plus a covering test, and a README section documenting the two-PR retirement procedure. Manifest content re-verified: I recomputed the advertised set with the exact discovery regexes over the checkout -- 31 .py + migrate-secrets.sh + worker-live.sh = exactly the 33 entries in scripts/selftest-suite.txt, set-identical, a strict superset of the 28 the old hardcoded list ran (lease_schema.py newly covered; it does support --self-test). No dangling EXPECTED_SELFTEST_SUITE/SELFTEST_DENYLIST references remain; the bidirectional check is real; glob/path-traversal manifest entries fail closed (removal check uses grep -Fx, and a bad entry hits the `*)` unsupported-entry exit). Both .txt files sit under the `scripts/` prefix of DEFAULT_TRUST_SURFACE_PATHS, so th\u2026 [truncated 69 chars]",
+  "verdict": "approve"
+ }
+}
