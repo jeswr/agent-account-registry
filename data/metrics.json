@@ -1,32 +1,32 @@
 {
-  "generated_at": "2026-07-25T07:49:58Z",
+  "generated_at": "2026-07-25T08:15:12Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1104,
+      "issues_open": 1105,
       "issues_ready": 8,
-      "issues_closed_1h": 8,
+      "issues_closed_1h": 6,
       "issues_closed_24h": 39,
       "prs_open": 61,
       "prs_draft": 45,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 8,
+      "prs_merged_1h": 6,
       "prs_merged_24h": 19,
       "review_changes_backlog": 1,
-      "needs_user_parked": 2,
+      "needs_user_parked": 3,
       "review_lane_health": "stalled",
-      "review_lane_runs_1h": 9,
+      "review_lane_runs_1h": 6,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
-      "pr_close_rate": 8.0,
-      "net_pr_flow": -8.0
+      "pr_close_rate": 6.0,
+      "net_pr_flow": -6.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 263,
+      "issues_open": 264,
       "issues_ready": 80,
-      "issues_closed_1h": 3,
+      "issues_closed_1h": 2,
       "issues_closed_24h": 11,
       "prs_open": 22,
       "prs_draft": 20,
@@ -37,7 +37,7 @@
       "review_changes_backlog": 7,
       "needs_user_parked": 3,
       "review_lane_health": "stalled",
-      "review_lane_runs_1h": 9,
+      "review_lane_runs_1h": 6,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
@@ -53,8 +53,8 @@
       "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=1 waits",
       "metrics": {
         "review_changes_backlog": 1,
-        "review_lane_runs_1h": 9,
-        "prs_merged_1h": 8
+        "review_lane_runs_1h": 6,
+        "prs_merged_1h": 6
       }
     },
     {
@@ -64,7 +64,7 @@
       "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=7 waits",
       "metrics": {
         "review_changes_backlog": 7,
-        "review_lane_runs_1h": 9,
+        "review_lane_runs_1h": 6,
         "prs_merged_1h": 1
       }
     }
