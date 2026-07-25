@@ -2337,8 +2337,16 @@ const degraded = (node) =>
     scope.render(document_);
     warnings[name] = {
       hidden: ids.warning.hidden,
-      probeNotice: /Usage probe did not measure the fleet/.test(ids.warning.textContent),
+      // `text()`, not `.textContent`: updateFreshness renders each independent degradation as its
+      // own `.warning-line` child (issue #580), so the banner's own textContent is empty and a
+      // direct read would make this row vacuously false for BOTH documents.
+      probeNotice: /Usage probe did not measure the fleet/.test(text(ids.warning)),
       summaryDegraded: ids.summary.children.some(degraded),
+      // Issue #580: staleness and the probe verdict are independent, so a page carrying both must
+      // render both — as SEPARATE `.warning-line` paragraphs, not one run-together blob.
+      lines: (ids.warning.children || []).filter((kid) => kid.className === "warning-line").length,
+      staleNotice: /Stale data/.test(text(ids.warning)),
+      capacityNote: /Eligible capacity unmeasured/.test(text(ids.summary)),
     };
   }
   process.stdout.write(JSON.stringify({ cards, warnings }));
@@ -2354,6 +2362,12 @@ const degraded = (node) =>
         issues, leases, live_usage, history, None, live_now, "fixture-salt",
         probe_status={"schema": PROBE_SCHEMA, "outcome": "failed",
                       "detail": "secret-materialization-failed", "attempted_at": live_now})
+    # ...and the same failed probe on a STALE generation (the year-old fixture `now`), which is the
+    # one document where both independent degradations fire at once (issue #580).
+    stale_failed_document = build_dashboard(
+        issues, leases, live_usage, history, None, now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "failed",
+                      "detail": "secret-materialization-failed", "attempted_at": now})
     page = _node_json(
         page_harness.replace("__APP_JS__",
                              json.dumps(str(Path(__file__).resolve().parent.parent
@@ -2361,7 +2375,8 @@ const degraded = (node) =>
         {"probes": {"measured": measured_document["usage_probe"],
                     "failed": failed_document["usage_probe"],
                     "absent": None},
-         "documents": {"measured": measured_document, "failed": failed_document}})
+         "documents": {"measured": measured_document, "failed": failed_document,
+                       "staleFailed": stale_failed_document}})
     check("[#612] EXECUTED page script: the probe card degrades exactly when nothing was measured",
           (page["cards"]["measured"]["degraded"],
            "NOT MEASURED" in page["cards"]["measured"]["text"],
@@ -2378,6 +2393,23 @@ const degraded = (node) =>
            page["warnings"]["failed"]["probeNotice"],
            page["warnings"]["failed"]["summaryDegraded"]),
           (True, False, False, False, True, True))
+    # --- issue #580: the banner carries INDEPENDENT degradations as separate lines, and the
+    # unmeasured `eligible` figure is annotated where it is rendered. Both directions are pinned:
+    # a healthy page has zero lines and no capacity note, a failed-but-fresh page has exactly one
+    # line, and a stale+failed page has TWO — so collapsing them back into one joined blob, or
+    # letting either notice mask the other, is red rather than green.
+    check("[#580] EXECUTED page script: independent degradations render as separate lines",
+          (page["warnings"]["measured"]["lines"],
+           page["warnings"]["measured"]["capacityNote"],
+           page["warnings"]["failed"]["lines"],
+           page["warnings"]["failed"]["staleNotice"],
+           page["warnings"]["failed"]["capacityNote"],
+           page["warnings"]["staleFailed"]["hidden"],
+           page["warnings"]["staleFailed"]["lines"],
+           page["warnings"]["staleFailed"]["staleNotice"],
+           page["warnings"]["staleFailed"]["probeNotice"],
+           page["warnings"]["staleFailed"]["capacityNote"]),
+          (0, False, 1, False, True, False, 2, True, True, True))
 
     health = _normalize_model_health({
         "generated_at": now,

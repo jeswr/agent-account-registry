@@ -64,6 +64,13 @@ function renderSummary(data) {
   }
   if (!providers.length) lines.append(node("p", "summary-meta", "No provider records"));
   capacity.append(lines);
+  // The `eligible` figure is exactly the number a failed probe used to overstate (issue #580): with
+  // nothing measured it reads 0 for every provider, which alone looks like a fleet-wide outage.
+  // Say which of the two it is, right where the misleading number is rendered.
+  if (data.usage_probe && typeof data.usage_probe === "object"
+      && data.usage_probe.measured !== true) {
+    capacity.append(node("p", "summary-meta", "Eligible capacity unmeasured — see the notice above"));
+  }
   summary.append(capacity);
   summary.append(summaryCard(
     "Last dispatch sweep", data.fleet.last_sweep_at ? relative(data.fleet.last_sweep_at) : "unknown",
@@ -423,7 +430,11 @@ function updateFreshness(generatedAt, probe) {
       + " shown as unknown, not as free capacity.");
   }
   warning.hidden = notices.length === 0;
-  warning.textContent = notices.join(" ");
+  // Staleness and the probe verdict are INDEPENDENT degradations (issue #580) and both can fire at
+  // once — a failed probe still publishes a FRESH generated_at, so neither notice implies the
+  // other. One `.warning-line` paragraph each (styles.css spaces them); run together in a single
+  // text blob the two read as one confused sentence.
+  warning.replaceChildren(...notices.map((notice) => node("p", "warning-line", notice)));
 }
 
 // --- Throughput panel (backlog-vs-drain). Consumes site/metrics.json, emitted by the separate
