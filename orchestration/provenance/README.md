@@ -1,10 +1,14 @@
 # Implementer provenance records
 
 One JSON file per worker pull request, `<owner>--<repo>--pr<N>.json`, written by the dedicated
-`provenance` job in worker.yml after publish (and by `scripts/backfill-provenance.py` for
-pre-existing PRs). That job executes NO target code — the worker job that runs model-authored
+`provenance` job in worker.yml after the `publish` job (and by `scripts/backfill-provenance.py`
+for pre-existing PRs). That job executes NO target code — the worker job that runs model-authored
 code host-side holds no registry-write token, so hostile target code can never write or forge
-these records.
+these records. Since issue #575 the PR itself is also opened outside that job: `publish` runs on
+its own runner and reconstructs the model's work from a digest-bound patch sealed before the
+target's gate ran, so no write-capable target token ever shares a runner with gated target code.
+`provenance` still reconciles from the deterministic head branch and the live API — it does not
+consume the publisher's reported PR number — so the root of trust is unchanged.
 
 ```json
 {"pr_number": 1, "head_sha_at_open": "<40-hex>", "impl_provider": "anthropic|openai",
