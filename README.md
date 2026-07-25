@@ -368,6 +368,22 @@ partial success rate.
   writes or mutation-confirmations (their conflict/fail-loud semantics are caller-owned — a replayed
   mutation can double-dispatch a worker, #559/#558).
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
+- Worker publication is re-attested LIVE, twice (issue #568). The pre-model `trust` step runs tens
+  of minutes before push/PR (the job budget is up to 90 minutes, which is why the lane mints two
+  further App tokens across that span), so `worker.yml` repeats the FULL author / body-SHA /
+  status-label / trust-gate revalidation in the fresh publisher immediately before
+  `Commit, push, and open DRAFT target pull request` — a maintainer who closes, rewrites, or
+  human-parks the issue mid-run is never published over. Three properties make it sound: the
+  verifier is a **pre-model snapshot** taken from the SHA-pinned checkout into `RUNNER_TEMP`
+  (outside every model-container mount) and re-bound to its recorded sha256, so the candidate
+  change can never authorize its own publication — `reverify --forbid-gate-root` refuses at runtime
+  if the gate path resolves into the model-mutable tree; the re-check runs in `--mode pre-publish`,
+  which accepts **this run's own** `status:in-progress` claim (dispatch mode's `status:ready`
+  demand would refuse every real run) and nothing else; and ownership is a genuine
+  compare-and-swap — the run-key-bound claim receipt is posted **before** the shared
+  `status:in-progress` label, so a newer run supersedes an older one even in the pre-attempt
+  window, and `holds_live_claim` refuses whenever the newest receipt is not this run's. Drift
+  ABORTS without mutating human-owned issue state; `final_state` returns the issue to the pool.
 
 ## Registering a new account (web-login broker)
 
