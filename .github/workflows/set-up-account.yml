@@ -968,33 +968,50 @@ jobs:
               # #616 review round 2: the branch name plus the changed-file list prove the SHAPE of
               # the provenance, NOT that the PR added THIS handle — and picking `merged[-1]` assumed
               # the newest merged PR on the branch was the grant. Every merged candidate is now
-              # examined and one must be provably the grant that ADDED the handle: its diff touches
-              # only the policy document, and that diff adds this handle to account_pool lines and
-              # moves nothing else. If none is, the membership is still unaccounted for and this
-              # enrollment refuses rather than activating inline.
-              evidence, refusals = None, []
+              # examined and each requested target must be traced to one that provably granted THAT
+              # ROW.
+              #
+              # #616 review round 4 (MAJOR 3): the diff-level proof carries no row identity, so a
+              # historical checked PR that added the handle to row C validated later UNCHECKED
+              # membership in rows A and B once C was cleaned up — zero current targets traced to a
+              # checked PR, while the notice claimed "membership traced to a checked PR". Row
+              # identity comes from each candidate's OWN pre/post documents (its merge commit and
+              # that commit's first parent), which is the same two-document proof the live path uses;
+              # `trace_membership_provenance` then requires EVERY requested target to appear in some
+              # candidate's established rows. Any read that fails here aborts the step (`check=True`)
+              # — a provenance we cannot read is a refusal, never an assumption.
+              candidates = []
               for candidate in merged:
-                  changed = gh_pages([f"repos/{repo}/pulls/{candidate}/files?per_page=100"])
-                  try:
-                      grant.require_grant_pr_scope(candidate, changed, path)
-                      diffs = [entry.get("patch") for entry in changed
-                               if isinstance(entry, dict) and entry.get("filename") == path]
-                      if len(diffs) != 1:
-                          raise grant.GrantError(
-                              f"carries {len(diffs)} diffs of {path}, expected exactly 1")
-                      grant.verify_grant_patch(diffs[0], handle)
-                  except grant.GrantError as exc:
-                      refusals.append(f"#{candidate}: {exc}")
-                      continue
-                  evidence = candidate
-                  break
-              if evidence is None:
-                  raise SystemExit(
-                      "::error::account_pool grant refused (fail closed): no merged "
-                      f"`{branch}` pull request is provably the grant that ADDED {handle} to the "
-                      f"policy account_pool — {'; '.join(refusals) or 'no candidates'}")
-              print(f"{handle} already granted to exactly {targets} in master account_pool "
-                    f"by merged PR #{evidence} — no new PR needed")
+                  meta = json.loads(gh_api([f"repos/{repo}/pulls/{candidate}"]).stdout)
+                  merge_sha = meta.get("merge_commit_sha")
+                  if not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_sha):
+                      raise SystemExit(
+                          "::error::account_pool grant refused (fail closed): merged PR "
+                          f"#{candidate} reports no usable merge commit, so the rows it granted "
+                          "cannot be established")
+                  parents = json.loads(
+                      gh_api([f"repos/{repo}/commits/{merge_sha}"]).stdout).get("parents") or []
+                  if not parents or not isinstance(parents[0], dict):
+                      raise SystemExit(
+                          "::error::account_pool grant refused (fail closed): merge commit "
+                          f"{merge_sha} of PR #{candidate} has no first parent")
+                  def policy_at(ref):
+                      return base64.b64decode("".join(json.loads(gh_api(
+                          [f"repos/{repo}/contents/{path}?ref={ref}"]).stdout)["content"].split())
+                      ).decode()
+                  candidates.append({
+                      "number": candidate,
+                      "changed": gh_pages([f"repos/{repo}/pulls/{candidate}/files?per_page=100"]),
+                      "before": policy_at(parents[0]["sha"]),
+                      "after": policy_at(merge_sha),
+                  })
+              evidence = proven(grant.trace_membership_provenance, handle, targets, candidates,
+                                path)
+              print(f"{handle} already granted to exactly {targets} in master account_pool; every "
+                    f"one of those rows was established by a merged, row-scoped grant PR "
+                    f"({evidence}) — no new PR needed. NOTE: that traces each row to a checked PR, "
+                    "not the CURRENT bytes of the row (an unchecked later edit could have removed "
+                    "and re-added the handle); today's shape is proved by verify_membership above.")
               set_output("pr", "none")
               raise SystemExit(0)
 
@@ -1156,7 +1173,7 @@ jobs:
           elif [ "$VALIDATE" != success ]; then
             comment "🚨 **$HANDLE** was stored and the pending issue created, but read_accounts validation failed (\`$VALIDATE\`) — the account body may be malformed, so no policy PR was opened. **Recovery:** fix the \`$HANDLE\` issue body (models / secret_ref), then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` (#211) and opens the account_pool PR."
           elif [ "$POLICY_PR" != success ]; then
-            comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** check the step log first — if the grant was REFUSED (#579), the \`grant:<owner>/<repo>\` labels on this request no longer match the targets recorded on the \`$HANDLE\` account issue, or they no longer name \`enabled = true\` policy rows; restore them to exactly that set. If instead the refusal says \`$HANDLE\` is ALREADY in the policy account_pool but no merged \`account-pool/$HANDLE\` PR accounts for it, the membership was not established by a checked grant PR — that is deliberate (#616 review finding 1: shape is not provenance). Establish it properly: open an \`account-pool/$HANDLE\` PR editing ONLY the granted rows (if the entry is stale, remove it first in its own PR), let it merge, and activation follows. Then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` on the same slot and re-drives the PR (#211); or open it manually (head branch \`account-pool/$HANDLE\`, editing ONLY the granted rows) — on merge it activates automatically."
+            comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** check the step log first — if the grant was REFUSED (#579), the \`grant:<owner>/<repo>\` labels on this request no longer match the targets recorded on the \`$HANDLE\` account issue, or they no longer name \`enabled = true\` policy rows; restore them to exactly that set. If instead the refusal says \`$HANDLE\` is ALREADY in the policy account_pool but no merged, ROW-SCOPED \`account-pool/$HANDLE\` PR accounts for **each authorized row**, the membership of the untraced rows was not established by a checked grant PR — that is deliberate (#616 review finding 1: shape is not provenance; round 4: and a checked PR for a DIFFERENT row is not provenance for this one). Establish it properly: open an \`account-pool/$HANDLE\` PR editing ONLY the granted rows (if the entry is stale, remove it first in its own PR), let it merge, and activation follows. Then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` on the same slot and re-drives the PR (#211); or open it manually (head branch \`account-pool/$HANDLE\`, editing ONLY the granted rows) — on merge it activates automatically."
           elif [ "$ACTIVATE_INLINE" != success ]; then
             comment "🚨 **$HANDLE** was stored, registered \`status:pending\`, and its handle was ALREADY in master \`account_pool\` (no policy PR needed), but the INLINE activation FAILED (activate: \`$ACTIVATE_INLINE\`) — the account may still be \`status:pending\` and this request may still be open despite policy being in place, so no false success was claimed. **Recovery:** confirm there is exactly one \`$HANDLE\` account issue and flip it to \`status:available\` (or re-apply \`set-up-account\`); re-merging/re-triggering the account_pool PR also drives the \`activate\` job to flip it."
           else
@@ -1305,19 +1322,30 @@ jobs:
               # ...and its OWN diff ADDED this handle and moved nothing else. Strategy-independent,
               # so a multi-commit rebase cannot hide an earlier commit's policy edit behind the
               # first-parent read, and a no-delta PR can never license an activation.
-              patches = [entry.get("patch") for entry in changed
+              records = [entry for entry in changed
                          if isinstance(entry, dict) and entry.get("filename") == path]
-              if len(patches) != 1:
+              if len(records) != 1:
                   raise grant.GrantError(
-                      f"merged PR #{os.environ['PR_NUMBER']} carries {len(patches)} diffs of {path}, "
+                      f"merged PR #{os.environ['PR_NUMBER']} carries {len(records)} diffs of {path}, "
                       "expected exactly 1 — refusing")
-              grant.verify_grant_patch(patches[0], handle)
+              # `patch_changed_lines` is the TRUNCATION oracle (#616 review round 4): `--paginate`
+              # proves every file RECORD was listed, never that a record's `patch` string is that
+              # file's whole diff, and GitHub truncates large patches. The API's own additions +
+              # deletions for this file must equal the changed lines the patch carries.
+              grant.verify_grant_patch(records[0].get("patch"), handle,
+                                       grant.patch_changed_lines(records[0]))
           except grant.GrantError as exc:
               print(f"::error::refusing to activate {handle}: {exc}", file=sys.stderr)
               sys.exit(1)
+          # Stated as exactly what the four proofs establish (#616 review round 4 corrected an
+          # F-class overclaim here): "byte-identical to the pre-merge policy" is only true of the
+          # document at the merge commit's FIRST PARENT, which under a multi-commit rebase is a
+          # commit of this same PR — which is why the PR's own merge-base diff is proved separately,
+          # position by position.
           print(f"{handle} confirmed granted to exactly {targets} in the merged account_pool; every "
-                "other row is byte-identical to the pre-merge policy, and PR "
-                f"#{os.environ['PR_NUMBER']}'s own diff touched only {path} and ADDED {handle}")
+                f"other row is byte-identical to the policy at the merge commit's first parent, and "
+                f"PR #{os.environ['PR_NUMBER']}'s own complete merge-base diff touched only {path} "
+                f"and added {handle} to account_pool lines while moving no other member")
           PY
           granted=$(printf '%s\n' "$body" | sed -n 's/^grant_targets:[[:space:]]*\(.*\)$/\1/p' | head -1 | tr -d '\r')
           labels=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')

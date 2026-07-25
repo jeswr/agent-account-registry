@@ -52,6 +52,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 # The authorization carrier on the request issue. Labels (not body prose) because a label change is
@@ -392,7 +393,31 @@ def _pool_entries(pool_line):
     return [entry.strip() for entry in match.group(2).split(",") if entry.strip()]
 
 
-def verify_grant_patch(patch, handle):
+def patch_changed_lines(record):
+    """`additions + deletions` from ONE `pulls/N/files` record, as the completeness oracle for its
+    `patch` string. GrantError when the record does not carry both as non-negative integers.
+
+    #616 review round 4 (MAJOR): `--paginate --slurp` proves every file RECORD was listed; it proves
+    nothing about whether each record's `patch` STRING is that file's whole diff. GitHub truncates
+    (and for very large diffs omits) `patch`, and a returned PREFIX that happens to contain a
+    complete legitimate grant hunk while omitting a later hunk used to be accepted as a complete
+    proof. The API reports the file's real changed-line counts in the same record, so the patch can
+    be checked for completeness against them instead of being trusted."""
+    if not isinstance(record, dict):
+        raise GrantError("the changed-file record is not an object — refusing to judge the "
+                         "completeness of its diff (fail closed)")
+    counts = []
+    for key in ("additions", "deletions"):
+        value = record.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise GrantError(
+                f"the changed-file record carries no usable `{key}` count ({value!r}), so a "
+                "TRUNCATED patch cannot be ruled out — refusing (fail closed)")
+        counts.append(value)
+    return counts[0] + counts[1]
+
+
+def verify_grant_patch(patch, handle, changed_lines):
     """Prove from a PULL REQUEST'S OWN unified diff of the policy document that the PR ADDED
     `handle` to one or more `account_pool` assignments and changed nothing else there.
 
@@ -413,16 +438,30 @@ def verify_grant_patch(patch, handle):
     byte-identical, formatting-only or other-file-only PR) is a REFUSAL, so a non-grant PR on the
     `account-pool/<handle>` branch can no longer stand in for a reviewed grant.
 
-    Requirements, all of them refusals otherwise: the patch is readable and non-empty; every removed
-    and added line is a single-line `account_pool` assignment; no removed line already lists
-    `handle`; every added line lists `handle` exactly once; and stripping `handle` from each added
-    line's entries reproduces the removed lines' entry lists EXACTLY (as a multiset, so hunk order
-    is irrelevant). Any other policy edit — a different handle added or removed, a reordered pool, a
-    non-pool field, a comment rewrite — therefore fails. Pure; unit-tested by --self-test.
+    Requirements, all of them refusals otherwise: the patch is readable, non-empty and COMPLETE
+    (see `changed_lines`); every removed and added line is a single-line `account_pool` assignment;
+    no removed line already lists `handle`; every added line lists `handle` exactly once; and
+    stripping `handle` from each added line's entries reproduces the removed lines' entry lists
+    EXACTLY, POSITION BY POSITION. Any other policy edit — a different handle added or removed, a
+    reordered pool, a non-pool field, a comment rewrite — therefore fails. Pure; unit-tested by
+    --self-test.
 
-    ROW SCOPING IS NOT THIS FUNCTION'S JOB: the diff carries no row identity. verify_grant (line
-    spans, against the merged document) and verify_membership (handle in no non-target row) own that,
-    and the three together are what make the proof complete."""
+    POSITIONAL, NOT A MULTISET — #616 review round 4 (MAJOR), reproduced. The comparison used to be
+    `sorted(stripped) != sorted(removed)`, i.e. a GLOBAL multiset that is order-insensitive ACROSS
+    ROWS, while the row scoping it deferred to (verify_grant) runs against the merge commit's first
+    parent — which under a MULTI-COMMIT REBASE is a commit of the same PR. So a PR whose commit 1
+    SWAPPED two other accounts' pools and whose commit 2 added this handle passed all four proofs:
+    the swap was already in `before`, and `removed [[aa],[bb]]` vs `stripped [[bb],[aa]]` sorted
+    equal. Other accounts' repository authorizations moved silently, inside a PR whose review surface
+    read "add acct99 to the pool". Within one file's patch, hunks and their changed groups are
+    emitted in FILE ORDER on both sides, so `removed[i]` pairs with `added[i]` and the multiset was
+    buying nothing that order did not already give: legitimate 1-row and 2-row grants still accept,
+    while a cross-row swap and a 3-row rotation now refuse.
+
+    ROW SCOPING IS STILL NOT THIS FUNCTION'S JOB: the diff carries no row NAMES. verify_grant (line
+    spans, against the merged document) and verify_membership (handle in no non-target row) own that.
+    What the positional form adds is that the pool CONTENTS cannot migrate between the lines this
+    diff touches."""
     _require_handle(handle)
     quoted = f'"{handle}"'
     if not isinstance(patch, str) or not patch.strip():
@@ -440,6 +479,23 @@ def verify_grant_patch(patch, handle):
                 f"the grant diff changes {body.strip()!r}, which is not a single-line account_pool "
                 "assignment — a grant PR rewrites account_pool lines and nothing else (fail closed)")
         (added if line.startswith("+") else removed).append(entries)
+    # COMPLETENESS (#616 review round 4, MAJOR). Every changed line reaching this point is a pool
+    # assignment (anything else raised above), so the patch's changed-line count must equal the count
+    # the API reports for this file. A truncated patch — a prefix carrying a valid grant hunk while a
+    # later hunk is cut off — is therefore a refusal instead of a proof. REQUIRED, positionally: a
+    # default would be the fail-open shape (a caller that forgot it would still get a "proof"), so a
+    # caller that omits it gets a TypeError and every production call site passes
+    # patch_changed_lines(record).
+    if not isinstance(changed_lines, int) or isinstance(changed_lines, bool) or changed_lines < 0:
+        raise GrantError(
+            f"the changed-line count for this patch is {changed_lines!r}, so a TRUNCATED patch "
+            "cannot be ruled out — refusing (fail closed)")
+    if len(added) + len(removed) != changed_lines:
+        raise GrantError(
+            f"the diff of the policy document carries {len(added) + len(removed)} changed "
+            f"line(s) but the API reports {changed_lines} for that file — the patch is "
+            "TRUNCATED or otherwise incomplete, so it cannot prove what this PR changed "
+            "(fail closed)")
     if not added:
         raise GrantError(
             f"the grant diff adds no account_pool line, so it did not establish {handle}'s "
@@ -460,11 +516,12 @@ def verify_grant_patch(patch, handle):
                 f"an added account_pool line lists {handle} {entries.count(quoted)} time(s); the "
                 "grant postcondition is EXACTLY once (fail closed)")
         stripped.append([entry for entry in entries if entry != quoted])
-    if sorted(stripped) != sorted(removed):
+    if stripped != removed:
         raise GrantError(
             f"the grant diff changes account_pool members other than {handle} (before {removed}, "
-            f"after {stripped} once {handle} is set aside) — a grant adds ONE handle and moves "
-            "nothing else, so this PR carries an edit outside its grant (fail closed)")
+            f"after {stripped} once {handle} is set aside, compared POSITION BY POSITION) — a grant "
+            "adds ONE handle and moves nothing else, so this PR carries an edit outside its grant, "
+            "or it MOVED pool members between rows (fail closed)")
     return len(added)
 
 
@@ -581,6 +638,94 @@ def require_grant_pr_scope(number, files, path):
             "PR edits the policy document and nothing else, so this PR does not prove the "
             "account_pool membership is a reviewed grant (fail closed)")
     return number
+
+
+def evidence_grant_rows(before_text, after_text, handle):
+    """The policy rows a merged pull request PROVABLY granted `handle` to, from its own pre/post
+    documents (its merge commit and that commit's first parent). Sorted; GrantError otherwise.
+
+    This is the ROW IDENTITY the diff-level proof cannot carry, and the reason the no-op path needed
+    it is #616 review round 4 (MAJOR 3), reproduced: `verify_grant_patch` proves "some checked PR
+    added this handle to SOME pool line", so a historical checked PR that granted row C validated a
+    later, UNCHECKED membership in rows A and B once C was cleaned up — ZERO current targets traced
+    to a checked PR. Here the rows the PR established are derived by parsing both of ITS OWN
+    documents, and `verify_grant` then proves that PR's edit was scoped to exactly those rows, so
+    the row names are as trustworthy as the two-document proof itself."""
+    _require_handle(handle)
+    before = _policy_repos(before_text)
+    after = _policy_repos(after_text)
+    gained = []
+    for name in sorted(after):
+        row, base_row = after[name], before.get(name)
+        if not isinstance(row, dict) or not isinstance(base_row, dict):
+            continue
+        pool, base_pool = row.get("account_pool"), base_row.get("account_pool")
+        if not isinstance(pool, list) or not isinstance(base_pool, list):
+            continue
+        if handle in pool and handle not in base_pool:
+            gained.append(name)
+    if not gained:
+        raise GrantError(
+            f"added {handle} to no account_pool row between its merge commit and that commit's "
+            "first parent, so it did not establish this membership (fail closed)")
+    # The same exact, row-scoped postcondition the live path uses: this PR added the handle to
+    # exactly `gained` and moved nothing else in the document.
+    verify_grant(before_text, after_text, handle, gained)
+    return gained
+
+
+def trace_membership_provenance(handle, targets, candidates, path):
+    """Map EVERY requested target to a merged pull request that provably granted `handle` to THAT
+    row. Returns {target: pr number}; GrantError when any target is untraced.
+
+    #616 review round 4 (MAJOR 3). The previous no-op-path bound — "the enrollment's own PR must be
+    a provable grant" — cannot hold on a path that by construction has no own PR, and what the code
+    actually proved was only that SOME merged `account-pool/<handle>` PR added the handle to SOME
+    pool line. Each candidate must now clear all four of: the file-level scope (only `path`
+    changed), a COMPLETE (non-truncated) diff of that file, that diff being a positional
+    handle-only grant, and the row-scoped two-document proof that names the rows it established.
+
+    WHAT THIS DOES AND DOES NOT BOUND, stated exactly. It does establish that every target row of
+    THIS enrollment was, at some point, granted this handle by a merged, checked, row-scoped PR — so
+    the zero-traced-target path above is closed. It does NOT prove the CURRENT bytes of those rows
+    are the ones that PR wrote: an unchecked later edit could have removed the handle from a row and
+    re-added it. `verify_membership` proves today's shape, and the two together are the honest
+    bound. Closing that last gap needs per-row history (a commit walk of the policy document), which
+    is deliberately not attempted here."""
+    _require_handle(handle)
+    resolved = sorted(set(targets or []))
+    if not resolved:
+        raise GrantError("cannot trace the provenance of an empty target set — refusing")
+    if not isinstance(candidates, (list, tuple)) or not candidates:
+        raise GrantError(
+            f"no merged grant pull request is available to account for {handle}'s membership — "
+            "refusing (fail closed)")
+    traced, refusals = {}, []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise GrantError(f"unreadable grant-PR evidence entry {candidate!r} — refusing")
+        number = candidate.get("number")
+        try:
+            require_grant_pr_scope(number, candidate.get("changed") or [], path)
+            records = [entry for entry in candidate["changed"]
+                       if isinstance(entry, dict) and entry.get("filename") == path]
+            if len(records) != 1:
+                raise GrantError(f"carries {len(records)} diffs of {path}, expected exactly 1")
+            verify_grant_patch(records[0].get("patch"), handle, patch_changed_lines(records[0]))
+            rows = evidence_grant_rows(candidate.get("before"), candidate.get("after"), handle)
+        except GrantError as exc:
+            refusals.append(f"#{number}: {exc}")
+            continue
+        for row in rows:
+            traced.setdefault(row, number)
+    missing = [target for target in resolved if target not in traced]
+    if missing:
+        raise GrantError(
+            f"no merged, row-scoped grant pull request accounts for {handle}'s membership in "
+            f"{missing} — the membership of those rows was not established by a checked grant PR, "
+            f"so this enrollment cannot activate on it — {'; '.join(refusals) or 'no candidates'} "
+            "(fail closed)")
+    return {target: traced[target] for target in resolved}
 
 
 def format_record_line(targets):
@@ -701,6 +846,34 @@ def _workflow_step_slice(text, step_id):
     if not slice_text.strip():
         raise GrantError(f"step `id: {step_id}` extracted to an empty body — refusing")
     return slice_text
+
+
+def workflow_step_script(text, step_id):
+    """The EXECUTABLE `run:` script of the ONE step whose `id:` is `step_id`, dedented.
+
+    #616 review round 4 (MAJOR 2): every step except `meta`'s provider fragment was asserted by
+    per-step substring PRESENCE, and presence is not outcome — turning `activate_merged`'s own
+    `except grant.GrantError: sys.exit(1)` into a `::warning::` left the full 34-script suite green,
+    a one-token fail-open on the credential boundary. The privileged body is EXECUTED instead, the
+    way #612 / #605 / #597 execute theirs. Comments are preserved: this text goes to bash, and the
+    step's own `# >>>` sentinels must survive for workflow_block."""
+    lines = workflow_step_raw(text, step_id).split("\n")
+    heads = [index for index, line in enumerate(lines) if line.strip() in {"run: |", "run: |-"}]
+    if len(heads) != 1:
+        raise GrantError(
+            f"step `id: {step_id}` has {len(heads)} block `run:` scripts, expected exactly 1 — "
+            "refusing to execute a body that cannot be located (fail closed)")
+    head = heads[0]
+    indent = len(lines[head]) - len(lines[head].lstrip())
+    body = []
+    for line in lines[head + 1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        body.append(line[indent + 2:] if line.strip() else "")
+    script = "\n".join(body)
+    if not script.strip():
+        raise GrantError(f"step `id: {step_id}` extracted to an empty `run:` script — refusing")
+    return script
 
 
 def workflow_block(text, step_id, marker):
@@ -1047,6 +1220,85 @@ def _self_test():
            refuses(require_grant_pr_scope, 41, None, "policy/repos.toml",
                    needle="unavailable or empty")), (True, True))
 
+    # ------------------------------------------------------------------------------------------
+    # [#616 review ROUND 4, MAJOR 3] THE NO-OP PATH'S TARGET-SET RESIDUAL WAS BROADER THAN DISCLOSED.
+    # `verify_grant_patch` carries no row identity, so a historical checked PR that added the handle
+    # to row C validated later UNCHECKED membership in rows A and B once C was cleaned up — ZERO
+    # current targets traced to a checked PR, while the notice claimed the membership WAS traced. Row
+    # identity now comes from each candidate PR's own pre/post documents, and every requested target
+    # must be traced. The row below is that exact reproduction, and it must REFUSE.
+    # ------------------------------------------------------------------------------------------
+    policy_path = "policy/repos.toml"
+    three_rows = FIXTURE.replace('[repos."o/disabled"]\nenabled = false',
+                                 '[repos."o/third"]\nenabled = true')
+
+    def evidence(number, before_text, after_text, patch, additions=1, deletions=1, files=None):
+        record = {"filename": policy_path, "additions": additions, "deletions": deletions,
+                  "patch": patch}
+        return {"number": number, "before": before_text, "after": after_text,
+                "changed": [record] if files is None else files}
+
+    granted_third = render_grant(three_rows, "acct07", ["o/third"])
+    third_patch = ('@@ -18,1 +18,1 @@\n-account_pool = ["acct09"]\n'
+                   '+account_pool = ["acct09", "acct07"]\n')
+    # ...and the CURRENT membership: acct07 seeded into o/target + o/second by an unchecked edit,
+    # removed from o/third. The only checked PR on the branch is the o/third grant above.
+    seeded_now = render_grant(three_rows, "acct07", ["o/second", "o/target"])
+    check("[#616 r4] a checked PR that granted a DIFFERENT row cannot validate today's targets",
+          refuses(trace_membership_provenance, "acct07", ["o/second", "o/target"],
+                  [evidence(41, three_rows, granted_third, third_patch)], policy_path,
+                  needle="no merged, row-scoped grant pull request accounts for"), True)
+    check("[#616 r4] ...and verify_membership alone was happy with that seeded document (why it hid)",
+          verify_membership(seeded_now, "acct07", ["o/second", "o/target"]),
+          ["o/second", "o/target"])
+    # The positive control: the SAME rows, granted by a real row-scoped PR, trace.
+    real_grant = render_grant(three_rows, "acct07", ["o/second", "o/target"])
+    real_patch = ('@@ -5,1 +5,1 @@\n-account_pool = ["acct01", "acct02"]\n'
+                  '+account_pool = ["acct01", "acct02", "acct07"]\n'
+                  '@@ -16,1 +16,1 @@\n-account_pool = ["acct01"]\n'
+                  '+account_pool = ["acct01", "acct07"]\n')
+    check("[#616 r4] a row-scoped grant PR traces every requested target to itself",
+          trace_membership_provenance("acct07", ["o/second", "o/target"],
+                                      [evidence(41, three_rows, real_grant, real_patch,
+                                                additions=2, deletions=2)], policy_path),
+          {"o/second": 41, "o/target": 41})
+    # A UNION of two checked PRs is accepted (a two-request history is legitimate); a partial union
+    # is not, so no target can ride in on another's provenance.
+    first_only = render_grant(three_rows, "acct07", ["o/target"])
+    first_patch = ('@@ -5,1 +5,1 @@\n-account_pool = ["acct01", "acct02"]\n'
+                   '+account_pool = ["acct01", "acct02", "acct07"]\n')
+    second_patch = ('@@ -16,1 +16,1 @@\n-account_pool = ["acct01"]\n'
+                    '+account_pool = ["acct01", "acct07"]\n')
+    check("[#616 r4] two checked PRs, one row each, together trace both targets",
+          trace_membership_provenance(
+              "acct07", ["o/second", "o/target"],
+              [evidence(41, three_rows, first_only, first_patch),
+               evidence(42, first_only, real_grant, second_patch)], policy_path),
+          {"o/second": 42, "o/target": 41})
+    check("[#616 r4] ...but a PARTIAL union still refuses the untraced row",
+          refuses(trace_membership_provenance, "acct07", ["o/second", "o/target"],
+                  [evidence(41, three_rows, first_only, first_patch)], policy_path,
+                  needle="['o/second']"), True)
+    check("[#616 r4] a candidate whose own pre/post documents show NO grant is not evidence",
+          refuses(trace_membership_provenance, "acct07", ["o/target"],
+                  [evidence(41, first_only, first_only, first_patch)], policy_path,
+                  needle="added acct07 to no account_pool row"), True)
+    check("[#616 r4] a candidate whose edit reached another row is not evidence either",
+          refuses(trace_membership_provenance, "acct07", ["o/target"],
+                  [evidence(41, three_rows,
+                            first_only.replace('account_pool = ["acct09"]',
+                                               'account_pool = ["acct09", "acct42"]'),
+                            first_patch)], policy_path,
+                  needle="NON-TARGET row"), True)
+    check("[#616 r4] an empty candidate list and an empty target set both refuse",
+          (refuses(trace_membership_provenance, "acct07", ["o/target"], [], policy_path,
+                   needle="no merged grant pull request is available"),
+           refuses(trace_membership_provenance, "acct07", [],
+                   [evidence(41, three_rows, first_only, first_patch)], policy_path,
+                   needle="empty target set")), (True, True))
+    check("[#616 r4] evidence_grant_rows names exactly the rows the PR established",
+          evidence_grant_rows(three_rows, real_grant, "acct07"), ["o/second", "o/target"])
+
     # ---- the LIVE documents: this repo's real policy + the wiring in the real workflow --------
     root = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1139,56 +1391,101 @@ def _self_test():
                   '-account_pool = ["acct01", "acct02"]\n'
                   '+account_pool = ["acct01", "acct02", "acct07"]\n')
     check("[#616 r2] a real grant diff is accepted and counts the rows it granted",
-          verify_grant_patch(good_patch, "acct07"), 1)
+          verify_grant_patch(good_patch, "acct07", 2), 1)
     # Split into separate rows on purpose: each must be able to go red and PRINT independently, so a
     # mutant that removes the readability guard reports a legible refusal-became-acceptance rather
     # than taking the suite down on the `None` row before the string row is shown.
     check("[#616 r2] an EMPTY diff is refused — a no-delta PR never licenses activation",
-          refuses(verify_grant_patch, "", "acct07", needle="no readable diff"), True)
+          refuses(verify_grant_patch, "", "acct07", 2, needle="no readable diff"), True)
     check("[#616 r2] an ABSENT diff (patch omitted by the API) is refused the same way",
-          refuses(verify_grant_patch, None, "acct07", needle="no readable diff"), True)
+          refuses(verify_grant_patch, None, "acct07", 2, needle="no readable diff"), True)
     check("[#616 r2] a context-only diff is refused (it establishes nothing)",
-          refuses(verify_grant_patch, "@@ -1,1 +1,1 @@\n context only\n", "acct07",
+          refuses(verify_grant_patch, "@@ -1,1 +1,1 @@\n context only\n", "acct07", 0,
                   needle="adds no account_pool line"), True)
     check("[#616 r2] a diff that ALSO edits a non-pool policy line is refused (the rebase payload)",
           refuses(verify_grant_patch,
-                  good_patch + '-max_concurrent = 2\n+max_concurrent = 9\n', "acct07",
+                  good_patch + '-max_concurrent = 2\n+max_concurrent = 9\n', "acct07", 4,
                   needle="not a single-line account_pool assignment"), True)
     check("[#616 r2] a diff that ALSO adds a DIFFERENT handle elsewhere is refused",
           (refuses(verify_grant_patch,
                    good_patch
                    + '-account_pool = ["acct01"]\n+account_pool = ["acct01", "acct99", "acct07"]\n',
-                   "acct07", needle="members other than acct07"),
+                   "acct07", 4, needle="members other than acct07"),
            # ...and a second changed pool line that does not carry the handle at all is refused too
            refuses(verify_grant_patch,
                    good_patch + '-account_pool = ["acct01"]\n+account_pool = ["acct01", "acct99"]\n',
-                   "acct07", needle="EXACTLY once")),
+                   "acct07", 4, needle="EXACTLY once")),
           (True, True))
     check("[#616 r2] a diff that REMOVES another handle while adding this one is refused",
           refuses(verify_grant_patch,
                   '-account_pool = ["acct01", "acct02"]\n+account_pool = ["acct01", "acct07"]\n',
-                  "acct07", needle="members other than acct07"), True)
+                  "acct07", 2, needle="members other than acct07"), True)
     check("[#616 r2] a diff that rewrites a row ALREADY listing the handle is refused",
           refuses(verify_grant_patch,
                   '-account_pool = ["acct07"]\n+account_pool = ["acct07", "acct07"]\n',
-                  "acct07", needle="already listed"), True)
+                  "acct07", 2, needle="already listed"), True)
     check("[#616 r2] a diff adding the handle TWICE is refused (exactly once, at diff level too)",
           refuses(verify_grant_patch,
                   '-account_pool = ["acct01"]\n+account_pool = ["acct01", "acct07", "acct07"]\n',
-                  "acct07", needle="EXACTLY once"), True)
+                  "acct07", 2, needle="EXACTLY once"), True)
     check("[#616 r2] a pure DELETION of a pool line is refused (nothing was established)",
-          refuses(verify_grant_patch, '-account_pool = ["acct01", "acct07"]\n', "acct07",
+          refuses(verify_grant_patch, '-account_pool = ["acct01", "acct07"]\n', "acct07", 1,
                   needle="adds no account_pool line"), True)
-    # Two granted rows in two hunks, emitted in either hunk order: the proof is a multiset, so hunk
-    # ordering cannot make a correct grant false-refuse.
+    # Two granted rows in two hunks. The comparison is POSITIONAL (#616 review round 4), and
+    # permuting whole hunks permutes BOTH streams together, so hunk ordering still cannot make a
+    # correct grant false-refuse — which is exactly why the multiset was buying nothing.
     two_rows = ('@@ -5,1 +5,1 @@\n-account_pool = ["acct01", "acct02"]\n'
                 '+account_pool = ["acct01", "acct02", "acct07"]\n'
                 '@@ -14,1 +14,1 @@\n-account_pool = ["acct01"]\n'
                 '+account_pool = ["acct01", "acct07"]\n')
     check("[#616 r2] a two-row grant is accepted in either hunk order",
-          (verify_grant_patch(two_rows, "acct07"),
-           verify_grant_patch("\n".join(reversed(two_rows.strip().split("\n"))), "acct07")),
+          (verify_grant_patch(two_rows, "acct07", 4),
+           verify_grant_patch("\n".join(reversed(two_rows.strip().split("\n"))), "acct07", 4)),
           (2, 2))
+    # ------------------------------------------------------------------------------------------
+    # [#616 review ROUND 4, MAJOR 1] THE CROSS-ROW SWAP. `sorted(stripped) != sorted(removed)` is a
+    # GLOBAL multiset — order-insensitive ACROSS rows — while the row scoping it deferred to runs
+    # against the merge commit's first parent, which under a multi-commit rebase is a commit of the
+    # SAME PR. So commit 1 could swap two other accounts' pools, commit 2 add the handle, and all
+    # four proofs passed while other accounts' repository authorizations moved. Every row below
+    # ACCEPTS under the multiset comparison and refuses under the positional one.
+    # ------------------------------------------------------------------------------------------
+    swap_patch = ('@@ -5,1 +5,1 @@\n-account_pool = ["acctaa"]\n+account_pool = ["acctbb", "acct07"]\n'
+                  '@@ -14,1 +14,1 @@\n-account_pool = ["acctbb"]\n'
+                  '+account_pool = ["acctaa", "acct07"]\n')
+    rotation_patch = (
+        '-account_pool = ["acctaa"]\n+account_pool = ["acctbb", "acct07"]\n'
+        '-account_pool = ["acctbb"]\n+account_pool = ["acctcc", "acct07"]\n'
+        '-account_pool = ["acctcc"]\n+account_pool = ["acctaa", "acct07"]\n')
+    check("[#616 r4] a CROSS-ROW pool swap carried by a grant diff is refused",
+          refuses(verify_grant_patch, swap_patch, "acct07", 4,
+                  needle="POSITION BY POSITION"), True)
+    check("[#616 r4] ...and so is a three-row rotation (the same defect, one row wider)",
+          refuses(verify_grant_patch, rotation_patch, "acct07", 6,
+                  needle="POSITION BY POSITION"), True)
+    check("[#616 r4] the multiset form of that swap really was order-equal (why it passed)",
+          sorted([["acctbb"], ["acctaa"]]) == sorted([["acctaa"], ["acctbb"]]), True)
+    # ------------------------------------------------------------------------------------------
+    # [#616 review ROUND 4, MAJOR 4] A TRUNCATED PATCH IS NOT A PROOF. `--paginate --slurp` proves
+    # every file RECORD was listed; GitHub truncates (and for very large diffs omits) each record's
+    # `patch` string, so a PREFIX carrying a complete legitimate grant hunk while a later hunk is cut
+    # off used to be accepted. The API reports the file's own changed-line counts in the same record.
+    # ------------------------------------------------------------------------------------------
+    check("[#616 r4] a patch shorter than the API's own changed-line count is refused",
+          refuses(verify_grant_patch, good_patch, "acct07", 4, needle="TRUNCATED"), True)
+    check("[#616 r4] ...and a caller that cannot supply the count is refused too (no fail-open)",
+          (refuses(verify_grant_patch, good_patch, "acct07", None, needle="TRUNCATED"),
+           refuses(verify_grant_patch, good_patch, "acct07", -1, needle="TRUNCATED")),
+          (True, True))
+    check("[#616 r4] patch_changed_lines reads additions+deletions, and refuses a record without",
+          (patch_changed_lines({"additions": 2, "deletions": 2}),
+           refuses(patch_changed_lines, {"additions": 2}, needle="no usable `deletions`"),
+           refuses(patch_changed_lines, {"additions": "2", "deletions": 2},
+                   needle="no usable `additions`"),
+           refuses(patch_changed_lines, {"additions": True, "deletions": 2},
+                   needle="no usable `additions`"),
+           refuses(patch_changed_lines, None, needle="not an object")),
+          (4, True, True, True, True))
 
     # #616 findings 3 + 4 (TEST VACUITY on the wiring). Every assertion below used to be a
     # WHOLE-FILE substring check, and every one of those was satisfiable by a prose comment or by
@@ -1229,13 +1526,21 @@ def _self_test():
           ("grant.render_grant" in write, "grant.verify_grant" in write), (True, True))
     check("[#616] the no-op path proves membership AND merged-grant-PR provenance",
           ("grant.verify_membership" in write, "grant.merged_grant_prs" in write,
-           "grant.require_grant_pr_scope" in write), (True, True, True))
+           "grant.trace_membership_provenance" in write), (True, True, True))
     # #616 review round 2: branch name + filename prove the SHAPE of the provenance, not that the PR
     # ADDED THIS HANDLE. The no-op path must prove that from the candidate PR's own diff, and must
     # not just take the newest merged PR on the branch on trust.
-    check("[#616 r2] the no-op path proves the evidence PR's diff ADDED this handle",
-          ("grant.verify_grant_patch" in write, "merged[-1]" in write,
-           "for candidate in merged" in write), (True, False, True))
+    # #616 review round 4 (MAJOR 3): and the diff carries no ROW identity, so every requested target
+    # must be traced to a candidate whose OWN pre/post documents (merge commit + first parent) show
+    # it granted THAT row. The scope + completeness + positional-diff + row-scoping proofs all live
+    # inside trace_membership_provenance, which is unit-tested above; what these rows pin is that the
+    # privileged step calls it, with the two documents, over EVERY candidate. This step body is NOT
+    # executed (only `activate_merged` and `meta` are) — stated plainly rather than implied.
+    check("[#616 r4] the no-op path traces every target row to a checked PR, from two documents",
+          ("grant.trace_membership_provenance" in write, "merged[-1]" in write,
+           "for candidate in merged" in write, "merge_commit_sha" in write,
+           '"before": policy_at(' in write, '"after": policy_at(' in write),
+          (True, False, True, True, True, True))
     check("[#616] the ACTIVATE step re-proves the record, membership AND the two-document scope",
           ("grant.parse_record_line" in activated, "grant.verify_membership" in activated,
            "grant.verify_grant" in activated), (True, True, True))
@@ -1288,11 +1593,18 @@ def _self_test():
     check("[#616 r2] the privileged policy write runs only after a real login or a resume",
           step_condition(workflow, "policy_pr"),
           "steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true'")
-    check("an absent/renamed job fails LOUDLY instead of asserting vacuously",
+    # #616 review round 4 (MINOR): the round-3 form of the row below was TAUTOLOGICAL —
+    # `refuses(...) or step_condition(workflow, "register") != ""` has a second disjunct that is
+    # unconditionally True, so it passed whether `register` carried no `if:` or any non-empty one.
+    # Pin the condition EXACTLY (like every other one), and prove the loud-refusal behaviour on a
+    # step that genuinely has no `if:` of its own — `activate_merged` is gated by its JOB.
+    check("[#616 r4] the register step's condition is pinned exactly",
+          step_condition(workflow, "register"), "steps.login.outputs.status == 'ok'")
+    check("an absent/renamed job — and a step with no `if:` — fail LOUDLY, never vacuously",
           (refuses(job_condition, workflow, "no_such_job", needle="found 0"),
-           refuses(step_condition, workflow, "register", needle="found 0")
-           or step_condition(workflow, "register") != ""),
-          (True, True))
+           refuses(step_condition, workflow, "no_such_step", needle="found 0"),
+           refuses(step_condition, workflow, "activate_merged", needle="found 0")),
+          (True, True, True))
 
     # ------------------------------------------------------------------------------------------
     # [#616 review ROUND 2, MAJOR] THE PROVIDER-LABEL PREDICATE IS EXECUTED. It had no test at all,
@@ -1325,6 +1637,260 @@ def _self_test():
           (provider_of([])[0], provider_of(["area:ci"])[0]), (1, 1))
     check("[#616 r2] a REPEATED single provider label still resolves (unique, not count)",
           provider_of(["provider:openai", "provider:openai"]), (0, "openai"))
+    # ------------------------------------------------------------------------------------------
+    # [#616 review ROUND 4, MAJOR 2] THE PRIVILEGED `activate_merged` BODY IS EXECUTED. Round 3
+    # asserted it by per-step substring PRESENCE, and presence is not outcome: converting its own
+    # `except grant.GrantError -> sys.exit(1)` into a `::warning::` and continuing left the entire
+    # 34-script suite green — a one-token fail-open on the credential boundary, on the step that
+    # performs the four-way proof and flips status:pending -> status:available. Seven more mutants of
+    # the same class survived (a self-comparison `verify_grant(policy, policy, require_delta=False)`,
+    # a neutered `verify_membership`, a synthetic literal patch, `base.sha` for the first parent, and
+    # three post-read mutations).
+    #
+    # So the real step body is run under bash against a FAKE `gh` (a dispatching script on PATH that
+    # serves a scenario document and RECORDS every call) with the REAL helper module on disk. Nothing
+    # about the proof is stubbed: each scenario differs only in what GitHub returns, and the
+    # assertions are the step's EXIT CODE and whether the account issue was actually relabelled.
+    # An unexpected `gh` invocation makes the fake exit nonzero, so a mutation that reads a different
+    # endpoint or a different issue fails closed instead of passing quietly.
+    # ------------------------------------------------------------------------------------------
+    activate_script = workflow_step_script(workflow, "activate_merged")
+    fake_gh = r'''#!/usr/bin/env python3
+import json, os, re, sys
+argv = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(argv) + "\n")
+path = os.environ["FAKE_GH_STATE"]
+with open(path, encoding="utf-8") as fh:
+    state = json.load(fh)
+
+
+def save():
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+
+
+def die(message, code=1):
+    sys.stderr.write("fake-gh: " + message + "\n")
+    sys.exit(code)
+
+
+def flag(name):
+    return argv[argv.index(name) + 1] if name in argv else ""
+
+
+if argv[:2] == ["issue", "list"]:
+    for number in state["issue_numbers"]:
+        print(number)
+elif argv[:2] == ["issue", "view"]:
+    number = argv[2]
+    fields = flag("--json")
+    if number not in state["labels"]:
+        die("no such issue " + number, 4)
+    if fields == "body":
+        print(state["bodies"].get(number, ""))
+    elif fields == "labels":
+        print(" ".join(state["labels"][number]))
+    else:
+        die("unexpected --json " + fields, 4)
+elif argv[:2] == ["issue", "edit"]:
+    number = argv[2]
+    if "edit" in state.get("fail", []):
+        die("issue edit rejected")
+    if not state.get("lose_edit"):
+        labels = list(state["labels"][number])
+        if not state.get("partial_edit"):
+            labels = [x for x in labels if x != flag("--remove-label")]
+        labels.append(flag("--add-label"))
+        state["labels"][number] = labels
+        save()
+elif argv[:2] in (["issue", "comment"], ["issue", "close"]):
+    pass
+elif argv[:1] == ["api"]:
+    url = argv[1]
+    if "/commits/" in url:
+        if "commits" in state.get("fail", []):
+            die("commits read rejected")
+        print(state["parent_sha"])
+    elif "/contents/policy/repos.toml" in url:
+        ref = re.search(r"ref=([0-9a-zA-Z]+)", url).group(1)
+        document = state["policy_at"].get(ref)
+        if document is None:
+            die("404 no policy at " + ref)
+        sys.stdout.write(document)
+    elif re.search(r"/pulls/\d+/files", url):
+        if "files" in state.get("fail", []):
+            die("files read rejected")
+        print(json.dumps(state["pr_files"]))
+    elif re.search(r"/pulls/\d+$", url):
+        print(state["base_sha"])
+    else:
+        die("unexpected api call " + url, 4)
+else:
+    die("unexpected gh invocation " + " ".join(argv), 4)
+'''
+    handle = "acct07"
+    activate_targets = ["o/second", "o/target"]
+    merged_policy = render_grant(FIXTURE, handle, activate_targets)
+    account_body = (f"secret_ref: X\nrequest_issue: 9\n{format_record_line(activate_targets)}\n")
+    grant_patch = ('@@ -5,1 +5,1 @@\n'
+                   '-account_pool = ["acct01", "acct02"]\n'
+                   '+account_pool = ["acct01", "acct02", "acct07"]\n'
+                   '@@ -16,1 +16,1 @@\n'
+                   '-account_pool = ["acct01"]\n'
+                   '+account_pool = ["acct01", "acct07"]\n')
+    parent_sha, base_sha = "a" * 40, "b" * 40
+
+    def pr_files(patch=grant_patch, additions=2, deletions=2, extra=()):
+        record = {"filename": "policy/repos.toml", "status": "modified",
+                  "additions": additions, "deletions": deletions}
+        if patch is not None:
+            record["patch"] = patch
+        return [[record, *extra]]
+
+    def run_activate(policy=None, before=None, body=None, labels=None, head_ref=None, **scenario):
+        """Execute the REAL activate_merged body against a fake GitHub.
+
+        Returns (exit code, final labels of the account issue, the gh calls, combined output)."""
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory)
+            (work / "scripts").mkdir()
+            (work / "scripts" / "grant-account.py").write_text(
+                pathlib.Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
+            (work / "policy").mkdir()
+            (work / "policy" / "repos.toml").write_text(
+                merged_policy if policy is None else policy, encoding="utf-8")
+            (work / "bin").mkdir()
+            (work / "bin" / "gh").write_text(fake_gh, encoding="utf-8")
+            (work / "bin" / "gh").chmod(0o755)
+            (work / "runner-temp").mkdir()
+            state = {"issue_numbers": ["5"],
+                     "bodies": {"5": account_body if body is None else body},
+                     "labels": {"5": ["status:pending"] if labels is None else labels},
+                     "parent_sha": parent_sha, "base_sha": base_sha,
+                     "policy_at": {parent_sha: FIXTURE if before is None else before,
+                                   base_sha: FIXTURE},
+                     "pr_files": pr_files()}
+            state.update(scenario)
+            state_file, log_file = work / "state.json", work / "calls.jsonl"
+            state_file.write_text(json.dumps(state), encoding="utf-8")
+            log_file.write_text("", encoding="utf-8")
+            done = subprocess.run(
+                ["bash", "-c", activate_script], cwd=str(work), capture_output=True, text=True,
+                timeout=300, check=False,
+                env={**os.environ, "PATH": f"{work / 'bin'}:{os.environ['PATH']}",
+                     "REPO": "o/registry",
+                     "HEAD_REF": head_ref or f"account-pool/{handle}",
+                     "PR_NUMBER": "42", "MERGE_SHA": "c" * 40, "GH_TOKEN": "t",
+                     "RUNNER_TEMP": str(work / "runner-temp"),
+                     "FAKE_GH_STATE": str(state_file), "FAKE_GH_LOG": str(log_file)})
+            final = json.loads(state_file.read_text(encoding="utf-8"))["labels"]["5"]
+            calls = [json.loads(line) for line in
+                     log_file.read_text(encoding="utf-8").split("\n") if line.strip()]
+            return done.returncode, final, calls, done.stdout + done.stderr
+
+    def activated_view(**scenario):
+        """(exit code, final labels, did it relabel?, did it comment on the account issue?)"""
+        code, final, calls, _output = run_activate(**scenario)
+        return (code, final,
+                any(call[:2] == ["issue", "edit"] for call in calls),
+                any(call[:3] == ["issue", "comment", "5"] for call in calls))
+
+    check("[#616 r4] EXECUTED activate: a fully proven merge flips pending -> available",
+          activated_view(),
+          (0, ["status:available"], True, True))
+    code, _final, calls, output = run_activate()
+    check("[#616 r4] EXECUTED activate: ...and it closes the linked request issue",
+          (any(call[:3] == ["issue", "close", "9"] for call in calls),
+           "confirmed granted to exactly ['o/second', 'o/target']" in output),
+          (True, True))
+    # THE fail-open mutant: with `except grant.GrantError` turned into a ::warning:: every row below
+    # reads (0, ["status:available"], True, True) — the credential is authorized on an unproven grant.
+    partial = render_grant(FIXTURE, handle, ["o/target"])
+    check("[#616 r4] EXECUTED activate: a PARTIAL grant (one target missing) activates nothing",
+          activated_view(policy=partial),
+          (1, ["status:pending"], False, False))
+    # verify_grant(policy, policy, ..., require_delta=False) — a self-comparison — passes here, and
+    # so does reading `pulls/N` `.base.sha` instead of the merge commit's FIRST PARENT: the parent
+    # carries an unrelated non-target edit, exactly the multi-commit-rebase shape.
+    tampered_parent = FIXTURE.replace('account_pool = ["acct09"]',
+                                      'account_pool = ["acct09", "acct42"]')
+    check("[#616 r4] EXECUTED activate: a non-target row that moved since the FIRST PARENT refuses",
+          activated_view(before=tampered_parent),
+          (1, ["status:pending"], False, False))
+    # THE cross-row swap (#616 review round 4, MAJOR 1), driven through the privileged step. The
+    # swap is already in the first parent (a multi-commit rebase), so verify_grant sees nothing;
+    # verify_membership and require_grant_pr_scope pass; ONLY the PR's own diff, compared
+    # POSITIONALLY, refuses. Under the multiset comparison — and under a synthetic literal patch
+    # fed to verify_grant_patch — this row reads (0, ["status:available"], True, True).
+    swapped_parent = (FIXTURE.replace('account_pool = ["acct01", "acct02"]',
+                                      'account_pool = ["acct02", "acct01"]'))
+    swapped_merged = render_grant(swapped_parent, handle, activate_targets)
+    swap_patch = ('@@ -5,1 +5,1 @@\n'
+                  '-account_pool = ["acct01", "acct02"]\n'
+                  '+account_pool = ["acct02", "acct01", "acct07"]\n'
+                  '@@ -16,1 +16,1 @@\n'
+                  '-account_pool = ["acct02"]\n'
+                  '+account_pool = ["acct01", "acct07"]\n')
+    check("[#616 r4] EXECUTED activate: a CROSS-ROW pool swap carried by the PR refuses",
+          activated_view(policy=swapped_merged, before=swapped_parent,
+                         pr_files=pr_files(patch=swap_patch)),
+          (1, ["status:pending"], False, False))
+    # A TRUNCATED patch (#616 review round 4, MAJOR 4): the API's own counts say six changed lines,
+    # the patch carries four. Without the completeness check this activates on a prefix.
+    check("[#616 r4] EXECUTED activate: a TRUNCATED policy patch refuses",
+          activated_view(pr_files=pr_files(additions=3, deletions=3)),
+          (1, ["status:pending"], False, False))
+    check("[#616 r4] EXECUTED activate: an ABSENT patch refuses (no proof of what merged)",
+          activated_view(pr_files=pr_files(patch=None, additions=0, deletions=0)),
+          (1, ["status:pending"], False, False))
+    # A neutered verify_membership: the handle ALSO sits in a non-target row, and it was there
+    # before the merge, so the two-document proof and the diff proof both pass.
+    leaked_parent = FIXTURE.replace('account_pool = ["acct09"]',
+                                    'account_pool = ["acct09", "acct07"]')
+    check("[#616 r4] EXECUTED activate: the handle leaked into a NON-TARGET row refuses",
+          activated_view(policy=render_grant(leaked_parent, handle, activate_targets),
+                         before=leaked_parent),
+          (1, ["status:pending"], False, False))
+    check("[#616 r4] EXECUTED activate: an extra file in the merged PR refuses (scope)",
+          activated_view(pr_files=pr_files(extra=({"filename": ".github/workflows/x.yml",
+                                                   "status": "modified", "additions": 1,
+                                                   "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"},))),
+          (1, ["status:pending"], False, False))
+    check("[#616 r4] EXECUTED activate: an unreadable record line refuses (no grant_targets)",
+          activated_view(body="secret_ref: X\nrequest_issue: 9\n"),
+          (1, ["status:pending"], False, False))
+    check("[#616 r4] EXECUTED activate: an unresolvable first parent refuses",
+          activated_view(fail=["commits"]), (1, ["status:pending"], False, False))
+    check("[#616 r4] EXECUTED activate: an unreadable changed-file listing refuses",
+          activated_view(fail=["files"]), (1, ["status:pending"], False, False))
+    check("[#616 r4] EXECUTED activate: two account issues with that title refuse (ambiguity)",
+          activated_view(issue_numbers=["5", "6"]), (1, ["status:pending"], False, False))
+    # THE POST-READ (#616 review round 4, MINOR): the round-3 assertion was a substring plus an
+    # ordering test, so a constant `post`, a post-read of a DIFFERENT issue, and a flipped case
+    # polarity all survived. Here the label write reports success and does NOT land: the step must
+    # refuse and must NOT post an activation notice.
+    check("[#616 r4] EXECUTED activate: a label write that did not LAND refuses, and never notices",
+          activated_view(lose_edit=True),
+          (1, ["status:pending"], True, False))
+    # ...and the SECOND post-read case: a partially-applied edit that ADDED status:available while
+    # leaving status:pending in place. The first case is satisfied by the available label, so only the
+    # ambiguous-state guard refuses — deleting it left the suite green until this row existed.
+    check("[#616 r4] EXECUTED activate: a flip that left status:pending behind refuses, no notice",
+          activated_view(partial_edit=True),
+          (1, ["status:pending", "status:available"], True, False))
+    check("[#616 r4] EXECUTED activate: an already-available account is an idempotent no-op",
+          activated_view(labels=["status:available"]),
+          (0, ["status:available"], False, False))
+    check("[#616 r4] EXECUTED activate: an account in neither state refuses",
+          activated_view(labels=["status:parked"]), (1, ["status:parked"], False, False))
+    check("[#616 r4] EXECUTED activate: NO account issue with that title refuses",
+          activated_view(issue_numbers=[]), (1, ["status:pending"], False, False))
+    check("[#616 r4] EXECUTED activate: a head ref that is not a handle refuses before any read",
+          run_activate(head_ref="account-pool/not-a-handle!")[:2] + (
+              [call for call in run_activate(head_ref="account-pool/x")[2]], ),
+          (1, ["status:pending"], []))
+
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
     check("the request form documents the grant label (in the form itself, not a comment)",
           GRANT_LABEL_PREFIX in strip_yaml_comments(template), True)
