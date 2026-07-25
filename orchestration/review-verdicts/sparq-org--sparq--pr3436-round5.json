@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3436,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b9cc201cfa6613985966fe2469f284c24ab867cd",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 remains correct and complete on the supplied diff-scoped evidence. The workflow and formal-suite registry consistently enable the join feature and invoke all three harnesses. The two symbolic proofs compare the production merge_join kernel against an independent nested-loop reference over bounded, key-sorted two-column relations, covering duplicate-key bag multiplicity, asymmetric key columns, deterministic output order, and extra_shared filtering. The concrete domain self-check is non-vacuous: ordinary assertions pin the bounds and exact outputs for a maximal duplicate-key witness, including strict extra_shared rejection; kani::cover! is accurately treated as supplementary reachability reporting. Short-circuit conjunction prevents out-of-bounds symbolic indexing. No hostile instruction appears in the diff. Round 4 had no findings and this round introduces none, so progress is stagnant.",
+  "verdict": "approve"
+ }
+}
