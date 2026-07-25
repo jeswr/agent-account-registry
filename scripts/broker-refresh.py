@@ -27,7 +27,17 @@
 #      stored credential and its refresh token are untouched, so no re-authentication is ever needed.
 #   3. The reported expiry is a REAL token expiry: openai's comes from the access token's own `exp`
 #      claim, never from `last_refresh` (a stamp of when a refresh last happened, which advertised
-#      long-dead tokens as valid); anthropic's stays `claudeAiOauth.expiresAt`.
+#      long-dead tokens as valid); anthropic's stays `claudeAiOauth.expiresAt`. That expiry must also
+#      still be in the FUTURE (assert_token_live) — a parsed expiry that is already past describes a
+#      dead token, and minting it advertises a live capability over a corpse.
+#
+# Review round 1 on #574 closed two holes in the above, both of which minted the ORIGINAL dead token:
+#   * The refresh proof compared the post-probe credential against the BACKDATED copy, so a CLI that
+#     merely rewrote the original metadata back looked like it had advanced the expiry. The baseline
+#     is now the ORIGINAL stored credential and only a CHANGED ACCESS TOKEN counts as proof — the one
+#     piece of evidence that cannot be manufactured by undoing force_stale.
+#   * Both expiries were parsed but never required to be in the future, so a capability could
+#     explicitly advertise an already-expired token.
 #
 # This module ships the PURE, security-critical parts (isolation + access-token-only extraction +
 # the refresh proof) with unit tests over the real credential layouts. --self-test drives
@@ -47,6 +57,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 PROVIDERS = ("openai", "anthropic")
 
@@ -103,7 +114,11 @@ def extract_access_token(provider, cred):
     """Return the SHORT-LIVED capability {access_token, expires_at} from a (refreshed) credential.
     NEVER returns the refresh token. `cred` is the parsed credential JSON. Raises (fail closed)
     rather than returning a capability with a missing token or an expiry that is not a real token
-    expiry — both were previously emitted silently and handed to a worker (#574)."""
+    expiry — both were previously emitted silently and handed to a worker (#574).
+
+    Reports the expiry; does NOT require it to be in the future. That is assert_token_live's job, on
+    the minting path only, because the stored pre-refresh credential this also validates for
+    worker-prep.sh is routinely (and harmlessly) past its access-token expiry."""
     if provider == "openai":
         tok = cred.get("tokens") if isinstance(cred.get("tokens"), dict) else {}
         access = _require(provider, tok.get("access_token"), "access token", str)
@@ -117,6 +132,57 @@ def extract_access_token(provider, cred):
         return {"access_token": access,
                 "expires_at": _require(provider, o.get("expiresAt"), "token expiry", (int, float))}
     raise ValueError(f"unknown provider {provider!r}")
+
+
+# A capability is only worth minting if the token is still alive when the worker uses it, so the
+# expiry must be in the future by this margin. The margin is the ONLY slack, and it points the
+# fail-closed way: a token with less than a minute left is refused rather than handed over. An
+# already-past expiry is never accepted for either provider (#574 review round 1) — parsing an expiry
+# proves it is readable, not that it is live, and a dead token advertised as live is the precise
+# failure #574 exists to stop.
+_MIN_REMAINING_SECONDS = 60
+
+# anthropic's claudeAiOauth.expiresAt is stamped in MILLISECONDS by some Claude CLI versions and in
+# seconds by others, and the capability passes the stored value through verbatim. Magnitude decides
+# the unit: 1e11 is 1973 read as milliseconds but the year 5138 read as seconds, so no real
+# seconds-expiry reaches it and no real milliseconds-expiry falls below it. Guessing the unit instead
+# would make this gate vacuous in one direction (every ms stamp looks live) and break the live path in
+# the other (every seconds stamp looks dead).
+_MS_EPOCH_THRESHOLD = 10 ** 11
+
+
+def _epoch_seconds(expiry):
+    """A provider expiry stamp -> epoch SECONDS, tolerating a milliseconds stamp (see above)."""
+    return expiry / 1000.0 if expiry >= _MS_EPOCH_THRESHOLD else float(expiry)
+
+
+def credential_expiry_epoch(provider, cred):
+    """Epoch seconds at which the credential's ACCESS token dies. Same sources extract_access_token
+    reports (openai: the access token's own `exp` claim; anthropic: claudeAiOauth.expiresAt), read as
+    a comparable number so liveness can be gated. Raises when the expiry is missing or unreadable."""
+    if provider == "openai":
+        tok = cred.get("tokens") if isinstance(cred.get("tokens"), dict) else {}
+        return _epoch_seconds(jwt_exp(_require(provider, tok.get("access_token"), "access token", str)))
+    if provider == "anthropic":
+        oauth = cred.get("claudeAiOauth") if isinstance(cred.get("claudeAiOauth"), dict) else {}
+        return _epoch_seconds(_require(provider, oauth.get("expiresAt"), "token expiry", (int, float)))
+    raise ValueError(f"unknown provider {provider!r}")
+
+
+def assert_token_live(provider, cred, now=None):
+    """Fail closed unless the credential's access token is still usable for _MIN_REMAINING_SECONDS.
+
+    This gates MINTING (broker), not extraction: the STORED pre-refresh credential is legitimately
+    expired — that is what its refresh token is for — and worker-prep.sh validates that credential's
+    shape through extract_access_token before any refresh happens. Only the credential the provider
+    CLI just refreshed has to be live. `now` is injected only so --self-test is deterministic."""
+    now = time.time() if now is None else now
+    exp = credential_expiry_epoch(provider, cred)
+    if exp - now <= _MIN_REMAINING_SECONDS:  # compared as floats; int() only formats the message
+        raise ValueError(f"{provider} access token has {int(exp - now)}s of life left, at or below the "
+                         f"{_MIN_REMAINING_SECONDS}s minimum; refusing to mint a capability that "
+                         "advertises a dead token")
+    return True
 
 
 _REFRESH_HINTS = ("refresh", "refresh_token", "refreshtoken")
@@ -180,43 +246,53 @@ def force_stale(provider, cred):
     raise ValueError(f"unknown provider {provider!r}")
 
 
-def _refresh_fingerprint(provider, cred):
-    """(access token, refresh/expiry stamp) as STORED — the two fields a real refresh moves.
-    `last_refresh` is the wrong field for reporting expiry but exactly the right one for "did a
-    refresh happen", which is all it is used for here."""
+def stored_access_token(provider, cred):
+    """The ACCESS token as stored in the credential — the one field a real OAuth refresh must move."""
     if provider == "openai":
         tok = cred.get("tokens") if isinstance(cred.get("tokens"), dict) else {}
-        return tok.get("access_token"), cred.get("last_refresh")
+        return tok.get("access_token")
     if provider == "anthropic":
         oauth = cred.get("claudeAiOauth") if isinstance(cred.get("claudeAiOauth"), dict) else {}
-        return oauth.get("accessToken"), oauth.get("expiresAt")
+        return oauth.get("accessToken")
     raise ValueError(f"unknown provider {provider!r}")
 
 
-def _expiry_advanced(after, before):
-    """True only when `after` is UNAMBIGUOUSLY later than `before` — unknown/mixed shapes are not
-    proof, so they fail closed."""
-    if isinstance(after, bool) or isinstance(before, bool):
-        return False
-    if isinstance(after, (int, float)) and isinstance(before, (int, float)):
-        return after > before
-    if isinstance(after, str) and isinstance(before, str):
-        return after > before  # both providers stamp RFC3339-Z, which sorts lexicographically
-    return False
+def is_stale_marked(provider, cred):
+    """True when `cred` still carries force_stale's artificial marker, i.e. it is the BACKDATED copy
+    rather than a stored credential. Used to refuse the backdated copy as a refresh baseline."""
+    if provider == "openai":
+        return cred.get("last_refresh") == _STALE_ISO
+    if provider == "anthropic":
+        oauth = cred.get("claudeAiOauth") if isinstance(cred.get("claudeAiOauth"), dict) else {}
+        exp = oauth.get("expiresAt")
+        return isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp == 0
+    raise ValueError(f"unknown provider {provider!r}")
 
 
-def assert_refresh_happened(provider, before, after):
-    """Fail closed unless the credential actually moved: a new access token, or an advanced expiry.
-    An unchanged credential means the probe refreshed nothing, and re-reading the stale credential
-    and calling it "refreshed" is exactly how a dead token reached a worker (#574)."""
-    before_token, before_exp = _refresh_fingerprint(provider, before)
-    after_token, after_exp = _refresh_fingerprint(provider, after)
-    if isinstance(after_token, str) and after_token and after_token != before_token:
-        return True
-    if _expiry_advanced(after_exp, before_exp):
-        return True
-    raise AssertionError(f"{provider} refresh produced no new access token and no advanced expiry: "
-                         "the CLI did not refresh the credential, so it must not reach a worker")
+def assert_refresh_happened(provider, original, after):
+    """Fail closed unless the probe left a genuinely NEW access token behind.
+
+    `original` is the STORED credential, never the backdated copy force_stale wrote into the isolated
+    HOME. Review round 1 on #574: with the backdated copy as the baseline, a CLI that merely rewrote
+    the ORIGINAL metadata back passed the proof — any openai `last_refresh` later than 1970, or any
+    positive anthropic `expiresAt`, read as "the expiry advanced" — and the same dead access token was
+    minted. So an advanced expiry stamp is no longer proof of anything by itself: undoing the forced
+    staleness reproduces it, and a stamp saying "a refresh happened" is not a refreshed token.
+
+    A changed access token is the one piece of evidence that cannot be manufactured that way, and a
+    real OAuth refresh always returns a new access token, so requiring it costs the live path
+    nothing. An unchanged (or missing) token means the probe refreshed nothing (#574)."""
+    if not isinstance(after, dict):
+        raise AssertionError(f"{provider} refresh left no credential object behind")
+    after_token = stored_access_token(provider, after)
+    if not isinstance(after_token, str) or not after_token.strip():
+        raise AssertionError(f"{provider} refresh left no usable access token in the credential: "
+                             "the CLI did not refresh it, so it must not reach a worker")
+    if after_token == stored_access_token(provider, original):
+        raise AssertionError(f"{provider} refresh returned the access token the stored credential "
+                             "already had: the CLI did not refresh it (an advanced expiry stamp over "
+                             "an unchanged token proves nothing), so it must not reach a worker")
+    return True
 
 
 # ---- isolation + live refresh (registry Actions only; probed via an injected runner in --self-test)
@@ -232,16 +308,22 @@ def _write_isolated(provider, cred, home):
     return path
 
 
-def refresh_via_cli(provider, home, runner=subprocess.run):
+def refresh_via_cli(provider, home, original, runner=subprocess.run):
     """Run the provider's refresh probe (with HOME=`home`) so the CLI refreshes the access token from
     the refresh token, then re-read the credential it left behind. The CLI owns the OAuth endpoints.
+
+    `original` is the STORED credential and is the refresh proof's baseline. It must NOT be the
+    backdated copy sitting in `home`: that copy's expiry was artificially rewound, so a CLI that only
+    restored the original metadata would look like it had advanced it (#574 review round 1). Passing a
+    stale-marked baseline is refused rather than silently trusted.
 
     Raises rather than returning a credential when the probe exits non-zero, times out, or leaves the
     credential unmoved. `runner` is injected only so --self-test can exercise both failure modes
     without spawning a provider CLI; the live path always uses subprocess.run. Registry-Actions only."""
+    if is_stale_marked(provider, original):
+        raise ValueError(f"{provider} refresh baseline is the backdated copy, which cannot prove a "
+                         "refresh; pass the stored credential as the baseline")
     cred_path = os.path.join(home, cred_relpath(provider))
-    with open(cred_path) as f:
-        before = json.load(f)
     env = dict(os.environ, HOME=home)
     cmd = refresh_probe_cmd(provider)
     proc = runner(cmd, env=env, capture_output=True, text=True, timeout=60)
@@ -252,19 +334,24 @@ def refresh_via_cli(provider, home, runner=subprocess.run):
                            "refusing to mint a capability from an unrefreshed credential")
     with open(cred_path) as f:
         after = json.load(f)
-    assert_refresh_happened(provider, before, after)
+    assert_refresh_happened(provider, original, after)
     return after
 
 
-def broker(provider, cred, runner=subprocess.run):
-    """Full path (registry Actions): isolate -> force stale -> refresh (proven) -> extract the
-    access-token-only capability. Every step fails closed; nothing is returned unless the provider
-    CLI demonstrably refreshed the credential and the resulting token reports a real expiry."""
+def broker(provider, cred, runner=subprocess.run, now=None):
+    """Full path (registry Actions): isolate -> force stale -> refresh (proven against the ORIGINAL
+    credential) -> require the refreshed token to still be live -> extract the access-token-only
+    capability. Every step fails closed; nothing is returned unless the provider CLI demonstrably
+    issued a NEW access token and that token's own expiry is still in the future. `now` is injected
+    only so --self-test is deterministic; the live path reads the real clock."""
     home = tempfile.mkdtemp(prefix="broker-")
     try:
         os.chmod(home, 0o700)
         _write_isolated(provider, force_stale(provider, cred), home)
-        refreshed = refresh_via_cli(provider, home, runner=runner)
+        # The backdated copy is what the CLI sees; `cred` (the stored credential) is the proof
+        # baseline, so restoring the original metadata cannot pass as a refresh.
+        refreshed = refresh_via_cli(provider, home, cred, runner=runner)
+        assert_token_live(provider, refreshed, now=now)
         cap = extract_access_token(provider, refreshed)
         assert_no_refresh_leak(cap)
         return cap
@@ -340,6 +427,10 @@ def _self_test():
 
     OLD_JWT = _jwt({"sub": "acct", "exp": 1799999999})  # 2027-01-15T07:59:59Z
     NEW_JWT = _jwt({"sub": "acct", "exp": 1800000600})  # 2027-01-15T08:10:00Z
+    # A FIXED "now" ahead of which both fixtures are live, so the liveness gate below is deterministic
+    # and the suite cannot rot into passing (or failing) as the wall clock crosses the fixtures.
+    NOW = 1799000000  # 2027-01-03T17:33:20Z
+    DEAD_JWT = _jwt({"sub": "acct", "exp": NOW - 3600})  # a refreshed-looking but already-dead token
 
     # real key layouts (values are fake)
     codex = {"auth_mode": "oauth",
@@ -455,9 +546,13 @@ def _self_test():
         codex["last_refresh"] == "2026-07-15T00:00:00Z"
         and claude["claudeAiOauth"]["expiresAt"] == 1799999999)
     chk("force_stale rejects an unknown provider", raises(lambda: force_stale("acme", {}), ValueError))
+    chk("stale marker recognised on the backdated copy",
+        is_stale_marked("openai", stale_codex) and is_stale_marked("anthropic", stale_claude))
+    chk("stale marker NOT seen on the stored credential",
+        not is_stale_marked("openai", codex) and not is_stale_marked("anthropic", claude))
     # happy path: the CLI refreshed, so the capability carries the NEW token and ITS expiry
     ok_run = fake_cli("openai", 0, refreshed_codex)
-    ocap = broker("openai", codex, runner=ok_run)
+    ocap = broker("openai", codex, runner=ok_run, now=NOW)
     chk("broker mints the refreshed openai token", ocap["access_token"] == NEW_JWT)
     chk("broker expiry tracks the refreshed token's exp", ocap["expires_at"] == "2027-01-15T08:10:00Z")
     chk("broker ran exactly the documented probe", ok_run.calls == [["codex", "login", "status"]])
@@ -466,45 +561,143 @@ def _self_test():
         and ok_run.seen[0]["tokens"]["refresh_token"] == "REFRESH_long")
     chk("refreshed capability still leaks no refresh secret",
         assert_no_refresh_leak(ocap) and "REFRESH_long" not in json.dumps(ocap))
-    acap = broker("anthropic", claude, runner=fake_cli("anthropic", 0, refreshed_claude))
+    acap = broker("anthropic", claude, runner=fake_cli("anthropic", 0, refreshed_claude), now=NOW)
     chk("broker mints the refreshed anthropic token", acap["access_token"] == "ACCESS_new")
     chk("anthropic keeps reading claudeAiOauth.expiresAt", acap["expires_at"] == 1800000600)
     # a non-zero probe exit is a hard failure EVEN IF the credential was rewritten
     chk("openai non-zero probe exit -> no capability",
-        raises(lambda: broker("openai", codex, runner=fake_cli("openai", 1, refreshed_codex)), RuntimeError))
-    chk("anthropic non-zero probe exit -> no capability",
-        raises(lambda: broker("anthropic", claude, runner=fake_cli("anthropic", 2, refreshed_claude)),
+        raises(lambda: broker("openai", codex, runner=fake_cli("openai", 1, refreshed_codex), now=NOW),
                RuntimeError))
+    chk("anthropic non-zero probe exit -> no capability",
+        raises(lambda: broker("anthropic", claude, runner=fake_cli("anthropic", 2, refreshed_claude),
+                              now=NOW), RuntimeError))
     # exit 0 but an UNCHANGED credential means nothing was refreshed
     chk("openai unchanged credential -> no capability",
-        raises(lambda: broker("openai", codex, runner=fake_cli("openai", 0)), AssertionError))
+        raises(lambda: broker("openai", codex, runner=fake_cli("openai", 0), now=NOW), AssertionError))
     chk("anthropic unchanged credential -> no capability",
-        raises(lambda: broker("anthropic", claude, runner=fake_cli("anthropic", 0)), AssertionError))
+        raises(lambda: broker("anthropic", claude, runner=fake_cli("anthropic", 0), now=NOW),
+               AssertionError))
+
+    # ---- #574 review round 1, hole A: the proof baseline is the ORIGINAL credential, not the
+    # backdated copy. A CLI that sees the stale copy and writes the EXACT ORIGINAL credential back
+    # "advances" last_refresh past 1970 / expiresAt past 0 while re-minting the SAME dead token. Both
+    # providers must reject that; these cases mint a capability if the baseline regresses to the copy.
+    SAME_TOKEN = "access token the stored credential already had"
+    restore_openai = fake_cli("openai", 0, codex)
+    chk("openai CLI that restores the original credential -> no capability",
+        raises(lambda: broker("openai", codex, runner=restore_openai, now=NOW), AssertionError, SAME_TOKEN))
+    chk("the restoring openai CLI really did see the backdated copy (test is not vacuous)",
+        restore_openai.seen[0]["last_refresh"] == _STALE_ISO)
+    restore_anthropic = fake_cli("anthropic", 0, claude)
+    chk("anthropic CLI that restores the original credential -> no capability",
+        raises(lambda: broker("anthropic", claude, runner=restore_anthropic, now=NOW), AssertionError,
+               SAME_TOKEN))
+    chk("the restoring anthropic CLI really did see the expired copy (test is not vacuous)",
+        restore_anthropic.seen[0]["claudeAiOauth"]["expiresAt"] == 0)
+    # ...and an ADVANCED expiry over an unchanged access token is not proof either, for either provider
+    chk("openai advanced last_refresh with the SAME token -> no capability",
+        raises(lambda: broker("openai", codex, runner=fake_cli(
+            "openai", 0, {**codex, "last_refresh": "2026-07-21T00:00:00Z"}), now=NOW),
+            AssertionError, SAME_TOKEN))
+    chk("anthropic advanced expiresAt with the SAME token -> no capability",
+        raises(lambda: broker("anthropic", claude, runner=fake_cli(
+            "anthropic", 0, {"claudeAiOauth": {**claude["claudeAiOauth"], "expiresAt": 1800000600}}),
+            now=NOW), AssertionError, SAME_TOKEN))
+    # the backdated copy is refused OUTRIGHT as a baseline, so the hole cannot be reopened by a caller
+    bh = tempfile.mkdtemp(prefix="broker-baseline-")
+    try:
+        _write_isolated("openai", force_stale("openai", codex), bh)
+        chk("refresh_via_cli refuses the backdated copy as its proof baseline",
+            raises(lambda: refresh_via_cli("openai", bh, force_stale("openai", codex),
+                                           runner=fake_cli("openai", 0, refreshed_codex)),
+                   ValueError, "backdated copy"))
+        chk("refresh_via_cli accepts the stored credential as its baseline",
+            refresh_via_cli("openai", bh, codex,
+                            runner=fake_cli("openai", 0, refreshed_codex))["tokens"]["access_token"]
+            == NEW_JWT)
+    finally:
+        subprocess.run(["rm", "-rf", bh], check=False)
+
+    # ---- #574 review round 1, hole B: a parsed expiry must also be in the FUTURE, or the capability
+    # advertises a dead token. Deterministic against the injected NOW, so these never rot.
+    DEAD = "advertises a dead token"
+    chk("assert_token_live accepts a future openai exp", assert_token_live("openai", refreshed_codex, now=NOW))
+    chk("assert_token_live accepts a future anthropic expiry",
+        assert_token_live("anthropic", refreshed_claude, now=NOW))
+    chk("assert_token_live rejects a PAST openai exp",
+        raises(lambda: assert_token_live("openai", {"tokens": {"access_token": DEAD_JWT}}, now=NOW),
+               ValueError, DEAD))
+    chk("assert_token_live rejects a PAST anthropic expiresAt",
+        raises(lambda: assert_token_live("anthropic", {"claudeAiOauth": {"accessToken": "A",
+                                                                        "expiresAt": NOW - 1}},
+                                         now=NOW), ValueError, DEAD))
+    chk("assert_token_live rejects an expiry inside the margin (fail closed, not rounded down)",
+        raises(lambda: assert_token_live("anthropic", {"claudeAiOauth": {"accessToken": "A",
+                                                                        "expiresAt": NOW + 1}},
+                                         now=NOW), ValueError, DEAD)
+        and assert_token_live("anthropic", {"claudeAiOauth": {"accessToken": "A",
+                                                              "expiresAt": NOW + _MIN_REMAINING_SECONDS + 1}},
+                              now=NOW))
+    # anthropic stamps expiresAt in milliseconds on some CLI versions: BOTH units must gate correctly
+    chk("assert_token_live reads a millisecond anthropic expiry (past -> reject, future -> accept)",
+        raises(lambda: assert_token_live("anthropic", {"claudeAiOauth": {"accessToken": "A",
+                                                                        "expiresAt": (NOW - 3600) * 1000}},
+                                         now=NOW), ValueError, DEAD)
+        and assert_token_live("anthropic", {"claudeAiOauth": {"accessToken": "A",
+                                                              "expiresAt": (NOW + 3600) * 1000}}, now=NOW))
+    # the default clock is really wired up (no `now` passed): dead is dead at the real wall clock
+    real_now = int(time.time())
+    chk("assert_token_live defaults to the real clock",
+        raises(lambda: assert_token_live("openai", {"tokens": {"access_token": _jwt({"exp": real_now - 3600})}}),
+               ValueError, DEAD)
+        and assert_token_live("openai", {"tokens": {"access_token": _jwt({"exp": real_now + 86400})}}))
+    chk("assert_token_live rejects an unknown provider",
+        raises(lambda: assert_token_live("acme", {}, now=NOW), ValueError))
+    # ...and the gate is reached THROUGH broker: a genuinely NEW but already-expired token mints nothing
+    chk("broker refuses a refreshed-but-EXPIRED openai token",
+        raises(lambda: broker("openai", codex, runner=fake_cli(
+            "openai", 0, {"tokens": {"access_token": DEAD_JWT, "refresh_token": "REFRESH_long"},
+                          "last_refresh": "2027-01-03T17:00:00Z"}), now=NOW), ValueError, DEAD))
+    chk("broker refuses a refreshed-but-EXPIRED anthropic token",
+        raises(lambda: broker("anthropic", claude, runner=fake_cli(
+            "anthropic", 0, {"claudeAiOauth": {"accessToken": "ACCESS_new", "refreshToken": "REFRESH_long",
+                                               "expiresAt": NOW - 1}}), now=NOW), ValueError, DEAD))
     # a "refreshed" credential that carries no usable token/expiry still mints nothing
     chk("refreshed-but-empty openai token -> no capability",
         raises(lambda: broker("openai", codex, runner=fake_cli(
             "openai", 0, {"tokens": {"access_token": "", "refresh_token": "REFRESH_long"},
-                          "last_refresh": "2026-07-20T00:00:00Z"})), ValueError, NO_TOKEN))
+                          "last_refresh": "2026-07-20T00:00:00Z"}), now=NOW),
+            AssertionError, "no usable access token"))
     chk("refreshed-but-opaque openai token -> no capability (expiry unreadable)",
         raises(lambda: broker("openai", codex, runner=fake_cli(
             "openai", 0, {"tokens": {"access_token": "opaque", "refresh_token": "REFRESH_long"},
-                          "last_refresh": "2026-07-20T00:00:00Z"})), ValueError, "not a JWT"))
+                          "last_refresh": "2026-07-20T00:00:00Z"}), now=NOW), ValueError, "not a JWT"))
     chk("refreshed-but-empty anthropic token -> no capability",
         raises(lambda: broker("anthropic", claude, runner=fake_cli(
             "anthropic", 0, {"claudeAiOauth": {"accessToken": "", "refreshToken": "REFRESH_long",
-                                               "expiresAt": 1800000600}})), ValueError, NO_TOKEN))
-    # the proof primitive itself: only a new token or an advanced expiry counts
+                                               "expiresAt": 1800000600}}), now=NOW),
+            AssertionError, "no usable access token"))
+    # the proof primitive itself: ONLY a changed access token counts
     chk("proof accepts a new access token",
-        assert_refresh_happened("openai", codex, refreshed_codex))
-    chk("proof accepts an advanced expiry alone",
-        assert_refresh_happened("anthropic", claude,
-                                {"claudeAiOauth": {**claude["claudeAiOauth"], "expiresAt": 1800000600}}))
+        assert_refresh_happened("openai", codex, refreshed_codex)
+        and assert_refresh_happened("anthropic", claude, refreshed_claude))
     chk("proof rejects an identical credential",
-        raises(lambda: assert_refresh_happened("openai", codex, codex), AssertionError))
+        raises(lambda: assert_refresh_happened("openai", codex, codex), AssertionError, SAME_TOKEN)
+        and raises(lambda: assert_refresh_happened("anthropic", claude, claude), AssertionError, SAME_TOKEN))
+    chk("proof rejects an advanced expiry over the SAME access token",
+        raises(lambda: assert_refresh_happened(
+            "anthropic", claude, {"claudeAiOauth": {**claude["claudeAiOauth"], "expiresAt": 1800000600}}),
+            AssertionError, SAME_TOKEN)
+        and raises(lambda: assert_refresh_happened(
+            "openai", codex, {**codex, "last_refresh": "2026-07-21T00:00:00Z"}),
+            AssertionError, SAME_TOKEN))
     chk("proof rejects a REWOUND expiry",
         raises(lambda: assert_refresh_happened("anthropic", claude,
                                                {"claudeAiOauth": {**claude["claudeAiOauth"], "expiresAt": 1}}),
                AssertionError))
+    chk("proof rejects a credential with no access token at all",
+        raises(lambda: assert_refresh_happened("openai", codex, {"last_refresh": "2027-01-03T17:00:00Z"}),
+               AssertionError, "no usable access token"))
     # the live capability is written to a private file, NEVER printed (the #193 invariant)
     d = tempfile.mkdtemp(prefix="broker-selftest-")
     try:

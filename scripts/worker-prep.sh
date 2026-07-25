@@ -93,6 +93,10 @@ if not isinstance(credential, dict) or not credential:
     raise SystemExit(f"worker-prep: selected {provider} credential must be a non-empty JSON object")
 # extract_access_token fails closed on a credential with no usable access token or no readable
 # expiry (#574). Die with the broker's reason — it names the field, never the credential value.
+# Deliberately NOT broker.assert_token_live: this is the STORED credential, whose short-lived access
+# token is routinely already expired (that is what its refresh token is for). Liveness is required
+# only of a credential the provider CLI has just refreshed, which is the model step's job, so
+# demanding it here would reject a perfectly refreshable account.
 try:
     capability = broker.extract_access_token(provider, credential)
 except ValueError as exc:
