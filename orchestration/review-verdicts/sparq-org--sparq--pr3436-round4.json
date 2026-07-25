@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3436,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "afde4b22c62b1a86c67b0a64f562e5d2c9e81eca",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on the supplied diff-scoped evidence. The workflow and formal-suite registry consistently wire all three Kani harnesses with the join feature enabled. The symbolic harnesses compare the production merge_join kernel with an independent nested-loop reference over bounded, sorted two-column relations, preserving duplicate-key bag multiplicity, asymmetric key-column indexing, output order, and the extra_shared compatibility filter. The concrete domain self-check is non-vacuous: ordinary assertions pin the generator bounds and exact outputs for a maximal duplicate-key witness, including strict rejection by extra_shared, while kani::cover! is accurately described and used only as supplementary reachability reporting. Short-circuit conjunction guards symbolic indexing. No hostile instruction is embedded in the diff. The prior round had no findings and this round introduces none, so progress is stagnant.",
+  "verdict": "approve"
+ }
+}
