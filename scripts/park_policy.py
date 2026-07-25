@@ -31,9 +31,43 @@
 #      human must never mint a veto or a fresh budget; only the strict maintainer probe
 #      (permission in {admin, maintain, write}, the worker-issue.py _is_human_maintainer
 #      pattern) counts.
+#
+# 3. AUTOMATIC RE-ADMISSION OF A MACHINE PARK ON PROVEN CAUSE-RECOVERY (registry #614). A
+#    MACHINE-owned park used to be clearable only by a HUMAN gesture: capacity_park_readmitted
+#    admits exactly one thing — an UNCONSUMED proven-human unlabel — so a capacity OUTAGE
+#    permanently stranded every PR it parked, even after the outage ended, and the label
+#    description ("cleared automatically on readmission") was simply false. Live evidence
+#    2026-07-25: acct01 (the fleet's ONLY cross-provider review account) failed every review with
+#    model-exit-class=auth (#596), which capacity-parked registry PRs #587/#590/#585/#593 with
+#    their source issues #574/#577/#582/#572 plus 6 sparq PRs; the credential fix restores review
+#    capacity but NONE of those parks recover without a hand-unlabel of every one.
+#    capacity_park_admission therefore adds an ADDITIONAL, STRICTLY NARROWER admission beside the
+#    human one:
+#    - MACHINE parks only. `needs:user` / `review:needs-user` and a park whose LATEST application
+#      was made by a PROVEN HUMAN are never auto-re-admitted, and the sticky human-unpark veto
+#      (invariant 2) is untouched — the automatic path only ever CLEARS a machine park, it never
+#      applies one, so it cannot interact with the veto at all.
+#    - Evidence-gated on the CAUSE, never on elapsed time: the caller supplies positive
+#      per-account model-health evidence (model-health.capacity_recovery_evidence — the SAME
+#      records #604's auth_cooldowns / account-auth-cooldown read, never a parallel health store)
+#      that the account which was failing when the park landed has since recorded a SUCCESSFUL
+#      run STRICTLY AFTER the park application. No evidence, an unreadable/ambiguous health read,
+#      an unreadable timeline, or an instant tie all fail toward STAYING PARKED — the same
+#      direction the human path already fails in.
+#    - Bounded, and unable to loop, because this is exactly why the human-only rule existed:
+#      every automatic re-admission is receipted durably (worker-pr AUTO_READMIT_MARKER, the same
+#      bot-authored-receipt style as #610's park-generation receipts, which it EXTENDS rather than
+#      replaces), and
+#        INVARIANT: an automatic re-admission CONSUMES its recovery evidence EXACTLY ONCE and can
+#        never be re-earned by the same evidence. A subsequent park requires a NEW
+#        outage-and-recovery pair (a success strictly after THAT park), and at most
+#        AUTO_READMISSION_MAX automatic re-admissions may ever be granted to one PR — past the cap
+#        the loop stops trying and says so LOUDLY, because a flapping account is a genuine human
+#        question.
 """Machine/human park-label ownership + the sticky human-unpark veto (one shared helper)."""
 
 import argparse
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -48,6 +82,10 @@ MACHINE_PARK_LABEL = "status:parked"
 MACHINE_PARK_PR_LABEL = "review:parked"
 # The human-owned terminal (genuine human questions only).
 HUMAN_PARK_LABEL = "needs:user"
+# Its PR-side twin (worker-pr's review:needs-user, dispatch-claim's HUMAN_HOLD_PR_LABELS): the
+# review loop's own human-question terminal. Named here so the automatic-readmission path can
+# recognise a human-owned hold without importing a writer module.
+HUMAN_PR_PARK_LABEL = "review:needs-user"
 PARK_LABELS = (HUMAN_PARK_LABEL, MACHINE_PARK_LABEL, MACHINE_PARK_PR_LABEL)
 # A human unlabel of ANY of these — on the PR or its provenance-linked source issue, latest
 # event wins — is an explicit readmission gesture: it opens the round/attempt-budget readmission
@@ -73,13 +111,28 @@ PARK_WINDOW_NONE = "none"
 # generation (or minting a PARK_WINDOW_NONE receipt) on a failed read would corrupt the durable
 # ladder — while plain budget consumers keep the default None => full-historical-count path.
 WINDOW_UNREADABLE = "window-unreadable"
+# Character class a park FINGERPRINT component (head SHA / attempt counter) must satisfy: no
+# whitespace and no `>`, so the value can never break out of the `head=<sha> attempt=<key> -->`
+# receipt marker (the readers key on `(\S+)` groups terminated by ` -->`).
+_FINGERPRINT_PART = re.compile(r"[A-Za-z0-9._=/:-]{1,120}")
 # The strict maintainer probe set (the worker-issue.py _is_human_maintainer pattern): repo
 # collaborator permission must be one of these for an actor to count as a trusted human.
 HUMAN_MAINTAINER_PERMISSIONS = {"admin", "maintain", "write"}
 MACHINE_PARK_COLOUR = "1d76db"
+# HONEST label text (invariant 3): a machine park clears on a human unlabel OR on proven
+# cause-recovery (capacity_park_admission). The old wording ("cleared automatically on
+# readmission") described a mechanism that did not exist — readmission was human-only, so an
+# outage's parks stayed parked until hand-unlabelled. Keep this in sync with groom.LABELS.
 MACHINE_PARK_DESCRIPTION = (
-    "Machine-owned capacity park (soft hold; cleared automatically on readmission)"
+    "Machine-owned capacity park (soft hold; cleared by a human unlabel or proven recovery)"
 )
+# HARD per-PR ceiling on AUTOMATIC re-admissions (invariant 3). Two is deliberate: one covers the
+# ordinary outage-then-recovery shape this exists for, the second covers a genuine second outage,
+# and anything past that is an account flapping — a state whose right answer is a human decision,
+# not a third machine retry. The cap bounds the ping-pong a flapping account could otherwise drive
+# even though each individual re-admission already needs its own fresh, unconsumed recovery
+# evidence; the two bounds are independent on purpose.
+AUTO_READMISSION_MAX = 2
 
 
 class MalformedTimelineError(RuntimeError):
@@ -387,23 +440,232 @@ def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_hum
             "was already consumed by a receipted budget window — a FRESH gesture is "
             "required")
         return False
-    park_instants = []
+    latest_park, _human_park, readable = park_applications(
+        repo, pr_number, issue_number, fetch_events, log=log)
+    if not readable:
+        return False
+    return latest_park is None or parse_ts(cutoff) > latest_park
+
+
+def park_applications(repo, pr_number, issue_number, fetch_events, is_human=None, log=print):
+    """(latest_park_instant, latest_was_human, readable) for `repo#pr_number` and its
+    provenance-linked source issue — the LATEST `labeled` event for ANY of READMISSION_LABELS
+    across BOTH surfaces (round-5 finding 1: the recency proof must span the same surfaces and
+    labels the readmission cutoff spans).
+
+    `latest_park_instant` is a parsed aware datetime (None when no park label was ever applied
+    on either surface — e.g. every write was veto-suppressed). `latest_was_human` is True when
+    a PROVEN HUMAN (the strict maintainer probe; `is_human=None` can prove nothing and yields
+    False) applied a park at that latest instant — a HUMAN-OWNED park, which the automatic
+    re-admission path must never clear. `readable` is False on ANY read/shape failure, and
+    every caller's documented fail direction on that is to STAY PARKED.
+
+    Extracted verbatim from capacity_park_readmitted so the human path and the automatic path
+    (capacity_park_admission) can never disagree about when a park was applied."""
+    probe = _human_probe(is_human)
+    latest, latest_human = None, False
     for number in [pr_number] + ([issue_number] if issue_number else []):
         try:
             events = fetch_events(repo, number)
             for label in READMISSION_LABELS:
-                park_instants.extend(
-                    parse_ts(created)
-                    for created, kind, _login, _app in _event_rows(events, label)
-                    if kind == "labeled")
+                for created, kind, login, via_app in _event_rows(events, label):
+                    if kind != "labeled":
+                        continue
+                    instant = parse_ts(created)
+                    human = _is_proven_human(login, via_app, probe)
+                    if latest is None or instant > latest:
+                        latest, latest_human = instant, human
+                    elif instant == latest and human:
+                        # An instant tie between a human and a machine application resolves
+                        # toward HUMAN-OWNED: the automatic path must never clear a park a
+                        # human might have applied.
+                        latest_human = True
         except Exception as exc:  # noqa: BLE001 — ambiguity stays parked
             log(f"readmission unknown: timeline read failed for {repo}#{number} ({exc}); "
                 "the capacity park stands")
-            return False
-    return not park_instants or parse_ts(cutoff) > max(park_instants)
+            return None, False, False
+    return latest, latest_human, True
 
 
-def park_ladder_decision(cutoff, receipts, already_labeled=False):
+def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_human=None,
+                            log=print, consumed=frozenset(), auto_receipts=(),
+                            auto_marker_count=None, auto_evidence=None, live_holds=()):
+    """Whether a MACHINE capacity park may be re-admitted now, and on WHOSE authority
+    (invariant 3). Returns (action, evidence, detail), where `evidence` is None or
+    {"key", "at"} — the recovery event's durable identity plus its canonical recovery stamp, i.e.
+    exactly what the caller receipts — and action is one of:
+
+    - "human"       — capacity_park_readmitted is True: an UNCONSUMED proven-human readmission
+                      gesture newer than every park application. UNCHANGED semantics, and it is
+                      checked FIRST so a human gesture always takes precedence and NO automatic
+                      evidence is consumed when one exists (no double consumption).
+    - "auto-receipt"— a well-formed bot-authored automatic-readmission receipt is already newer
+                      than every park application: this PR was ALREADY automatically re-admitted
+                      and the receipt is the durable gesture. Idempotent — no new evidence is
+                      consumed, so a crashed label write converges on a later tick, and the
+                      receipt-driven CLAIM proof gate can admit the PR after the sweep cleared
+                      its labels (without this, the machine's own re-admission would be invisible
+                      to the proof gate and the PR would defer forever — the very deadlock this
+                      whole change exists to remove).
+    - "auto-mint"   — a NEW automatic re-admission is earned: fresh, unconsumed recovery
+                      evidence strictly newer than the latest park application, under the
+                      AUTO_READMISSION_MAX cap. The caller MUST receipt `evidence` durably
+                      BEFORE it clears any label (RECEIPT-FIRST, #610's ordering: dying
+                      receipt-then-label is recoverable — the "auto-receipt" branch above
+                      converges it — while label-then-receipt would erase the re-admission from
+                      every proof surface and re-strand the PR).
+    - None          — stays parked; `detail` says why.
+
+    `consumed` is the park-GENERATION receipt set (worker-pr park_generation_cutoffs) the human
+    path already consults. `auto_receipts` are the well-formed AUTOMATIC receipts
+    (worker-pr auto_readmission_records — [{"key": evidence key, "at": canonical stamp}]);
+    `auto_marker_count` is the count of ALL bot-authored auto-readmit markers including
+    malformed ones (worker-pr auto_readmission_marker_count) and defaults to len(auto_receipts).
+    The cap counts MARKERS, not well-formed records, so a corrupt receipt can never buy an extra
+    automatic re-admission. `live_holds` are the labels currently live on either surface: ANY
+    `needs:*` label or `review:needs-user` among them is a HUMAN-OWNED hold and blocks the
+    automatic path outright — the same rule the review lane's own admission applies, so
+    "human-held there" and "never auto-re-admitted here" cannot drift.
+    `auto_evidence(parked_at)` is the caller's recovery-evidence probe — called at most once,
+    with the canonical stamp of the latest park application (None when none was ever applied) —
+    returning {"key", "recovered_at"} or None; pass None (the CLAIM proof gate) to evaluate the
+    human + already-receipted paths WITHOUT minting anything.
+
+    EVERY ambiguity fails toward staying parked: an unreadable timeline, an unreadable/absent
+    health record, a probe that raises, an unsafe evidence key, a recovery that is not STRICTLY
+    after the park (a tie included), a human-owned label, a human-applied park, and the cap."""
+    if capacity_park_readmitted(repo, pr_number, issue_number, fetch_events,
+                                is_human=is_human, log=log, consumed=consumed):
+        return ("human", None, "unconsumed proven-human readmission gesture")
+    held = sorted({label for label in live_holds
+                   if isinstance(label, str)
+                   and (label == HUMAN_PR_PARK_LABEL or label.startswith("needs:"))})
+    if held:
+        return (None, None,
+                f"human-owned hold(s) live ({'/'.join(held)}) — never auto-re-admitted")
+    latest_park, human_park, readable = park_applications(
+        repo, pr_number, issue_number, fetch_events, is_human=is_human, log=log)
+    if not readable:
+        return (None, None, "the park application timeline could not be read")
+    if human_park:
+        return (None, None, "the latest park application is HUMAN-owned — only a human clears it")
+    parked_at = canonical_ts(latest_park.isoformat()) if latest_park is not None else None
+    for receipt in auto_receipts:
+        stamp = receipt.get("at") if isinstance(receipt, dict) else None
+        if not valid_timestamp(stamp):
+            continue                    # malformed receipts prove nothing (they still count
+            # toward the cap below, so they can never buy an extra re-admission)
+        if latest_park is None or parse_ts(stamp) > latest_park:
+            return ("auto-receipt", {"key": receipt.get("key"), "at": canonical_ts(stamp)},
+                    f"already automatically re-admitted at {canonical_ts(stamp)} "
+                    f"(receipt evidence {receipt.get('key')!r}); no new evidence consumed")
+    minted = len(auto_receipts) if auto_marker_count is None else auto_marker_count
+    if minted >= AUTO_READMISSION_MAX:
+        log(f"::warning::automatic readmission REFUSED for {repo}#{pr_number}: "
+            f"{minted} automatic re-admission(s) already granted (cap "
+            f"{AUTO_READMISSION_MAX}) and the park fired again — an account that keeps "
+            "flapping is a genuine human question; the park stands until a human acts")
+        return (None, None, f"automatic-readmission cap reached ({minted}/"
+                            f"{AUTO_READMISSION_MAX})")
+    if auto_evidence is None:
+        return (None, None, "no unconsumed human gesture and no recovery evidence offered")
+    try:
+        evidence = auto_evidence(parked_at)
+    except Exception as exc:  # noqa: BLE001 — an unreadable cause probe stays parked
+        log(f"automatic readmission unknown for {repo}#{pr_number}: the recovery-evidence "
+            f"probe failed ({exc}); the capacity park stands")
+        return (None, None, "the recovery-evidence probe failed")
+    if not evidence:
+        return (None, None, "no recorded recovery of the park's starvation cause")
+    key = evidence.get("key") if isinstance(evidence, dict) else None
+    recovered_at = evidence.get("recovered_at") if isinstance(evidence, dict) else None
+    if not safe_receipt_part(key) or not valid_timestamp(recovered_at):
+        log(f"automatic readmission unknown for {repo}#{pr_number}: the recovery evidence is "
+            f"malformed (key={key!r}, recovered_at={recovered_at!r}); the capacity park stands")
+        return (None, None, "the recovery evidence is malformed")
+    recovered_canonical = canonical_ts(recovered_at)
+    if key in {receipt.get("key") for receipt in auto_receipts if isinstance(receipt, dict)}:
+        log(f"automatic readmission declined for {repo}#{pr_number}: the recovery evidence "
+            f"{key!r} was already consumed by a receipted automatic re-admission — a NEW "
+            "outage-and-recovery pair is required")
+        return (None, None, f"recovery evidence {key!r} already consumed")
+    if latest_park is not None and parse_ts(recovered_at) <= latest_park:
+        return (None, None,
+                f"the recovery at {recovered_canonical} is not STRICTLY after the park "
+                f"application at {parked_at}")
+    return ("auto-mint", {"key": key, "at": recovered_canonical},
+            f"recovery evidence {key!r} recorded at {recovered_canonical}, strictly after the "
+            f"park application at {parked_at}")
+
+
+def effective_readmission_cutoff(human_cutoff, auto_stamps=(), log=print):
+    """The budget readmission window a re-admitted PR actually gets: the LATEST of the
+    proven-human cutoff (readmission_cutoff) and every well-formed AUTOMATIC re-admission
+    receipt stamp, in canonical spelling.
+
+    WHY the automatic stamp must count here too: clearing the park label without granting a
+    budget window would leave the PR enumerable but permanently un-dispatchable — every tick
+    would re-derive the SAME exhausted lifetime counters (the missed-fix marker budget grows
+    purely from allocator starvation, so an outage pins it) and quietly re-defer forever. The
+    automatic re-admission grants EXACTLY the window a human gesture grants, and it is bounded
+    by exactly the same two things that bound the re-admission itself: fresh unconsumed
+    evidence and AUTO_READMISSION_MAX. The park-generation ladder is unchanged and still
+    escalates to the QUESTION class after PARK_ESCALATION_GENERATIONS consumed windows, so a PR
+    that is automatically re-admitted and then exhausts its real budget again still reaches a
+    human — it just does so having actually retried.
+
+    WINDOW_UNREADABLE is contagious and wins outright: an automatic stamp must never mask an
+    unreadable label timeline (the ladder has to FREEZE on unproven data). A malformed automatic
+    stamp is dropped with a loud log — unprovable time can never mint a window."""
+    if human_cutoff == WINDOW_UNREADABLE:
+        return WINDOW_UNREADABLE
+    candidates = []
+    for source, stamp in ([("human gesture", human_cutoff)] if human_cutoff else []) \
+            + [("automatic re-admission", stamp) for stamp in (auto_stamps or [])]:
+        if not valid_timestamp(stamp):
+            log(f"::warning::readmission window: dropping the malformed {source} stamp "
+                f"{stamp!r} — unprovable time can never mint a budget window")
+            continue
+        candidates.append((parse_ts(stamp), stamp))
+    return canonical_ts(max(candidates)[1]) if candidates else None
+
+
+def safe_receipt_part(value):
+    """True when `value` may be embedded in a durable park-receipt marker: non-empty, bounded,
+    and free of whitespace and `>` (_FINGERPRINT_PART), so it can never break out of the
+    `... key=<value> -->` marker every receipt reader keys on. Shared by park_fingerprint's
+    components and by the automatic-readmission evidence key (registry #614) so ONE grammar
+    governs everything a receipt can carry."""
+    return isinstance(value, str) and bool(_FINGERPRINT_PART.fullmatch(value))
+
+
+def park_fingerprint(head_sha, attempt_key):
+    """The ATTEMPT fingerprint a capacity park is receipted against (#555 recurrence gap):
+    the pair (PR head SHA, monotone attempt counter) that the exhaustion decision was
+    derived from. Two parks with an EQUAL fingerprint were derived from byte-identical
+    per-PR state — nothing new was attempted between them — so the second one is pure noise
+    (see park_ladder_decision's "unchanged" action).
+
+    Returns None when either component is unknown: an unknown fingerprint can prove
+    nothing, so the ladder falls back to its pre-fix behaviour (the park is emitted). That
+    is the conservative direction here — over-emitting a park is recoverable churn, whereas
+    suppressing on unproven identity would silently drop a due park.
+
+    `attempt_key` MUST be a monotone, space-free counter of work ATTEMPTED (a global round
+    number, a lifetime per-round missed/nochange/gatefail marker count) — never a
+    window-relative count, which resets on every readmission and would collide across
+    windows. Any character outside [A-Za-z0-9._=/:-] is rejected (None) so the value can
+    never break out of the `attempt=<key> -->` receipt marker."""
+    if not head_sha or not attempt_key:
+        return None
+    head, attempt = str(head_sha), str(attempt_key)
+    if not _FINGERPRINT_PART.fullmatch(head) or not _FINGERPRINT_PART.fullmatch(attempt):
+        return None
+    return f"{head}/{attempt}"
+
+
+def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=None,
+                         consumed_fingerprints=frozenset()):
     """The ONE label-independent capacity-park escalation ladder (round-3 finding 1), shared
     by the deferred-issue lane (dispatch-claim) and the worker-PR lane (worker-pr needs_user).
     `cutoff` is readmission_cutoff(..., on_unreadable=WINDOW_UNREADABLE); `receipts` is the
@@ -417,6 +679,11 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False):
       terminal escalation) for it was recorded once, honestly; re-defer QUIETLY until a fresh
       human gesture mints a new window key. Dedupe applies to COMMENTS/labels only: the
       generation progression is already durable in the receipts.
+    - ("unchanged", window_key, None): a FRESH window, but the exhaustion decision re-derived
+      from the SAME per-PR state as an already-receipted park (equal park_fingerprint — same
+      head SHA, same attempt counter). Nothing was attempted since that park, so re-emitting
+      its terminal verdict is pure noise: skip QUIETLY (a log line, no label, no comment, NO
+      generation consumed). See below for why this is what makes readmission mean anything.
     - ("legacy-quiet", None, None): a pre-receipt park (label live, no gesture, no receipts)
       — stay quiet; generation accounting starts with the first receipted window.
     - ("terminal", window_key, generation): PARK_ESCALATION_GENERATIONS windows consumed —
@@ -426,6 +693,27 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False):
       never escalate, and a cutoff that regressed to None cannot prove a fresh window.
     - ("park", window_key, generation): consume this window — soft park (veto-gated label,
       best-effort) + the MANDATORY receipt binding window_key.
+
+    IDEMPOTENCE AGAINST AN UNCHANGED HEAD (#555 recurrence gap; live evidence sparq PR #3488
+    re-admitted 2026-07-22T16:36:56Z and re-escalated 16:44:10Z — ~7 minutes later, unchanged
+    head, no work attempted; PR #3472 re-escalated seconds apart with byte-identical
+    boilerplate five days after the last commit or review round on either PR). #555 made the
+    park CLASSIFICATION correct and gave the budget a readmission WINDOW, but the ladder
+    itself keyed only on the window: a human re-admission mints a BRAND-NEW window key, so
+    the very next tick that re-derived exhaustion from unchanged persisted state consumed
+    that window immediately and — with the gen-1 receipt already standing — went straight to
+    the gen-2 QUESTION-class terminal. The readmission gesture therefore accomplished
+    nothing. The fingerprint axis fixes exactly that: a new window can only be CONSUMED by a
+    park whose decision inputs actually moved.
+
+    BOUNDED ESCALATION IS PRESERVED (this is why the fingerprint is (head, ATTEMPT-count),
+    not the head alone): every path that can re-park without moving the head still moves its
+    attempt counter — a re-review consumes a global round number, a no-change fix and a local
+    gate failure each add a per-round marker, a missed fix dispatch adds a missed marker — so
+    genuinely consumed work always yields a fresh fingerprint, the window is consumed, and
+    PARK_ESCALATION_GENERATIONS consumed windows still reach the terminal. Only a tick that
+    attempted NOTHING is silenced, and a silenced tick leaves the previous park's receipt (and
+    any label a human did not remove) standing.
 
     The window key is CANONICALIZED here (canonical_ts, round-6 finding 2) — this is the
     value every writer embeds in the receipt marker, so it must be the one deterministic
@@ -446,6 +734,11 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False):
     window_key = cutoff or PARK_WINDOW_NONE
     if window_key in receipts:
         return ("dedupe", window_key, None)
+    # Checked AFTER the window dedupe (which already covers the same-window repeat) and
+    # BEFORE any generation is minted: an unchanged-state re-derivation must never advance
+    # the ladder, or the escalation bound would be spent on ticks that attempted nothing.
+    if fingerprint and fingerprint in consumed_fingerprints:
+        return ("unchanged", window_key, None)
     if not cutoff and already_labeled and not receipts:
         return ("legacy-quiet", None, None)
     generation = len(receipts) + 1
@@ -975,6 +1268,386 @@ def _self_test():
     check("ladder round-6 f2: an unparseable cutoff freezes (defensive rail — it can mint "
           "neither a window key nor a receipt)",
           park_ladder_decision("not-a-timestamp", set()), ("freeze", None, None))
+
+    # ---- park_fingerprint + the UNCHANGED-HEAD idempotence axis (#555 recurrence gap).
+    # THE DEFECT: a human readmission mints a BRAND-NEW window key, so the next tick that
+    # re-derived exhaustion from unchanged persisted state consumed that window immediately and
+    # — with the gen-1 receipt standing — jumped to the gen-2 question-class terminal. Live:
+    # sparq PR #3488 re-admitted 2026-07-22T16:36:56Z, re-escalated 16:44:10Z (~7 min, unchanged
+    # head); PR #3472 seconds later with byte-identical boilerplate. ----
+    head = "a" * 40
+    check("fingerprint: head + monotone attempt counter",
+          park_fingerprint(head, "rounds=5"), f"{head}/rounds=5")
+    check("fingerprint: an unknown head claims NO idempotence (pre-fix behaviour)",
+          park_fingerprint("", "rounds=5"), None)
+    check("fingerprint: an unknown attempt counter claims NO idempotence",
+          park_fingerprint(head, ""), None)
+    check("fingerprint: a marker-breaking component is rejected, never smuggled into a receipt",
+          (park_fingerprint(head, "rounds=5 -->"), park_fingerprint("a b", "rounds=5")),
+          (None, None))
+    consumed = {f"{head}/rounds=5"}
+    # (a) THE BOUNCE: a fresh readmission window whose exhaustion re-derives the SAME
+    # fingerprint is NOT consumed — quiet skip, no generation, no terminal.
+    check("(a) ladder: a fresh window + an unchanged fingerprint is skipped QUIETLY (the "
+          "#3488 bounce), never consumed",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=consumed),
+          ("unchanged", "2026-07-23T09:18:19Z", None))
+    # (b) the head ADVANCED => real work was attempted => the window is consumed normally.
+    check("(b) ladder: an advanced head consumes the fresh window (gen-2 terminal at the "
+          "configured bound)",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=f"{'b' * 40}/rounds=5",
+                               consumed_fingerprints=consumed),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    # (b') the head did NOT move but the ATTEMPT COUNTER did (a re-review on the same head, a
+    # no-change fix, a failed local gate, another missed dispatch): genuinely consumed work, so
+    # the window IS consumed — this is what keeps the escalation bound reachable.
+    check("(b') ladder: an advanced attempt counter on an UNCHANGED head still consumes the "
+          "window (bounded escalation survives)",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=f"{head}/rounds=6",
+                               consumed_fingerprints=consumed),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    check("ladder: the FIRST park always lands — no receipted fingerprint can match",
+          park_ladder_decision(None, set(), fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=frozenset()),
+          ("park", PARK_WINDOW_NONE, 1))
+    check("ladder: a legacy receipt (no fingerprint recorded) claims no idempotence",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=frozenset()),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    check("ladder: an unknown fingerprint (None) can never suppress a due park",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=None, consumed_fingerprints=consumed),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    # Precedence: the window dedupe (already receipted) and the freeze (unproven timeline)
+    # both outrank the fingerprint check — an unchanged fingerprint must never turn a frozen
+    # or already-receipted decision into a different action.
+    check("ladder: the same-window dedupe still wins over the fingerprint check",
+          park_ladder_decision("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"},
+                               fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=consumed),
+          ("dedupe", "2026-07-23T09:18:19Z", None))
+    check("ladder: an unreadable timeline still FREEZES ahead of the fingerprint check",
+          park_ladder_decision(WINDOW_UNREADABLE, {PARK_WINDOW_NONE},
+                               fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=consumed),
+          ("freeze", None, None))
+    # (d) THE BOUND STILL TERMINATES. Walk the ladder from nothing, alternating a GENUINELY
+    # consumed window (the fingerprint moved: real work was attempted) with an UNCHANGED-state
+    # re-derivation of the same window's exhaustion (the bounce). The unchanged ticks must be
+    # invisible to the ladder — they neither advance nor block it — and after
+    # PARK_ESCALATION_GENERATIONS consumed windows the ladder is TERMINAL and stays terminal.
+    # Asserted against the CONSTANT, never a hard-coded 2.
+    ladder_receipts, ladder_consumed = set(), set()
+    real_actions, bounce_actions = [], []
+    for step in range(1, PARK_ESCALATION_GENERATIONS + 2):
+        window = f"2026-07-23T{step:02d}:00:00Z"
+        fingerprint = f"{head}/r={step}"
+        action, key, _generation = park_ladder_decision(
+            window, ladder_receipts, fingerprint=fingerprint,
+            consumed_fingerprints=ladder_consumed)
+        real_actions.append(action)
+        ladder_receipts.add(key)
+        ladder_consumed.add(fingerprint)
+        # ... the very next tick re-derives the SAME exhaustion from the SAME state under a
+        # BRAND-NEW readmission window (a human just re-admitted): the #3488 bounce.
+        bounce_actions.append(park_ladder_decision(
+            f"2026-07-24T{step:02d}:00:00Z", ladder_receipts, fingerprint=fingerprint,
+            consumed_fingerprints=ladder_consumed)[0])
+    check("(d) genuinely consumed windows climb the ladder to the configured TERMINAL and "
+          "stay there",
+          real_actions,
+          ["park"] * (PARK_ESCALATION_GENERATIONS - 1) + ["terminal", "terminal"])
+    check("(d) an unchanged-state re-derivation NEVER advances the ladder at any generation "
+          "(the bound is spent only on work actually attempted)",
+          bounce_actions, ["unchanged"] * (PARK_ESCALATION_GENERATIONS + 1))
+
+    # ---- capacity_park_admission: AUTOMATIC re-admission of a MACHINE park on proven
+    # cause-recovery (invariant 3, registry #614). THE DEFECT: a machine-owned park could only
+    # ever be cleared by a HUMAN gesture, so the acct01 credential outage (#596) parked
+    # registry PRs #587/#590/#585/#593 + issues #574/#577/#582/#572 and 6 sparq PRs that the
+    # credential fix could NOT recover — every one needed a hand-unlabel. ----
+    machine_park = event("labeled", "review:parked", "2026-07-25T02:19:47Z",
+                         "sparq-orchestrator[bot]")
+    machine_park_issue = event("labeled", "status:parked", "2026-07-25T02:19:49Z",
+                               "sparq-orchestrator[bot]")
+
+    def evidence_at(key, stamp):
+        """A recovery-evidence probe that answers only when the recovery is after the park."""
+        def probe(parked_at):
+            probe.seen.append(parked_at)
+            return {"key": key, "recovered_at": stamp}
+        probe.seen = []
+        return probe
+
+    timelines[41], timelines[7] = [machine_park], [machine_park_issue]
+    # (a) a machine capacity park + a recorded success on the same account STRICTLY AFTER the
+    # park => automatically re-admitted, exactly once, consuming that evidence.
+    recovery = evidence_at("openai/dc2d7519aaaa0001/6041.1", "2026-07-25T03:10:00Z")
+    logs.clear()
+    check("(a) machine park + post-park success => auto-mint, carrying the recovery identity "
+          "the caller must receipt",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                                  auto_evidence=recovery)[:2],
+          ("auto-mint", {"key": "openai/dc2d7519aaaa0001/6041.1",
+                         "at": "2026-07-25T03:10:00Z"}))
+    check("(a) the probe is asked about the LATEST park application (either surface)",
+          recovery.seen, ["2026-07-25T02:19:49Z"])
+    # (b) the SAME evidence a second time (its receipt now stands) is NOT re-admitted — the
+    # receipt was consumed exactly once and cannot be re-earned. The receipt's own stamp is
+    # OLDER than a NEWER park application here, so the "auto-receipt" branch cannot admit it
+    # either: a fresh park needs a fresh outage-and-recovery pair.
+    consumed_receipt = [{"key": "openai/dc2d7519aaaa0001/6041.1", "at": "2026-07-25T03:10:00Z"}]
+    timelines[41] = [machine_park, event("labeled", "review:parked", "2026-07-25T04:00:00Z",
+                                         "sparq-orchestrator[bot]")]
+    logs.clear()
+    action_b = capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                                       auto_receipts=consumed_receipt,
+                                       auto_evidence=evidence_at(
+                                           "openai/dc2d7519aaaa0001/6041.1",
+                                           "2026-07-25T03:10:00Z"))
+    check("(b) the SAME recovery evidence never re-admits twice", action_b[0], None)
+    check("(b) the consumed-evidence decline names a NEW outage-and-recovery pair",
+          any("already consumed" in line and "NEW outage-and-recovery pair" in line
+              for line in logs), True)
+    # ... and the consume-once rule holds on EVIDENCE IDENTITY, not merely on recency: the same
+    # recovery event RE-STAMPED later (a rewritten/forged ledger record reusing one run identity to
+    # spring the park again) clears the strictly-after-the-park test and is STILL refused.
+    logs.clear()
+    check("(b) a RE-STAMPED replay of consumed evidence is refused on identity alone",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                                  auto_receipts=consumed_receipt,
+                                  auto_evidence=evidence_at(
+                                      "openai/dc2d7519aaaa0001/6041.1",
+                                      "2026-07-25T05:00:00Z")),
+          (None, None,
+           "recovery evidence 'openai/dc2d7519aaaa0001/6041.1' already consumed"))
+    check("(b) the re-stamped replay is logged loudly",
+          any("already consumed" in line for line in logs), True)
+    check("(b) a DIFFERENT recovery event after that same park is a fresh pair and admits",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_receipts=consumed_receipt,
+                                  auto_evidence=evidence_at(
+                                      "openai/dc2d7519aaaa0001/6099.1",
+                                      "2026-07-25T05:00:00Z"))[0], "auto-mint")
+    # ... while the receipt DOES keep proving the re-admission it already granted, for as long
+    # as no NEWER park application supersedes it (the idempotent converge path the CLAIM proof
+    # gate and a crashed label write both need).
+    timelines[41] = [machine_park]
+    check("(b') an unsuperseded automatic receipt keeps proving its own re-admission",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_receipts=consumed_receipt)[0], "auto-receipt")
+    # (c) NO post-park success => stays parked.
+    check("(c) no recorded recovery => stays parked",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_evidence=lambda _parked_at: None),
+          (None, None, "no recorded recovery of the park's starvation cause"))
+    check("(c') a success NOT strictly after the park application => stays parked",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T02:19:49Z"))[0],
+          None)
+    check("(c'') a pre-park success => stays parked",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T01:00:00Z"))[0],
+          None)
+    # (d) an UNREADABLE / ambiguous health record (the probe raises, or answers malformed) and an
+    # unreadable park timeline all stay parked.
+    logs.clear()
+
+    def raising_evidence(_parked_at):
+        raise RuntimeError("model-health ledger unreadable")
+
+    check("(d) an unreadable health record => stays parked",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                                  auto_evidence=raising_evidence)[0], None)
+    check("(d) the unreadable health read is logged loudly",
+          any("recovery-evidence probe failed" in line for line in logs), True)
+    for ambiguous in ({"key": "openai/a/1", "recovered_at": "not-a-timestamp"},
+                      {"key": "openai/a 1", "recovered_at": "2026-07-25T03:10:00Z"},
+                      {"key": "openai/a/1 -->", "recovered_at": "2026-07-25T03:10:00Z"},
+                      {"key": None, "recovered_at": "2026-07-25T03:10:00Z"},
+                      {"recovered_at": "2026-07-25T03:10:00Z"}, "garbage"):
+        check(f"(d) ambiguous evidence {ambiguous!r} => stays parked",
+              capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                                      auto_evidence=lambda _p, e=ambiguous: e)[0], None)
+    check("(d) an unreadable park timeline => stays parked",
+          capacity_park_admission("o/r", 41, 404, fetch, is_human=trusted, log=logs.append,
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T03:10:00Z")),
+          (None, None, "the park application timeline could not be read"))
+    # (e) a HUMAN-OWNED hold is NEVER auto-re-admitted — neither a live human label nor a park
+    # a PROVEN HUMAN applied.
+    check("(e) a live needs:user is never auto-re-admitted",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  live_holds=["needs:user"],
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T03:10:00Z"))[0], None)
+    check("(e) a live review:needs-user is never auto-re-admitted",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  live_holds=["review:needs-user", "area:x"],
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T03:10:00Z"))[0], None)
+    check("(e) ANY needs:* hold (the review lane's own rule) blocks the automatic path",
+          [capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                   live_holds=["area:x", hold],
+                                   auto_evidence=evidence_at("openai/a/1",
+                                                             "2026-07-25T03:10:00Z"))[0]
+           for hold in ("needs:user", "needs:decision", "needs:ec2")], [None] * 3)
+    check("(e) an ordinary machine label is NOT a human hold (the path still works)",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  live_holds=["review:parked", "status:parked", "area:x"],
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T03:10:00Z"))[0],
+          "auto-mint")
+    check("(e) even an already-receipted automatic re-admission cannot clear a human hold",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  live_holds=["needs:user"],
+                                  auto_receipts=consumed_receipt)[0], None)
+    timelines[41] = [event("labeled", "review:parked", "2026-07-25T02:19:47Z", "jeswr")]
+    timelines[7] = []
+    check("(e) a park the MAINTAINER applied is human-owned — only a human clears it",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T03:10:00Z")),
+          (None, None,
+           "the latest park application is HUMAN-owned — only a human clears it"))
+    # A human park on the SOURCE issue is equally human-owned (the proof spans both surfaces).
+    timelines[41] = [machine_park]
+    timelines[7] = [event("labeled", "status:parked", "2026-07-25T02:30:00Z", "jeswr")]
+    check("(e) a source-side park the MAINTAINER applied is human-owned too",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T03:10:00Z"))[0], None)
+    # An instant TIE between a human and a machine application resolves toward HUMAN-owned.
+    timelines[41] = [event("labeled", "review:parked", "2026-07-25T02:19:47Z", "jeswr"),
+                     event("labeled", "status:parked", "2026-07-25T02:19:47Z",
+                           "sparq-orchestrator[bot]")]
+    timelines[7] = []
+    check("(e) a human/machine tie at the latest application stays human-owned",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T03:10:00Z"))[0], None)
+    # A park applied by an UNVERIFIABLE actor is NOT human-owned (same strict probe as the veto),
+    # so it remains automatically re-admittable.
+    timelines[41] = [event("labeled", "review:parked", "2026-07-25T02:19:47Z", "drive-by")]
+    check("(e) an unverifiable actor's park is not human-owned (auto-re-admittable)",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T03:10:00Z"))[0],
+          "auto-mint")
+    # (f) THE STICKY HUMAN-UNPARK VETO IS UNTOUCHED: the automatic path only ever CLEARS a
+    # machine park, never applies one, so a standing human unlabel still suppresses every park
+    # write regardless of any recovery evidence or automatic receipt.
+    timelines[41] = [machine_park, event("unlabeled", "review:parked", "2026-07-25T05:00:00Z",
+                                         "jeswr")]
+    logs.clear()
+    check("(f) the sticky human-unpark veto still suppresses the park write",
+          park_vetoed("o/r", 41, "review:parked", fetch, is_human=trusted, log=logs.append),
+          True)
+    check("(f) the veto log is unchanged",
+          any("park suppressed: human unlabeled review:parked at 2026-07-25T05:00:00Z" in line
+              for line in logs), True)
+    # ... and that human gesture (newer than every application, unconsumed) takes PRECEDENCE:
+    # (h) the HUMAN path admits and NO automatic evidence is consumed.
+    precedence_probe = evidence_at("openai/a/1", "2026-07-25T06:00:00Z")
+    check("(h) a human gesture and automatic evidence both present => HUMAN precedence",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  auto_evidence=precedence_probe),
+          ("human", None, "unconsumed proven-human readmission gesture"))
+    check("(h) the human path consumes NO automatic evidence (the probe is never called)",
+          precedence_probe.seen, [])
+    check("(h) capacity_park_readmitted itself still admits that gesture unchanged",
+          capacity_park_readmitted("o/r", 41, 7, fetch, is_human=trusted), True)
+    # A CONSUMED human gesture falls through to the automatic path instead of admitting.
+    timelines[41] = [machine_park, event("unlabeled", "review:parked", "2026-07-25T05:00:00Z",
+                                         "jeswr")]
+    check("(h) a receipted (consumed) human gesture falls through to the automatic path",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                  consumed={"2026-07-25T05:00:00Z"},
+                                  auto_evidence=evidence_at("openai/a/1",
+                                                            "2026-07-25T06:00:00Z"))[0],
+          "auto-mint")
+    # (g) the per-PR automatic cap TERMINATES and logs loudly. Walk AUTO_READMISSION_MAX real
+    # outage-and-recovery pairs (each park newer than the last receipt, each recovery newer than
+    # its park — genuinely distinct events), then prove the next one is refused. Asserted against
+    # the CONSTANT, never a hard-coded 2.
+    receipts, actions = [], []
+    for step in range(1, AUTO_READMISSION_MAX + 2):
+        timelines[41] = [event("labeled", "review:parked", f"2026-07-25T{step:02d}:00:00Z",
+                              "sparq-orchestrator[bot]")]
+        timelines[7] = []
+        logs.clear()
+        action, evidence, _detail = capacity_park_admission(
+            "o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+            auto_receipts=list(receipts),
+            auto_evidence=evidence_at(f"openai/a/{step}", f"2026-07-25T{step:02d}:30:00Z"))
+        actions.append(action)
+        if action == "auto-mint":
+            receipts.append(evidence)
+    check("(g) exactly AUTO_READMISSION_MAX automatic re-admissions are granted, then the cap "
+          "refuses",
+          actions, ["auto-mint"] * AUTO_READMISSION_MAX + [None])
+    check("(g) hitting the cap logs LOUDLY as a genuine human question",
+          any("::warning::automatic readmission REFUSED" in line
+              and "genuine human question" in line for line in logs), True)
+    check("(g) the cap counts MALFORMED markers too — a corrupt receipt buys no extra "
+          "re-admission",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                                  auto_receipts=[], auto_marker_count=AUTO_READMISSION_MAX,
+                                  auto_evidence=evidence_at("openai/a/9",
+                                                            "2026-07-25T09:30:00Z"))[0],
+          None)
+    # The CLAIM proof gate passes NO evidence probe: it evaluates the human + already-receipted
+    # paths only, and mints nothing.
+    timelines[41] = [machine_park]
+    check("the proof gate (no evidence probe) mints nothing",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted),
+          (None, None, "no unconsumed human gesture and no recovery evidence offered"))
+
+    # ---- effective_readmission_cutoff: an automatic re-admission grants the SAME real budget
+    # window a human gesture grants (without it the cleared park is inert — every tick
+    # re-derives the same exhausted starvation counters and quietly re-defers forever) ----
+    check("cutoff: the automatic stamp is used when there is no human gesture",
+          effective_readmission_cutoff(None, ["2026-07-25T03:10:00Z"]), "2026-07-25T03:10:00Z")
+    check("cutoff: the LATEST of the human and automatic stamps wins (human newer)",
+          effective_readmission_cutoff("2026-07-25T09:00:00Z", ["2026-07-25T03:10:00Z"]),
+          "2026-07-25T09:00:00Z")
+    check("cutoff: the LATEST of the human and automatic stamps wins (automatic newer)",
+          effective_readmission_cutoff("2026-07-25T01:00:00Z",
+                                       ["2026-07-25T03:10:00Z", "2026-07-24T00:00:00Z"]),
+          "2026-07-25T03:10:00Z")
+    check("cutoff: no gesture and no automatic receipt => no window (full historical count)",
+          effective_readmission_cutoff(None, []), None)
+    check("cutoff: WINDOW_UNREADABLE wins outright — an automatic stamp never masks an "
+          "unreadable timeline (the ladder must FREEZE)",
+          effective_readmission_cutoff(WINDOW_UNREADABLE, ["2026-07-25T03:10:00Z"]),
+          WINDOW_UNREADABLE)
+    logs.clear()
+    check("cutoff: a malformed automatic stamp is dropped loudly, never minting a window",
+          effective_readmission_cutoff(None, ["zzz"], log=logs.append), None)
+    check("cutoff: the dropped stamp is logged loudly",
+          any("::warning::readmission window" in line and "unprovable time" in line
+              for line in logs), True)
+    check("cutoff: spellings are canonicalized like every other window key",
+          effective_readmission_cutoff(None, ["2026-07-25 03:10:00Z"]), "2026-07-25T03:10:00Z")
+
+    # ---- park_applications: the shared park-application view both paths read ----
+    timelines[41] = [machine_park]
+    timelines[7] = [machine_park_issue]
+    check("park_applications: the latest application across BOTH surfaces",
+          park_applications("o/r", 41, 7, fetch, is_human=trusted)[0],
+          parse_ts("2026-07-25T02:19:49Z"))
+    check("park_applications: no application anywhere is not an error",
+          park_applications("o/r", 43, None, fetch, is_human=trusted), (None, False, True))
+    check("park_applications: an unreadable surface is reported, never guessed",
+          park_applications("o/r", 41, 404, fetch, is_human=trusted, log=logs.append),
+          (None, False, False))
 
     # ---- probe_maintainer (round-3 Opus finding): a probe-call FAILURE warns loudly and
     # fails toward not-human; a genuine not-a-maintainer stays quiet ----
