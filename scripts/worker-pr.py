@@ -5603,19 +5603,25 @@ def _self_test():
         park_order.append(("latch-read", pr_number))
         if park_latch["read_raises"]:
             raise WorkerPrError("merge-latch state query returned a malformed pull request")
+        if park_latch.get("shape") is not None:
+            return park_latch["shape"]
         return (f"PR_node{pr_number}", park_latch["queued"], park_latch["auto"])
 
     def _fake_park_retract(action, node_id):
+        # The live world settles BEFORE the call reports: `sticky` models a latch that survives
+        # the mutation, `fail` models the API rejecting the call. Independent on purpose —
+        # #487's race is exactly "rejected AND already gone".
         park_order.append(("retract", action, node_id))
-        if park_latch["sticky"]:
-            return          # a latch that survives its own retraction (queue already merging)
-        park_latch["queued"] = False
-        park_latch["auto"] = False
+        if not park_latch["sticky"]:
+            park_latch["queued"] = False
+            park_latch["auto"] = False
+        if action in park_latch.get("fail", ()):
+            raise WorkerPrError("GraphQL mutation failed for the queued pull request")
 
     def arm_park_latch(**state):
         park_order.clear()
         park_latch.update({"queued": False, "auto": False, "sticky": False,
-                           "read_raises": False})
+                           "read_raises": False, "shape": None, "fail": ()})
         park_latch.update(state)
 
     class _ParkRouteIssueModule:
@@ -6060,6 +6066,54 @@ def _self_test():
                    any(entry[0] in ("PR-PARK-LABEL", "receipt") for entry in park_order),
                    park_route_calls),
                   (True, False, []))
+            # An UNPROVEN latch value (anything that is not a real bool — a None from a
+            # partially-parsed read, a string) must not be coerced to "unarmed" by the wrapper
+            # either. Red if park_disarm_actions' proven-boolean requirement is relaxed to
+            # truthiness anywhere between here and the policy module.
+            park_route_calls.clear()
+            arm_park_latch(shape=("PR_node41", None, None))
+            try:
+                call()
+            except park_disarm_error:
+                raised_shape = True
+            else:
+                raised_shape = False
+            check(f"#684 ({path}): an UNPROVEN (non-boolean) latch value aborts the park — it "
+                  "is never coerced to 'unarmed'",
+                  (raised_shape,
+                   any(entry[0] in ("PR-PARK-LABEL", "receipt") for entry in park_order),
+                   park_route_calls),
+                  (True, False, []))
+            # A retraction that FAILS OUTRIGHT and leaves the latch live must abort. Red if the
+            # failure is swallowed and the park proceeds — the exit-zero-swallows-failure shape
+            # that has bitten this repo before, here in its most dangerous position.
+            park_route_calls.clear()
+            arm_park_latch(auto=True, sticky=True, fail=("disable-auto",))
+            try:
+                call()
+            except park_disarm_error as exc:
+                failed_retraction = " ".join(str(exc).split())
+            else:
+                failed_retraction = ""
+            check(f"#684 ({path}): a retraction that FAILS and leaves the latch live aborts "
+                  "the park, and the API failure rides the message",
+                  (bool(failed_retraction),
+                   "auto-merge latch still live" in failed_retraction,
+                   "GraphQL mutation failed" in failed_retraction,
+                   any(entry[0] in ("PR-PARK-LABEL", "receipt") for entry in park_order),
+                   park_route_calls),
+                  (True, True, True, False, []))
+            # #487's race: the retraction is REJECTED because the latch had ALREADY gone. The
+            # PROOF re-read — not the mutation's exit code — decides, so this converges and
+            # DOES park. Red if a failed retraction is treated as fatal regardless of proof.
+            park_route_calls.clear()
+            arm_park_latch(auto=True, fail=("disable-auto",))
+            call()
+            check(f"#684 ({path}): a RACED already-unarmed retraction converges idempotently "
+                  "and still parks (#487)",
+                  (any(entry[0] == "PR-PARK-LABEL" for entry in park_order),
+                   any(entry[0] == "retract" for entry in park_order)),
+                  (True, True))
 
         # A VETOED park writes no PR label, so it releases no crate — and must therefore NOT
         # strip an arm from a PR a human has just explicitly unparked (invariant 2 is not

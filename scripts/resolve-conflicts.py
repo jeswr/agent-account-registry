@@ -925,6 +925,9 @@ def _self_test():
                 if not latch.get("sticky"):
                     latch["queued"] = False
                     latch["auto"] = False
+                if action in latch.get("fail", ()):
+                    raise ResolverError(
+                        f"GitHub POST failed (HTTP 422) for /graphql ({action})")
                 return {}
             number = variables["number"]
             self.journal.append(("latch-read", number))
@@ -1068,6 +1071,22 @@ def _self_test():
            "NOT parking" in resolver.errors[0],
            any(row[0] == "needs:user" for row in resolver.actions)),
           (True, True, True, False))
+    # A retraction that FAILS OUTRIGHT and leaves the latch live must abort the park — the
+    # exit-zero-swallows-failure shape, in its most dangerous position.
+    api, resolver = escalate_twice(
+        {10: {"auto": True, "sticky": True, "fail": ("disable-auto",)}})
+    check("#684 (conflict escalation): a retraction that FAILS and leaves the latch live "
+          "aborts the park, and the API failure rides the error",
+          (api.labels_added, len(resolver.errors) == 1,
+           "auto-merge latch still live" in resolver.errors[0],
+           "HTTP 422" in resolver.errors[0]),
+          ([], True, True, True))
+    # #487's race: the retraction is REJECTED because the latch had already gone. The PROOF
+    # re-read, not the mutation's exit code, decides — so this converges and DOES park.
+    api, resolver = escalate_twice({10: {"auto": True, "fail": ("disable-auto",)}})
+    check("#684 (conflict escalation): a RACED already-unarmed retraction converges "
+          "idempotently and still parks (#487)",
+          (api.labels_added, resolver.errors), ([(10, "needs:user")], []))
     api, resolver = escalate_twice({10: {"auto": True, "read_raises": True}})
     check("#684 (conflict escalation): an UNREADABLE latch state aborts the park rather than "
           "assuming the PR is unarmed",

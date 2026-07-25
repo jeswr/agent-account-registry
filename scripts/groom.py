@@ -4714,6 +4714,9 @@ def _self_test() -> int:
                     if not latch.get("sticky"):
                         latch["queued"] = False
                         latch["auto"] = False
+                    if action in latch.get("fail", ()):
+                        raise GroomError(
+                            f"GitHub POST failed (HTTP 422) for /graphql ({action})")
                     return {}
                 number = (body or {}).get("variables", {}).get("number")
                 terminal_sweep_env["writes"].append(("GRAPHQL", "latch-read", number))
@@ -5166,6 +5169,33 @@ def _self_test() -> int:
                 stuck_error,
             ),
             (True, [{"e" * 32}], ""),
+        )
+        # A retraction that FAILS OUTRIGHT and leaves the latch live must abort the park —
+        # the exit-zero-swallows-failure shape, in its most dangerous position.
+        fail_log, _, _ = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),),
+            latch={31: {"auto": True, "sticky": True, "fail": ("disable-auto",)}})
+        check(
+            "#684 (groom age-park): a retraction that FAILS and leaves the latch live aborts "
+            "the park, and the API failure rides the deferral message",
+            (
+                park_label_post in terminal_sweep_env["writes"],
+                "auto-merge latch still live" in fail_log,
+                "HTTP 422" in fail_log,
+                "stale PR hand-off deferred" in fail_log,
+            ),
+            (False, True, True, True),
+        )
+        # #487's race: the retraction is REJECTED because the latch had already gone. The PROOF
+        # re-read, not the mutation's exit code, decides — so this converges and DOES park.
+        _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),),
+            latch={31: {"auto": True, "fail": ("disable-auto",)}})
+        check(
+            "#684 (groom age-park): a RACED already-unarmed retraction converges idempotently "
+            "and still parks (#487)",
+            park_label_post in terminal_sweep_env["writes"],
+            True,
         )
         # An unreadable latch is not an absent latch.
         unread_log, _, _ = _sweep_with_refusals(
