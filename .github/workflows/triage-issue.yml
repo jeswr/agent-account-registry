@@ -1,4 +1,4 @@
-# [OPUS-4.8] Registry self-management: issue triage + untrusted-input quarantine for
+# Registry self-management: issue triage + untrusted-input quarantine for
 # jeswr/agent-account-registry. Mirrors the sparq target's .github/workflows/triage-issue.yml
 # trust-gate pattern: on a new/edited issue, trust-gate by the AUTHOR's repo permission with an
 # EXACT-MATCH trust for jeswr (the maintainer) and for the registry orchestrator App bot login; a
@@ -69,9 +69,34 @@ jobs:
         if: steps.trust.outputs.trusted == '1'
         run: |
           set -euo pipefail
+          # Reconcile the canonical catalog before computing or applying a plan. A create failure
+          # aborts the step; triage must never remove an old role unless its replacement exists.
+          repo_labels=$(python3 - "$REPO" <<'PY'
+          import sys
+          sys.path.insert(0, "scripts")
+          import gh_retry
+
+          result = gh_retry.run_gh([
+              "label", "list", "-R", sys.argv[1], "--limit", "1000",
+              "--json", "name", "--jq", ".[].name",
+          ])
+          if result.returncode:
+              sys.stderr.write(result.stderr)
+              raise SystemExit(result.returncode)
+          sys.stdout.write(result.stdout)
+          PY
+          )
+          while IFS=$'\t' read -r label color description; do
+            if ! grep -Fxq "$label" <<< "$repo_labels"; then
+              gh label create "$label" -R "$REPO" --color "$color" \
+                --description "$description"
+            fi
+          done < <(python3 scripts/triage.py --role-labels)
           labels=$(gh issue view "$NUM" -R "$REPO" --json labels --jq '[.labels[].name]|join(",")')
           out=$(python3 scripts/triage.py --labels "$labels" --type task)
           add=$(printf '%s\n' "$out" | sed -n 's/^ADD: //p')
           rem=$(printf '%s\n' "$out" | sed -n 's/^REMOVE: //p')
-          for l in $add; do gh issue edit "$NUM" -R "$REPO" --add-label "$l" || true; done
-          for l in $rem; do gh issue edit "$NUM" -R "$REPO" --remove-label "$l" || true; done
+          # Adds are a prerequisite phase. With errexit, no dependent remove runs after a failed
+          # add, preserving the issue's existing role rather than leaving it roleless.
+          for l in $add; do gh issue edit "$NUM" -R "$REPO" --add-label "$l"; done
+          for l in $rem; do gh issue edit "$NUM" -R "$REPO" --remove-label "$l"; done

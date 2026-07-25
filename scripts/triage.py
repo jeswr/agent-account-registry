@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Registry self-management: static (no-LLM) issue triage for jeswr/agent-account-registry.
+# Registry self-management: static (no-LLM) issue triage for jeswr/agent-account-registry.
 # Modeled on the sparq target's scripts/triage.py, adjusted for the registry's area:* sections and
 # its trust-surface soundness lane. Applied by .github/workflows/triage-issue.yml.
 """triage.py — the deterministic, no-LLM part of issue triage.
@@ -20,6 +20,14 @@ removes it after the design pass, then the retriage path promotes.
 import re
 import sys
 
+ROLE_LABELS = {
+    "docs": ("0e8a16", "Documentation work"),
+    "impl": ("1d76db", "Implementation work"),
+    "ci": ("5319e7", "CI and infrastructure work"),
+    "research": ("d4c5f9", "Research and design work"),
+    "site": ("fbca04", "Site and frontend work"),
+    "soundness": ("b60205", "Trust-surface soundness work; human-arm required"),
+}
 ROLE_BY_KIND = {"docs": "docs", "research": "research", "ci": "ci", "site": "site",
                 "security": "soundness"}
 ROLE_BY_TYPE = {"feature": "impl", "bug": "impl", "task": "impl", "chore": "ci",
@@ -59,7 +67,7 @@ def _role(labels, issue_type):
     # respect an EXPLICIT single role:* label (a seeded/migrated issue already carrying its role).
     explicit = sorted(lb[5:] for lb in labels if lb.startswith("role:"))
     if len(explicit) == 1:
-        return explicit[0]
+        return explicit[0] if explicit[0] in ROLE_LABELS else None
     for lb in labels:
         if lb.startswith("kind:") and lb[5:] in ROLE_BY_KIND:
             return ROLE_BY_KIND[lb[5:]]
@@ -128,6 +136,22 @@ def _self_test():
         "soundness")
     chk("dispatch -> soundness", triage(["priority:P1", "area:dispatch"], "feature")["role"],
         "soundness")
+    # The workflow creates/validates this shared catalog before applying a plan. Every derivation
+    # source must remain representable, and an unknown explicit role must fail closed.
+    derived_roles = set(ROLE_BY_KIND.values()) | set(ROLE_BY_TYPE.values()) | {
+        _role([label], "task") for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS
+    } | {_role(["area:dispatch"], "task")}
+    chk("all derived roles have labels", derived_roles <= set(ROLE_LABELS), True)
+    chk("unknown explicit role rejected", _role(["role:not-a-repo-label"], "task"), None)
+    # Exact regression: applying the plan for a trust-surface issue which starts at role:impl
+    # leaves exactly one representable role, never a transiently planned roleless end state.
+    labels = {"role:impl", "area:worker", "priority:P2", "from:agent"}
+    r = triage(labels)
+    final_labels = (labels | r["add"]) - r["remove"]
+    final_roles = {lb for lb in final_labels if lb.startswith("role:")}
+    chk("trust role replacement is exactly-one", final_roles, {"role:soundness"})
+    chk("trust role replacement adds before remove",
+        ("role:soundness" in r["add"], "role:impl" in r["remove"]), (True, True))
     # [FABLE-5] UI-surface ownership: dashboard work derives role:site (codex-led chain, e4098b9);
     # kind:docs about the dashboard stays docs.
     chk("dashboard -> site", triage(["priority:P2", "area:dashboard"], "feature")["role"], "site")
@@ -173,12 +197,18 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--role-labels", action="store_true",
+                    help="print the canonical role-label catalog as name<TAB>color<TAB>description")
     ap.add_argument("--labels", default="", help="comma-separated current labels")
     ap.add_argument("--type", default="task")
     ap.add_argument("--untrusted", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return _self_test()
+    if a.role_labels:
+        for role, (color, description) in ROLE_LABELS.items():
+            print(f"role:{role}\t{color}\t{description}")
+        return 0
     labels = [x for x in a.labels.split(",") if x.strip()]
     r = triage(labels, a.type, trusted=not a.untrusted)
     print("ADD: " + " ".join(sorted(r["add"])))
