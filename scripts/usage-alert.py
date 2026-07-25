@@ -39,6 +39,7 @@
 # usage file + `gh`.
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,58 @@ import tomllib
 
 ALERT_TITLE = "⚠️ Worker account availability — action may be needed"
 ALERT_LABEL = "ops-alert"
+
+# --- PROBE OUTCOME SIDECAR (registry #639; schema shared with issue #219's dashboard lane). Both
+# probe jobs persist `{"schema","outcome","detail","attempted_at"}` next to the snapshot. This script
+# used to infer a wholesale failure from `not usage`, which cannot tell "the fleet is idle" from
+# "nothing was measured" and misses a PARTIAL failure completely. Read fail-closed: when
+# USAGE_PROBE_STATUS_FILE is set, anything that is not an explicit, fresh `ok` means the measurement
+# did not happen. The variable being UNSET keeps the legacy emptiness inference (callers that do not
+# produce a sidecar), so this can never turn a non-dispatch caller permanently degraded.
+PROBE_SCHEMA = "account-usage-probe/v1"          # parity with dashboard-gen.PROBE_SCHEMA (self-test)
+PROBE_MAX_AGE_SECONDS = 30 * 60                  # dispatch ticks every 10 min; 3 missed slots
+# The reachability values an exempt entry may carry (registry #639). MIRRORS
+# select-and-claim.USAGE_REACHABILITY_ADMITTED — the dispatch gate — so monitoring and dispatch never
+# split (parity asserted in --self-test). `dead` / absent / unrecognised are UNAVAILABLE here exactly
+# as they are ineligible there.
+REACHABILITY_ADMITTED = frozenset({"live", "unproven"})
+REACHABILITY_DEAD = "dead"
+
+
+def probe_status(path, now):
+    """(measured, detail) for a persisted probe-outcome sidecar. FAIL-CLOSED: an absent, unparseable,
+    wrong-schema, non-`ok` or STALE sidecar is (False, <reason>) — never "assume it ran". `path` None
+    means no sidecar was configured, reported as (None, "") so the caller keeps its legacy inference
+    rather than treating an unwired variable as an outage."""
+    if not path:
+        return None, ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return False, "probe-status-unreadable"
+    return probe_outcome(document, now)
+
+
+def probe_outcome(document, now):
+    """(measured, detail) for an already-PARSED sidecar. Split from probe_status so account-usage.py's
+    self-test can feed it the document the workflow step ACTUALLY wrote and assert the shell -> python
+    contract (schema string, outcome vocabulary, stamp format) end to end. Pure — unit-tested."""
+    if not isinstance(document, dict) or document.get("schema") != PROBE_SCHEMA:
+        return False, "probe-status-malformed"
+    stamp = document.get("attempted_at")
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or stamp != stamp:
+        return False, "probe-status-undated"
+    if not -PROBE_MAX_AGE_SECONDS <= (now - stamp) <= PROBE_MAX_AGE_SECONDS:
+        return False, "probe-status-stale"
+    if document.get("outcome") != "ok":
+        detail = document.get("detail")
+        # The detail is rendered into an issue body, so accept ONLY the producer's fixed vocabulary
+        # shape (lowercase-hyphen token) — a file that somehow carried markup or a handle can never
+        # reach the alert.
+        return False, detail if isinstance(detail, str) \
+            and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", detail) else "probe-not-ok"
+    return True, "probe-succeeded"
 
 
 def _policy_pool_margin(policy_path):
@@ -150,6 +203,18 @@ def classify(pool, usage, margin, now=None):
             rows.append((h, "UNAVAILABLE — token invalid/expired or probe failed (rotate setup-token)", False))
             continue
         if u.get("exempt") is True:  # STRICT, mirroring usage_eligible (cross-provider review r1)
+            # [#639] Exemption skips the QUOTA probe; it never asserts reachability. Mirrors
+            # usage_eligible's allowlist exactly, so a credential the allocator refuses is reported
+            # UNAVAILABLE here instead of "ok — probe-exempt provider" (the split that let a dead
+            # account look healthy on the monitoring surface while burning a runner per tick).
+            reachability = u.get("reachability")
+            if not isinstance(reachability, str) or reachability not in REACHABILITY_ADMITTED:
+                dead = reachability == REACHABILITY_DEAD
+                rows.append((h, "UNAVAILABLE — worker credential REJECTED by the provider "
+                                "(re-mint required; dispatch is holding this account out)" if dead
+                                else "UNAVAILABLE — reachability not stated by the probe "
+                                     "(fail-closed; dispatch holds this account out)", False))
+                continue
             until = _util(u.get("backoff_until"))
             if until is not None and now < until:
                 # A saturated chain may have been truncated in the health ledger (model-health
@@ -182,7 +247,8 @@ def classify(pool, usage, margin, now=None):
     return eligible, rows
 
 
-def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redact_handles=False):
+def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redact_handles=False,
+           probe_detail=""):
     header = "> 🤖 SPARQ agent — automated worker-account availability check.\n"
     if redact_handles:
         # PUBLIC-registry fallback (issue #107, #39, #204): whenever the alert lands on the PUBLIC
@@ -210,9 +276,14 @@ def render(eligible, rows, pool, threshold, maintainer, probe_empty=False, redac
         ])
     lines = [header]
     if probe_empty:
-        lines.append("🚨 **The usage probe returned NO data — dispatch is holding fail-closed.** "
-                     "This is a probe/secret-infrastructure failure (malformed secrets, endpoint or "
-                     "header change, curl outage), not N individually capped accounts.\n")
+        # [#639] `probe_detail` is the probe's OWN recorded cause when the persisted sidecar says the
+        # measurement did not happen (secret-subset-empty, probe-exited-nonzero, ...). Without it this
+        # banner could only guess from an empty map — and could not fire at all for a partial failure.
+        cause = f" Recorded cause: `{probe_detail}`." if probe_detail else ""
+        lines.append("🚨 **The usage probe did NOT measure this fleet — dispatch is holding "
+                     "fail-closed.** This is a probe/secret-infrastructure failure (malformed "
+                     "secrets, endpoint or header change, curl outage), not N individually capped "
+                     f"accounts.{cause}\n")
     lines.append(f"**Usable workers: {eligible}/{len(pool)}**  (degraded below {threshold}).\n")
     for h, s, ok in rows:
         lines.append(f"- {'✅' if ok else '⛔'} `{h}`: {s}")
@@ -281,6 +352,19 @@ def main():
     maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
     usage_file = os.environ.get("WORKER_USAGE_FILE")
     usage = json.load(open(usage_file)) if usage_file and os.path.exists(usage_file) else {}
+    # [#639] The probe's persisted outcome decides whether this snapshot may be TRUSTED at all. An
+    # explicit non-`ok` (or absent/stale) sidecar means the measurement did not happen, so the
+    # snapshot is classified as EMPTY — every configured account reads UNAVAILABLE, the wholesale
+    # banner fires with the recorded cause, and the alert cannot report a fleet as healthy on data the
+    # probe itself disclaims. This also catches a PARTIAL failure, which `not usage` never could.
+    import time
+    probe_measured, probe_detail = probe_status(
+        os.environ.get("USAGE_PROBE_STATUS_FILE"), time.time())
+    unmeasured = probe_measured is False
+    if unmeasured:
+        print("::warning::usage-alert: the usage probe recorded that it did NOT measure this fleet "
+              f"({probe_detail}) — classifying every configured account as unavailable")
+    trusted_usage = {} if unmeasured else usage
     policy_pool, policy_margin = _policy_pool_margin(
         os.environ.get("POLICY_FILE", "policy/repos.toml"))
     margin = policy_margin if policy_margin is not None \
@@ -294,11 +378,11 @@ def main():
         print("usage-alert: no accounts to check (empty pool and empty probe)")
         return 0
 
-    eligible, rows = classify(pool, usage, margin)
+    eligible, rows = classify(pool, trusted_usage, margin)
     threshold = max(1, (len(pool) + 1) // 2)      # degraded if fewer than half the pool is usable
     degraded = eligible < threshold
-    body = render(eligible, rows, pool, threshold, maintainer, probe_empty=not usage,
-                  redact_handles=redact_handles)
+    body = render(eligible, rows, pool, threshold, maintainer, probe_empty=not trusted_usage,
+                  redact_handles=redact_handles, probe_detail=probe_detail if unmeasured else "")
 
     # Privacy (locked decision 22b): NOTHING printed to the (public) workflow log carries an account
     # handle, a per-provider count, or the pool size — the detail lives only in the alert issue body.
@@ -320,8 +404,9 @@ def main():
             # count, or reset time.
             print("::warning::usage-alert: private-route alert delivery FAILED — retrying a "
                   "REDACTED generic alert on the public registry repo")
-            body = render(eligible, rows, pool, threshold, maintainer, probe_empty=not usage,
-                          redact_handles=True)
+            body = render(eligible, rows, pool, threshold, maintainer,
+                          probe_empty=not trusted_usage, redact_handles=True,
+                          probe_detail=probe_detail if unmeasured else "")
             delivered = _deliver_alert(registry_repo, None, body)
         if not delivered:
             # FAIL LOUD (review round 2 of #432): every route failed, so the degraded-fleet
@@ -376,7 +461,8 @@ def _self_test():
     pool = ["a", "b", "c", "d"]
     usage = {
         "a": {"5h_util": "0.2", "7d_util": "0.3", "5h_reset": "t1", "7d_reset": "t2"},  # ok
-        "b": {"exempt": True},                                                          # ok (codex)
+        # [#639] an exempt entry carries its reachability; `live` is the probed-healthy shape
+        "b": {"exempt": True, "reachability": "live"},                                   # ok (codex)
         "c": {"5h_util": "0.95", "7d_util": "0.1", "5h_reset": "14:00"},                # capped 5h
         # "d" missing -> token bad -> UNAVAILABLE
     }
@@ -399,6 +485,88 @@ def _self_test():
     chk("empty probe -> all unavailable", (e6, all(not o for _h, _s, o in r6)), (0, True))
     chk("empty probe fires the alert", e6 < max(1, (len(pool) + 1) // 2), True)
     chk("probe-failure banner", "holding fail-closed" in render(0, r6, pool, 2, "m", probe_empty=True), True)
+
+    # ---- [registry #639] EXEMPTION IS NOT REACHABILITY, and monitoring must not split from dispatch.
+    # `classify` is documented as mirroring usage_eligible; the two vocabularies are asserted EQUAL
+    # against the allocator itself, and each state is then checked through classify. Before the fix a
+    # dead exempt account rendered "ok — probe-exempt provider" while dispatch burned a runner on it.
+    import importlib.util as _ilu
+    _sac_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "select-and-claim.py")
+    _spec = _ilu.spec_from_file_location("registry_select_and_claim_alert", _sac_path)
+    _allocator = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_allocator)
+    chk("[#639] the admitted-reachability allowlist is IDENTICAL to the allocator's",
+        REACHABILITY_ADMITTED, _allocator.USAGE_REACHABILITY_ADMITTED)
+    chk("[#639] the dead spelling is IDENTICAL to the allocator's",
+        REACHABILITY_DEAD, _allocator.USAGE_REACHABILITY_DEAD)
+    for state, want_ok in (("live", True), ("unproven", True), ("dead", False)):
+        entry = {"exempt": True, "reachability": state}
+        e_state, r_state = classify(["x"], {"x": entry}, 0.10)
+        chk(f"[#639] classify and usage_eligible agree for reachability={state}",
+            (bool(e_state), r_state[0][2], _allocator.usage_eligible(dict(entry), now=1000)),
+            (want_ok, want_ok, want_ok))
+    e_dead, r_dead = classify(["x"], {"x": {"exempt": True, "reachability": "dead"}}, 0.10)
+    chk("[#639] a DEAD exempt credential reads UNAVAILABLE and names the maintainer action",
+        (e_dead, "UNAVAILABLE" in r_dead[0][1], "re-mint" in r_dead[0][1]), (0, True, True))
+    e_bare, r_bare = classify(["x"], {"x": {"exempt": True}}, 0.10)
+    chk("[#639] an exempt entry with NO reachability stated is UNAVAILABLE (fail-closed)",
+        (e_bare, "UNAVAILABLE" in r_bare[0][1]), (0, True))
+    e_forged, _r = classify(["x"], {"x": {"exempt": True, "reachability": "LIVE"}}, 0.10)
+    chk("[#639] a forged reachability spelling does not read as usable", e_forged, 0)
+
+    # ---- [registry #639] the PROBE-OUTCOME SIDECAR: `probe_empty = not usage` cannot tell an idle
+    # fleet from an unmeasured one, and misses a partial failure entirely. Read fail-closed. --------
+    def _sidecar(document, name="usage-probe.json"):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(document if isinstance(document, str) else json.dumps(document))
+        return path
+
+    probe_now = 1_700_000_000
+    chk("[#639] an UNSET sidecar path keeps the legacy inference (None, not an outage)",
+        probe_status(None, probe_now), (None, ""))
+    chk("[#639] a fresh ok sidecar is measured",
+        probe_status(_sidecar({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                               "attempted_at": probe_now}), probe_now),
+        (True, "probe-succeeded"))
+    chk("[#639] a failed sidecar is NOT measured and carries the recorded cause",
+        probe_status(_sidecar({"schema": PROBE_SCHEMA, "outcome": "failed",
+                               "detail": "secret-subset-empty", "attempted_at": probe_now}),
+                     probe_now),
+        (False, "secret-subset-empty"))
+    chk("[#639] an ABSENT sidecar (path set, file missing) fails closed",
+        probe_status(os.path.join(tempfile.mkdtemp(), "nope.json"), probe_now),
+        (False, "probe-status-unreadable"))
+    chk("[#639] truncated JSON fails closed",
+        probe_status(_sidecar('{"schema":"account-usage-probe/v1"'), probe_now),
+        (False, "probe-status-unreadable"))
+    chk("[#639] a wrong-schema sidecar fails closed",
+        probe_status(_sidecar({"schema": "something-else", "outcome": "ok",
+                               "attempted_at": probe_now}), probe_now),
+        (False, "probe-status-malformed"))
+    chk("[#639] an undated sidecar fails closed",
+        probe_status(_sidecar({"schema": PROBE_SCHEMA, "outcome": "ok"}), probe_now),
+        (False, "probe-status-undated"))
+    chk("[#639] a STALE ok sidecar fails closed (a leftover from an earlier run)",
+        probe_status(_sidecar({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                               "attempted_at": probe_now - PROBE_MAX_AGE_SECONDS - 1}), probe_now),
+        (False, "probe-status-stale"))
+    chk("[#639] a markup/handle-bearing detail is not rendered verbatim",
+        probe_status(_sidecar({"schema": PROBE_SCHEMA, "outcome": "failed",
+                               "detail": "acct01 <img src=x>", "attempted_at": probe_now}),
+                     probe_now),
+        (False, "probe-not-ok"))
+    chk("[#639] the unmeasured banner names the recorded cause",
+        "`secret-subset-empty`" in render(0, r6, pool, 2, "m", probe_empty=True,
+                                          probe_detail="secret-subset-empty"), True)
+    # Schema parity with the OTHER producer/consumer of this sidecar (#219's dashboard lane): one
+    # contract, so a rename there cannot silently make this reader fail closed forever.
+    _dg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard-gen.py")
+    _dg_spec = _ilu.spec_from_file_location("registry_dashboard_gen_alert", _dg_path)
+    _dg = _ilu.module_from_spec(_dg_spec)
+    _dg_spec.loader.exec_module(_dg)
+    chk("[#639] the probe-sidecar schema matches dashboard-gen's", PROBE_SCHEMA, _dg.PROBE_SCHEMA)
     # Policy reader: pool union + strictest (max) margin across enabled rows; disabled rows ignored.
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
         fh.write('[repos."o/a"]\nenabled = true\naccount_pool = ["acct01", "acct02"]\n'
@@ -778,7 +946,7 @@ def _self_test():
     # open), never parsed as "no open alert"; a healthy fleet with working gh stays rc 0.
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as uf:
         json.dump({"acct-wire-h1": {"5h_util": "0.1", "7d_util": "0.1"},
-                   "acct-wire-h2": {"exempt": True}}, uf)
+                   "acct-wire-h2": {"exempt": True, "reachability": "live"}}, uf)
         healthy_usage = uf.name
     HEALTHY = dict(CONF, ALERT_REPO=None, ALERT_TOKEN=None, WORKER_USAGE_FILE=healthy_usage)
     calls_rf = []
@@ -794,7 +962,7 @@ def _self_test():
     # is `ok` by design (never probe-missing), but an ACTIVE backoff is surfaced + not eligible,
     # an EXPIRED one clears, and a forged/malformed stamp fails open to `ok` (never crashes).
     tnow = 5_000
-    e8, r8 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow + 300,
+    e8, r8 = classify(["cx"], {"cx": {"exempt": True, "reachability": "live", "backoff_until": tnow + 300,
                                       "backoff_consecutive": 2}}, 0.10, now=tnow)
     chk("active backoff surfaced + not eligible",
         (e8, "BACKED OFF" in r8[0][1], "x2" in r8[0][1], r8[0][2]), (0, True, True, False))
@@ -803,27 +971,27 @@ def _self_test():
     # A saturated (>6-hit, possibly ledger-truncated) chain displays the LOWER-BOUND form —
     # "x6+", never an exact "x6" (PR #85 finding 2: prune truncation floors the re-derived
     # count, so an exact display corrupts the diagnostic). Forged non-bool flags add nothing.
-    e8b, r8b = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow + 300,
+    e8b, r8b = classify(["cx"], {"cx": {"exempt": True, "reachability": "live", "backoff_until": tnow + 300,
                                         "backoff_consecutive": 6,
                                         "backoff_saturated": True}}, 0.10, now=tnow)
     chk("saturated backoff displays the lower-bound form (x6+, never exact x6)",
         ("(x6+)" in r8b[0][1], "(x6)" in r8b[0][1], r8b[0][2]), (True, False, False))
-    e8c, r8c = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow + 300,
+    e8c, r8c = classify(["cx"], {"cx": {"exempt": True, "reachability": "live", "backoff_until": tnow + 300,
                                         "backoff_consecutive": 6,
                                         "backoff_saturated": "yes"}}, 0.10, now=tnow)
     chk("forged non-bool saturated flag never adds the suffix (strict is-True)",
         ("(x6)" in r8c[0][1], "(x6+)" in r8c[0][1]), (True, False))
-    e9, r9 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": tnow - 1}}, 0.10, now=tnow)
+    e9, r9 = classify(["cx"], {"cx": {"exempt": True, "reachability": "live", "backoff_until": tnow - 1}}, 0.10, now=tnow)
     chk("expired backoff -> ok again", (e9, r9[0][2]), (1, True))
-    e10, r10 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "garbage"}}, 0.10, now=tnow)
+    e10, r10 = classify(["cx"], {"cx": {"exempt": True, "reachability": "live", "backoff_until": "garbage"}}, 0.10, now=tnow)
     chk("malformed backoff stamp fails open to ok", (e10, r10[0][2]), (1, True))
     # inf/nan stamps fail open to ok (matches usage_eligible's finite-only comparison, r1)
-    e11, r11 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": "inf"}}, 0.10, now=tnow)
+    e11, r11 = classify(["cx"], {"cx": {"exempt": True, "reachability": "live", "backoff_until": "inf"}}, 0.10, now=tnow)
     chk("inf backoff stamp fails open to ok (no dispatch/alert split)", (e11, r11[0][2]), (1, True))
     # a huge JSON int (10**400) makes float() RAISE OverflowError, not return inf — the monitoring
     # tick must survive it: exempt backoff fails OPEN to ok, a usage window fails CLOSED to
     # UNAVAILABLE (cross-provider review r2 finding 3)
-    e13, r13 = classify(["cx"], {"cx": {"exempt": True, "backoff_until": 10**400}}, 0.10, now=tnow)
+    e13, r13 = classify(["cx"], {"cx": {"exempt": True, "reachability": "live", "backoff_until": 10**400}}, 0.10, now=tnow)
     chk("huge-int backoff stamp fails open to ok (no alert drop)", (e13, r13[0][2]), (1, True))
     e14, r14 = classify(["a"], {"a": {"status": "allowed", "5h_util": 10**400, "7d_util": 0.1}},
                         0.10, now=tnow)
