@@ -1869,12 +1869,14 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
         detail = ("unbound legacy record" if bound is None
                   else f"reviewed {bound[:12]} != live head {expected_sha[:12]}")
         print(f"verdict NOT staged for the fixer ({detail}); deferring to a fresh review")
+        print(_FIX_LANE_DEFER_NOTICE)
         return
     if not envelope_identity_matches(record, expected_repo, expected_pr, expected_round):
         _write_outputs({"staged": False, "stale_reason": "identity-mismatch"})
         print("verdict NOT staged for the fixer (envelope repo/pr/round does not name "
               f"{expected_repo}#{expected_pr} round {expected_round}); "
               "deferring to a fresh review")
+        print(_FIX_LANE_DEFER_NOTICE)
         return
     path = Path(out_file)
     path.write_text(json.dumps(envelope_verdict(record), indent=1, sort_keys=True) + "\n",
@@ -1882,6 +1884,134 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
     os.chmod(path, 0o600)
     _write_outputs({"staged": True})
     print(f"verdict staged for the fixer (bound to {expected_sha[:12]})")
+
+
+# ---- issue #560: the defer-to-fresh-review LANE TRANSITION ---------------------------------------
+# dispatch-claim.enumerate_review_items buckets a worker PR into a lane by ONE label:
+# `review:changes` -> the FIX lane (item state `needs-fix`), `review:needs` -> the REVIEW lane
+# (`needs-review`). When stage_verdict_for_fix defers above it stages NOTHING, review-fix.yml skips
+# the fix step, and the run produces no fix, no push, and no new verdict — so before this transition
+# existed the PR kept `review:changes` and the FIX lane re-admitted it on EVERY dispatch tick while
+# the REVIEW lane, which keys on `review:needs`, never saw it. That is a permanent wrong-lane spin,
+# not a retry: nothing in the fix lane can ever mint the head-bound verdict the fixer refuses to run
+# without. LIVE 2026-07-24: from 08:02Z sparq#3523/#3542/#3572/#3573/#3608 each launched a fix run
+# per ~8min tick, every one completing "success" on `verdict NOT staged for the fixer (unbound legacy
+# record); deferring to a fresh review` (e.g. run 30082079950 at 09:19Z) — ~35 wasted runs/hour
+# across five PRs (each burning an account claim + a runner) until the orchestrator flipped the five
+# labels by hand.
+#
+# The defer therefore HANDS THE PR TO THE REVIEW LANE — the only lane that can produce a verdict
+# bound to the current head. The transition is applied by review-fix.yml's `outcome` job (the job
+# that runs no target code and owns every PR label mutation), keyed off the `stale_reason` this
+# defer branch emits.
+FIX_LANE_PR_LABEL = "review:changes"
+REVIEW_LANE_PR_LABEL = "review:needs"
+# Every `stale_reason` stage_verdict_for_fix can emit on a defer (staged=false). All three mean the
+# same thing for lane ownership — no verdict is bound to the live head — so all three hand over.
+FIX_LANE_DEFER_REASONS = ("unbound", "head-moved", "identity-mismatch")
+_FIX_LANE_DEFER_NOTICE = (
+    f"fix lane releasing this PR: the {FIX_LANE_PR_LABEL} -> {REVIEW_LANE_PR_LABEL} lane "
+    "transition is applied by the outcome job (issue #560), so fix-enumeration stops re-admitting "
+    "this PR on every dispatch tick and the review lane owns the fresh head-bound verdict")
+
+
+def fix_lane_defer_action(live_review, holds=()):
+    """PURE (issue #560): what the defer-to-fresh-review hand-over must do, given the LIVE
+    `review:*` label set and the LIVE hold set (live_human_holds — the PR's own needs:user /
+    review:needs-user / review:parked, else the source issue's needs:*).
+
+    - "hold" — a human hold OR the #555 MACHINE capacity park is live: mutate NOTHING. A lane
+      transition is not a park and must never displace one; a park already excludes the PR from
+      BOTH lanes (enumerate_review_items rejects review:parked and every human hold outright), so
+      there is no spin to close and nothing to hand over.
+    - "noop" — `review:changes` is not live: already handed over (a re-run of this step, or a
+      concurrent claim that got there first). Idempotent by construction.
+    - "drop-fix-label" — `review:needs` is ALREADY live beside `review:changes` (a review outcome
+      landed while this fix run was in flight, or a crash between set_review_state's add and its
+      removes). The review lane already owns the PR, so the hand-over completes by removing ONLY
+      the stale FIX-lane label. That is monotone (it adds nothing) and reaches the same single
+      clean state without escalating a machine lane hand-over into a human question — the
+      resolution is not a guess here, because the defer itself is authoritative that the fix lane
+      must not own this PR.
+    - "transition" — the normal case: set_review_state(.., "needs"). Its own issue #138 machinery
+      then applies unchanged (a live review:needs-user refuses the write; any OTHER ambiguous split
+      converges to the fail-closed human hold rather than a guessed clean value) — this function
+      deliberately does not second-guess it.
+    """
+    if holds:
+        return "hold"
+    live = set(live_review)
+    if FIX_LANE_PR_LABEL not in live:
+        return "noop"
+    if live == {FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL}:
+        return "drop-fix-label"
+    return "transition"
+
+
+def fix_lane_defer_labels(live_review, action):
+    """PURE (issue #560): the `review:*` label set the transition LEAVES BEHIND. Exists so the
+    SPIN-CLOSURE property can be asserted end-to-end without touching GitHub: dispatch-claim.py's
+    --self-test imports this, projects the post-defer label set, and feeds it straight back into
+    enumerate_review_items to prove the fix lane no longer re-admits the PR. worker-pr.py's own
+    --self-test pins this projection to the IMPERATIVE path (the stubbed mutation must produce
+    exactly this set), so the two can never drift."""
+    live = set(live_review)
+    if action in ("hold", "noop"):
+        return frozenset(live)
+    if action == "drop-fix-label":
+        return frozenset(live - {FIX_LANE_PR_LABEL})
+    if action == "transition":
+        # set_review_state: a single clean review:changes becomes review:needs; ANY other
+        # ambiguous namespace converges to the fail-closed human hold (issue #138).
+        if live == {FIX_LANE_PR_LABEL}:
+            return frozenset({REVIEW_LANE_PR_LABEL})
+        return frozenset({"review:needs-user"})
+    raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
+
+
+def fix_lane_defer(repo, pr_number, stale_reason, issue=None):
+    """Issue #560: hand a deferred PR from the FIX lane to the REVIEW lane.
+
+    Called from review-fix.yml's `outcome` job when stage-verdict refused to seed the fixer
+    (`staged=false`) because no recorded verdict is bound to the live head. Reads the LIVE hold
+    surface and the LIVE `review:*` namespace, then applies fix_lane_defer_action through the
+    SHARED label primitives (set_review_state / _remove_label) — never a raw label API call — so
+    the issue #138 hold guard and the #555 park ownership split both keep applying underneath.
+    Fails closed on an unrecognised `stale_reason` (no label is touched on a reason this code does
+    not understand) and is idempotent under the concurrent-claim semantics: a re-run, or a tick
+    that already flipped the label, is a logged no-op.
+
+    The LEASE is deliberately not touched here. The per-PR fix lease is the claim itself, keyed
+    `fix:<repo>#<pr>` (select-and-claim holder prefix; the exact key enumerate_review_items
+    single-flights on), and review-fix.yml's `release` job releases it by claim id on EVERY path
+    (`if: always() && needs.claim.outputs.acquired == 'true'`, a job that does not depend on the
+    outcome job) — so the fix claim is already freed before the next dispatch tick reads the
+    ledger. dispatch-claim.py's --self-test pins that unconditional release statically."""
+    if stale_reason not in FIX_LANE_DEFER_REASONS:
+        raise WorkerPrError(
+            f"unknown verdict defer reason {stale_reason!r} (expected one of "
+            f"{', '.join(FIX_LANE_DEFER_REASONS)}); refusing to touch any label")
+    holds = live_human_holds(repo, pr_number, issue)
+    live_review = _live_review_labels(repo, pr_number)
+    action = fix_lane_defer_action(live_review, holds)
+    if action == "hold":
+        print(f"fix-lane defer ({stale_reason}): live hold(s) {holds} own {repo}#{pr_number} — "
+              "NO lane transition. A machine lane hand-over never displaces a human hold or the "
+              "capacity park (issue #555), and a park already excludes the PR from both lanes.")
+    elif action == "noop":
+        print(f"fix-lane defer ({stale_reason}): {FIX_LANE_PR_LABEL} is not live on "
+              f"{repo}#{pr_number} — already handed to the review lane (idempotent no-op)")
+    elif action == "drop-fix-label":
+        _remove_label(repo, pr_number, FIX_LANE_PR_LABEL)
+        print(f"fix-lane defer ({stale_reason}): {REVIEW_LANE_PR_LABEL} already owns "
+              f"{repo}#{pr_number}; dropped the stale {FIX_LANE_PR_LABEL} so fix-enumeration "
+              "stops re-admitting it")
+    else:
+        set_review_state(repo, pr_number, "needs")
+        print(f"fix-lane defer ({stale_reason}): handed {repo}#{pr_number} to the review lane "
+              f"({FIX_LANE_PR_LABEL} -> {REVIEW_LANE_PR_LABEL}) so a fresh head-bound verdict is "
+              "produced; the fix lane no longer re-admits it every tick")
+    _write_outputs({"action": action})
 
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
@@ -5350,6 +5480,12 @@ def _self_test():
             stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 3)
             check("stage-verdict unwraps a matching record",
                   (_stage_out.get("staged"), json.loads(_out.read_text())), (True, _env_doc))
+            # Issue #560: a BOUND verdict proceeds to the fixer normally — staged=true and NO
+            # stale_reason, so review-fix.yml's `outcome` job never reaches the lane hand-over
+            # step (its `if` requires verdict_staged == 'false' AND a non-empty reason) and the
+            # PR keeps review:changes for the fix it is about to receive.
+            check("#560: a bound verdict emits no defer reason (fix proceeds, no relabel)",
+                  ("stale_reason" in _stage_out, _stage_out.get("staged")), (False, True))
             _out.unlink()
             _stage_out.clear()
             stage_verdict_for_fix(str(_rec), str(_out), "b" * 40, "o/r", 41, 3)
@@ -5394,6 +5530,127 @@ def _self_test():
                           ("raised", _out.exists()), ("raised", False))
         finally:
             globals()["_write_outputs"] = _real_wo
+
+    # ---- issue #560: the defer-to-fresh-review LANE TRANSITION -------------------------------
+    # The fix lane SPUN because an unbound/stale-verdict defer left review:changes on the PR:
+    # fix-enumeration re-admitted it every ~8min dispatch tick (live 2026-07-24 — sparq#3523/
+    # #3542/#3572/#3573/#3608, ~35 wasted runs/hour) while review-enumeration, which keys on
+    # review:needs, never saw it. Assert the pure decision, the pure post-state projection, and
+    # that the IMPERATIVE path applies exactly that projection through the shared label
+    # primitives. The end-to-end SPIN-CLOSURE property (a subsequent enumeration pass no longer
+    # emits needs-fix) is asserted in dispatch-claim.py's --self-test against this same
+    # projection, so neither half can drift from the other.
+    check("#560: every stage-verdict defer reason is a legal hand-over reason",
+          sorted(FIX_LANE_DEFER_REASONS), ["head-moved", "identity-mismatch", "unbound"])
+    check("#560: a clean review:changes hands over to the review lane",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL}), "transition")
+    check("#560: review:needs already live -> drop only the stale fix-lane label",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL}), "drop-fix-label")
+    check("#560: no review:changes -> idempotent no-op",
+          fix_lane_defer_action({REVIEW_LANE_PR_LABEL}), "noop")
+    check("#560: an empty review namespace -> idempotent no-op",
+          fix_lane_defer_action(set()), "noop")
+    check("#560: the hand-over leaves exactly review:needs",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "transition")),
+          {REVIEW_LANE_PR_LABEL})
+    check("#560: the drop leaves exactly review:needs",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL},
+                                    "drop-fix-label")),
+          {REVIEW_LANE_PR_LABEL})
+    # An ambiguous namespace that is NOT the review:needs pair still converges to the fail-closed
+    # human hold: set_review_state's issue #138 policy is honoured, never second-guessed.
+    check("#560: an ambiguous split still converges to the human hold",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, "review:pass"}, "transition")),
+          {"review:needs-user"})
+    try:
+        fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "invent")
+        check("#560: an unknown projection action fails closed", "no error", "raised")
+    except WorkerPrError:
+        check("#560: an unknown projection action fails closed", "raised", "raised")
+    # #555 park ownership + #138 human holds: a MACHINE lane hand-over never displaces either.
+    for _hold in (MACHINE_PARK_PR_LABEL, "review:needs-user", "needs:user"):
+        check(f"#560: a live {_hold} keeps the hand-over out",
+              fix_lane_defer_action({FIX_LANE_PR_LABEL}, holds=[_hold]), "hold")
+        check(f"#560: a live {_hold} leaves the label set untouched",
+              set(fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "hold")), {FIX_LANE_PR_LABEL})
+
+    # The IMPERATIVE path, with the GitHub label surface stubbed (nothing hits the network).
+    fld_globals = globals()
+    fld_real = {name: fld_globals[name] for name in
+                ("_gh_json", "_ensure_label", "_remove_label", "_write_outputs",
+                 "live_human_holds")}
+    try:
+        fld = {"live": [], "posted": [], "removed": [], "holds": [], "output": {}}
+
+        def fld_gh(args, **kwargs):
+            if "-X" in args and "POST" in args:            # the label ADD
+                fld["posted"].append(kwargs.get("input_doc", {}).get("labels") or [])
+                return {}
+            return fld["live"]                             # the live-labels GET
+
+        fld_globals["_gh_json"] = fld_gh
+        fld_globals["_ensure_label"] = lambda repo, label: None
+        fld_globals["_remove_label"] = lambda repo, pr, other: fld["removed"].append(other)
+        fld_globals["_write_outputs"] = lambda values: fld["output"].update(values)
+        fld_globals["live_human_holds"] = (
+            lambda repo, pr, issue=None, live=None: list(fld["holds"]))
+
+        def run_defer(live, reason="unbound", holds=()):
+            fld["live"] = [{"name": name} for name in sorted(live)]
+            fld["holds"] = list(holds)
+            fld["posted"], fld["removed"], fld["output"] = [], [], {}
+            fix_lane_defer("o/r", 5, reason, issue=7)
+            after = ((set(live) | {n for names in fld["posted"] for n in names})
+                     - set(fld["removed"])) & set(REVIEW_LABELS)
+            return fld["output"].get("action"), after
+
+        # THE regression, one assertion: an unbound-record defer must REMOVE review:changes and
+        # ADD review:needs. Leaving review:changes behind IS the live spin.
+        check("#560: an unbound-record defer flips review:changes -> review:needs",
+              run_defer({FIX_LANE_PR_LABEL}, "unbound"), ("transition", {REVIEW_LANE_PR_LABEL}))
+        # The stubbed mutation must equal the pure projection for EVERY reason/namespace pair, so
+        # dispatch-claim's spin-closure test is asserting the real post-defer label set.
+        for _live in ({FIX_LANE_PR_LABEL},
+                      {FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL},
+                      {FIX_LANE_PR_LABEL, "review:pass"},
+                      {REVIEW_LANE_PR_LABEL},
+                      set()):
+            for _reason in FIX_LANE_DEFER_REASONS:
+                _act, _after = run_defer(_live, _reason)
+                check(f"#560: the applied mutation matches the projection "
+                      f"({sorted(_live)} / {_reason})",
+                      _after, set(fix_lane_defer_labels(_live, _act)))
+        # A live hold mutates NOTHING on either surface — no add, no remove.
+        for _hold in (MACHINE_PARK_PR_LABEL, "review:needs-user", "needs:user"):
+            _act, _after = run_defer({FIX_LANE_PR_LABEL}, "unbound", holds=[_hold])
+            check(f"#560: a live {_hold} blocks every label write",
+                  (_act, fld["posted"], fld["removed"], _after),
+                  ("hold", [], [], {FIX_LANE_PR_LABEL}))
+        # Idempotence under the concurrent-claim semantics: replaying the defer on the ALREADY
+        # transitioned PR writes nothing (a second fix run, or a re-run of the outcome job).
+        _act, _after = run_defer({REVIEW_LANE_PR_LABEL}, "unbound")
+        check("#560: replaying the defer after the flip writes nothing",
+              (_act, fld["posted"], fld["removed"], _after),
+              ("noop", [], [], {REVIEW_LANE_PR_LABEL}))
+        # An unrecognised reason fails closed: raises BEFORE any read or write.
+        fld["live"] = [{"name": FIX_LANE_PR_LABEL}]
+        fld["holds"], fld["posted"], fld["removed"] = [], [], []
+        try:
+            fix_lane_defer("o/r", 5, "made-up-reason", issue=7)
+            check("#560: an unknown defer reason fails closed", "no error", "raised")
+        except WorkerPrError:
+            check("#560: an unknown defer reason fails closed",
+                  ("raised", fld["posted"], fld["removed"]), ("raised", [], []))
+        # A malformed live label payload fails closed (never "no labels" -> no hand-over).
+        fld["live"] = "nope"
+        try:
+            fix_lane_defer("o/r", 5, "unbound", issue=7)
+            check("#560: a malformed live label payload fails closed", "no error", "raised")
+        except WorkerPrError:
+            check("#560: a malformed live label payload fails closed",
+                  ("raised", fld["posted"], fld["removed"]), ("raised", [], []))
+    finally:
+        fld_globals.update(fld_real)
 
     # Privacy (locked decision 22a): salted hash is 16-hex, deterministic, salt-sensitive, and
     # never the raw handle; missing salt fails closed.
@@ -6146,6 +6403,15 @@ def main():
     svrec.add_argument("--pr", required=True, type=int)
     svrec.add_argument("--round", required=True, type=int)
 
+    # Issue #560: stage-verdict deferred (staged=false), so the fix lane must release the PR to the
+    # REVIEW lane — otherwise fix-enumeration re-claims it every dispatch tick forever.
+    fldefer = subparsers.add_parser("fix-lane-defer", parents=[common])
+    fldefer.add_argument("--stale-reason", required=True,
+                         choices=FIX_LANE_DEFER_REASONS,
+                         help="the stage-verdict stale_reason that caused the defer")
+    fldefer.add_argument("--issue", type=int,
+                         help="the source issue (its needs:* labels are part of the hold surface)")
+
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
@@ -6290,6 +6556,8 @@ def main():
         elif args.command == "stage-verdict":
             stage_verdict_for_fix(args.record_file, args.out_file, args.expected_sha,
                                   args.target_repo, args.pr, args.round)
+        elif args.command == "fix-lane-defer":
+            fix_lane_defer(args.repo, args.pr, args.stale_reason, issue=args.issue)
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,

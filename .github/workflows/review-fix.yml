@@ -807,6 +807,14 @@ jobs:
       verdict_b64: ${{ steps.handoff.outputs.verdict_b64 }}
       files_b64: ${{ steps.handoff.outputs.files_b64 }}
       fix_done: ${{ steps.fix.outcome }}
+      # Issue #560: whether the recorded verdict was STAGED for the fixer, and the reason it was
+      # not. staged=false means this run produced NOTHING — no fix, no push, no verdict — because
+      # no recorded verdict is bound to the live head. The `outcome` job must then hand the PR from
+      # the FIX lane to the REVIEW lane, or fix-enumeration (which keys on review:changes) re-claims
+      # it on every ~8min dispatch tick while review-enumeration (review:needs) never sees it.
+      # Empty in review mode and for the ci/rebase repair flavours (stage-verdict is skipped there).
+      verdict_staged: ${{ steps.stage-verdict.outputs.staged }}
+      verdict_stale_reason: ${{ steps.stage-verdict.outputs.stale_reason }}
       fix_made_changes: ${{ steps.fix.outputs.fix_made_changes }}
       injection_detected: ${{ steps.fix.outputs.injection_detected }}
       gate_outcome: ${{ steps.gate.outcome }}
@@ -1292,7 +1300,11 @@ jobs:
   outcome:
     name: Apply ${{ inputs.mode }} outcome (no target code runs here)
     needs: [resolve, claim, run]
-    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success') }}
+    # Issue #560 adds the third admission: a fix run that STAGED NOTHING (verdict_stale_reason
+    # non-empty) skips the fix step, so fix_done is 'skipped' and this job used to be skipped with
+    # it — which is exactly why the PR kept review:changes and the fix lane re-admitted it forever.
+    # The lane hand-over below is the only step that runs on that path.
+    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success' || needs.run.outputs.verdict_stale_reason != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + PROVENANCE_SALT, which
@@ -1507,6 +1519,35 @@ jobs:
             --pushed "${{ needs.run.outputs.pushed }}" \
             --reviewed-sha "${{ needs.run.outputs.pushed == 'true' && needs.run.outputs.pushed_sha || needs.resolve.outputs.head_sha }}" \
             --issue "${{ needs.resolve.outputs.issue }}"
+
+      # Issue #560 — WRONG-LANE SPIN CLOSURE. stage-verdict refused to seed the fixer because no
+      # recorded verdict is bound to the live head (a legacy pre-#156 unbound record, a head that
+      # moved under an update-branch/main merge, or an envelope naming another repo/PR/round), so
+      # this run produced NOTHING. Leaving review:changes on the PR kept it in the FIX lane's bucket
+      # while only the REVIEW lane can mint the head-bound verdict the fixer needs: live 2026-07-24,
+      # sparq#3523/#3542/#3572/#3573/#3608 each launched a fix run per ~8min tick from 08:02Z, every
+      # one completing "success" on `deferring to a fresh review` (~35 wasted runs/hour, each burning
+      # an account claim + a runner) until a human flipped the five labels. Hand the PR over here.
+      #
+      # This is a MACHINE LANE transition, NOT a park: worker-pr.py reads the live hold surface first
+      # and mutates nothing when a human hold (needs:user / review:needs-user) or the #555 machine
+      # capacity park (review:parked) is live. It is idempotent, so a re-run or a concurrent claim
+      # that already flipped the label writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>`
+      # lease enumerate_review_items single-flights on) is released unconditionally by the `release`
+      # job below, which does not depend on this job — the slot is free before the next tick.
+      - name: Hand a deferred fix back to the review lane (unbound/stale verdict)
+        if: ${{ inputs.mode == 'fix' && needs.run.outputs.verdict_staged == 'false' && needs.run.outputs.verdict_stale_reason != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          # Script-authored value, but it reaches the CLI via env like every other non-literal
+          # (issue #199): never interpolated into this `run:` shell source.
+          STALE_REASON: ${{ needs.run.outputs.verdict_stale_reason }}
+        run: |
+          python3 registry/scripts/worker-pr.py fix-lane-defer \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --issue "${{ needs.resolve.outputs.issue }}" \
+            --stale-reason "$STALE_REASON"
 
   # Escalate an unresolvable inverse chain to a human immediately (never silent-queue): if the
   # routing catalog cannot resolve a concrete model for this direction, a human must decide.

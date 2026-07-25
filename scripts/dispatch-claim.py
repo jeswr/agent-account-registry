@@ -3878,6 +3878,19 @@ def _review_fix_workflow_values():
     ttl_review = re.search(r'prefix="review:";[^\n]*\bttl=(\d+)', claim_span)
     ttl_fix = re.search(r'prefix="fix:";[^\n]*\bttl=(\d+)', claim_span)
     assert ttl_review and ttl_fix, "claim job local review/fix ttl= literals not found"
+    # Issue #560 lane-hand-over wiring, pinned to the WORKFLOW (the python halves cannot see it):
+    # the `run` job must EXPORT stage-verdict's staged/stale_reason, the `outcome` job must ADMIT
+    # the staged-nothing path (its old `if` skipped the whole job, which is why review:changes was
+    # never cleared), it must INVOKE worker-pr.py fix-lane-defer, and the `release` job that frees
+    # the `fix:<repo>#<pr>` claim must stay UNCONDITIONAL and independent of the outcome job.
+    release_span = spans.get("release")
+    assert release_span is not None, "review-fix.yml is missing the release job"
+    outcome_span = spans.get("outcome")
+    assert outcome_span is not None, "review-fix.yml is missing the outcome job"
+    release_if = re.search(r"(?m)^    if: (.+)$", release_span)
+    release_needs = re.search(r"(?m)^    needs: (.+)$", release_span)
+    outcome_if = re.search(r"(?m)^    if: (.+)$", outcome_span)
+    assert release_if and release_needs and outcome_if, "review-fix.yml if/needs not parsable"
     return {
         "resolve_s": _fixed_minutes("resolve") * 60,
         "claim_s": _fixed_minutes("claim") * 60,
@@ -3886,6 +3899,14 @@ def _review_fix_workflow_values():
         "run_fix_s": int(run_m.group(2)) * 60,
         "local_review_ttl": int(ttl_review.group(1)),
         "local_fix_ttl": int(ttl_fix.group(1)),
+        "run_exports_staged": "verdict_staged: ${{ steps.stage-verdict.outputs.staged }}"
+                              in run_span,
+        "run_exports_stale_reason":
+            "verdict_stale_reason: ${{ steps.stage-verdict.outputs.stale_reason }}" in run_span,
+        "outcome_if": outcome_if.group(1),
+        "outcome_hands_over": "worker-pr.py fix-lane-defer" in outcome_span,
+        "release_if": release_if.group(1),
+        "release_needs": release_needs.group(1),
     }
 
 
@@ -3946,6 +3967,28 @@ def _self_test():
     # would hold the same account for different windows.
     assert _wf["local_review_ttl"] == REVIEW_TTL, _wf["local_review_ttl"]
     assert _wf["local_fix_ttl"] == FIX_TTL, _wf["local_fix_ttl"]
+    # Issue #560 lane-hand-over wiring (see _review_fix_workflow_values). Without these the fix
+    # lane silently re-acquires the SAME deferred PR every dispatch tick: the enumerator's bucket
+    # is the review:changes label, and only this wiring clears it.
+    assert _wf["run_exports_staged"], "review-fix.yml run job must export verdict_staged (#560)"
+    assert _wf["run_exports_stale_reason"], (
+        "review-fix.yml run job must export verdict_stale_reason (#560)")
+    assert "needs.run.outputs.verdict_stale_reason != ''" in _wf["outcome_if"], (
+        "review-fix.yml outcome job must ADMIT the staged-nothing fix path (#560): "
+        f"{_wf['outcome_if']}")
+    assert _wf["outcome_hands_over"], (
+        "review-fix.yml outcome job must invoke worker-pr.py fix-lane-defer (#560)")
+    # The claim/lease release must not depend on the hand-over: it frees `fix:<repo>#<pr>` on
+    # EVERY path (always() + acquired) from a job that does not `needs:` the outcome job, so a
+    # deferred fix never holds the per-PR single-flight lease into the next tick.
+    assert "always()" in _wf["release_if"] \
+        and "needs.claim.outputs.acquired == 'true'" in _wf["release_if"], _wf["release_if"]
+    assert "outcome" not in _wf["release_needs"], (
+        "review-fix.yml release must not depend on the outcome job (#560 lease release): "
+        f"{_wf['release_needs']}")
+    print("  ok   #560: review-fix.yml exports the defer reason, admits the staged-nothing "
+          "outcome path, invokes fix-lane-defer, and still releases the fix lease "
+          "unconditionally")
 
     # #500 round-2: execute the REAL dispatch() call site for every decline-escalation tripwire.
     # The round-1 helper-only checks could stay green if dispatch stopped calling the helper; this
@@ -4936,6 +4979,46 @@ def _self_test():
         repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
                     login="human", labels=["review:changes"])],
         provenance, [], issue_labels, now) == []
+
+    # ---- issue #560 SPIN CLOSURE (cross-script, end-to-end) --------------------------------
+    # The FIX lane spun on unbound legacy verdicts: the fixer refused to stage a verdict that is
+    # not bound to the live head, deferred "to a fresh review", and left review:changes on the
+    # PR — so THIS enumerator re-admitted it as needs-fix on every ~8min dispatch tick while the
+    # review lane (keyed on review:needs) never saw it. Live 2026-07-24: sparq#3523/#3542/#3572/
+    # #3573/#3608 burned ~35 fix runs/hour that way until the labels were flipped by hand.
+    # Drive the REAL post-defer label projection out of worker-pr.py and assert this enumerator's
+    # verdict on it: the fix lane must NOT re-admit the PR, and the review lane must own it.
+    # Deleting the transition from worker-pr.fix_lane_defer* flips these red.
+    _worker_pr = _load_module(
+        "registry_worker_pr", Path(__file__).resolve().with_name("worker-pr.py"))
+    _spun = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                 labels=[_worker_pr.FIX_LANE_PR_LABEL])
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [_spun], provenance, [], issue_labels, now)] == ["needs-fix"], "pre-defer lane"
+    for _reason in _worker_pr.FIX_LANE_DEFER_REASONS:
+        _action = _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL})
+        _after = sorted(_worker_pr.fix_lane_defer_labels(
+            {_worker_pr.FIX_LANE_PR_LABEL}, _action))
+        # The hand-over removed the fix lane's admission label...
+        assert _worker_pr.FIX_LANE_PR_LABEL not in _after, (_reason, _after)
+        _handed = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=_after)
+        _states = [item["state"] for item in enumerate_review_items(
+            repo, [_handed], provenance, [], issue_labels, now)]
+        # ...so the next enumeration pass never re-admits it to the FIX lane (the spin closes),
+        # and the REVIEW lane picks it up to produce the head-bound verdict the fixer needs.
+        assert "needs-fix" not in _states, (_reason, _after, _states)
+        assert _states == ["needs-review"], (_reason, _after, _states)
+    # A hold/park defers WITHOUT a lane change (the park itself already excludes the PR from both
+    # lanes, so the spin cannot recur): review:parked keeps it out of this enumerator entirely.
+    _parked_after = sorted(_worker_pr.fix_lane_defer_labels(
+        {_worker_pr.FIX_LANE_PR_LABEL}, "hold"))
+    assert _parked_after == [_worker_pr.FIX_LANE_PR_LABEL], _parked_after
+    assert enumerate_review_items(
+        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                    labels=_parked_after + [MACHINE_PARK_PR_LABEL])],
+        provenance, [], issue_labels, now) == []
+    print("  ok   #560: the unbound-verdict defer hand-over closes the fix-lane spin "
+          "(review:changes -> review:needs; no needs-fix re-admission)")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
