@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Registry self-management: static (no-LLM) issue triage for jeswr/agent-account-registry.
+# Registry self-management: static (no-LLM) issue triage for jeswr/agent-account-registry.
 # Modeled on the sparq target's scripts/triage.py, adjusted for the registry's area:* sections and
 # its trust-surface soundness lane. Applied by .github/workflows/triage-issue.yml.
 """triage.py — the deterministic, no-LLM part of issue triage.
@@ -45,6 +45,8 @@ import json
 import re
 import subprocess
 import sys
+
+ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
 
 # ---------------------------------------------------------------------------------------------------
 # TRUST-PLANE ROLE — INTERIM MAPPING (TODO: registry #582 / #225).
@@ -95,7 +97,6 @@ TRUST_PLANE_ROLE = "impl"
 # SEC_KEYWORD as a substring, and the set of ROLE_BY_KIND keys mapped to TRUST_PLANE_ROLE must be
 # EXACTLY this tuple — adding a trust-plane kind without Phase-1 coverage fails the suite.
 TRUST_PLANE_KINDS = ("security",)
-
 ROLE_BY_KIND = {"docs": "docs", "research": "research", "ci": "ci", "site": "site",
                 **{kind: TRUST_PLANE_ROLE for kind in TRUST_PLANE_KINDS}}
 ROLE_BY_TYPE = {"feature": "impl", "bug": "impl", "task": "impl", "chore": "ci",
@@ -655,6 +656,21 @@ def _self_test():
         triage(["priority:P1", "area:worker"], "feature")["role"], TRUST_PLANE_ROLE)
     chk("dispatch -> trust-plane role", triage(["priority:P1", "area:dispatch"], "feature")["role"],
         TRUST_PLANE_ROLE)
+    # The shared catalog pins every role this planner may derive. Every derivation source must
+    # remain representable.
+    derived_roles = set(ROLE_BY_KIND.values()) | set(ROLE_BY_TYPE.values()) | {
+        _role([label], "task") for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS
+    } | set(AREA_ROLE_DEFAULT.values())
+    chk("all derived roles have labels", derived_roles <= set(ROLE_LABELS), True)
+    # Exact regression: applying the plan for a trust-surface issue which starts at role:impl
+    # leaves exactly one representable role, never a transiently planned roleless end state.
+    labels = {"role:impl", "area:worker", "priority:P2", "from:agent"}
+    r = triage(labels)
+    final_labels = (labels | r["add"]) - r["remove"]
+    final_roles = {lb for lb in final_labels if lb.startswith("role:")}
+    chk("trust role replacement is exactly-one", final_roles, {f"role:{TRUST_PLANE_ROLE}"})
+    chk("trust role replacement plans no churn when the target is already present",
+        (f"role:{TRUST_PLANE_ROLE}" in r["add"], "role:impl" in r["remove"]), (False, False))
     # [FABLE-5] UI-surface ownership: dashboard work derives role:site (codex-led chain, e4098b9);
     # kind:docs about the dashboard stays docs.
     chk("dashboard -> site", triage(["priority:P2", "area:dashboard"], "feature")["role"], "site")
@@ -819,6 +835,9 @@ def _self_test():
             "area:dispatch", "area:worker", "area:usage", "area:docs", "area:ci",
             "area:workflows", "area:dashboard", "area:review-loop", "area:groom",
             "trust:untrusted"}
+    chk("catalog == the pinned live role labels",
+        {f"role:{role}" for role in ROLE_LABELS},
+        {label for label in REAL if label.startswith("role:")})
     chk("trust-plane role label EXISTS in the registry label set",
         f"role:{TRUST_PLANE_ROLE}" in REAL, True)
     chk("role:soundness is NOT a registry label (the #582 root cause)",
@@ -880,6 +899,16 @@ def _self_test():
         (1, True, True))
     chk("[#582] missing target label still leaves exactly one role on the issue",
         _roles_of((fixture | r["add"]) - r["remove"]), {"role:docs"})
+    # An explicit role on a NON-trust surface reaches the same live-label check. It is preserved
+    # verbatim and diagnosed when the repository does not have that label; a static catalog must
+    # never silently pre-empt this fail-closed path.
+    fixture = {"priority:P2", "role:soundness", "area:docs"}
+    r = triage(fixture, "task", known_labels=REAL)
+    warning = r["warnings"][0] if r["warnings"] else ""
+    chk("[#582] missing explicit role is preserved and warned on a non-trust surface",
+        (r["role"], _roles_of((fixture | r["add"]) - r["remove"]), len(r["warnings"]),
+         "role:soundness" in warning),
+        ("soundness", {"role:soundness"}, 1, True))
     # missing target AND no existing role -> NOT ready (recoverable untriaged), never ready+roleless.
     r = triage(["priority:P1", "area:dispatch"], "task",
                known_labels=REAL - {f"role:{TRUST_PLANE_ROLE}"})
