@@ -73,6 +73,11 @@ CLASSES = (1, 2, 3, 4)
 HEAL_RANKS = (1, 2, 3, 4)
 UNRANKED = max(HEAL_RANKS) + 1
 KINDS = frozenset({"review", "fix", "disarm", "issue", "adjudicate", "repair"})
+# The kinds whose target is a PULL REQUEST. These — and only these — carry the full planned head
+# SHA (`head`) and are re-validated against the LIVE head, so a row can never be routed for a head
+# it was not planned for. Kept as a named set because three separate rules key on it (the schema's
+# required/forbidden `head`, `revalidate`'s exact-match binding, and the live endpoint below).
+PR_KINDS = frozenset({"review", "fix", "disarm"})
 # Which contents the drain must read to re-validate a kind against LIVE state. Kept here rather
 # than in drain.yml so it is covered by this module's self-test: the suite asserts every KIND has
 # an endpoint, so a kind added without classifying it turns the gate red instead of silently
@@ -89,6 +94,10 @@ DEFAULT_DRAIN_BATCH = 3
 # cannot hot-loop the same row every tick; the row stays queued and simply becomes eligible again.
 # Comfortably longer than the 10-minute drain cadence.
 DEFAULT_VISIBILITY_MINUTES = 30
+# A HOLD is not a failure: it hides a healthy, never-launched row for this long WITHOUT touching
+# `attempts`. Kept equal to the visibility window so a hold after a pick is normally already
+# satisfied and writes nothing (see `hold_task`).
+DEFAULT_HOLD_MINUTES = 30
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_MAX_AGE_MINUTES = 24 * 60
 
@@ -101,10 +110,14 @@ ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}")
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 CACHE_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}")
 ENQUEUED_BY_RE = re.compile(r"https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{1,255}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 REQUIRED_TASK_FIELDS = frozenset(
     {"id", "class", "kind", "repo", "ref", "cache_key", "enqueued_by", "enqueued_at", "attempts"})
-OPTIONAL_TASK_FIELDS = frozenset({"heal_rank", "not_before"})
+# `head` is OPTIONAL only in the flat-set sense: validate_task REQUIRES it on every PR kind and
+# FORBIDS it on every issue kind, so neither a PR row without a head binding nor a meaningless head
+# on an issue row can enter the queue.
+OPTIONAL_TASK_FIELDS = frozenset({"heal_rank", "not_before", "head"})
 
 
 class TaskQueueError(ValueError):
@@ -149,6 +162,17 @@ def validate_task(task):
     _atom(task["enqueued_by"], ENQUEUED_BY_RE, "enqueued_by")
     if task["kind"] not in KINDS:
         raise TaskQueueError(f"task kind {task['kind']!r} is not a known kind")
+    # HEAD BINDING. A PR row names the exact head it was planned for; `revalidate` drops it the
+    # moment the live head differs, so a force-push or a new commit can never be executed against
+    # a superseded plan. A row without that binding could outlive its head, so it is refused —
+    # and a head on an issue row is meaningless (nothing would ever check it), so that is refused
+    # too rather than being silently carried.
+    if task["kind"] in PR_KINDS:
+        if "head" not in task:
+            raise TaskQueueError("a PR-kind task must carry its planned head sha")
+        _atom(task["head"], SHA_RE, "head")
+    elif "head" in task:
+        raise TaskQueueError("head is only meaningful on a PR-kind task")
     if task["class"] not in CLASSES or isinstance(task["class"], bool):
         raise TaskQueueError("task class must be 1..4")
     if not _positive_int(task["ref"]):
@@ -331,6 +355,39 @@ def requeue_task(document, task_id, now, *, draw=random.uniform):
     return dict(document, tasks=tasks), attempts
 
 
+def hold_task(document, task_id, now, hold_minutes=DEFAULT_HOLD_MINUTES):
+    """PURE: hide a HEALTHY task for `hold_minutes` WITHOUT touching `attempts`.
+
+    A hold is NOT a failure, and that distinction is the whole point of this operation. `requeue`
+    exists for a task that was attempted and did not succeed: it burns one of `max_attempts`, which
+    `compact` uses to drop a row that keeps failing. A task the drain deliberately did not launch —
+    Phase A's still-push-dispatched kinds — has failed nothing, so requeueing it would classify a
+    perfectly healthy row as repeatedly failed and delete it after `max_attempts` drain ticks,
+    destroying queue continuity while emitting a false attempts-exhausted signal.
+
+    Returns (document, not_before) or (None, 0) for an unknown id. When the row is ALREADY hidden
+    at least this long (the normal case: `apply_pick`'s visibility window ≥ the hold), the document
+    is unchanged and (None, existing_not_before) is returned so `mutate` skips the CAS write — a
+    held row must not burn one ledger commit per row per tick.
+    """
+    if not _positive_int(hold_minutes):
+        raise TaskQueueError("hold_minutes must be a positive integer")
+    until = now + hold_minutes * 60
+    tasks, found, current = [], False, 0
+    for task in document["tasks"]:
+        if task["id"] == task_id:
+            found = True
+            current = task.get("not_before", 0)
+            if current < until:
+                task = dict(task, not_before=until)
+        tasks.append(task)
+    if not found:
+        return None, 0
+    if current >= until:
+        return None, current
+    return dict(document, tasks=tasks), until
+
+
 def compact(document, now, *, max_attempts=DEFAULT_MAX_ATTEMPTS,
             cache_ttl_minutes=DEFAULT_CACHE_TTL_MINUTES, max_age_minutes=DEFAULT_MAX_AGE_MINUTES):
     """PURE: drop dead rows and expired cache warmth. Returns (document, [(id, reason), ...]).
@@ -407,9 +464,21 @@ def revalidate(task, live):
         return False, "live-state-malformed"
     if live.get("state") != "open":
         return False, "target-not-open"
-    if task["kind"] in {"review", "fix", "disarm"}:
+    if task["kind"] in PR_KINDS:
         if live.get("merged"):
             return False, "target-merged"
+        # EXACT HEAD BINDING, for every PR kind. The row was planned for one head; anything else
+        # live means the PR moved on (new commit or force-push) and this row is SUPERSEDED — the
+        # PLAN tick that observed the new head enqueues its own row. An unreadable/malformed live
+        # head fails CLOSED to a drop rather than to "assume it still matches".
+        live_head = live.get("head")
+        if not isinstance(live_head, dict):
+            return False, "live-state-malformed"
+        live_sha = live_head.get("sha")
+        if not isinstance(live_sha, str) or SHA_RE.fullmatch(live_sha) is None:
+            return False, "live-state-malformed"
+        if live_sha != task["head"]:
+            return False, "head-superseded"
         draft = live.get("draft")
         if not isinstance(draft, bool):
             return False, "live-state-malformed"
@@ -457,18 +526,35 @@ def plan_cache_key(repo, package, lane, provider):
             f"#{lane}#{_sanitise_component(provider, 'noprov')}")
 
 
+def _plan_items(plan, key):
+    """The PLAN artifact's emission list under `key`, or raise.
+
+    `plan.get(key) or []` would be WRONG here in the way that matters most: a truncated artifact
+    missing the key, a null, or a hostile wrong type (`{}`, `""`, `0`) is falsey and would project
+    to an empty queue that is INDISTINGUISHABLE from a genuine 'this lane had no work' tick. PLAN
+    (dispatch.yml) always emits both keys as lists, so anything else is corruption and fails loud.
+    """
+    if key not in plan:
+        raise TaskQueueError(f"plan artifact is missing required key {key!r}")
+    items = plan[key]
+    if not isinstance(items, list):
+        raise TaskQueueError(f"plan artifact key {key!r} must be a list")
+    return items
+
+
 def tasks_from_plan(plan, enqueued_by, now):
     """PURE: the queue rows a dispatch PLAN artifact implies. Raises TaskQueueError on a malformed
     artifact — the enqueuer must fail LOUD rather than silently enqueue a truncated view of the
     tick, which would read downstream as 'the lane had no work'.
 
-    Ids embed the head SHA, so a new push produces a NEW row and the superseded one is dropped by
-    `revalidate` instead of executing against a stale head.
+    Each row carries the FULL planned head SHA (and embeds its prefix in the id), so a new push
+    produces a NEW row and the superseded one is dropped by `revalidate`'s exact head match instead
+    of executing against a stale head.
     """
     if not isinstance(plan, dict):
         raise TaskQueueError("plan artifact is not an object")
     tasks = []
-    for item in plan.get("review_items") or []:
+    for item in _plan_items(plan, "review_items"):
         if not isinstance(item, dict):
             raise TaskQueueError("plan review item is not an object")
         state = item.get("state")
@@ -484,6 +570,7 @@ def tasks_from_plan(plan, enqueued_by, now):
             "id": f"{kind}:{repo}#{number}:{head[:12]}",
             "class": klass,
             "kind": kind,
+            "head": head,
             "repo": repo if isinstance(repo, str) else "",
             "ref": number,
             "cache_key": plan_cache_key(repo, item.get("package"), kind,
@@ -495,7 +582,7 @@ def tasks_from_plan(plan, enqueued_by, now):
         if rank is not None:
             task["heal_rank"] = rank
         tasks.append(validate_task(task))
-    for item in plan.get("disarm_items") or []:
+    for item in _plan_items(plan, "disarm_items"):
         if not isinstance(item, dict):
             raise TaskQueueError("plan disarm item is not an object")
         kind, klass, rank = DISARM_ROUTE
@@ -503,11 +590,17 @@ def tasks_from_plan(plan, enqueued_by, now):
         head = item.get("head_sha")
         if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
             raise TaskQueueError("plan disarm item head_sha is malformed")
+        # The disarm row binds the same way every PR kind does: the head the mismatch was observed
+        # at. A push moves the head, so the old row is superseded and PLAN's next tick re-emits the
+        # disarm for the new head if the armed-SHA mismatch still holds. The reviewed-sha side of
+        # that invariant stays where it lives — dispatch-claim/worker-pr re-derive it live before
+        # any disarm acts; nothing here replaces it.
         tasks.append(validate_task({
             "id": f"{kind}:{repo}#{number}:{head[:12]}",
             "class": klass,
             "heal_rank": rank,
             "kind": kind,
+            "head": head,
             "repo": repo if isinstance(repo, str) else "",
             "ref": number,
             "cache_key": plan_cache_key(repo, None, kind, None),
@@ -632,7 +725,11 @@ def build_parser():
     parser.add_argument("--run-url", default="", help="enqueuing workflow run URL (provenance)")
     parser.add_argument("--pick", action="store_true", help="pick a drain batch")
     parser.add_argument("--complete", default="", metavar="TASK_ID")
-    parser.add_argument("--requeue", default="", metavar="TASK_ID")
+    parser.add_argument("--requeue", default="", metavar="TASK_ID",
+                        help="a task was ATTEMPTED and failed: back it off and burn one attempt")
+    parser.add_argument("--hold", default="", metavar="TASK_ID",
+                        help="a healthy task was deliberately NOT launched: hide it without "
+                             "consuming its failure budget")
     parser.add_argument("--compact", action="store_true")
     parser.add_argument("--stats", action="store_true")
     parser.add_argument("--limit", type=int, default=DEFAULT_DRAIN_BATCH)
@@ -640,6 +737,7 @@ def build_parser():
     parser.add_argument("--heal-max-wait-minutes", type=int,
                         default=DEFAULT_HEAL_MAX_WAIT_MINUTES)
     parser.add_argument("--visibility-minutes", type=int, default=DEFAULT_VISIBILITY_MINUTES)
+    parser.add_argument("--hold-minutes", type=int, default=DEFAULT_HOLD_MINUTES)
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     return parser
 
@@ -655,6 +753,9 @@ def _require_repo(args, parser):
                         ("--cache-ttl-minutes", args.cache_ttl_minutes),
                         ("--heal-max-wait-minutes", args.heal_max_wait_minutes),
                         ("--visibility-minutes", args.visibility_minutes),
+                        # --hold-minutes 0 would leave a held row instantly re-pickable, so the
+                        # drain would spin on the same unconverted kind every tick.
+                        ("--hold-minutes", args.hold_minutes),
                         ("--max-attempts", args.max_attempts)):
         if not _positive_int(value):
             parser.error(f"{flag} must be a positive integer")
@@ -729,6 +830,21 @@ def main(argv=None):
         print(f"requeued {args.requeue} (attempts={attempts})")
         return 0
 
+    if args.hold:
+        repo = _require_repo(args, parser)
+        until, committed = mutate(
+            repo, lambda doc: hold_task(doc, args.hold, now, args.hold_minutes),
+            f"hold task {args.hold}")
+        if not committed:
+            print("::error::task queue hold CAS kept conflicting", file=sys.stderr)
+            return 1
+        if not until:
+            # Not an error: the row can have been completed or compacted between pick and hold.
+            print(f"::warning::hold of unknown task {args.hold} (already completed or compacted)")
+            return 0
+        print(f"held {args.hold} until {until} (attempts unchanged)")
+        return 0
+
     if args.compact:
         repo = _require_repo(args, parser)
 
@@ -757,17 +873,22 @@ def main(argv=None):
                          sort_keys=True))
         return 0
 
-    parser.error("one of --self-test/--enqueue-from-plan/--pick/--complete/--requeue/"
+    parser.error("one of --self-test/--enqueue-from-plan/--pick/--complete/--requeue/--hold/"
                  "--compact/--stats is required")
     return 2
 
 
 # ---- self-test ----------------------------------------------------------------------------------
+HEAD_A = "a" * 40
+
+
 def _task(task_id, klass, *, enqueued_at, cache_key="r#p#review#anthropic", rank=None,
-          kind="review", not_before=None, attempts=0, repo="o/r", ref=1):
+          kind="review", not_before=None, attempts=0, repo="o/r", ref=1, head=HEAD_A):
     task = {"id": task_id, "class": klass, "kind": kind, "repo": repo, "ref": ref,
             "cache_key": cache_key, "enqueued_by": "https://example.invalid/run/1",
             "enqueued_at": enqueued_at, "attempts": attempts}
+    if kind in PR_KINDS:
+        task["head"] = head
     if rank is not None:
         task["heal_rank"] = rank
     if not_before is not None:
@@ -893,6 +1014,17 @@ def _self_test():
     refuses("negative attempts refused", lambda: validate_task(dict(good, attempts=-1)))
     refuses("heal_rank outside class 2 refused",
             lambda: validate_task(dict(good, heal_rank=1)))
+    # HEAD BINDING is part of the schema: a PR row without one could outlive its head, and a head
+    # on an issue row is never checked by anything.
+    refuses("a PR-kind task without a head refused",
+            lambda: validate_task({k: v for k, v in good.items() if k != "head"}))
+    refuses("a short head refused", lambda: validate_task(dict(good, head="a" * 39)))
+    refuses("an upper-case head refused", lambda: validate_task(dict(good, head="A" * 40)))
+    refuses("a non-string head refused", lambda: validate_task(dict(good, head=1)))
+    refuses("a head on an issue-kind task refused",
+            lambda: validate_task(dict(_task("i", 4, enqueued_at=now, kind="issue"), head=HEAD_A)))
+    check("an issue-kind task needs no head",
+          validate_task(_task("i", 4, enqueued_at=now, kind="issue"))["kind"], "issue")
     refuses("heal_rank 9 refused",
             lambda: validate_task(dict(_task("h", 2, enqueued_at=now), heal_rank=9)))
     refuses("wrong schema refused",
@@ -952,6 +1084,57 @@ def _self_test():
           requeue_task(applied, "p", now, draw=lambda lo, hi: 0)[0]["tasks"][0]["not_before"] > now,
           True)
 
+    # ---- HOLD: a deliberate non-launch is NOT a failure and must not consume the retry budget.
+    held_doc = _doc([_task("h", 4, enqueued_at=now - 10)])
+    holding, until = hold_task(held_doc, "h", now, hold_minutes=30)
+    check("hold hides the task WITHOUT bumping attempts",
+          (holding["tasks"][0]["attempts"], holding["tasks"][0]["not_before"], until),
+          (0, now + 30 * 60, now + 30 * 60))
+    check("a held task is not re-picked inside its window",
+          drain_pick(holding, now + 60, limit=1), [])
+    check("a held task IS pickable again once the window lapses",
+          [t["id"] for t in drain_pick(holding, now + 31 * 60, limit=1)], ["h"])
+    check("hold of an unknown id writes nothing", hold_task(held_doc, "nope", now), (None, 0))
+    # A row already hidden at least this long needs NO write — otherwise every held row would burn
+    # one ledger commit on every drain tick.
+    already = _doc([_task("h", 4, enqueued_at=now - 10, not_before=now + 9999)])
+    check("hold writes nothing when the row is already hidden longer",
+          hold_task(already, "h", now, hold_minutes=30), (None, now + 9999))
+    refuses("a non-positive hold window refused",
+            lambda: hold_task(held_doc, "h", now, hold_minutes=0))
+
+    # END TO END, the claim drain.yml's Phase-A hold branch makes: a healthy row that is picked and
+    # held on EVERY tick survives more than `max_attempts` ticks with its attempts untouched...
+    def _drain_cycles(cycles, settle):
+        """Run `cycles` full drain ticks (pick -> apply -> settle -> compact) over one row."""
+        doc, clock, picks = _doc([_task("phase-a", 4, enqueued_at=now, cache_key="ck")]), now, 0
+        for _ in range(cycles):
+            batch = drain_pick(doc, clock, limit=1)
+            if batch:
+                picks += 1
+                doc = apply_pick(doc, batch, clock, visibility_minutes=30)
+                updated = settle(doc, clock)
+                doc = updated if updated is not None else doc
+            clock += 40 * 60          # the next tick after the hiding window lapses
+            doc, _dropped = compact(doc, clock, max_attempts=DEFAULT_MAX_ATTEMPTS)
+        return doc, picks
+
+    cycles = DEFAULT_MAX_ATTEMPTS + 2
+    held_end, held_picks = _drain_cycles(
+        cycles, lambda doc, clock: hold_task(doc, "phase-a", clock, hold_minutes=30)[0])
+    check("a HELD row survives more than max_attempts drain ticks, attempts untouched",
+          ([t["id"] for t in held_end["tasks"]], [t["attempts"] for t in held_end["tasks"]],
+           held_picks),
+          (["phase-a"], [0], cycles))
+    # ...whereas the SAME loop settling with --requeue burns the failure budget and the row is
+    # compacted as attempts-exhausted. This is the check that makes the one above non-vacuous: it
+    # is the exact defect the hold operation exists to fix.
+    burned_end, burned_picks = _drain_cycles(
+        cycles, lambda doc, clock: requeue_task(doc, "phase-a", clock, draw=lambda lo, hi: 0)[0])
+    check("the SAME loop on requeue is compacted as attempts-exhausted",
+          ([t["id"] for t in burned_end["tasks"]], burned_picks < cycles),
+          ([], True))
+
     # ---- compact
     doc = _doc([_task("dead", 4, enqueued_at=now - 60, attempts=5),
                 _task("ancient", 4, enqueued_at=now - 48 * 3600),
@@ -983,31 +1166,64 @@ def _self_test():
     review = _task("rv", 4, enqueued_at=now, kind="review")
     disarm = _task("dz", 2, enqueued_at=now, kind="disarm", rank=3)
     issue = _task("is", 4, enqueued_at=now, kind="issue")
-    check("open draft PR revalidates for review",
-          revalidate(review, {"state": "open", "draft": True, "merged": False}), (True, "ok"))
-    check("closed PR drops", revalidate(review, {"state": "closed", "draft": True})[1],
-          "target-not-open")
-    check("merged PR drops",
-          revalidate(review, {"state": "open", "draft": True, "merged": True})[1], "target-merged")
-    check("un-drafted PR drops a review",
-          revalidate(review, {"state": "open", "draft": False, "merged": False})[1],
+
+    def _live_pr(sha=HEAD_A, **overrides):
+        live = {"state": "open", "draft": True, "merged": False, "head": {"sha": sha}}
+        live.update(overrides)
+        return live
+
+    check("open draft PR revalidates for review", revalidate(review, _live_pr()), (True, "ok"))
+    check("closed PR drops", revalidate(review, _live_pr(state="closed"))[1], "target-not-open")
+    check("merged PR drops", revalidate(review, _live_pr(merged=True))[1], "target-merged")
+    check("un-drafted PR drops a review", revalidate(review, _live_pr(draft=False))[1],
           "pr-no-longer-draft")
-    check("a re-drafted PR drops its disarm",
-          revalidate(disarm, {"state": "open", "draft": True, "merged": False})[1],
+    check("a re-drafted PR drops its disarm", revalidate(disarm, _live_pr())[1],
           "pr-already-disarmed")
     check("an armed PR revalidates for disarm",
-          revalidate(disarm, {"state": "open", "draft": False, "merged": False}), (True, "ok"))
+          revalidate(disarm, _live_pr(draft=False)), (True, "ok"))
     check("unreadable live state drops (fail closed)", revalidate(review, None)[1],
           "live-state-unreadable")
     check("missing draft flag drops (fail closed)",
-          revalidate(review, {"state": "open", "merged": False})[1], "live-state-malformed")
+          revalidate(review, {"state": "open", "merged": False, "head": {"sha": HEAD_A}})[1],
+          "live-state-malformed")
     check("an open issue revalidates", revalidate(issue, {"state": "open"}), (True, "ok"))
+
+    # ---- HEAD BINDING: the row is bound to the EXACT head it was planned for, for EVERY PR kind.
+    # Both directions, one character apart, so neither check can pass for any other reason.
+    for kind, task, live_extra in (("review", review, {}),
+                                   ("fix", _task("fx", 4, enqueued_at=now, kind="fix"), {}),
+                                   ("disarm", disarm, {"draft": False})):
+        check(f"the SAME live head revalidates a {kind}",
+              revalidate(task, _live_pr(HEAD_A, **live_extra)), (True, "ok"))
+        check(f"a one-character-different live head drops a {kind}",
+              revalidate(task, _live_pr("a" * 39 + "b", **live_extra))[1], "head-superseded")
+        check(f"a wholly new live head drops a {kind}",
+              revalidate(task, _live_pr("e" * 40, **live_extra))[1], "head-superseded")
+    check("an unreadable live head drops (fail closed, never assumed-matching)",
+          (revalidate(review, {"state": "open", "draft": True, "merged": False})[1],
+           revalidate(review, _live_pr(head="not-a-sha"))[1],
+           revalidate(review, _live_pr(head={"sha": "A" * 40}))[1]),
+          ("live-state-malformed", "live-state-malformed", "live-state-malformed"))
+    # END TO END: the supersession the projection docstring claims. The row PLAN emitted for the
+    # old head is DROPPED once the PR's live head moves, so it can never be routed as live work.
+    superseded = tasks_from_plan(
+        {"review_items": [{"pr_number": 7, "head_sha": HEAD_A, "state": "needs-review",
+                           "impl_provider": "anthropic", "repo": "o/r", "package": "core",
+                           "security": False, "context": ""}],
+         "disarm_items": []}, "https://example.invalid/run/5", now)[0]
+    check("a queued row is dropped once the PR is pushed to a new head",
+          (revalidate(superseded, _live_pr(HEAD_A))[0],
+           revalidate(superseded, _live_pr("f" * 40))), (True, (False, "head-superseded")))
     # Every kind must declare the endpoint the drain re-validates it against; an unclassified kind
     # would probe the wrong API and drop all its tasks as "unreadable".
     check("every kind has a live-state endpoint", sorted(LIVE_ENDPOINT), sorted(KINDS))
     check("PR kinds read pulls, issue kinds read issues",
           sorted({k for k, v in LIVE_ENDPOINT.items() if v == "pulls"}),
           ["disarm", "fix", "review"])
+    # PR_KINDS drives the schema's head requirement AND the head binding above; a kind that reads
+    # `pulls` but is missing here would be routed with no head binding at all.
+    check("PR_KINDS is exactly the set of pulls-endpoint kinds",
+          sorted(PR_KINDS), sorted(k for k, v in LIVE_ENDPOINT.items() if v == "pulls"))
 
     # ---- PLAN projection (the first enqueuer)
     plan = {
@@ -1029,26 +1245,50 @@ def _self_test():
     check("PLAN ids bind the head SHA",
           [t["id"] for t in rows],
           ["review:o/r#7:aaaaaaaaaaaa", "fix:o/r#8:bbbbbbbbbbbb", "disarm:o/r#9:cccccccccccc"])
+    # The id carries only a PREFIX; the row carries the FULL head, which is what revalidate binds.
+    check("every projected PR row carries the FULL planned head",
+          [t["head"] for t in rows], ["a" * 40, "b" * 40, "c" * 40])
     check("PLAN cache_key is repo+surface+lane+agent",
           rows[0]["cache_key"], "o-r#core#review#anthropic")
     check("a new head SHA is a NEW task, not a mutation of the old one",
-          tasks_from_plan({"review_items": [dict(plan["review_items"][0], head_sha="e" * 40)]},
+          tasks_from_plan({"review_items": [dict(plan["review_items"][0], head_sha="e" * 40)],
+                           "disarm_items": []},
                           "https://example.invalid/run/5", now)[0]["id"],
           "review:o/r#7:eeeeeeeeeeee")
     check("re-projecting the same PLAN enqueues nothing new",
           enqueue_tasks(enqueue_tasks(_doc([]), rows)[0], rows)[1], 0)
+    def _one_review(**overrides):
+        return {"review_items": [dict(plan["review_items"][0], **overrides)], "disarm_items": []}
+
     refuses("an unclassified PLAN state refuses (never silently defaulted)",
-            lambda: tasks_from_plan({"review_items": [dict(plan["review_items"][0],
-                                                           state="needs-telepathy")]},
+            lambda: tasks_from_plan(_one_review(state="needs-telepathy"),
                                     "https://example.invalid/run/5", now))
     refuses("a malformed PLAN head_sha refuses",
-            lambda: tasks_from_plan({"review_items": [dict(plan["review_items"][0],
-                                                           head_sha="nope")]},
+            lambda: tasks_from_plan(_one_review(head_sha="nope"),
                                     "https://example.invalid/run/5", now))
     refuses("a hostile PLAN repo refuses",
-            lambda: tasks_from_plan({"review_items": [dict(plan["review_items"][0],
-                                                           repo="o/r; rm -rf /")]},
+            lambda: tasks_from_plan(_one_review(repo="o/r; rm -rf /"),
                                     "https://example.invalid/run/5", now))
+    # A MALFORMED PLAN MUST NEVER LOOK LIKE 'NO WORK'. Each emission key must be PRESENT and a
+    # LIST: a missing key, a null, or a falsey wrong type would otherwise project to an empty
+    # queue indistinguishable from a genuine empty tick, silently starving the lane.
+    for label, bad_plan in (("missing review_items", {"disarm_items": []}),
+                            ("missing disarm_items", {"review_items": []}),
+                            ("null review_items", {"review_items": None, "disarm_items": []}),
+                            ("empty-object disarm_items", {"review_items": [], "disarm_items": {}}),
+                            ("string review_items", {"review_items": "", "disarm_items": []}),
+                            ("non-empty string review_items",
+                             {"review_items": "[]", "disarm_items": []}),
+                            ("zero disarm_items", {"review_items": [], "disarm_items": 0})):
+        refuses(f"a PLAN with {label} refuses (never a silent empty queue)",
+                lambda bad=bad_plan: tasks_from_plan(bad, "https://example.invalid/run/5", now))
+    refuses("a non-object PLAN refuses",
+            lambda: tasks_from_plan([], "https://example.invalid/run/5", now))
+    # ...and ONLY a genuinely empty tick — both keys present, both real lists — projects to zero
+    # rows. Without this the checks above could pass by refusing everything.
+    check("a genuinely empty PLAN projects to zero rows",
+          tasks_from_plan({"review_items": [], "disarm_items": []},
+                          "https://example.invalid/run/5", now), [])
     check("a hostile PLAN package cannot inject into cache_key",
           plan_cache_key("o/r", "co re;$(id)", "review", "anthropic"),
           "o-r#co-re-id#review#anthropic")
@@ -1126,23 +1366,36 @@ def _self_test():
 
     # ---- CLI GUARDS, driven through the REAL entrypoint (argparse exits 2 on error). No I/O runs:
     # every case below is refused during argument validation, before the first `gh` call.
-    def cli_exit(argv):
-        # argparse prints usage to stderr on error; swallow it so a PASSING suite does not emit
-        # 4KB of usage text that reads like a failure in the pr-gate log.
+    def cli_run(argv):
+        # argparse prints usage to stderr on error; capture it so a PASSING suite does not emit
+        # 4KB of usage text that reads like a failure in the pr-gate log — and so a check can
+        # assert WHICH guard refused, not merely that something exited 2.
         import contextlib
         import io
+        buffer = io.StringIO()
         try:
-            with contextlib.redirect_stderr(io.StringIO()):
-                return main(argv)
+            with contextlib.redirect_stderr(buffer):
+                return main(argv), buffer.getvalue()
         except SystemExit as exc:
-            return exc.code
+            return exc.code, buffer.getvalue()
+
+    def cli_exit(argv):
+        return cli_run(argv)[0]
 
     for bad_flag, bad_value in (("--limit", "0"), ("--cache-ttl-minutes", "0"),
                                 ("--heal-max-wait-minutes", "-1"), ("--visibility-minutes", "0"),
-                                ("--max-attempts", "0")):
+                                # 0 would leave a held row instantly re-pickable every tick.
+                                ("--hold-minutes", "0"), ("--max-attempts", "0")):
         check(f"{bad_flag}={bad_value} is refused by the CLI",
               cli_exit(["--pick", "--repo", "o/r", bad_flag, bad_value]), 2)
     check("a malformed --repo is refused", cli_exit(["--pick", "--repo", "not-a-repo"]), 2)
+    # --hold must be a REAL action, not an undeclared flag falling through to "no action selected"
+    # (both exit 2, so the exit code alone cannot tell them apart — the guard message can).
+    hold_code, hold_err = cli_run(["--hold", "review:o/r#1:abc", "--repo", "not-a-repo"])
+    check("--hold is a real CLI action, refused by the --repo guard (not 'no action selected')",
+          (hold_code, "--repo must be a well-formed owner/name" in hold_err,
+           "one of --self-test" in hold_err),
+          (2, True, False))
     check("a non-https --run-url is refused",
           cli_exit(["--enqueue-from-plan", "/nonexistent", "--repo", "o/r",
                     "--run-url", "file:///etc/passwd"]), 2)
@@ -1173,6 +1426,18 @@ def _self_test():
           sorted(set(passed) - declared), [])
     check("drain.yml runs the enrolled self-test",
           any(wf == "drain.yml" and "--self-test" in argv for wf, argv in invocations), True)
+    # The Phase-A hold branch is asserted against the WORKFLOW TEXT, because its verb is passed
+    # through a python list the argv reader cannot see. A drain that settles an unconverted kind
+    # with `--requeue` burns that healthy row's failure budget and compacts it as exhausted after
+    # `max_attempts` ticks, so the verb itself is the invariant.
+    drain_body = "\n".join(
+        line for line in (root / ".github" / "workflows" / "drain.yml")
+        .read_text(encoding="utf-8").splitlines() if not line.strip().startswith("#"))
+    check("drain.yml holds an unconverted kind (--hold), never --requeue",
+          (bool(re.search(r'queue\(\s*"--hold"', drain_body)),
+           bool(re.search(r'queue\(\s*"--requeue"', drain_body)),
+           "--hold" in declared),
+          (True, False, True))
     check("dispatch.yml dual-writes PLAN emissions into the queue",
           any(wf == "dispatch.yml" and "--enqueue-from-plan" in argv
               for wf, argv in invocations), True)

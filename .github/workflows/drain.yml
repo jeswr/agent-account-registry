@@ -191,13 +191,16 @@ jobs:
                   dropped += 1
                   continue
               if task["kind"] not in execute_kinds:
-                  # Phase A: the push edge still owns this kind. Requeue so the row keeps its place
-                  # (with backoff) instead of being lost or double-executed.
+                  # Phase A: the push edge still owns this kind. HOLD — not requeue — so the row
+                  # keeps its place instead of being lost or double-executed. A hold hides the row
+                  # for a window WITHOUT touching `attempts`: this task failed nothing, it was
+                  # deliberately not launched, and requeueing it would burn one of `max_attempts`
+                  # per tick until compact deleted a perfectly healthy row as attempts-exhausted.
                   print(f"hold {task['id']}: kind '{task['kind']}' is still push-dispatched "
                         "(DRAIN_EXECUTE_KINDS)")
                   summary.write(f"- `{task['id']}` held: kind `{task['kind']}` still "
                                 "push-dispatched\n")
-                  queue("--requeue", task["id"])
+                  queue("--hold", task["id"])
                   held += 1
                   continue
               # A converted kind launches through the EXISTING review-fix.yml / worker.yml
