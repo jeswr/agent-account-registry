@@ -30,7 +30,10 @@ write, and enqueue payloads are derived from the dispatch PLAN artifact, which i
 by a job that executes untrusted target code. So the schema is validated on READ and again before
 every WRITE, with bounded sizes and character-class-pinned atoms. A malformed document FAILS
 CLOSED (the drain refuses) rather than degrading to an empty queue, which would look exactly like
-"no work" while starving every lane.
+"no work" while starving every lane. And because safe characters prove nothing about ORIGIN, the
+PLAN artifact is put through dispatch-claim.py's FULL validator first (`validate_plan_artifact`) —
+the same validation the CLAIM consumer applies to the same artifact — so every projected row is
+bound to a repository the plan itself declared.
 
 CAS discipline is the lease ledger's, thread for thread (select-and-claim.py): read-SHA
 compare-and-swap pinned to the data-plane branch, bounded FULLY JITTERED retries, and REAL API
@@ -542,10 +545,56 @@ def _plan_items(plan, key):
     return items
 
 
+_CLAIM_MODULE = None
+
+
+def _claim_module():
+    """Cached dispatch-claim.py module — CLAIM's OWN strict PLAN validator, IMPORTED rather than
+    replicated so the enqueue side of the artifact can never drift into a weaker schema than the
+    dispatch side. dispatch-claim.py is import-side-effect-free (constants and defs only); the
+    same lazy-load seam groom.py/plan-snapshot.py already use for this file."""
+    global _CLAIM_MODULE
+    if _CLAIM_MODULE is None:
+        path = Path(__file__).resolve().with_name("dispatch-claim.py")
+        spec = importlib.util.spec_from_file_location("registry_dispatch_claim_tq", path)
+        if spec is None or spec.loader is None:
+            raise TaskQueueError(f"cannot load the PLAN validator {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CLAIM_MODULE = module
+    return _CLAIM_MODULE
+
+
+def validate_plan_artifact(plan):
+    """FULL dispatch-claim.py PLAN validation, run before ANY projection or queue mutation.
+
+    WHY THE WHOLE SCHEMA, NOT JUST THE FIELDS THIS MODULE READS. The enqueue job holds
+    `contents: write` on the data-plane branch while consuming an artifact produced by the
+    unprivileged job that executes untrusted target code. Character-class checks on the handful of
+    fields the projection touches stop injection but establish NOTHING about authenticity: a
+    compromised producer could emit well-formed rows for repositories the tick never planned, or
+    repeat a row until the queue hits MAX_TASKS and every later legitimate enqueue fails closed.
+    So the enqueuer applies exactly the validation the CLAIM consumer applies to the SAME artifact
+    — exact top-level and per-item fields, schema version, deterministic order, uniqueness, and
+    (the binding that matters here) every review/disarm item's `repo` must be a member of the
+    plan's own validated `repositories` set. A plan that CLAIM would refuse to act on is a plan
+    this job refuses to enqueue.
+    """
+    claim = _claim_module()
+    try:
+        return claim.validate_plan(plan)
+    except claim.DispatchError as error:
+        raise TaskQueueError(f"plan artifact failed dispatch validation: {error}") from error
+
+
 def tasks_from_plan(plan, enqueued_by, now):
     """PURE: the queue rows a dispatch PLAN artifact implies. Raises TaskQueueError on a malformed
     artifact — the enqueuer must fail LOUD rather than silently enqueue a truncated view of the
     tick, which would read downstream as 'the lane had no work'.
+
+    The artifact is FULLY validated (`validate_plan_artifact`) before a single row is projected, so
+    every emitted row is bound to a repository the plan itself declared. The per-field checks below
+    are kept as defence in depth for the fields this projection actually reads.
 
     Each row carries the FULL planned head SHA (and embeds its prefix in the id), so a new push
     produces a NEW row and the superseded one is dropped by `revalidate`'s exact head match instead
@@ -553,6 +602,7 @@ def tasks_from_plan(plan, enqueued_by, now):
     """
     if not isinstance(plan, dict):
         raise TaskQueueError("plan artifact is not an object")
+    validate_plan_artifact(plan)
     tasks = []
     for item in _plan_items(plan, "review_items"):
         if not isinstance(item, dict):
@@ -1204,13 +1254,32 @@ def _self_test():
            revalidate(review, _live_pr(head="not-a-sha"))[1],
            revalidate(review, _live_pr(head={"sha": "A" * 40}))[1]),
           ("live-state-malformed", "live-state-malformed", "live-state-malformed"))
+    # A COMPLETE, dispatch-valid PLAN artifact — the projection now refuses anything less (see
+    # validate_plan_artifact), so every fixture below is a genuine v4 document. The schema string
+    # is READ FROM the validator rather than hard-coded, so a schema bump does not turn these
+    # fixtures into a false red while the membership/uniqueness properties they assert stay live.
+    claim_mod = _claim_module()
+
+    def _plan_doc(reviews, disarms, repos=("o/r",), **overrides):
+        document = {
+            "schema": claim_mod.SCHEMA,
+            "generated_at": "2026-07-18T00:00:00Z",
+            "repositories": [{"target_repo": repo, "target_sha": "0" * 40, "items": []}
+                             for repo in repos],
+            "review_items": list(reviews),
+            "disarm_items": list(disarms),
+            "snapshot_skips": [],
+        }
+        document.update(overrides)
+        return document
+
     # END TO END: the supersession the projection docstring claims. The row PLAN emitted for the
     # old head is DROPPED once the PR's live head moves, so it can never be routed as live work.
     superseded = tasks_from_plan(
-        {"review_items": [{"pr_number": 7, "head_sha": HEAD_A, "state": "needs-review",
-                           "impl_provider": "anthropic", "repo": "o/r", "package": "core",
-                           "security": False, "context": ""}],
-         "disarm_items": []}, "https://example.invalid/run/5", now)[0]
+        _plan_doc([{"pr_number": 7, "head_sha": HEAD_A, "state": "needs-review",
+                    "impl_provider": "anthropic", "repo": "o/r", "package": "core",
+                    "security": False, "context": ""}], []),
+        "https://example.invalid/run/5", now)[0]
     check("a queued row is dropped once the PR is pushed to a new head",
           (revalidate(superseded, _live_pr(HEAD_A))[0],
            revalidate(superseded, _live_pr("f" * 40))), (True, (False, "head-superseded")))
@@ -1226,8 +1295,8 @@ def _self_test():
           sorted(PR_KINDS), sorted(k for k, v in LIVE_ENDPOINT.items() if v == "pulls"))
 
     # ---- PLAN projection (the first enqueuer)
-    plan = {
-        "review_items": [
+    plan = _plan_doc(
+        [
             {"pr_number": 7, "head_sha": "a" * 40, "state": "needs-review",
              "impl_provider": "anthropic", "repo": "o/r", "package": "core",
              "security": False, "context": ""},
@@ -1235,9 +1304,8 @@ def _self_test():
              "impl_provider": "openai", "repo": "o/r", "package": "core",
              "security": False, "context": "gate"},
         ],
-        "disarm_items": [{"pr_number": 9, "head_sha": "c" * 40, "reviewed_sha": "d" * 40,
-                          "repo": "o/r"}],
-    }
+        [{"pr_number": 9, "head_sha": "c" * 40, "reviewed_sha": "d" * 40, "repo": "o/r"}],
+    )
     rows = tasks_from_plan(plan, "https://example.invalid/run/5", now)
     check("PLAN emissions project to class 4 / 3 / 2c by kind",
           [(t["kind"], t["class"], t.get("heal_rank")) for t in rows],
@@ -1251,14 +1319,13 @@ def _self_test():
     check("PLAN cache_key is repo+surface+lane+agent",
           rows[0]["cache_key"], "o-r#core#review#anthropic")
     check("a new head SHA is a NEW task, not a mutation of the old one",
-          tasks_from_plan({"review_items": [dict(plan["review_items"][0], head_sha="e" * 40)],
-                           "disarm_items": []},
+          tasks_from_plan(_plan_doc([dict(plan["review_items"][0], head_sha="e" * 40)], []),
                           "https://example.invalid/run/5", now)[0]["id"],
           "review:o/r#7:eeeeeeeeeeee")
     check("re-projecting the same PLAN enqueues nothing new",
           enqueue_tasks(enqueue_tasks(_doc([]), rows)[0], rows)[1], 0)
     def _one_review(**overrides):
-        return {"review_items": [dict(plan["review_items"][0], **overrides)], "disarm_items": []}
+        return _plan_doc([dict(plan["review_items"][0], **overrides)], [])
 
     refuses("an unclassified PLAN state refuses (never silently defaulted)",
             lambda: tasks_from_plan(_one_review(state="needs-telepathy"),
@@ -1271,30 +1338,90 @@ def _self_test():
                                     "https://example.invalid/run/5", now))
     # A MALFORMED PLAN MUST NEVER LOOK LIKE 'NO WORK'. Each emission key must be PRESENT and a
     # LIST: a missing key, a null, or a falsey wrong type would otherwise project to an empty
-    # queue indistinguishable from a genuine empty tick, silently starving the lane.
-    for label, bad_plan in (("missing review_items", {"disarm_items": []}),
-                            ("missing disarm_items", {"review_items": []}),
-                            ("null review_items", {"review_items": None, "disarm_items": []}),
-                            ("empty-object disarm_items", {"review_items": [], "disarm_items": {}}),
-                            ("string review_items", {"review_items": "", "disarm_items": []}),
-                            ("non-empty string review_items",
-                             {"review_items": "[]", "disarm_items": []}),
-                            ("zero disarm_items", {"review_items": [], "disarm_items": 0})):
-        refuses(f"a PLAN with {label} refuses (never a silent empty queue)",
+    # queue indistinguishable from a genuine empty tick, silently starving the lane. Asserted at
+    # BOTH layers — through the projection, AND against `_plan_items` directly, so this
+    # defence-in-depth layer cannot go vacuous behind the full-schema gate now running in front
+    # of it (the gate refuses these first, which is why the inner layer needs its own test).
+    for label, key, value in (("null", "review_items", None),
+                              ("empty-object", "disarm_items", {}),
+                              ("string", "review_items", ""),
+                              ("non-empty string", "review_items", "[]"),
+                              ("zero", "disarm_items", 0)):
+        bad_plan = _plan_doc([], [], **{key: value})
+        refuses(f"a PLAN with {label} {key} refuses (never a silent empty queue)",
                 lambda bad=bad_plan: tasks_from_plan(bad, "https://example.invalid/run/5", now))
+        refuses(f"_plan_items refuses a {label} {key}",
+                lambda bad=bad_plan, k=key: _plan_items(bad, k))
+    for key in ("review_items", "disarm_items"):
+        missing = {name: value for name, value in _plan_doc([], []).items() if name != key}
+        refuses(f"a PLAN missing {key} refuses (never a silent empty queue)",
+                lambda bad=missing: tasks_from_plan(bad, "https://example.invalid/run/5", now))
+        refuses(f"_plan_items refuses a missing {key}",
+                lambda bad=missing, k=key: _plan_items(bad, k))
     refuses("a non-object PLAN refuses",
             lambda: tasks_from_plan([], "https://example.invalid/run/5", now))
-    # ...and ONLY a genuinely empty tick — both keys present, both real lists — projects to zero
-    # rows. Without this the checks above could pass by refusing everything.
+    # ...and ONLY a genuinely empty tick — a complete, dispatch-valid document with both emission
+    # lists empty — projects to zero rows. Without this the checks above could pass by refusing
+    # everything, and the new full-schema gate would be indistinguishable from a blanket refusal.
     check("a genuinely empty PLAN projects to zero rows",
-          tasks_from_plan({"review_items": [], "disarm_items": []},
-                          "https://example.invalid/run/5", now), [])
+          tasks_from_plan(_plan_doc([], []), "https://example.invalid/run/5", now), [])
     check("a hostile PLAN package cannot inject into cache_key",
           plan_cache_key("o/r", "co re;$(id)", "review", "anthropic"),
           "o-r#co-re-id#review#anthropic")
     check("every PLAN state dispatch-claim enumerates is classified",
           sorted(PLAN_STATE_ROUTE),
           sorted({"needs-review", "needs-fix", "needs-ci-fix", "needs-rebase", "stranded"}))
+    # ...pinned against the LIVE validator too, not only the literal above. validate_plan_artifact
+    # now admits exactly dispatch-claim's REVIEW_STATES, so a state added there without a class
+    # here would reach an unclassified route at enqueue time (fail-closed, but only in production).
+    # This makes that drift turn the GATE red instead.
+    check("the classification table matches dispatch-claim's live REVIEW_STATES",
+          sorted(PLAN_STATE_ROUTE), sorted(claim_mod.REVIEW_STATES))
+
+    # ---- AUTHENTICITY OF THE ARTIFACT (review round 2 on PR #634), not merely well-formedness.
+    # The enqueue job holds `contents: write` on the ledger while consuming an artifact assembled
+    # by the unprivileged job that executes untrusted target code. Character classes stop
+    # injection but prove nothing about ORIGIN: a well-formed row naming a repository the tick
+    # never planned, an unknown field smuggling state past the schema, or the same row repeated
+    # until the queue hits MAX_TASKS are all "safe strings" and all forgeries. Each is refused
+    # BEFORE projection by validate_plan_artifact, and each has a positive control so the refusal
+    # cannot be an artefact of the fixture.
+    forged_review = dict(plan["review_items"][0], repo="o/unplanned")
+    forged_disarm = dict(plan["disarm_items"][0], repo="o/unplanned")
+    refuses("a review item for a repo the PLAN never planned refuses",
+            lambda: tasks_from_plan(_plan_doc([forged_review], []),
+                                    "https://example.invalid/run/5", now))
+    refuses("a disarm item for a repo the PLAN never planned refuses",
+            lambda: tasks_from_plan(_plan_doc([], [forged_disarm]),
+                                    "https://example.invalid/run/5", now))
+    check("...and the SAME rows project once that repo IS in the planned set",
+          [task["repo"] for task in tasks_from_plan(
+              _plan_doc([forged_review], [forged_disarm], repos=("o/r", "o/unplanned")),
+              "https://example.invalid/run/5", now)],
+          ["o/unplanned", "o/unplanned"])
+    refuses("an unknown top-level PLAN field refuses",
+            lambda: tasks_from_plan(_plan_doc([], [], smuggled="x"),
+                                    "https://example.invalid/run/5", now))
+    refuses("an unknown review-item field refuses",
+            lambda: tasks_from_plan(
+                _plan_doc([dict(plan["review_items"][0], smuggled="x")], []),
+                "https://example.invalid/run/5", now))
+    refuses("a missing review-item field refuses",
+            lambda: tasks_from_plan(
+                _plan_doc([{name: value for name, value in plan["review_items"][0].items()
+                            if name != "security"}], []),
+                "https://example.invalid/run/5", now))
+    refuses("an unsupported PLAN schema version refuses",
+            lambda: tasks_from_plan(_plan_doc([], [], schema="registry-dispatch-plan/v0"),
+                                    "https://example.invalid/run/5", now))
+    refuses("a repeated review item refuses (queue-flooding by duplication)",
+            lambda: tasks_from_plan(
+                _plan_doc([plan["review_items"][0], plan["review_items"][0]], []),
+                "https://example.invalid/run/5", now))
+    refuses("a repeated disarm item refuses (queue-flooding by duplication)",
+            lambda: tasks_from_plan(
+                _plan_doc([], [plan["disarm_items"][0], plan["disarm_items"][0]]),
+                "https://example.invalid/run/5", now))
 
     # ---- CAS I/O: argv shape, branch pinning, 404 policy, conflict classification, retry loop
     args = queue_write_args("o/r", "msg", "Ym9keQ==", "sha1")
@@ -1363,6 +1490,34 @@ def _self_test():
         globals()["read_queue"] = saved_read
         globals()["write_queue"] = saved_write
         globals()["_sleep_backoff"] = saved_sleep
+
+    # MUTATION-SENSITIVE end-to-end proof that the artifact gate sits IN FRONT of the ledger: the
+    # forged plan is refused with ZERO writes, and the genuine plan commits its rows through the
+    # very same stubbed I/O — so "refused" can never be an artefact of the stub.
+    saved_read, saved_write = read_queue, write_queue
+    try:
+        import tempfile
+        writes = []
+        globals()["read_queue"] = lambda repo: (_doc([]), "sha-a")
+        globals()["write_queue"] = lambda repo, document, sha, message: (
+            writes.append(len(document["tasks"])) or True)
+        with tempfile.TemporaryDirectory() as tmp:
+            forged_path = Path(tmp, "forged.json")
+            forged_path.write_text(
+                json.dumps(_plan_doc([dict(plan["review_items"][0], repo="o/unplanned")], [])),
+                encoding="utf-8")
+            genuine_path = Path(tmp, "genuine.json")
+            genuine_path.write_text(json.dumps(plan), encoding="utf-8")
+            argv = ["--repo", "o/r", "--run-url", "https://example.invalid/run/5",
+                    "--enqueue-from-plan"]
+            refuses("a forged PLAN is refused before ANY queue write",
+                    lambda: main(argv + [str(forged_path)]))
+            check("...with nothing written to the ledger", writes, [])
+            check("a genuine PLAN still enqueues its rows through the same path",
+                  (main(argv + [str(genuine_path)]), writes), (0, [3]))
+    finally:
+        globals()["read_queue"] = saved_read
+        globals()["write_queue"] = saved_write
 
     # ---- CLI GUARDS, driven through the REAL entrypoint (argparse exits 2 on error). No I/O runs:
     # every case below is refused during argument validation, before the first `gh` call.

@@ -681,8 +681,12 @@ jobs:
   # executes hostile target planner code under `contents: read` by design. Enqueueing needs
   # `contents: write` for the ledger CAS PUT, and granting PLAN that would hand write access to the
   # data plane to the one job that runs untrusted code. This job takes the PLAN artifact as HOSTILE
-  # DATA instead — task-queue.py validates every projected row's character classes and refuses an
-  # unclassified state — exactly as CLAIM treats the same artifact.
+  # DATA instead: before projecting a single row, task-queue.py runs dispatch-claim.py's FULL
+  # `validate_plan` over it — exact top-level/item fields, schema version, deterministic order,
+  # uniqueness, and every emitted item's repo bound to the plan's own `repositories` set — and only
+  # then pins each projected row's character classes and refuses an unclassified state. That is the
+  # SAME validation CLAIM applies to this artifact, so a compromised PLAN producer can no more
+  # enqueue a forged row than it can get one dispatched.
   #
   # It holds NO secrets (only the ephemeral github.token), so it is correctly not bound to the
   # `dispatch-secrets` environment and not gated on secrets-guard: dispatch-secrets-guard.py
