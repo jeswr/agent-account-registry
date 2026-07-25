@@ -915,6 +915,9 @@ jobs:
           WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
           WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
           WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+          # Provider refresh tokens are ONE-TIME-USE (issue #596): a dry run must not consume the
+          # account's stored grant, so it materializes the mount without exchanging anything.
+          WORKER_PREFLIGHT_REFRESH: ${{ inputs.dry_run && 'skip' || 'refresh' }}
         run: bash registry/scripts/worker-prep.sh
 
       - name: Confirm dry-run boundary
@@ -978,7 +981,10 @@ jobs:
           if [[ "$MODEL_OUTCOME" == "success" ]]; then
             cls=success
           elif [[ "$MODEL_OUTCOME" == "skipped" ]]; then
-            cls=unknown   # pre-launch abort: no CLI ever ran
+            # Pre-launch abort: no CLI ever ran. worker-prep's host-side credential pre-flight
+            # (issue #596) nonetheless classifies its own failures into WORKER_EXIT_CLASS before the
+            # model step can run, so prefer that over a blanket `unknown`.
+            cls="${WORKER_EXIT_CLASS:-unknown}"
           else
             # failure OR cancellation/timeout: use the host-observed class when worker-live.sh
             # got far enough to write one; otherwise unknown.
@@ -1045,7 +1051,11 @@ jobs:
 
       - name: Write back a rotated full account credential
         id: writeback
-        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' && steps.model.outcome != 'skipped' }}
+        # NO model-step guard (issue #596): rotation now happens in worker-prep's HOST-SIDE
+        # pre-flight, before the model step exists. Provider refresh tokens are one-time-use, so
+        # dropping this step because the model never launched would strand a consumed grant in the
+        # secret and kill the NEXT run on this account.
+        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}

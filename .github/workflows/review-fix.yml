@@ -1180,13 +1180,16 @@ jobs:
           WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
         run: bash ../registry/scripts/worker-live.sh fix
 
-      # The provider CLI may refresh the account credential during the run (codex rotates its
-      # auth.json); write it back exactly like worker.yml so the next claim still authenticates.
-      # Runs IMMEDIATELY after the model steps and BEFORE the gate: rotation only happens during
-      # the model call, and REGISTRY_SECRETS_PAT must never be live in a step that runs after
-      # hostile target code executed on this runner (the fix-mode cargo gate below).
+      # Persist a HOST-SIDE-rotated account credential so the next claim still authenticates
+      # (issue #596). Rotation happens in worker-prep's pre-flight refresh, NOT in the container:
+      # the credential file is bind-mounted read-only (issue #134), so the CLI's own in-place
+      # refresh cannot happen there — which is exactly why this lane died. Still runs BEFORE the
+      # gate: REGISTRY_SECRETS_PAT must never be live in a step that runs after hostile target code
+      # executed on this runner (the fix-mode cargo gate below).
       - name: Write back a rotated full account credential
-        if: ${{ always() && steps.prepare.outcome == 'success' && (steps.review.outcome != 'skipped' || steps.fix.outcome != 'skipped') }}
+        # NO model-step guard (issue #596): see worker.yml — a host-side rotation must be
+        # persisted even when the model step never ran, or the consumed grant strands the account.
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
@@ -1213,7 +1216,11 @@ jobs:
           if [[ "$REVIEW_OUTCOME" == "success" || "$FIX_OUTCOME" == "success" ]]; then
             cls=success
           elif [[ "$REVIEW_OUTCOME" == "skipped" && "$FIX_OUTCOME" == "skipped" ]]; then
-            cls=unknown   # pre-launch abort/cancellation: no host-observed CLI exit exists
+            # Pre-launch abort/cancellation: no host-observed CLI exit exists. But worker-prep's
+            # host-side credential pre-flight (issue #596) DOES classify its own failures and writes
+            # WORKER_EXIT_CLASS before any model step can run — recording `unknown` over it would
+            # discard the one signal that says "this account needs a re-mint".
+            cls="${WORKER_EXIT_CLASS:-unknown}"
           else
             cls="${WORKER_EXIT_CLASS:-unknown}"
           fi
