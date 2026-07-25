@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3434,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "acf9b51e88bd6d455a58ba332337ab58a3f4d1e8",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 4's major consistency finding is resolved. The dedicated ZK verification-and-costs record now uses the 24,452 hidden_issuer_d4 baseline, updates the per-member table and analysis from two to four scalar multiplications, attributes the +7,506 gates to the two subgroup checks, and retains the repository-level NOT-yet-sound/external-audit caveat. The snapshot, bench mirror, catalog source/generated data, and site evidence agree on the new value. The added workflow step runs the previously uncovered non-ignored gate-count regression with nargo/bb available, while the existing test performs a real compile and bb gate-count comparison rather than a mock; the catalog test checks summary/high-gate consistency. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
