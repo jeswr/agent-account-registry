@@ -296,7 +296,12 @@ def _probe_account(account, secrets, probe=None, fable_probe=None):
 def _apply_backoff(entry, backoff):
     """Annotate one exempt usage entry with an ACTIVE backoff record (pure). Tolerant fail-open:
     a malformed/forged record (non-dict, non-numeric/non-finite backoff_until) leaves the entry
-    untouched — never crashes the sweep, never blocks the account."""
+    untouched — never crashes the sweep, never blocks the account.
+
+    `backoff_signal` is the model-health class that produced the hold: `limit`/`transient` for the
+    reactive rate-limit chain, and (registry #596) `auth` for the bounded CREDENTIAL COOLDOWN after
+    AUTH_COOLDOWN_MIN consecutive auth failures. Both arrive in the same shape through the same
+    account_backoffs read, so nothing here needs to distinguish them."""
     if not isinstance(backoff, dict):
         return entry
     try:
