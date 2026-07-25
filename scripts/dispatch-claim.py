@@ -3809,7 +3809,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     catalog_cache["accounts"] = allocator.read_accounts(registry_repo)
                 pool = set(resolved["account_pool"])
                 pool_accounts = [a for a in catalog_cache["accounts"] if a["handle"] in pool]
-                # [OPUS-5 issue #676] `run_seconds` turns on the PROJECTED-BURN half of the
+                # [OPUS-5 issue #688] `run_seconds` turns on the PROJECTED-BURN half of the
                 # wind-down: an account is refused new work once its window is projected to run dry
                 # before a worker of this length could finish. The worker TIMEOUT is deliberately
                 # used as the run-length estimate — it is the wall-clock upper bound the dispatcher

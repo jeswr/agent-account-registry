@@ -36,7 +36,7 @@ BUSY_STATUS = {"status:in-progress", "status:in-progress-review", "status:blocke
 # an epic is a tracking umbrella (its children are the work) — never dispatchable.
 NON_DISPATCHABLE = "kind:epic"
 GLOBAL = "__global__"  # the cross-cutting partition (serializes against everything)
-# [OPUS-5 issue #676] Historical, behaviour-preserving frontier width: exactly one in-flight issue
+# [OPUS-5 issue #688] Historical, behaviour-preserving frontier width: exactly one in-flight issue
 # per `area:` package. Also the fail-closed floor for a policy-supplied width.
 DEFAULT_PACKAGE_WIDTH = 1
 _PRIO = re.compile(r"^priority:P([0-4])$")   # only P0..P4 are valid
@@ -158,7 +158,7 @@ def compute_ready(issues, in_progress_packages=None, log=None, package_width=DEF
     """Conflict-free, priority-ordered, FAIL-CLOSED ready frontier. This is NOT the count of
     drainable work — see ready_candidates() for that.
 
-    [OPUS-5 issue #676] `package_width` is the number of issues that may be in flight PER
+    [OPUS-5 issue #688] `package_width` is the number of issues that may be in flight PER
     `area:<section>` package. It defaults to 1, which is the historical exactly-one-per-package
     serialization, byte-for-byte — so an unset width changes nothing anywhere.
 
@@ -298,7 +298,7 @@ def _self_test():
           exclusion_reason({"priority:P1", "role:impl"}), "no status:ready attestation")
     check("exclusion_reason: an area-less set is still enumerable (it reserves __global__)",
           exclusion_reason({"status:ready", "priority:P1", "role:impl"}), None)
-    # ---- [OPUS-5 issue #676] PACKAGE WIDTH: the frontier lever ------------------------------------
+    # ---- [OPUS-5 issue #688] PACKAGE WIDTH: the frontier lever ------------------------------------
     # The default MUST be byte-for-byte the historical one-per-package serialization, and a widened
     # package MUST actually admit more work — otherwise "raise the ceiling" is inert on a
     # package-clustered backlog. Deleting the width plumbing collapses the first two to the same

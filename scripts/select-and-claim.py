@@ -174,7 +174,7 @@ def _fable_eligible(u, margin):
 def _backoff_expired(u, now=None):
     """True when NO active reactive rate-limit hold applies to this entry.
 
-    ONE implementation for both provider arms (issue #676 made the metered arm honour the hold too);
+    ONE implementation for both provider arms (issue #688 made the metered arm honour the hold too);
     a second copy of this rule is exactly how the two arms would drift apart.
 
     Fail-OPEN on a missing, malformed, or non-finite stamp. That direction is deliberate and
@@ -227,7 +227,7 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
         # [ISSUE #196] require status EXACTLY `allowed`: an empty status was previously accepted
         # (the `("allowed", "")` set) and failed open as eligible capacity.
         return False                                  # empty/throttled/rejected -> not eligible
-    # [OPUS-5 issue #676] The REACTIVE rate-limit hold now applies to METERED accounts too. A 429
+    # [OPUS-5 issue #688] The REACTIVE rate-limit hold now applies to METERED accounts too. A 429
     # (or a secondary/burst limit) on an anthropic worker writes a `transient` model-health record
     # and `account_backoffs` derives a hold from it — but that hold used to be stamped onto exempt
     # entries ONLY, so nothing on the anthropic side ever observed it and the account kept being
@@ -252,7 +252,7 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
     return True
 
 
-# ---- WINDOW ACCOUNTING + PROJECTED-BURN WIND-DOWN (issue #676) -----------------------------------
+# ---- WINDOW ACCOUNTING + PROJECTED-BURN WIND-DOWN (issue #688) -----------------------------------
 # [OPUS-5] The half that makes RAISING concurrency safe. The point-in-time gate above is a CLIFF: an
 # account at (1 - margin) utilisation admits a full complement of workers, all of which then die
 # together when the window runs dry mid-run. That is precisely the mass-failure a higher ceiling
@@ -535,7 +535,7 @@ def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, ma
     static policy `max_concurrent`; a returned 0 WITH a non-empty usage map means every account is
     genuinely tapped out and nothing should dispatch.
 
-    [OPUS-5 issue #676] Each eligible account now contributes its WIND-DOWN-TAPERED slot count
+    [OPUS-5 issue #688] Each eligible account now contributes its WIND-DOWN-TAPERED slot count
     (`adaptive_slots`) rather than its flat static cap, so the fleet sheds concurrency smoothly as
     accounts approach their quota windows instead of running at full width into a cliff. Passing
     `run_seconds` (the expected worker wall-clock) additionally enables the projected-burn factor,
@@ -597,7 +597,7 @@ def available_account_slots(accounts, leases, model_chain, now, account_pool=Non
             cap = int(account.get("max_concurrent_workers", 4))
         except (TypeError, ValueError, OverflowError):
             continue
-        # [OPUS-5 issue #676] The review/fix lane's bound winds down with the quota window too —
+        # [OPUS-5 issue #688] The review/fix lane's bound winds down with the quota window too —
         # otherwise raising the review-lane ceiling reintroduces the cliff on the very lane the
         # throughput goal loads hardest. `usage=None` (the deliberate static path) is untapered.
         if usage is not None:
@@ -2151,7 +2151,7 @@ def _self_test():
     # backward compat: usage=None keeps the original cache-affinity selection.
     check("usage=None backward compatible", choose_account(A, [], ["fable"], "pkg", "impl", now), "acct02")
 
-    # ---- [OPUS-5 issue #676] REACTIVE RATE-LIMIT HOLD ON THE **METERED** ARM ---------------------
+    # ---- [OPUS-5 issue #688] REACTIVE RATE-LIMIT HOLD ON THE **METERED** ARM ---------------------
     # The live hole: a 429 on an anthropic worker produced a model-health `transient` record and a
     # derived backoff, but the overlay was stamped onto EXEMPT entries only, so the anthropic arm
     # never observed it. Utilisation cannot stand in for this — a burst limit can fire at any
@@ -2181,7 +2181,7 @@ def _self_test():
            usage_eligible({"exempt": True, "reachability": "live", "backoff_until": B_NOW - 1},
                           now=B_NOW)), (False, True))
 
-    # ---- [OPUS-5 issue #676] WINDOW ACCOUNTING + PROJECTED-BURN WIND-DOWN ------------------------
+    # ---- [OPUS-5 issue #688] WINDOW ACCOUNTING + PROJECTED-BURN WIND-DOWN ------------------------
     # Every check below is written to DIE if the guard it names is deleted or inverted. The
     # utilisation ramp, the projection ramp, the fail-closed reads and BOTH call sites
     # (dynamic_concurrency / available_account_slots) are asserted separately, because a taper that

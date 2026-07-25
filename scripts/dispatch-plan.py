@@ -442,7 +442,7 @@ def _self_test():
          "#19, #20 (+10 more)" in _truncated, "#21" in _truncated),
         (True, True, False))
 
-    # ---- [OPUS-5 issue #676] THE FRONTIER-WIDTH CALL SITE, EXECUTED ------------------------------
+    # ---- [OPUS-5 issue #688] THE FRONTIER-WIDTH CALL SITE, EXECUTED ------------------------------
     # This is the YAML seam, and it is where vacuity lives: the width branch and the TypeError
     # fallback are workflow python that no unit test would otherwise reach. Deleting `package_width`
     # from the call, inverting `if width > 1`, or dropping the except-TypeError arm each makes a
@@ -474,15 +474,15 @@ def _self_test():
         return text, planner.calls, namespace.get("ready")
 
     _text, _calls, _frontier = _run_width(3)
-    chk("[#676] a widened target PASSES package_width through to the readiness engine",
+    chk("[#688] a widened target PASSES package_width through to the readiness engine",
         (_calls, _frontier, _text.strip()), ([3], [{"number": 1}], ""))
     _text, _calls, _frontier = _run_width(1)
-    chk("[#676] width 1 takes the ORIGINAL call path (no kwarg at all — byte-for-byte unchanged)",
+    chk("[#688] width 1 takes the ORIGINAL call path (no kwarg at all — byte-for-byte unchanged)",
         (_calls, _text.strip()), ([None], ""))
     # The cross-repo compatibility hazard: an older target engine must DEGRADE to the narrow
     # frontier with a warning, never take that target's dispatch down.
     _text, _calls, _frontier = _run_width(3, supports_width=False)
-    chk("[#676] an older target engine falls back to the narrow frontier and says so LOUDLY",
+    chk("[#688] an older target engine falls back to the narrow frontier and says so LOUDLY",
         ("::warning::o/t: readiness engine does not support package_width" in _text,
          _calls, _frontier),
         (True, [None], [{"number": 1}]))
@@ -490,7 +490,7 @@ def _self_test():
     planner = _WidthPlanner()
     _captured(lambda: exec(width_block, {"dispatch": planner, "ready_input": [], "repo": "o/absent",
                                          "frontier_width": {}}))  # noqa: S102
-    chk("[#676] a target with no policy width defaults to the one-per-package frontier",
+    chk("[#688] a target with no policy width defaults to the one-per-package frontier",
         planner.calls, [None])
 
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the

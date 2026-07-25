@@ -148,7 +148,7 @@ jobs:
           if not isinstance(rows, dict):
               raise SystemExit("registry policy has no repos table")
           allowlist = {}
-          # [OPUS-5 issue #676] Per-target FRONTIER WIDTH, extracted here for the same reason the
+          # [OPUS-5 issue #688] Per-target FRONTIER WIDTH, extracted here for the same reason the
           # bot allowlist is: the planner step runs TARGET-supplied code and must never read the
           # registry policy itself. Validated by REGISTRY code before any target code sees it, and
           # bounded on both sides — a junk/absent/over-large value degrades to the historical
@@ -215,7 +215,7 @@ jobs:
           # this is pure registry data, never influenced by the target repo being planned.
           trusted_bots_map = json.loads(
               Path(out_dir, "trusted-bots.json").read_text(encoding="utf-8"))
-          # [OPUS-5 issue #676] Per-target frontier width, from the same registry-code extraction
+          # [OPUS-5 issue #688] Per-target frontier width, from the same registry-code extraction
           # step and validated there. Same provenance rule: registry data only.
           frontier_width = json.loads(
               Path(out_dir, "frontier-width.json").read_text(encoding="utf-8"))
@@ -353,7 +353,7 @@ jobs:
                   or (row["number"] not in linked
                       and trusted(details[row["number"]][0], repo_trusted_bots))
               ]
-              # [OPUS-5 issue #676] FRONTIER WIDTH. The frontier — not `max_concurrent` — is what
+              # [OPUS-5 issue #688] FRONTIER WIDTH. The frontier — not `max_concurrent` — is what
               # actually bounds parallelism on a package-clustered backlog, so this is the knob that
               # converts drainable backlog into concurrent work. Two safety properties matter here:
               #  (1) width 1 takes the ORIGINAL call path verbatim, so an un-widened target is

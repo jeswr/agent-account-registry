@@ -95,7 +95,7 @@ routing = "orchestration/routing.toml"
 # and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
 # provenance records or salted fingerprints.
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
-# [OPUS-5 issue #676] DELIBERATELY UNCHANGED at 40, and that is a finding rather than an omission.
+# [OPUS-5 issue #688] DELIBERATELY UNCHANGED at 40, and that is a finding rather than an omission.
 # 40 already equals the whole measured pool (7 anthropic x 4 = 28, plus acct01's 12 codex slots), so
 # it is not the binding limiter and raising it would be a placebo. On the 2026-07-25 snapshot sparq
 # had 1118 open issues but only 10 DRAINABLE (`ready_candidates`) and a frontier of 7 — the limiter
@@ -149,7 +149,7 @@ routing = "orchestration/routing.toml"   # THIS repo's own routing (self-managed
 # and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
 # provenance records or salted fingerprints.
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
-# [OPUS-5 issue #676] 3 -> 8, TOGETHER WITH package_width below. Measured, not guessed:
+# [OPUS-5 issue #688] 3 -> 8, TOGETHER WITH package_width below. Measured, not guessed:
 #   * The binding limiter here was NEVER this number. On the 2026-07-25 snapshot the registry had
 #     285 open issues -> 12 DRAINABLE (`ready_candidates`) -> a frontier of 3 (`compute_ready`),
 #     because those 12 clustered into only 3 distinct areas (review-loop 5, dispatch 5, workflows 2)

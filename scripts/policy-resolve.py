@@ -49,7 +49,7 @@ POLICY_FIELDS = {
     "max_attempts",
     "trust",
 }
-# [OPUS-5 issue #676] Hard upper bound on the per-package frontier width. The frontier's
+# [OPUS-5 issue #688] Hard upper bound on the per-package frontier width. The frontier's
 # one-per-package rule is a merge-conflict guard, so width is a THROUGHPUT-vs-CONFLICT dial, not a
 # free parameter: a bounded ceiling keeps a policy typo (or an over-eager future tuning pass) from
 # turning the guard off altogether while still allowing a real, measured widening.
@@ -206,7 +206,7 @@ def _policy_row(target_repo, policy_doc):
         margin = row["usage_safety_margin"]
         if not isinstance(margin, (int, float)) or isinstance(margin, bool) or not (0.0 <= margin < 1.0):
             raise PolicyError(f"usage_safety_margin for {target_repo!r} must be a float in [0, 1)")
-    # [OPUS-5 issue #676] package_width: in-flight issues permitted per `area:` package. Bounded
+    # [OPUS-5 issue #688] package_width: in-flight issues permitted per `area:` package. Bounded
     # ABOVE as well as below — an unbounded width would silently disable the conflict-avoidance the
     # frontier exists to provide, and a typo'd 1000 must be rejected loudly, not obeyed.
     if "package_width" in row:
@@ -643,7 +643,7 @@ agent = "docs-agent"
         check("usage_safety_margin range validated", "accepted", "rejected")
     except PolicyError:
         check("usage_safety_margin range validated", "rejected", "rejected")
-    # ---- [OPUS-5 issue #676] package_width: the frontier lever, bounded on BOTH sides ------------
+    # ---- [OPUS-5 issue #688] package_width: the frontier lever, bounded on BOTH sides ------------
     def _width_policy(line):
         return tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                              'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
