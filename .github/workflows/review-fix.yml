@@ -1287,6 +1287,13 @@ jobs:
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
+          # [#583] run_gate is shared with worker.yml and now runs the target's cargo inside a
+          # sandbox whose scratch CARGO_HOME/RUSTUP_HOME and host-local output log live under
+          # WORKER_ROOT, so this lane must name the same root the rest of the job uses. This lane
+          # does NOT yet run the pre-gate credential purge — that adoption is tracked in #247 — but
+          # it already benefits from the container: the gate sandbox refuses to mount
+          # $WORKER_ROOT/home, so target code cannot read the credential through it.
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: bash ../registry/scripts/worker-live.sh gate

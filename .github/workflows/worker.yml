@@ -1079,37 +1079,71 @@ jobs:
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back
 
-      - name: Ensure a Rust toolchain for the crate-scoped gate
-        # [OPUS-4.8] The gate runs `cargo clippy/test` directly on the runner; a stock ubuntu-latest may
-        # have rustup with NO default toolchain set (and the target may pin one via rust-toolchain.toml),
-        # which fails the gate with "rustup could not choose a version of cargo". Set one up in the target
-        # dir so a rust-toolchain.toml pin is honoured; harmless for non-cargo gate profiles.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
-        working-directory: target
-        run: |
-          set -uo pipefail
-          command -v rustup >/dev/null 2>&1 || { echo '::error::rustup not found on the runner'; exit 1; }
-          rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
-          rustup show >/dev/null 2>&1 || true      # installs a rust-toolchain.toml-pinned toolchain if present
-          rustup component add clippy rustfmt >/dev/null 2>&1 || true
-          cargo --version; rustc --version
+      # [#583] PURGE the live account credential before ANY target-controlled process starts. The
+      # gate below runs the target repository's own cargo build scripts and tests; until this step
+      # existed they ran as the runner user with the credential still materialized under
+      # $WORKER_ROOT/home (plus the .credential-baseline copy) and with both paths advertised
+      # job-wide through $GITHUB_ENV — hostile gate code could simply read it. Ordering is
+      # load-bearing in BOTH directions: it must run AFTER write-back (which needs the possibly
+      # rotated credential) and BEFORE the gate. It therefore requires write-back success — a
+      # failed rotation must not be silently discarded by deleting the credential, and it must not
+      # fall through to the gate with the credential intact either; the gate's own
+      # `steps.purge.outcome == 'success'` guard below is the fail-closed half.
+      - name: Purge the live account credential before target-controlled code runs
+        id: purge
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' && steps.writeback.outcome == 'success' }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: bash registry/scripts/worker-live.sh purge-credentials
+
+      # [#583] The host-side `Ensure a Rust toolchain` step that used to sit here is GONE: the cargo
+      # gate below no longer runs on the runner at all, so provisioning a host toolchain by running
+      # `rustup show` inside the target checkout (driven by the target's own rust-toolchain.toml)
+      # was both dead weight and one more target-config-driven host action. The toolchain now comes
+      # from the digest-pinned gate sandbox image, and the fetch phase installs any
+      # rust-toolchain.toml pin plus clippy/rustfmt into the container's scratch RUSTUP_HOME while
+      # the network is still available.
 
       - name: Run policy-selected local gate
         id: gate
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        # Fail-closed on the purge (#583): the gate runs target-CONTROLLED cargo build scripts and
+        # tests, so it must not start unless the account credential has been deleted from the
+        # runner. A skipped/failed purge skips the gate rather than running target code beside a
+        # live credential.
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' && steps.purge.outcome == 'success' }}
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
-          # [OPUS-4.8] Credential-safety (security review, finding #3): do NOT `tee` the gate's own
-          # stdout+stderr — which is target-CONTROLLED cargo output (build scripts / tests) — into a
-          # runner-local file. An earlier revision did that to feed a diagnostics artifact; a hostile
-          # build script could exhaust runner disk by writing the COMPLETE unbounded stream to that
-          # file before any tail bounded it. The gate's stream is already surfaced verbatim in the
-          # GitHub job log (streamed off-runner, not a local file), which is a sufficient and safe
-          # crash signal. The failure-class annotation below reads only host-derived step outcomes.
+          # [#583] Output containment. This step's stream is target-CONTROLLED cargo output and this
+          # repository is PUBLIC, so it is NOT surfaced verbatim any more: worker-live.sh captures it
+          # into a mode-600 host-local log at the WORKER_ROOT root (outside every container mount)
+          # and publishes only pass/fail, a host-derived failure class, and a size-bounded tail that
+          # is withheld entirely if it matches the credential tripwire.
+          # This DOES reintroduce a runner-local copy, which the earlier security review rejected
+          # (finding #3: a hostile build script could write the COMPLETE unbounded stream to disk and
+          # exhaust it). That is answered, not ignored: the capture is capped AT WRITE TIME against
+          # the log's cumulative size (_GATE_LOG_MAX_BYTES), so an over-producing gate is cut off and
+          # fails closed rather than filling the runner's disk. The no-diagnostics-ARTIFACT posture
+          # below is unchanged — this log is never uploaded, and WORKER_ROOT is deleted on cleanup.
         run: bash ../registry/scripts/worker-live.sh gate
+
+      # [#583] Post-gate tripwire, wired AHEAD of the token-bearing publish step: `publish` stages
+      # the whole tree with `git add -A`, so anything the gate wrote into target/ would be committed
+      # and pushed to a PUBLIC pull request. This rescans the modified/untracked target files and
+      # followups.jsonl against a host-local pattern list the gate cannot reach, fails closed on a
+      # hit, and deletes that list before publish runs. always(): a FAILED gate still leaves a tree
+      # and a followups.jsonl that the followups step would publish.
+      - name: Rescan the post-gate target tree for credential material
+        id: rescan
+        if: ${{ always() && !inputs.dry_run && steps.purge.outcome == 'success' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: bash ../registry/scripts/worker-live.sh rescan
 
       # TTL guard, PRE-PUBLISH (issue #40): app-token-post is minted right after the model step but
       # BEFORE the `Run policy-selected local gate` step above, which runs target-controlled cargo and
@@ -1142,7 +1176,7 @@ jobs:
 
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
-        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' && steps.rescan.outcome == 'success' }}
         working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
@@ -1169,7 +1203,9 @@ jobs:
         # step creates de-duplicated, labelled, back-linked issues. Best-effort; never fails the worker.
         # `always()` is load-bearing: without a status function the `if` is implicitly success()-gated,
         # so a FAILED gate would skip the very followups-only run the post-gate token mint refreshes for.
-        if: ${{ always() && !inputs.dry_run && steps.model.outcome == 'success' }}
+        # [#583] rescan-gated too: followups.jsonl becomes PUBLIC issue bodies, so it is covered by
+        # the same post-gate credential tripwire as the published tree.
+        if: ${{ always() && !inputs.dry_run && steps.model.outcome == 'success' && steps.rescan.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
