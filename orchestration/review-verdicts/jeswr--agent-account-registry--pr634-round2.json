@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 634,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bd68039f5595bdae071efdc01c9825e9c27c47d6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The enqueue job explicitly treats plan.json as hostile data while holding contents:write, but tasks_from_plan() does not validate the PLAN schema or bind emitted item repos to the PLAN's validated repository set. It accepts any object containing list-valued review_items/disarm_items and only checks a small subset of each item. A compromised PLAN producer can therefore supply well-formed arbitrary repo/PR/head rows (including many unique rows up to the queue cap), commit them to the ledger, consume drain/API work, and make later legitimate enqueue operations fail once MAX_TASKS is reached. Character-class validation prevents command injection but does not establish that these are authentic emissions of the planned repositories; this privilege boundary is consequently not fail-closed.",
+    "file": "scripts/task-queue.py",
+    "fix_hint": "Before projection, run the same strict full PLAN validation used by the existing CLAIM consumer (including exact top-level/item fields, schema, repository membership, and uniqueness), or define and verify an equivalently strict queue-specific envelope produced by PLAN. Add mutation-sensitive tests proving that an item whose repo is absent from the validated repositories, an unknown top-level/item field, and duplicate/oversized emissions are rejected before any queue mutation, while a genuine validated PLAN still projects.",
+    "severity": "major",
+    "title": "Privileged enqueue accepts forged rows from an unauthenticated PLAN artifact"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The three round-1 findings are substantively fixed: PR rows now carry and exactly revalidate the full head SHA with mutation-sensitive tests; Phase-A uses a non-attempt-consuming hold with an end-to-end survival test; and both PLAN emission arrays are required to be lists. However, the new privileged enqueuer still does not authenticate the hostile artifact as the PLAN it claims to consume. Its projection validates only selected row syntax, so a replaced artifact can enqueue arbitrary repository/PR rows and fill the durable queue. Because this is a new major finding at the unprivileged-artifact to contents:write boundary, progress is regressing under the required scale despite the prior fixes.",
+  "verdict": "request_changes"
+ }
+}
