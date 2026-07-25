@@ -97,6 +97,31 @@
 # prose as evidence. The workflows directory and scripts/worker-live.sh ship in the guard
 # job's sparse checkout so both contracts also run live every tick.
 #
+# GATE CONTRACT (issue #618) — this guard's own exit code proves NOTHING about whether the
+# privileged jobs are stopped. The job shipped with `continue-on-error: true` (a 2026-07-18
+# advisory-mode line, issue #276, meant to be removed once #275's migration verified on
+# 2026-07-19), which does not merely keep the RUN green: it makes this job resolve as SUCCESS for
+# DEPENDENCY purposes, so CLAIM's plain `needs: secrets-guard` AND plan-alert's
+# `needs.secrets-guard.result == 'success'` were BOTH satisfied by a FAILING guard. Measured on run
+# 30141528651: GUARD conclusion `failure`, CLAIM ran, ALERT ran, run conclusion `success`. The
+# self-test therefore asserts the WIRING in dispatch.yml (guard_gate_verdict): the guard job exists
+# and carries NO truthy continue-on-error at job or step level; every secret-consuming job in the
+# file — DERIVED, not listed — declares `needs: secrets-guard`; and any such job carrying a
+# job-level `if:` re-states `needs.secrets-guard.result == 'success'` (an `if` containing always()
+# cancels the implicit needs-must-succeed gate). Re-adding the continue-on-error line turns that
+# check red.
+#
+# SPARSE-CHECKOUT COVERAGE (issue #618 defect 2) — this same self-test runs in TWO environments:
+# the full-checkout pr-gate and the guard job's SPARSE checkout. A live input missing from the
+# latter used to land in a broad `except` and silently degrade the check that needed it: #528 added
+# the human-arm trust-surface assertions (which read scripts/worker-pr.py and policy/repos.toml)
+# without extending dispatch.yml's sparse-checkout list, so from 2026-07-22T12:43Z the surface
+# derived EMPTY and the guard reported all 22 privileged scripts — this file included — as "outside
+# the human-arm trust surface", every tick, for 62 hours, hidden behind the continue-on-error.
+# SELF_TEST_LIVE_INPUTS + sparse_checkout_covers_verdict now pin the two lists together, and an
+# empty surface refuses by NAMING the derivation instead of emitting a script list that reads as a
+# policy finding.
+#
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
 import json
@@ -191,6 +216,230 @@ def workflow_guard_permissions(workflow_text):
                 continue
             break  # end of the permissions mapping
     return permissions
+
+
+# ---- the GATE contract (issue #618) --------------------------------------------------------------
+# The guard job's own exit code is worthless on its own: `continue-on-error: true` kept every
+# existing assertion green for 62 hours while the control was fail-OPEN. What must be asserted is
+# that a FAILING guard PREVENTS the privileged jobs from running, so these checks are on the WIRING
+# in dispatch.yml, not on the guard's behaviour.
+GATE_GUARD_JOB = "secrets-guard"
+# `continue-on-error:` at ANY indent inside the guard job. Job level makes the job resolve as
+# SUCCESS for dependents (defeating both gating idioms); step level on the verify step makes the
+# job green while the verification failed. Neither is ever legitimate here, so the guard job is
+# required to carry NONE — an advisory diagnostic belongs in a SEPARATE job.
+GATE_CONTINUE_ON_ERROR_RE = re.compile(r"(?m)^\s*continue-on-error:\s*(\S.*?)\s*$")
+# The success-conditioned dependency expression. Required only on a gated job that ALSO carries a
+# job-level `if:` — an `if:` containing always() cancels the implicit needs-must-succeed gate, so
+# the dependency has to be re-stated explicitly. Whitespace-tolerant; either quote style.
+GATE_SUCCESS_RE = re.compile(
+    r"needs\s*\.\s*" + GATE_GUARD_JOB + r"\s*\.\s*result\s*==\s*['\"]success['\"]")
+GATE_NEEDS_RE = re.compile(r"(?m)^    needs:\s*(.*)$")
+GATE_IF_RE = re.compile(r"(?m)^    if:\s*(.*)$")
+
+
+def job_continue_on_error(body_lines):
+    """Pure: the truthy/unprovable `continue-on-error:` values inside one job body (job level or
+    step level), as a sorted list of the raw value strings. `false` is the only value treated as
+    safe: an `${{ ... }}` expression cannot be statically proven false, so it counts as an escape
+    (fail closed). Comment tails are stripped first, so the prose ABOVE this job explaining why
+    there is no continue-on-error never registers as one."""
+    escapes = []
+    for line in body_lines:
+        if line.lstrip().startswith("#"):
+            continue
+        code = line.split(" #", 1)[0]
+        for value in GATE_CONTINUE_ON_ERROR_RE.findall(code):
+            if value.strip().strip("'\"").lower() != "false":
+                escapes.append(value.strip())
+    return sorted(escapes)
+
+
+def job_needs(body_lines):
+    """Pure: the job names in a job-level `needs:` — the inline flow-sequence/scalar forms
+    (`needs: a`, `needs: [a, b]`) and the block-sequence form (`needs:` then `- a`). Empty tuple
+    when the job declares no dependencies."""
+    for index, line in enumerate(body_lines):
+        match = GATE_NEEDS_RE.match(line.split(" #", 1)[0].rstrip())
+        if not match:
+            continue
+        inline = match.group(1).strip()
+        if inline:
+            return tuple(sorted(name for name in re.split(r"[\[\],\s]+", inline) if name))
+        names = []
+        for follow in body_lines[index + 1:]:
+            code = follow.split(" #", 1)[0].rstrip()
+            if not code:
+                continue
+            if not code.startswith("      - "):
+                break
+            names.append(code[len("      - "):].strip())
+        return tuple(sorted(name for name in names if name))
+    return ()
+
+
+def job_if_expression(body_lines):
+    """Pure: the job-level `if:` expression text, or None when the job carries none."""
+    for line in body_lines:
+        match = GATE_IF_RE.match(line.split(" #", 1)[0].rstrip())
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def guard_gate_verdict(workflow_text):
+    """Pure: (ok, reason). Prove the secret-exfil guard actually GATES the privileged jobs in
+    dispatch.yml — the assertion issue #618 was opened for, and the one no pre-existing check
+    made. Three properties, each fail-closed:
+
+      (1) the guard job EXISTS and carries NO truthy `continue-on-error` at the job or step
+          level. This is the whole defect: job-level continue-on-error does not merely keep the
+          RUN green, it makes the job resolve as SUCCESS for dependency purposes, so a plain
+          `needs: secrets-guard` AND a `needs.secrets-guard.result == 'success'` expression are
+          BOTH satisfied by a guard that failed. Measured on run 30141528651 — GUARD conclusion
+          `failure`, CLAIM ran, ALERT ran (its `if` is the result-conditioned form), run
+          conclusion `success`. So no downstream expression can substitute for this property;
+      (2) EVERY secret-consuming job in the file (derived by secret_consuming_jobs, not a
+          hand-maintained list, so a newly added secret-bearing job cannot land ungated) other
+          than the guard itself declares `needs: secrets-guard`;
+      (3) a gated job that ALSO carries a job-level `if:` must re-state the dependency as
+          `needs.secrets-guard.result == 'success'` — an `if` containing always() cancels the
+          implicit needs-must-succeed gate, which is exactly why plan-alert carries that
+          expression while claim needs no `if` at all.
+
+    Zero derived consumers, an unparseable jobs block, or a missing guard job is a refusal: a
+    check that proves nothing must not read as a pass."""
+    jobs = workflow_jobs(workflow_text)
+    if jobs is None:
+        return False, "cannot locate a `jobs:` block in dispatch.yml (fail closed)"
+    guard_body = jobs.get(GATE_GUARD_JOB)
+    if guard_body is None:
+        return False, (f"dispatch.yml has no `{GATE_GUARD_JOB}` job — the secret-exfil settings "
+                       "check is GONE, not merely ungated (fail closed)")
+    escapes = job_continue_on_error(guard_body)
+    if escapes:
+        return False, (
+            f"`{GATE_GUARD_JOB}` carries continue-on-error: {', '.join(escapes)} — a failed guard "
+            "then resolves as SUCCESS for dependency purposes, so every downstream `needs:` and "
+            "`needs." + GATE_GUARD_JOB + ".result == 'success'` gate passes while the secret-exfil "
+            "settings are UNVERIFIED (issue #618: the control is fail-OPEN). Put any non-blocking "
+            "diagnostic in a separate advisory job instead")
+    consuming = secret_consuming_jobs({"dispatch.yml": workflow_text})
+    if consuming is None:
+        return False, "cannot derive dispatch.yml's secret-consuming jobs (fail closed)"
+    gated = sorted(job for (_, job) in consuming if job != GATE_GUARD_JOB)
+    if not gated:
+        return False, ("derived ZERO secret-consuming jobs to gate in dispatch.yml — the scan "
+                       "proves nothing (fail closed: the parser or the file shape has drifted)")
+    for job_name in gated:
+        body = jobs.get(job_name)
+        if body is None:
+            return False, f"derived job {job_name} is not in the parsed jobs map (fail closed)"
+        if GATE_GUARD_JOB not in job_needs(body):
+            return False, (f"privileged job `{job_name}` consumes secrets but does not declare "
+                           f"`needs: {GATE_GUARD_JOB}` — it would launch with the secret-exfil "
+                           "settings unverified")
+        condition = job_if_expression(body)
+        if condition is not None and not GATE_SUCCESS_RE.search(condition):
+            return False, (
+                f"privileged job `{job_name}` carries a job-level `if:` ({condition!r}) that does "
+                f"not require `needs.{GATE_GUARD_JOB}.result == 'success'` — an `if` expression "
+                "containing always() overrides the implicit needs-must-succeed gate, so the job "
+                "would run on a failed guard")
+    return True, "ok"
+
+
+# Every repository file the --self-test path READS from the live checkout. The guard job in
+# dispatch.yml runs this same self-test under a SPARSE checkout, so a live input missing from that
+# job's sparse-checkout list does not fail loudly — it lands in an except branch and degrades the
+# check that needed it. That is issue #618 defect 2 verbatim: #528 added the trust-surface
+# assertions (reading scripts/worker-pr.py + policy/repos.toml) without extending the list, the
+# surface derivation resolved EMPTY, and the guard reported all 22 privileged scripts — itself
+# included — as outside the trust surface, on every tick, for 62 hours, invisibly. This constant
+# plus sparse_checkout_covers_verdict close that class: add a live input here and the guard goes
+# red until dispatch.yml's sparse-checkout list covers it.
+SELF_TEST_LIVE_INPUTS = (
+    "scripts/dispatch-secrets-guard.py",
+    "scripts/worker-live.sh",
+    "scripts/worker-pr.py",
+    "policy/repos.toml",
+    ".github/workflows/dispatch.yml",
+    ".github/workflows/set-up-account.yml",
+)
+
+
+def sparse_checkout_paths(workflow_text, job_name):
+    """Pure: the literal `sparse-checkout: |` block entries inside one job of `workflow_text`, or
+    None when the job or the block cannot be located (callers treat None as a failure — fail
+    closed). Same narrow, dependency-free line-parser discipline as workflow_guard_permissions."""
+    jobs = workflow_jobs(workflow_text)
+    if jobs is None:
+        return None
+    body = jobs.get(job_name)
+    if body is None:
+        return None
+    for index, line in enumerate(body):
+        if line.split("#", 1)[0].rstrip() != "          sparse-checkout: |":
+            continue
+        entries = []
+        for follow in body[index + 1:]:
+            if not follow.strip():
+                continue
+            if not follow.startswith("            "):
+                break
+            entry = follow.strip()
+            if entry.startswith("#"):
+                continue
+            entries.append(entry)
+        return tuple(entries) or None
+    return None
+
+
+def sparse_checkout_covers_verdict(workflow_text, job_name, required_paths):
+    """Pure: (ok, reason). Every path in `required_paths` must be checked out by `job_name`'s
+    sparse-checkout list — matched exactly or by a directory-prefix entry. An unlocatable block is
+    a refusal (fail closed): the self-test's live checks silently degrade without those files."""
+    entries = sparse_checkout_paths(workflow_text, job_name)
+    if entries is None:
+        return False, (f"cannot locate {job_name}'s `sparse-checkout: |` block in dispatch.yml "
+                       "(fail closed — the self-test's live inputs cannot be proven present)")
+    normalized = tuple(entry.replace("\\", "/").lstrip("./") for entry in entries)
+    missing = []
+    for path in required_paths:
+        target = path.replace("\\", "/").lstrip("./")
+        if not any(target.startswith(entry) if entry.endswith("/") else target == entry
+                   for entry in normalized):
+            missing.append(path)
+    if missing:
+        return False, (
+            "self-test live input(s) absent from " + job_name + "'s sparse checkout: "
+            + ", ".join(sorted(missing)) + " — the check that reads each one would degrade to "
+            "vacuous (or to a MISLEADING verdict) on every dispatch tick while passing in the "
+            "full-checkout pr-gate; add them to the sparse-checkout list")
+    return True, "ok"
+
+
+def trust_surface_from_worker_pr(source_text):
+    """Pure: worker-pr.py's DEFAULT_TRUST_SURFACE_PATHS as a tuple, via `ast` — the module is
+    PARSED, never imported, so the guard job never executes 7.6k lines of privileged script to
+    read one constant. Raises ValueError when the constant is absent or is not a literal
+    sequence of strings (callers surface that as a refusal — a surface that cannot be read must
+    never resolve to the empty tuple, which would mark every privileged script uncovered)."""
+    import ast
+
+    tree = ast.parse(source_text)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "DEFAULT_TRUST_SURFACE_PATHS":
+                value = ast.literal_eval(node.value)
+                if not isinstance(value, (tuple, list)) or not value:
+                    raise ValueError("DEFAULT_TRUST_SURFACE_PATHS is empty or not a sequence")
+                if not all(isinstance(item, str) and item.strip() for item in value):
+                    raise ValueError("DEFAULT_TRUST_SURFACE_PATHS holds a non-string entry")
+                return tuple(value)
+    raise ValueError("DEFAULT_TRUST_SURFACE_PATHS not found in worker-pr.py")
 
 
 # The slot-allocation listings set-up-account.yml's store step MUST union BEFORE creating the
@@ -653,6 +902,15 @@ def privileged_script_coverage_verdict(workflow_docs, surface_paths):
     an unreadable jobs block, or one uncovered script fails closed."""
     surfaces = tuple(path.strip().replace("\\", "/").lstrip("./")
                      for path in surface_paths if isinstance(path, str) and path.strip())
+    # An EMPTY surface must refuse HERE, naming the derivation (issue #618 defect 2). Falling
+    # through with no surfaces marks every derived script uncovered, which reads as "22 privileged
+    # scripts escaped the human-arm policy" — a security-policy verdict — when the real fault is
+    # that the surface could not be READ at all. The misdiagnosis cost is the whole point: the
+    # emitted list even contained this guard script itself.
+    if not surfaces:
+        return False, ("the human-arm trust surface derived EMPTY — this is a DERIVATION failure "
+                       "(unreadable worker-pr.py / policy/repos.toml, or a moved key), NOT a "
+                       "finding about the scripts; fix the derivation (fail closed)")
     privileged = set()
     for filename, document in sorted(workflow_docs.items()):
         jobs = workflow_jobs(document)
@@ -779,7 +1037,12 @@ def _self_test():
         nonlocal ok
         good = got == want
         ok = ok and good
-        print(f"  {'ok  ' if good else 'FAIL'} {name}: {got} (want {want})")
+        # repr(), NOT str(): a `got`/`want` holding an embedded newline (the comment-stripper
+        # checks do) used to print across several lines, and the orphan fragments
+        # (`tail  (want keep "a # b"`) were read as a THIRD failing assertion when issue #618 was
+        # triaged from the run log — a phantom, since the check passed. One line per check keeps
+        # log-scraped failure counts honest.
+        print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
 
     # Pure workflow-permission extraction — accept AND reject directions on synthetic text.
     sample = "\n".join([
@@ -1141,28 +1404,168 @@ def _self_test():
         privileged_script_coverage_verdict(
             {"plain.yml": "jobs:\n  lint:\n    steps:\n      - run: python3 scripts/lint.py"},
             ("scripts/",))[0], False)
+    # Issue #618 defect 2: an EMPTY surface is a DERIVATION failure, and it must say so instead of
+    # emitting a list of "uncovered" scripts that reads as a policy finding.
+    empty_surface = privileged_script_coverage_verdict(privileged_fixture, ())
+    chk("privileged-script coverage: an EMPTY surface names the DERIVATION, not the scripts",
+        (empty_surface[0], "DERIVATION failure" in empty_surface[1],
+         "scripts/probe.sh" in empty_surface[1]),
+        (False, True, False))
+
+    # The human-arm trust surface, derived from the TWO live sources (issue #166: the policy list
+    # is a per-target EXTENSION unioned onto worker-pr.py's mandatory floor). #528 wrapped this in
+    # a broad `except (OSError, KeyError, TypeError, AttributeError, ImportError)` that fell back
+    # to EMPTY tuples — so on the guard job's sparse checkout, where neither file is present, both
+    # assertions below turned into a 22-script "outside the trust surface" verdict rather than a
+    # readable "these inputs are missing". The failure reason is now CAPTURED and asserted on its
+    # own, so a derivation fault can never again be mistaken for a policy gap.
+    import tomllib
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    derivation_error = None
+    policy_surfaces = ()
+    default_surfaces = ()
     try:
-        import importlib.util
-        import tomllib
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-        worker_pr_path = os.path.join(repo_root, "scripts", "worker-pr.py")
-        spec = importlib.util.spec_from_file_location("guard_worker_pr", worker_pr_path)
-        worker_pr = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(worker_pr)
+        with open(os.path.join(repo_root, "scripts", "worker-pr.py"), encoding="utf-8") as handle:
+            default_surfaces = trust_surface_from_worker_pr(handle.read())
         with open(os.path.join(repo_root, "policy", "repos.toml"), "rb") as handle:
             policy_doc = tomllib.load(handle)
-        policy_surfaces = policy_doc["repos"]["jeswr/agent-account-registry"]["readiness"][
-            "security_paths"]
-        default_surfaces = worker_pr.DEFAULT_TRUST_SURFACE_PATHS
-    except (OSError, KeyError, TypeError, AttributeError, ImportError):
-        policy_surfaces = ()
-        default_surfaces = ()
+        policy_surfaces = tuple(policy_doc["repos"]["jeswr/agent-account-registry"]["readiness"][
+            "security_paths"])
+        if not policy_surfaces:
+            raise ValueError("policy/repos.toml readiness.security_paths is empty")
+    except (OSError, KeyError, TypeError, AttributeError, ValueError,
+            SyntaxError, tomllib.TOMLDecodeError) as error:
+        derivation_error = f"{type(error).__name__}: {error}"
+    chk("trust surface: BOTH live sources (worker-pr.py DEFAULT_TRUST_SURFACE_PATHS + "
+        "policy/repos.toml security_paths) are readable here — a derivation fault must name "
+        "ITSELF, never surface as a 22-script policy finding (issue #618)",
+        derivation_error, None)
     chk("workflow: every script run with secrets or write permission is covered by the "
         "worker-pr mandatory human-arm floor",
         privileged_script_coverage_verdict(live_docs, default_surfaces), (True, "ok"))
     chk("workflow: every script run with secrets or write permission is covered by the registry "
         "policy human-arm surface",
         privileged_script_coverage_verdict(live_docs, policy_surfaces), (True, "ok"))
+
+    # ---- the GATE: a FAILING guard must PREVENT the privileged jobs from running (issue #618) --
+    # The pre-existing suite passed in full while the control was fail-OPEN, so every assertion
+    # here is on dispatch.yml's WIRING. Synthetic accept + reject directions first, then LIVE.
+    gate_ok_sample = "\n".join([
+        "jobs:",
+        "  plan:",
+        "    runs-on: ubuntu-latest",
+        "  secrets-guard:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: python3 scripts/dispatch-secrets-guard.py",
+        "        env:",
+        "          ALL_SECRETS: ${{ toJSON(secrets) }}",
+        "  claim:",
+        "    needs: [plan, secrets-guard]",
+        "    environment: dispatch-secrets",
+        "    steps:",
+        "      - run: true",
+        "        env:",
+        "          TOKEN: ${{ secrets.ALERT_TOKEN }}",
+        "  plan-alert:",
+        "    needs: [plan, secrets-guard]",
+        "    if: ${{ always() && needs.secrets-guard.result == 'success' }}",
+        "    environment: dispatch-secrets",
+        "    steps:",
+        "      - run: true",
+        "        env:",
+        "          TOKEN: ${{ secrets.ALERT_TOKEN }}",
+    ])
+    chk("GATE: plain `needs` on a guard with no continue-on-error, plus an always()-job that "
+        "re-states the success condition -> ok",
+        guard_gate_verdict(gate_ok_sample), (True, "ok"))
+    # THE defect, exactly as it shipped: the guard job is continue-on-error, so its failure
+    # resolves as SUCCESS for dependents and BOTH downstream idioms pass anyway.
+    gate_coe = gate_ok_sample.replace(
+        "  secrets-guard:\n    runs-on:", "  secrets-guard:\n    continue-on-error: true\n"
+        "    runs-on:")
+    verdict_coe = guard_gate_verdict(gate_coe)
+    chk("GATE: job-level `continue-on-error: true` on the guard -> REFUSE (the shipped fail-open "
+        "defect; a success-conditioned downstream expression does NOT rescue it)",
+        (verdict_coe[0], "continue-on-error" in verdict_coe[1]), (False, True))
+    chk("GATE: `continue-on-error: ${{ ... }}` on the guard -> REFUSE (an expression cannot be "
+        "statically proven false, so it counts as an escape)",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "  secrets-guard:\n    runs-on:",
+            "  secrets-guard:\n    continue-on-error: ${{ github.event_name == 'schedule' }}\n"
+            "    runs-on:"))[0], False)
+    chk("GATE: `continue-on-error: false` on the guard -> still ok (explicitly not an escape)",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "  secrets-guard:\n    runs-on:",
+            "  secrets-guard:\n    continue-on-error: false\n    runs-on:")), (True, "ok"))
+    chk("GATE: STEP-level continue-on-error inside the guard -> REFUSE (the verification step "
+        "goes red while the job reports green)",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "      - run: python3 scripts/dispatch-secrets-guard.py",
+            "      - run: python3 scripts/dispatch-secrets-guard.py\n"
+            "        continue-on-error: true"))[0], False)
+    chk("GATE: a comment mentioning continue-on-error is not one",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "  secrets-guard:\n", "  secrets-guard:\n    # NO continue-on-error: true here\n")),
+        (True, "ok"))
+    verdict_unneeded = guard_gate_verdict(
+        gate_ok_sample.replace("  claim:\n    needs: [plan, secrets-guard]", "  claim:\n"
+                               "    needs: [plan]"))
+    chk("GATE: privileged `claim` without `needs: secrets-guard` -> REFUSE, job NAMED",
+        (verdict_unneeded[0], "claim" in verdict_unneeded[1]), (False, True))
+    chk("GATE: block-sequence `needs:` form is understood (no false refusal)",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "  claim:\n    needs: [plan, secrets-guard]",
+            "  claim:\n    needs:\n      - plan\n      - secrets-guard")), (True, "ok"))
+    chk("GATE: an `if: always()` job that drops the success condition -> REFUSE (always() "
+        "overrides the implicit needs-must-succeed gate)",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "    if: ${{ always() && needs.secrets-guard.result == 'success' }}",
+            "    if: ${{ always() }}"))[0], False)
+    chk("GATE: guard job deleted outright -> REFUSE (the check is GONE, not merely ungated)",
+        guard_gate_verdict("\n".join([
+            "jobs:",
+            "  claim:",
+            "    steps:",
+            "      - run: true",
+            "        env:",
+            "          TOKEN: ${{ secrets.ALERT_TOKEN }}"]))[0], False)
+    chk("GATE: zero derived secret consumers -> REFUSE (a gate check that proves nothing)",
+        guard_gate_verdict("\n".join([
+            "jobs:",
+            "  secrets-guard:",
+            "    steps:",
+            "      - run: python3 scripts/dispatch-secrets-guard.py",
+            "        env:",
+            "          ALL_SECRETS: ${{ toJSON(secrets) }}"]))[0], False)
+    chk("GATE: unparseable jobs block -> REFUSE",
+        guard_gate_verdict("name: no jobs key here")[0], False)
+    # LIVE: dispatch.yml itself. This is the assertion that would have caught issue #618 on the
+    # day the continue-on-error line landed, and it goes red the moment it comes back.
+    chk("GATE (LIVE): dispatch.yml's guard carries no continue-on-error and every "
+        "secret-consuming job in the file is gated on it",
+        guard_gate_verdict(live_docs.get("dispatch.yml", "")), (True, "ok"))
+    # LIVE: the guard job's sparse checkout must carry every file this self-test reads, so no
+    # check can degrade to vacuous (or misleading) on a dispatch tick while passing in pr-gate.
+    chk("GATE (LIVE): the guard job's sparse checkout covers every self-test live input",
+        sparse_checkout_covers_verdict(
+            live_docs.get("dispatch.yml", ""), "secrets-guard", SELF_TEST_LIVE_INPUTS),
+        (True, "ok"))
+    missing_input = sparse_checkout_covers_verdict(
+        live_docs.get("dispatch.yml", ""), "secrets-guard",
+        SELF_TEST_LIVE_INPUTS + ("policy/never-checked-out.toml",))
+    chk("sparse checkout: a live input absent from the list -> REFUSE, path NAMED",
+        (missing_input[0], "policy/never-checked-out.toml" in missing_input[1]), (False, True))
+    chk("sparse checkout: an unlocatable block -> REFUSE (fail closed)",
+        sparse_checkout_covers_verdict(
+            "jobs:\n  secrets-guard:\n    steps:\n      - uses: actions/checkout@v4\n",
+            "secrets-guard", ("scripts/worker-pr.py",))[0], False)
+    chk("sparse checkout: a directory entry covers files beneath it",
+        sparse_checkout_covers_verdict(
+            "\n".join(["jobs:", "  secrets-guard:", "    steps:", "      - uses: checkout",
+                       "        with:", "          sparse-checkout: |",
+                       "            .github/workflows/", "          x: y"]),
+            "secrets-guard", (".github/workflows/dispatch.yml",)), (True, "ok"))
 
     # Round 19: the ONE shared quote-aware comment stripper, tested directly — every shell-text
     # check strips through it before matching.
