@@ -52,6 +52,19 @@ OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
 
+# Usage-probe outcome sidecar (issue #219). dashboard.yml's secret-materialization and probe steps
+# are `continue-on-error`, and a failed probe used to be replaced by `{}` — indistinguishable from
+# "every account is idle". The probe job now PERSISTS its outcome next to the snapshot and the
+# build hands it in via --usage-status; anything that is not an explicit, FRESH `ok` means the
+# measurement did not happen, so no account may be published as usable capacity on its basis.
+PROBE_SCHEMA = "account-usage-probe/v1"
+# The probe runs on dashboard.yml's */15 cron; one hour is four missed slots. Beyond it the
+# snapshot describes a fleet state nobody has observed recently, so it stops counting as measured.
+PROBE_MAX_AGE_SECONDS = 3600
+# Runner/generator clock skew is seconds, not minutes; a stamp further in the future than this is
+# not a clock artifact but a bogus stamp, and bogus == unmeasured.
+PROBE_MAX_SKEW_SECONDS = 300
+
 
 class DashboardError(RuntimeError):
     pass
@@ -246,8 +259,14 @@ def _percent(value):
 def _availability(account, usage_entry):
     if not account["catalog_available"]:
         return "unavailable"
-    if not isinstance(usage_entry, dict):
-        return "available"
+    if not isinstance(usage_entry, dict) or not usage_entry:
+        # NO measurement exists for this account (issue #219). account-usage.py fail-closed OMITS an
+        # account whose token is missing or whose probe failed, and a wholly failed probe publishes
+        # an EMPTY map — so this branch is exactly the "measurement did not happen" case. It used to
+        # return "available", which is why a failed probe rendered the entire catalog as fresh
+        # usable capacity. Dispatch (select-and-claim.usage_eligible) treats the omission as
+        # INELIGIBLE, so the honest public label is "unknown", never "available".
+        return "unknown"
     status = str(usage_entry.get("status") or "").strip().lower()
     if status not in {"", "allowed"}:
         return "unavailable"
@@ -308,12 +327,14 @@ def _backoff_epoch(value):
 
 
 def _quota_state(account, entry, now):
-    """Availability for the CUMULATIVE provider view: the per-account trichotomy from
-    _availability, except that (a) a catalog-available account with NO usage entry — the probe
-    fail-closed OMITS an account whose token is missing or whose probe failed — is "unknown":
-    dispatch (select-and-claim.usage_eligible) and usage-alert treat that omission as
-    UNAVAILABLE, so counting it free here would advertise quota the allocator will never use
-    (sol finding 2, PR #281 fix round); (b) a probe-exempt account under an ACTIVE reactive
+    """Availability for the CUMULATIVE provider view AND (since issue #219) for the per-account
+    cards + `fleet.capacity.eligible`, so one predicate decides every "is this capacity usable"
+    claim on the public page: the per-account state from _availability — where (a) a
+    catalog-available account with NO usage entry is already "unknown", because the probe
+    fail-closed OMITS an account whose token is missing or whose probe failed and dispatch
+    (select-and-claim.usage_eligible) plus usage-alert treat that omission as UNAVAILABLE, so
+    counting it free would advertise quota the allocator will never use (sol finding 2, PR #281
+    fix round) — refined so that (b) a probe-exempt account under an ACTIVE reactive
     backoff (its only quota signal — issue #29) counts as capped until the backoff expires,
     with the stamp parsed by the allocator's shared `_backoff_epoch` semantics; and (c) a
     non-exempt account counts "available" only with BOTH mandatory windows (5h AND 7d) validly
@@ -323,11 +344,14 @@ def _quota_state(account, entry, now):
     rendering it free would again advertise quota the allocator will never use (sol finding 1,
     PR #281 fix round 3); partial ⇒ "unknown". Returns (state, backoff_epoch_or_None).
     Pure — unit-tested by --self-test."""
+    if not isinstance(entry, dict) or not entry:
+        # No measurement at all. _availability already answers "unknown"/"unavailable" here; the
+        # restatement keeps this function TOTAL (every dict access below is unreachable on a
+        # non-dict) rather than resting on a caller-invisible coupling to that branch.
+        return _availability(account, entry), None
     availability = _availability(account, entry)
     if availability != "available":
         return availability, None
-    if not isinstance(entry, dict) or not entry:
-        return "unknown", None
     if entry.get("exempt") is True:
         until = _backoff_epoch(entry.get("backoff_until"))
         if until is not None and until > now:
@@ -473,6 +497,46 @@ def _provider_quota(accounts, usage, now):
             "oldest_reset": max(provider_resets, default=None),
         })
     return rows
+
+
+def _probe_epoch(value):
+    """`value` as a UTC epoch second, reusing _utc_iso's tolerant epoch/ISO parsing, or None."""
+    iso = _utc_iso(value)
+    if iso is None:
+        return None
+    return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _probe_outcome(document, now):
+    """Normalize the probe job's persisted outcome sidecar, FAIL-CLOSED (issue #219).
+
+    `measured` is True ONLY for an explicit, correctly-schema'd `ok` outcome with a fresh
+    attempt stamp. Every other shape — a `failed` outcome, an absent/empty/alien document, an
+    unparseable or missing stamp, a stamp older than PROBE_MAX_AGE_SECONDS or implausibly far in
+    the future — is "we did not measure", and build_dashboard then refuses to publish ANY account
+    as usable capacity on the strength of a snapshot nobody produced. Pure — unit-tested by
+    --self-test. Callers pass `None` to say "no sidecar was supplied at all"; anything else,
+    including `{}`, is a supplied-but-unusable sidecar and degrades."""
+    outcome, detail, attempted = "unknown", "probe outcome was not persisted", None
+    if isinstance(document, dict) and document.get("schema") == PROBE_SCHEMA:
+        raw = str(document.get("outcome") or "").strip().lower()
+        outcome = raw if raw in {"ok", "failed"} else "unknown"
+        # `detail` reaches the PUBLIC page and arrives from another job's artifact, so it is held
+        # to the same bounded safe-token shape this generator uses for every externally-sourced
+        # label — never published as free text.
+        text = str(document.get("detail") or "").strip()
+        detail = text if OBS_TOKEN_RE.fullmatch(text) else ""
+        attempted = _probe_epoch(document.get("attempted_at"))
+    age = int(now - attempted) if attempted is not None else None
+    stale = age is None or age > PROBE_MAX_AGE_SECONDS or age < -PROBE_MAX_SKEW_SECONDS
+    return {
+        "outcome": outcome,
+        "detail": detail,
+        "attempted_at": _utc_iso(attempted),
+        "age_seconds": age,
+        "stale": stale,
+        "measured": outcome == "ok" and not stale,
+    }
 
 
 def _parse_dispatch_log(log_text):
@@ -942,7 +1006,7 @@ def _normalize_observability(document):
 
 
 def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
-                    observability=None):
+                    observability=None, probe_status=None):
     accounts, private_values = _catalog(issues)
     handles = [account["handle"] for account in accounts]
     labels = _salted_labels(handles, salt)
@@ -956,11 +1020,23 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
     # the private catalog/usage inputs and remain in the privacy deny-set.
     private_values.update(str(handle) for handle in usage)
 
+    # Issue #219: a snapshot the probe did not actually produce is not evidence of anything. When
+    # the persisted outcome is not a fresh `ok`, the usage map is DISCARDED for every rendering
+    # decision — accounts, per-provider aggregates and eligible capacity all fall back to
+    # "unknown" — rather than being published as fresh available capacity. `probe` is None only
+    # when the caller supplied no sidecar at all, in which case the usage map is taken at face
+    # value (and an absent measurement is still "unknown" via _availability).
+    probe = _probe_outcome(probe_status, now) if probe_status is not None else None
+    measured = probe is None or probe["measured"]
+    usage_rendered = usage if measured else {}
+
     rows = []
     capacity = {}
     for account in accounts:
-        entry = usage.get(account["handle"])
-        availability = _availability(account, entry)
+        entry = usage_rendered.get(account["handle"])
+        # ONE predicate for the card badge, the provider row and eligible capacity: an account is
+        # counted eligible only where the allocator would also admit it.
+        availability, _backoff_until = _quota_state(account, entry, now)
         provider_capacity = capacity.setdefault(
             account["provider"], {"eligible": 0, "total": 0})
         provider_capacity["total"] += 1
@@ -986,7 +1062,7 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         "accounts": rows,
         # Cumulative per-provider headroom (maintainer request 2026-07-18) — rendered by the
         # dashboard's "Provider quota (cumulative)" section, above the per-account cards.
-        "provider_quota": _provider_quota(accounts, usage, now),
+        "provider_quota": _provider_quota(accounts, usage_rendered, now),
         "fleet": {
             "active_agents": len(live),
             "capacity": capacity,
@@ -996,6 +1072,10 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         "active_by_repository": _repository_activity(live),
         "model_health": _normalize_model_health(model_health),
     }
+    if probe is not None:
+        # Degradation marker (issue #219): the page renders probe age + failure so a stale or
+        # failed measurement is visible instead of silently looking like a fresh, idle fleet.
+        document["usage_probe"] = probe
     observability = _normalize_observability(observability)
     if observability is not None:
         # Optional key (absent => the dashboard hides the Observability panels), placed INSIDE the
@@ -1423,6 +1503,109 @@ def _self_test():
            for row in ordered["provider_quota"]],
           [("anthropic", 3, False), ("future-provider", 1, True), ("openai", 1, True)])
 
+    # --- usage-probe outcome (issue #219): dashboard.yml's secret-materialization + probe steps
+    # are continue-on-error and a failed probe was replaced by `{}`, so precisely WHEN measurement
+    # failed the public page showed every catalog-available account as fresh usable capacity. Every
+    # case below feeds the IDENTICAL complete usage entry and varies only the persisted outcome —
+    # so the accept path (fresh `ok` still publishes real capacity) and each reject path (failed /
+    # stale / unstamped / alien / absent sidecar) are both non-vacuous: dropping the gate turns the
+    # reject rows red, over-rejecting turns the accept row red. ------------------------------------
+    fresh_probe = {"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                   "attempted_at": now - 30}
+    failed_probe = {"schema": PROBE_SCHEMA, "outcome": "failed",
+                    "detail": "secret-materialization-failed", "attempted_at": now - 30}
+    stale_probe = {"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                   "attempted_at": now - PROBE_MAX_AGE_SECONDS - 1}
+
+    def probe_view(status):
+        built = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                                probe_status=status)
+        return (built["accounts"][0]["availability"], built["fleet"]["capacity"],
+                built["provider_quota"][0]["accounts_available"],
+                built["provider_quota"][0]["accounts_unknown"],
+                (built.get("usage_probe") or {}).get("measured"))
+
+    check("fresh ok probe: a real measurement still publishes real capacity",
+          probe_view(fresh_probe),
+          ("available", {"anthropic": {"eligible": 1, "total": 1}}, 1, 0, True))
+    for probe_name, probe_status in (
+            ("failed", failed_probe),
+            ("stale ok", stale_probe),
+            ("empty/absent sidecar", {}),
+            ("alien schema", {"schema": "wrong/v0", "outcome": "ok", "attempted_at": now}),
+            ("unstamped ok", {"schema": PROBE_SCHEMA, "outcome": "ok"}),
+            ("unknown outcome word", {"schema": PROBE_SCHEMA, "outcome": "maybe",
+                                      "attempted_at": now})):
+        check(f"{probe_name} probe: the SAME usage input is never published as capacity",
+              probe_view(probe_status),
+              ("unknown", {"anthropic": {"eligible": 0, "total": 1}}, 0, 1, False))
+    degraded = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                               probe_status=failed_probe)
+    check("failed probe publishes no window numbers or weekly reset from the dead snapshot",
+          [(row["weekly_reset_at"], [window["used_percent"] for window in row["windows"]])
+           for row in degraded["accounts"]],
+          [(None, [None, None])])
+    check("failed probe surfaces its outcome, detail and age on the public document",
+          degraded["usage_probe"],
+          {"outcome": "failed", "detail": "secret-materialization-failed",
+           "attempted_at": _utc_iso(now - 30), "age_seconds": 30, "stale": False,
+           "measured": False})
+    check("stale ok probe surfaces its age and stops counting as measured",
+          _probe_outcome(stale_probe, now),
+          {"outcome": "ok", "detail": "probe-succeeded",
+           "attempted_at": _utc_iso(now - PROBE_MAX_AGE_SECONDS - 1),
+           "age_seconds": PROBE_MAX_AGE_SECONDS + 1, "stale": True, "measured": False})
+    check("free-text probe detail is dropped, never published as-is on the public page",
+          _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "failed",
+                          "attempted_at": now, "detail": "token acct-fixture rejected"},
+                         now)["detail"], "")
+    check("probe age boundary: exactly at the limit is measured, one second past is not",
+          [_probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                           "attempted_at": now - probe_age}, now)["measured"]
+           for probe_age in (PROBE_MAX_AGE_SECONDS, PROBE_MAX_AGE_SECONDS + 1)],
+          [True, False])
+    check("future probe stamp: clock skew tolerated, an implausible stamp is not measured",
+          [_probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                           "attempted_at": now + skew}, now)["measured"]
+           for skew in (PROBE_MAX_SKEW_SECONDS, PROBE_MAX_SKEW_SECONDS + 1)],
+          [True, False])
+    check("no sidecar supplied at all: usage is taken at face value, no degradation key",
+          (build_dashboard(issues, leases, usage, history, None, now,
+                           "fixture-salt")["accounts"][0]["availability"],
+           "usage_probe" in got),
+          ("available", False))
+    # The core misreport (issue #219): a catalog-available account the probe never reported on used
+    # to render "available" and count toward eligible capacity. It is the allocator's INELIGIBLE
+    # shape, so it is "unknown" and eligible 0 — even with a perfectly healthy probe.
+    unreported = build_dashboard(issues, leases, {}, history, None, now, "fixture-salt",
+                                 probe_status=fresh_probe)
+    check("catalog-available account with NO probe entry is unknown and not eligible capacity",
+          (unreported["accounts"][0]["availability"], unreported["fleet"]["capacity"]),
+          ("unknown", {"anthropic": {"eligible": 0, "total": 1}}))
+    check("eligible capacity equals the provider row's free count (one shared predicate)",
+          [(row["provider"], row["accounts_available"]) for row in ordered["provider_quota"]],
+          [(provider, values["eligible"])
+           for provider, values in sorted(ordered["fleet"]["capacity"].items())])
+    with tempfile.TemporaryDirectory() as directory:
+        usage_file = Path(directory, "usage.json")
+        usage_file.write_text(json.dumps(usage), encoding="utf-8")
+        leases_file = Path(directory, "leases.json")
+        leases_file.write_text(json.dumps(leases), encoding="utf-8")
+        health_file = Path(directory, "model-health.json")
+        health_file.write_text(json.dumps({"records": []}), encoding="utf-8")
+        try:
+            main(["--leases", str(leases_file), "--model-health", str(health_file),
+                  "--usage", str(usage_file)])
+        except DashboardError as exc:
+            # Assert on the MESSAGE, not merely that something raised: main() has several later
+            # fail-closed exits (no REGISTRY_REPO, gh unavailable) that would make a bare
+            # "did it raise" assertion pass with the coupling deleted — i.e. vacuous.
+            status_required = "--usage-status" in str(exc)
+        else:
+            status_required = False
+        check("a usage snapshot without --usage-status is refused (the #219 caller coupling)",
+              status_required, True)
+
     health = _normalize_model_health({
         "generated_at": now,
         "models": [{"model": "fable", "provider": "anthropic", "status": "ok"}],
@@ -1594,6 +1777,9 @@ def main(argv=None):
     parser.add_argument("--leases")
     parser.add_argument("--issues-file")
     parser.add_argument("--usage")
+    # The probe job's persisted outcome sidecar (issue #219). REQUIRED whenever a usage snapshot is
+    # in play: without it a failed probe's `{}` is indistinguishable from an idle fleet.
+    parser.add_argument("--usage-status")
     parser.add_argument("--model-health")
     # Optional: the collector's observability snapshot from a `ledger`-branch checkout (issue
     # #246). Absent file => the Observability panels stay hidden; a present-but-invalid document
@@ -1612,6 +1798,16 @@ def main(argv=None):
             "see data/README.md)")
     if not 1 <= args.history <= 20:
         raise DashboardError("--history must be between 1 and 20")
+    usage_path = _optional_usage_path(args.usage)
+    if usage_path and not args.usage_status:
+        # Fail-closed coupling (issue #219): dropping --usage-status from the caller would restore
+        # exactly the bug — a FAILED probe's empty/partial snapshot published as fresh capacity
+        # with no degradation marker — so a usage snapshot without its outcome sidecar is refused
+        # rather than rendered on trust.
+        raise DashboardError(
+            "--usage-status is required alongside a usage snapshot (issue #219): without the "
+            "probe's persisted outcome a failed measurement is indistinguishable from an idle "
+            "fleet, and every catalog-available account would be published as fresh capacity")
     repo = os.environ.get("REGISTRY_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
     if args.issues_file:
         try:
@@ -1622,13 +1818,25 @@ def main(argv=None):
     else:
         issues = _fetch_issues(repo)
     leases = _read_json(args.leases, required=True)
-    usage = _read_json(_optional_usage_path(args.usage), default={})
+    usage = _read_json(usage_path, default={})
+    probe_status = None
+    if args.usage_status:
+        try:
+            # A missing or malformed sidecar degrades to the "unknown" outcome (`{}` is a supplied
+            # -but-unusable document, NOT the None "no sidecar" case) instead of taking the whole
+            # public page down over one unreadable status file.
+            probe_status = _read_json(args.usage_status, default={})
+        except DashboardError:
+            probe_status = {}
+        if not isinstance(probe_status, dict):
+            probe_status = {}
     model_health = _read_json(args.model_health, default=None)
     observability = _read_json(args.observability, default=None)
     history = _fetch_dispatch_history(repo, args.history)
     document = build_dashboard(
         issues, leases, usage, history, model_health, int(time.time()),
-        os.environ.get("PROVENANCE_SALT", ""), observability=observability)
+        os.environ.get("PROVENANCE_SALT", ""), observability=observability,
+        probe_status=probe_status)
     _write_site(document, args.assets, args.site)
     # Public workflow log: never disclose the account count (issue #184; the codebase norm in
     # model-health.py — "the public workflow log never carries provider counts").
