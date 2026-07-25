@@ -1179,15 +1179,22 @@ def _parked_pr_snapshot(
     # Fail direction: unknown or malformed authorship SKIPS. The permissive answer here would be
     # to mutate a PR whose owner we could not establish, which is the wrong way round.
     #
-    # The test is EXACT OWNERSHIP against the resolved App login — not `type == "Bot"`. Cross-
-    # provider review of the first cut reproduced the difference: a `type == "Bot"` check admits
-    # `dependabot[bot]`, `copilot`, and every other third-party App, and the reviewer drove one
-    # through live revalidation to an actual `gh pr ready --undo` plus an audit comment. The
-    # obligation this guard encodes is "OUR OWN parked PRs", which is a single login, so a
-    # predicate over the whole set of bot-authored PRs is the wrong quantifier scope.
+    # Ownership is EXACT LOGIN **and** `type == "Bot"`, conjunctively. Two review rounds, two
+    # different halves:
     #
-    # An unresolved bot_login therefore admits NOTHING: with no established identity to compare
-    # against, every PR is somebody else's.
+    #   r1: `type == "Bot"` ALONE is not ownership — it admits `dependabot[bot]`, `copilot`,
+    #       and every third-party App, and the reviewer drove one through live revalidation to
+    #       a real `gh pr ready --undo` plus an audit comment. The obligation is "OUR OWN
+    #       parked PRs", a single login, so a predicate over the category is the wrong scope.
+    #   r2: replacing it with exact login ALONE dropped the type check entirely, so a payload
+    #       carrying our login with NO `type`, or with a contradictory `type: "User"`, was
+    #       admitted. The r1 "malformed authorship" fixture only ever exercised a FOREIGN
+    #       login, so it was rejected for the wrong reason and pinned nothing.
+    #
+    # Both conjuncts are load-bearing and each has its own test. A well-formed payload for our
+    # own App satisfies both; anything that fails either — unknown identity, absent type,
+    # contradictory type — is somebody else's PR as far as this guard is concerned, which is
+    # the direction that declines to mutate.
     if not bot_login:
         return None
     user = pull.get("user")
@@ -1195,6 +1202,8 @@ def _parked_pr_snapshot(
         return None
     login = user.get("login")
     if not isinstance(login, str) or login.casefold() != bot_login.casefold():
+        return None
+    if user.get("type") != "Bot":
         return None
     updated_at = pull.get("updated_at")
     updated = _epoch(updated_at, "parked pull request")
@@ -2778,9 +2787,13 @@ def _self_test() -> int:
         # selected on every sweep and every redraft came back
         # `Resource not accessible by integration (convertPullRequestToDraft)`.
         10: _defuse_pull(10, user={"login": "jeswr", "type": "User"}),
-        # Unknown/malformed authorship must fail toward NOT touching the PR.
+        # Unknown/malformed authorship must fail toward NOT touching the PR. These carry OUR
+        # OWN login on purpose: with a foreign login they would be rejected by the ownership
+        # conjunct and would pin nothing about `type` (exactly how the r1 version was vacuous).
         11: _defuse_pull(11, user=None),
-        12: _defuse_pull(12, user={"login": "someone"}),  # no `type` at all
+        12: _defuse_pull(12, user={"login": DEFUSE_BOT_LOGIN}),          # no `type` at all
+        20: _defuse_pull(20, user={"login": DEFUSE_BOT_LOGIN, "type": "User"}),   # contradictory
+        21: _defuse_pull(21, user={"login": DEFUSE_BOT_LOGIN, "type": ""}),       # empty type
         # A FOREIGN bot. `type == "Bot"` admitted these; cross-provider review drove
         # dependabot[bot] all the way through live revalidation to a real `gh pr ready --undo`
         # plus an audit comment. Ownership is a single login, not a category.
@@ -2844,8 +2857,10 @@ def _self_test() -> int:
         (True, False),
     )
     check(
-        "#3427: unknown or malformed authorship fails toward NOT mutating the PR",
-        {("owner/repo", number) in defuse_candidates for number in (11, 12)},
+        "#3427: unknown or malformed authorship fails toward NOT mutating the PR — asserted "
+        "with OUR OWN login, so it pins the `type` conjunct rather than the ownership one "
+        "(#659 review r2: the foreign-login version was rejected for the wrong reason)",
+        {("owner/repo", number) in defuse_candidates for number in (11, 12, 20, 21)},
         {False},
     )
     # The first cut of this guard tested `user.type == "Bot"`, which admits EVERY GitHub App.
