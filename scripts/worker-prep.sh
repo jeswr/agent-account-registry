@@ -91,7 +91,12 @@ except (OSError, json.JSONDecodeError) as exc:
     raise SystemExit(f"worker-prep: selected {provider} credential is not valid JSON: {exc}") from exc
 if not isinstance(credential, dict) or not credential:
     raise SystemExit(f"worker-prep: selected {provider} credential must be a non-empty JSON object")
-capability = broker.extract_access_token(provider, credential)
+# extract_access_token fails closed on a credential with no usable access token or no readable
+# expiry (#574). Die with the broker's reason — it names the field, never the credential value.
+try:
+    capability = broker.extract_access_token(provider, credential)
+except ValueError as exc:
+    raise SystemExit(f"worker-prep: selected {provider} credential is unusable: {exc}") from exc
 broker.assert_no_refresh_leak(capability)
 if not isinstance(capability.get("access_token"), str) or not capability["access_token"]:
     raise SystemExit(f"worker-prep: selected {provider} credential has no access token")
