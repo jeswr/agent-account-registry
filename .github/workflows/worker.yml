@@ -1055,7 +1055,22 @@ jobs:
         # pre-flight, before the model step exists. Provider refresh tokens are one-time-use, so
         # dropping this step because the model never launched would strand a consumed grant in the
         # secret and kill the NEXT run on this account.
-        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' }}
+        #
+        # NO PREPARE-STEP GUARD EITHER (retro-review of #614). `steps.prepare.outcome == 'success'`
+        # made this compensating action reachable ONLY from the success path — the same class as
+        # #604's root cause, where the round-void job was gated on the very verdict a credential
+        # outage prevents. The pre-flight consumes the ONE-TIME-USE refresh token EARLY inside
+        # prepare, and prepare then keeps going: materialize the minimal mount, assert no refresh
+        # material leaked, copy the tamper baseline, npm-install the pinned CLI, export $GITHUB_ENV.
+        # ANY failure in that window skipped this step, so the OLD grant was spent, the NEW grant
+        # died with the runner, and the account was PERMANENTLY dead until an interactive re-mint.
+        # The condition is now keyed to `always()` plus the ACCOUNT SELECTION (which identifies the
+        # secret to write and precedes the pre-flight), and worker-live.sh's rotation MARKER — the
+        # host-side "a rotation was obtained" receipt — decides whether there is anything to
+        # persist. With no marker this step is a no-op: it reports rotated=false and exits 0.
+        # Asserted by dispatch-secrets-guard.rotation_writeback_reachable_verdict, so restoring a
+        # success-only guard is a red tick rather than a silent regression.
+        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.selected.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}

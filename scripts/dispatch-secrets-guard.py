@@ -124,6 +124,7 @@
 #
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
+import itertools
 import json
 import os
 import re
@@ -223,74 +224,375 @@ def workflow_guard_permissions(workflow_text):
 # existing assertion green for 62 hours while the control was fail-OPEN. What must be asserted is
 # that a FAILING guard PREVENTS the privileged jobs from running, so these checks are on the WIRING
 # in dispatch.yml, not on the guard's behaviour.
+#
+# RETRO-REVIEW OF #621 (the PR that added this contract). Two mutations against the merged file left
+# the whole enrolled suite GREEN, so the contract as shipped was DEFEATABLE:
+#   (a) replacing BOTH `python3 registry/scripts/dispatch-secrets-guard.py` invocations in the guard
+#       job's `run:` with `true` — the contract proved a job NAMED secrets-guard exists, is gated on,
+#       and carries no continue-on-error, but never that it RUNS THE VERIFIER. An empty guard job
+#       satisfies every dependency and verifies nothing;
+#   (b) flipping `always() && needs.secrets-guard.result == 'success'` to `||` at dispatch.yml — the
+#       old check was a SUBSTRING search for the success comparison, and the comparison is still
+#       present in the `||` form, so "GATE (LIVE)" kept passing while the gate was inverted.
+# Plus five permissive misparses from matching regexes against YAML rather than parsing it:
+# `"continue-on-error": true` (quoted key), `continue-on-error : true` (space before the colon),
+# `"if": ${{ always() }}` (quoted key => the polarity check was SKIPPED entirely), `needs: [plan]`
+# with a TAB-prefixed `# secrets-guard` comment (` #` tail-stripping missed it, so the COMMENT
+# satisfied the needs check), and `lstrip("./")` letting a `github/workflows/` sparse-checkout entry
+# "cover" `.github/workflows/dispatch.yml`. Everything below therefore parses the workflow with
+# PyYAML — the same precedent #619 set in dispatch-claim.py the same night — and the two gate
+# properties are asserted SEMANTICALLY: the verifier is invoked, and the success condition's POLARITY
+# is evaluated rather than pattern-matched.
 GATE_GUARD_JOB = "secrets-guard"
-# `continue-on-error:` at ANY indent inside the guard job. Job level makes the job resolve as
-# SUCCESS for dependents (defeating both gating idioms); step level on the verify step makes the
-# job green while the verification failed. Neither is ever legitimate here, so the guard job is
-# required to carry NONE — an advisory diagnostic belongs in a SEPARATE job.
-GATE_CONTINUE_ON_ERROR_RE = re.compile(r"(?m)^\s*continue-on-error:\s*(\S.*?)\s*$")
 # The success-conditioned dependency expression. Required only on a gated job that ALSO carries a
 # job-level `if:` — an `if:` containing always() cancels the implicit needs-must-succeed gate, so
-# the dependency has to be re-stated explicitly. Whitespace-tolerant; either quote style.
+# the dependency has to be re-stated explicitly. Whitespace-tolerant; either quote style. Used as
+# the FALSE atom of the polarity evaluation below, never as a bare substring test.
 GATE_SUCCESS_RE = re.compile(
     r"needs\s*\.\s*" + GATE_GUARD_JOB + r"\s*\.\s*result\s*==\s*['\"]success['\"]")
-GATE_NEEDS_RE = re.compile(r"(?m)^    needs:\s*(.*)$")
-GATE_IF_RE = re.compile(r"(?m)^    if:\s*(.*)$")
+# The guard job must EXECUTE the verifier. Matches `python3 [<prefix>/]scripts/dispatch-secrets-guard.py`
+# in a step's `run:` body — the live job uses the `registry/` sparse-checkout prefix, the synthetic
+# fixtures none. Group 1 is the argument tail, which separates the `--self-test` (static assertions)
+# invocation from the bare (live settings verification) one; BOTH are required.
+GATE_VERIFIER_RE = re.compile(
+    r"(?:^|[;&|]\s*|\s)python3\s+(?:[\w./$~{}-]*/)?scripts/dispatch-secrets-guard\.py([^\n]*)")
 
 
-def job_continue_on_error(body_lines):
-    """Pure: the truthy/unprovable `continue-on-error:` values inside one job body (job level or
-    step level), as a sorted list of the raw value strings. `false` is the only value treated as
-    safe: an `${{ ... }}` expression cannot be statically proven false, so it counts as an escape
-    (fail closed). Comment tails are stripped first, so the prose ABOVE this job explaining why
-    there is no continue-on-error never registers as one."""
+def _yaml_module():
+    """PyYAML, or a RuntimeError naming the fix. HARD dependency, deliberately: the workflow-shape
+    checks in this file are security assertions, and a hand-rolled line parser is precisely what let
+    the five #621 misparses through. Every context that runs this script installs or provides it
+    (pr-gate.yml pins it version+hash-locked; dispatch.yml's guard job probes for it and falls back
+    to the same pinned install) — so an ImportError here is a real misconfiguration and must be
+    LOUD, never a silent downgrade to the buggy parser."""
+    try:
+        import yaml  # lazy: same shape as resolve-conflicts.validate_syntax_blob / #619
+    except ImportError as exc:                                   # pragma: no cover - env fault
+        raise RuntimeError(
+            "PyYAML is required to parse the workflows for the secret-exfil gate assertions "
+            "(install pyyaml==6.0.2); refusing to fall back to a line parser") from exc
+    return yaml
+
+
+def workflow_document(workflow_text):
+    """Pure: the PARSED workflow mapping, or None when the text is not a YAML mapping (callers
+    treat None as a refusal — fail closed)."""
+    yaml = _yaml_module()
+    try:
+        document = yaml.safe_load(workflow_text or "")
+    except yaml.YAMLError:
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def workflow_parse_error(workflow_text):
+    """Pure: the first line of the YAMLError parsing `workflow_text` raises, or None when it parses.
+    Reported separately so a REFUSAL can name the real fault: "does not parse as YAML" and "has no
+    jobs: block" are different problems, and conflating them sends the reader looking in the wrong
+    place. A stray TAB before a comment — one of the five #621 misparses, where the comment used to
+    satisfy a `needs:` check — lands here."""
+    yaml = _yaml_module()
+    try:
+        yaml.safe_load(workflow_text or "")
+    except yaml.YAMLError as exc:
+        return str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+    return None
+
+
+def workflow_job_docs(workflow_text):
+    """Pure: {job name: parsed job mapping} for the top-level `jobs:` block, or None when the block
+    is missing/not a mapping/holds no mapping-shaped job (fail closed).
+
+    This is the PARSED counterpart of workflow_jobs (which returns body LINES and is still used by
+    the binding-map and privileged-script scans). Parsing is what makes a quoted key, an unusual
+    space before a colon, a TAB-prefixed comment or a folded scalar a non-event: the value the
+    assertions see is the value GitHub sees."""
+    document = workflow_document(workflow_text)
+    if document is None:
+        return None
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return None
+    parsed = {str(name): body for name, body in jobs.items() if isinstance(body, dict)}
+    return parsed or None
+
+
+def _job_steps(job_doc):
+    """Pure: the `steps:` list of a parsed job, or an empty tuple."""
+    steps = (job_doc or {}).get("steps")
+    return tuple(step for step in steps if isinstance(step, dict)) if isinstance(steps, list) \
+        else ()
+
+
+def _continue_on_error_escape(value):
+    """Pure: the escape string for one `continue-on-error` value, or None when it is provably safe.
+    `false` (bool or the string) is the ONLY safe value: a `${{ ... }}` expression cannot be
+    statically proven false, so it counts as an escape (fail closed)."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        return "true"
+    text = str(value).strip()
+    return None if text.strip("'\"").lower() == "false" else (text or "''")
+
+
+def job_continue_on_error(job_doc):
+    """Pure: the truthy/unprovable `continue-on-error` values in one PARSED job (job level and step
+    level), as a sorted list of value strings. Because the job is parsed, prose ABOUT
+    continue-on-error — a full-line comment, a ` #` tail, a TAB-prefixed comment — is gone before
+    this looks, and a QUOTED key or a space before the colon is the same key it always was (the
+    first two #621 misparses: both read as "no continue-on-error" to the old regex)."""
     escapes = []
-    for line in body_lines:
-        if line.lstrip().startswith("#"):
-            continue
-        code = line.split(" #", 1)[0]
-        for value in GATE_CONTINUE_ON_ERROR_RE.findall(code):
-            if value.strip().strip("'\"").lower() != "false":
-                escapes.append(value.strip())
+    for holder in (job_doc, *_job_steps(job_doc)):
+        escape = _continue_on_error_escape(holder.get("continue-on-error"))
+        if escape is not None:
+            escapes.append(escape)
     return sorted(escapes)
 
 
-def job_needs(body_lines):
-    """Pure: the job names in a job-level `needs:` — the inline flow-sequence/scalar forms
-    (`needs: a`, `needs: [a, b]`) and the block-sequence form (`needs:` then `- a`). Empty tuple
-    when the job declares no dependencies."""
-    for index, line in enumerate(body_lines):
-        match = GATE_NEEDS_RE.match(line.split(" #", 1)[0].rstrip())
-        if not match:
+def job_needs(job_doc):
+    """Pure: the job names in a PARSED job's `needs:` — the scalar (`needs: a`), flow-sequence
+    (`needs: [a, b]`) and block-sequence forms all arrive here as a str or a list. Empty tuple when
+    the job declares no dependencies. Parsing kills #621 misparse 4: a `# secrets-guard` COMMENT
+    (TAB-prefixed, so the old ` #` tail strip missed it) is not a dependency."""
+    needs = (job_doc or {}).get("needs")
+    if needs is None:
+        return ()
+    if isinstance(needs, str):
+        names = [needs]
+    elif isinstance(needs, list):
+        names = [item for item in needs if isinstance(item, str)]
+    else:
+        return ()
+    return tuple(sorted(name.strip() for name in names if name.strip()))
+
+
+def job_if_expression(job_doc):
+    """Pure: the job-level `if:` expression of a PARSED job, or None when it carries none. Parsing
+    kills #621 misparse 3: `"if": ${{ always() }}` is an `if`, and the old anchored regex read it as
+    "no if at all", which SKIPPED the gate-polarity check entirely."""
+    condition = (job_doc or {}).get("if")
+    if condition is None:
+        return None
+    return str(condition).strip()
+
+
+# ---- `if:` POLARITY (retro-review of #621 mutation (b)) ------------------------------------------
+# A substring test cannot express "this condition GATES on the guard": `always() ||
+# needs.secrets-guard.result == 'success'` contains the comparison and defeats it. So evaluate the
+# expression's boolean structure under the ADVERSARIAL assignment — the atom we care about is FALSE,
+# every other atom is TRUE (the most permissive world an attacker could arrange) — and ask whether it
+# can still be TRUE. The same primitive expresses the opposite obligation for a compensating action
+# that MUST stay reachable from a failure path (see rotation_writeback_reachable_verdict), which is
+# why it takes the false-atom pattern as a parameter instead of hard-coding the guard.
+_IF_OPERATORS = ("&&", "||")
+
+
+def _tokenize_if(expression):
+    """Pure: an `if:` expression as a token list of "&&" / "||" / "!" / "(" / ")" / ("atom", text).
+    A `(` that opens a FUNCTION CALL (`always()`, `contains(a, 'b')`) is absorbed into the atom;
+    only a `(` in operand position is grouping. Quoted strings are opaque. Raises ValueError on
+    anything it cannot tokenize — callers treat that as unparseable."""
+    tokens, index, length = [], 0, len(expression)
+    while index < length:
+        char = expression[index]
+        if char.isspace():
+            index += 1
             continue
-        inline = match.group(1).strip()
-        if inline:
-            return tuple(sorted(name for name in re.split(r"[\[\],\s]+", inline) if name))
-        names = []
-        for follow in body_lines[index + 1:]:
-            code = follow.split(" #", 1)[0].rstrip()
-            if not code:
+        if expression.startswith(_IF_OPERATORS, index):
+            tokens.append(expression[index:index + 2])
+            index += 2
+            continue
+        if char == "!" and not expression.startswith("!=", index):
+            tokens.append("!")
+            index += 1
+            continue
+        if char in "()":
+            tokens.append(char)
+            index += 1
+            continue
+        start, depth, quote = index, 0, ""
+        while index < length:
+            current = expression[index]
+            if quote:
+                quote = "" if current == quote else quote
+                index += 1
                 continue
-            if not code.startswith("      - "):
+            if current in "'\"":
+                quote = current
+                index += 1
+                continue
+            if current == "(":
+                depth += 1
+                index += 1
+                continue
+            if current == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+                index += 1
+                continue
+            if depth == 0 and expression.startswith(_IF_OPERATORS, index):
                 break
-            names.append(code[len("      - "):].strip())
-        return tuple(sorted(name for name in names if name))
-    return ()
+            index += 1
+        if quote or depth:
+            raise ValueError("unterminated quote or parenthesis inside an operand")
+        atom = expression[start:index].strip()
+        if not atom:
+            raise ValueError("empty operand")
+        tokens.append(("atom", atom))
+    if not tokens:
+        raise ValueError("no tokens")
+    return tokens
 
 
-def job_if_expression(body_lines):
-    """Pure: the job-level `if:` expression text, or None when the job carries none."""
-    for line in body_lines:
-        match = GATE_IF_RE.match(line.split(" #", 1)[0].rstrip())
-        if match:
-            return match.group(1).strip()
-    return None
+def _evaluate_if(tokens, value_of):
+    """Pure: evaluate a tokenized `if:` expression with `value_of(atom_text) -> bool`. GitHub's `&&`
+    / `||` precedence (`&&` binds tighter) and `!`. Raises ValueError on a malformed token stream."""
+    position = 0
+
+    def unary():
+        nonlocal position
+        if position >= len(tokens):
+            raise ValueError("expression ends where an operand was expected")
+        token = tokens[position]
+        if token == "!":
+            position += 1
+            return not unary()
+        if token == "(":
+            position += 1
+            value = disjunction()
+            if position >= len(tokens) or tokens[position] != ")":
+                raise ValueError("unbalanced parenthesis")
+            position += 1
+            return value
+        if isinstance(token, tuple):
+            position += 1
+            return bool(value_of(token[1]))
+        raise ValueError(f"unexpected token {token!r}")
+
+    def conjunction():
+        nonlocal position
+        value = unary()
+        while position < len(tokens) and tokens[position] == "&&":
+            position += 1
+            value = unary() and value
+        return value
+
+    def disjunction():
+        nonlocal position
+        value = conjunction()
+        while position < len(tokens) and tokens[position] == "||":
+            position += 1
+            value = conjunction() or value
+        return value
+
+    result = disjunction()
+    if position != len(tokens):
+        raise ValueError("trailing tokens")
+    return result
+
+
+# Atoms with a KNOWN constant truth value. Everything else is a FREE variable (see
+# if_condition_admits): `always()` genuinely is always true, and a bare `true`/`false` literal is
+# what it says. Deliberately short — assuming a value for anything else is how a substring test gets
+# the answer wrong (`!cancelled()` runs on a FAILED dependency, so pinning `cancelled()` to either
+# constant would mis-decide it).
+_IF_CONSTANT_ATOMS = {"always()": True, "true": True, "false": False}
+# Free-atom ceiling for the exhaustive decision. Real workflow conditions carry a handful of atoms;
+# beyond this the expression is reported UNDECIDED and each caller applies its own fail direction,
+# rather than this returning a guess.
+_IF_MAX_FREE_ATOMS = 12
+
+
+def if_condition_admits(condition, false_atom_re):
+    """Pure: (admits, decided, detail) for a job/step-level `if:` expression.
+
+    `admits` — is there ANY world in which this expression is TRUE while every atom matching
+               `false_atom_re` is FALSE? (For the gate: can the job run while the guard did not
+               succeed. For a compensating action: can it still run when the thing it compensates
+               for failed.)
+    `decided` — whether the question was actually answered (the expression parsed and its free-atom
+               count was inside the ceiling).
+
+    DECIDED BY EXHAUSTIVE SATISFIABILITY, not by a fixed adversarial assignment: every atom that is
+    neither a known constant nor a `false_atom_re` match is a FREE boolean, and all assignments are
+    tried. A fixed "everything else is TRUE" valuation is wrong under negation — it makes
+    `!cancelled()` evaluate FALSE and so reads a condition that DOES run on a failed dependency as
+    though it gated. `admits=False` is therefore a proof of unreachability over all worlds, and
+    `admits=True` exhibits at least one reaching world.
+
+    Callers pick their fail direction from `decided`: a gate that must NOT admit treats undecided as
+    admitting (an unreadable gate is not a proven gate); a compensating action that MUST admit treats
+    undecided as a refusal (an unprovable reachability is not reachability). Neither ever guesses."""
+    text = str(condition if condition is not None else "").strip()
+    if not text:
+        return True, False, "empty `if:` expression"
+    inner = text
+    if inner.startswith("${{") and inner.endswith("}}"):
+        inner = inner[3:-2].strip()
+    elif "${{" in inner:
+        return True, False, ("the `if:` value interleaves literal text with `${{ }}` expressions "
+                             "and cannot be evaluated statically")
+    try:
+        tokens = _tokenize_if(inner)
+    except ValueError as exc:
+        return True, False, f"the `if:` expression could not be parsed ({exc})"
+    fixed, free = {}, []
+    for token in tokens:
+        if not isinstance(token, tuple):
+            continue
+        atom = token[1]
+        if atom in fixed or atom in free:
+            continue
+        if false_atom_re.search(atom):
+            fixed[atom] = False
+        elif atom.strip().lower() in _IF_CONSTANT_ATOMS:
+            fixed[atom] = _IF_CONSTANT_ATOMS[atom.strip().lower()]
+        else:
+            free.append(atom)
+    if len(free) > _IF_MAX_FREE_ATOMS:
+        return True, False, (f"the `if:` expression carries {len(free)} independent atoms, over the "
+                             f"{_IF_MAX_FREE_ATOMS} this decision procedure will enumerate")
+    try:
+        for combination in itertools.product((False, True), repeat=len(free)):
+            values = dict(fixed, **dict(zip(free, combination)))
+            if _evaluate_if(tokens, values.__getitem__):
+                return True, True, ("reachable when "
+                                    + ", ".join(f"{atom}={value}"
+                                                for atom, value in sorted(values.items())))
+    except ValueError as exc:
+        return True, False, f"the `if:` expression could not be evaluated ({exc})"
+    return False, True, "ok"
+
+
+def guard_verifier_invocations(guard_doc):
+    """Pure: (self_test_steps, verify_steps, guarded_steps) over a PARSED guard job — the step
+    indices whose `run:` invokes this script with `--self-test`, without it, and (third element) the
+    indices of ANY invoking step that carries a step-level `if:`.
+
+    A step-level `if:` is reported because it is the same bypass as #621 mutation (a) wearing a
+    different hat: `if: false` (or any condition) on the invoking step leaves the job green, the
+    dependency satisfied, and the verifier unrun."""
+    self_tests, verifies, conditional = [], [], []
+    for index, step in enumerate(_job_steps(guard_doc)):
+        run = step.get("run")
+        if not isinstance(run, str):
+            continue
+        tails = GATE_VERIFIER_RE.findall(run)
+        if not tails:
+            continue
+        for tail in tails:
+            (self_tests if "--self-test" in tail else verifies).append(index)
+        if step.get("if") is not None:
+            conditional.append(index)
+    return tuple(self_tests), tuple(verifies), tuple(conditional)
 
 
 def guard_gate_verdict(workflow_text):
     """Pure: (ok, reason). Prove the secret-exfil guard actually GATES the privileged jobs in
     dispatch.yml — the assertion issue #618 was opened for, and the one no pre-existing check
-    made. Three properties, each fail-closed:
+    made. Five properties, each fail-closed:
 
       (1) the guard job EXISTS and carries NO truthy `continue-on-error` at the job or step
           level. This is the whole defect: job-level continue-on-error does not merely keep the
@@ -299,24 +601,49 @@ def guard_gate_verdict(workflow_text):
           BOTH satisfied by a guard that failed. Measured on run 30141528651 — GUARD conclusion
           `failure`, CLAIM ran, ALERT ran (its `if` is the result-conditioned form), run
           conclusion `success`. So no downstream expression can substitute for this property;
+      (1b) the guard job actually RUNS THE VERIFIER — both `dispatch-secrets-guard.py --self-test`
+          (the static workflow-shape assertions) and the bare invocation (the live settings
+          verification), in a step that is not itself `if:`-conditional. RETRO-REVIEW OF #621:
+          replacing both `run:` invocations with `true` left the ENTIRE enrolled suite green,
+          because every other property here is satisfied by an EMPTY job of the right name. A gate
+          whose verifier can be deleted without a red tick is not a gate;
       (2) EVERY secret-consuming job in the file (derived by secret_consuming_jobs, not a
           hand-maintained list, so a newly added secret-bearing job cannot land ungated) other
           than the guard itself declares `needs: secrets-guard`;
-      (3) a gated job that ALSO carries a job-level `if:` must re-state the dependency as
-          `needs.secrets-guard.result == 'success'` — an `if` containing always() cancels the
-          implicit needs-must-succeed gate, which is exactly why plan-alert carries that
-          expression while claim needs no `if` at all.
+      (3) a gated job that ALSO carries a job-level `if:` must not be able to run while the guard
+          did NOT succeed — an `if` containing always() cancels the implicit needs-must-succeed
+          gate, which is exactly why plan-alert re-states the dependency while claim needs no `if`.
+          This is a POLARITY evaluation (if_condition_admits), not a substring search: RETRO-REVIEW
+          OF #621 flipped that `&&` to `||` and the old substring test still found the comparison,
+          so "GATE (LIVE)" passed while the gate was inverted;
+      (4) the PARSED job set and the line-parsed job set (workflow_jobs, still used by the binding
+          map) must AGREE. They are two readers of the same file, and a shape only one of them
+          understands — a quoted job key, say — is a job that escapes whichever check uses the other
+          reader. Divergence is a refusal rather than a silent half-check.
 
     Zero derived consumers, an unparseable jobs block, or a missing guard job is a refusal: a
     check that proves nothing must not read as a pass."""
-    jobs = workflow_jobs(workflow_text)
+    parse_error = workflow_parse_error(workflow_text)
+    if parse_error is not None:
+        return False, (f"dispatch.yml does not parse as YAML ({parse_error}) — the gate contract "
+                       "cannot be derived (fail closed)")
+    jobs = workflow_job_docs(workflow_text)
     if jobs is None:
         return False, "cannot locate a `jobs:` block in dispatch.yml (fail closed)"
-    guard_body = jobs.get(GATE_GUARD_JOB)
-    if guard_body is None:
+    line_jobs = workflow_jobs(workflow_text)
+    if line_jobs is None or set(line_jobs) != set(jobs):
+        only_parsed = sorted(set(jobs) - set(line_jobs or {}))
+        only_lines = sorted(set(line_jobs or {}) - set(jobs))
+        return False, (
+            "the PARSED and line-parsed job sets of dispatch.yml disagree (parsed-only: "
+            f"{only_parsed}; line-only: {only_lines}) — the binding-map scan and the gate contract "
+            "read the same file with two readers, so a job only one of them sees escapes the other's "
+            "assertions entirely (fail closed)")
+    guard_doc = jobs.get(GATE_GUARD_JOB)
+    if guard_doc is None:
         return False, (f"dispatch.yml has no `{GATE_GUARD_JOB}` job — the secret-exfil settings "
                        "check is GONE, not merely ungated (fail closed)")
-    escapes = job_continue_on_error(guard_body)
+    escapes = job_continue_on_error(guard_doc)
     if escapes:
         return False, (
             f"`{GATE_GUARD_JOB}` carries continue-on-error: {', '.join(escapes)} — a failed guard "
@@ -324,6 +651,24 @@ def guard_gate_verdict(workflow_text):
             "`needs." + GATE_GUARD_JOB + ".result == 'success'` gate passes while the secret-exfil "
             "settings are UNVERIFIED (issue #618: the control is fail-OPEN). Put any non-blocking "
             "diagnostic in a separate advisory job instead")
+    self_tests, verifies, conditional = guard_verifier_invocations(guard_doc)
+    if not verifies or not self_tests:
+        missing = " and ".join(
+            part for part, present in (("`dispatch-secrets-guard.py` (the live settings "
+                                        "verification)", verifies),
+                                       ("`dispatch-secrets-guard.py --self-test` (the static "
+                                        "workflow-shape assertions)", self_tests)) if not present)
+        return False, (
+            f"`{GATE_GUARD_JOB}` never invokes {missing} in any step's `run:` — the job exists, is "
+            "gated on, and is green, and it VERIFIES NOTHING. Every other property of this contract "
+            "is satisfied by an empty job of the right name, which is why replacing these "
+            "invocations with `true` had to become a red tick")
+    if conditional:
+        return False, (
+            f"`{GATE_GUARD_JOB}` invokes the verifier from `if:`-conditional step(s) "
+            f"{list(conditional)} — a step-level condition can skip the verification while the job "
+            "still resolves as SUCCESS for every dependent, the same fail-open shape as "
+            "continue-on-error. Put any conditional diagnostic in a separate advisory job")
     consuming = secret_consuming_jobs({"dispatch.yml": workflow_text})
     if consuming is None:
         return False, "cannot derive dispatch.yml's secret-consuming jobs (fail closed)"
@@ -332,20 +677,26 @@ def guard_gate_verdict(workflow_text):
         return False, ("derived ZERO secret-consuming jobs to gate in dispatch.yml — the scan "
                        "proves nothing (fail closed: the parser or the file shape has drifted)")
     for job_name in gated:
-        body = jobs.get(job_name)
-        if body is None:
+        job_doc = jobs.get(job_name)
+        if job_doc is None:
             return False, f"derived job {job_name} is not in the parsed jobs map (fail closed)"
-        if GATE_GUARD_JOB not in job_needs(body):
+        if GATE_GUARD_JOB not in job_needs(job_doc):
             return False, (f"privileged job `{job_name}` consumes secrets but does not declare "
                            f"`needs: {GATE_GUARD_JOB}` — it would launch with the secret-exfil "
                            "settings unverified")
-        condition = job_if_expression(body)
-        if condition is not None and not GATE_SUCCESS_RE.search(condition):
+        condition = job_if_expression(job_doc)
+        if condition is None:
+            continue
+        admits, parsed, detail = if_condition_admits(condition, GATE_SUCCESS_RE)
+        if admits:
             return False, (
-                f"privileged job `{job_name}` carries a job-level `if:` ({condition!r}) that does "
-                f"not require `needs.{GATE_GUARD_JOB}.result == 'success'` — an `if` expression "
-                "containing always() overrides the implicit needs-must-succeed gate, so the job "
-                "would run on a failed guard")
+                f"privileged job `{job_name}` carries a job-level `if:` ({condition!r}) that can "
+                f"evaluate TRUE while `needs.{GATE_GUARD_JOB}.result` is not 'success'"
+                + (f" — {detail}" if not parsed else "")
+                + ". An `if` expression containing always() overrides the implicit "
+                "needs-must-succeed gate, and merely MENTIONING the success comparison is not "
+                "requiring it (an `||` satisfies a substring test and inverts the gate), so the "
+                "condition must be a conjunction the guard's failure makes false")
     return True, "ok"
 
 
@@ -365,33 +716,55 @@ SELF_TEST_LIVE_INPUTS = (
     "policy/repos.toml",
     ".github/workflows/dispatch.yml",
     ".github/workflows/set-up-account.yml",
+    # rotation_writeback_reachable_verdict reads both worker lanes (retro-review of #614). Already
+    # covered by the `.github/workflows/` directory entry; listed explicitly so the dependency is
+    # visible where the coverage assertion is, per this constant's whole reason for existing.
+    ".github/workflows/worker.yml",
+    ".github/workflows/review-fix.yml",
 )
 
 
+def normalize_repo_path(value):
+    """Pure: a repository-relative path in one comparable form — backslashes to `/`, and a leading
+    `./` (only that, however many times) removed.
+
+    NOT `lstrip("./")`. RETRO-REVIEW OF #621: `lstrip` takes a SET OF CHARACTERS, so
+    `".github/workflows/dispatch.yml".lstrip("./")` is `"github/workflows/dispatch.yml"` — it eats the
+    leading dot of a DOTFILE directory. A sparse-checkout entry of `github/workflows/` (which checks
+    out nothing at all) therefore normalized to the same prefix and read as COVERING
+    `.github/workflows/dispatch.yml`, i.e. the sparse-checkout coverage assertion — the one that
+    exists so no self-test input can silently degrade to vacuous on a dispatch tick — passed on a
+    typo that guaranteed the file was absent."""
+    path = str(value).strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
 def sparse_checkout_paths(workflow_text, job_name):
-    """Pure: the literal `sparse-checkout: |` block entries inside one job of `workflow_text`, or
-    None when the job or the block cannot be located (callers treat None as a failure — fail
-    closed). Same narrow, dependency-free line-parser discipline as workflow_guard_permissions."""
-    jobs = workflow_jobs(workflow_text)
+    """Pure: the `sparse-checkout:` block-scalar entries inside one job of `workflow_text`, or None
+    when the job or the block cannot be located (callers treat None as a failure — fail closed).
+
+    PARSED (retro-review of #621): the old reader required the literal line
+    `          sparse-checkout: |` at exactly ten spaces of indent, so any reflow of the step made
+    this whole coverage assertion refuse — and it hand-stripped `#` comment tails from a YAML
+    LITERAL scalar, where `#` is ordinary content. PyYAML hands back the scalar already de-indented,
+    whatever the style (`|`, `|-`, `>` or a flow sequence)."""
+    jobs = workflow_job_docs(workflow_text)
     if jobs is None:
         return None
-    body = jobs.get(job_name)
-    if body is None:
+    job_doc = jobs.get(job_name)
+    if job_doc is None:
         return None
-    for index, line in enumerate(body):
-        if line.split("#", 1)[0].rstrip() != "          sparse-checkout: |":
+    for step in _job_steps(job_doc):
+        with_block = step.get("with")
+        if not isinstance(with_block, dict) or "sparse-checkout" not in with_block:
             continue
-        entries = []
-        for follow in body[index + 1:]:
-            if not follow.strip():
-                continue
-            if not follow.startswith("            "):
-                break
-            entry = follow.strip()
-            if entry.startswith("#"):
-                continue
-            entries.append(entry)
-        return tuple(entries) or None
+        value = with_block["sparse-checkout"]
+        raw = value if isinstance(value, list) else str(value).splitlines()
+        entries = tuple(str(entry).strip() for entry in raw
+                        if str(entry).strip() and not str(entry).strip().startswith("#"))
+        return entries or None
     return None
 
 
@@ -401,12 +774,12 @@ def sparse_checkout_covers_verdict(workflow_text, job_name, required_paths):
     a refusal (fail closed): the self-test's live checks silently degrade without those files."""
     entries = sparse_checkout_paths(workflow_text, job_name)
     if entries is None:
-        return False, (f"cannot locate {job_name}'s `sparse-checkout: |` block in dispatch.yml "
+        return False, (f"cannot locate {job_name}'s `sparse-checkout:` block in dispatch.yml "
                        "(fail closed — the self-test's live inputs cannot be proven present)")
-    normalized = tuple(entry.replace("\\", "/").lstrip("./") for entry in entries)
+    normalized = tuple(normalize_repo_path(entry) for entry in entries)
     missing = []
     for path in required_paths:
-        target = path.replace("\\", "/").lstrip("./")
+        target = normalize_repo_path(path)
         if not any(target.startswith(entry) if entry.endswith("/") else target == entry
                    for entry in normalized):
             missing.append(path)
@@ -900,7 +1273,10 @@ def privileged_script_coverage_verdict(workflow_docs, surface_paths):
     """Pure: prove every script executed by a secret-consuming or write-permission job is inside
     the human-arm trust surface. The inventory is derived from workflow job bodies; zero matches,
     an unreadable jobs block, or one uncovered script fails closed."""
-    surfaces = tuple(path.strip().replace("\\", "/").lstrip("./")
+    # normalize_repo_path, NOT lstrip("./") — see its docstring: the character-set semantics of
+    # lstrip ate the leading dot of every dotfile surface (`.github/...`), so a surface entry could
+    # match a path it does not actually cover.
+    surfaces = tuple(normalize_repo_path(path)
                      for path in surface_paths if isinstance(path, str) and path.strip())
     # An EMPTY surface must refuse HERE, naming the derivation (issue #618 defect 2). Falling
     # through with no surfaces marks every derived script uncovered, which reads as "22 privileged
@@ -932,6 +1308,85 @@ def privileged_script_coverage_verdict(workflow_docs, surface_paths):
     uncovered = sorted(path for path in privileged if not covered(path))
     if uncovered:
         return False, "privileged scripts outside human-arm trust surface: " + ", ".join(uncovered)
+    return True, "ok"
+
+
+# ---- the ROTATION WRITE-BACK must be reachable from the FAILURE path (retro-review of #614) ------
+# #614 moved the credential refresh HOST-SIDE, into worker-prep.sh, and made the rotation write-back
+# key on "the pre-flight produced new durable material". It also gated the write-back step on
+# `steps.prepare.outcome == 'success'`. Those two facts are incompatible: the provider commits the
+# rotation EARLY inside prepare, and prepare then keeps going (materialize the minimal mount, assert
+# no refresh material leaked, copy the tamper baseline, npm-install the pinned CLI, export
+# $GITHUB_ENV). Any failure in that window skips the write-back, so the OLD grant is spent, the NEW
+# grant is discarded with the runner, and — provider refresh tokens being ONE-TIME-USE — the account
+# is permanently dead until an interactive re-mint.
+#
+# That is the SAME CLASS as #604's root cause: a compensating action reachable only from the success
+# path. #604's void job was gated on a validated verdict, so the credential outage it existed to
+# compensate for skipped it. Here the compensation for a consumed grant is gated on the success of
+# the very step that consumes it. So the invariant is asserted structurally, in the workflow YAML —
+# the seam the retro-review found vacuity concentrated in — and in BOTH lanes.
+WRITEBACK_STEP_RE = re.compile(
+    r"(?:^|[;&|]\s*|\s)bash\s+(?:\S*/)?scripts/worker-live\.sh\s+write-back\b")
+# The atom whose falsity must NOT make the write-back unreachable: "the credential-prepare step
+# succeeded". Matches `steps.<id>.outcome == 'success'` / `.conclusion == 'success'` for the prepare
+# step under either quote style, with or without spaces.
+PREPARE_SUCCESS_RE = re.compile(
+    r"steps\s*\.\s*prepare\s*\.\s*(?:outcome|conclusion)\s*==\s*['\"]success['\"]")
+
+
+def rotation_writeback_reachable_verdict(workflow_docs):
+    """Pure: (ok, reason). In EVERY workflow that runs `worker-live.sh write-back`, that step's `if:`
+    must still be able to run when the credential-prepare step did NOT succeed.
+
+    Evaluated with the same polarity primitive as the secret-exfil gate, in the opposite direction:
+    set `steps.prepare.outcome == 'success'` FALSE, leave every other atom TRUE, and require the
+    condition to remain satisfiable. Fail directions, both deliberate:
+      * a step whose condition cannot be PARSED is a refusal (unlike the gate, where unparseable
+        means "cannot prove it gates"; here unparseable means "cannot prove the compensation is
+        reachable", and an unpersisted rotation is unrecoverable);
+      * finding ZERO write-back steps across the documents is a refusal — the step was renamed or
+        removed and this assertion would otherwise pass vacuously, which is exactly how #614's gap
+        survived its own review."""
+    if not workflow_docs:
+        return False, "no workflow documents to scan (fail closed)"
+    found = []
+    for filename in sorted(workflow_docs):
+        jobs = workflow_job_docs(workflow_docs[filename])
+        if jobs is None:
+            continue     # not every workflow has a parseable jobs block worth scanning here
+        for job_name, job_doc in sorted(jobs.items()):
+            for index, step in enumerate(_job_steps(job_doc)):
+                run = step.get("run")
+                if not isinstance(run, str) or not WRITEBACK_STEP_RE.search(run):
+                    continue
+                where = f"{filename}::{job_name} step {index}"
+                found.append(where)
+                condition = step.get("if")
+                if condition is None:
+                    continue        # unconditional: maximally reachable
+                admits, parsed, detail = if_condition_admits(condition, PREPARE_SUCCESS_RE)
+                if not parsed:
+                    return False, (
+                        f"{where}: the rotation write-back's `if:` ({condition!r}) cannot be "
+                        f"evaluated ({detail}), so its reachability from the credential-prepare "
+                        "FAILURE path is unprovable (fail closed)")
+                if not admits:
+                    return False, (
+                        f"{where}: the rotation write-back can ONLY run when the credential-prepare "
+                        f"step succeeded (`if:` = {condition!r}). The host-side pre-flight consumes "
+                        "the stored ONE-TIME-USE refresh token EARLY inside that step, so every "
+                        "later failure in it (the no-leak assertion, the tamper baseline, the pinned "
+                        "CLI install, the $GITHUB_ENV export) discards a grant the provider has "
+                        "already rotated — old one spent, new one thrown away, account permanently "
+                        "dead until an interactive re-mint (#614; same class as #604's root cause). "
+                        "Key the condition to `always()` plus the account SELECTION, and let "
+                        "worker-live.sh's rotation marker decide whether there is anything to "
+                        "persist")
+    if not found:
+        return False, ("found ZERO `worker-live.sh write-back` steps in any workflow — the rotation "
+                       "write-back was renamed or removed, and this reachability assertion would "
+                       "pass vacuously (fail closed)")
     return True, "ok"
 
 
@@ -1450,6 +1905,11 @@ def _self_test():
     # ---- the GATE: a FAILING guard must PREVENT the privileged jobs from running (issue #618) --
     # The pre-existing suite passed in full while the control was fail-OPEN, so every assertion
     # here is on dispatch.yml's WIRING. Synthetic accept + reject directions first, then LIVE.
+    guard_run_block = "\n".join([
+        "      - run: |",
+        "          python3 scripts/dispatch-secrets-guard.py --self-test",
+        "          python3 scripts/dispatch-secrets-guard.py",
+    ])
     gate_ok_sample = "\n".join([
         "jobs:",
         "  plan:",
@@ -1457,7 +1917,7 @@ def _self_test():
         "  secrets-guard:",
         "    runs-on: ubuntu-latest",
         "    steps:",
-        "      - run: python3 scripts/dispatch-secrets-guard.py",
+        guard_run_block,
         "        env:",
         "          ALL_SECRETS: ${{ toJSON(secrets) }}",
         "  claim:",
@@ -1501,9 +1961,8 @@ def _self_test():
     chk("GATE: STEP-level continue-on-error inside the guard -> REFUSE (the verification step "
         "goes red while the job reports green)",
         guard_gate_verdict(gate_ok_sample.replace(
-            "      - run: python3 scripts/dispatch-secrets-guard.py",
-            "      - run: python3 scripts/dispatch-secrets-guard.py\n"
-            "        continue-on-error: true"))[0], False)
+            "        env:\n          ALL_SECRETS:",
+            "        continue-on-error: true\n        env:\n          ALL_SECRETS:"))[0], False)
     chk("GATE: a comment mentioning continue-on-error is not one",
         guard_gate_verdict(gate_ok_sample.replace(
             "  secrets-guard:\n", "  secrets-guard:\n    # NO continue-on-error: true here\n")),
@@ -1535,11 +1994,157 @@ def _self_test():
             "jobs:",
             "  secrets-guard:",
             "    steps:",
-            "      - run: python3 scripts/dispatch-secrets-guard.py",
+            guard_run_block,
             "        env:",
             "          ALL_SECRETS: ${{ toJSON(secrets) }}"]))[0], False)
     chk("GATE: unparseable jobs block -> REFUSE",
         guard_gate_verdict("name: no jobs key here")[0], False)
+
+    # ---- RETRO-REVIEW OF #621, MUTATION (a): the guard job must RUN THE VERIFIER ----------------
+    # Replacing both `python3 registry/scripts/dispatch-secrets-guard.py` invocations in dispatch.yml
+    # with `true` left the ENTIRE enrolled suite green — every property above is satisfied by an
+    # EMPTY job of the right name. These are the assertions that make that mutation a red tick.
+    verdict_stub = guard_gate_verdict(gate_ok_sample.replace(
+        guard_run_block, "      - run: |\n          true\n          true"))
+    chk("GATE: the guard job runs `true` instead of the verifier -> REFUSE (#621 mutation (a): "
+        "gated, green, and verifying NOTHING)",
+        (verdict_stub[0], "VERIFIES NOTHING" in verdict_stub[1]), (False, True))
+    verdict_no_selftest = guard_gate_verdict(gate_ok_sample.replace(
+        "          python3 scripts/dispatch-secrets-guard.py --self-test\n", ""))
+    chk("GATE: the guard drops the `--self-test` invocation -> REFUSE (the static workflow-shape "
+        "assertions, this contract included, would stop running on every tick)",
+        (verdict_no_selftest[0], "--self-test" in verdict_no_selftest[1]), (False, True))
+    verdict_no_verify = guard_gate_verdict(gate_ok_sample.replace(
+        "          python3 scripts/dispatch-secrets-guard.py\n", "\n"))
+    chk("GATE: the guard drops the LIVE settings verification -> REFUSE (only the self-test would "
+        "run, so the repo-settings check the job exists for is gone)",
+        verdict_no_verify[0], False)
+    chk("GATE: an `if:`-conditional verifier step -> REFUSE (a skipped step still resolves the job "
+        "as SUCCESS for every dependent — the same fail-open shape as continue-on-error)",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "        env:\n          ALL_SECRETS:",
+            "        if: ${{ github.event_name == 'schedule' }}\n"
+            "        env:\n          ALL_SECRETS:"))[0], False)
+    chk("GATE: the `registry/` sparse-checkout path prefix the LIVE job uses is recognised",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "python3 scripts/dispatch-secrets-guard.py",
+            "python3 registry/scripts/dispatch-secrets-guard.py")), (True, "ok"))
+
+    # ---- RETRO-REVIEW OF #621, MUTATION (b): the success condition's POLARITY -------------------
+    # Flipping `always() && needs.secrets-guard.result == 'success'` to `||` at dispatch.yml:1227
+    # left the suite green — the old check was a SUBSTRING search, and the comparison is still
+    # present in the `||` form. The gate was inverted and "GATE (LIVE)" still passed.
+    verdict_or = guard_gate_verdict(gate_ok_sample.replace(
+        "    if: ${{ always() && needs.secrets-guard.result == 'success' }}",
+        "    if: ${{ always() || needs.secrets-guard.result == 'success' }}"))
+    chk("GATE: `always() || needs.secrets-guard.result == 'success'` -> REFUSE (#621 mutation (b): "
+        "the comparison is PRESENT and the gate is INVERTED)",
+        (verdict_or[0], "can evaluate TRUE" in verdict_or[1]), (False, True))
+    # The polarity evaluator, directly, over the shapes that matter. Accept only what a failed
+    # guard makes false.
+    for condition, admits in (
+            ("${{ always() && needs.secrets-guard.result == 'success' }}", False),
+            ("${{ needs.secrets-guard.result == 'success' && always() }}", False),
+            ("${{ always() && needs.secrets-guard.result=='success' }}", False),
+            ("${{ always() && needs . secrets-guard . result == \"success\" }}", False),
+            # a disjunction is admitted only when EVERY branch requires the guard
+            ("${{ (github.event_name == 'schedule' || github.event_name == 'push') && "
+             "needs.secrets-guard.result == 'success' }}", False),
+            ("${{ always() || needs.secrets-guard.result == 'success' }}", True),
+            ("${{ needs.secrets-guard.result == 'success' || always() }}", True),
+            ("${{ always() }}", True),
+            ("${{ !cancelled() }}", True),
+            ("${{ needs.secrets-guard.result != 'success' }}", True),
+            ("${{ always() && needs.plan.result == 'success' }}", True),
+            # negation of the requirement is not the requirement
+            ("${{ always() && !(needs.secrets-guard.result == 'success') }}", True)):
+        chk(f"if-polarity: {condition} admits a FAILED guard",
+            if_condition_admits(condition, GATE_SUCCESS_RE)[0], admits)
+    chk("if-polarity: an unparseable expression reports parsed=False and ADMITS (the gate "
+        "direction fails closed — an unreadable gate is not a proven gate)",
+        if_condition_admits("${{ always() && ( }}", GATE_SUCCESS_RE)[:2], (True, False))
+    chk("if-polarity: a literal/expression mix cannot be evaluated statically",
+        if_condition_admits("ref-${{ always() }}", GATE_SUCCESS_RE)[:2], (True, False))
+    chk("if-polarity: a bare (unwrapped) expression is evaluated too",
+        if_condition_admits("always() && needs.secrets-guard.result == 'success'",
+                            GATE_SUCCESS_RE)[0], False)
+
+    # ---- RETRO-REVIEW OF #621: the five PERMISSIVE MISPARSES of regex-over-YAML -----------------
+    # Each of these was verified GREEN against the merged #621 file. All five are now parse events,
+    # not pattern events: the value the assertion sees is the value GitHub sees.
+    chk('misparse 1: `"continue-on-error": true` (QUOTED key) -> REFUSE',
+        guard_gate_verdict(gate_ok_sample.replace(
+            "  secrets-guard:\n    runs-on:",
+            '  secrets-guard:\n    "continue-on-error": true\n    runs-on:'))[0], False)
+    chk("misparse 2: `continue-on-error : true` (space BEFORE the colon) -> REFUSE",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "  secrets-guard:\n    runs-on:",
+            "  secrets-guard:\n    continue-on-error : true\n    runs-on:"))[0], False)
+    chk('misparse 3: `"if": ${{ always() }}` (QUOTED key) -> REFUSE (the old anchored regex read '
+        "this as NO `if:` at all, which SKIPPED the polarity check entirely)",
+        guard_gate_verdict(gate_ok_sample.replace(
+            "    if: ${{ always() && needs.secrets-guard.result == 'success' }}",
+            '    "if": ${{ always() }}'))[0], False)
+    # misparse 4 has TWO shapes, because the exact one the retro-review used is not even valid YAML.
+    # A TAB before a comment is a YAML scanner error, so it now REFUSES naming the parse fault (it
+    # used to satisfy the needs check: the old ` #` tail strip required a SPACE, so the tab-prefixed
+    # `# secrets-guard` survived into `re.split(r"[\[\],\s]+", ...)` and appeared as a dependency).
+    misparse_tab = guard_gate_verdict(gate_ok_sample.replace(
+        "  claim:\n    needs: [plan, secrets-guard]",
+        "  claim:\n    needs: [plan]\t# secrets-guard"))
+    chk("misparse 4a: `needs: [plan]<TAB># secrets-guard` -> REFUSE, naming the YAML parse fault "
+        "(the old reader accepted the COMMENT as the dependency)",
+        (misparse_tab[0], "does not parse as YAML" in misparse_tab[1]), (False, True))
+    # ...and the valid-YAML sibling proves the property itself: a comment MENTIONING the guard is
+    # not a dependency on it, and the refusal names the job.
+    misparse_needs = guard_gate_verdict(gate_ok_sample.replace(
+        "  claim:\n    needs: [plan, secrets-guard]",
+        "  claim:\n    needs: [plan] # secrets-guard is deliberately not required here"))
+    chk("misparse 4b: a `# secrets-guard` COMMENT does not satisfy `needs:` -> REFUSE, job NAMED",
+        (misparse_needs[0], "claim" in misparse_needs[1]), (False, True))
+    chk("misparse 5: a `github/workflows/` sparse-checkout entry does NOT cover "
+        "`.github/workflows/dispatch.yml` -> REFUSE (lstrip('./') ate the leading dot of the "
+        "dotfile directory, so a typo that checks out NOTHING read as full coverage)",
+        sparse_checkout_covers_verdict(
+            "\n".join(["jobs:", "  secrets-guard:", "    steps:", "      - uses: checkout",
+                       "        with:", "          sparse-checkout: |",
+                       "            github/workflows/", "          x: y"]),
+            "secrets-guard", (".github/workflows/dispatch.yml",))[0], False)
+    chk("normalize_repo_path: a leading ./ is stripped and a dotfile directory is NOT",
+        (normalize_repo_path("./scripts/x.py"), normalize_repo_path(".github/workflows/d.yml"),
+         normalize_repo_path("././a/b"), normalize_repo_path("a\\b"), normalize_repo_path(".env")),
+        ("scripts/x.py", ".github/workflows/d.yml", "a/b", "a/b", ".env"))
+    chk("normalize_repo_path is NOT lstrip('./') — the old expression on the very path that broke",
+        (normalize_repo_path(".github/workflows/dispatch.yml"),
+         ".github/workflows/dispatch.yml".lstrip("./")),
+        (".github/workflows/dispatch.yml", "github/workflows/dispatch.yml"))
+    # ...and the accept direction still holds, so the fix is not simply "refuse everything".
+    chk("misparse 5 (accept): the CORRECT `.github/workflows/` entry still covers the file",
+        sparse_checkout_covers_verdict(
+            "\n".join(["jobs:", "  secrets-guard:", "    steps:", "      - uses: checkout",
+                       "        with:", "          sparse-checkout: |",
+                       "            .github/workflows/", "          x: y"]),
+            "secrets-guard", (".github/workflows/dispatch.yml",)), (True, "ok"))
+    # A REFLOWED-but-equivalent dispatch.yml must yield the same verdicts (#619's precedent): the
+    # gate contract is now a property of the parsed document, not of the file's whitespace.
+    _yaml = _yaml_module()
+    reflowed_dispatch = _yaml.safe_dump(
+        _yaml.safe_load(live_docs.get("dispatch.yml", "")), default_flow_style=False, width=10000)
+    chk("GATE (LIVE, REFLOWED): a re-serialised dispatch.yml yields the same gate verdict — the "
+        "contract is on the PARSED document, not on its indentation",
+        guard_gate_verdict(reflowed_dispatch), (True, "ok"))
+    chk("GATE (LIVE, REFLOWED): the reflow fixture is NON-VACUOUS — the exact 10-space "
+        "`sparse-checkout: |` literal the old reader addressed by is gone from the reflow, and a "
+        "single-quoted flow scalar stands where the block scalar was",
+        ("          sparse-checkout: |" in reflowed_dispatch,
+         "        sparse-checkout: 'scripts/dispatch-secrets-guard.py" in reflowed_dispatch),
+        (False, True))
+    chk("sparse checkout (LIVE, REFLOWED): the coverage assertion survives a reflow too",
+        sparse_checkout_covers_verdict(reflowed_dispatch, "secrets-guard",
+                                       SELF_TEST_LIVE_INPUTS), (True, "ok"))
+    chk("GATE: a QUOTED job key is seen by BOTH readers or the verdict REFUSES (the parsed and "
+        "line-parsed job sets must agree — a job only one reader sees escapes the other's checks)",
+        guard_gate_verdict(gate_ok_sample.replace("  claim:\n", '  "claim":\n'))[0], False)
     # LIVE: dispatch.yml itself. This is the assertion that would have caught issue #618 on the
     # day the continue-on-error line landed, and it goes red the moment it comes back.
     chk("GATE (LIVE): dispatch.yml's guard carries no continue-on-error and every "
@@ -1640,6 +2245,54 @@ def _self_test():
         live_rotation_write = (False, "worker-live.sh unreadable (fail closed)")
     chk("script: the rotation write-back writes into the dispatch-secrets ENVIRONMENT",
         live_rotation_write, (True, "ok"))
+
+    # ---- the ROTATION WRITE-BACK must be REACHABLE FROM THE FAILURE PATH (retro-review of #614) --
+    # LIVE, both lanes: worker.yml and review-fix.yml each gated this step on
+    # `steps.prepare.outcome == 'success'` — the success of the very step whose pre-flight CONSUMES
+    # the one-time-use refresh token. This is the assertion that makes restoring that guard red.
+    chk("WRITE-BACK (LIVE): the rotation write-back is reachable when the credential-prepare step "
+        "FAILED, in every lane that runs it (#614: a compensating action gated on the success of "
+        "the step it compensates for is no compensation at all)",
+        rotation_writeback_reachable_verdict(live_docs), (True, "ok"))
+    # THE MUTANT: success-only reachability, exactly as #614 shipped it. Both lanes, independently.
+    for lane in ("worker.yml", "review-fix.yml"):
+        mutant_docs = dict(live_docs)
+        mutant_docs[lane] = mutant_docs[lane].replace(
+            "steps.selected.outcome == 'success'", "steps.prepare.outcome == 'success'")
+        chk(f"WRITE-BACK: {lane} reverted to `steps.prepare.outcome == 'success'` -> REFUSE "
+            "(one-time-use grant spent, rotated grant discarded, account permanently dead)",
+            rotation_writeback_reachable_verdict(mutant_docs)[0], False)
+    # A step-level `if:` that merely MENTIONS the prepare step is not the same as requiring it — the
+    # polarity evaluation, not a substring test, decides (same primitive as the gate contract).
+    for condition, reachable in (
+            (None, True),
+            ("${{ always() }}", True),
+            ("${{ always() && steps.selected.outcome == 'success' }}", True),
+            ("${{ always() && steps.prepare.outcome == 'success' }}", False),
+            ("${{ steps.prepare.conclusion == 'success' }}", False),
+            ("${{ always() && steps.prepare.outcome != 'success' }}", True),
+            ("${{ always() && (steps.prepare.outcome == 'success' || "
+             "steps.preflight.outputs.rotated == 'true') }}", True)):
+        synthetic = ["jobs:", "  run:", "    steps:"]
+        if condition is not None:
+            synthetic.append(f"      - if: {condition}")
+            synthetic.append("        run: bash registry/scripts/worker-live.sh write-back")
+        else:
+            synthetic.append("      - run: bash registry/scripts/worker-live.sh write-back")
+        chk(f"WRITE-BACK: `if: {condition}` keeps the write-back reachable on a prepare FAILURE",
+            rotation_writeback_reachable_verdict({"w.yml": "\n".join(synthetic)})[0], reachable)
+    chk("WRITE-BACK: zero write-back steps anywhere -> REFUSE (a renamed step must not make this "
+        "assertion pass vacuously)",
+        rotation_writeback_reachable_verdict(
+            {"w.yml": "jobs:\n  run:\n    steps:\n      - run: true\n"})[0], False)
+    chk("WRITE-BACK: an UNPARSEABLE condition on the write-back step -> REFUSE (unlike the gate, "
+        "an unprovable reachability fails toward the refusal: an unpersisted rotation is "
+        "unrecoverable)",
+        rotation_writeback_reachable_verdict(
+            {"w.yml": "\n".join(["jobs:", "  run:", "    steps:",
+                                 "      - if: ${{ always() && ( }}",
+                                 "        run: bash scripts/worker-live.sh write-back"])})[0],
+        False)
 
     # IDEMPOTENT-RESUME credential-existence contract (#211; review round 1 of #533): the
     # reconcile step must NEVER grant resume=true on the say-so of a secret_ref LINE — an

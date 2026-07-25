@@ -1827,28 +1827,23 @@ write_back() {
   local registry_repo=${REGISTRY_REPO:-}
   local pat=${REGISTRY_SECRETS_PAT:-}
   [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
-  [[ "$current" == "$worker_root"/* && "$baseline" == "$worker_root"/* ]] ||
-    die 'credential paths escaped WORKER_ROOT'
-  [[ -f "$current" && ! -L "$current" && -f "$baseline" && ! -L "$baseline" ]] ||
-    die 'credential comparison files are missing or unsafe'
   [[ "$account" =~ ^acct[0-9a-z]{2,}$ ]] || die 'unsafe account handle'
   [[ "$secret_ref" == "${account^^}_TOKEN" ]] || die 'secret reference does not match claimed account'
   [[ "$registry_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe registry repo'
-  # --- TAMPER CHECK (issue #134, KEPT and now standalone). The mounted credential is bind-mounted
-  # read-only, so it MUST come back byte-identical to what worker-prep materialized. If it does not,
-  # the containment that stops a prompt-injected model from poisoning the central ACCTNN_TOKEN secret
-  # has failed — refuse to write ANYTHING back. This check is no longer the rotation TRIGGER (it
-  # could never fire as one: the read-only mount makes change impossible, so `rotated` was
-  # structurally pinned to false and the lane could never self-heal — issue #596). It remains
-  # load-bearing as a containment assertion. ---
-  if ! cmp -s -- "$baseline" "$current"; then
-    write_output rotated false
-    die 'mounted account credential was MUTATED during the run; refusing any write-back (containment failure)'
-  fi
-  # --- ROTATION TRIGGER (issue #596): whether the HOST-SIDE pre-flight produced NEW DURABLE
-  # material. worker-prep writes the rotated credential + its marker directly under WORKER_ROOT
-  # (never under $WORKER_ROOT/home, the only part of the tree the container sees), so the refresh
-  # token being persisted here was never reachable from inside the model container. ---
+  # --- ROTATION TRIGGER, CHECKED FIRST (issue #596; the ORDER is the retro-review fix for #614):
+  # whether the HOST-SIDE pre-flight produced NEW DURABLE material. worker-prep writes the rotated
+  # credential, its format, and its marker directly under WORKER_ROOT (never under
+  # $WORKER_ROOT/home, the only part of the tree the container sees), so the refresh token persisted
+  # here was never reachable from inside the model container.
+  #
+  # WHY IT MOVED AHEAD OF THE MOUNT CHECKS. worker.yml / review-fix.yml no longer gate this step on
+  # `steps.prepare.outcome == 'success'`: the pre-flight consumes the ONE-TIME-USE grant EARLY inside
+  # prepare, so a later failure there used to discard the rotated replacement and leave the account
+  # permanently dead. But an early prepare abort ALSO means there is no mounted credential and no
+  # $GITHUB_ENV export, so WORKER_CREDENTIAL_PATH / _BASELINE / _FORMAT are simply absent —
+  # validating them first turned the rescued case into `die 'credential paths escaped WORKER_ROOT'`,
+  # i.e. the same lost grant one error message further on. So: first decide whether anything needs
+  # persisting, then assert the contract that actually applies. ---
   local durable="$worker_root/.credential-durable"
   local rotated_marker="$worker_root/.credential-rotated"
   if [[ ! -f "$rotated_marker" || -L "$rotated_marker" ]]; then
@@ -1858,6 +1853,42 @@ write_back() {
   fi
   [[ -f "$durable" && ! -L "$durable" ]] ||
     die 'rotation marker is present but the durable credential is missing or unsafe'
+  # --- TAMPER CHECK (issue #134, KEPT and now standalone). The mounted credential is bind-mounted
+  # read-only, so it MUST come back byte-identical to what worker-prep materialized. If it does not,
+  # the containment that stops a prompt-injected model from poisoning the central ACCTNN_TOKEN secret
+  # has failed — refuse to write ANYTHING back. This check is no longer the rotation TRIGGER (it
+  # could never fire as one: the read-only mount makes change impossible, so `rotated` was
+  # structurally pinned to false and the lane could never self-heal — issue #596). It remains
+  # load-bearing as a containment assertion.
+  #
+  # Asserted whenever a mount was DECLARED; skipped ONLY when neither path is declared — prepare
+  # aborted before materializing anything, so no container ever ran and there is no containment claim
+  # to make. A HALF-declared pair, or a declared path that is missing or a symlink, still dies: that
+  # is a shape nothing legitimate produces. What gets written back is `$durable`, host-side material
+  # the container could never read, so persisting it in the no-mount case adds no exposure — while
+  # refusing costs the account. ---
+  if [[ -n "$current" || -n "$baseline" ]]; then
+    [[ "$current" == "$worker_root"/* && "$baseline" == "$worker_root"/* ]] ||
+      die 'credential paths escaped WORKER_ROOT'
+    [[ -f "$current" && ! -L "$current" && -f "$baseline" && ! -L "$baseline" ]] ||
+      die 'credential comparison files are missing or unsafe'
+    if ! cmp -s -- "$baseline" "$current"; then
+      write_output rotated false
+      die 'mounted account credential was MUTATED during the run; refusing any write-back (containment failure)'
+    fi
+  else
+    printf '%s\n' '::warning::The credential pre-flight rotated this account host-side and worker-prep then aborted before materializing the container mount. Persisting the rotated credential anyway: the provider has already consumed the previous refresh token, so discarding its replacement would leave the account permanently unable to authenticate (registry #614). No container ran, so no mount-containment assertion applies.'
+  fi
+  # The FORMAT normally arrives through $GITHUB_ENV, which worker-prep exports at the very END — long
+  # after the pre-flight consumed the grant. Fall back to the host-side record worker-prep writes
+  # alongside the rotation marker, so an early prepare abort still knows how to validate the material
+  # it is persisting. An unrecognised value still fails closed in the case statement below.
+  if [[ -z "$format" ]]; then
+    local format_file="$worker_root/.credential-format"
+    if [[ -f "$format_file" && ! -L "$format_file" ]]; then
+      format=$(head -n1 -- "$format_file" | tr -cd 'a-z-')
+    fi
+  fi
   if [[ -z "$pat" ]]; then
     write_output rotated true
     printf '%s\n' '::warning::Account credential rotated host-side, but REGISTRY_SECRETS_PAT is absent; skipping write-back. This run authenticates, but the rotated refresh token is NOT persisted — provider refresh tokens are one-time-use, so the NEXT run on this account will need a re-mint (or the PAT).'
@@ -2939,6 +2970,104 @@ FAKE
   chk "write_back tamper path reports rotated=false" \
     "$(grep -c '^rotated=false$' "$wb_out4" || true)" "1"
 
+  # --- (4) THE RESCUED FAILURE PATH (retro-review of #614). worker-prep's pre-flight consumed the
+  # ONE-TIME-USE grant and wrote the rotated replacement + its format + the marker, and prepare THEN
+  # died before materializing the mount and before the $GITHUB_ENV export. So WORKER_CREDENTIAL_PATH
+  # / _BASELINE / _FORMAT are all ABSENT. Before this fix the workflow skipped write-back entirely
+  # (`steps.prepare.outcome == 'success'`) and, had it not, write_back died on `credential paths
+  # escaped WORKER_ROOT`. Either way the only copy of the new grant went to the bin with the runner
+  # and the account was permanently dead. It must now PERSIST, warn about why, take the format from
+  # the host-side record, and still never echo the material. ---
+  local wbroot5="$tmp/wbroot-noenv" wb_out5="$tmp/wb5-github-output" wb5_rc
+  mkdir -p "$wbroot5" "$tmp/wbcap5"
+  printf '{"tokens":{"refresh_token":"ROTATED-SENTINEL-NOENV"}}' > "$wbroot5/.credential-durable"
+  printf 'codex-auth-json\n' > "$wbroot5/.credential-format"
+  printf 'rotated\n' > "$wbroot5/.credential-rotated"
+  : > "$wb_out5"
+  if (
+    export WORKER_ROOT="$wbroot5" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out5" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap5"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb5.log" 2>&1; then wb5_rc=0; else wb5_rc=$?; fi
+  chk "write_back PERSISTS a host-side rotation when prepare aborted before the mount existed" \
+    "$wb5_rc" "0"
+  chk "write_back (prepare aborted) still writes to the dispatch-secrets ENVIRONMENT" \
+    "$(cat "$tmp/wbcap5/argv" 2>/dev/null)" \
+    "secret set ACCTEXAMPLE_TOKEN --repo o/r --env dispatch-secrets"
+  chk "write_back (prepare aborted) streams the ROTATED durable credential" \
+    "$(cat "$tmp/wbcap5/stdin" 2>/dev/null)" \
+    '{"tokens":{"refresh_token":"ROTATED-SENTINEL-NOENV"}}'
+  chk "write_back (prepare aborted) reports rotated=true" \
+    "$(grep -c '^rotated=true$' "$wb_out5" || true)" "1"
+  chk "write_back (prepare aborted) says WHY it proceeded without the mount contract" \
+    "$(grep -c '^::warning::The credential pre-flight rotated this account host-side' "$tmp/wb5.log" || true)" "1"
+  chk "write_back (prepare aborted) never echoes the rotated credential" \
+    "$(grep -c 'ROTATED-SENTINEL-NOENV' "$tmp/wb5.log" || true)" "0"
+  chk "write_back (prepare aborted) never echoes the account secret reference" \
+    "$(grep -c 'ACCTEXAMPLE_TOKEN\|acctexample' "$tmp/wb5.log" || true)" "0"
+  # ...and with NO rotation the same env-less invocation is still a clean no-op, never a failure:
+  # this is the ordinary shape of every run where prepare failed before the pre-flight even ran.
+  local wbroot6="$tmp/wbroot-noenv-norot" wb_out6="$tmp/wb6-github-output" wb6_rc
+  mkdir -p "$wbroot6" "$tmp/wbcap6"
+  : > "$wb_out6"
+  if (
+    export WORKER_ROOT="$wbroot6" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out6" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap6"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb6.log" 2>&1; then wb6_rc=0; else wb6_rc=$?; fi
+  chk "write_back (prepare aborted, NO rotation) is a clean rotated=false no-op" \
+    "$wb6_rc:$(grep -c '^rotated=false$' "$wb_out6" || true)" "0:1"
+  chk "write_back (prepare aborted, NO rotation) never invokes gh" \
+    "$([[ -e "$tmp/wbcap6/argv" ]] && printf called || printf uncalled)" "uncalled"
+  # The containment assertion is SKIPPED only when NEITHER mount path is declared. A HALF-declared
+  # pair is a shape nothing legitimate produces, so it must still die rather than silently skip the
+  # tamper check — otherwise "unset one variable" becomes a way past issue #134's containment.
+  local wbroot7="$tmp/wbroot-half" wb_out7="$tmp/wb7-github-output" wb7_rc
+  mkdir -p "$wbroot7" "$tmp/wbcap7"
+  printf 'POISONED-BY-THE-MODEL' > "$wbroot7/current"
+  printf '{"tokens":{"refresh_token":"ROTATED-SENTINEL-HALF"}}' > "$wbroot7/.credential-durable"
+  printf 'codex-auth-json\n' > "$wbroot7/.credential-format"
+  printf 'rotated\n' > "$wbroot7/.credential-rotated"
+  : > "$wb_out7"
+  if (
+    export WORKER_ROOT="$wbroot7" WORKER_CREDENTIAL_PATH="$wbroot7/current" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out7" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap7"
+    unset WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb7.log" 2>&1; then wb7_rc=0; else wb7_rc=$?; fi
+  chk "write_back FAILS closed on a HALF-declared mount pair (the tamper check is not optional)" \
+    "$([[ "$wb7_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "write_back half-declared path never invokes gh" \
+    "$([[ -e "$tmp/wbcap7/argv" ]] && printf called || printf uncalled)" "uncalled"
+  # An unrecognised host-side format record must fail closed, not smuggle unvalidated material into
+  # the central secret (the format drives WHICH validation the durable document gets).
+  local wbroot8="$tmp/wbroot-badfmt" wb_out8="$tmp/wb8-github-output" wb8_rc
+  mkdir -p "$wbroot8" "$tmp/wbcap8"
+  printf 'not-a-real-format\n' > "$wbroot8/.credential-format"
+  printf 'ROTATED-SENTINEL-BADFMT' > "$wbroot8/.credential-durable"
+  printf 'rotated\n' > "$wbroot8/.credential-rotated"
+  : > "$wb_out8"
+  if (
+    export WORKER_ROOT="$wbroot8" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out8" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap8"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb8.log" 2>&1; then wb8_rc=0; else wb8_rc=$?; fi
+  chk "write_back FAILS closed on an unrecognised host-side credential format" \
+    "$([[ "$wb8_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "write_back unrecognised-format path never invokes gh" \
+    "$([[ -e "$tmp/wbcap8/argv" ]] && printf called || printf uncalled)" "uncalled"
+
   # --- HOST-SIDE PRE-FLIGHT, end to end through the REAL worker-prep.sh (issue #596). Hermetic:
   # a stubbed CLI binary skips the npm install, and every fixture reaches its outcome with ZERO
   # network egress (a comfortably-valid access token exchanges nothing; an empty stored refresh token
@@ -3050,6 +3179,127 @@ print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/h
     "$(grep -c 'credential-remint-required' "$tmp/pf-transient.log" || true)" "0"
   chk "(f) the transient class reaches GITHUB_ENV" \
     "$(grep -c '^WORKER_EXIT_CLASS=credential-refresh-transient$' "$pf3_env" || true)" "1"
+
+  # --- (h) a SUCCESSFUL host-side ROTATION, end to end through the REAL worker-prep.sh, then the
+  # REAL write_back over the artifacts it left behind (retro-review of #614). Until this case the
+  # pre-flight was only exercised on its FAILURE paths, so nothing proved that the artifacts the
+  # rescued write-back depends on — the durable material, the FORMAT record, the rotation marker —
+  # are actually produced, nor that they are produced BEFORE the rest of prepare can fail. Hermetic:
+  # a one-shot loopback token endpoint on an ephemeral port through the LOOPBACK-ONLY override seam;
+  # no network egress, no fixture reaches the real provider. ---
+  cat > "$tmp/pf-token-server.py" <<'PY'
+import base64
+import http.server
+import json
+import sys
+import time
+
+port_file, request_file = sys.argv[1], sys.argv[2]
+
+
+def enc(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        with open(request_file, "wb") as handle:
+            handle.write(body)
+        access = (enc(json.dumps({"alg": "RS256"}).encode()) + "."
+                  + enc(json.dumps({"exp": int(time.time()) + 864000}).encode()) + ".sig")
+        payload = json.dumps({"access_token": access,
+                              "refresh_token": "REFRESH-TOKEN-SENTINEL-ROTATED",
+                              "id_token": "ID_TOKEN_ROTATED"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_args):
+        return
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_port))
+server.handle_request()
+PY
+  local pfroot5="$tmp/pf-rotate" pf5_rc pf5_env="$tmp/pf-rotate.env"
+  local pf5_port_file="$tmp/pf-rotate.port" pf5_request="$tmp/pf-rotate.request" pf5_port=""
+  rm -f -- "$pf5_port_file" "$pf5_request"
+  python3 "$tmp/pf-token-server.py" "$pf5_port_file" "$pf5_request" \
+    > "$tmp/pf-rotate-server.log" 2>&1 &
+  local pf5_server_pid=$!
+  local pf5_wait=0
+  while [[ ! -s "$pf5_port_file" && "$pf5_wait" -lt 100 ]]; do
+    sleep 0.05
+    pf5_wait=$((pf5_wait + 1))
+  done
+  pf5_port=$(cat "$pf5_port_file" 2>/dev/null || true)
+  chk "(h) the hermetic loopback token endpoint came up on an ephemeral port" \
+    "$([[ "$pf5_port" =~ ^[0-9]+$ ]] && printf up || printf down)" "up"
+  pf_cred=$(_preflight_fixture "$pfroot5" -3600 'REFRESH-TOKEN-SENTINEL-ORIGINAL')
+  : > "$pf5_env"
+  if (
+    export WORKER_ROOT="$pfroot5" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf5_env" \
+           REGISTRY_TOKEN_ENDPOINT_OVERRIDE="http://127.0.0.1:$pf5_port/oauth/token"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-rotate.log" 2>&1; then pf5_rc=0; else pf5_rc=$?; fi
+  wait "$pf5_server_pid" 2>/dev/null || true
+  chk "(h) the pre-flight completes against a rotating token endpoint" "$pf5_rc" "0"
+  chk "(h) the pre-flight reports refreshed=true rotated=true" \
+    "$(grep -c 'pre-flight complete (refreshed=true, rotated=true)' "$tmp/pf-rotate.log" || true)" "1"
+  chk "(h) the ORIGINAL one-time-use grant was transmitted EXACTLY ONCE, verbatim" \
+    "$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["refresh_token"])' "$pf5_request" 2>&1)" \
+    "REFRESH-TOKEN-SENTINEL-ORIGINAL"
+  chk "(h) the ROTATION MARKER is written host-side" \
+    "$([[ -f "$pfroot5/.credential-rotated" ]] && printf marked || printf missing)" "marked"
+  # THE #614 ARTIFACT: the format lands WITH the marker, not with the $GITHUB_ENV export at the very
+  # end of prepare — so a prepare abort in between still leaves write_back able to validate the
+  # rotated material it must persist.
+  chk "(h) the CREDENTIAL FORMAT is recorded host-side alongside the marker" \
+    "$(cat "$pfroot5/.credential-format" 2>/dev/null)" "codex-auth-json"
+  chk "(h) the format record is mode 600" \
+    "$(stat -c '%a' "$pfroot5/.credential-format" 2>/dev/null)" "600"
+  chk "(h) the DURABLE material carries the ROTATED refresh token" \
+    "$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' \
+      "$pfroot5/.credential-durable" 2>&1)" "REFRESH-TOKEN-SENTINEL-ROTATED"
+  chk "(h) NEITHER refresh token appears anywhere under the mounted worker HOME" \
+    "$(grep -rlc 'REFRESH-TOKEN-SENTINEL-ROTATED\|REFRESH-TOKEN-SENTINEL-ORIGINAL' \
+      "$pfroot5/home" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  chk "(h) no token material reaches the PUBLIC prep log" \
+    "$(grep -c 'REFRESH-TOKEN-SENTINEL' "$tmp/pf-rotate.log" || true)" "0"
+  # ...and the REAL write_back over those artifacts, with the mount env DELIBERATELY UNSET, i.e. the
+  # exact state an abort between the rotation and the $GITHUB_ENV export leaves behind.
+  local wb_g_out="$tmp/wb-g-github-output" wbg_rc
+  mkdir -p "$tmp/wbcapg"
+  : > "$wb_g_out"
+  if (
+    export WORKER_ROOT="$pfroot5" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_g_out" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcapg"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb-g.log" 2>&1; then wbg_rc=0; else wbg_rc=$?; fi
+  chk "(h) write_back persists the REAL rotated credential with the mount env absent" \
+    "$wbg_rc:$(grep -c '^rotated=true$' "$wb_g_out" || true)" "0:1"
+  chk "(h) what reaches the account secret is the ROTATED durable document" \
+    "$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcapg/stdin" 2>&1)" \
+    "REFRESH-TOKEN-SENTINEL-ROTATED"
+  chk "(h) write_back never echoes either token" \
+    "$(grep -c 'REFRESH-TOKEN-SENTINEL' "$tmp/wb-g.log" || true)" "0"
 
   # HONESTY of the classification: a prep failure that is NOT a refresh failure (here a malformed
   # stored credential) must classify NOTHING — downstream then records the truthful `unknown`
