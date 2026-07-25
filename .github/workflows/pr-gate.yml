@@ -82,7 +82,8 @@ jobs:
           suite="policy-resolve.py route-resolve.py ready-issues.py curate-frontier.py dispatch-plan.py \
           plan-snapshot.py resolve-conflicts.py triage.py park_policy.py gh_retry.py \
           dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
-          account-usage.py usage-alert.py model-health.py plan-alert.py groom-alert.py pat-validity.py broker-refresh.py \
+          account-usage.py usage-alert.py model-health.py plan-alert.py groom-alert.py \
+          alert_route.py retriage-alert.py pat-validity.py broker-refresh.py \
           backfill-provenance.py dashboard-gen.py trust-gate.py dispatch-secrets-guard.py"
           for s in $suite; do
             # An enrolled script that is MISSING is a hard failure (sol r3 on #227): the

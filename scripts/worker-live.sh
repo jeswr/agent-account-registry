@@ -752,11 +752,11 @@ run_gate() {
 # advertised --self-test entrypoint enrolls it automatically instead of requiring a conflict-prone
 # edit here. Keep exclusions explicit and exceptional: a denylisted self-test gets no trust credit.
 SELFTEST_DENYLIST=""
-EXPECTED_SELFTEST_SUITE="account-usage.py backfill-provenance.py broker-refresh.py \
+EXPECTED_SELFTEST_SUITE="account-usage.py alert_route.py backfill-provenance.py broker-refresh.py \
 curate-frontier.py dashboard-gen.py dispatch-claim.py dispatch-plan.py dispatch-secrets-guard.py \
 gh_retry.py groom-alert.py groom.py ledger-invariant.py ledger_retry.py metrics.py migrate-secrets.sh \
 model-health.py park_policy.py pat-validity.py plan-alert.py plan-snapshot.py policy-resolve.py ready-issues.py \
-resolve-conflicts.py retriage.py route-resolve.py select-and-claim.py triage.py trust-gate.py \
+resolve-conflicts.py retriage-alert.py retriage.py route-resolve.py select-and-claim.py triage.py trust-gate.py \
 usage-alert.py worker-issue.py worker-live.sh worker-pr.py"
 
 _derive_full_selftest_suite() {

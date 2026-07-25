@@ -65,3 +65,72 @@ jobs:
             gh issue edit "$number" -R "$REPO" "${args[@]}"
             echo "promoted #$number"
           done < "$tmp/issues.jsonl"
+
+  # FAIL-LOUD alert for a HARD RETRIAGE failure (issue #577). Retriage is the ONLY path that returns
+  # `status:untriaged` issues to dispatch (issue #415, built to end the stranding outage #414
+  # measured), and until now it had NO alert leg at all — unlike the dispatch PLAN cron
+  # (scripts/plan-alert.py) and the groom cron (scripts/groom-alert.py). A `gh issue edit`
+  # permission error, a `gh`/`jq` shape change or a `retriage.py --self-test` regression aborts the
+  # sweep under `set -euo pipefail` — possibly PART-WAY through, with some issues promoted and the
+  # rest stranded — and the only signal is the untriaged count growing on the dashboard. The
+  # dashboard keepalive does not cover it either: it re-dispatches workflows whose last run is
+  # STALE, and a cron that runs punctually every tick and FAILS every time is never stale.
+  #
+  # This standalone job keys on `needs.retriage.result` and, on failure/cancelled, upserts a rolling
+  # `ops-alert` issue @-mentioning the maintainer via the SAME ALERT_REPO/ALERT_TOKEN routing
+  # (locked decision 22c) — ONE alert issue, re-used, never one per tick; it auto-closes on an
+  # explicit RETRIAGE success. It reads only the job RESULT, so no issue content reaches it.
+  retriage-alert:
+    name: ALERT (hard RETRIAGE-sweep failure)
+    needs: [retriage]
+    # Runs every tick regardless of the sweep result so a healthy sweep can auto-close a prior
+    # alert; scripts/retriage-alert.py keys on needs.retriage.result — close happens ONLY on an
+    # explicit success (a skipped RETRIAGE is not a recovery), and a success tick with no open alert
+    # does only a bare `gh issue list`, so a green tick stays cheap and side-effect-free. Without
+    # this always() GitHub implicitly success()-gates the job and the FAILING tick — the only one
+    # that matters — would skip the alert entirely.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): this job reads ALERT_TOKEN/ALERT_REPO (the private-alert
+    # routing secrets), so — like the groom-alert job — it is bound to the default-branch-only
+    # `dispatch-secrets` environment where those secrets live. It only ever runs from the default
+    # branch (schedule/workflow_dispatch), so the branch policy never starves it.
+    environment: dispatch-secrets
+    permissions:
+      contents: read  # minimum for the sparse checkout below — the job runs a script from the repo
+      issues: write   # upsert/close the rolling retriage-failure ops-alert issue
+    steps:
+      # The alert logic lives in scripts/retriage-alert.py plus the shared destination router
+      # scripts/alert_route.py — only those two files are needed, so sparse-checkout scopes the
+      # working copy to them, pinned and with no persisted token. Dropping alert_route.py from this
+      # list makes the script die loudly rather than guess at the routing decision.
+      - name: Check out ONLY the alert scripts (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/retriage-alert.py
+            scripts/alert_route.py
+          sparse-checkout-cone-mode: false
+
+      - name: Alert maintainer that the scheduled RETRIAGE sweep hard-failed
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          RETRIAGE_RESULT: ${{ needs.retriage.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c, issue #39): scripts/alert_route.py routes to a
+          # maintainer-set PRIVATE ALERT_REPO only when ALERT_TOKEN can write there; otherwise the
+          # registry repo under the ambient token. The body carries NO account handles (it reports
+          # only the sweep RESULT + run link), so that fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/alert_route.py --self-test
+          python3 registry/scripts/retriage-alert.py --self-test
+          python3 registry/scripts/retriage-alert.py
