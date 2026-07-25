@@ -166,10 +166,10 @@ class GitHubAPI:
             return self.tokens.get(parts[1], "")
         return next(iter(self.tokens.values()), "")
 
-    def request(self, method, url, body=None):
+    def request(self, method, url, body=None, token=None):
         if url.startswith("/"):
             url = API_ROOT + url
-        token = self._token_for_url(url)
+        token = token or self._token_for_url(url)
         if not token:
             raise ResolverError(f"no target App token for {urlparse(url).path}")
         payload = None if body is None else json.dumps(body).encode("utf-8")
@@ -241,6 +241,21 @@ class GitHubAPI:
     def add_label(self, repo, number, label):
         return self.request(
             "POST", f"/repos/{repo}/issues/{number}/labels", {"labels": [label]}
+        )
+
+    def graphql(self, repo, query, variables):
+        """A GraphQL POST scoped to `repo`'s OWNER token (issue #684).
+
+        The repo is EXPLICIT rather than derived from the URL: `_token_for_url` resolves the
+        token from a `/repos/<owner>/...` path, and `/graphql` has no such path, so it would
+        fall through to `next(iter(self.tokens.values()))` — an arbitrary owner's token. In a
+        multi-target sweep that is the wrong credential, and it would fail (or, worse, act) on
+        the wrong installation."""
+        token = self.tokens.get(repo.split("/", 1)[0], "")
+        if not token:
+            raise ResolverError(f"no target App token for {repo}")
+        return self.request(
+            "POST", "/graphql", {"query": query, "variables": variables}, token=token
         )
 
     def app_identity(self, bot_slug):
@@ -537,6 +552,80 @@ class ConflictResolver:
         if self.apply:
             self.api.comment(repo, number, body)
 
+    def _merge_latch_state(self, repo, number):
+        """Live ``(node_id, queued, auto_merge_requested)`` — issue #684, fail-closed on shape.
+
+        Mirrors worker-pr `_merge_latch_state` and groom `_merge_latch_state`: BOTH latch forms
+        come from ONE authoritative GraphQL read, and the REST `auto_merge` field is never the
+        deciding signal (it lags a disable). An unreadable answer raises — an unproven latch is
+        not an absent latch."""
+        owner, name = repo.split("/", 1)
+        document = self.api.graphql(
+            repo,
+            "query($owner:String!,$name:String!,$number:Int!){"
+            "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+            "id mergeQueueEntry{id} autoMergeRequest{enabledAt}}}}",
+            {"owner": owner, "name": name, "number": number},
+        )
+        pull = None
+        if isinstance(document, dict):
+            data = document.get("data")
+            repository = data.get("repository") if isinstance(data, dict) else None
+            pull = repository.get("pullRequest") if isinstance(repository, dict) else None
+        if (
+            not isinstance(pull, dict)
+            or not isinstance(pull.get("id"), str)
+            or not pull["id"]
+            or "mergeQueueEntry" not in pull
+            or "autoMergeRequest" not in pull
+            or (pull["mergeQueueEntry"] is not None
+                and not isinstance(pull["mergeQueueEntry"], dict))
+            or (pull["autoMergeRequest"] is not None
+                and not isinstance(pull["autoMergeRequest"], dict))
+        ):
+            raise ResolverError(
+                f"conflicting pull request merge-latch state is unknown for {repo}#{number}"
+            )
+        return (
+            pull["id"],
+            pull["mergeQueueEntry"] is not None,
+            pull["autoMergeRequest"] is not None,
+        )
+
+    def _park_retract(self, repo, action, node_id):
+        """One latch-retraction mutation for `disarm_before_park` (issue #684)."""
+        if action == _park_policy.PARK_DISARM_DEQUEUE:
+            query = "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}"
+        elif action == _park_policy.PARK_DISARM_DISABLE_AUTO:
+            query = (
+                "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id})"
+                "{clientMutationId}}"
+            )
+        else:
+            raise ResolverError(f"unknown park disarm action {action}")
+        self.api.graphql(repo, query, {"id": node_id})
+
+    def _disarm_before_park(self, repo, number, park):
+        """Apply `park` only after PROVING `repo#number` has no live auto-merge latch (#684).
+
+        A conflicting PR normally cannot merge — but `mergeable is False` is a transient
+        property, and an auto-merge latch SURVIVES the conflict being resolved. So a
+        conflict-escalation park that leaves the latch on hands the crate to a sibling (once
+        #683 releases it on the `needs:user` label) and then merges the moment the base moves
+        and the conflict clears. Raises ResolverError on any unprovable latch — `run`'s per-PR
+        handler records that as a loud error and moves to the next PR, leaving this one
+        UNPARKED-AND-ARMED, which is the prior, known-safe state."""
+        try:
+            return _park_policy.disarm_before_park(
+                repo,
+                number,
+                lambda: self._merge_latch_state(repo, number),
+                lambda action, node_id: self._park_retract(repo, action, node_id),
+                park,
+            )
+        except _park_policy.ParkDisarmError as exc:
+            raise ResolverError(" ".join(str(exc).split())) from exc
+
     def _escalate(self, repo, pr, comments, conflicts):
         number = pr["number"]
         bodies = _comment_bodies(_self_authored_comments(comments, self.bot_login))
@@ -563,7 +652,16 @@ class ConflictResolver:
                 self._record("needs:user-suppressed", repo, number,
                              "sticky human unpark (or unreadable timeline)")
                 return
-            self.api.add_label(repo, number, "needs:user")
+            # #684: the label is written through the disarm so the auto-merge latch is PROVEN
+            # gone first. Ordered after the sticky-unpark veto (a suppressed park writes no
+            # label, releases no crate, and must not strip an arm a human just re-admitted) and
+            # before the label write itself, so a latch that cannot be retracted leaves the PR
+            # UNPARKED-AND-ARMED rather than parked-and-armed. The `_record` below is a run
+            # report, not a durable park artifact, and is deliberately outside the callback:
+            # it must never claim a park that did not land.
+            self._disarm_before_park(
+                repo, number, lambda: self.api.add_label(repo, number, "needs:user")
+            )
         self._record("needs:user", repo, number, ", ".join(conflicts))
 
     def _handle_conflict(self, repo, pr, conflicts, comments):
@@ -774,6 +872,13 @@ def _self_test():
             self.labels_added = []
             self.timelines = {number: [deepcopy(event) for event in events]
                               for number, events in (timelines or {}).items()}
+            # Issue #684. `latches[number]` is the live merge-latch state; the default (absent)
+            # is UNLATCHED, which keeps every pre-#684 fixture behaving exactly as before —
+            # one extra authoritative read, no mutation, then the park. `journal` records the
+            # latch reads, the retraction mutations AND the label write in the order they
+            # happen, so "the label landed before the latch was proven gone" is a red test.
+            self.latches = {}
+            self.journal = []
 
         def has_token(self, _repo):
             return True
@@ -811,8 +916,30 @@ def _self_test():
         def comment(self, _repo, number, body):
             self.comment_rows[number].append({"body": body, "user": {"login": bot_login}})
 
+        def graphql(self, _repo, query, variables):
+            if query.startswith("mutation"):
+                node = variables["id"]
+                action = "dequeue" if "dequeuePullRequest" in query else "disable-auto"
+                self.journal.append(("retract", action, node))
+                latch = self.latches.setdefault(int(node.removeprefix("PR_node")), {})
+                if not latch.get("sticky"):
+                    latch["queued"] = False
+                    latch["auto"] = False
+                return {}
+            number = variables["number"]
+            self.journal.append(("latch-read", number))
+            latch = self.latches.get(number, {})
+            if latch.get("read_raises"):
+                return {"data": {"repository": {"pullRequest": None}}}
+            return {"data": {"repository": {"pullRequest": {
+                "id": f"PR_node{number}",
+                "mergeQueueEntry": {"id": "MQE"} if latch.get("queued") else None,
+                "autoMergeRequest": ({"enabledAt": "2026-07-25T00:00:00Z"}
+                                     if latch.get("auto") else None)}}}}
+
         def add_label(self, _repo, number, label):
             self.labels_added.append((number, label))
+            self.journal.append(("PARK-LABEL", number, label))
             names = _label_names(self.prs[number])
             if label not in names:
                 self.prs[number].setdefault("labels", []).append({"name": label})
@@ -890,6 +1017,63 @@ def _self_test():
     api.set_head(10, "c" * 40)
     ConflictResolver(api, snapshot, claim, [repo], bot_login, True, 5, rebaser).run()
     check("human unpark vetoes the needs:user re-park", api.labels_added, [])
+    check("#684: a sticky-veto-SUPPRESSED park applies no label and therefore performs NO "
+          "retraction (the machine never disarms a PR the human just unparked)",
+          [entry for entry in api.journal if entry[0] != "latch-read"], [])
+
+    # ============ issue #684: the conflict escalation retracts the auto-merge latch ============
+    # A conflicting PR normally cannot merge — but `mergeable is False` is transient and an
+    # auto-merge latch SURVIVES the conflict clearing. Once #683 frees a parked PR's crates on
+    # the needs:user label alone, an un-disarmed escalation hands the crate to a sibling and
+    # then merges the moment the base moves.
+    def escalate_twice(latches):
+        api = FakeAPI([pull(10, "a" * 40)])
+        api.latches = dict(latches)
+        rebaser = FakeRebaser("conflict")
+        ConflictResolver(api, snapshot, claim, [repo], bot_login, True, 5, rebaser).run()
+        api.set_head(10, "c" * 40)
+        api.journal.clear()
+        resolver = ConflictResolver(api, snapshot, claim, [repo], bot_login, True, 5, rebaser)
+        resolver.run()
+        return api, resolver
+
+    api, _ = escalate_twice({10: {"auto": True}})
+    check("#684 (conflict escalation): the auto-merge latch is retracted and PROVEN gone "
+          "BEFORE needs:user lands (reorder the label above the disarm, or drop the proof "
+          "re-read, and this reds)",
+          api.journal,
+          [("latch-read", 10), ("retract", "disable-auto", "PR_node10"),
+           ("latch-read", 10), ("PARK-LABEL", 10, "needs:user")])
+    api, _ = escalate_twice({10: {"queued": True, "auto": True}})
+    check("#684 (conflict escalation): a MERGE-QUEUE member is dequeued first, then un-armed, "
+          "then parked",
+          api.journal,
+          [("latch-read", 10), ("retract", "dequeue", "PR_node10"),
+           ("retract", "disable-auto", "PR_node10"), ("latch-read", 10),
+           ("PARK-LABEL", 10, "needs:user")])
+    api, _ = escalate_twice({})
+    check("#684 (conflict escalation): an unarmed PR parks after one read, no mutation",
+          api.journal, [("latch-read", 10), ("PARK-LABEL", 10, "needs:user")])
+    # THE HAZARD: a latch that survives must leave the PR unparked-and-armed, loudly.
+    api, resolver = escalate_twice({10: {"queued": True, "sticky": True}})
+    check("#684 (conflict escalation): a merge-queue entry that CANNOT be dequeued does NOT "
+          "park — the PR stays unparked-and-armed, still reserving its crates",
+          (api.labels_added, [entry for entry in api.journal if entry[0] == "PARK-LABEL"]),
+          ([], []))
+    check("#684 (conflict escalation): the un-retractable latch is REPORTED loudly as a "
+          "per-PR error, naming the surviving latch form — never a silent skip, and never a "
+          "`needs:user` action row claiming a park that did not land",
+          (len(resolver.errors) == 1,
+           "merge-queue latch still live" in resolver.errors[0],
+           "NOT parking" in resolver.errors[0],
+           any(row[0] == "needs:user" for row in resolver.actions)),
+          (True, True, True, False))
+    api, resolver = escalate_twice({10: {"auto": True, "read_raises": True}})
+    check("#684 (conflict escalation): an UNREADABLE latch state aborts the park rather than "
+          "assuming the PR is unarmed",
+          (api.labels_added, len(resolver.errors) == 1,
+           "merge-latch state is unknown" in resolver.errors[0]),
+          ([], True, True))
 
     # (c) Dependabot receives a command, never a host rebase, once per head SHA.
     api = FakeAPI([pull(20, "d" * 40, author=DEPENDABOT_LOGIN)])
