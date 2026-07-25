@@ -9,6 +9,16 @@
    "model": "sol",
    "issued_at": 1784989899,
    "expires_at": 1784994099
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "dc849a286f3b46a2a6ff1fff3a3e6f4f",
+   "holder": "review:sparq-org/sparq#3436@dispatch-30161706167.1",
+   "package": "sparq-substrate",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1784989905,
+   "expires_at": 1784994105
   }
  ]
 }
