@@ -1345,7 +1345,7 @@ def _live_review_labels(repo, pr_number):
     return {label["name"] for label in labels} & set(REVIEW_LABELS)
 
 
-def set_review_state(repo, pr_number, state, abort_on_machine_park=False):
+def set_review_state(repo, pr_number, state, abort_on_machine_park=False, live_review=None):
     """Apply the mutually-exclusive review:* label for `state` and drop the OTHER review:* labels.
 
     Returns WHAT ACTUALLY HAPPENED so a caller can log honestly instead of asserting its intent:
@@ -1392,11 +1392,29 @@ def set_review_state(repo, pr_number, state, abort_on_machine_park=False):
     check rides the SAME validated `live_review` read that drives the removes below, so a park
     landing in a caller's own probe-to-call gap is still caught: this closes the window rather than
     moving it. Park-as-the-requested-state (`state="parked"`) is exempt — it is not a transition
-    away from the park."""
+    away from the park.
+
+    `live_review` lets a caller that has ALREADY taken a validated `_live_review_labels` snapshot —
+    and has already made its own abort decision on THAT snapshot — hand it in instead of forcing a
+    second read here (#584 follow-up finding 2). Without it a multi-write caller has TWO guard
+    windows: its own pre-write re-read, and this primitive's independent read AFTER the caller's
+    earlier writes have landed — so an abort decided in here is not mutation-free for that caller.
+    Riding the caller's snapshot keeps the "guard rides the same read that drives the removes"
+    property (the removes still delete only labels OBSERVED in it, so anything landing later
+    survives to be converged on the next read) while moving every abort decision ahead of every
+    write. A malformed handed-in snapshot fails closed rather than being trusted."""
     label = f"review:{state}"
     if label not in REVIEW_LABELS:
         raise WorkerPrError(f"unknown review state {state}")
-    live_review = _live_review_labels(repo, pr_number)
+    if live_review is None:
+        live_review = _live_review_labels(repo, pr_number)
+    elif not isinstance(live_review, (set, frozenset)) or any(
+            not isinstance(name, str) for name in live_review):
+        raise WorkerPrError(
+            "set_review_state was handed a malformed live_review snapshot; refusing to mutate "
+            "(fail closed)")
+    else:
+        live_review = set(live_review) & set(REVIEW_LABELS)
     if (abort_on_machine_park and MACHINE_PARK_PR_LABEL in live_review
             and label != MACHINE_PARK_PR_LABEL):
         print(f"review state '{state}' ABORTED: {MACHINE_PARK_PR_LABEL} is a live MACHINE "
@@ -2261,12 +2279,62 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
 #     i.e. the pre-fix behaviour, no worse. Crashing after a label flip that had NOT yet retracted
 #     leaves {review:needs, marker==head} on a draft — precisely the no-owner / already_done state
 #     above. Same discipline as the receipt-first park ladder.
+#
+# #584 FOLLOW-UP FINDING 1 — A `review:pass` PR IS NOT THE FIX LANE'S TO HAND OVER. The retraction
+# above is scoped only by "does the marker name the disproved head", NOT by which lane owns the PR.
+# But the fix lane admits a PR on FIVE states, and only `needs-fix` keys on review:changes:
+# enumerate_review_items also emits `needs-ci-fix` purely from a concluded-RED gate on the current
+# head (GAP-A), which is REVIEW-STATE-AGNOSTIC — a NON-DRAFT `review:pass` PR with a red gate is
+# routed straight into the fix lane. stage-verdict then finds no head-bound verdict record (a pass
+# verdict is not a fix verdict) and defers, and the hand-over used to compute action="noop"
+# (review:changes was never live) and RETRACT the marker anyway.
+#
+# That retraction is the single most destructive write in the pipeline. `sparq-reviewed-sha` is what
+# BINDS the auto-merge latch to reviewed content, so dispatch-claim.enumerate_disarm_items treats
+# `marker != head` on an ARMED PR as a safety violation and CLAIM runs `worker-pr.py disarm --when
+# mismatch` — disable-auto + dequeue + REDRAFT. So the hand-over would take the one state the
+# pipeline is scarcest in (a passed, armed, ready PR) and destroy it: unlatched, re-drafted, and
+# with its verdict binding erased, all on a lane transition it had no business performing. There is
+# nothing to hand to the review lane either — the review lane's job is producing a verdict, and the
+# pass IS the verdict.
+#
+# So `review:pass` is a hand-over STAND-DOWN, on the same footing as a hold: NO marker write, NO
+# lane label write, no comment. Re-read immediately before the write like every other hold surface,
+# because the arm path can bind review:pass while a fix run is in flight. This is deliberately
+# scoped by the PASS label rather than by the admission state (`needs-ci-fix` never reaches this
+# code — the outcome job only knows the stale_reason), and it deliberately stands down on the
+# AMBIGUOUS {review:changes, review:pass} pair too: that pair no valid flow produces, and the
+# pre-fix behaviour there was to converge it to review:needs-user — deleting the pass AND retracting
+# the marker. Failing toward LEAVING THE PR ALONE is the only safe direction when the cost of being
+# wrong is a destroyed arm; the stand-down is logged loudly so the ambiguity is visible rather than
+# silently self-healed.
 FIX_LANE_PR_LABEL = "review:changes"
 REVIEW_LANE_PR_LABEL = "review:needs"
-# The hand-over ABORTED because a machine park / human hold was live at the RE-READ taken
-# immediately before the write (round-2 finding 2). Distinct from "hold" (the park was already
-# visible on the FIRST read) so the log and the `action` output can say which actually happened.
+# The PASSED review state. A live review:pass makes the hand-over stand down entirely (finding 1):
+# the review lane has nothing to produce for a PR that already passed, and retracting its
+# reviewed-sha marker would make enumerate_disarm_items disarm + redraft an armed, passed PR.
+PASS_LANE_PR_LABEL = "review:pass"
+# The hand-over ABORTED because a machine park / human hold / review:pass was live at the RE-READ
+# taken immediately before the write (round-2 finding 2; #584 follow-up finding 1). Distinct from
+# "hold"/"pass-hold" (the guard was already visible on the FIRST read) so the log and the `action`
+# output can say which actually happened.
 FIX_LANE_ABORT_ACTION = "abort-park"
+# The hand-over STOOD DOWN because the PR carries the PASSED review state (#584 follow-up finding 1).
+# Distinct from "hold" and from the abort so the log, the `action` output and the telemetry can say
+# which of the three mutation-free outcomes actually happened.
+FIX_LANE_PASS_ACTION = "pass-hold"
+# Every action that mutates NOTHING on either surface — no label write, no marker write, no comment.
+# `hold` and `pass-hold` are decided from the first reads; FIX_LANE_ABORT_ACTION is decided from the
+# pre-write re-read. All three are decided BEFORE the first write, which is what lets every
+# "mutates nothing" claim in this module be literally true (#584 follow-up finding 2).
+FIX_LANE_QUIET_ACTIONS = ("hold", FIX_LANE_PASS_ACTION, FIX_LANE_ABORT_ACTION)
+# Every action that still performs at least one write.
+FIX_LANE_WRITING_ACTIONS = ("noop", "drop-fix-label", "transition")
+# Every PR-side label whose presence at the pre-write re-read stands the hand-over down: the machine
+# capacity park and the human terminal hold (#555 / #138), plus the PASSED state (#584 follow-up
+# finding 1 — retracting a passed PR's reviewed-sha marker disarms and re-drafts it).
+FIX_LANE_ABORT_ON_LABELS = (set(MACHINE_PARK_LABELS) | set(HUMAN_OWNED_LABELS)
+                            | {PASS_LANE_PR_LABEL})
 # Every `stale_reason` stage_verdict_for_fix can emit on a defer (staged=false). All three mean the
 # same thing for lane ownership — no verdict is bound to the live head — so all three hand over.
 FIX_LANE_DEFER_REASONS = ("unbound", "head-moved", "identity-mismatch")
@@ -2274,7 +2342,9 @@ _FIX_LANE_DEFER_NOTICE = (
     f"fix lane releasing this PR: the outcome job applies the {FIX_LANE_PR_LABEL} -> "
     f"{REVIEW_LANE_PR_LABEL} lane transition AND retracts the stale reviewed-sha assertion for "
     "this head (issue #560), so fix-enumeration stops re-admitting this PR on every dispatch tick "
-    "and the review lane provably owns producing the fresh head-bound verdict")
+    "and the review lane provably owns producing the fresh head-bound verdict — unless a live "
+    f"hold, capacity park or {PASS_LANE_PR_LABEL} owns the PR, in which case the hand-over stands "
+    "down and mutates NOTHING")
 
 
 def fix_lane_defer_action(live_review, holds=()):
@@ -2288,6 +2358,14 @@ def fix_lane_defer_action(live_review, holds=()):
       transition is not a park and must never displace one; a park already excludes the PR from
       BOTH lanes (enumerate_review_items rejects review:parked and every human hold outright), so
       there is no spin to close and nothing to hand over.
+    - "pass-hold" — `review:pass` is live: mutate NOTHING (#584 follow-up finding 1). The fix lane
+      admits a PR on a concluded-RED gate alone (`needs-ci-fix`, review-state-AGNOSTIC), so a
+      non-draft passed PR reaches this defer with no review:changes anywhere — and the pre-fix code
+      fell through to "noop", which still RETRACTS the reviewed-sha marker. On an ARMED PR that
+      retraction is a disarm trigger (enumerate_disarm_items: marker != head => disable-auto +
+      redraft), so the hand-over would destroy the passed arm it was never asked to touch. A passed
+      PR also has nothing to hand to the review lane: the pass IS the verdict. Stands down on the
+      ambiguous {review:changes, review:pass} pair too — fail toward leaving the PR alone.
     - "noop" — `review:changes` is not live: already handed over (a re-run of this step, or a
       concurrent claim that got there first). Idempotent by construction.
     - "drop-fix-label" — `review:needs` is ALREADY live beside `review:changes` (a review outcome
@@ -2305,6 +2383,8 @@ def fix_lane_defer_action(live_review, holds=()):
     if holds:
         return "hold"
     live = set(live_review)
+    if PASS_LANE_PR_LABEL in live:
+        return FIX_LANE_PASS_ACTION
     if FIX_LANE_PR_LABEL not in live:
         return "noop"
     if live == {FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL}:
@@ -2320,7 +2400,7 @@ def fix_lane_defer_labels(live_review, action):
     --self-test pins this projection to the IMPERATIVE path (the stubbed mutation must produce
     exactly this set), so the two can never drift."""
     live = set(live_review)
-    if action in ("hold", "noop", FIX_LANE_ABORT_ACTION):
+    if action in ("noop", *FIX_LANE_QUIET_ACTIONS):
         return frozenset(live)
     if action == "drop-fix-label":
         return frozenset(live - {FIX_LANE_PR_LABEL})
@@ -2343,8 +2423,11 @@ def fix_lane_defer_marker_action(action, live_marker, proven_head):
     marker, given the decided `action`, the marker value read live off the PR body, and
     `proven_head` — the head sha stage-verdict proved has NO head-bound verdict record.
 
-    - "keep" on every non-writing action (`hold` / the pre-write park abort): a park or human hold
-      owns the PR and a lane hand-over mutates NOTHING on either surface.
+    - "keep" on every FIX_LANE_QUIET_ACTION (`hold`, `pass-hold`, and the pre-write abort): a park,
+      a human hold or a PASSED review owns the PR, and a lane hand-over mutates NOTHING on either
+      surface for any of them. All three are decided BEFORE the first write (#584 follow-up finding
+      2 — the abort used to be adjudicated a second time INSIDE set_review_state, i.e. after this
+      marker write had already landed, so "mutates nothing" was not true of that path).
     - "keep" when the live marker does not name `proven_head`: either it is already stale to
       enumerate_review_items (so re-review is already admitted and there is nothing to fix) or it
       belongs to a NEWER completed review this defer has said nothing about — retracting that would
@@ -2353,9 +2436,9 @@ def fix_lane_defer_marker_action(action, live_marker, proven_head):
       end-to-end, and the defer is the registry's own proof that the head-bound verdict record that
       assertion promises does not exist. The assertion is false; writing UNBOUND_REVIEWED_SHA
       retracts it so the review lane re-admits the head instead of exiting `already_done`."""
-    if action in ("hold", FIX_LANE_ABORT_ACTION):
+    if action in FIX_LANE_QUIET_ACTIONS:
         return "keep"
-    if action not in ("noop", "drop-fix-label", "transition"):
+    if action not in FIX_LANE_WRITING_ACTIONS:
         raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
     if live_marker != proven_head:
         return "keep"
@@ -2366,6 +2449,13 @@ def fix_lane_defer_abort(action, recheck_review, recheck_holds):
     """PURE (issue #560 round-2 finding 2): given the `action` decided from the FIRST reads and the
     label/hold state RE-READ immediately before the first write, must the hand-over ABORT?
 
+    This is the hand-over's SOLE stand-down adjudicator, and it runs before the first write (#584
+    follow-up finding 2). Previously a second adjudication happened inside set_review_state's own
+    independent read — i.e. AFTER the reviewed-sha retraction had been written — so that abort path
+    left a trace while three comments claimed it mutated nothing. set_review_state now rides the
+    very `recheck_review` snapshot passed to this predicate, so no guard survives past the first
+    write and every abort is genuinely mutation-free.
+
     #555 splits ownership: `review:parked`/`status:parked` is the MACHINE capacity hold,
     `review:needs-user`/`needs:user` the HUMAN terminal hold. A hold landing between this
     function's caller's initial probe and its write used to be resolved AWAY: the park is a
@@ -2373,17 +2463,21 @@ def fix_lane_defer_abort(action, recheck_review, recheck_holds):
     set_review_state, which converged it to review:needs-user — DELETING a machine capacity park
     and converting it into a human-owned terminal hold, the precise inversion #555 exists to
     prevent, while the caller logged a successful review-lane hand-over. THE PARK WINS: a lane
-    transition is not a park adjudication, so it stands down and leaves the hold untouched.
+    transition is not a park adjudication, so it stands down and writes nothing at all.
 
-    True for any live hold (machine park or human) on any action that would still WRITE — including
-    `noop`, which writes no label but does retract the reviewed-sha marker. Only the two actions
-    that mutate nothing at all (`hold`, and an abort already decided) have nothing to abort."""
-    if action in ("hold", FIX_LANE_ABORT_ACTION):
+    A `review:pass` that lands in the same window aborts identically (#584 follow-up finding 1): the
+    arm path binds review:pass while a fix run is in flight, and retracting a passed PR's
+    reviewed-sha marker is what disarms and re-drafts it. The PASS WINS for exactly the reason the
+    park does — the hand-over is not the adjudicator of either.
+
+    True for any live guard (machine park, human hold, or the passed state) on any action that would
+    still WRITE — including `noop`, which writes no label but does retract the reviewed-sha marker.
+    Only the FIX_LANE_QUIET_ACTIONS, which mutate nothing at all, have nothing to abort."""
+    if action in FIX_LANE_QUIET_ACTIONS:
         return False
-    if action not in ("noop", "drop-fix-label", "transition"):
+    if action not in FIX_LANE_WRITING_ACTIONS:
         raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
-    return bool((set(recheck_review) & (set(MACHINE_PARK_LABELS) | set(HUMAN_OWNED_LABELS)))
-                | set(recheck_holds))
+    return bool((set(recheck_review) & FIX_LANE_ABORT_ON_LABELS) | set(recheck_holds))
 
 
 def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
@@ -2403,13 +2497,26 @@ def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
        green gate (successful run, no work) or nothing would own the PR at all on a pending gate.
     2. Apply the lane label per fix_lane_defer_action.
 
-    Marker first is the crash-safe order (see the module comment above). Between the decision reads
-    and the first write the hold surface is RE-READ and any live machine park / human hold ABORTS
-    the whole hand-over (round-2 finding 2) — the park WINS; a lane transition never adjudicates
-    one. The transition additionally passes abort_on_machine_park so that guard rides the same
-    validated read that drives set_review_state's own removes, closing rather than moving the
-    window. The `action`/`marker`/`applied` outputs and every log line report what ACTUALLY
-    happened, not the intent.
+    NEITHER write happens at all when a GUARD owns the PR. Three mutation-free outcomes exist and
+    ALL THREE are decided before the first write (#584 follow-up finding 2 — the abort used to be
+    adjudicated a second time inside set_review_state's own read, i.e. after the marker retraction
+    had already landed):
+
+    - `hold` — a live human hold / machine capacity park on the FIRST reads (#555 / #138).
+    - `pass-hold` — a live `review:pass` on the FIRST reads (#584 follow-up finding 1). The fix lane
+      admits on a red gate alone (`needs-ci-fix`), so a passed, non-draft, ARMED PR reaches this
+      code; retracting its reviewed-sha marker is precisely what makes enumerate_disarm_items
+      disarm + redraft it. Nothing is handed to the review lane because the pass IS the verdict.
+    - `abort-park` — any of those guards appears at the pre-write RE-READ of BOTH hold surfaces and
+      the review namespace. This is the SOLE remaining adjudication point: the transition hands its
+      validated `recheck_review` snapshot into set_review_state (with abort_on_machine_park), so
+      that primitive takes no independent read and no guard can fire after a write. The residual
+      TOCTOU is unchanged in kind (issue #294): a guard landing after that snapshot is never
+      DELETED, because the removes only drop labels observed in it, so it survives to be converged
+      or excluded on the next read.
+
+    Marker first is the crash-safe order (see the module comment above). The `action`/`marker`/
+    `applied` outputs and every log line report what ACTUALLY happened, not the intent.
 
     Fails closed on an unrecognised `stale_reason` or a malformed `proven_head` (nothing is read or
     written on inputs this code does not understand) and is idempotent under the concurrent-claim
@@ -2444,21 +2551,43 @@ def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
         _write_outputs({"action": action, "decided": decided, "marker": "keep",
                         "applied": "none"})
         return
-    # ---- PARK WINS: re-read BOTH surfaces immediately before the first write (round-2 finding 2).
+    if action == FIX_LANE_PASS_ACTION:
+        # #584 follow-up finding 1. NOT a hand-over candidate at all: the review lane's product is a
+        # verdict and this PR already has one. Retracting its reviewed-sha marker would make
+        # enumerate_disarm_items read `marker != head` on an ARMED PR as a safety violation and
+        # disable-auto + dequeue + REDRAFT it — destroying a passed, armed, ready PR on a lane
+        # transition. Mutate NOTHING and say so.
+        ambiguous = FIX_LANE_PR_LABEL in set(live_review)
+        print(f"{'::warning::' if ambiguous else ''}fix-lane defer ({stale_reason}): "
+              f"{PASS_LANE_PR_LABEL} is live on {repo}#{pr_number} (review namespace "
+              f"{sorted(live_review)}) — NO lane transition and NO marker retraction. A passed PR "
+              "has nothing to hand to the review lane (the pass IS the verdict), and retracting its "
+              "reviewed-sha marker would disarm and re-draft it (enumerate_disarm_items reads "
+              "marker != head on an armed PR as a safety violation). Nothing was written."
+              + (f" The namespace is AMBIGUOUS ({FIX_LANE_PR_LABEL} beside {PASS_LANE_PR_LABEL}): "
+                 "no valid flow produces that pair, so it is left exactly as it is for a human to "
+                 "resolve rather than converged into a state that deletes the pass."
+                 if ambiguous else ""))
+        _write_outputs({"action": action, "decided": decided, "marker": "keep",
+                        "applied": "none"})
+        return
+    # ---- THE GUARD WINS: re-read BOTH hold surfaces AND the review namespace immediately before the
+    # first write (round-2 finding 2). This is the hand-over's SOLE remaining adjudication point —
+    # `recheck_review` is handed straight into set_review_state below, so that primitive takes no
+    # independent read of its own and no guard can fire AFTER a write (#584 follow-up finding 2).
     recheck_holds = live_human_holds(repo, pr_number, issue)
     recheck_parks = live_machine_parks(repo, pr_number, issue)
     recheck_review = _live_review_labels(repo, pr_number)
     landed = sorted(set(recheck_holds) | set(recheck_parks)
-                    | (set(recheck_review)
-                       & (set(MACHINE_PARK_LABELS) | set(HUMAN_OWNED_LABELS))))
+                    | (set(recheck_review) & FIX_LANE_ABORT_ON_LABELS))
     if fix_lane_defer_abort(action, recheck_review,
                             sorted(set(recheck_holds) | set(recheck_parks))):
         print(f"fix-lane defer ({stale_reason}): ABORTED the '{action}' hand-over for "
-              f"{repo}#{pr_number} — hold(s) {landed} landed after the decision read. NOTHING "
-              "was written: the park/hold WINS over a lane transition (issue #555) and is left "
-              "exactly as it is. No review-lane hand-over happened, no reviewed-sha retraction, "
-              "and no review:needs-user was synthesised; the PR is re-derived once the hold "
-              "clears.")
+              f"{repo}#{pr_number} — guard(s) {landed} landed after the decision read. NOTHING "
+              "was written: the park/hold/pass WINS over a lane transition (issue #555, #584 "
+              "follow-up finding 1) and is left exactly as it is. No review-lane hand-over "
+              "happened, no reviewed-sha retraction, and no review:needs-user was synthesised; the "
+              "PR is re-derived once the guard clears.")
         _write_outputs({"action": FIX_LANE_ABORT_ACTION, "decided": decided, "marker": "keep",
                         "applied": "none"})
         return
@@ -2489,19 +2618,24 @@ def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
               f"{repo}#{pr_number}; dropped the stale {FIX_LANE_PR_LABEL} so fix-enumeration "
               "stops re-admitting it")
     else:
-        applied = set_review_state(repo, pr_number, "needs", abort_on_machine_park=True)
-        if applied == "park-abort":
-            # A park landed inside set_review_state's own read->write window. It wrote nothing, so
-            # report the abort — never the hand-over.
+        # Ride the SAME validated snapshot the abort predicate above cleared (#584 follow-up finding
+        # 2): set_review_state takes no read of its own, so its guards cannot re-adjudicate AFTER
+        # the marker write and turn a "mutates nothing" abort into a half-applied hand-over.
+        applied = set_review_state(repo, pr_number, "needs", abort_on_machine_park=True,
+                                   live_review=recheck_review)
+        if applied in ("park-abort", "refused-hold"):
+            # UNREACHABLE BY CONSTRUCTION: fix_lane_defer_abort already rejected every machine park,
+            # human hold and pass label in `recheck_review`, and that is the only snapshot
+            # set_review_state now sees. Kept as fail-closed reporting in case the predicate and the
+            # primitive ever drift — and it states honestly that only the LABEL write stood down;
+            # the marker retraction above had already landed, so this is NOT a mutation-free abort.
             action = FIX_LANE_ABORT_ACTION
-            print(f"fix-lane defer ({stale_reason}): ABORTED for {repo}#{pr_number} — a machine "
-                  f"capacity park landed inside the label write window. No lane transition, no "
-                  f"review:needs-user, park untouched (issue #555). The reviewed-sha retraction "
-                  f"already applied is safe on its own: it only widens re-review admission and "
-                  f"the park excludes the PR from both lanes until a human clears it.")
-        elif applied == "refused-hold":
-            print(f"fix-lane defer ({stale_reason}): NO hand-over for {repo}#{pr_number} — "
-                  "review:needs-user is a live human hold and refused the write (issue #138)")
+            print(f"::warning::fix-lane defer ({stale_reason}): set_review_state returned "
+                  f"'{applied}' for {repo}#{pr_number} on the very snapshot {sorted(recheck_review)} "
+                  "the pre-write abort predicate had cleared — the two guards have DRIFTED. No lane "
+                  "transition was applied and the park/hold is untouched (issue #555), but the "
+                  "reviewed-sha retraction above was already written, so this is NOT a "
+                  "mutation-free abort.")
         elif applied == "converged":
             print(f"fix-lane defer ({stale_reason}): {repo}#{pr_number} was NOT handed to the "
                   f"review lane — an ambiguous live review namespace converged to the fail-closed "
@@ -6556,7 +6690,7 @@ def _self_test():
               fix_lane_defer_marker_action(_writing, UNBOUND_REVIEWED_SHA, _f1_head), "keep")
         check(f"#560 f1: '{_writing}' keeps an absent marker",
               fix_lane_defer_marker_action(_writing, None, _f1_head), "keep")
-    for _quiet in ("hold", FIX_LANE_ABORT_ACTION):
+    for _quiet in FIX_LANE_QUIET_ACTIONS:
         check(f"#560 f1: '{_quiet}' never touches the marker",
               fix_lane_defer_marker_action(_quiet, _f1_head, _f1_head), "keep")
     try:
@@ -6567,6 +6701,52 @@ def _self_test():
         check("#560 f1: an unknown action fails closed in the marker projection",
               "raised", "raised")
 
+    # ---- #584 FOLLOW-UP FINDING 1: a review:pass PR IS NOT THE FIX LANE'S TO HAND OVER ----------
+    # The fix lane admits on FIVE states and only `needs-fix` keys on review:changes;
+    # enumerate_review_items also emits `needs-ci-fix` from a concluded-RED gate alone (GAP-A,
+    # review-state-AGNOSTIC), so a NON-DRAFT review:pass PR with a red gate is routed into the fix
+    # lane, stage-verdict finds no head-bound FIX verdict and defers. Pre-fix the hand-over computed
+    # "noop" (review:changes was never live) and retracted the marker anyway — and a retracted marker
+    # on an ARMED PR is a disarm trigger (dispatch-claim.enumerate_disarm_items: marker != head =>
+    # disable-auto + dequeue + REDRAFT), so the hand-over destroyed a passed, armed, ready PR.
+    # LIVE at the time of this fix: sparq#2521 (review:pass + trust-surface, non-draft, --auto
+    # armed, `docs-quality quick-gates` genuinely failing under newest-run resolution) was the ONLY
+    # review:pass PR in the sparq repo and sat on exactly this path.
+    check("#584 f1: a clean review:pass stands the hand-over down",
+          fix_lane_defer_action({PASS_LANE_PR_LABEL}), FIX_LANE_PASS_ACTION)
+    check("#584 f1: review:pass beside review:changes stands down too (fail toward leaving alone)",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}), FIX_LANE_PASS_ACTION)
+    check("#584 f1: the stand-down leaves the review namespace untouched",
+          set(fix_lane_defer_labels({PASS_LANE_PR_LABEL}, FIX_LANE_PASS_ACTION)),
+          {PASS_LANE_PR_LABEL})
+    check("#584 f1: ...including the ambiguous pair (the pass is never converged away)",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL},
+                                    FIX_LANE_PASS_ACTION)),
+          {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL})
+    check("#584 f1: the stand-down NEVER retracts the reviewed-sha marker",
+          fix_lane_defer_marker_action(FIX_LANE_PASS_ACTION, _f1_head, _f1_head), "keep")
+    check("#584 f1: nothing left to abort once the decision is the pass stand-down",
+          fix_lane_defer_abort(FIX_LANE_PASS_ACTION, {PASS_LANE_PR_LABEL}, []), False)
+    # ...and re-read AT WRITE TIME like every other guard surface: the arm path can bind review:pass
+    # while a fix run is in flight, so a pass appearing only at the pre-write re-read must ABORT.
+    for _writing in FIX_LANE_WRITING_ACTIONS:
+        check(f"#584 f1: a review:pass at the pre-write re-read aborts '{_writing}'",
+              fix_lane_defer_abort(_writing, {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}, []), True)
+    # DISCRIMINATION, not either half alone: the normal review:changes case still hands over and
+    # still retracts. If the pass guard were widened to every namespace, this pair flips red.
+    check("#584 f1: the NORMAL review:changes case still transitions",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL}), "transition")
+    check("#584 f1: ...and still retracts the disproved marker",
+          fix_lane_defer_marker_action(fix_lane_defer_action({FIX_LANE_PR_LABEL}),
+                                       _f1_head, _f1_head), "invalidate")
+    check("#584 f1: the quiet (zero-write) actions are exactly hold/pass-hold/abort",
+          sorted(FIX_LANE_QUIET_ACTIONS), ["abort-park", "hold", "pass-hold"])
+    check("#584 f1: every writing action is disjoint from the quiet ones",
+          sorted(set(FIX_LANE_WRITING_ACTIONS) & set(FIX_LANE_QUIET_ACTIONS)), [])
+    check("#584 f1: the pre-write abort label set covers park + human hold + pass",
+          sorted(FIX_LANE_ABORT_ON_LABELS),
+          ["needs:user", "review:needs-user", "review:parked", "review:pass", "status:parked"])
+
     # ---- The IMPERATIVE path over a FAITHFUL stubbed GitHub surface: the PR body (which IS the
     # reviewed-sha store), the PR labels, and the SOURCE ISSUE labels. Nothing touches the network,
     # but the REAL live_human_holds / live_machine_parks probes, the REAL set_reviewed_sha CAS loop
@@ -6575,27 +6755,41 @@ def _self_test():
     # arrive inside a specific window.
     fld_globals = globals()
     fld_real = {name: fld_globals[name] for name in
-                ("_gh_json", "_ensure_label", "_remove_label", "_write_outputs")}
+                ("_gh_json", "_ensure_label", "_remove_label", "_write_outputs",
+                 "live_human_holds", "live_machine_parks", "_live_review_labels")}
     try:
         fld = {"labels": set(), "issue_labels": set(), "body": "", "posted": [], "removed": [],
                "patched": [], "output": {}, "counts": {}, "inject": None,
-               "inject_label": MACHINE_PARK_PR_LABEL, "malformed": False}
+               "inject_label": MACHINE_PARK_PR_LABEL, "malformed": False, "ops": []}
         _fld_pr = "repos/o/r/pulls/5"
         _fld_pr_labels = "repos/o/r/issues/5/labels"
         _fld_issue = "repos/o/r/issues/7"
+        # `ops` records, IN ORDER, every raw API read (`read:<path>#n`), every GUARD PROBE — the
+        # three functions whose result can stand the hand-over down (`guard:<name>`) — and every
+        # write. That makes the structural property behind "an aborted hand-over mutates NOTHING"
+        # (#584 follow-up finding 2) directly assertable: NO GUARD PROBE may run after the FIRST
+        # write, so no stand-down can be decided once something has been written. Pre-fix,
+        # set_review_state ran its own _live_review_labels probe AFTER the reviewed-sha PATCH.
+        # (set_reviewed_sha's CAS read-back and _ensure_label's repo-label existence probe are raw
+        # reads, not guard probes — they decide nothing about standing down.)
+        _fld_guard_paths = (_fld_pr, _fld_pr_labels, _fld_issue)
 
         def fld_gh(args, **kwargs):
             if "-X" in args and "POST" in args:            # the label ADD
                 names = list(kwargs.get("input_doc", {}).get("labels") or [])
                 fld["posted"].append(names)
+                fld["ops"].append(f"write:label-add:{','.join(names)}")
                 fld["labels"] |= set(names)
                 return {}
             if "-X" in args and "PATCH" in args:           # the PR-body (reviewed-sha) write
                 fld["body"] = kwargs.get("input_doc", {}).get("body") or ""
                 fld["patched"].append(fld["body"])
+                fld["ops"].append("write:body")
                 return {}
             path = args[1] if len(args) > 1 else ""
             fld["counts"][path] = fld["counts"].get(path, 0) + 1
+            if path in _fld_guard_paths:
+                fld["ops"].append(f"read:{path}#{fld['counts'][path]}")
             if fld["inject"] == (path, fld["counts"][path]):
                 fld["labels"].add(fld["inject_label"])     # a park lands INSIDE this window
             if path == _fld_pr_labels:
@@ -6612,12 +6806,25 @@ def _self_test():
 
         def fld_remove(repo, pr, other):
             fld["removed"].append(other)
+            fld["ops"].append(f"write:label-remove:{other}")
             fld["labels"].discard(other)
+
+        def fld_guard(name):
+            """Wrap a GUARD PROBE so `ops` records that a stand-down input was read. The REAL
+            implementation still runs (and still fails closed on malformed payloads)."""
+            real = fld_real[name]
+
+            def probe(*args, **kwargs):
+                fld["ops"].append(f"guard:{name}")
+                return real(*args, **kwargs)
+            return probe
 
         fld_globals["_gh_json"] = fld_gh
         fld_globals["_ensure_label"] = lambda repo, label: None
         fld_globals["_remove_label"] = fld_remove
         fld_globals["_write_outputs"] = lambda values: fld["output"].update(values)
+        for _probe_name in ("live_human_holds", "live_machine_parks", "_live_review_labels"):
+            fld_globals[_probe_name] = fld_guard(_probe_name)
 
         def fld_reset(live, issue_labels=(), marker=None, inject=None,
                       inject_label=MACHINE_PARK_PR_LABEL, malformed=False):
@@ -6626,13 +6833,32 @@ def _self_test():
             fld["body"] = ("desc\n\n<!-- sparq-reviewed-sha:"
                            f"{_f1_head if marker is None else marker} -->\n")
             fld["posted"], fld["removed"], fld["patched"] = [], [], []
-            fld["output"], fld["counts"] = {}, {}
+            fld["output"], fld["counts"], fld["ops"] = {}, {}, []
             fld["inject"], fld["inject_label"] = inject, inject_label
             fld["malformed"] = malformed
 
         def run_defer(live, reason="unbound", **kwargs):
             fld_reset(live, **kwargs)
             fix_lane_defer("o/r", 5, reason, _f1_head, issue=7)
+            ops = list(fld["ops"])
+            writes = [op for op in ops if op.startswith("write:")]
+            # #584 follow-up finding 2, asserted on EVERY fixture rather than one: once the first
+            # write has landed, NO GUARD PROBE runs again. That is the structural fact that makes
+            # "an aborted hand-over mutates NOTHING" true — a stand-down that can only be decided
+            # before the first write cannot leave a trace. Pre-fix, set_review_state ran its OWN
+            # _live_review_labels probe after the reviewed-sha PATCH and aborted on it.
+            if writes:
+                _after = ops[ops.index(writes[0]) + 1:]
+                assert not [op for op in _after if op.startswith("guard:")], (
+                    "a GUARD PROBE ran AFTER the first write, so an abort decided there would not "
+                    f"be mutation-free: {ops}")
+            # ...and the property that structure exists to guarantee, also on EVERY fixture: an
+            # ABORT never coexists with a write. Pre-fix, the reviewed-sha PATCH had already landed
+            # when set_review_state's own park read aborted, so `abort-park` was reported with
+            # ['write:body'] behind it — the state three comments called mutation-free.
+            assert not (fld["output"].get("action") == FIX_LANE_ABORT_ACTION and writes), (
+                "an ABORTED fix-lane hand-over performed writes, so the abort is NOT "
+                f"mutation-free: {writes} (ops: {ops})")
             return {
                 "action": fld["output"].get("action"),
                 "decided": fld["output"].get("decided"),
@@ -6643,6 +6869,8 @@ def _self_test():
                 "posted": [list(names) for names in fld["posted"]],
                 "removed": list(fld["removed"]),
                 "body_writes": len(fld["patched"]),
+                "ops": ops,
+                "writes": writes,
             }
 
         # THE round-1 regression: an unbound-record defer must REMOVE review:changes and ADD
@@ -6660,7 +6888,8 @@ def _self_test():
         # dispatch-claim's ownership test is asserting the real post-defer PR state.
         for _live in ({FIX_LANE_PR_LABEL},
                       {FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL},
-                      {FIX_LANE_PR_LABEL, "review:pass"},
+                      {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL},
+                      {PASS_LANE_PR_LABEL},
                       {REVIEW_LANE_PR_LABEL},
                       set()):
             for _reason in FIX_LANE_DEFER_REASONS:
@@ -6668,11 +6897,69 @@ def _self_test():
                 check(f"#560: the applied labels match the projection "
                       f"({sorted(_live)} / {_reason})",
                       _r["labels"], set(fix_lane_defer_labels(_live, _r["action"])))
+                # The marker half is derived from the projection too, so a namespace that must NOT
+                # be retracted (review:pass — #584 follow-up finding 1) keeps its original binding
+                # instead of being asserted against a hard-coded 'none'.
+                _want_marker = fix_lane_defer_marker_action(_r["decided"], _f1_head, _f1_head)
                 check(f"#560: the applied marker matches the projection "
                       f"({sorted(_live)} / {_reason})",
                       (_r["marker"], _r["reviewed_sha"]),
-                      (fix_lane_defer_marker_action(_r["decided"], _f1_head, _f1_head),
-                       UNBOUND_REVIEWED_SHA))
+                      (_want_marker,
+                       UNBOUND_REVIEWED_SHA if _want_marker == "invalidate" else _f1_head))
+        # ---- #584 FOLLOW-UP FINDING 1, THE REPRODUCTION, over the real imperative path. A
+        # review:pass PR whose marker names the disproved head must come out COMPLETELY UNTOUCHED:
+        # no label write, no body write, no comment — because the retraction would disarm+redraft it.
+        # The DISCRIMINATION is the test: the review:changes twin immediately below runs the same
+        # code and MUST still retract, so a guard that swallowed every namespace fails here.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r_pass = run_defer({PASS_LANE_PR_LABEL}, "unbound")
+        check("#584 f1: a review:pass PR is left COMPLETELY untouched by the hand-over",
+              (_r_pass["action"], _r_pass["decided"], _r_pass["labels"], _r_pass["writes"],
+               _r_pass["marker"], _r_pass["reviewed_sha"]),
+              (FIX_LANE_PASS_ACTION, FIX_LANE_PASS_ACTION, {PASS_LANE_PR_LABEL}, [],
+               "keep", _f1_head))
+        check("#584 f1: ...and the stand-down is logged honestly (never a hand-over claim)",
+              (f"{PASS_LANE_PR_LABEL} is live" in _log.getvalue()
+               and "would disarm and re-draft it" in _log.getvalue()
+               and "handed o/r#5 to the review lane" not in _log.getvalue()), True)
+        # THE DISCRIMINATION: identical fixture, review:changes instead of review:pass -> the marker
+        # IS retracted and the lane IS flipped. Only the namespace differs.
+        _r_changes = run_defer({FIX_LANE_PR_LABEL}, "unbound")
+        check("#584 f1: DISCRIMINATION — the review:changes twin still retracts and transitions",
+              (_r_changes["action"], _r_changes["marker"], _r_changes["reviewed_sha"],
+               _r_changes["labels"], _r_changes["body_writes"]),
+              ("transition", "invalidate", UNBOUND_REVIEWED_SHA, {REVIEW_LANE_PR_LABEL}, 1))
+        check("#584 f1: ...so the pass fixture and the changes fixture really do differ",
+              (_r_pass["reviewed_sha"] != _r_changes["reviewed_sha"],
+               _r_pass["writes"] == [] and _r_changes["writes"] != []), (True, True))
+        # The AMBIGUOUS pair no valid flow produces: pre-fix it converged to review:needs-user,
+        # DELETING the pass AND retracting the marker. Now nothing is written at all.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}, "unbound")
+        check("#584 f1: the ambiguous {changes, pass} pair is left alone, not converged",
+              (_r["action"], _r["labels"], _r["writes"], _r["reviewed_sha"]),
+              (FIX_LANE_PASS_ACTION, {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}, [], _f1_head))
+        check("#584 f1: ...and the ambiguity is surfaced as a warning, not silently self-healed",
+              ("::warning::" in _log.getvalue()
+               and "AMBIGUOUS" in _log.getvalue()
+               and "review:needs-user" not in _r["labels"]), True)
+        # A review:pass that lands only at the PRE-WRITE re-read (the arm binding it while this fix
+        # run is in flight) must abort with zero writes, exactly like a park landing there.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr_labels, 2),
+                           inject_label=PASS_LANE_PR_LABEL)
+        check("#584 f1: a review:pass at the pre-write re-read ABORTS with zero writes",
+              (_r["action"], _r["decided"], _r["labels"], _r["writes"], _r["marker"],
+               _r["reviewed_sha"]),
+              (FIX_LANE_ABORT_ACTION, "transition",
+               {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}, [], "keep", _f1_head))
+        check("#584 f1: ...and names the pass in the abort log",
+              (f"guard(s) ['{PASS_LANE_PR_LABEL}']" in _log.getvalue()
+               and "WINS over a lane transition" in _log.getvalue()), True)
+
         # A marker bound to a DIFFERENT sha belongs to a newer completed review — never clobbered.
         _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", marker=_f1_other)
         check("#560 f1: a marker naming another head survives the hand-over",
@@ -6733,19 +7020,58 @@ def _self_test():
               ("ABORTED" in _log.getvalue()
                and "WINS over a lane transition" in _log.getvalue()
                and "handed o/r#5 to the review lane" not in _log.getvalue()), True)
-        # The residual sub-window: the park lands after the re-read, so ONLY set_review_state's own
-        # validated read sees it. The abort_on_machine_park guard rides THAT read, so the window is
-        # closed rather than moved — the park still survives and no human hold is invented.
+        # ---- #584 FOLLOW-UP FINDING 2: THE ABORT PATH PERFORMS ZERO WRITES. Three code comments
+        # asserted the abort "mutates NOTHING", but the marker retraction was written BEFORE the
+        # second adjudication (set_review_state's own independent park read), so an abort decided
+        # there left the reviewed-sha marker retracted — a trace, and on an armed PR a disarm
+        # trigger. Assert on the recorded WRITE LIST being empty, not just on the final label state:
+        # a label-state assertion passes even when a body PATCH landed.
+        for _landed, _where, _at in ((MACHINE_PARK_PR_LABEL, "pr label", (_fld_pr_labels, 2)),
+                                     ("review:needs-user", "pr label", (_fld_pr_labels, 2)),
+                                     (PASS_LANE_PR_LABEL, "pr label", (_fld_pr_labels, 2)),
+                                     (MACHINE_PARK_PR_LABEL, "hold probe", (_fld_pr, 3)),
+                                     ("review:needs-user", "hold probe", (_fld_pr, 3))):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=_at, inject_label=_landed)
+            check(f"#584 f2: an abort on {_landed} at the {_where} re-read writes NOTHING "
+                  f"(empty write list)",
+                  (_r["action"], _r["writes"], _r["body_writes"], _r["reviewed_sha"]),
+                  (FIX_LANE_ABORT_ACTION, [], 0, _f1_head))
+        # ...and the structural reason it is mutation-free: the transition rides the pre-write
+        # snapshot, so set_review_state takes NO read of its own and there is no adjudication point
+        # left after the first write. run_defer asserts "no guard read after the first write" on
+        # every fixture; pin the read budget explicitly too, so re-introducing that second read
+        # (which is what made the abort leave a trace) trips this immediately.
+        _r = run_defer({FIX_LANE_PR_LABEL}, "unbound")
+        check("#584 f2: exactly SIX guard probes run, all of them before any write",
+              ([op for op in _r["ops"] if op.startswith("guard:")],
+               _r["ops"].index("write:body")
+               > max(index for index, op in enumerate(_r["ops"]) if op.startswith("guard:"))),
+              (["guard:live_human_holds", "guard:live_machine_parks", "guard:_live_review_labels",
+                "guard:live_human_holds", "guard:live_machine_parks", "guard:_live_review_labels"],
+               True))
+        check("#584 f2: the write order is marker-then-label (crash-safe direction preserved)",
+              _r["writes"],
+              ["write:body", f"write:label-add:{REVIEW_LANE_PR_LABEL}",
+               f"write:label-remove:{FIX_LANE_PR_LABEL}"])
+        # THE RESIDUAL, stated honestly (issue #294 is not closed here): a park landing AFTER the
+        # pre-write snapshot — inside the marker write itself — is no longer adjudicated, because the
+        # only remaining adjudication point is ahead of every write. The hand-over therefore COMPLETES
+        # rather than aborting, and that is the safe direction: the removes drop only labels OBSERVED
+        # in the snapshot, so the late park is never DELETED — it survives beside review:needs, keeps
+        # the PR excluded from BOTH lanes, and no review:needs-user is invented. Pre-fix this window
+        # produced `abort-park` with the reviewed-sha PATCH already written, i.e. an "abort" that had
+        # mutated the one field that disarms a PR. This fixture is what turns that trade explicit:
+        # under a mutant that restores set_review_state's own read, run_defer's invariant above fires
+        # with the non-empty write list.
         _log = io.StringIO()
         with contextlib.redirect_stdout(_log):
-            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr_labels, 3))
-        check("#560 f2: a park inside set_review_state's own read window still WINS",
-              (_r["action"], _r["applied"], _r["labels"], _r["posted"], _r["removed"]),
-              (FIX_LANE_ABORT_ACTION, "park-abort",
-               {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL}, [], []))
-        check("#560 f2: the inner abort is logged honestly too",
-              ("ABORTED" in _log.getvalue()
-               and "handed o/r#5 to the review lane" not in _log.getvalue()), True)
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr, 5))
+        check("#584 f2: a park landing INSIDE the write window is never deleted (park survives)",
+              (_r["action"], _r["labels"], _r["reviewed_sha"], _r["removed"]),
+              ("transition", {REVIEW_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL},
+               UNBOUND_REVIEWED_SHA, [FIX_LANE_PR_LABEL]))
+        check("#584 f2: ...and no human hold is synthesised in that window either",
+              "review:needs-user" in _r["labels"], False)
         # A HUMAN hold landing in the same window aborts identically (never a silent unpark).
         _log = io.StringIO()
         with contextlib.redirect_stdout(_log):

@@ -1180,13 +1180,16 @@ jobs:
           WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
         run: bash ../registry/scripts/worker-live.sh fix
 
-      # The provider CLI may refresh the account credential during the run (codex rotates its
-      # auth.json); write it back exactly like worker.yml so the next claim still authenticates.
-      # Runs IMMEDIATELY after the model steps and BEFORE the gate: rotation only happens during
-      # the model call, and REGISTRY_SECRETS_PAT must never be live in a step that runs after
-      # hostile target code executed on this runner (the fix-mode cargo gate below).
+      # Persist a HOST-SIDE-rotated account credential so the next claim still authenticates
+      # (issue #596). Rotation happens in worker-prep's pre-flight refresh, NOT in the container:
+      # the credential file is bind-mounted read-only (issue #134), so the CLI's own in-place
+      # refresh cannot happen there — which is exactly why this lane died. Still runs BEFORE the
+      # gate: REGISTRY_SECRETS_PAT must never be live in a step that runs after hostile target code
+      # executed on this runner (the fix-mode cargo gate below).
       - name: Write back a rotated full account credential
-        if: ${{ always() && steps.prepare.outcome == 'success' && (steps.review.outcome != 'skipped' || steps.fix.outcome != 'skipped') }}
+        # NO model-step guard (issue #596): see worker.yml — a host-side rotation must be
+        # persisted even when the model step never ran, or the consumed grant strands the account.
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
@@ -1213,7 +1216,11 @@ jobs:
           if [[ "$REVIEW_OUTCOME" == "success" || "$FIX_OUTCOME" == "success" ]]; then
             cls=success
           elif [[ "$REVIEW_OUTCOME" == "skipped" && "$FIX_OUTCOME" == "skipped" ]]; then
-            cls=unknown   # pre-launch abort/cancellation: no host-observed CLI exit exists
+            # Pre-launch abort/cancellation: no host-observed CLI exit exists. But worker-prep's
+            # host-side credential pre-flight (issue #596) DOES classify its own failures and writes
+            # WORKER_EXIT_CLASS before any model step can run — recording `unknown` over it would
+            # discard the one signal that says "this account needs a re-mint".
+            cls="${WORKER_EXIT_CLASS:-unknown}"
           else
             cls="${WORKER_EXIT_CLASS:-unknown}"
           fi
@@ -1564,10 +1571,19 @@ jobs:
       # (BOTH machine park labels — review:parked on the PR and status:parked on the source issue —
       # plus the human holds), RE-READS it immediately before writing, and ABORTS the whole hand-over
       # if any of them landed in between: the park WINS (issue #555) and is never converted into a
-      # human-owned review:needs-user. It is idempotent, so a re-run or a concurrent claim that
-      # already handed over writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>` lease
+      # human-owned review:needs-user. Every abort is decided BEFORE the first write, so it leaves no
+      # trace at all (#584 follow-up finding 2). It is idempotent, so a re-run or a concurrent claim
+      # that already handed over writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>` lease
       # enumerate_review_items single-flights on) is released unconditionally by the `release` job
       # below, which does not depend on this job — the slot is free before the next tick.
+      #
+      # A live `review:pass` STANDS THE HAND-OVER DOWN entirely (#584 follow-up finding 1) — no lane
+      # write, no marker write, no comment. The fix lane admits on a concluded-RED gate ALONE too
+      # (GAP-A `needs-ci-fix`, review-state-agnostic), so a NON-DRAFT, ARMED, passed PR reaches this
+      # step; retracting its reviewed-sha marker is precisely what makes dispatch-claim's disarm net
+      # read `marker != head` on an armed PR as a safety violation and disable-auto + dequeue +
+      # REDRAFT it. A passed PR has nothing to hand to the review lane either — the pass IS the
+      # verdict.
       #
       # `--head-sha` is REQUIRED and load-bearing (round-2 finding 1): the label flip ALONE only
       # relocates the spin, because a completed request-changes review left `sparq-reviewed-sha ==
