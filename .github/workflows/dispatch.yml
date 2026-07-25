@@ -332,6 +332,28 @@ jobs:
                       and trusted(details[row["number"]][0], repo_trusted_bots))
               ]
               ready = dispatch.compute_ready(ready_input)
+              # Issue #225: a `status:ready` issue carrying NO role:* label is dropped by the
+              # readiness engine (has_role) BEFORE any plan row exists — it shows up in no plan,
+              # no diagnostic, and never drains. 117 accumulated before a human noticed. Report
+              # the count on EVERY tick, printed even when zero (the same always-printed shape as
+              # the review-enumeration exclusion line at PLAN completion below), over the FULL
+              # readiness_input so the number is the honest backlog, not the post-trust subset.
+              # Advisory only: PLAN never guesses a role (fail-closed) and the plan document is
+              # unchanged. A target whose planner predates roleless_ready says so out loud rather
+              # than reporting a fabricated zero.
+              roleless_fn = getattr(dispatch, "roleless_ready", None)
+              if roleless_fn is None:
+                  print(f"::warning::{repo}: target planner has no roleless_ready() — "
+                        "ready-but-roleless issues are NOT counted for this target")
+              else:
+                  roleless = roleless_fn(readiness_input)
+                  if roleless:
+                      shown = ", ".join(f"#{number}" for number in roleless[:20])
+                      more = f" (+{len(roleless) - 20} more)" if len(roleless) > 20 else ""
+                      print(f"::warning::{repo}: {len(roleless)} status:ready issue(s) carry no "
+                            f"role:* label and are INVISIBLE to dispatch: {shown}{more}")
+                  else:
+                      print(f"{repo}: ready-but-roleless issues: 0")
               # Deferred-retry candidates (registry decision: a status:deferred issue with no
               # live lease and no linked open PR is retryable). The ready-engine gate is reused
               # by SWAPPING deferred->ready only for readiness computation; the emitted item

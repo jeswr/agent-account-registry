@@ -5,7 +5,8 @@
 """triage.py — the deterministic, no-LLM part of issue triage.
 
 Given an issue's labels + type, decide the labels to ADD/REMOVE and whether it is triage-complete:
-  * role     — from a `kind:*` label or the issue type; a trust-surface area forces `soundness`.
+  * role     — from a `kind:*` label, the issue type, or (last resort, issue #225) the issue's
+               `area:*` default; a trust-surface area forces `soundness`.
   * priority — kept if a valid single `priority:P0..P4` is present; else triage is incomplete.
   * package  — the existing `area:<section>` labels are the package. A NO-area issue is parked
                `needs:area` (it would otherwise reserve the serializing __global__ partition).
@@ -44,12 +45,45 @@ UI_SURFACE_LABELS = ("area:dashboard", "dashboard", "surface:frontend")
 # forced to the soundness lane by SEC_KEYWORDS above, which WINS — opus + human arm is stricter
 # than the frontier floor. role:ci covers the residual: .github/workflows + non-trust CI plumbing.
 INFRA_SURFACE_LABELS = ("area:ci", "area:workflows")
+# [OPUS-5] issue #225 — the DEFAULT role for each of the registry's OWN areas: the LAST fallback
+# in _role(), consulted only when the security/UI/infra lanes, an explicit `role:*`, a `kind:*` AND
+# the type map have all come up empty. `ROLE_BY_TYPE.get()` returns None for an issue with no
+# GitHub type or a type outside its keys, and a ROLELESS issue is INVISIBLE to the dispatch
+# enumerator (ready-issues.has_role requires `role:.+`, so the frontier drops it with no signal):
+# 117 `status:ready` issues sat silently undrainable. Keys are area VALUES matched EXACTLY — never
+# substrings; substring semantics belong to SEC_KEYWORDS / routing match_labels, which human-arm
+# whatever they match. Every value MUST be a role configured in orchestration/routing.toml, else
+# the row this enables is rejected by the planner (route-resolve.RoleResolutionError).
+# The first three groups are REDUNDANT today — an earlier lane short-circuits before the fallback
+# is reached — and are listed anyway so this table is the one complete registry-area map, and so a
+# future narrowing of SEC_KEYWORDS/UI/INFRA cannot silently reopen the roleless hole. `_self_test`
+# asserts each entry AGREES with the lane that actually wins, so the redundancy can never drift.
+AREA_ROLE_DEFAULT = {
+    # trust-plane script surfaces — SEC_KEYWORDS already forces `soundness` (stricter, and it wins)
+    "dispatch": "soundness", "worker": "soundness", "groom": "soundness",
+    "review-loop": "soundness", "set-up-account": "soundness",
+    # workflow/CI plumbing — INFRA_SURFACE_LABELS already derives `ci`
+    "ci": "ci", "workflows": "ci",
+    # the UI surface — UI_SURFACE_LABELS already derives `site`
+    "dashboard": "site",
+    # the residual registry surfaces, reachable ONLY through this table
+    "usage": "impl", "docs": "docs",
+}
 _PRIO = re.compile(r"^priority:P([0-4])$")
 
 
 def _valid_priority(labels):
     ps = {m.group(1) for lb in labels for m in [_PRIO.match(lb)] if m}
     return len(ps) == 1
+
+
+def _area_default(labels):
+    """The role ALL of the issue's known `area:<value>` labels agree on; None when they disagree
+    (fail-closed: never an arbitrary pick — an ambiguous issue stays `status:untriaged` for a
+    human) or when no area is in the table."""
+    roles = {AREA_ROLE_DEFAULT[lb[5:]] for lb in labels
+             if lb.startswith("area:") and lb[5:] in AREA_ROLE_DEFAULT}
+    return next(iter(roles)) if len(roles) == 1 else None
 
 
 def _role(labels, issue_type):
@@ -71,7 +105,11 @@ def _role(labels, issue_type):
     # same precedence slot: after security (soundness wins), explicit role:*, and kind.
     if any(lb in INFRA_SURFACE_LABELS for lb in labels):
         return "ci"
-    return ROLE_BY_TYPE.get(issue_type)
+    # [OPUS-5] issue #225: the area-derived default is the LAST resort, so an issue with no GitHub
+    # type (or a type outside ROLE_BY_TYPE) still derives a role instead of silently becoming
+    # undispatchable. Strictly a WIDENING — it fires only where the type map returned None, so no
+    # existing derivation changes.
+    return ROLE_BY_TYPE.get(issue_type) or _area_default(labels)
 
 
 def triage(labels, issue_type="task", trusted=True):
@@ -141,6 +179,31 @@ def _self_test():
         triage(["priority:P3", "kind:docs", "area:ci"], "task")["role"], "docs")
     chk("infra+trust surface -> soundness",
         triage(["priority:P1", "area:ci", "area:dispatch"], "feature")["role"], "soundness")
+    # [OPUS-5] issue #225: EVERY registry area derives a role even when the issue TYPE is unknown
+    # (an untyped issue fell through `ROLE_BY_TYPE.get(...)` to None, and a roleless issue is
+    # invisible to the dispatch enumerator). Each check ALSO asserts the table agrees with the lane
+    # that actually wins for that area — SEC_KEYWORDS/INFRA/UI short-circuit before the fallback,
+    # so a divergent entry here would flip the check red rather than sit unnoticed. Non-vacuous:
+    # pre-fix, area:usage/area:docs returned None for an unknown type.
+    for _area, _want in sorted(AREA_ROLE_DEFAULT.items()):
+        chk(f"area:{_area} derives a role when untyped",
+            triage(["priority:P2", f"area:{_area}"], "")["role"], _want)
+    # the consequence that matters: such an issue is now READY (it was parked status:untriaged and
+    # never entered any dispatch plan).
+    r = triage(["priority:P2", "area:usage"], "")
+    chk("untyped registry issue becomes ready", (r["ready"], "role:impl" in r["add"]), (True, True))
+    # AMBIGUOUS area defaults -> no role at all (fail closed), never an arbitrary pick.
+    chk("conflicting area defaults -> no role",
+        triage(["priority:P2", "area:usage", "area:docs"], "")["role"], None)
+    # the area default is LAST: an explicit role, a kind, the UI/infra lanes and the type map win.
+    chk("type map wins over area default",
+        triage(["priority:P3", "area:usage"], "spike")["role"], "research")
+    chk("explicit role wins over area default",
+        triage(["priority:P2", "role:research", "area:usage"], "")["role"], "research")
+    chk("kind wins over area default",
+        triage(["priority:P2", "kind:docs", "area:usage"], "")["role"], "docs")
+    # an unknown area is NOT invented into a role — an untyped, unmapped issue stays untriaged.
+    chk("unknown area derives nothing", triage(["priority:P2", "area:mystery"], "")["role"], None)
     # B2: a needs:design issue is NOT ready even with a full role+priority+area label-set.
     r = triage(["priority:P2", "role:impl", "area:review-loop", "needs:design"], "task")
     chk("needs:design not ready (B2)", r["ready"], False)

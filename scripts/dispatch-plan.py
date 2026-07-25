@@ -62,6 +62,33 @@ def _plan_package(labels):
     return next(iter(pkgs)) if len(pkgs) == 1 else GLOBAL
 
 
+def roleless_ready(issues):
+    """The SILENT-INVISIBILITY class (registry issue #225): open issues that carry `status:ready`,
+    are not epics, not gated, not busy and not blocked — and yet carry NO `role:*` label.
+
+    `ready_candidates` requires a role, so the readiness engine drops these BEFORE any plan row
+    exists: they appear in no plan, in no diagnostic, and drain never. 117 of them accumulated
+    before a human noticed the backlog was not moving. PURE (returns sorted issue numbers); the
+    planner still never GUESSES a role — the fail-closed drop is correct, its SILENCE was not, so
+    callers report this count LOUDLY on every plan. Deliberately does NOT require a valid priority:
+    a roleless issue must be reported whether or not it is also mis-prioritized."""
+    numbers = []
+    for it in issues:
+        if str(it.get("state", "OPEN")).upper() != "OPEN":
+            continue
+        labels = labels_of(it)
+        if "status:ready" not in labels or _ready.NON_DISPATCHABLE in labels:
+            continue
+        if _ready.is_gated(labels) or _ready.is_busy(labels):
+            continue
+        if int(it.get("open_blockers", 0)) > 0:
+            continue
+        if _ready.has_role(labels):
+            continue
+        numbers.append(it.get("number", 0))
+    return sorted(numbers)
+
+
 def plan_dispatch(ready_issues, routing_doc):
     """Compose the ready frontier + routing into a dispatch plan. PURE apart from a stderr
     diagnostic when it REJECTS an ambiguous-role issue (below). A roleless issue is flagged
@@ -221,6 +248,26 @@ def _self_test():
     ]), doc)
     chk("malformed single-role dropped, valid kept", [r["number"] for r in p_mix2], [15])
 
+    # issue #225: a `status:ready` issue with NO role:* label is INVISIBLE to the enumerator
+    # (ready_candidates' has_role gate drops it) — it must be REPORTED, never silently dropped.
+    invisible = [
+        iss(20, R + ["priority:P1", "area:usage"]),                        # ready but ROLELESS
+        iss(21, R + ["priority:P1", "role:impl", "area:docs"]),            # has a role -> visible
+        iss(22, R + ["priority:P1", "area:groom", "needs:design"]),        # gated (human-held)
+        iss(23, R + ["priority:P1", "area:worker", "status:in-progress"]),  # busy
+        iss(24, R + ["priority:P1", "area:ci", "kind:epic"]),              # epic (never work)
+        iss(25, R + ["priority:P1", "area:dispatch"], state="CLOSED"),     # closed
+        iss(26, R + ["priority:P1", "area:review-loop"], blk=1),           # open blocker
+    ]
+    chk("roleless-ready reported", roleless_ready(invisible), [20])
+    # non-vacuous pairing: #20 is EXACTLY the issue the frontier cannot see for want of a role —
+    # the only ready row it plans is the role-carrying #21.
+    chk("roleless-ready is the frontier's blind spot",
+        [i["number"] for i in compute_ready(invisible)], [21])
+    # a fully-labelled ready frontier reports NOTHING (no false alarm on a healthy tick).
+    chk("healthy frontier -> no roleless", roleless_ready(
+        [iss(27, R + ["priority:P1", "role:impl", "area:usage"])]), [])
+
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
     # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
     # it and it would double-dispatch. A single-area issue still reserves just that area.
@@ -259,6 +306,19 @@ def _print_table(plan):
     print(f"\n{len(plan)} issue(s) would be dispatched (dry-run).")
 
 
+def _print_roleless(numbers):
+    """ONE aggregate line on EVERY plan — printed even when the count is zero, the same
+    always-printed shape as dispatch.yml's review-enumeration exclusion line. A plan showing N
+    rows must never silently coexist with ready issues no enumerator can see (issue #225)."""
+    if not numbers:
+        print("ready-but-roleless issues: 0 (every status:ready issue is enumerable).")
+        return
+    print(f"WARNING: {len(numbers)} status:ready issue(s) carry NO role:* label and are INVISIBLE "
+          "to dispatch — they can never be planned: "
+          + ", ".join(f"#{n}" for n in numbers))
+    print("  fix: give each one a role:* label (scripts/triage.py derives one from its area:*).")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Pure dispatch planner (dry-run) for the registry.")
     ap.add_argument("--repo", default="jeswr/agent-account-registry")
@@ -272,6 +332,7 @@ def main():
         ready = compute_ready(issues)
         plan = plan_dispatch(ready, _routing_doc())
         _print_table(plan)
+        _print_roleless(roleless_ready(issues))
         return 0
     ap.print_help()
     return 0
