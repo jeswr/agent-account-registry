@@ -2,7 +2,9 @@
 # REG-3 live harness, local policy gate, target DRAFT-PR publisher, cross-provider
 # review/fix runners, and rotation write-back.
 # Secrets are accepted only through the environment/private files; xtrace must never be enabled.
-# The model container NEVER receives a GitHub token in any mode (see _run_headless_harness).
+# The model container NEVER receives a GitHub token in any mode (see _run_headless_harness), and
+# the account credential is PURGED from the runner before the target-controlled gate runs at all
+# (see purge_credentials / run_gate, issue #583).
 set -euo pipefail
 set +x
 umask 077
@@ -659,91 +661,445 @@ for p in paths:
 '
 }
 
+# ================================ pre-gate credential purge + isolated gate (issue #583) =========
+# The local gate runs the TARGET repository's own build scripts and `#[test]` bodies — arbitrary,
+# target-controlled code. Before #583 that code ran as the runner user while the LIVE provider
+# credential was still materialized under $WORKER_ROOT/home (plus a second copy at
+# .credential-baseline, with both paths advertised job-wide through $GITHUB_ENV), with unrestricted
+# network egress, and with its stdout/stderr streamed verbatim into a job log on a PUBLIC
+# repository. Three controls close that:
+#   (1) PURGE (purge_credentials): every enumerated credential path is deleted and its env pointers
+#       scrubbed BEFORE any target-controlled process starts. Fail-closed — a survivor aborts.
+#   (2) TWO-PHASE ISOLATED GATE: a fetch-only phase (network on, `cargo fetch`, no build script
+#       executes) followed by the real gate under `--network none` + CARGO_NET_OFFLINE=true, in a
+#       container that never mounts $WORKER_ROOT/home.
+#   (3) OUTPUT CONTAINMENT: gate stdout/stderr lands in a host-local log outside every mount; the
+#       public job log gets pass/fail, a host-derived failure class, and a bounded, scanned tail.
+# What this does NOT claim: it is not the credential-brokering re-architecture (never hand one
+# actor both the live credential and a writable target) tracked in #249 / #367 / #192, and the
+# post-gate rescan is a tripwire, not containment (see _rescan_paths_for_credentials).
+
+# PURE: enumerate every path worker-prep.sh materializes the selected account credential into —
+# the isolated HOME ($WORKER_ROOT/home holds .codex/auth.json, .claude/.credentials.json and
+# .claude/worker-token), the transient source file, and the rotation baseline copy. This list IS
+# the purge contract: adding a credential location without adding it here is exactly the regression
+# the enumeration self-test exists to catch.
+_gate_credential_paths() {
+  local worker_root=$1
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  printf '%s\n' \
+    "$worker_root/home" \
+    "$worker_root/.selected-credential" \
+    "$worker_root/.credential-baseline"
+}
+
+# Fail-closed assertion: nothing target-controlled may start, and nothing may be published, while
+# any enumerated credential path still exists. Names ONLY the surviving path, never its content.
+# An enumeration that fails (the helper died inside the process substitution) is itself a refusal —
+# a partial/empty list must never read as "all clear".
+_assert_credentials_purged() {
+  local worker_root=$1 path survivors=0
+  local -a paths=()
+  mapfile -t paths < <(_gate_credential_paths "$worker_root")
+  [[ ${#paths[@]} -ge 3 ]] ||
+    { printf 'worker-live: credential path enumeration failed (fail closed)\n' >&2; return 1; }
+  for path in "${paths[@]}"; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      printf 'worker-live: credential path is still present: %s\n' "$path" >&2
+      survivors=$((survivors + 1))
+    fi
+  done
+  [[ "$survivors" -eq 0 ]] || return 1
+  return 0
+}
+
+# PURE: the $GITHUB_ENV lines that retire worker-prep.sh's job-wide credential pointers (#232's
+# half of the finding: the gate step did not even have to guess where the credential lived). HOME
+# is REPOINTED at a fresh, credential-free gate home rather than emptied — later host steps (git in
+# publish) still need one. WORKER_PROVIDER/WORKER_HARNESS are deliberately left alone: they name no
+# credential and publish_pr still reads WORKER_PROVIDER for commit provenance.
+_credential_env_scrub_lines() {
+  local gate_home=$1
+  [[ -n "$gate_home" && "$gate_home" != / ]] || die 'gate HOME is unsafe'
+  printf 'HOME=%s\n' "$gate_home"
+  printf '%s=\n' CODEX_HOME WORKER_ACCOUNT WORKER_CREDENTIAL_FORMAT \
+    WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE
+}
+
+# Credential TRIPWIRE patterns (ERE, one per line, consumed via `grep -E -f`). Deliberately
+# conservative — real token shapes are long, so the minimum lengths below keep a legitimate diff
+# that merely MENTIONS a credential format (this repository's own scripts and self-tests do) from
+# tripping the gate, while a genuine copied credential still matches.
+_CREDENTIAL_TRIPWIRE_PATTERNS=(
+  'sk-ant-[A-Za-z0-9_-]{40,}'
+  'sk-proj-[A-Za-z0-9_-]{40,}'
+  'gh[pousr]_[A-Za-z0-9]{36,}'
+  'github_pat_[A-Za-z0-9_]{40,}'
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+  '"(access_token|refresh_token)"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
+)
+
+# The pattern list lives in a mode-600 file at the WORKER_ROOT root — a location no gate container
+# mount reaches — so target-controlled code can neither read the list (to encode around it) nor
+# rewrite it (to blind the scan).
+_write_credential_patterns() {
+  local file=$1
+  printf '%s\n' "${_CREDENTIAL_TRIPWIRE_PATTERNS[@]}" > "$file"
+  chmod 600 "$file"
+}
+
+# TRIPWIRE, NOT CONTAINMENT (the reviewer's framing on #242). This catches a CARELESS copy of
+# credential material into the tree `publish` stages wholesale — a build script that cat'd a file
+# it found, a test that dumped its environment. It does NOT stop a deliberate actor: any reversible
+# encoding (base64, split literals, gzip) walks straight past a literal pattern scan. The real
+# controls are the pre-gate purge (the credential is not on disk when target code runs) and the
+# egress restriction; the remaining egress work is tracked in #255.
+# Reads candidate paths on stdin; returns non-zero when any matches, printing ONLY the path — the
+# matched bytes are never echoed, because echoing them would BE the leak.
+_rescan_paths_for_credentials() {
+  local patterns_file=$1 path hits=0
+  [[ -f "$patterns_file" && ! -L "$patterns_file" ]] ||
+    { printf 'worker-live: credential pattern file is missing (fail closed)\n' >&2; return 1; }
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    # symlinks are skipped deliberately: following one would scan (and could report on) a file
+    # outside the published tree.
+    [[ -f "$path" && ! -L "$path" ]] || continue
+    if LC_ALL=C grep -a -q -E -f "$patterns_file" -- "$path" 2>/dev/null; then
+      printf 'worker-live: post-gate credential tripwire matched in %s\n' "$path" >&2
+      hits=$((hits + 1))
+    fi
+  done
+  [[ "$hits" -eq 0 ]] || return 1
+  return 0
+}
+
+# The gate sandbox reuses the SAME digest-pinned definition as the model sandbox (issue #145's
+# _assert_dockerfile_pinned keeps it pinned, and the registry gate re-checks it whenever the file is
+# touched); a distinct tag documents that this container is never handed a credential mount.
+_GATE_IMAGE='registry-worker-gate:reg3'
+
+# PURE (self-tested): the docker argv prefix for one gate phase, one element per line.
+#   fetch — network ON. Downloads dependency sources and provisions the toolchain. `cargo fetch`
+#           executes NO build script, so no target-controlled code runs while egress exists.
+#   build — `--network none` + CARGO_NET_OFFLINE=true. This is the phase that compiles and runs
+#           target build scripts and tests, and it has no route off the runner at all.
+# Neither phase mounts $WORKER_ROOT/home (the credential HOME) — and the loop below REFUSES to
+# build an argv that would, so a future edit that adds such a mount fails closed instead of
+# silently re-exposing the credential.
+# WORKER_DOCKER_BIN is a seam for the HERMETIC self-test's output-capturing fake docker only; live
+# runs never set it. It crosses no trust boundary: an actor who controls this process's environment
+# already controls the gate command itself.
+_gate_container_args() {
+  local phase=$1 worker_root=$2 target_dir=$3
+  [[ "$phase" == fetch || "$phase" == build ]] || die "unsupported gate phase $phase"
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  [[ -n "$target_dir" && "$target_dir" != / ]] || die 'TARGET_DIR is unsafe'
+  # shellcheck disable=SC2054  # comma-separated Docker mount options are single argv elements
+  local -a args=(
+    "${WORKER_DOCKER_BIN:-docker}" run --rm
+    --user "$(id -u):$(id -g)"
+    --workdir /workspace
+    --cap-drop ALL
+    --security-opt no-new-privileges
+    --pids-limit 4096
+    --mount "type=bind,src=$target_dir,dst=/workspace"
+    --mount "type=bind,src=$worker_root/gate-home,dst=/gate/home"
+    --mount "type=bind,src=$worker_root/gate-cargo,dst=/gate/cargo"
+    --mount "type=bind,src=$worker_root/gate-rustup,dst=/gate/rustup"
+    --env HOME=/gate/home
+    --env CARGO_HOME=/gate/cargo
+    --env RUSTUP_HOME=/gate/rustup
+    --env CARGO_TERM_COLOR=never
+    --env PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  )
+  if [[ "$phase" == build ]]; then
+    args+=(--network none --env CARGO_NET_OFFLINE=true)
+  fi
+  local item
+  for item in "${args[@]}"; do
+    [[ "$item" != *"$worker_root/home"* ]] ||
+      die 'refusing to mount the account credential HOME into the gate container'
+    [[ "$item" != GH_TOKEN* && "$item" != GITHUB_* ]] ||
+      die 'refusing to forward a GitHub token env into the gate container'
+  done
+  printf '%s\n' "${args[@]}"
+}
+
+# PURE (self-tested): the fetch phase's shell body. Network is ON here, so it must contain NO
+# build/test/gate command — `cargo fetch` only downloads dependency sources. Toolchain provisioning
+# also belongs here: the image's rustup tree is seeded into the writable RUSTUP_HOME mount and any
+# rust-toolchain.toml pin plus the clippy/rustfmt components are installed now, because the build
+# phase that needs them is offline.
+_gate_fetch_script() {
+  cat <<'SH'
+set -eu
+cp -dRn /usr/local/rustup/. "$RUSTUP_HOME"/ 2>/dev/null || true
+rustup show >/dev/null 2>&1 || rustup default stable >/dev/null 2>&1 || true
+rustup component add clippy rustfmt >/dev/null 2>&1 || true
+cargo fetch
+SH
+}
+
+_gate_prepare() {
+  local worker_root=$1
+  local dir
+  for dir in gate-home gate-cargo gate-rustup gate-image-context; do
+    mkdir -p "$worker_root/$dir"
+    chmod 700 "$worker_root/$dir"
+  done
+  : >> "$worker_root/gate-output.log"
+  chmod 600 "$worker_root/gate-output.log"
+  "${WORKER_DOCKER_BIN:-docker}" build --quiet \
+    --file "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
+    --tag "$_GATE_IMAGE" "$worker_root/gate-image-context" \
+    >> "$worker_root/gate-output.log" 2>&1 ||
+    die 'gate sandbox image build failed'
+}
+
+# TOTAL byte cap on the host-local gate log. Security review finding #3 — the reason the gate used
+# to stream straight to the job log and keep NO runner-local copy — is that target-controlled cargo
+# output is UNBOUNDED: a hostile build script can write until the runner's disk is full, and a cap
+# applied only when the tail is READ is applied far too late. So the cap is enforced AT WRITE TIME,
+# against the log's CUMULATIVE size rather than per command: the capture can never grow past it, and
+# exhausting the budget fails the gate closed instead of filling the disk.
+_GATE_LOG_MAX_BYTES=67108864
+
+# Byte allowance left for the next append. Returns NON-ZERO rather than die()ing, because it runs
+# inside a command substitution where a die() would exit only the subshell and leave the caller to
+# carry on with an EMPTY budget; the callers below convert that non-zero into the actual refusal.
+_gate_log_budget() {
+  local log=$1 used=0
+  [[ ! -f "$log" ]] || used=$(stat -c '%s' "$log" 2>/dev/null || echo 0)
+  local budget=$((_GATE_LOG_MAX_BYTES - used))
+  if [[ "$budget" -le 0 ]]; then
+    printf 'worker-live: gate output reached the runner-local capture cap\n' >&2
+    return 1
+  fi
+  printf '%s' "$budget"
+}
+
+# Run one gate command inside its phase container. ALL of its stdout+stderr — target-controlled by
+# construction — is appended to the host-local gate log, which sits at the WORKER_ROOT root and is
+# therefore outside every mount the container receives. Nothing from this stream reaches the PUBLIC
+# job log; the caller publishes only a class and a bounded, scanned tail (_gate_die).
+_gate_run() {
+  local phase=$1; shift
+  local worker_root=${WORKER_ROOT:-} target_dir=${TARGET_DIR:-}
+  local -a argv=()
+  mapfile -t argv < <(_gate_container_args "$phase" "$worker_root" "$target_dir")
+  # The helper's own die() cannot halt this caller from inside a process substitution, so the
+  # element-count check is the load-bearing guard: a refused argv must never degrade to running
+  # the command uncontained on the host.
+  [[ ${#argv[@]} -ge 20 ]] ||
+    die 'gate container argv could not be built; refusing to run target code uncontained'
+  local log="$worker_root/gate-output.log" budget rc=0
+  # The host-authored phase header is appended BEFORE the budget is read so the budget accounts for
+  # it: the cap then bounds the log exactly, rather than the cap plus one header per command.
+  printf '\n=== gate phase %s: %s ===\n' "$phase" "$1" >> "$log"
+  budget=$(_gate_log_budget "$log") ||
+    die 'gate output exceeded the runner-local capture cap; refusing to continue (fail closed)'
+  # `head -c` closes the pipe at the budget, so an over-producing command is SIGPIPE'd rather than
+  # allowed to keep writing; pipefail makes the pipeline carry the CONTAINER's exit status.
+  "${argv[@]}" "$_GATE_IMAGE" "$@" 2>&1 | head -c "$budget" >> "$log" || rc=$?
+  return "$rc"
+}
+
+# Same containment, but the command's STDOUT is returned to the caller instead of logged. Used ONLY
+# for `cargo metadata --no-deps` (which runs no build script) because the host parses its JSON; that
+# JSON goes into a shell variable, never into the job log.
+_gate_capture() {
+  local phase=$1; shift
+  local worker_root=${WORKER_ROOT:-} target_dir=${TARGET_DIR:-}
+  local -a argv=()
+  mapfile -t argv < <(_gate_container_args "$phase" "$worker_root" "$target_dir")
+  [[ ${#argv[@]} -ge 20 ]] ||
+    die 'gate container argv could not be built; refusing to run target code uncontained'
+  local log="$worker_root/gate-output.log" budget
+  budget=$(_gate_log_budget "$log") ||
+    die 'gate output exceeded the runner-local capture cap; refusing to continue (fail closed)'
+  "${argv[@]}" "$_GATE_IMAGE" "$@" 2> >(head -c "$budget" >> "$log")
+}
+
+# A SIZE-BOUNDED, credential-scanned tail of the host-local gate log, for the public job log.
+# Bounded FIRST (a hostile build script can emit gigabytes), then scanned as a whole — a hit
+# withholds the entire tail rather than attempting redaction, which a partial match would botch.
+_gate_log_tail() {
+  local log=$1 patterns_file=$2 max_lines=${3:-40} max_cols=${4:-200}
+  [[ -f "$log" ]] || { printf '(no gate output was captured)\n'; return 0; }
+  local bounded
+  bounded=$(tail -n "$max_lines" -- "$log" | cut -c "1-$max_cols")
+  if [[ -f "$patterns_file" ]] &&
+     printf '%s\n' "$bounded" | LC_ALL=C grep -a -q -E -f "$patterns_file" 2>/dev/null; then
+    printf '(gate output tail WITHHELD: it matched the credential tripwire)\n'
+    return 0
+  fi
+  printf '%s\n' "$bounded"
+}
+
+# The gate's failure signal for a PUBLIC log: a host-derived class (which host-chosen command
+# failed, never target-authored text) plus the bounded, scanned tail.
+_gate_die() {
+  local class=$1
+  local worker_root=${WORKER_ROOT:-}
+  printf '::error::worker-live: gate-failure-class=%s (target-controlled gate output is withheld from this PUBLIC log)\n' \
+    "$class"
+  printf 'worker-live: bounded, credential-scanned tail of the gate output:\n'
+  _gate_log_tail "$worker_root/gate-output.log" "$worker_root/.credential-patterns"
+  die "local gate failed (class $class)"
+}
+
+# Entrypoint for the dedicated pre-gate workflow step. Runs AFTER the rotation write-back (which
+# needs the credential) and BEFORE anything target-controlled.
+purge_credentials() {
+  local worker_root=${WORKER_ROOT:-}
+  [[ -n "$worker_root" && "$worker_root" != / && -d "$worker_root" ]] || die 'WORKER_ROOT is unsafe'
+  local -a paths=()
+  mapfile -t paths < <(_gate_credential_paths "$worker_root")
+  [[ ${#paths[@]} -ge 3 ]] || die 'credential path enumeration failed; refusing a partial purge'
+  local path
+  for path in "${paths[@]}"; do
+    rm -rf -- "$path" || true
+  done
+  _assert_credentials_purged "$worker_root" ||
+    die 'a credential path survived the purge; refusing to run target-controlled code'
+  local gate_home="$worker_root/gate-home"
+  mkdir -p "$gate_home"
+  chmod 700 "$gate_home"
+  [[ -z ${GITHUB_ENV:-} ]] || _credential_env_scrub_lines "$gate_home" >> "$GITHUB_ENV"
+  _write_credential_patterns "$worker_root/.credential-patterns"
+  printf 'worker-live: purged %s credential path(s) and scrubbed their job-env pointers before the gate\n' \
+    "${#paths[@]}"
+}
+
+# Entrypoint for the post-gate workflow step, wired ahead of the token-bearing publish step.
+rescan_target() {
+  require_target
+  local worker_root=${WORKER_ROOT:-}
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  local patterns="$worker_root/.credential-patterns"
+  # `publish` stages the whole tree with `git add -A`, so re-assert the purge held: the gate could
+  # not have restored the credential, but assert rather than assume.
+  _assert_credentials_purged "$worker_root" ||
+    die 'a credential path reappeared after the gate; refusing to publish'
+  local changed rc=0
+  changed="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
+    || die 'post-gate rescan: changed-path listing refused (fail closed)'
+  {
+    printf '%s\n' "$changed"
+    # followups.jsonl is not in the tree, but its contents become PUBLIC issue bodies.
+    [[ ! -f "$worker_root/followups.jsonl" ]] || printf '%s\n' "$worker_root/followups.jsonl"
+  } | _rescan_paths_for_credentials "$patterns" || rc=$?
+  # The pattern list never survives into the token-bearing publish step.
+  rm -f -- "$patterns"
+  [[ "$rc" -eq 0 ]] ||
+    die 'post-gate credential tripwire matched; refusing to publish the target tree'
+  printf 'worker-live: post-gate credential tripwire clean (modified/untracked target files + followups)\n'
+}
+
 run_gate() {
   require_target
   local profile=${GATE_PROFILE:-}
   local packages=${WORKER_PACKAGES:-}
+  local worker_root=${WORKER_ROOT:-}
   git diff --check
+  # Profiles that never invoke cargo need no sandbox image.
   case "$profile" in
     none)
       printf 'worker-live: local gate skipped by policy profile none\n'
-      ;;
-    lint-only)
-      if [[ -f Cargo.toml ]]; then
-        cargo fmt --all -- --check || echo "worker-live: fmt drift (advisory; sparq CI treats fmt non-blocking)"
-      fi
-      printf 'worker-live: lint-only gate passed\n'
-      ;;
-    crate-scoped)
-      [[ -f Cargo.toml ]] || die 'crate-scoped gate requires Cargo.toml'
-      if [[ -z "$packages" ]]; then
-        # [OPUS-4.8] No area:<crate> label. Legitimate for a docs/non-crate change (e.g. a
-        # role:docs task edits AGENTS.md only) — there is no crate to build, and the PR's CI
-        # docs-quality gate is the real backstop. But it is a REAL error if the diff actually
-        # touches crate source with no crate label, so fail closed in that case.
-        local changed_paths
-        changed_paths="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
-          || die 'crate-scoped gate: changed-path listing refused (fail closed)'
-        if printf '%s\n' "$changed_paths" | grep -qE '^crates/|^Cargo\.toml$|^Cargo\.lock$'; then
-          die 'crate-scoped gate requires an area:<crate> label (diff touches crate source)'
-        fi
-        printf 'worker-live: docs/non-crate change (no crate source touched) — nothing to build; gate passed\n'
-      else
-        cargo fmt --all -- --check || echo "worker-live: fmt drift (advisory; sparq CI treats fmt non-blocking)"
-        # [FABLE-5] Validate every requested package against the ACTUAL workspace members BEFORE
-        # `cargo -p` (defect #2). Compute the member set once (cargo metadata --no-deps runs no
-        # build scripts; its ~333KB JSON is streamed through stdin, never an env var/argv). An
-        # atom that is not an exact member DEGRADES to lint-only for that atom (never crashes)
-        # with a loud, no-silent-degrade log line.
-        local members
-        members="$(cargo metadata --no-deps --format-version 1 2>/dev/null | _workspace_member_names || true)"
-        [[ -n "$members" ]] || die 'crate-scoped gate could not enumerate workspace members (cargo metadata failed)'
-        local package resolution kind name
-        local -a built=() degraded=()
-        IFS=',' read -r -a package_list <<< "$packages"
-        for package in "${package_list[@]}"; do
-          [[ -n "$package" ]] || continue
-          safe_atom "$package" || die "unsafe crate package $package"
-          resolution="$(_resolve_gate_package "$package" "$members")"
-          kind=${resolution%%:*}; name=${resolution#*:}
-          if [[ "$kind" == member ]]; then
-            cargo clippy -p "$name" --all-targets -- -D warnings
-            cargo test -p "$name"
-            built+=("$name")
-          else
-            # Non-member area (gui, deps, ci, docs, site, js, …): fail SAFE to lint-only for
-            # this atom instead of a hard `cargo -p` crash that would discard the model's work.
-            printf 'worker-live: area label %s is not a root-workspace member — substituting lint-only gate profile for it (no name-guessing)\n' \
-              "$package"
-            degraded+=("$package")
-          fi
-        done
-        if [[ ${#built[@]} -eq 0 && ${#degraded[@]} -gt 0 ]]; then
-          # Every requested atom degraded: this is exactly the lint-only outcome — run the fmt
-          # check that lint-only would (already done above) and pass. NEVER a crash.
-          printf 'worker-live: crate-scoped gate degraded to lint-only (no requested area resolved to a crate: %s)\n' \
-            "${degraded[*]}"
-        else
-          printf 'worker-live: crate-scoped gate passed for %s' "${built[*]}"
-          [[ ${#degraded[@]} -gt 0 ]] && printf ' (lint-only substituted for non-crate area(s): %s)' "${degraded[*]}"
-          printf '\n'
-        fi
-      fi
-      ;;
-    workspace)
-      [[ -f Cargo.toml ]] || die 'workspace gate requires Cargo.toml'
-      cargo fmt --all -- --check || echo "worker-live: fmt drift (advisory; sparq CI treats fmt non-blocking)"
-      cargo clippy --workspace --all-targets -- -D warnings
-      cargo test --workspace
-      printf 'worker-live: workspace gate passed\n'
+      return 0
       ;;
     registry-selftest)
       # [OPUS-4.8] python/actions gate for a self-managed target (the registry itself): the
       # crate-scoped cargo gate does not fit a python repo. Fail-closed, and NON-VACUOUS — a run
       # that touched a script but found no runnable suite is an error, not a silent pass.
+      # NOT sandboxed (#583 scope): this lane runs the registry's own python suite host-side, so it
+      # still has host network access and streams its output to the job log. It IS credential-free —
+      # the pre-gate purge is profile-independent — but do not read it as contained.
       registry_selftest_gate
+      return 0
       ;;
+    lint-only | crate-scoped | workspace) ;;
     *) die "unsupported gate profile $profile" ;;
+  esac
+  [[ "$profile" == lint-only || -f Cargo.toml ]] || die "$profile gate requires Cargo.toml"
+  if [[ "$profile" == crate-scoped && -z "$packages" ]]; then
+    # [OPUS-4.8] No area:<crate> label. Legitimate for a docs/non-crate change (e.g. a
+    # role:docs task edits AGENTS.md only) — there is no crate to build, and the PR's CI
+    # docs-quality gate is the real backstop. But it is a REAL error if the diff actually
+    # touches crate source with no crate label, so fail closed in that case. No cargo runs here,
+    # so no sandbox is needed either.
+    local changed_paths
+    changed_paths="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
+      || die 'crate-scoped gate: changed-path listing refused (fail closed)'
+    if printf '%s\n' "$changed_paths" | grep -qE '^crates/|^Cargo\.toml$|^Cargo\.lock$'; then
+      die 'crate-scoped gate requires an area:<crate> label (diff touches crate source)'
+    fi
+    printf 'worker-live: docs/non-crate change (no crate source touched) — nothing to build; gate passed\n'
+    return 0
+  fi
+  if [[ ! -f Cargo.toml ]]; then
+    printf 'worker-live: lint-only gate passed (no Cargo.toml to build)\n'
+    return 0
+  fi
+
+  [[ -n "$worker_root" && "$worker_root" != / ]] ||
+    die 'WORKER_ROOT is required to build the isolated gate sandbox'
+  _gate_prepare "$worker_root"
+  # Phase 1: network ON, but nothing target-controlled executes (`cargo fetch` only downloads).
+  _gate_run fetch sh -c "$(_gate_fetch_script)" || _gate_die fetch
+  # Phase 2 onward: every command below compiles/runs target-controlled code with --network none.
+  _gate_run build cargo fmt --all -- --check ||
+    printf 'worker-live: fmt drift (advisory; sparq CI treats fmt non-blocking)\n'
+  case "$profile" in
+    lint-only)
+      printf 'worker-live: lint-only gate passed\n'
+      ;;
+    crate-scoped)
+      # [FABLE-5] Validate every requested package against the ACTUAL workspace members BEFORE
+      # `cargo -p` (defect #2). Compute the member set once (cargo metadata --no-deps runs no
+      # build scripts; its ~333KB JSON is streamed through stdin, never an env var/argv). An
+      # atom that is not an exact member DEGRADES to lint-only for that atom (never crashes)
+      # with a loud, no-silent-degrade log line.
+      local members
+      members="$(_gate_capture build cargo metadata --no-deps --format-version 1 | _workspace_member_names || true)"
+      [[ -n "$members" ]] || die 'crate-scoped gate could not enumerate workspace members (cargo metadata failed)'
+      local package resolution kind name
+      local -a built=() degraded=()
+      IFS=',' read -r -a package_list <<< "$packages"
+      for package in "${package_list[@]}"; do
+        [[ -n "$package" ]] || continue
+        safe_atom "$package" || die "unsafe crate package $package"
+        resolution="$(_resolve_gate_package "$package" "$members")"
+        kind=${resolution%%:*}; name=${resolution#*:}
+        if [[ "$kind" == member ]]; then
+          _gate_run build cargo clippy -p "$name" --all-targets -- -D warnings || _gate_die "clippy:$name"
+          _gate_run build cargo test -p "$name" || _gate_die "test:$name"
+          built+=("$name")
+        else
+          # Non-member area (gui, deps, ci, docs, site, js, …): fail SAFE to lint-only for
+          # this atom instead of a hard `cargo -p` crash that would discard the model's work.
+          printf 'worker-live: area label %s is not a root-workspace member — substituting lint-only gate profile for it (no name-guessing)\n' \
+            "$package"
+          degraded+=("$package")
+        fi
+      done
+      if [[ ${#built[@]} -eq 0 && ${#degraded[@]} -gt 0 ]]; then
+        # Every requested atom degraded: this is exactly the lint-only outcome — run the fmt
+        # check that lint-only would (already done above) and pass. NEVER a crash.
+        printf 'worker-live: crate-scoped gate degraded to lint-only (no requested area resolved to a crate: %s)\n' \
+          "${degraded[*]}"
+      else
+        printf 'worker-live: crate-scoped gate passed for %s' "${built[*]}"
+        [[ ${#degraded[@]} -gt 0 ]] && printf ' (lint-only substituted for non-crate area(s): %s)' "${degraded[*]}"
+        printf '\n'
+      fi
+      ;;
+    workspace)
+      _gate_run build cargo clippy --workspace --all-targets -- -D warnings || _gate_die clippy
+      _gate_run build cargo test --workspace || _gate_die test
+      printf 'worker-live: workspace gate passed\n'
+      ;;
   esac
 }
 
@@ -2734,6 +3090,213 @@ TOML
     printf '  skip (d) live cargo crash-reproduction (cargo not on PATH)\n'
   fi
 
+  # --- [issue #583] pre-gate credential purge + two-phase isolated gate + post-gate tripwire.
+  # The gate runs the TARGET's own build scripts/tests; before this it ran as the runner user with
+  # the live credential still on disk, with egress, and with its output streamed to a PUBLIC job
+  # log. Each chk below goes RED when its control is removed. ---
+  local gate_root="$tmp/gateroot"
+  mkdir -p "$gate_root/home/.claude" "$gate_root/cli"
+  printf 'fixture-token\n' > "$gate_root/home/.claude/worker-token"
+  printf 'fixture-source\n' > "$gate_root/.selected-credential"
+  printf 'fixture-baseline\n' > "$gate_root/.credential-baseline"
+
+  # (1) the purge CONTRACT: every path worker-prep.sh materializes a credential into is enumerated.
+  chk "(583) the purge enumerates every credential path worker-prep materializes" \
+    "$(_gate_credential_paths "$gate_root" | sed "s|^$gate_root/||" | sort | paste -sd',' -)" \
+    ".credential-baseline,.selected-credential,home"
+  chk "(583) an un-purged worker root is REFUSED before target code runs" \
+    "$(_assert_credentials_purged "$gate_root" >/dev/null 2>&1 && echo continued || echo aborted)" \
+    "aborted"
+
+  local purge_env="$tmp/purge-github-env" purge_rc
+  : > "$purge_env"
+  if ( export WORKER_ROOT="$gate_root" GITHUB_ENV="$purge_env"; purge_credentials ) \
+      > "$tmp/purge.log" 2>&1; then purge_rc=0; else purge_rc=$?; fi
+  chk "(583) purge_credentials completes" "$purge_rc" "0"
+  chk "(583) EVERY enumerated credential path is deleted (a no-op purge turns this red)" \
+    "$(_gate_credential_paths "$gate_root" \
+        | while IFS= read -r p; do [[ -e "$p" || -L "$p" ]] && printf '%s\n' "$p"; done | wc -l)" "0"
+  chk "(583) the purged worker root passes the pre-gate assertion" \
+    "$(_assert_credentials_purged "$gate_root" >/dev/null 2>&1 && echo continued || echo aborted)" \
+    "continued"
+  # a survivor must ABORT the run, never continue on to the gate
+  mkdir -p "$gate_root/home"
+  chk "(583) a credential path that survives the purge ABORTS the run (fail closed)" \
+    "$(_assert_credentials_purged "$gate_root" >/dev/null 2>&1 && echo continued || echo aborted)" \
+    "aborted"
+  rm -rf -- "$gate_root/home"
+  for scrubbed in HOME CODEX_HOME WORKER_ACCOUNT WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE; do
+    chk "(583) $scrubbed is scrubbed from the job env (the gate cannot look up where it was)" \
+      "$(grep -c "^$scrubbed=" "$purge_env" || true)" "1"
+  done
+  chk "(583) the scrubbed HOME repoints at a credential-free gate home" \
+    "$(grep '^HOME=' "$purge_env")" "HOME=$gate_root/gate-home"
+  chk "(583) the tripwire pattern list is mode 600 (target code cannot read or rewrite it)" \
+    "$(stat -c '%a' "$gate_root/.credential-patterns" 2>/dev/null)" "600"
+  chk "(583) the pattern list sits at the WORKER_ROOT root, outside every gate mount" \
+    "$(printf '%s\n' "$gate_root/.credential-patterns" | grep -c "^$gate_root/gate-" || true)" "0"
+
+  # (2) two-phase gate argv: the phase that runs target code has NO network.
+  local -a fetch_argv=() build_argv=()
+  mapfile -t fetch_argv < <(_gate_container_args fetch "$gate_root" "$tmp/faketarget")
+  mapfile -t build_argv < <(_gate_container_args build "$gate_root" "$tmp/faketarget")
+  chk "(583) the gate container argv builds at all (an empty argv would make the rest vacuous)" \
+    "$([[ ${#build_argv[@]} -ge 20 && ${#fetch_argv[@]} -ge 20 ]] && echo built || echo empty)" "built"
+  chk "(583) the BUILD phase argv carries --network none" \
+    "$(printf '%s ' "${build_argv[@]}" | grep -c -- '--network none' || true)" "1"
+  chk "(583) the BUILD phase argv forces CARGO_NET_OFFLINE=true" \
+    "$(printf '%s\n' "${build_argv[@]}" | grep -cx 'CARGO_NET_OFFLINE=true' || true)" "1"
+  chk "(583) the FETCH phase keeps network (it downloads deps and runs no target code)" \
+    "$(printf '%s\n' "${fetch_argv[@]}" | grep -cx -- '--network' || true)" "0"
+  chk "(583) neither gate phase mounts the account credential HOME" \
+    "$(printf '%s\n' "${fetch_argv[@]}" "${build_argv[@]}" | grep -c "src=$gate_root/home," || true)" "0"
+  chk "(583) an unknown gate phase fails closed" \
+    "$( (_gate_container_args sneaky "$gate_root" "$tmp/faketarget" >/dev/null 2>&1 && echo built) || echo refused)" \
+    "refused"
+
+  local fetch_script
+  fetch_script=$(_gate_fetch_script)
+  chk "(583) the fetch phase fetches dependencies" \
+    "$(grep -cx 'cargo fetch' <<< "$fetch_script" || true)" "1"
+  chk "(583) the fetch phase contains NO gate/test command (no build script runs while egress exists)" \
+    "$(grep -cE 'cargo (test|clippy|build|run|bench)' <<< "$fetch_script" || true)" "0"
+
+  # (3) output containment, exercised through the REAL _gate_run with an argv-faking docker that
+  # emits credential-shaped bytes on both streams. The job-log path must receive none of it.
+  mkdir -p "$tmp/faketarget"
+  cat > "$tmp/fake-docker" <<'FAKE'
+#!/usr/bin/env bash
+[[ "${1:-}" != build ]] || { printf 'sha256:fakeimage\n'; exit 0; }
+printf 'compiling target crate; leaked sk-ant-oat01-%s\n' "$(printf 'A%.0s' {1..64})"
+printf 'error: leaked sk-ant-oat01-%s on stderr\n' "$(printf 'B%.0s' {1..64})" >&2
+exit "${FAKE_DOCKER_RC:-0}"
+FAKE
+  chmod +x "$tmp/fake-docker"
+  : > "$gate_root/gate-output.log"
+  ( export WORKER_ROOT="$gate_root" TARGET_DIR="$tmp/faketarget" \
+           WORKER_DOCKER_BIN="$tmp/fake-docker"
+    _gate_run build cargo test --workspace ) > "$tmp/gate-joblog.txt" 2>&1 || true
+  chk "(583) the job-log path receives NO raw gate output" \
+    "$(grep -c 'sk-ant-' "$tmp/gate-joblog.txt" || true)" "0"
+  chk "(583) gate stdout AND stderr land in the host-local log instead" \
+    "$(grep -c 'sk-ant-' "$gate_root/gate-output.log" || true)" "2"
+
+  ( export WORKER_ROOT="$gate_root"; _gate_die "test:sparq-engine" ) \
+    > "$tmp/gate-die.log" 2>&1 || true
+  chk "(583) a gate failure publishes a HOST-derived failure class" \
+    "$(grep -c 'gate-failure-class=test:sparq-engine' "$tmp/gate-die.log" || true)" "1"
+  chk "(583) the published tail is WITHHELD when it matches the credential tripwire" \
+    "$(grep -c 'WITHHELD' "$tmp/gate-die.log" || true)" "1"
+  chk "(583) no credential-shaped bytes reach the public failure output" \
+    "$(grep -c 'sk-ant-' "$tmp/gate-die.log" || true)" "0"
+
+  local big_log="$tmp/big-gate.log" bounded_tail
+  python3 -c 'import sys
+sys.stdout.writelines("line %d %s\n" % (i, "x" * 500) for i in range(3000))' > "$big_log"
+  bounded_tail=$(_gate_log_tail "$big_log" "$gate_root/.credential-patterns" 40 200)
+  chk "(583) the published gate tail is line-bounded" "$(wc -l <<< "$bounded_tail")" "40"
+  chk "(583) the published gate tail is column-bounded" \
+    "$(awk 'length($0) > 200 { n++ } END { print n + 0 }' <<< "$bounded_tail")" "0"
+
+  # The runner-local capture is bounded AT WRITE TIME, not merely when the tail is read (security
+  # review finding #3: target-controlled cargo output is unbounded and could otherwise fill the
+  # runner's disk — the reason the gate used to keep no runner-local copy at all). Cap at 4KB with a
+  # fake docker that floods ~1MB: the log must stop at the cap AND the flood must fail the gate.
+  cat > "$tmp/flood-docker" <<'FAKE'
+#!/usr/bin/env bash
+[[ "${1:-}" != build ]] || { printf 'sha256:fakeimage\n'; exit 0; }
+exec python3 -c 'import sys
+sys.stdout.writelines("flood %d %s\n" % (i, "F" * 100) for i in range(10000))'
+FAKE
+  chmod +x "$tmp/flood-docker"
+  local capped_rc
+  : > "$gate_root/gate-output.log"
+  if ( export WORKER_ROOT="$gate_root" TARGET_DIR="$tmp/faketarget" \
+              WORKER_DOCKER_BIN="$tmp/flood-docker"
+       _GATE_LOG_MAX_BYTES=4096
+       _gate_run build cargo test --workspace ) >/dev/null 2>&1
+  then capped_rc=passed; else capped_rc=failed; fi
+  chk "(583) an over-producing gate cannot grow the runner-local log past the write-time cap" \
+    "$(( $(stat -c '%s' "$gate_root/gate-output.log") <= 4096 ))" "1"
+  chk "(583) blowing the capture cap FAILS the gate (never a silent unbounded write)" \
+    "$capped_rc" "failed"
+  chk "(583) a further append once the budget is spent is refused (fail closed)" \
+    "$( ( _GATE_LOG_MAX_BYTES=4096; _gate_log_budget "$gate_root/gate-output.log" ) >/dev/null 2>&1 \
+        && echo allowed || echo refused)" "refused"
+  # ...and the refusal reaches _gate_run itself BEFORE the container is launched. _gate_log_budget
+  # runs inside a command substitution, where a die() would exit only the subshell and leave
+  # _gate_run to carry on with an EMPTY budget — so observe the LAUNCH directly (a marker the fake
+  # docker writes). Exit status alone cannot discriminate: an empty `head -c ''` fails either way.
+  cat > "$tmp/mark-docker" <<'FAKE'
+#!/usr/bin/env bash
+: > "$MARK_FILE"
+[[ "${1:-}" != build ]] || { printf 'sha256:fakeimage\n'; exit 0; }
+printf 'ordinary gate output\n'
+FAKE
+  chmod +x "$tmp/mark-docker"
+  rm -f "$tmp/docker-launched"
+  ( export WORKER_ROOT="$gate_root" TARGET_DIR="$tmp/faketarget" \
+           WORKER_DOCKER_BIN="$tmp/mark-docker" MARK_FILE="$tmp/docker-launched"
+    _GATE_LOG_MAX_BYTES=1
+    _gate_run build cargo test --workspace ) >/dev/null 2>&1 || true
+  chk "(583) an exhausted capture budget stops the gate BEFORE the container is launched" \
+    "$([[ -e "$tmp/docker-launched" ]] && echo launched || echo refused)" "refused"
+  # marker control: with budget available the container IS launched, so the check above measures
+  # the guard rather than a fixture that never fires.
+  rm -f "$tmp/docker-launched"
+  ( export WORKER_ROOT="$gate_root" TARGET_DIR="$tmp/faketarget" \
+           WORKER_DOCKER_BIN="$tmp/mark-docker" MARK_FILE="$tmp/docker-launched"
+    _GATE_LOG_MAX_BYTES=67108864
+    _gate_run build cargo test --workspace ) >/dev/null 2>&1 || true
+  chk "(583) marker control: with budget available the gate container IS launched" \
+    "$([[ -e "$tmp/docker-launched" ]] && echo launched || echo refused)" "launched"
+
+  # (4) post-gate tripwire over the files publish would stage, plus followups.jsonl.
+  local scan_dir="$tmp/scanroot"
+  mkdir -p "$scan_dir"
+  printf 'pub fn main() {}\n' > "$scan_dir/clean.rs"
+  printf 'const T: &str = "sk-ant-oat01-%s";\n' "$(printf 'Z%.0s' {1..80})" > "$scan_dir/leaky.rs"
+  printf '{"title":"t","body":"sk-ant-oat01-%s"}\n' "$(printf 'Y%.0s' {1..80})" \
+    > "$scan_dir/followups.jsonl"
+  chk "(583) a clean post-gate file passes the tripwire" \
+    "$(printf '%s\n' "$scan_dir/clean.rs" \
+        | _rescan_paths_for_credentials "$gate_root/.credential-patterns" >/dev/null 2>&1 \
+        && echo clean || echo tripped)" "clean"
+  chk "(583) a credential written into the target tree by the gate TRIPS the rescan (fail closed)" \
+    "$(printf '%s\n' "$scan_dir/clean.rs" "$scan_dir/leaky.rs" \
+        | _rescan_paths_for_credentials "$gate_root/.credential-patterns" >/dev/null 2>&1 \
+        && echo clean || echo tripped)" "tripped"
+  chk "(583) followups.jsonl is rescanned too (its contents become public issue bodies)" \
+    "$(printf '%s\n' "$scan_dir/followups.jsonl" \
+        | _rescan_paths_for_credentials "$gate_root/.credential-patterns" >/dev/null 2>&1 \
+        && echo clean || echo tripped)" "tripped"
+  chk "(583) the rescan names only the path, never the matched bytes" \
+    "$(printf '%s\n' "$scan_dir/leaky.rs" \
+        | _rescan_paths_for_credentials "$gate_root/.credential-patterns" 2>&1 \
+        | grep -c 'sk-ant-' || true)" "0"
+  chk "(583) a missing pattern file fails closed (never a silent all-clear)" \
+    "$(printf '%s\n' "$scan_dir/clean.rs" \
+        | _rescan_paths_for_credentials "$tmp/no-such-pattern-file" >/dev/null 2>&1 \
+        && echo clean || echo tripped)" "tripped"
+  # This repository is its own target on the self-managed lane, so the pattern list must NOT trip
+  # on scripts that merely DESCRIBE credential formats — a tripwire that always fires is no gate.
+  chk "(583) the tripwire does not fire on this repository's own credential-handling scripts" \
+    "$(printf '%s\n' "$SCRIPT_DIR/worker-live.sh" "$SCRIPT_DIR/worker-prep.sh" \
+        | _rescan_paths_for_credentials "$gate_root/.credential-patterns" >/dev/null 2>&1 \
+        && echo clean || echo tripped)" "clean"
+
+  # (5) workflow wiring: the purge is upstream of the gate and the rescan is upstream of publish.
+  chk "(583) the gate cannot run unless the pre-gate purge SUCCEEDED" \
+    "$(_workflow_step_if "$wf" gate | grep -Fc "steps.purge.outcome == 'success'" || true)" "1"
+  chk "(583) the purge runs only after the credential write-back completed" \
+    "$(_workflow_step_if "$wf" purge | grep -Fc "steps.writeback.outcome == 'success'" || true)" "1"
+  chk "(583) the post-gate rescan is wired AHEAD of the token-bearing publish step" \
+    "$(_workflow_step_if "$wf" pr | grep -Fc "steps.rescan.outcome == 'success'" || true)" "1"
+  chk "(583) followups (which publishes followups.jsonl) is rescan-gated too" \
+    "$(_workflow_step_if "$wf" followups | grep -Fc "steps.rescan.outcome == 'success'" || true)" "1"
+  chk "(583) the rescan still runs when the gate FAILED (always()-guarded)" \
+    "$(_workflow_step_if "$wf" rescan | grep -c 'always()' || true)" "1"
+
   # --- rotation write_back env-scope contract (sol review on #275): the PAT-authed gh call MUST
   # target the `dispatch-secrets` ENVIRONMENT (a repo-scope write re-trips the secrets-guard AND
   # leaves the env copy stale) and the credential MUST travel via stdin, never argv. Hermetic:
@@ -2827,7 +3390,9 @@ FAKE
 
 case "${1:-}" in
   model) run_model ;;
+  purge-credentials) purge_credentials ;;
   gate) run_gate ;;
+  rescan) rescan_target ;;
   publish) publish_pr ;;
   review) run_review ;;
   fix) run_fix ;;
@@ -2838,5 +3403,5 @@ case "${1:-}" in
     _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
     ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|print-selftest-suite|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|purge-credentials|gate|rescan|publish|review|fix|push-fix|write-back|print-selftest-suite|self-test>' ;;
 esac
