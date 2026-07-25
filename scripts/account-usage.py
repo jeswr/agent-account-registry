@@ -664,6 +664,29 @@ def main():
         probed = _probe_account(account, secrets)
         if probed is None:
             continue  # fail-closed omit: unknown provider / bad secret_ref / no token / failed probe
+        # [OPUS-5 issue #676] Join the REACTIVE rate-limit backoff onto PROBED (anthropic) entries
+        # too. This closes a live hole: a 429 on an anthropic worker already wrote a `transient`
+        # model-health record and `account_backoffs` already derived a hold from it, but the
+        # backoff overlay was gated on `_is_exempt_provider`, so nothing ever applied it to the
+        # anthropic side. The account kept being handed out at full width until its UTILISATION
+        # eventually climbed — which, for a secondary/burst rate limit, it may never do.
+        #
+        # The quota probe stays authoritative for headroom; this only ADDS a hold, and only while
+        # one is active. Fail-open on a malformed record is inherited from `_apply_backoff` and is
+        # deliberate: the probe's own fail-closed omission is the backstop for anthropic, so a
+        # corrupt ledger must not be able to starve the metered provider.
+        if salt:
+            if health is None:
+                try:
+                    mh = _load_model_health(script_dir)
+                    health = _load_health_state(mh, now)
+                except Exception:
+                    print("::warning::account-usage: model-health module unavailable — probed "
+                          "accounts admitted WITHOUT rate-limit backoff this tick (fail-open)",
+                          file=sys.stderr)
+                    mh, health = None, {"backoffs": {}, "credentials": {}}
+            if mh is not None:
+                probed = _apply_backoff(probed, health["backoffs"].get(mh.account_hash(handle, salt)))
         usage[handle] = probed
     json.dump(usage, sys.stdout)
     return 0

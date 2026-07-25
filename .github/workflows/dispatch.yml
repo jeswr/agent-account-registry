@@ -363,6 +363,10 @@ jobs:
               #      kwarg would TypeError and take down that target's whole dispatch, so an older
               #      engine falls back to the narrow frontier with a warning instead of failing.
               #      Narrower is the safe direction: it dispatches less, never more.
+              # >>> frontier-width — EXECUTED by scripts/dispatch-plan.py --self-test. These two
+              # `if`s are workflow python: the width branch and the TypeError fallback are exactly
+              # the kind of call-site logic that no unit test reaches, so they are extracted and
+              # run against stub planners rather than pattern-matched (#597 r2 lesson).
               width = frontier_width.get(repo, 1)
               if width > 1:
                   try:
@@ -373,6 +377,7 @@ jobs:
                       ready = dispatch.compute_ready(ready_input)
               else:
                   ready = dispatch.compute_ready(ready_input)
+              # <<< frontier-width
               # Issue #225: a `status:ready` issue carrying NO role:* label is dropped by the
               # readiness engine (has_role) BEFORE any plan row exists — it shows up in no plan,
               # no diagnostic, and never drains. 117 accumulated before a human noticed. Report

@@ -171,6 +171,26 @@ def _fable_eligible(u, margin):
     return util is not None and (1.0 - util) >= margin
 
 
+def _backoff_expired(u, now=None):
+    """True when NO active reactive rate-limit hold applies to this entry.
+
+    ONE implementation for both provider arms (issue #676 made the metered arm honour the hold too);
+    a second copy of this rule is exactly how the two arms would drift apart.
+
+    Fail-OPEN on a missing, malformed, or non-finite stamp. That direction is deliberate and
+    narrow: the hold is a reactive OPTIMISATION layered on top of the real admission gates, so a
+    corrupt health ledger must not be able to starve a provider. Finite stamps only — `inf` would
+    otherwise sideline an account FOREVER (`now < inf` is always true) while usage-alert's own
+    nan/inf guard still reported it healthy, a dispatch/monitoring split (cross-provider review r1).
+    """
+    until = _usage_num(u.get("backoff_until"))
+    if until is None or not math.isfinite(until):
+        return True
+    if now is None:
+        now = time.time()
+    return now >= until
+
+
 def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
     """Fail-closed admission test for STARTING a worker (of `model`) on an account. Beyond the whole-account
     5h/7d headroom, a PREMIUM_MODELS route (fable) additionally requires FABLE sub-quota headroom.
@@ -200,21 +220,25 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
         # raise TypeError and abort the whole dispatch instead of failing closed on that one account.
         if not isinstance(reachability, str) or reachability not in USAGE_REACHABILITY_ADMITTED:
             return False                              # dead / unstated / unrecognised -> not eligible
-        until = _usage_num(u.get("backoff_until"))
-        # Finite stamps only (cross-provider review r1): `inf` would sideline the account FOREVER
-        # (now < inf is always True) while usage-alert's nan/inf guard reports it healthy — a
-        # dispatch/monitoring split. Non-finite = no backoff, matching _apply_backoff's fail-open.
-        if until is not None and math.isfinite(until):
-            if now is None:
-                import time
-                now = time.time()
-            if now < until:
-                return False                          # rate-limited earlier — backed off until it expires
+        if not _backoff_expired(u, now):
+            return False                              # rate-limited earlier — backed off until it expires
         return True                                   # non-metered provider (e.g. codex) — not probe-gated
     if str(u.get("status", "")).strip().lower() != "allowed":
         # [ISSUE #196] require status EXACTLY `allowed`: an empty status was previously accepted
         # (the `("allowed", "")` set) and failed open as eligible capacity.
         return False                                  # empty/throttled/rejected -> not eligible
+    # [OPUS-5 issue #676] The REACTIVE rate-limit hold now applies to METERED accounts too. A 429
+    # (or a secondary/burst limit) on an anthropic worker writes a `transient` model-health record
+    # and `account_backoffs` derives a hold from it — but that hold used to be stamped onto exempt
+    # entries ONLY, so nothing on the anthropic side ever observed it and the account kept being
+    # dispatched at full width. Utilisation cannot substitute for this: a burst limit can fire at
+    # any utilisation and may never move the quota windows at all.
+    #
+    # Fail-open on a malformed/absent stamp, exactly as on the exempt arm: for a metered account the
+    # probe's own fail-closed omission is the real backstop, so a corrupt health ledger must never
+    # be able to starve the provider. `_apply_backoff` already refuses to write a non-finite stamp.
+    if not _backoff_expired(u, now):
+        return False                                  # rate-limited earlier — held until it expires
     for prefix in ("5h", "7d"):
         util, _ = _usage_window(u, prefix)
         # [ISSUE #196] Validate the SHAPE before trusting the headroom comparison: a base window of
@@ -424,7 +448,10 @@ def adaptive_slots(account, u, now=None, run_seconds=None, margin=SAFETY_MARGIN)
         return 0                       # malformed catalog value -> no grant (never an exception)
     if cap <= 0:
         return 0
-    return cap  # MUTANT
+    factor = winddown_factor(u, now=now, run_seconds=run_seconds, margin=margin)
+    if factor <= 0.0:
+        return 0
+    return max(1, min(cap, int(round(cap * factor))))
 
 
 def _weekly_reset(u):
@@ -2123,6 +2150,36 @@ def _self_test():
           dynamic_concurrency(U, None, ["fable"]), 0)
     # backward compat: usage=None keeps the original cache-affinity selection.
     check("usage=None backward compatible", choose_account(A, [], ["fable"], "pkg", "impl", now), "acct02")
+
+    # ---- [OPUS-5 issue #676] REACTIVE RATE-LIMIT HOLD ON THE **METERED** ARM ---------------------
+    # The live hole: a 429 on an anthropic worker produced a model-health `transient` record and a
+    # derived backoff, but the overlay was stamped onto EXEMPT entries only, so the anthropic arm
+    # never observed it. Utilisation cannot stand in for this — a burst limit can fire at any
+    # utilisation. Deleting the metered-arm check makes the first assertion go red.
+    B_NOW = 1_800_000_000
+    metered = {"status": "allowed", "5h_util": "0.10", "7d_util": "0.10"}
+    check("a metered (anthropic) account under an ACTIVE backoff is INELIGIBLE",
+          usage_eligible({**metered, "backoff_until": B_NOW + 600}, 0.15, now=B_NOW), False)
+    check("the same metered account is eligible once the backoff EXPIRES",
+          usage_eligible({**metered, "backoff_until": B_NOW - 1}, 0.15, now=B_NOW), True)
+    check("a metered account with plenty of headroom but an active hold contributes NO capacity",
+          dynamic_concurrency(
+              [{"handle": "m", "models": ["opus5"], "max_concurrent_workers": 4, "available": True}],
+              {"m": {**metered, "backoff_until": B_NOW + 600}}, ["opus5"], margin=0.15, now=B_NOW), 0)
+    check("the backoff hold is independent of utilisation (a FRESH window is still held)",
+          usage_eligible({"status": "allowed", "5h_util": "0.0", "7d_util": "0.0",
+                          "backoff_until": B_NOW + 600}, 0.15, now=B_NOW), False)
+    # Fail-OPEN on junk, on BOTH arms, from the one shared implementation.
+    for bad, why in ((None, "absent"), ("garbage", "unparseable"), (float("inf"), "inf"),
+                     (float("nan"), "nan"), (10 ** 400, "huge-int (OverflowError)")):
+        entry = dict(metered) if bad is None else {**metered, "backoff_until": bad}
+        check(f"a {why} backoff stamp fails OPEN on the metered arm",
+              usage_eligible(entry, 0.15, now=B_NOW), True)
+    check("_backoff_expired is the SINGLE rule both arms use (exempt arm unchanged)",
+          (usage_eligible({"exempt": True, "reachability": "live", "backoff_until": B_NOW + 600},
+                          now=B_NOW),
+           usage_eligible({"exempt": True, "reachability": "live", "backoff_until": B_NOW - 1},
+                          now=B_NOW)), (False, True))
 
     # ---- [OPUS-5 issue #676] WINDOW ACCOUNTING + PROJECTED-BURN WIND-DOWN ------------------------
     # Every check below is written to DIE if the guard it names is deleted or inverted. The
