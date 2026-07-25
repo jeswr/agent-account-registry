@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5f5009263b20cf5434d8a1c0d58c891f6c92b236",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_mark_model_launched` runs as a separate command immediately before `docker run`. There is still a cancellation window after the output append and before Docker/container/CLI startup, and ordinary `docker run` startup failures (daemon unavailable, mount/runtime failure, container entry failure) also leave `launched=true` even though the provider CLI never executed. In either case `model_health` is admitted and `${EXIT_CLASS:-unknown}` records the same fabricated provider-health event this PR intends to eliminate. Cases A and B do not expose this: A kills during the earlier build, while B waits until the Docker stub itself has started. There is no assertion for a marker-written-but-Docker-not-started/startup-failed path.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Move the durable signal to a boundary that is emitted only once the container-side provider CLI is actually starting (for example, a trusted wrapper/handshake inside the container), while preserving a host-visible marker that survives mid-run cancellation. Add a non-vacuous test that makes `docker run` fail before invoking the CLI (and, if feasible, exercises cancellation at the handshake boundary) and asserts that no launch marker/health record is admitted.",
+    "severity": "major",
+    "title": "Launch marker is set before the provider CLI actually executes"
+   }
+  ],
+  "progress": null,
+  "summary": "The change improves the coarse distinction between failures before image preparation and failures after entering `docker run`, but the new marker does not establish the fact it claims to establish. It is written before Docker is invoked, so cancellation or a Docker startup failure can still produce `model_started=true` without any provider CLI process executing; the workflow then records a fabricated `unknown`. The new behavioral tests cover cancellation during build and after the Docker stub has begun, but omit this load-bearing interval. Because the stated purpose is to prevent non-attempts from contaminating provider-health persistence, this remaining default-record path requires changes.",
+  "verdict": "request_changes"
+ }
+}
