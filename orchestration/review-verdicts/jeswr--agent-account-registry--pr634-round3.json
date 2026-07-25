@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 634,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "128b231c7219ae5a59cd48cfb45fbfd12b3a4895",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "validate_plan_artifact() calls validate_plan(), whose repository-membership rule checks each emitted repo against plan[\"repositories\"]. Both values come from the same hostile artifact. The producer can add o/unplanned to repositories and then emit rows for it (the positive-control self-test explicitly demonstrates acceptance), or retain the expected repositories and fabricate many unique PR rows for them. In contrast, dispatch-claim.py's dispatch() separately requires the planned set to equal the enabled repositories from protected policy and then performs live claim-side checks. The enqueuer performs neither external binding nor an independent bounded derivation before its contents:write CAS. Thus well-shaped forged data can still fill or pollute the 2,000-row durable queue; character classes, exact fields, and duplicate rejection do not establish origin.",
+    "file": "scripts/task-queue.py",
+    "fix_hint": "Bind the artifact to trusted inputs outside the artifact before projection: at minimum require its repository manifest to exactly equal a protected policy/workflow manifest, impose a strict per-plan emission bound, and independently verify that each projected PR/head/state is an authentic emission (for example, derive it in a clean trusted job from the authenticated snapshot and protected registry code rather than trusting post-hostile-job plan rows). Add mutation-sensitive tests showing that changing both repositories and item.repo together, and fabricating many unique rows inside an allowed repo, causes rejection with zero queue writes while a genuine plan still commits.",
+    "severity": "major",
+    "title": "PLAN validation is self-consistency, not authentication"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 trust-boundary finding remains at major severity. Importing dispatch-claim.py's validate_plan improves schema, ordering, uniqueness, and internal membership checks, but it does not authenticate the hostile artifact: the artifact controls both the emitted rows and the repositories set against which those rows are checked. CLAIM's actual external binding occurs later in dispatch(), where the planned repository set is compared with protected policy and each item is re-derived against live state; the new contents:write enqueuer invokes none of that. A compromised PLAN producer can therefore add a syntactically valid repository entry and arbitrary unique review/disarm rows, or forge many rows within a legitimate repository, and consume the durable queue's finite capacity. The new tests only prove self-consistency of attacker-controlled fields, so they do not make the privilege-boundary claim mutation-sensitive. Progress is stagnant because the same major issue remains despite stricter shape validation.",
+  "verdict": "request_changes"
+ }
+}
