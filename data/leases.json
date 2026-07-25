@@ -11,16 +11,6 @@
    "expires_at": 1784959111
   },
   {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "388b8898d6434aef91d5fe0a92aea5ea",
-   "holder": "fix:sparq-org/sparq#3434@dispatch-30145292197.1",
-   "package": "sparq-zk",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1784957016,
-   "expires_at": 1784963316
-  },
-  {
    "account": "dc2d751954080e13",
    "claim_id": "3e6b7488d6c04e51b382cd188828ac6a",
    "holder": "review:jeswr/agent-account-registry#630@dispatch-30145831730.1",
