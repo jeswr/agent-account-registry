@@ -53,7 +53,12 @@ jobs:
         run: python3 scripts/ledger-invariant.py ledger
 
       # Only this filter sees the complete secret map; the probe receives an ACCT_* file.
+      # `id` + `continue-on-error`: the next step reads this step's OUTCOME (the pre-continue
+      # result) so a materialization failure is recorded in the probe verdict instead of silently
+      # degrading into a token-less probe the generator cannot distinguish from a healthy one
+      # (issue #580).
       - name: Materialize the ACCT_* worker-token subset for the probe
+        id: acct-secret-subset
         continue-on-error: true
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}
@@ -81,6 +86,9 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          # Outcome (not conclusion) of the materialization step above: `success` only when the
+          # ACCT_* subset was really written.
+          SECRETS_OUTCOME: ${{ steps.acct-secret-subset.outcome }}
           # The salt is the probe's ONLY route to the openai quota signal (issue #29): the
           # model-health ledger keys rate-limit backoff records by SALTED account hash, so a
           # salt-less probe emits bare `{"exempt": true}` entries and the reactive backoff never
@@ -92,19 +100,39 @@ jobs:
           REGISTRY_REPO: ${{ github.repository }}
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          # FAIL-CLOSED SEED (issue #580): the snapshot and its VERDICT are both written as
+          # "nothing was measured" BEFORE anything that can fail, and are replaced only on the
+          # success path. `set -e` therefore leaves an honest `{"ok": false}` behind for ANY
+          # failure below, instead of a fresh dashboard that republishes every catalog-available
+          # account as eligible capacity precisely when measurement is broken. The generator
+          # additionally fails closed on an absent/forged marker, so a lost file cannot read as ok.
+          printf '{}' > "$RUNNER_TEMP/usage.json"
+          printf '{"ok": false, "at": %s}\n' "$(date -u +%s)" > "$RUNNER_TEMP/usage-probe.json"
           python3 scripts/account-usage.py --self-test
+          # No ACCT_* subset means the probe has NOTHING to measure with: account-usage.py would
+          # fail open to an empty snapshot indistinguishable from a healthy "nothing to report".
+          test "$SECRETS_OUTCOME" = success
           # stderr flows to the step log: the probe's fail-open ::warning:: lines are sanitized
           # (no handles/salt/counts — asserted by its self-test), and the old 2>/dev/null is
           # exactly what hid this step's missing-salt gap in production.
-          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" || printf '{}' > "$RUNNER_TEMP/usage.json"
+          # Written aside and moved: a probe that dies mid-write must not leave a TRUNCATED
+          # usage.json where the seeded `{}` was.
+          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.probe-raw.json"
+          mv "$RUNNER_TEMP/usage.probe-raw.json" "$RUNNER_TEMP/usage.json"
+          printf '{"ok": true, "at": %s}\n' "$(date -u +%s)" > "$RUNNER_TEMP/usage-probe.json"
           echo 'usage-probe: snapshot written'
 
-      - name: Upload privacy-safe usage snapshot (pinned)
+      # Both files travel together (explicit paths, never a glob — the discarded probe-raw
+      # scratch file must not ride along): usage.json is meaningless to the generator without the
+      # verdict that says whether it was measured at all.
+      - name: Upload privacy-safe usage snapshot + probe verdict (pinned)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dashboard-usage-${{ github.run_id }}
-          path: ${{ runner.temp }}/usage.json
+          path: |
+            ${{ runner.temp }}/usage.json
+            ${{ runner.temp }}/usage-probe.json
           retention-days: 1
           if-no-files-found: error
 
@@ -135,7 +163,7 @@ jobs:
       - name: Ledger checkout is data-only (trust guard)
         run: python3 scripts/ledger-invariant.py ledger
 
-      - name: Download privacy-safe usage snapshot (pinned)
+      - name: Download privacy-safe usage snapshot + probe verdict (pinned)
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dashboard-usage-${{ github.run_id }}
@@ -157,7 +185,12 @@ jobs:
           # The observability snapshot (issue #246) is OPTIONAL on the ledger until its collector
           # lands: an absent file keeps the panel hidden, while a present-but-invalid one fails
           # this build loudly inside dashboard-gen (never published on a guess).
+          # --usage-probe (issue #580): the probe job's verdict for THIS snapshot. Without an
+          # `{"ok": true}` verdict the generator distrusts the snapshot entirely — accounts render
+          # "unknown", eligible capacity is 0, and the page says the probe failed instead of
+          # advertising catalog-available accounts as measured, free capacity.
           python3 scripts/dashboard-gen.py --usage "$RUNNER_TEMP/usage.json" \
+            --usage-probe "$RUNNER_TEMP/usage-probe.json" \
             --leases ledger/data/leases.json --model-health ledger/data/model-health.json \
             --observability ledger/data/observability.json
           # metrics.yml CAS-publishes the optional snapshot under the ledger's whitelisted data/

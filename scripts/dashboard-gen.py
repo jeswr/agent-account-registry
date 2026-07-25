@@ -52,6 +52,16 @@ OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
 
+# Usage-probe verdict (issue #580). dashboard.yml writes {"ok": bool, "at": epoch} next to the
+# usage snapshot: `ok` is true ONLY when both the ACCT_* secret materialization and the probe
+# itself succeeded. Without it the generator cannot tell "probed, nothing to report" from "the
+# probe never ran" — and used to publish every catalog-available account as fresh eligible
+# capacity precisely when measurement was broken. Anything other than a literal `true` normalizes
+# to PROBE_UNKNOWN (see _normalize_usage_probe); only PROBE_OK lets a measurement be trusted.
+PROBE_OK = "ok"
+PROBE_FAILED = "failed"
+PROBE_UNKNOWN = "unknown"
+
 
 class DashboardError(RuntimeError):
     pass
@@ -243,17 +253,47 @@ def _percent(value):
     return round(number * 100, 1)
 
 
+def _has_measurement(usage_entry):
+    """The ONE shared "no measurement ⇒ not free" rule (issue #580, criterion 5) behind BOTH the
+    per-account classifier (_availability) and the cumulative provider view (_quota_state).
+
+    A quota signal exists only when:
+      * the entry is a non-empty object — the probe fail-closed OMITS an account whose token is
+        missing or whose probe failed, and dispatch (select-and-claim.usage_eligible) plus
+        usage-alert treat that omission as UNAVAILABLE; or
+      * the account is probe-exempt (issue #29), whose ONLY quota signal is the reactive backoff
+        stamp the caller evaluates — there is nothing else to measure; or
+      * BOTH mandatory windows (5h AND 7d) are validly reported. account-usage.py can emit a
+        PARTIAL entry (status-only, or one window without the other) and dispatch
+        (usage_eligible: `util is None` → ineligible) plus usage-alert (classify: `u5 is None or
+        u7 is None` → UNAVAILABLE) both fail closed on that shape.
+
+    Anything else would advertise quota the allocator will never use."""
+    if not isinstance(usage_entry, dict) or not usage_entry:
+        return False
+    if usage_entry.get("exempt") is True:
+        return True
+    return all(_percent(usage_entry.get(f"{prefix}_util")) is not None for prefix in ("5h", "7d"))
+
+
 def _availability(account, usage_entry):
+    """Per-account trichotomy+unknown for the PUBLIC account cards and eligible-capacity count.
+
+    A catalog-available account with no usable measurement is "unknown", NEVER "available" (issue
+    #580): it used to be published as fresh eligible capacity precisely when measurement was
+    broken, contradicting the `accounts_unknown` count _provider_quota rendered on the same page.
+    The measurement rule is _has_measurement — shared with _quota_state, not re-derived."""
     if not account["catalog_available"]:
         return "unavailable"
-    if not isinstance(usage_entry, dict):
-        return "available"
-    status = str(usage_entry.get("status") or "").strip().lower()
+    entry = usage_entry if isinstance(usage_entry, dict) else {}
+    status = str(entry.get("status") or "").strip().lower()
     if status not in {"", "allowed"}:
         return "unavailable"
-    known = [_percent(usage_entry.get(f"{prefix}_util")) for prefix, _ in WINDOWS]
+    known = [_percent(entry.get(f"{prefix}_util")) for prefix, _ in WINDOWS]
     if any(value is not None and value >= 100 for value in known):
         return "capped"
+    if not _has_measurement(entry):
+        return "unknown"
     return "available"
 
 
@@ -308,33 +348,25 @@ def _backoff_epoch(value):
 
 
 def _quota_state(account, entry, now):
-    """Availability for the CUMULATIVE provider view: the per-account trichotomy from
-    _availability, except that (a) a catalog-available account with NO usage entry — the probe
-    fail-closed OMITS an account whose token is missing or whose probe failed — is "unknown":
-    dispatch (select-and-claim.usage_eligible) and usage-alert treat that omission as
-    UNAVAILABLE, so counting it free here would advertise quota the allocator will never use
-    (sol finding 2, PR #281 fix round); (b) a probe-exempt account under an ACTIVE reactive
-    backoff (its only quota signal — issue #29) counts as capped until the backoff expires,
-    with the stamp parsed by the allocator's shared `_backoff_epoch` semantics; and (c) a
-    non-exempt account counts "available" only with BOTH mandatory windows (5h AND 7d) validly
-    reported — account-usage.py can emit a PARTIAL entry (status-only, or one window without
-    the other), and dispatch (usage_eligible: `util is None` → ineligible) plus usage-alert
-    (classify: `u5 is None or u7 is None` → UNAVAILABLE) both fail closed on that shape, so
-    rendering it free would again advertise quota the allocator will never use (sol finding 1,
-    PR #281 fix round 3); partial ⇒ "unknown". Returns (state, backoff_epoch_or_None).
-    Pure — unit-tested by --self-test."""
+    """Availability for the CUMULATIVE provider view: exactly the per-account classification from
+    _availability — including its "unknown" for a fail-closed-omitted or PARTIAL entry (sol
+    findings 1+2, PR #281 fix rounds; the rule now lives in the shared _has_measurement so the
+    public account cards cannot disagree with these counts — issue #580) — plus the one signal
+    that is meaningless on an individual card: a probe-exempt account under an ACTIVE reactive
+    backoff (its only quota signal — issue #29) counts as capped until the backoff expires, with
+    the stamp parsed by the allocator's shared `_backoff_epoch` semantics. Returns
+    (state, backoff_epoch_or_None). Pure — unit-tested by --self-test."""
     availability = _availability(account, entry)
     if availability != "available":
         return availability, None
-    if not isinstance(entry, dict) or not entry:
-        return "unknown", None
-    if entry.get("exempt") is True:
+    # _availability only returns "available" once _has_measurement passed, so `entry` is a
+    # non-empty object here (either probe-exempt or reporting both mandatory windows). The
+    # isinstance guard keeps a future loosening of that rule a clean self-test red rather than an
+    # AttributeError that would take the whole public build down.
+    if isinstance(entry, dict) and entry.get("exempt") is True:
         until = _backoff_epoch(entry.get("backoff_until"))
         if until is not None and until > now:
             return "capped", until
-        return "available", None
-    if any(_percent(entry.get(f"{prefix}_util")) is None for prefix in ("5h", "7d")):
-        return "unknown", None
     return "available", None
 
 
@@ -941,20 +973,62 @@ def _normalize_observability(document):
     }
 
 
+def _normalize_usage_probe(document):
+    """FAIL-CLOSED normalization of dashboard.yml's probe verdict (issue #580).
+
+    Only a literal boolean `true` reads as PROBE_OK: an absent file (None), a non-object, a
+    missing `ok`, or a TRUTHY-BUT-NON-BOOLEAN `ok` ("true", 1, [1], "yes") all normalize to
+    PROBE_UNKNOWN, and `ok: false` to PROBE_FAILED. A forged/garbled marker can therefore only
+    ever DOWNGRADE trust, never manufacture it. `at` is best-effort provenance for the UI and
+    never influences the state. Pure — unit-tested by --self-test."""
+    if not isinstance(document, dict):
+        return {"state": PROBE_UNKNOWN, "at": None}
+    at = _utc_iso(document.get("at"))
+    ok = document.get("ok")
+    if not isinstance(ok, bool):
+        return {"state": PROBE_UNKNOWN, "at": at}
+    return {"state": PROBE_OK if ok else PROBE_FAILED, "at": at}
+
+
+def _read_usage_probe(path):
+    """Read the runner-written probe verdict TOLERANTLY: unreadable or malformed JSON degrades the
+    document to PROBE_UNKNOWN (via _normalize_usage_probe(None)) rather than taking the whole
+    public build down — a broken marker must never be able to read as ok, and must never be able
+    to suppress the dashboard that is reporting the degradation."""
+    if not path or not Path(path).is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        print("dashboard-gen: usage-probe verdict is unreadable — the probe counts as unknown")
+        return None
+
+
 def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
-                    observability=None):
+                    observability=None, usage_probe=None):
     accounts, private_values = _catalog(issues)
     handles = [account["handle"] for account in accounts]
     labels = _salted_labels(handles, salt)
     usage = usage if isinstance(usage, dict) else {}
+    probe = _normalize_usage_probe(usage_probe)
+    # Raw handles from the snapshot join the privacy deny-set BEFORE the fail-closed discard below,
+    # so a distrusted snapshot still cannot leak an identity through some other surface.
+    private_values.update(str(handle) for handle in usage)
+    if probe["state"] != PROBE_OK:
+        # FAIL CLOSED (issue #580): a probe that did not verifiably succeed cannot have produced a
+        # trustworthy snapshot, so the whole snapshot is discarded and every account is routed
+        # through the ONE shared "no measurement ⇒ not free" rule — "unknown" cards, no eligible
+        # capacity, no window numbers. The alternative (publishing whatever happens to be in the
+        # file) overstates usable capacity exactly when measurement is broken.
+        usage = {}
     try:
         leases = _lease_schema_module().validate_ledger(leases_document)
     except ValueError as exc:
         raise DashboardError(f"lease ledger is malformed: {exc}") from exc
     live = _live_leases(leases, now)
     # Lease identities are already the canonical public salted labels. Raw handles come only from
-    # the private catalog/usage inputs and remain in the privacy deny-set.
-    private_values.update(str(handle) for handle in usage)
+    # the private catalog/usage inputs and remain in the privacy deny-set (added above).
 
     rows = []
     capacity = {}
@@ -984,6 +1058,10 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         "schema": SCHEMA,
         "generated_at": _utc_iso(now),
         "accounts": rows,
+        # Explicit measurement provenance (issue #580): `generated_at` is FRESH on a failed-probe
+        # build, so the stale-generation warning can never surface a broken probe. The UI renders
+        # this state alongside (not instead of) that warning.
+        "usage_probe": probe,
         # Cumulative per-provider headroom (maintainer request 2026-07-18) — rendered by the
         # dashboard's "Provider quota (cumulative)" section, above the per-account cards.
         "provider_quota": _provider_quota(accounts, usage, now),
@@ -1065,10 +1143,13 @@ def _self_test():
                       "7d_util": "0.8", "7d_reset": now + 86400}}
     history = [{"at": "2025-06-15T15:05:00Z", "conclusion": "success",
                 "dispatched": 2, "deferred": 3}]
-    got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt")
+    probe_ok = {"ok": True, "at": now - 5}
+    got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                          usage_probe=probe_ok)
     expected = {
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
+        "usage_probe": {"state": "ok", "at": "2025-06-15T15:06:35Z"},
         "accounts": [{
             "label": "26208fef35e33b14", "provider": "anthropic", "availability": "available",
             "active_agents": 1,
@@ -1196,7 +1277,8 @@ def _self_test():
          "model_alias": "", "exit_class": "zero-dispatch", "run_id": "r4"},
     ]}
     ordered = build_dashboard(
-        ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt")
+        ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt",
+        usage_probe=probe_ok)
     check("canonical records ledger -> per-provider/model checks", ordered["model_health"], {
         "generated_at": _utc_iso(now - 120),
         "checks": [
@@ -1423,6 +1505,94 @@ def _self_test():
            for row in ordered["provider_quota"]],
           [("anthropic", 3, False), ("future-provider", 1, True), ("openai", 1, True)])
 
+    # --- usage-probe verdict + the ONE shared "no measurement ⇒ not free" rule (issue #580).
+    # A failed probe used to publish every catalog-available account as `available` with a FRESH
+    # generated_at and no marker, so the page advertised full eligible capacity precisely when
+    # measurement was broken — while `provider_quota` on the same page said `accounts_unknown: N`.
+    measured_usage = {handle: {"status": "allowed", "5h_util": "0.1", "5h_reset": now + 600,
+                               "7d_util": "0.2", "7d_reset": now + 86400}}
+
+    def _probe_view(usage_snapshot, marker):
+        built = build_dashboard(issues, leases, usage_snapshot, history, None, now,
+                               "fixture-salt", usage_probe=marker)
+        return (built["usage_probe"]["state"],
+                [row["availability"] for row in built["accounts"]],
+                built["fleet"]["capacity"]["anthropic"]["eligible"],
+                built["provider_quota"][0]["accounts_available"],
+                built["provider_quota"][0]["accounts_unknown"])
+
+    check("probe ok + full measurement: available card, counted eligible",
+          _probe_view(measured_usage, {"ok": True, "at": now}),
+          (PROBE_OK, ["available"], 1, 1, 0))
+    check("FAILED probe + empty snapshot: unknown card, zero eligible, failure surfaced",
+          _probe_view({}, {"ok": False, "at": now}),
+          (PROBE_FAILED, ["unknown"], 0, 0, 1))
+    # Non-vacuity of the fail-closed discard: the SAME fully-measured snapshot that renders
+    # "available" under an ok verdict must render "unknown" with ZERO eligible capacity under a
+    # failed one. A marker that were merely published without being acted on would leave this row
+    # identical to the ok row above.
+    check("FAILED probe distrusts even a fully-measured snapshot",
+          _probe_view(measured_usage, {"ok": False, "at": now}),
+          (PROBE_FAILED, ["unknown"], 0, 0, 1))
+    # Criterion 4: absent / forged / malformed markers fail closed to "unknown", never to ok. Only
+    # a literal boolean `true` may unlock published capacity — not "true", not 1, not [1].
+    for marker_name, marker in (("absent (None)", None), ("non-object", ["ok"]),
+                                ("missing ok", {"at": now}), ("string 'true'", {"ok": "true"}),
+                                ("integer 1", {"ok": 1}), ("truthy list", {"ok": [1]}),
+                                ("null ok", {"ok": None})):
+        check(f"forged/absent probe marker ({marker_name}) fails closed to unknown",
+              _probe_view(measured_usage, marker),
+              (PROBE_UNKNOWN, ["unknown"], 0, 0, 1))
+    check("probe verdict carries its own stamp; an unparseable stamp degrades to None only",
+          (_normalize_usage_probe({"ok": True, "at": now}),
+           _normalize_usage_probe({"ok": False, "at": "not-a-time"})),
+          ({"state": PROBE_OK, "at": _utc_iso(now)}, {"state": PROBE_FAILED, "at": None}))
+    check("a distrusted snapshot still cannot leak a raw handle (deny-set built before discard)",
+          handle not in json.dumps(build_dashboard(
+              issues, leases, measured_usage, history, None, now, "fixture-salt",
+              usage_probe={"ok": False, "at": now})), True)
+    with tempfile.TemporaryDirectory() as directory:
+        marker_path = Path(directory, "usage-probe.json")
+        probe_states = []
+        for label, writer in (("absent file", None),
+                              ("malformed JSON", lambda: marker_path.write_text(
+                                  '{"ok": tru', encoding="utf-8")),
+                              ("valid ok verdict", lambda: marker_path.write_text(
+                                  '{"ok": true, "at": 1}', encoding="utf-8"))):
+            if writer:
+                writer()
+            probe_states.append(
+                (label, _normalize_usage_probe(_read_usage_probe(str(marker_path)))["state"]))
+        probe_states.append(("no --usage-probe flag",
+                             _normalize_usage_probe(_read_usage_probe(None))["state"]))
+        check("verdict FILE reads fail closed (absent/malformed unknown, valid ok)", probe_states,
+              [("absent file", PROBE_UNKNOWN), ("malformed JSON", PROBE_UNKNOWN),
+               ("valid ok verdict", PROBE_OK), ("no --usage-probe flag", PROBE_UNKNOWN)])
+    # Criterion 2 + 5: the public per-account classifier and the cumulative quota view share ONE
+    # rule. A measurement-free catalog-available account is "unknown" on the CARD too — it used to
+    # return "available" there while _quota_state called that same account "unknown".
+    ghost = {"handle": "ghost", "provider": "anthropic", "catalog_available": True, "limits": {}}
+    check("measurement-free account: card and quota state agree on unknown",
+          (_availability(ghost, None), _availability(ghost, {}), _quota_state(ghost, None, now)),
+          ("unknown", "unknown", ("unknown", None)))
+    check("partial (5h-only) entry is unknown on the public card, not only in the quota row",
+          _availability(ghost, {"status": "allowed", "5h_util": "0.2"}), "unknown")
+    check("capped/unavailable still win over unknown (precedence unchanged)",
+          (_availability(ghost, {"status": "allowed", "5h_util": "1.0"}),
+           _availability(ghost, {"status": "blocked"}),
+           _availability({**ghost, "catalog_available": False}, measured_usage[handle])),
+          ("capped", "unavailable", "unavailable"))
+    check("probe-exempt account keeps its issue-#29 backoff-only semantics (PR #281 vectors)",
+          (_availability(ghost, {"exempt": True}), _quota_state(ghost, {"exempt": True}, now)),
+          ("available", ("available", None)))
+    # Because both views now derive from that one rule, eligible capacity must EQUAL
+    # accounts_available for every provider. On this very fixture the two contradicted each other:
+    # 3/3 anthropic "eligible" rendered next to `accounts_available: 0`.
+    check("eligible capacity equals accounts_available for every provider",
+          [(row["provider"], ordered["fleet"]["capacity"][row["provider"]]["eligible"],
+            row["accounts_available"]) for row in ordered["provider_quota"]],
+          [("anthropic", 0, 0), ("future-provider", 0, 0), ("openai", 1, 1)])
+
     health = _normalize_model_health({
         "generated_at": now,
         "models": [{"model": "fable", "provider": "anthropic", "status": "ok"}],
@@ -1532,7 +1702,8 @@ def _self_test():
     check("raw (non-salted) lease label is a fatal privacy violation (decision 22)",
           label_rejected, True)
     with_observability = build_dashboard(
-        issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
+        issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture,
+        usage_probe=probe_ok)
     check("build_dashboard publishes the normalized observability key",
           with_observability.get("observability"), obs_expected)
     check("no observability input leaves data.json without the key (panel hidden)",
@@ -1594,6 +1765,9 @@ def main(argv=None):
     parser.add_argument("--leases")
     parser.add_argument("--issues-file")
     parser.add_argument("--usage")
+    # dashboard.yml's probe verdict for --usage (issue #580). Absent/malformed => the probe counts
+    # as "unknown" and the snapshot is distrusted; only {"ok": true} publishes measured capacity.
+    parser.add_argument("--usage-probe")
     parser.add_argument("--model-health")
     # Optional: the collector's observability snapshot from a `ledger`-branch checkout (issue
     # #246). Absent file => the Observability panels stay hidden; a present-but-invalid document
@@ -1628,7 +1802,8 @@ def main(argv=None):
     history = _fetch_dispatch_history(repo, args.history)
     document = build_dashboard(
         issues, leases, usage, history, model_health, int(time.time()),
-        os.environ.get("PROVENANCE_SALT", ""), observability=observability)
+        os.environ.get("PROVENANCE_SALT", ""), observability=observability,
+        usage_probe=_read_usage_probe(args.usage_probe))
     _write_site(document, args.assets, args.site)
     # Public workflow log: never disclose the account count (issue #184; the codebase norm in
     # model-health.py — "the public workflow log never carries provider counts").

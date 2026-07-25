@@ -58,6 +58,10 @@ h2 { margin-bottom: 0; font-size: clamp(1.35rem, 2vw, 1.75rem); letter-spacing: 
   color: #ffe0a1;
   font-size: .9rem;
 }
+/* The banner can carry SEVERAL independent degradations at once (stale generation + usage-probe
+   verdict — issue #580); each is its own line, with no stray margin on the first/last. */
+.warning-line { margin: 0; }
+.warning-line + .warning-line { margin-top: 8px; }
 
 main > section { padding-top: 42px; }
 .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }

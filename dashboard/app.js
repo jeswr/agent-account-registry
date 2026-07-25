@@ -64,6 +64,11 @@ function renderSummary(data) {
   }
   if (!providers.length) lines.append(node("p", "summary-meta", "No provider records"));
   capacity.append(lines);
+  // The eligible count is exactly the number a failed probe used to overstate (issue #580): when
+  // the probe is not verified it reads 0, so say why rather than letting it look like an outage.
+  if (probeWarning(data.usage_probe)) {
+    capacity.append(node("p", "summary-meta", "Eligible capacity unmeasured — see the notice above"));
+  }
   summary.append(capacity);
   summary.append(summaryCard(
     "Last dispatch sweep", data.fleet.last_sweep_at ? relative(data.fleet.last_sweep_at) : "unknown",
@@ -377,20 +382,43 @@ function renderHealth(health) {
   }
 }
 
-function updateFreshness(generatedAt) {
+// Degradation banner. Staleness and the usage-probe verdict are INDEPENDENT failures (issue #580):
+// a failed probe still publishes a FRESH generated_at, so the stale check can never surface it.
+// Both render together — one line each — and the banner hides only when neither fires.
+// `usage_probe.state` is written by dashboard-gen._normalize_usage_probe: "ok" only for a verified
+// probe, "failed" when dashboard.yml recorded a failure, "unknown" for an absent/forged/malformed
+// verdict (and for an older data.json that carries no verdict at all). On anything but "ok" the
+// generator has already discarded the snapshot — accounts read "unknown" and eligible capacity is
+// 0 — so this line explains a page that would otherwise look like a fleet-wide outage.
+function probeWarning(probe) {
+  // Read through a typed view: a non-object `usage_probe` must not reach `.at` (on a string that
+  // resolves to String.prototype.at — a truthy FUNCTION — and would render "recorded unknown").
+  const verdict = probe && typeof probe === "object" ? probe : {};
+  const state = verdict.state;
+  if (state === "ok") return null;
+  const stamp = typeof verdict.at === "string" ? verdict.at : null;
+  const at = stamp ? ` (verdict recorded ${relative(stamp)} · ${utc(stamp)})` : "";
+  return state === "failed"
+    ? `Usage probe FAILED${at}: account quota was not measured for this snapshot, so accounts read "unknown" and no eligible capacity is published. Real headroom may be higher or lower than shown.`
+    : `Usage probe outcome is unknown${at}: this snapshot carries no verified probe verdict, so accounts read "unknown" rather than available. The dashboard pipeline may need attention.`;
+}
+
+function updateFreshness(data) {
+  const generatedAt = data.generated_at;
   const generated = parseTime(generatedAt);
   const warning = byId("warning");
   byId("freshness").textContent = generated
     ? `Generated ${relative(generatedAt)} · ${utc(generatedAt)}` : "Generation time unknown";
+  const messages = [];
   if (!generated || Date.now() - generated.getTime() > STALE_MS) {
-    warning.hidden = false;
-    warning.textContent = generated
+    messages.push(generated
       ? `Stale data: this snapshot is ${relative(generatedAt)}. The dashboard pipeline may need attention.`
-      : "Data freshness is unknown. The dashboard pipeline may need attention.";
-  } else {
-    warning.hidden = true;
-    warning.textContent = "";
+      : "Data freshness is unknown. The dashboard pipeline may need attention.");
   }
+  const probe = probeWarning(data.usage_probe);
+  if (probe) messages.push(probe);
+  warning.replaceChildren(...messages.map((message) => node("p", "warning-line", message)));
+  warning.hidden = messages.length === 0;
 }
 
 // --- Throughput panel (backlog-vs-drain). Consumes site/metrics.json, emitted by the separate
@@ -943,7 +971,7 @@ function render(data) {
   renderOutcomes(data.fleet.dispatch_outcomes || []);
   renderHealth(data.model_health);
   renderObservability(data.observability);
-  updateFreshness(data.generated_at);
+  updateFreshness(data);
 }
 
 async function refresh() {
