@@ -388,6 +388,8 @@ def plan_repository(
     logs: list[str] = []
     gate_actions: list[Mutation] = []
     safe_candidates: dict[int, dict[str, Any]] = {}
+    # [OPUS-5] issues the curator can never stage because no area can be attributed to them.
+    unattributable: list[int] = []
 
     for issue in open_issues:
         labels = labels_of(issue)
@@ -518,6 +520,14 @@ def plan_repository(
             continue
         area, area_reason = derive_area(issue, labels, repo_labels)
         if area is None:
+            # [OPUS-5] The fail-closed refusal is CORRECT — an area is never guessed. Its
+            # SILENCE was not. This skip line scrolls past every 30 minutes and the issue is
+            # re-skipped forever with no label, no count, and no route back to a human. On
+            # sparq-org/sparq this class was 142 of 218 curator-visible issues. Recorded here
+            # and reported as an always-printed total below (the same shape as dispatch.yml's
+            # roleless-report), so "the curator staged nothing" can be told apart from "the
+            # curator cannot see anything".
+            unattributable.append(number)
             logs.append(f"skip #{number}: no confident area ({area_reason})")
             continue
         role = role_for(labels, area)
@@ -563,6 +573,13 @@ def plan_repository(
         selected_areas.add(area)
         stage_actions.append(Mutation("stage", number, issue, desired))
         logs.append(f"stage #{number}: {','.join(desired)}")
+
+    # [OPUS-5] ALWAYS emitted, including the zero case — a report that only appears when the
+    # number is non-zero cannot be told apart from a report that stopped running.
+    shown = ", ".join(f"#{n}" for n in unattributable[:20])
+    more = f" (+{len(unattributable) - 20} more)" if len(unattributable) > 20 else ""
+    logs.append(f"unattributable: {len(unattributable)} issue(s) have NO confident area and can "
+                f"never stage{': ' + shown + more if unattributable else ''}")
 
     if area_limited and len(stage_actions) < depth:
         resulting_ready = current_ready + len(stage_actions)
@@ -1319,6 +1336,32 @@ def _self_test() -> int:
     checks.append(("area-limited frontier is logged loudly",
                    len([m for m in planned if m.kind == "stage"]) == 1
                    and "frontier: area-limited at 1/4 (1 areas busy)" in logs))
+
+    # [OPUS-5] The unattributable class must be REPORTED, not silently re-skipped forever.
+    # "Zebra component" matches no crate, path or area label, so derive_area refuses it.
+    # NB: a body with NO path and NO crate token — the shared long_body names scripts/frontier.py,
+    # which would itself supply an area:ci path hint and make this fixture attributable.
+    # A function+line reference satisfies is_well_specified WITHOUT naming a path, so the
+    # fixture reaches derive_area and is refused there (rather than being filtered earlier).
+    blind_body = ("Rework zebra_behaviour() at line 42 so the documented outcome holds. "
+                  "Acceptance criteria: the described outcome is verified by a test. " * 6)
+    blind = [issue(500, "Zebra component needs rework", body=blind_body),
+             issue(501, "Quokka component needs rework", body=blind_body)]
+    _planned, blind_logs = plan_repository(blind, all_labels, automation)
+    report = [line for line in blind_logs if line.startswith("unattributable: ")]
+    checks.append((
+        "unattributable issues are counted and named, not silently skipped",
+        len(report) == 1 and report[0].startswith("unattributable: 2 issue(s)")
+        and "#500" in report[0] and "#501" in report[0]))
+    # The always-printed half: a report that only appears when non-zero is indistinguishable
+    # from a report that stopped running. Deleting the zero case must red THIS check.
+    _planned, clean_logs = plan_repository(
+        [issue(502, "Improve alpha component behavior", ("area:alpha",))],
+        all_labels, automation)
+    clean_report = [line for line in clean_logs if line.startswith("unattributable: ")]
+    checks.append((
+        "the unattributable report is emitted even when the count is ZERO",
+        clean_report == ["unattributable: 0 issue(s) have NO confident area and can never stage"]))
 
     ok = all(result for _, result in checks)
     for name, result in checks:
