@@ -96,6 +96,14 @@ PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
 # through readmission windows forever. Bot-authored + reserved-namespace like every other
 # durable marker (post_findings defangs the whole `<!-- sparq-` namespace in republished
 # verdict text).
+#
+# The receipt ALSO records the park's ATTEMPT FINGERPRINT (#555 recurrence gap) —
+# `head=<sha> attempt=<monotone-counter>`, park_policy.park_fingerprint — so a later
+# exhaustion that re-derives from the SAME per-PR state (unchanged head, no new round /
+# missed / nochange / gatefail marker) is recognised as a re-emission and skipped QUIETLY
+# instead of consuming the fresh readmission window and jumping the ladder straight to its
+# terminal. Both fields are OPTIONAL in the reader: a legacy (#555-era) receipt carries no
+# fingerprint, claims no idempotence, and is re-parked exactly once — which then records one.
 PARK_GENERATION_MARKER = "<!-- sparq-park-generation:v1"
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
@@ -361,9 +369,40 @@ def park_generation_cutoffs(comments, bot_login, log=print):
     space-form source cutoff ("cutoff=2026-07-23 10:30:00Z -->") — invisible to the old
     `cutoff=(\\S+) -->` read, which made gen-1 repeat forever and gen-2 unreachable — is
     recovered onto the same canonical key."""
-    pattern = re.escape(PARK_GENERATION_MARKER) + r" gen=([0-9]+) cutoff=(.+?) -->"
+    return {record["window"] for record in park_generation_records(comments, bot_login, log)}
+
+
+def park_generation_fingerprints(comments, bot_login, log=print):
+    """The set of ATTEMPT FINGERPRINTS (park_policy.park_fingerprint — "<head-sha>/<attempt
+    counter>") already bound to a receipted capacity park (#555 recurrence gap). A due
+    exhaustion whose fingerprint is in this set re-derived from per-PR state that has not
+    moved since a park was already recorded — nothing was attempted, so the ladder skips it
+    QUIETLY instead of consuming the readmission window (park_ladder_decision "unchanged").
+
+    Legacy (#555-era) receipts carry no `head=`/`attempt=` fields and contribute NOTHING here:
+    absent identity proves nothing, so the first park after this change is always emitted (and
+    records a fingerprint for every tick after it)."""
+    return {record["fingerprint"]
+            for record in park_generation_records(comments, bot_login, log)
+            if record["fingerprint"]}
+
+
+def park_generation_records(comments, bot_login, log=print):
+    """Every well-formed bot-authored park-generation receipt as
+    {"window": key, "generation": int|None, "fingerprint": str|None} — the ONE receipt parser
+    park_generation_cutoffs (the escalation-ladder counter) and
+    park_generation_fingerprints (the unchanged-head idempotence key) both derive from, so
+    the two views can never disagree about which receipts are well-formed.
+
+    Malformed-field direction (round-3 finding 4, extended to the fingerprint fields): a
+    malformed CUTOFF drops the whole receipt (it can neither count as a consumed window nor
+    dedupe one — escalation is delayed, never fabricated); a malformed/absent FINGERPRINT
+    keeps the receipt but claims no idempotence (the park is re-emitted once, which records a
+    good fingerprint). Neither direction can fabricate a suppression."""
+    pattern = (re.escape(PARK_GENERATION_MARKER)
+               + r" gen=([0-9]+) cutoff=(.+?)(?: head=(\S+))?(?: attempt=(\S+))? -->")
     policy = _park_policy()
-    cutoffs = set()
+    records = []
     for comment in _bot_comments(comments, bot_login):
         for match in re.finditer(pattern, str(comment.get("body", ""))):
             cutoff = match.group(2)
@@ -374,8 +413,12 @@ def park_generation_cutoffs(comments, bot_login, log=print):
                         "receipts")
                     continue
                 cutoff = policy.canonical_ts(cutoff)
-            cutoffs.add(cutoff)
-    return cutoffs
+            records.append({
+                "window": cutoff,
+                "generation": int(match.group(1)),
+                "fingerprint": policy.park_fingerprint(match.group(3), match.group(4)),
+            })
+    return records
 
 
 def marker_runs(comments, bot_login, kind, round_n):
@@ -388,6 +431,70 @@ def marker_runs(comments, bot_login, kind, round_n):
                 str(comment.get("body", ""))):
             if int(match.group(1)) == round_n:
                 runs.add(match.group(2))
+    return runs
+
+
+def marker_runs_since(comments, bot_login, kind, round_n, since, log=print):
+    """marker_runs WINDOWED by the human-readmission cutoff (#555 recurrence gap) — the
+    distinct run keys for `kind` at `round_n` recorded at or AFTER `since`.
+
+    THE BUG THIS CLOSES: the per-round marker counts are durable per-PR state that NOTHING
+    resets, and the capacity park keyed on them read the LIFETIME count. #555 gave the ROUND
+    budget a readmission window but left this counter unwindowed, so a re-admitted PR
+    re-derived "N consecutive fix dispatches missed for round R" from the very same markers on
+    the very next tick — with an unchanged head, no work attempted, and (because a gen-1
+    receipt already stood) a straight jump to the gen-2 question-class terminal. That is the
+    observed bounce: sparq PR #3488 re-admitted
+    2026-07-22T16:36:56Z, re-escalated 16:44:10Z; PR #3472 re-escalated seconds later with
+    byte-identical boilerplate, five days after the last commit or review round on either PR.
+    A re-admission must grant REAL capacity: the markers burned before the human said "keep
+    trying" are not chargeable against the post-readmission budget.
+
+    Fail direction — identical to count_rounds_since (toward the OLD conservative full
+    count, never a fresh budget on unproven data): a falsy or UNPARSEABLE `since` (logged
+    loudly) means no window and the plain marker_runs applies; a marker whose comment has no
+    created_at, or an unparseable one (logged), is CHARGED; an instant tie with the cutoff is
+    CHARGED. Ordering is over PARSED aware datetimes (park_policy.parse_ts), never raw
+    strings.
+
+    Consumed today by dispatch-claim's MISSED_FIX_LIMIT budget (`missed`). fix_outcome's
+    nochange/gatefail limits still charge the LIFETIME count deliberately: each of those
+    markers records a fix that actually RAN, so its park is work genuinely consumed (and the
+    attempt fingerprint keeps it from re-emitting on a no-work tick) — windowing them is a
+    separate policy change, kept out of this diff because the auth-class round-charging work
+    lands on that same path."""
+    if not since:
+        return marker_runs(comments, bot_login, kind, round_n)
+    parse_ts = _park_policy().parse_ts
+    try:
+        since_instant = parse_ts(since)
+    except ValueError:
+        log(f"::warning::readmission cutoff {since!r} is not a parseable timestamp — the "
+            f"{kind} marker budget keeps the FULL historical count (never a fresh budget on "
+            "unproven data)")
+        return marker_runs(comments, bot_login, kind, round_n)
+    prefix = MARKER_KINDS[kind]
+    runs = set()
+    for comment in _bot_comments(comments, bot_login):
+        matched = {match.group(2)
+                   for match in re.finditer(
+                       re.escape(prefix) + r" round=([1-9][0-9]*) run=(\S+) -->",
+                       str(comment.get("body", "")))
+                   if int(match.group(1)) == round_n}
+        if not matched:
+            continue  # nothing chargeable in this comment — its timestamp is irrelevant
+        created = comment.get("created_at")
+        if isinstance(created, str) and created:
+            try:
+                created_instant = parse_ts(created)
+            except ValueError:
+                log(f"::warning::{kind} marker carries a malformed created_at {created!r} "
+                    "— CHARGED against the post-readmission budget (unprovable time can "
+                    "never authorize exhausted work)")
+            else:
+                if created_instant < since_instant:
+                    continue
+        runs.update(matched)
     return runs
 
 
@@ -1886,7 +1993,8 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
-               maintainer=None, park_class="question", bot_login=""):
+               maintainer=None, park_class="question", bot_login="", head_sha="",
+               attempt_key=""):
     """Loop stop: park labels on BOTH surfaces, an explanatory comment, and an ops-alert-style
     registry ping. The PR stays DRAFT.
 
@@ -1918,7 +2026,20 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     proof surface. `bot_login` is required for every capacity park (the receipt parser's
     trust filter). worker-issue's
     set_status and the review:parked write here both enforce the sticky human-unpark veto
-    (strict maintainer probe) before writing."""
+    (strict maintainer probe) before writing.
+
+    IDEMPOTENCE AGAINST AN UNCHANGED HEAD (#555 recurrence gap). `head_sha` + `attempt_key`
+    form the park's ATTEMPT FINGERPRINT (park_policy.park_fingerprint): the live head SHA plus
+    a MONOTONE counter of work attempted (the global round number for the round budget, the
+    lifetime per-round missed/nochange/gatefail marker count for the marker budgets). It is
+    written into the receipt and compared against every earlier receipt: an exhaustion that
+    re-derives the SAME fingerprint attempted NOTHING since the park already on record, so it
+    is skipped QUIETLY — no label, no comment, and NO generation consumed. Without this axis a
+    human readmission mints a fresh window key that the very next unchanged-state tick
+    consumes, driving the ladder to its question-class terminal minutes after the readmission
+    and making the whole readmission mechanism (and any human unpark) inert — the live
+    sparq #3488 / #3472 bounce. Omitting either component (unknown head, no counter) claims no
+    idempotence and behaves exactly as before."""
     handle = maintainer or os.environ.get("MAINTAINER_HANDLE", "jeswr")
     if park_class == "capacity":
         policy = _park_policy()
@@ -1930,8 +2051,13 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
         cutoff = policy.readmission_cutoff(repo, pr_number, issue, _issue_timeline,
                                            is_human=probe,
                                            on_unreadable=policy.WINDOW_UNREADABLE)
-        receipts = park_generation_cutoffs(_paginated_comments(repo, pr_number), bot_login)
-        action, window_key, generation = policy.park_ladder_decision(cutoff, receipts)
+        records = park_generation_records(_paginated_comments(repo, pr_number), bot_login)
+        receipts = {record["window"] for record in records}
+        fingerprint = policy.park_fingerprint(head_sha, attempt_key)
+        action, window_key, generation = policy.park_ladder_decision(
+            cutoff, receipts, fingerprint=fingerprint,
+            consumed_fingerprints={record["fingerprint"] for record in records
+                                   if record["fingerprint"]})
         if action == "freeze":
             print(f"capacity park frozen for {repo}#{pr_number}: the label timeline is "
                   "unreadable — no receipt, no label, no comment this run (the escalation "
@@ -1941,8 +2067,21 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             print(f"capacity park already receipted for window {window_key}; awaiting a "
                   "fresh human gesture — no label/comment churn")
             return
+        if action == "unchanged":
+            # #555 recurrence gap: the exhaustion re-derived from per-PR state that has NOT
+            # moved since an already-receipted park (same head, same attempt counter) —
+            # nothing was attempted, so re-emitting the terminal verdict would be pure noise
+            # AND would burn the fresh readmission window that a human just granted. Skip
+            # quietly; the earlier park's receipt still stands, and the next tick that
+            # actually attempts something gets a new fingerprint and parks normally.
+            print(f"capacity park skipped for {repo}#{pr_number}: nothing new was attempted "
+                  f"since the receipted park at the same fingerprint ({fingerprint}) — "
+                  f"window {window_key} stays UNCONSUMED (no label/comment churn)")
+            return
         generation_marker = (f"\n\n{PARK_GENERATION_MARKER} gen={generation} "
-                             f"cutoff={window_key} -->")
+                             f"cutoff={window_key}"
+                             f"{f' head={head_sha} attempt={attempt_key}' if fingerprint else ''}"
+                             " -->")
         if action == "terminal":
             # Bounded escalation: PARK_ESCALATION_GENERATIONS windows consumed — repeated
             # post-readmission failure IS a human question now. The terminal label write is
@@ -2986,6 +3125,11 @@ def review_outcome(args):
         set_review_state(args.repo, args.pr, "changes")
     elif decision == "needs-user":
         approved = document["verdict"] == "approve" and not has_blockers
+        # The capacity park's attempt fingerprint (#555 recurrence gap): the reviewed head —
+        # revalidated as the LIVE head above — plus the GLOBAL round number, which is monotone
+        # across readmission windows (post-readmission rounds keep global numbering) so it can
+        # never collide with an earlier window's park the way the window-relative charge could.
+        attempt_key = f"rounds={args.round}"
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
             reason, park_class = "the reviewer flagged possible prompt injection", "question"
@@ -3002,7 +3146,8 @@ def review_outcome(args):
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
-                   bot_login=args.bot_login)
+                   bot_login=args.bot_login, head_sha=args.reviewed_sha,
+                   attempt_key=attempt_key)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
         # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
@@ -3080,9 +3225,16 @@ def fix_outcome(args):
         # (park_policy.py defect 1: capacity parks must not masquerade as human questions).
         park_class = "question" if injection else "capacity"
         alert_repo, alert_token = _alert_route()
+        # Attempt fingerprint (#555 recurrence gap): a no-change fix and a failed local gate
+        # both leave the head WHERE IT WAS, so the head alone could never distinguish "the
+        # fixer just declined again" (real consumed work — must be chargeable, so the
+        # escalation bound still terminates) from "nothing was attempted". The LIFETIME
+        # per-round marker count supplies that monotone axis.
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
-                   bot_login=args.bot_login)
+                   bot_login=args.bot_login, head_sha=args.reviewed_sha,
+                   attempt_key=(f"nochange{args.round}={nochange_runs}" if not made_changes
+                                else f"gatefail{args.round}={gatefail_runs}"))
     else:
         print("fix outcome: staying in review:changes (retried next sweep tick)")
 
@@ -3168,6 +3320,79 @@ def _self_test():
     check("round-7 f1: the overflow receipt cutoff logs loudly",
           any("malformed park-generation receipt cutoff" in line for line in receipt_logs),
           True)
+    # ---- #555 recurrence gap: receipts also bind the park's ATTEMPT FINGERPRINT
+    # (head=<sha> attempt=<monotone counter>) so an exhaustion re-derived from unchanged
+    # per-PR state is recognisable as a re-emission. Both fields are OPTIONAL: a legacy
+    # (#555-era) receipt still parses its window key and simply claims no idempotence. ----
+    fp_head = "e" * 40
+    fp_receipts = [
+        {"user": {"login": bot},
+         "body": (f"x {PARK_GENERATION_MARKER} gen=1 cutoff=none "
+                  f"head={fp_head} attempt=rounds=5 -->")},
+        {"user": {"login": bot},
+         "body": (f"x {PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T09:00:00Z "
+                  f"head={fp_head} attempt=missed3=6 -->")},
+        {"user": {"login": "mallory"},
+         "body": (f"x {PARK_GENERATION_MARKER} gen=9 cutoff=2026-07-23T12:00:00Z "
+                  f"head={'f' * 40} attempt=rounds=99 -->")},
+    ]
+    check("fingerprinted receipts still yield the window keys the LADDER counts",
+          park_generation_cutoffs(fp_receipts, bot),
+          {PARK_WINDOW_NONE, "2026-07-23T09:00:00Z"})
+    check("fingerprinted receipts round-trip the (head, attempt) identity — bot-authored only",
+          park_generation_fingerprints(fp_receipts, bot),
+          {f"{fp_head}/rounds=5", f"{fp_head}/missed3=6"})
+    check("a LEGACY receipt (no head/attempt) contributes no fingerprint — claims no "
+          "idempotence, so the first park after this change always lands",
+          park_generation_fingerprints(receipts, bot), set())
+    check("the single receipt parser keeps both views consistent (windows + fingerprints)",
+          [(record["window"], record["generation"], record["fingerprint"])
+           for record in park_generation_records(fp_receipts, bot)],
+          [(PARK_WINDOW_NONE, 1, f"{fp_head}/rounds=5"),
+           ("2026-07-23T09:00:00Z", 2, f"{fp_head}/missed3=6")])
+
+    # ---- marker_runs_since (#555 recurrence gap): the missed/nochange/gatefail marker
+    # budgets are windowed by the readmission cutoff exactly like the round budget. The
+    # unwindowed LIFETIME read is what re-derived "N consecutive fix dispatches missed" on the
+    # tick after a readmission with an unchanged head (the sparq #3488 / #3472 bounce). ----
+    ms_cut = "2026-07-23T09:18:19Z"
+
+    def missed_at(run, created):
+        return {"user": {"login": bot}, "created_at": created,
+                "body": f"x {MARKER_KINDS['missed']} round=3 run={run} -->"}
+
+    burned_misses = [missed_at(f"{i}.1", "2026-07-22T05:00:00Z") for i in range(1, 7)]
+    fresh_misses = [missed_at(f"{i}.1", "2026-07-23T10:00:00Z") for i in range(7, 9)]
+    check("misses burned BEFORE the readmission are not chargeable after it",
+          len(marker_runs_since(burned_misses, bot, "missed", 3, ms_cut)), 0)
+    check("misses after the readmission charge normally",
+          len(marker_runs_since(burned_misses + fresh_misses, bot, "missed", 3, ms_cut)), 2)
+    check("no cutoff => the plain lifetime count (behaviour unchanged)",
+          len(marker_runs_since(burned_misses + fresh_misses, bot, "missed", 3, None)), 8)
+    check("an instant TIE with the cutoff is CHARGED (fail toward the old count)",
+          len(marker_runs_since([missed_at("9.1", ms_cut)], bot, "missed", 3, ms_cut)), 1)
+    check("a marker comment with NO created_at is CHARGED",
+          len(marker_runs_since(
+              [{"user": {"login": bot},
+                "body": f"x {MARKER_KINDS['missed']} round=3 run=9.1 -->"}],
+              bot, "missed", 3, ms_cut)), 1)
+    ms_logs = []
+    check("a marker comment with a MALFORMED created_at is CHARGED, loudly",
+          (len(marker_runs_since([missed_at("9.1", "zzz-not-a-timestamp")], bot, "missed", 3,
+                                 ms_cut, log=ms_logs.append)),
+           any("malformed created_at" in line for line in ms_logs)),
+          (1, True))
+    ms_logs.clear()
+    check("an UNPARSEABLE cutoff keeps the FULL historical count, loudly (never a fresh "
+          "budget on unproven data)",
+          (len(marker_runs_since(burned_misses, bot, "missed", 3, "not-a-timestamp",
+                                 log=ms_logs.append)),
+           any("is not a parseable timestamp" in line for line in ms_logs)),
+          (6, True))
+    check("the window never leaks across ROUNDS or the bot trust filter",
+          (len(marker_runs_since(fresh_misses, bot, "missed", 2, ms_cut)),
+           len(marker_runs_since(fresh_misses, "mallory", "missed", 3, ms_cut))),
+          (0, 0))
 
     # Issue #162: round markers bind the reviewed head sha, and a stale-deferred round is VOIDED
     # (subtracted) so head churn never burns the global round budget.
@@ -4369,6 +4594,98 @@ def _self_test():
         needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
         check("(i) an unreadable timeline freezes the ladder (no receipt/label/comment)",
               (park_route_calls, park_route_comments), ([], []))
+        wiring_globals["_issue_timeline"] = (
+            lambda repo, number: park_route_state["timelines"].get(number, []))
+
+        # ---- (k) #555 RECURRENCE GAP end-to-end: the park must be IDEMPOTENT against an
+        # unchanged head, and a re-admission must grant REAL budget. Live evidence: sparq PR
+        # #3488 was re-admitted 2026-07-22T16:36:56Z and re-escalated at 16:44:10Z — ~7
+        # minutes later, with an UNCHANGED head and no work attempted; PR #3472 re-escalated
+        # seven seconds after it with byte-identical boilerplate, five days after the last
+        # commit or review round on either PR. #555 fixed the park CLASSIFICATION and gave
+        # the budget a readmission WINDOW, but the ladder keyed only on the window: the human
+        # gesture minted a brand-new window key that the very next unchanged-state tick
+        # consumed, driving the ladder straight to its question-class terminal — so the
+        # readmission gesture (and any human unpark) accomplished nothing. ----
+        old_head, new_head = "1" * 40, "2" * 40
+        park_route_state["timelines"] = {41: [], 7: []}
+        park_route_state["comments"] = []
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot,
+                   head_sha=old_head, attempt_key="rounds=5")
+        check("(k) the FIRST park lands and RECEIPTS its attempt fingerprint",
+              (park_route_calls,
+               f"gen=1 cutoff={PARK_WINDOW_NONE} head={old_head} attempt=rounds=5 -->"
+               in park_route_comments[-1]),
+              ([("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")], True))
+        # ... the park's labels become timeline events and its receipt a durable bot comment.
+        park_route_state["timelines"][41] = [labeled("review:parked",
+                                                     "2026-07-22T16:00:00Z")]
+        park_route_state["timelines"][7] = [labeled("status:parked", "2026-07-22T16:00:00Z")]
+        park_route_state["comments"] = [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        # (a) THE BOUNCE: the maintainer re-admits (unlabels review:parked at the observed
+        # 16:36:56Z) and the very next tick re-derives the SAME exhaustion from the SAME
+        # state — unchanged head, no new round. Pre-fix this consumed the fresh window and
+        # emitted the gen-2 question-class terminal at 16:44:10Z. It must now be a QUIET skip:
+        # no label churn, no comment, and the window left UNCONSUMED.
+        park_route_state["timelines"][41] = park_route_state["timelines"][41] + [
+            unlabel("review:parked", "2026-07-22T16:36:56Z")]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        import contextlib
+        import io
+        bounce_log = io.StringIO()
+        with contextlib.redirect_stdout(bounce_log):
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha=old_head, attempt_key="rounds=5")
+        check("(a) unchanged head + an already-recorded park => NO re-emission (no label "
+              "churn, no comment) — the #3488 16:36:56Z->16:44:10Z bounce",
+              (park_route_calls, park_route_comments), ([], []))
+        check("(a) the quiet skip is LOGGED and names the unconsumed window",
+              ("capacity park skipped" in bounce_log.getvalue()
+               and "stays UNCONSUMED" in bounce_log.getvalue()), True)
+        check("(a) the readmission window is still UNCONSUMED (no second receipt)",
+              len(park_generation_cutoffs(park_route_state["comments"], bot)), 1)
+        # (b) the head ADVANCED (a fix was pushed and re-reviewed) and the WINDOWED budget is
+        # genuinely exhausted again => the park re-emits exactly once, consuming the window.
+        # At PARK_ESCALATION_GENERATIONS this is the question-class terminal.
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot, head_sha=new_head, attempt_key="rounds=8")
+        check("(b) an ADVANCED head + a genuinely exhausted budget re-emits the park once — "
+              "here the gen-2 question-class TERMINAL (receipt first)",
+              (park_route_calls,
+               "readmitted and exhausted its budget again" in park_route_comments[-1]),
+              ([("receipt",), ("pr-state", "needs-user"),
+                ("issue-status", 7, "needs-user")], True))
+        check("(b) the re-emitted receipt binds the FRESH window and the new fingerprint",
+              (f"gen=2 cutoff=2026-07-22T16:36:56Z head={new_head} attempt=rounds=8 -->"
+               in park_route_comments[-1]), True)
+        # (d) the bound still terminates: the consumed window's receipt makes every later
+        # unchanged-state tick quiet, and the ladder has reached its terminal generation.
+        park_route_state["comments"] = park_route_state["comments"] + [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot, head_sha=new_head, attempt_key="rounds=8")
+        check("(d) after the consumed window the loop TERMINATES quietly (bounded escalation "
+              "intact)", (park_route_calls, park_route_comments), ([], []))
+        check("(d) exactly PARK_ESCALATION_GENERATIONS windows were consumed — the bound was "
+              "spent on work actually attempted, never on the bounce",
+              len(park_generation_cutoffs(park_route_state["comments"], bot)),
+              _park_policy().PARK_ESCALATION_GENERATIONS)
+        # A capacity park with NO fingerprint (unknown head) is unchanged from #555: it can
+        # never be suppressed, so a drifted caller degrades to churn, never to a lost park.
+        park_route_state["comments"] = []
+        park_route_calls.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot,
+                   head_sha="", attempt_key="rounds=5")
+        check("(k) an unknown fingerprint parks exactly as before (no `head=` in the receipt)",
+              (bool(park_route_calls), "head=" in park_route_comments[-1]), (True, False))
     finally:
         wiring_globals.update(real_park_route)
 
@@ -6155,6 +6472,13 @@ def main():
     # Required for capacity parks once a readmission window exists (the generation-receipt
     # parser's bot trust filter); the question class never needs it.
     nuser.add_argument("--bot-login", default="")
+    # The capacity park's ATTEMPT FINGERPRINT (#555 recurrence gap; park_policy.park_
+    # fingerprint): the live head SHA plus a MONOTONE counter of work attempted. Supplied
+    # together they make the park idempotent against an unchanged head — a re-derivation that
+    # attempted nothing is skipped quietly instead of consuming the readmission window a human
+    # just granted. Optional: omitting either claims no idempotence (pre-fix behaviour).
+    nuser.add_argument("--head-sha", default="")
+    nuser.add_argument("--attempt-key", default="")
 
     dis = subparsers.add_parser("disarm", parents=[common])
     dis.add_argument("--when", choices=("mismatch", "always"), required=True)
@@ -6294,7 +6618,8 @@ def main():
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
                        alert_repo=alert_repo, alert_token=alert_token,
-                       park_class=args.park_class, bot_login=args.bot_login)
+                       park_class=args.park_class, bot_login=args.bot_login,
+                       head_sha=args.head_sha, attempt_key=args.attempt_key)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
                    preserve_review_state=args.preserve_review_state)

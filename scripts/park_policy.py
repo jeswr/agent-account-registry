@@ -34,6 +34,7 @@
 """Machine/human park-label ownership + the sticky human-unpark veto (one shared helper)."""
 
 import argparse
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -73,6 +74,10 @@ PARK_WINDOW_NONE = "none"
 # generation (or minting a PARK_WINDOW_NONE receipt) on a failed read would corrupt the durable
 # ladder — while plain budget consumers keep the default None => full-historical-count path.
 WINDOW_UNREADABLE = "window-unreadable"
+# Character class a park FINGERPRINT component (head SHA / attempt counter) must satisfy: no
+# whitespace and no `>`, so the value can never break out of the `head=<sha> attempt=<key> -->`
+# receipt marker (the readers key on `(\S+)` groups terminated by ` -->`).
+_FINGERPRINT_PART = re.compile(r"[A-Za-z0-9._=/:-]{1,120}")
 # The strict maintainer probe set (the worker-issue.py _is_human_maintainer pattern): repo
 # collaborator permission must be one of these for an actor to count as a trusted human.
 HUMAN_MAINTAINER_PERMISSIONS = {"admin", "maintain", "write"}
@@ -403,7 +408,33 @@ def capacity_park_readmitted(repo, pr_number, issue_number, fetch_events, is_hum
     return not park_instants or parse_ts(cutoff) > max(park_instants)
 
 
-def park_ladder_decision(cutoff, receipts, already_labeled=False):
+def park_fingerprint(head_sha, attempt_key):
+    """The ATTEMPT fingerprint a capacity park is receipted against (#555 recurrence gap):
+    the pair (PR head SHA, monotone attempt counter) that the exhaustion decision was
+    derived from. Two parks with an EQUAL fingerprint were derived from byte-identical
+    per-PR state — nothing new was attempted between them — so the second one is pure noise
+    (see park_ladder_decision's "unchanged" action).
+
+    Returns None when either component is unknown: an unknown fingerprint can prove
+    nothing, so the ladder falls back to its pre-fix behaviour (the park is emitted). That
+    is the conservative direction here — over-emitting a park is recoverable churn, whereas
+    suppressing on unproven identity would silently drop a due park.
+
+    `attempt_key` MUST be a monotone, space-free counter of work ATTEMPTED (a global round
+    number, a lifetime per-round missed/nochange/gatefail marker count) — never a
+    window-relative count, which resets on every readmission and would collide across
+    windows. Any character outside [A-Za-z0-9._=/:-] is rejected (None) so the value can
+    never break out of the `attempt=<key> -->` receipt marker."""
+    if not head_sha or not attempt_key:
+        return None
+    head, attempt = str(head_sha), str(attempt_key)
+    if not _FINGERPRINT_PART.fullmatch(head) or not _FINGERPRINT_PART.fullmatch(attempt):
+        return None
+    return f"{head}/{attempt}"
+
+
+def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=None,
+                         consumed_fingerprints=frozenset()):
     """The ONE label-independent capacity-park escalation ladder (round-3 finding 1), shared
     by the deferred-issue lane (dispatch-claim) and the worker-PR lane (worker-pr needs_user).
     `cutoff` is readmission_cutoff(..., on_unreadable=WINDOW_UNREADABLE); `receipts` is the
@@ -417,6 +448,11 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False):
       terminal escalation) for it was recorded once, honestly; re-defer QUIETLY until a fresh
       human gesture mints a new window key. Dedupe applies to COMMENTS/labels only: the
       generation progression is already durable in the receipts.
+    - ("unchanged", window_key, None): a FRESH window, but the exhaustion decision re-derived
+      from the SAME per-PR state as an already-receipted park (equal park_fingerprint — same
+      head SHA, same attempt counter). Nothing was attempted since that park, so re-emitting
+      its terminal verdict is pure noise: skip QUIETLY (a log line, no label, no comment, NO
+      generation consumed). See below for why this is what makes readmission mean anything.
     - ("legacy-quiet", None, None): a pre-receipt park (label live, no gesture, no receipts)
       — stay quiet; generation accounting starts with the first receipted window.
     - ("terminal", window_key, generation): PARK_ESCALATION_GENERATIONS windows consumed —
@@ -426,6 +462,27 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False):
       never escalate, and a cutoff that regressed to None cannot prove a fresh window.
     - ("park", window_key, generation): consume this window — soft park (veto-gated label,
       best-effort) + the MANDATORY receipt binding window_key.
+
+    IDEMPOTENCE AGAINST AN UNCHANGED HEAD (#555 recurrence gap; live evidence sparq PR #3488
+    re-admitted 2026-07-22T16:36:56Z and re-escalated 16:44:10Z — ~7 minutes later, unchanged
+    head, no work attempted; PR #3472 re-escalated seconds apart with byte-identical
+    boilerplate five days after the last commit or review round on either PR). #555 made the
+    park CLASSIFICATION correct and gave the budget a readmission WINDOW, but the ladder
+    itself keyed only on the window: a human re-admission mints a BRAND-NEW window key, so
+    the very next tick that re-derived exhaustion from unchanged persisted state consumed
+    that window immediately and — with the gen-1 receipt already standing — went straight to
+    the gen-2 QUESTION-class terminal. The readmission gesture therefore accomplished
+    nothing. The fingerprint axis fixes exactly that: a new window can only be CONSUMED by a
+    park whose decision inputs actually moved.
+
+    BOUNDED ESCALATION IS PRESERVED (this is why the fingerprint is (head, ATTEMPT-count),
+    not the head alone): every path that can re-park without moving the head still moves its
+    attempt counter — a re-review consumes a global round number, a no-change fix and a local
+    gate failure each add a per-round marker, a missed fix dispatch adds a missed marker — so
+    genuinely consumed work always yields a fresh fingerprint, the window is consumed, and
+    PARK_ESCALATION_GENERATIONS consumed windows still reach the terminal. Only a tick that
+    attempted NOTHING is silenced, and a silenced tick leaves the previous park's receipt (and
+    any label a human did not remove) standing.
 
     The window key is CANONICALIZED here (canonical_ts, round-6 finding 2) — this is the
     value every writer embeds in the receipt marker, so it must be the one deterministic
@@ -446,6 +503,11 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False):
     window_key = cutoff or PARK_WINDOW_NONE
     if window_key in receipts:
         return ("dedupe", window_key, None)
+    # Checked AFTER the window dedupe (which already covers the same-window repeat) and
+    # BEFORE any generation is minted: an unchanged-state re-derivation must never advance
+    # the ladder, or the escalation bound would be spent on ticks that attempted nothing.
+    if fingerprint and fingerprint in consumed_fingerprints:
+        return ("unchanged", window_key, None)
     if not cutoff and already_labeled and not receipts:
         return ("legacy-quiet", None, None)
     generation = len(receipts) + 1
@@ -975,6 +1037,103 @@ def _self_test():
     check("ladder round-6 f2: an unparseable cutoff freezes (defensive rail — it can mint "
           "neither a window key nor a receipt)",
           park_ladder_decision("not-a-timestamp", set()), ("freeze", None, None))
+
+    # ---- park_fingerprint + the UNCHANGED-HEAD idempotence axis (#555 recurrence gap).
+    # THE DEFECT: a human readmission mints a BRAND-NEW window key, so the next tick that
+    # re-derived exhaustion from unchanged persisted state consumed that window immediately and
+    # — with the gen-1 receipt standing — jumped to the gen-2 question-class terminal. Live:
+    # sparq PR #3488 re-admitted 2026-07-22T16:36:56Z, re-escalated 16:44:10Z (~7 min, unchanged
+    # head); PR #3472 seconds later with byte-identical boilerplate. ----
+    head = "a" * 40
+    check("fingerprint: head + monotone attempt counter",
+          park_fingerprint(head, "rounds=5"), f"{head}/rounds=5")
+    check("fingerprint: an unknown head claims NO idempotence (pre-fix behaviour)",
+          park_fingerprint("", "rounds=5"), None)
+    check("fingerprint: an unknown attempt counter claims NO idempotence",
+          park_fingerprint(head, ""), None)
+    check("fingerprint: a marker-breaking component is rejected, never smuggled into a receipt",
+          (park_fingerprint(head, "rounds=5 -->"), park_fingerprint("a b", "rounds=5")),
+          (None, None))
+    consumed = {f"{head}/rounds=5"}
+    # (a) THE BOUNCE: a fresh readmission window whose exhaustion re-derives the SAME
+    # fingerprint is NOT consumed — quiet skip, no generation, no terminal.
+    check("(a) ladder: a fresh window + an unchanged fingerprint is skipped QUIETLY (the "
+          "#3488 bounce), never consumed",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=consumed),
+          ("unchanged", "2026-07-23T09:18:19Z", None))
+    # (b) the head ADVANCED => real work was attempted => the window is consumed normally.
+    check("(b) ladder: an advanced head consumes the fresh window (gen-2 terminal at the "
+          "configured bound)",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=f"{'b' * 40}/rounds=5",
+                               consumed_fingerprints=consumed),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    # (b') the head did NOT move but the ATTEMPT COUNTER did (a re-review on the same head, a
+    # no-change fix, a failed local gate, another missed dispatch): genuinely consumed work, so
+    # the window IS consumed — this is what keeps the escalation bound reachable.
+    check("(b') ladder: an advanced attempt counter on an UNCHANGED head still consumes the "
+          "window (bounded escalation survives)",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=f"{head}/rounds=6",
+                               consumed_fingerprints=consumed),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    check("ladder: the FIRST park always lands — no receipted fingerprint can match",
+          park_ladder_decision(None, set(), fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=frozenset()),
+          ("park", PARK_WINDOW_NONE, 1))
+    check("ladder: a legacy receipt (no fingerprint recorded) claims no idempotence",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=frozenset()),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    check("ladder: an unknown fingerprint (None) can never suppress a due park",
+          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+                               fingerprint=None, consumed_fingerprints=consumed),
+          ("terminal", "2026-07-23T09:18:19Z", 2))
+    # Precedence: the window dedupe (already receipted) and the freeze (unproven timeline)
+    # both outrank the fingerprint check — an unchanged fingerprint must never turn a frozen
+    # or already-receipted decision into a different action.
+    check("ladder: the same-window dedupe still wins over the fingerprint check",
+          park_ladder_decision("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"},
+                               fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=consumed),
+          ("dedupe", "2026-07-23T09:18:19Z", None))
+    check("ladder: an unreadable timeline still FREEZES ahead of the fingerprint check",
+          park_ladder_decision(WINDOW_UNREADABLE, {PARK_WINDOW_NONE},
+                               fingerprint=f"{head}/rounds=5",
+                               consumed_fingerprints=consumed),
+          ("freeze", None, None))
+    # (d) THE BOUND STILL TERMINATES. Walk the ladder from nothing, alternating a GENUINELY
+    # consumed window (the fingerprint moved: real work was attempted) with an UNCHANGED-state
+    # re-derivation of the same window's exhaustion (the bounce). The unchanged ticks must be
+    # invisible to the ladder — they neither advance nor block it — and after
+    # PARK_ESCALATION_GENERATIONS consumed windows the ladder is TERMINAL and stays terminal.
+    # Asserted against the CONSTANT, never a hard-coded 2.
+    ladder_receipts, ladder_consumed = set(), set()
+    real_actions, bounce_actions = [], []
+    for step in range(1, PARK_ESCALATION_GENERATIONS + 2):
+        window = f"2026-07-23T{step:02d}:00:00Z"
+        fingerprint = f"{head}/r={step}"
+        action, key, _generation = park_ladder_decision(
+            window, ladder_receipts, fingerprint=fingerprint,
+            consumed_fingerprints=ladder_consumed)
+        real_actions.append(action)
+        ladder_receipts.add(key)
+        ladder_consumed.add(fingerprint)
+        # ... the very next tick re-derives the SAME exhaustion from the SAME state under a
+        # BRAND-NEW readmission window (a human just re-admitted): the #3488 bounce.
+        bounce_actions.append(park_ladder_decision(
+            f"2026-07-24T{step:02d}:00:00Z", ladder_receipts, fingerprint=fingerprint,
+            consumed_fingerprints=ladder_consumed)[0])
+    check("(d) genuinely consumed windows climb the ladder to the configured TERMINAL and "
+          "stay there",
+          real_actions,
+          ["park"] * (PARK_ESCALATION_GENERATIONS - 1) + ["terminal", "terminal"])
+    check("(d) an unchanged-state re-derivation NEVER advances the ladder at any generation "
+          "(the bound is spent only on work actually attempted)",
+          bounce_actions, ["unchanged"] * (PARK_ESCALATION_GENERATIONS + 1))
 
     # ---- probe_maintainer (round-3 Opus finding): a probe-call FAILURE warns loudly and
     # fails toward not-human; a genuine not-a-maintainer stays quiet ----
