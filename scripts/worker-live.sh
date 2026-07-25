@@ -2768,7 +2768,7 @@ YAML
   # re-attestation at all. So the driver is snapshotted and digest-bound on the same terms, and
   # the re-check executes the snapshot, never the checkout copy. ---
   chk "pre-publish re-check EXECUTES the pinned reverify driver snapshot (review r1)" \
-    "$(_workflow_step_run "$wf" republish-trust | grep -Fc 'python3 "$driver" reverify' || true)" "1"
+    "$(_workflow_step_run "$wf" republish-trust | grep -Fc '"$driver" reverify' || true)" "1"
   chk "pre-publish re-check NEVER runs the registry checkout's driver copy (review r1)" \
     "$(_workflow_step_run "$wf" republish-trust | grep -c 'registry/scripts/worker-issue' || true)" "0"
   chk "the pinned driver is re-bound to the pin step's recorded digest (review r1)" \
@@ -2793,11 +2793,13 @@ YAML
   # the REAL republish-trust run block (expressions substituted with sandbox values) and EXECUTE
   # it, simulating what target-controlled build scripts can do to runner files AFTER the pin step
   # completed. Intact snapshot -> the pinned driver runs. Driver replaced with an exit-zero
-  # impostor -> non-zero exit and the impostor never executes, so the publish step (gated on this
-  # step's outcome) stays off. Module planted beside the driver -> same, because python puts the
-  # executed script's own directory first on sys.path, so shadowing `json` would hijack a driver
-  # whose own bytes still match. Deleting the digest re-binding or the directory assertion from
-  # the workflow flips these red; the loud checkout-copy marker proves no fallback path exists.
+  # impostor -> non-zero exit and the impostor never executes, so the publish step stays off.
+  # Module planted beside the driver -> same: shadowing `json` would otherwise hijack a driver
+  # whose own bytes still match, since python normally puts the executed script's own directory
+  # first on sys.path. Deleting the digest re-binding or the directory assertion from the workflow
+  # flips these red; the loud checkout-copy marker proves no fallback path exists. Every scenario
+  # also asserts the sandbox $GITHUB_OUTPUT, because publication is gated on the ATTESTATION the
+  # block writes there, not on its exit status alone (review r2, below).
   # Extractor first (both directions on a fixture), then the property on the real workflow. ---
   chk "step-run extractor yields the dedented run: block ONLY (non-vacuous)" \
     "$(_workflow_step_run "$tmp/wf-body.yml" alpha)" "echo alpha-marker"
@@ -2805,15 +2807,20 @@ YAML
     "$(_workflow_step_run "$tmp/wf-body.yml" delta | grep -c . || true)" "0"
   chk "step-run extractor yields NOTHING for an unknown id (fail-closed)" \
     "$(_workflow_step_run "$tmp/wf-body.yml" gamma | grep -c . || true)" "0"
-  local rt="$tmp/rp-runner" rws="$tmp/rp-ws" step="$tmp/rp-step.sh" gsha dsha rprc rpout
+  local rt="$tmp/rp-runner" rws="$tmp/rp-ws" step="$tmp/rp-step.sh" gsha dsha psha rprc rpout
+  local rpo="$tmp/rp-output"          # the sandbox's $GITHUB_OUTPUT — where the attestation lands
   mkdir -p "$rt/trust-verifier" "$rws/registry/scripts"
   printf 'print("trusted")\n' > "$rt/trust-verifier/trust-gate.py"
   printf 'print("PINNED-DRIVER-RAN")\n' > "$rt/trust-verifier/worker-issue.py"
+  # The policy sibling the real driver loads out of this directory (see the closure checks below);
+  # here it only has to be present and digest-matching, like the snapshot member it stands for.
+  printf '# pinned policy sibling\n' > "$rt/trust-verifier/park_policy.py"
   # The copy a hostile build script owns. Reaching it at all is the defect being closed, so it is
   # loud: any run whose output carries this marker has fallen back to attacker-writable bytes.
   printf 'print("CHECKOUT-DRIVER-RAN")\n' > "$rws/registry/scripts/worker-issue.py"
   gsha=$(sha256sum "$rt/trust-verifier/trust-gate.py" | cut -d' ' -f1)
   dsha=$(sha256sum "$rt/trust-verifier/worker-issue.py" | cut -d' ' -f1)
+  psha=$(sha256sum "$rt/trust-verifier/park_policy.py" | cut -d' ' -f1)
   # runner.temp / github.workspace / both pin digests come from runner STATE in production — the
   # whole point — so they are substituted from outside the sandbox here; every remaining
   # expression is inert argument text to the driver stub.
@@ -2822,24 +2829,112 @@ YAML
           -e "s#\${{ github.workspace }}#$rws#g" \
           -e "s#\${{ steps.pin-trust-gate.outputs.sha256 }}#$gsha#g" \
           -e "s#\${{ steps.pin-trust-gate.outputs.driver_sha256 }}#$dsha#g" \
+          -e "s#\${{ steps.pin-trust-gate.outputs.policy_sha256 }}#$psha#g" \
           -e "s#\${{[^}]*}}#x#g" > "$step"
-  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_RUN_ID=77 GITHUB_RUN_ATTEMPT=1 \
-              bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
   chk "rendered pre-publish block runs the PINNED driver on an intact snapshot (control)" \
     "$rprc:$(grep -Fc 'PINNED-DRIVER-RAN' <<<"$rpout" || true):$(grep -Fc 'CHECKOUT-DRIVER-RAN' <<<"$rpout" || true)" \
     "ran:1:0"
+  chk "...and only THEN attests, so publish is enabled by a verification that really ran" \
+    "$(grep -Fc "verified=$gsha" "$rpo" || true)" "1"
   printf 'print("IMPOSTOR-RAN")\n' > "$rt/trust-verifier/worker-issue.py"
-  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_RUN_ID=77 GITHUB_RUN_ATTEMPT=1 \
-              bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
   chk "a reverify driver REPLACED after the pin blocks publish and never executes" \
-    "$rprc:$(grep -Fc 'IMPOSTOR-RAN' <<<"$rpout" || true)" "blocked:0"
+    "$rprc:$(grep -Fc 'IMPOSTOR-RAN' <<<"$rpout" || true):$(grep -c . "$rpo" || true)" "blocked:0:0"
   printf 'print("PINNED-DRIVER-RAN")\n' > "$rt/trust-verifier/worker-issue.py"
   printf 'raise SystemExit(0)\n' > "$rt/trust-verifier/json.py"
-  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_RUN_ID=77 GITHUB_RUN_ATTEMPT=1 \
-              bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
-  chk "a module PLANTED beside the pinned driver blocks publish (sys.path[0] hijack)" \
-    "$rprc:$(grep -Fc 'PINNED-DRIVER-RAN' <<<"$rpout" || true)" "blocked:0"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a module PLANTED beside the pinned driver blocks publish (stdlib-shadowing hijack)" \
+    "$rprc:$(grep -Fc 'PINNED-DRIVER-RAN' <<<"$rpout" || true):$(grep -c . "$rpo" || true)" "blocked:0:0"
   rm -f "$rt/trust-verifier/json.py"
+
+  # --- [issue #568 review r2] The host-side gate executes TARGET-CONTROLLED build scripts, which
+  # can PERSIST an execution environment into every later step ($GITHUB_ENV) and PREPEND binaries
+  # to its PATH ($GITHUB_PATH) — neither of which alters a byte of the pinned files, so neither is
+  # visible to the digest check. The scenarios above ran in a clean environment and therefore did
+  # not exercise that class at all. These do, against the same REAL rendered block:
+  #
+  #   (a) BASH_ENV — bash SOURCES it before the block's first line, so a startup file containing
+  #       `exit 0` makes the step exit 0 having verified NOTHING. This is why the workflow gates
+  #       publish on the block's positive ATTESTATION and not on its outcome: the step still
+  #       "succeeds" here, and MUST leave $GITHUB_OUTPUT empty. Deleting the attestation line, or
+  #       moving it above the reverify call, flips this red.
+  #   (b) $GITHUB_PATH — an attacker sha256sum that exits 0 would wave a TAMPERED snapshot through
+  #       the digest check, and an attacker python3 would "verify" without running the driver. The
+  #       block resets PATH to the system allowlist before looking up any command, so the REAL
+  #       tools run: the tampered snapshot is still refused, and on an intact one the pinned driver
+  #       (not the hijack) executes. Removing the PATH reset flips both.
+  #   (c) PYTHONPATH — a `sitecustomize.py` on it executes inside every non-isolated interpreter
+  #       startup, i.e. inside the digest-bound driver's own process. The block clears the PYTHON*
+  #       levers and runs python isolated, so the marker must NEVER appear.
+  #
+  # The workflow ALSO removes the primitive at its source (the gate step redirects its runner
+  # command files to a quarantine path); that is asserted as wiring below, since only a real runner
+  # can exercise it. These behavioural scenarios deliberately assume the quarantine FAILED. ---
+  local evilbin="$tmp/rp-evilbin" bashenv="$tmp/rp-bashenv.sh" pypath="$tmp/rp-pypath"
+  printf 'exit 0\n' > "$bashenv"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 BASH_ENV="$bashenv" bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a BASH_ENV early exit SUCCEEDS but attests NOTHING (outcome alone cannot publish)" \
+    "$rprc:$(grep -c . "$rpo" || true)" "ran:0"
+  mkdir -p "$evilbin"
+  local hijacked
+  for hijacked in sha256sum python3; do
+    printf '#!/bin/sh\necho HIJACKED-TOOL-RAN\nexit 0\n' > "$evilbin/$hijacked"
+    chmod +x "$evilbin/$hijacked"
+  done
+  printf 'print("IMPOSTOR-RAN")\n' > "$rt/trust-verifier/worker-issue.py"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 PATH="$evilbin:$PATH" bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a \$GITHUB_PATH-hijacked sha256sum/python3 cannot wave a TAMPERED snapshot through" \
+    "$rprc:$(grep -Fc 'HIJACKED-TOOL-RAN' <<<"$rpout" || true):$(grep -c . "$rpo" || true)" "blocked:0:0"
+  printf 'print("PINNED-DRIVER-RAN")\n' > "$rt/trust-verifier/worker-issue.py"
+  mkdir -p "$pypath"
+  printf 'print("PYTHONPATH-HIJACK-RAN")\n' > "$pypath/sitecustomize.py"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 PATH="$evilbin:$PATH" PYTHONPATH="$pypath" \
+              bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a hijacked PATH/PYTHONPATH is neutralised: the REAL pinned driver still runs and attests" \
+    "$rprc:$(grep -Fc 'PINNED-DRIVER-RAN' <<<"$rpout" || true):$(grep -Fc 'HIJACKED-TOOL-RAN' <<<"$rpout" || true):$(grep -Fc 'PYTHONPATH-HIJACK-RAN' <<<"$rpout" || true):$(grep -Fc "verified=$gsha" "$rpo" || true)" \
+    "ran:1:0:0:1"
+
+  # Wiring the sandbox cannot execute: publication is gated on the ATTESTATION (a bare outcome is
+  # what scenario (a) proves insufficient), and the primitive itself is removed at the source by
+  # quarantining the target-controlled gate step's runner command files. Deleting any of these
+  # from the workflow flips the corresponding assertion red.
+  chk "the publish/PR step requires the re-check's positive attestation, not just its outcome" \
+    "$(_workflow_step_if "$wf" pr \
+       | grep -Fc "steps.republish-trust.outputs.verified == steps.pin-trust-gate.outputs.sha256" || true)" "1"
+  chk "...and requires it to be NON-EMPTY (two skipped steps must not compare equal)" \
+    "$(_workflow_step_if "$wf" pr | grep -Fc "steps.republish-trust.outputs.verified != ''" || true)" "1"
+  # ORDER inside the block is the whole property: an attestation written before the reverify call
+  # would attest to nothing. Moving the printf above it flips this red.
+  local rb="$tmp/rp-block.txt" rev_at att_at
+  _workflow_step_run "$wf" republish-trust > "$rb"
+  rev_at=$(grep -n 'python3 -I "\$driver" reverify' "$rb" | cut -d: -f1 | head -1)
+  att_at=$(grep -n "printf 'verified=%s" "$rb" | cut -d: -f1 | head -1)
+  chk "the pre-publish block writes its attestation only AFTER the reverify call returns" \
+    "$([[ -n "$rev_at" && -n "$att_at" && "$rev_at" -lt "$att_at" ]] \
+       && echo attest-last || echo attest-first-or-missing)" "attest-last"
+  chk "the pre-publish block resets PATH to the system allowlist before running anything" \
+    "$(_workflow_step_run "$wf" republish-trust \
+       | grep -Fc 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' || true)" "1"
+  chk "the pre-publish block neutralises BASH_ENV/ENV in its STEP env (bash sources them first)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Ec "^ +(BASH_ENV|ENV): ''$" || true)" "2"
+  chk "the pre-publish block runs the pinned driver in python isolated mode" \
+    "$(_workflow_step_run "$wf" republish-trust | grep -Fc 'python3 -I "$driver" reverify' || true)" "1"
+  chk "the target-controlled gate step cannot persist environment into later steps (quarantine)" \
+    "$(_workflow_step_body "$wf" gate \
+       | grep -Ec '^ +GITHUB_(ENV|PATH): \$\{\{ runner.temp \}\}/gate-quarantine/(env|path)$' || true)" "2"
 
   # --- [issue #568] the re-check must accept the workflow's OWN label lifecycle, and the claim
   # step must establish ownership BEFORE it takes the shared label. The claim step moves the issue
@@ -2957,6 +3052,38 @@ PY
     "$(python3 "$tmp/prepub-driver.py" "$wisrc" modeltree "$tmp" 2>/dev/null || true)" "refused"
   chk "dispatch-mode reverify still REFUSES the in-progress state (mode is load-bearing)" \
     "$(python3 "$tmp/prepub-driver.py" "$wisrc" dispatch "$tmp" 2>/dev/null || true)" "refused"
+
+  # --- [issue #568 review r2] The snapshot must be the COMPLETE CLOSURE of the pre-publish path.
+  # Every check above ran the driver from the CHECKOUT, where its siblings sit beside it; the
+  # digest checks prove WHICH bytes run and say nothing about whether the pinned SET is sufficient.
+  # It was not: holds_live_claim — the ownership CAS this whole mode rests on — loads park_policy
+  # by `Path(__file__).with_name(...)`, i.e. out of the driver's own directory, so a snapshot
+  # missing it raises FileNotFoundError before the CAS is ever evaluated. Fail-closed, but on EVERY
+  # legitimate run: a lane that can never publish. Build the snapshot the way the pin step does —
+  # the file list is read OUT OF THE WORKFLOW, so a future reverify path that needs an uncopied
+  # module goes red HERE instead of on the runner — then run the REAL pre-publish path from it,
+  # and prove the negative by deleting the sibling again. ---
+  local snapdir="$tmp/prepub-snapshot" snapfile
+  mkdir -p "$snapdir"
+  while read -r snapfile; do
+    [[ -n "$snapfile" ]] || continue
+    cp "$SCRIPT_DIR/$snapfile" "$snapdir/$snapfile"
+  done < <(_workflow_step_run "$wf" pin-trust-gate \
+           | grep -oE '\$GITHUB_WORKSPACE/registry/scripts/[A-Za-z0-9_.-]+' | sed 's#.*/##' | sort -u)
+  chk "the snapshot fixture is really built from the pin step's own file list (non-vacuous)" \
+    "$([[ -s "$snapdir/worker-issue.py" ]] && echo driver-copied || echo list-not-read)" "driver-copied"
+  chk "the REAL pre-publish path COMPLETES when run from the pinned snapshot (closure)" \
+    "$(python3 "$tmp/prepub-driver.py" "$snapdir/worker-issue.py" own "$tmp" 2>/dev/null || true)" \
+    "accepted"
+  rm -f "$snapdir/park_policy.py"
+  chk "...and DIES from a snapshot missing that sibling (why the pin covers the closure)" \
+    "$(python3 "$tmp/prepub-driver.py" "$snapdir/worker-issue.py" own "$tmp" 2>/dev/null || echo died)" \
+    "died"
+  chk "the pinned policy sibling is digest-bound like the rest of the snapshot (review r2)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "policy_expected='\${{ steps.pin-trust-gate.outputs.policy_sha256 }}'" || true)" "1"
+  chk "the snapshot-directory assertion counts the WHOLE pinned closure (review r2)" \
+    "$(_workflow_step_run "$wf" republish-trust | grep -Fc -- '-eq 3 ]]' || true)" "1"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.

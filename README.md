@@ -374,9 +374,11 @@ partial success rate.
   status-label / trust-gate revalidation in the fresh publisher immediately before
   `Commit, push, and open DRAFT target pull request` — a maintainer who closes, rewrites, or
   human-parks the issue mid-run is never published over. Three properties make it sound: the
-  verifier is a **pre-model snapshot** — the trust-gate program *and* the `worker-issue.py` driver
-  that runs the live checks and decides whether to invoke it, since the local gate executes
-  target-controlled cargo build scripts on the runner and could otherwise rewrite either — taken
+  verifier is a **pre-model snapshot** — the trust-gate program, the `worker-issue.py` driver that
+  runs the live checks and decides whether to invoke it, and the `park_policy.py` sibling the
+  driver loads out of its own directory (the whole closure the path executes, or it dies on every
+  run), since the local gate executes target-controlled cargo build scripts on the runner and
+  could otherwise rewrite any of them — taken
   from the SHA-pinned checkouts into `RUNNER_TEMP` (outside every model-container mount) and
   re-bound to their recorded sha256s, with nothing else permitted in the snapshot directory, so the
   candidate change can never authorize its own publication — `reverify --forbid-gate-root` refuses
@@ -386,8 +388,15 @@ partial success rate.
   demand would refuse every real run) and nothing else; and ownership is a genuine
   compare-and-swap — the run-key-bound claim receipt is posted **before** the shared
   `status:in-progress` label, so a newer run supersedes an older one even in the pre-attempt
-  window, and `holds_live_claim` refuses whenever the newest receipt is not this run's. Drift
-  ABORTS without mutating human-owned issue state; `final_state` returns the issue to the pool.
+  window, and `holds_live_claim` refuses whenever the newest receipt is not this run's. A step
+  *outcome*, finally, proves only that a shell exited 0 — which those same build scripts can
+  arrange without the verifier ever running, by persisting `BASH_ENV` (bash sources it before the
+  block's first line) or a hijacked `PATH` out of the gate via `$GITHUB_ENV`/`$GITHUB_PATH` — so
+  publication is additionally gated on a positive **attestation** the re-check emits only after the
+  live re-verification returns; the re-check executes on a reset PATH with the interpreter levers
+  cleared and python isolated; and the gate step's own runner command files are redirected to a
+  quarantine path, removing that persistence primitive at its source. Drift ABORTS without
+  mutating human-owned issue state; `final_state` returns the issue to the pool.
 
 ## Registering a new account (web-login broker)
 

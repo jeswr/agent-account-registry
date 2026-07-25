@@ -941,9 +941,13 @@ jobs:
       # can rewrite just as easily (`../registry/...` from the target working directory). An
       # exit-zero impostor there would make the re-check "succeed" and publish with no
       # re-attestation at all, so the driver is snapshotted and digest-bound on the same terms.
-      # Its reverify path imports only the standard library; the lazily-loaded sibling policy
-      # modules are deliberately NOT copied, so any future reverify code path that reaches for one
-      # dies on a missing import (fail-closed) instead of silently loading a rewritable copy.
+      # [review r2] That pin must cover the CLOSURE the pre-publish path actually executes, which
+      # is not the driver alone: `holds_live_claim` — the ownership CAS the mode's claim proof
+      # rests on — loads park_policy.py out of the driver's own directory by path, so a two-file
+      # snapshot dies with FileNotFoundError on EVERY legitimate run (fail-closed, but publication
+      # would never happen). All three are copied and digest-bound; siblings no reverify path
+      # touches stay out, so a future path reaching for one still dies on a missing import rather
+      # than silently loading a rewritable copy.
       - name: Pin trust-gate verifier + reverify driver outside the model-writable tree
         id: pin-trust-gate
         if: ${{ !inputs.dry_run && steps.trust.outcome == 'success' }}
@@ -961,6 +965,21 @@ jobs:
           driver_sha="$(sha256sum "$driver_dst" | cut -d' ' -f1)"
           [[ "$driver_sha" =~ ^[0-9a-f]{64}$ ]]
           echo "driver_sha256=$driver_sha" >> "$GITHUB_OUTPUT"
+          # The snapshot must be the COMPLETE closure of the pre-publish path, not just its entry
+          # point: `holds_live_claim` — the ownership CAS this mode's whole claim proof rests on —
+          # loads park_policy.py by `Path(__file__).with_name(...)`, i.e. out of THIS directory. A
+          # snapshot without it does not fail open, but it does die on every legitimate run
+          # (FileNotFoundError before the CAS is ever evaluated), so publication would never
+          # happen. It is copied and digest-bound on exactly the same terms as the other two; the
+          # remaining lazily-loaded siblings (worker-pr.py) belong to no reverify path and stay
+          # out, so a future code path that reaches for one still dies fail-closed rather than
+          # silently loading a rewritable copy.
+          policy_src="$GITHUB_WORKSPACE/registry/scripts/park_policy.py"
+          policy_dst="$RUNNER_TEMP/trust-verifier/park_policy.py"
+          install -D -m 0444 "$policy_src" "$policy_dst"
+          policy_sha="$(sha256sum "$policy_dst" | cut -d' ' -f1)"
+          [[ "$policy_sha" =~ ^[0-9a-f]{64}$ ]]
+          echo "policy_sha256=$policy_sha" >> "$GITHUB_OUTPUT"
 
       - name: Prepare isolated selected-account environment
         id: prepare
@@ -1151,6 +1170,20 @@ jobs:
           # file before any tail bounded it. The gate's stream is already surfaced verbatim in the
           # GitHub job log (streamed off-runner, not a local file), which is a sufficient and safe
           # crash signal. The failure-class annotation below reads only host-derived step outcomes.
+          #
+          # [issue #568 review r2] QUARANTINE the runner command files for this step. A build
+          # script / test that this gate executes is TARGET-CONTROLLED code running on the runner
+          # host, and $GITHUB_ENV / $GITHUB_PATH are cross-step primitives: an append to the former
+          # persists BASH_ENV, LD_PRELOAD or PYTHON* into EVERY later step (a BASH_ENV startup file
+          # containing `exit 0` makes the next `run:` block succeed having executed none of it),
+          # and an append to the latter puts an attacker binary ahead of the system bash / python3 /
+          # sha256sum the pre-publish verifier below depends on. Pointing both at a path the runner
+          # never reads back removes the primitive rather than racing it. Nothing legitimate is
+          # lost: `worker-live.sh gate` reports through its exit status and writes neither file
+          # (the WORKER_EXIT_CLASS / WORKER_BRANCH appends live in the model+launch path, a
+          # different step), and `steps.gate.outputs` has no consumer.
+          GITHUB_ENV: ${{ runner.temp }}/gate-quarantine/env
+          GITHUB_PATH: ${{ runner.temp }}/gate-quarantine/path
         run: bash ../registry/scripts/worker-live.sh gate
 
       # TTL guard, PRE-PUBLISH (issue #40): app-token-post is minted right after the model step but
@@ -1193,7 +1226,10 @@ jobs:
       # publish only ever runs from a snapshot re-attested seconds earlier. On ANY drift it fails
       # (continue-on-error, mirroring the pre-model `trust` step) which gates the publish step
       # below OFF; every downstream consumer of this step checks its OUTCOME explicitly, so
-      # continue-on-error cannot make it fail open.
+      # continue-on-error cannot make it fail open. [review r2] The outcome is necessary but NOT
+      # sufficient: publish additionally requires the positive `verified` attestation this step
+      # emits only after the live re-verification actually returned, because an exit-0 shell — the
+      # thing an outcome really measures — is reachable without running the verifier at all.
       #
       # `--mode pre-publish`: the claim step above ITSELF moved the issue ready -> in-progress, so
       # dispatch mode's status:ready demand would refuse every legitimate run and publication would
@@ -1219,33 +1255,73 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
+          # [review r2] bash expands and SOURCES $BASH_ENV (and $ENV in posix mode) before the
+          # first line of the block below runs, so those two levers cannot be cleared inside it: a
+          # gate build script that appended `BASH_ENV=<file containing exit 0>` to $GITHUB_ENV
+          # would make this step exit 0 having verified NOTHING. Step-level env is applied over the
+          # runner's persisted globals, so these win. This is the belt; the positive attestation at
+          # the end of the block is the braces — no short-circuit of the block can produce it, so
+          # correctness here does not RELY on this override (or on the gate-step quarantine) taking
+          # effect.
+          BASH_ENV: ''
+          ENV: ''
         run: |
           set -euo pipefail
+          # [review r2] Execute the verifier in a context target-controlled code cannot influence.
+          # $GITHUB_PATH would otherwise put an attacker sha256sum/find/wc/python3 ahead of the
+          # system tools, PYTHONPATH/PYTHONHOME would hijack what the digest-bound driver imports,
+          # and LD_* would hijack every child process — none of which the digest check can see,
+          # because none of them alter a byte of the pinned files. PATH is therefore reset to the
+          # system allowlist BEFORE any command is looked up, every interpreter lever is cleared,
+          # and python runs in isolated mode (-I: ignores PYTHON* and drops the script's own
+          # directory from sys.path). PYTHONNOUSERSITE is exported rather than unset because it is
+          # the one lever that must be ON: it also reaches the trust-gate CHILD the driver spawns,
+          # whose interpreter would otherwise honour a .pth planted in the model-writable HOME.
+          # A tool missing from the hardened PATH aborts (fail-closed: no publish), never falls
+          # back to the inherited one.
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          unset BASH_ENV ENV IFS PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH
+          export PYTHONNOUSERSITE=1
+          for tool in sha256sum find wc python3; do
+            command -v "$tool" >/dev/null \
+              || { echo "::error::pre-publish verifier: $tool is not on the hardened PATH"; exit 1; }
+          done
           # The verifier path comes from the runner.temp EXPRESSION (runner state — immune to a
           # $GITHUB_ENV append by the gate's target-controlled build scripts, which could redirect
           # a $RUNNER_TEMP env lookup) and is re-bound to the digest recorded in the pin step's
           # in-memory output before it is executed. Wrong digest → abort → publish stays gated off.
           verifier='${{ runner.temp }}/trust-verifier/trust-gate.py'
           driver='${{ runner.temp }}/trust-verifier/worker-issue.py'
+          policy='${{ runner.temp }}/trust-verifier/park_policy.py'
           pinned='${{ runner.temp }}/trust-verifier'
           expected='${{ steps.pin-trust-gate.outputs.sha256 }}'
           driver_expected='${{ steps.pin-trust-gate.outputs.driver_sha256 }}'
-          [[ "$expected" =~ ^[0-9a-f]{64}$ && "$driver_expected" =~ ^[0-9a-f]{64}$ ]] \
+          policy_expected='${{ steps.pin-trust-gate.outputs.policy_sha256 }}'
+          [[ "$expected" =~ ^[0-9a-f]{64}$ && "$driver_expected" =~ ^[0-9a-f]{64}$ \
+             && "$policy_expected" =~ ^[0-9a-f]{64}$ ]] \
             || { echo '::error::pinned verifier digest missing'; exit 1; }
-          printf '%s  %s\n%s  %s\n' "$expected" "$verifier" "$driver_expected" "$driver" \
+          # Every member of the snapshot is bound, including the policy sibling the driver loads
+          # out of this directory by path: an unbound module beside a digest-checked driver is the
+          # same impostor hole one level down.
+          printf '%s  %s\n%s  %s\n%s  %s\n' "$expected" "$verifier" "$driver_expected" "$driver" \
+            "$policy_expected" "$policy" \
             | sha256sum --check --strict --quiet -
-          # Nothing may be PLANTED beside the pinned pair either: python puts the executed script's
-          # own directory first on sys.path, so a stdlib-shadowing module dropped in here (json.py,
-          # argparse.py) would hijack the digest-checked driver without altering a single byte of
-          # it. The snapshot holds exactly the two files above and nothing else.
-          [[ "$(find "$pinned" -mindepth 1 | wc -l)" -eq 2 ]] \
+          # Nothing may be PLANTED beside the pinned pair either: a stdlib-shadowing module dropped
+          # in here (json.py, argparse.py) would hijack the digest-checked driver without altering
+          # a single byte of it — python normally puts the executed script's own directory first on
+          # sys.path. Isolated mode drops that entry, and this assertion holds independently of it:
+          # the snapshot holds exactly the three files above and nothing else.
+          [[ "$(find "$pinned" -mindepth 1 | wc -l)" -eq 3 ]] \
             || { echo '::error::pinned verifier directory was modified'; exit 1; }
           # The forbidden root is the github.workspace EXPRESSION for the same reason the verifier
           # path is: a $GITHUB_ENV append by the gate's target-controlled build scripts must not be
           # able to redirect it. The digest check above is the PRIMARY binding on which bytes run;
           # this is the structural assertion layered on top of it.
           forbidden='${{ github.workspace }}/target'
-          python3 "$driver" reverify \
+          # The re-freshened snapshot lands on the runner.temp EXPRESSION too, not a $RUNNER_TEMP
+          # env lookup: redirecting that lookup would leave the publish step (which reads the
+          # expression path) consuming the STALE pre-model snapshot this step exists to replace.
+          python3 -I "$driver" reverify \
             --repo "${{ inputs.target_repo }}" \
             --issue "${{ inputs.issue_number }}" \
             --expected-author "${{ needs.resolve.outputs.issue_author }}" \
@@ -1253,13 +1329,28 @@ jobs:
             --trust-gate "$verifier" \
             --forbid-gate-root "$forbidden" \
             --bot-login "${{ steps.target.outputs.bot_login }}" \
-            --issue-file "$RUNNER_TEMP/verified-issue.json" \
+            --issue-file '${{ runner.temp }}/verified-issue.json' \
             --current-run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
             --mode pre-publish
+          # [review r2] POSITIVE ATTESTATION. Publication is gated on this OUTPUT, not merely on
+          # this step's outcome, because an outcome of `success` is produced by EVERY exit-0 path —
+          # including paths that never reached the verifier at all (a BASH_ENV startup file that
+          # `exit 0`s, a shell or interpreter swapped in via $GITHUB_PATH, a process killed after a
+          # trivially-true command). This line is reachable only after reverify itself returned 0
+          # under `set -e`, so any short-circuited block leaves the output EMPTY and the publish
+          # step below stays gated off. Its value re-states the pinned digest, binding publish to
+          # the same trust root the verification actually ran from.
+          printf 'verified=%s\n' "$expected" >> "$GITHUB_OUTPUT"
 
+      # [review r2] The `verified` OUTPUT — not just the re-check's outcome — is what enables this
+      # step: a success outcome proves only that the step's shell exited 0, which target-controlled
+      # persisted environment can arrange without the verifier ever running. The attestation is
+      # written by the re-check's last line, after reverify returned 0. `!= ''` is load-bearing on
+      # its own terms: an unset output equals an unset digest, so the equality alone would hold
+      # vacuously if both steps were skipped.
       - name: Commit, push, and open DRAFT target pull request (review pending)
         id: pr
-        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' && steps.republish-trust.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' && steps.republish-trust.outcome == 'success' && steps.republish-trust.outputs.verified != '' && steps.republish-trust.outputs.verified == steps.pin-trust-gate.outputs.sha256 }}
         working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token-publish.outputs.token || steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
@@ -1340,6 +1431,12 @@ jobs:
           # "model=success, gate=success, pr=skipped" and no reason at all. Host-derived step
           # outcome only, like every other value here.
           REPUBLISH_OUTCOME: ${{ steps.republish-trust.outcome }}
+          # [review r2] ...and publication ALSO requires the re-check's positive attestation, so a
+          # success outcome with no attestation (the shape a short-circuited verifier step leaves
+          # behind) must be reported as its own cause rather than read as unexplained. Host-derived
+          # step output only.
+          REPUBLISH_VERIFIED: ${{ steps.republish-trust.outputs.verified }}
+          PINNED_VERIFIER_SHA: ${{ steps.pin-trust-gate.outputs.sha256 }}
           RESOLVED_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: |
           set -uo pipefail
@@ -1349,6 +1446,8 @@ jobs:
           fi
           if [[ "${GATE_OUTCOME:-}" == "success" && "${REPUBLISH_OUTCOME:-}" != "success" ]]; then
             echo '::warning::The gate passed but the pre-publish live-trust re-check did not (outcome='"${REPUBLISH_OUTCOME:-?}"') — the target issue drifted (closed, rewritten, human-parked, or the claim was superseded) during the model+gate span, so publication was ABORTED and no human-owned issue state was changed. The specific drift is in the Re-verify live trust step log above.'
+          elif [[ "${GATE_OUTCOME:-}" == "success" && "${REPUBLISH_VERIFIED:-}" != "${PINNED_VERIFIER_SHA:-x}" ]]; then
+            echo '::warning::The gate passed and the pre-publish live-trust re-check reported success but produced NO verifier attestation — its shell exited 0 without the live re-verification completing (the shape a poisoned execution environment leaves behind). Publication was ABORTED, fail-closed, and no human-owned issue state was changed.'
           fi
 
   # Final-state convergence runs as its OWN always() job (issue #127). The `worker` job runs the
