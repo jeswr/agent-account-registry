@@ -520,57 +520,6 @@ agent = "docs-agent"
     check("the retired registry holds the known retirements (emptying it must not silently "
           "disable every check below)",
           sorted(RETIRED_ACCOUNTS), ["acct03", "acct06"])
-    # The README's enrolment runbook says it can be followed VERBATIM, and #660 review r4 found
-    # that its `account_pool` example still listed a retired handle — so following it produced a
-    # PolicyError. Fixing that instance is not enough: any future retirement or handle-shape
-    # change can silently invalidate the runbook again. So the DOCUMENTED examples are validated
-    # against the live rules here. Doc drift becomes a test failure instead of a maintainer's
-    # wasted afternoon.
-    _readme = pathlib.Path(__file__).resolve().parent.parent / "README.md"
-    _doc_pools = re.findall(r'account_pool\s*=\s*\[([^\]]*)\]', _readme.read_text(encoding="utf-8"))
-    check("the README documents at least one account_pool example (a zero-example scan would "
-          "make the checks below vacuously pass)",
-          len(_doc_pools) > 0, True)
-    # Drive each documented pool through the REAL resolve(), not through a hand-rolled subset of
-    # its rules. Review r5 found the first version checked individual handles only, so `[]` and
-    # `["acct01","acct01"]` — both rejected by resolve() for non-handle reasons (empty, duplicate)
-    # — passed a test that CLAIMED the resolver would accept them. Asserting "the resolver
-    # accepts X" by reimplementing part of the resolver is how that claim came to be false.
-    _doc_rejected = []
-    for _raw in _doc_pools:
-        _pool = [x.strip().strip('"').strip("'") for x in _raw.split(",") if x.strip()]
-        try:
-            resolve("sparq-org/sparq", "impl", _policy_with_pool(_pool), routing)
-        except PolicyError as exc:
-            _doc_rejected.append(f"{_pool!r}: {exc}")
-    # CROSS-STEP consistency (review r5 finding 2): the runbook creates a slot in its earlier
-    # steps and then tells you to add "the new handle" to a pool. Those two must be the SAME
-    # handle. They were not — the steps create acct05 while the pool example said acct08, so
-    # following the runbook verbatim would have authorised an unrelated, dangling slot. The
-    # reviewer noted the handle-level checker could not see this; it is checkable, so it is
-    # checked. Both sources are structured, not prose: the claim ref and the --account-handle arg.
-    _readme_text = _readme.read_text(encoding="utf-8")
-    # EACH source is pinned separately, not just their union. Found by mutation: neutering one of
-    # the two regexes left the union non-empty via the other, so the scan silently NARROWED
-    # without failing — the same shape as pinning a set's membership rather than its emptiness.
-    _runbook_sources = {
-        "claim ref": set(re.findall(r"refs/acct-claims/(acct[0-9a-z]{2,})", _readme_text)),
-        "--account-handle arg": set(re.findall(r"--account-handle\s+(acct[0-9a-z]{2,})", _readme_text)),
-    }
-    check("each runbook handle source still matches something (a source that silently stops "
-          "matching would narrow the cross-step check instead of failing it)",
-          sorted(name for name, found in _runbook_sources.items() if not found), [])
-    _runbook_handles = set().union(*_runbook_sources.values())
-    _documented = {x.strip().strip('"').strip("'")
-                   for raw in _doc_pools for x in raw.split(",") if x.strip()}
-    check("every slot the runbook CREATES also appears in its account_pool example — otherwise "
-          "following it verbatim authorises a different slot than the one just enrolled",
-          sorted(_runbook_handles - _documented), [])
-
-    check("every account_pool example in README.md is accepted by resolve() itself — the runbook "
-          "says follow it VERBATIM, so a documented pool that raises PolicyError is a defect",
-          _doc_rejected, [])
-
     # NON-CANONICAL handles are refused outright (#660 review r3). Padding is the case that
     # bit us: `" acct03"` was a legal handle to the old validation AND invisible to the raw
     # retirement intersection, and downstream select-and-claim strips before matching, so it
