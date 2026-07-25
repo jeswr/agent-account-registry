@@ -1164,6 +1164,23 @@ def _parked_pr_snapshot(
     labels = _labels(pull, "parked pull request")
     if not (labels & HUMAN_HOLD_PR_LABELS):
         return None
+    # Defuse exists to stop OUR OWN parked PRs burning target CI while they wait on a human. A
+    # human's pull request is not ours to re-draft: the human-hold label means the decision is
+    # theirs, and converting their PR to draft is the machine mutating a person's artifact.
+    #
+    # This is also where a permanent red came from (2026-07-25): sparq-org/sparq#3427 is authored
+    # by the maintainer and labelled `needs:user`, so every sweep selected it, every redraft came
+    # back `Resource not accessible by integration (convertPullRequestToDraft)`, and — being the
+    # only candidate — it tripped precedence rule 2 ("attempted, none completed") on every tick
+    # for hours. The fix belongs HERE, in candidate selection, and NOT in phase_exit_failure:
+    # weakening the exit rule to tolerate a stuck object would buy exactly the silence that rule
+    # is written to prevent. An object that was never ours to touch is not a failed attempt.
+    #
+    # Fail direction: unknown or malformed authorship SKIPS. The permissive answer here would be
+    # to mutate a PR whose owner we could not establish, which is the wrong way round.
+    user = pull.get("user")
+    if not isinstance(user, dict) or user.get("type") != "Bot":
+        return None
     updated_at = pull.get("updated_at")
     updated = _epoch(updated_at, "parked pull request")
     if now - updated < stale_seconds:
@@ -2715,6 +2732,9 @@ def _self_test() -> int:
             "labels": [{"name": "needs:user"}],
             "updated_at": old_activity,
             "head": {"sha": f"{number:040x}"},
+            # Defuse candidates are OUR OWN parked PRs. A human's PR is excluded by
+            # _parked_pr_snapshot and is covered separately below.
+            "user": {"login": "sparq-orchestrator[bot]", "type": "Bot"},
             "auto_merge": None,
         }
         pull.update(changes)
@@ -2730,6 +2750,14 @@ def _self_test() -> int:
         7: _defuse_pull(7),
         8: _defuse_pull(8),
         9: _defuse_pull(9),
+        # #3427: identical to the admitted #1 in EVERY respect except authorship. This is the
+        # live shape that made groom permanently red — the maintainer's own `needs:user` PR was
+        # selected on every sweep and every redraft came back
+        # `Resource not accessible by integration (convertPullRequestToDraft)`.
+        10: _defuse_pull(10, user={"login": "jeswr", "type": "User"}),
+        # Unknown/malformed authorship must fail toward NOT touching the PR.
+        11: _defuse_pull(11, user=None),
+        12: _defuse_pull(12, user={"login": "someone"}),  # no `type` at all
     }
     del defuse_details[8]["auto_merge"]  # unknown REST latch state must fail closed
 
@@ -2767,6 +2795,23 @@ def _self_test() -> int:
         "#548 tripwire (b): a recently-active parked PR is NOT defused",
         ("owner/repo", 2) in defuse_candidates,
         False,
+    )
+    # #3427: a HUMAN's parked PR is not ours to re-draft. Asserted against the admitted bot PR #1
+    # in the same breath — without that contrast this would also pass if the whole defuse phase
+    # were deleted, which is the vacuity shape this repo keeps producing.
+    check(
+        "#3427: a human-authored parked PR is NOT a defuse candidate, while the otherwise "
+        "IDENTICAL bot-authored PR still is",
+        (
+            ("owner/repo", 1) in defuse_candidates,
+            ("owner/repo", 10) in defuse_candidates,
+        ),
+        (True, False),
+    )
+    check(
+        "#3427: unknown or malformed authorship fails toward NOT mutating the PR",
+        {("owner/repo", number) in defuse_candidates for number in (11, 12)},
+        {False},
     )
     check(
         "#548 tripwire (c): review:changes alone is NOT a terminal defuse hold",
@@ -4641,8 +4686,14 @@ def _self_test() -> int:
                 now - DEFAULT_STALE_HOURS * 3600 - 600, timezone.utc
             ).isoformat(),
             "head": {"sha": "c" * 40, "ref": "ci/codeql-nonblocking-retroactive"},
-            "user": {"login": "jeswr"},
-            "body": "a human PR touching .github/workflows/**",
+            # A BOT-authored PR touching workflow files. It was originally modelled on
+            # sparq-org/sparq#3427, which is HUMAN-authored — but human PRs are no longer defuse
+            # candidates at all (see _parked_pr_snapshot), so the #3427 shape now belongs to the
+            # dedicated check further down. What this block still tests, and must keep testing, is
+            # the head-of-line property: one un-redraftable candidate must not abort the phase.
+            # A bot PR touching `.github/workflows/**` reaches that same failure legitimately.
+            "user": {"login": "sparq-orchestrator[bot]", "type": "Bot"},
+            "body": "a worker PR touching .github/workflows/**",
             "auto_merge": None,
         }
         terminal_sweep_env.update(
