@@ -31,6 +31,8 @@ import os
 import re
 import stat
 import subprocess
+import socket
+import ssl
 import sys
 import tempfile
 import urllib.error
@@ -170,6 +172,28 @@ CLASS_REFRESH_TRANSIENT = "credential-refresh-transient"   # retried, still fail
 # (OpenAI rotates refresh tokens and detects replay) ALREADY USED. No amount of retrying fixes it;
 # only an interactive re-login can. 429 and 5xx are throttle/availability and ARE retried.
 _REMINT_STATUSES = frozenset({400, 401, 403})
+# --- IDEMPOTENCY of the exchange (retro-review of #614) -------------------------------------------
+# The refresh token is ONE-TIME-USE and the provider detects replay. So "did this request reach the
+# provider?" is a load-bearing question, and the old code could not ask it: every timeout, URLError
+# and OSError collapsed to `(0, "")` — indistinguishable from "never sent" — was classified TRANSIENT,
+# and the SAME grant was posted again, up to REFRESH_ATTEMPTS times. If the provider had already
+# committed the rotation and only the response was lost, the retry replays a spent grant and kills
+# the account permanently. Retrying is therefore only safe when the outcome is OBSERVED.
+#
+# Two sentinel statuses stand in for "no HTTP status":
+#   STATUS_NOT_SENT (0)       — the failure PROVES nothing was transmitted (DNS failure, connection
+#                               refused, a TLS handshake that never completed, a malformed URL). The
+#                               grant is untouched, so this is genuinely retryable.
+#   STATUS_INDETERMINATE (-1) — the request may have been transmitted and no response was observed
+#                               (timeout, connection reset, broken pipe, any other I/O fault). The
+#                               grant MAY already be consumed, so it must NOT be sent again. Fail
+#                               loudly to the maintainer instead: a false re-mint page costs minutes,
+#                               a replayed grant costs the account.
+STATUS_NOT_SENT = 0
+STATUS_INDETERMINATE = -1
+# Exception types that prove the request never left this host. Anything NOT here is indeterminate —
+# the fail direction is toward "assume it may have been spent".
+_NOT_SENT_ERRORS = (socket.gaierror, ConnectionRefusedError, ssl.SSLError)
 # Fixed allowlist of provider error codes safe to echo into a PUBLIC log. Anything outside it is
 # never printed (no provider free text, no token material, ever reaches a log line).
 _REMINT_CODES = frozenset({
@@ -188,10 +212,19 @@ class RefreshFailure(Exception):
     assembled from fixed strings + the allowlisted code ONLY — never provider free text, never any
     token material."""
 
-    def __init__(self, kind, code=None):
+    def __init__(self, kind, code=None, indeterminate=False):
         self.kind = kind
         self.code = code if code in _REMINT_CODES else None
+        # INDETERMINATE (retro-review of #614): the exchange request may have reached the provider and
+        # no response came back, so the one-time-use grant may already be spent. Carried on the
+        # exception so the operator-facing message can say which of the two remint causes this is
+        # ("the grant is dead" vs "the grant's fate is unknown and must not be gambled again").
+        self.indeterminate = bool(indeterminate)
         detail = f" (provider code: {self.code})" if self.code else ""
+        if self.indeterminate:
+            detail += (" — the token-endpoint request may have been delivered with no response "
+                       "observed, so this ONE-TIME-USE grant may already be consumed; it was NOT "
+                       "re-sent (replaying it would permanently kill the account)")
         super().__init__(f"host-side credential refresh failed: {kind}{detail}")
 
 
@@ -308,10 +341,17 @@ def merge_refreshed(provider, stored, response, now):
 def classify_refresh_failure(status, body=""):
     """Map a token-endpoint failure onto exactly one of the two new classes.
 
-    `status` is the HTTP status, or 0 for "no response" (DNS/TCP/TLS/timeout). A recognised remint
-    error CODE wins over the status so a provider that reports `invalid_grant` with an unusual
-    status is still routed to the maintainer instead of being retried forever."""
+    `status` is the HTTP status, `STATUS_NOT_SENT` (0) for "provably never transmitted", or
+    `STATUS_INDETERMINATE` (-1) for "may have been transmitted, no response observed". A recognised
+    remint error CODE wins over the status so a provider that reports `invalid_grant` with an unusual
+    status is still routed to the maintainer instead of being retried forever.
+
+    INDETERMINATE is REMINT, not transient (retro-review of #614): transient means "safe to send this
+    grant again", and that is exactly what an unobserved outcome does not license. Classifying it as
+    remint routes it to a maintainer while `refresh_access_token`'s remint arm stops the resend."""
     if refresh_error_code(body) in _DECISIVE_REMINT_CODES:
+        return CLASS_REMINT
+    if int(status) == STATUS_INDETERMINATE:
         return CLASS_REMINT
     if int(status) in _REMINT_STATUSES:
         return CLASS_REMINT
@@ -344,7 +384,12 @@ def refresh_error_code(body):
 def _post_token_endpoint(url, payload, timeout=REFRESH_TIMEOUT_SECONDS):
     """One token-endpoint exchange. Returns (status, body_text). Never raises for an HTTP error
     status, and never logs: the body may echo request material, so only the CALLER's allowlisted
-    code extraction ever looks at it."""
+    code extraction ever looks at it.
+
+    A failure with no HTTP status is reported as `STATUS_NOT_SENT` when the exception PROVES the
+    request never left this host, and `STATUS_INDETERMINATE` otherwise — see those constants. The old
+    blanket `(0, "")` made a lost response look exactly like an unsent one, which is what let a
+    one-time-use grant be re-sent after the provider had already consumed it."""
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json", "Accept": "application/json"})
@@ -357,8 +402,17 @@ def _post_token_endpoint(url, payload, timeout=REFRESH_TIMEOUT_SECONDS):
         except OSError:
             body = ""
         return exc.code, body
-    except (urllib.error.URLError, OSError, ValueError):
-        return 0, ""   # no response at all: DNS / TCP / TLS / timeout => transient
+    except ValueError:
+        return STATUS_NOT_SENT, ""     # malformed URL/payload: nothing was ever transmitted
+    except urllib.error.URLError as exc:
+        # urllib wraps connect-phase socket/TLS faults in URLError; `reason` carries the original.
+        return (STATUS_NOT_SENT if isinstance(exc.reason, _NOT_SENT_ERRORS)
+                else STATUS_INDETERMINATE), ""
+    except OSError as exc:
+        # Raised bare from the response read (ConnectionResetError, TimeoutError, ...) or from an
+        # unwrapped connect fault.
+        return (STATUS_NOT_SENT if isinstance(exc, _NOT_SENT_ERRORS)
+                else STATUS_INDETERMINATE), ""
 
 
 def token_endpoint(provider, environ=None):
@@ -380,7 +434,14 @@ def refresh_access_token(provider, refresh_token, *, poster=_post_token_endpoint
 
     Bounded retry on TRANSIENT classes only, reusing gh_retry's exponential-with-jitter sleep
     mechanics. A remint class fails immediately — retrying a dead grant just delays the maintainer
-    signal (the exact misclassification gh_retry's docstring calls out)."""
+    signal (the exact misclassification gh_retry's docstring calls out).
+
+    IDEMPOTENCY-AWARE (retro-review of #614): the retry re-POSTS the SAME one-time-use grant, so it
+    is only performed when the previous attempt's outcome was OBSERVED. An attempt whose outcome is
+    unobserved (`STATUS_INDETERMINATE` — timeout, reset, any I/O fault after the request may have
+    gone out) classifies as REMINT and therefore raises on the spot, WITHOUT a resend: if the provider
+    committed the rotation and the response was lost, resending replays a spent grant and OpenAI's
+    replay detection kills the account for good. Failing loudly is the cheaper error."""
     url = token_endpoint(provider, environ)
     client_id = OAUTH_CLIENT_IDS.get(provider)
     if not url or not client_id:
@@ -403,8 +464,11 @@ def refresh_access_token(provider, refresh_token, *, poster=_post_token_endpoint
             last = RefreshFailure(CLASS_REFRESH_TRANSIENT)
         else:
             kind = classify_refresh_failure(status, body)
-            failure = RefreshFailure(kind, refresh_error_code(body))
+            indeterminate = int(status) == STATUS_INDETERMINATE
+            failure = RefreshFailure(kind, refresh_error_code(body), indeterminate=indeterminate)
             if kind == CLASS_REMINT:
+                # Covers BOTH remint causes, and the resend guard is the same statement: a dead grant
+                # is not worth retrying, and an INDETERMINATE grant must not be retried.
                 raise failure
             last = failure
         if attempt < max(1, int(attempts)):
@@ -622,8 +686,54 @@ def _self_test():
     chk("503 classifies as transient", classify_refresh_failure(503, "") == CLASS_REFRESH_TRANSIENT)
     chk("429 classifies as transient (throttle, not a dead grant)",
         classify_refresh_failure(429, "") == CLASS_REFRESH_TRANSIENT)
-    chk("no response at all (DNS/TCP/TLS/timeout) classifies as transient",
-        classify_refresh_failure(0, "") == CLASS_REFRESH_TRANSIENT)
+    chk("a PROVABLY-unsent request (DNS/connection-refused/TLS) classifies as transient",
+        classify_refresh_failure(STATUS_NOT_SENT, "") == CLASS_REFRESH_TRANSIENT)
+    # --- IDEMPOTENCY (retro-review of #614). An UNOBSERVED outcome is not transient: "transient"
+    # licenses re-POSTing the same ONE-TIME-USE grant, and that is exactly what must not happen when
+    # the provider may already have consumed it. ---
+    chk("an INDETERMINATE outcome (request may have landed, no response seen) classifies as "
+        "remint-required, NOT transient — so it is never re-sent",
+        classify_refresh_failure(STATUS_INDETERMINATE, "") == CLASS_REMINT)
+    chk("the two no-status sentinels are distinct (a lost response is not an unsent request)",
+        STATUS_NOT_SENT != STATUS_INDETERMINATE
+        and classify_refresh_failure(STATUS_NOT_SENT, "")
+        != classify_refresh_failure(STATUS_INDETERMINATE, ""))
+    chk("an indeterminate RefreshFailure says the grant may already be consumed and was NOT re-sent",
+        "may already be consumed" in str(RefreshFailure(CLASS_REMINT, indeterminate=True))
+        and "NOT re-sent" in str(RefreshFailure(CLASS_REMINT, indeterminate=True))
+        and RefreshFailure(CLASS_REMINT, indeterminate=True).indeterminate is True
+        and RefreshFailure(CLASS_REMINT).indeterminate is False)
+    # The transport-level classification itself, over the exception shapes urllib actually raises.
+    # A refused connection / DNS failure / failed TLS handshake transmitted NOTHING; a timeout or a
+    # reset mid-exchange may have.
+    for error, expected_status, label in (
+            (urllib.error.URLError(ConnectionRefusedError(111, "refused")), STATUS_NOT_SENT,
+             "connection refused"),
+            (urllib.error.URLError(socket.gaierror(-2, "Name or service not known")),
+             STATUS_NOT_SENT, "DNS failure"),
+            (urllib.error.URLError(ssl.SSLCertVerificationError("bad cert")), STATUS_NOT_SENT,
+             "TLS handshake failure"),
+            (ConnectionRefusedError(111, "refused"), STATUS_NOT_SENT, "bare connection refused"),
+            (urllib.error.URLError(TimeoutError("timed out")), STATUS_INDETERMINATE,
+             "connect/read timeout"),
+            (TimeoutError("timed out"), STATUS_INDETERMINATE, "bare read timeout"),
+            (ConnectionResetError(104, "reset by peer"), STATUS_INDETERMINATE,
+             "connection reset mid-exchange"),
+            (BrokenPipeError(32, "broken pipe"), STATUS_INDETERMINATE, "broken pipe"),
+            (ValueError("unknown url type"), STATUS_NOT_SENT, "malformed URL")):
+        saved_urlopen = urllib.request.urlopen
+
+        def raiser(*_args, _error=error, **_kwargs):
+            raise _error
+
+        urllib.request.urlopen = raiser
+        try:
+            got = _post_token_endpoint("https://auth.example/oauth/token", {"grant_type": "x"})
+        finally:
+            urllib.request.urlopen = saved_urlopen
+        chk(f"transport: {label} -> "
+            f"{'NOT_SENT (retryable)' if expected_status == STATUS_NOT_SENT else 'INDETERMINATE'}",
+            got == (expected_status, ""))
     chk("the two new classes are distinct from `auth`",
         CLASS_REMINT != "auth" and CLASS_REFRESH_TRANSIENT != "auth"
         and CLASS_REMINT != CLASS_REFRESH_TRANSIENT)
@@ -659,6 +769,41 @@ def _self_test():
         kind = exc.kind
     chk("a dead grant fails on the FIRST attempt with the remint class",
         (kind, len(calls), sleeps) == (CLASS_REMINT, 1, []))
+    # --- THE #614 IDEMPOTENCY DEFECT, end to end through the real retry loop. A lost response used to
+    # replay the SAME one-time-use grant REFRESH_ATTEMPTS times; the grant must now be TRANSMITTED
+    # EXACTLY ONCE, and the failure must say the account may need a re-mint. ---
+    calls.clear(); sleeps.clear()
+    sent, failure = [], None
+    try:
+        refresh_access_token(
+            "openai", "REFRESH_ONE_TIME_USE",
+            poster=lambda url, payload: (sent.append(payload["refresh_token"]),
+                                         (STATUS_INDETERMINATE, ""))[1],
+            sleeper=lambda attempt: sleeps.append(attempt))
+    except RefreshFailure as exc:
+        failure = exc
+    chk("a LOST RESPONSE transmits the one-time-use grant EXACTLY ONCE (never replayed)",
+        sent == ["REFRESH_ONE_TIME_USE"])
+    chk("a LOST RESPONSE never sleeps for a retry it must not perform", sleeps == [])
+    chk("a LOST RESPONSE raises the remint class, flagged indeterminate",
+        failure is not None and failure.kind == CLASS_REMINT and failure.indeterminate is True)
+    chk("REFRESH_ATTEMPTS > 1, so the exactly-once assertion above is NON-VACUOUS",
+        REFRESH_ATTEMPTS > 1)
+    # ...and the contrast: a genuinely-unsent request (connection refused) IS still retried, so the
+    # fix did not simply disable the bounded retry the transient class exists for.
+    sent.clear(); sleeps.clear()
+    kind = None
+    try:
+        refresh_access_token(
+            "openai", "REFRESH_ONE_TIME_USE",
+            poster=lambda url, payload: (sent.append(payload["refresh_token"]),
+                                         (STATUS_NOT_SENT, ""))[1],
+            sleeper=lambda attempt: sleeps.append(attempt))
+    except RefreshFailure as exc:
+        kind = exc.kind
+    chk("a PROVABLY-unsent request is still retried to the bound (the grant was never spent)",
+        (len(sent), sleeps, kind)
+        == (REFRESH_ATTEMPTS, list(range(1, REFRESH_ATTEMPTS)), CLASS_REFRESH_TRANSIENT))
     calls.clear(); sleeps.clear()
     kind = None
     try:

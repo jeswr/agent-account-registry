@@ -173,6 +173,21 @@ title (GitHub does not enforce unique titles).
   - **`REGISTRY_SECRETS_PAT` must be present** for the account to self-heal indefinitely. Without it
     the write-back warns and skips, the rotated refresh token is lost, and the account needs a
     re-mint the next time its access token expires.
+  - **The write-back is reachable from the pre-flight's FAILURE path.** The exchange consumes the
+    one-time-use grant early inside the credential-prepare step, so the write-back step is keyed to
+    `always()` plus the account selection — never to that step succeeding. Any later failure in
+    prepare (the no-leak assertion, the tamper baseline, the pinned CLI install, the `$GITHUB_ENV`
+    export) would otherwise discard a grant the provider had already rotated, leaving the account
+    permanently unable to authenticate. `worker-prep.sh` writes the durable material, the credential
+    format, and the rotation marker at the moment the rotation happens, so a write-back reached with
+    no mount and no exported environment still knows what to persist and how to validate it;
+    `dispatch-secrets-guard.rotation_writeback_reachable_verdict` asserts that reachability in both
+    worker lanes.
+  - **A lost response never re-sends the grant.** `_post_token_endpoint` distinguishes "provably
+    never transmitted" (DNS failure, connection refused, failed TLS handshake — retried) from "may
+    have been delivered, no response observed" (timeout, reset, broken pipe). The second is classed
+    `credential-remint-required` and raises immediately: re-POSTing a grant the provider may already
+    have consumed trips its replay detection and kills the account, so this fails loudly instead.
 - On this work box, pre-provisioned Anthropic setup-tokens already exist as files
   `~/.claude-acctN-token` (one per account). Read the file; do not echo it.
 
@@ -323,9 +338,15 @@ from the `data/model-health.json` records the worker/review outcome jobs already
 ### Credential-outage exits are not declines (issue #596)
 
 A model launch that dies on the **worker account's credential or capacity** — exit class `auth`,
-`rate-limit`, `session-limit`, or `billing` — is a **credential outage**, not a model decline. The
-model never read the task or the diff, so there is no judgment to charge for. Two consequences,
-both wired through machinery that already existed:
+`rate-limit`, `session-limit`, `billing`, or either of `worker-prep.sh`'s host-side credential
+pre-flight classes `credential-remint-required` / `credential-refresh-transient` — is a **credential
+outage**, not a model decline. The model never read the task or the diff, so there is no judgment to
+charge for. The set is **locked to `model-health.py`'s fold map**, not maintained by hand: a
+set-equality assertion in `worker-pr.py --self-test` requires
+`CREDENTIAL_OUTAGE_EXIT_CLASSES` to equal every raw exit class whose fold target is one of
+model-health's outage decision classes, so a new class can never be non-chargeable on one side only
+(the drift that made the two pre-flight classes chargeable for the whole acct01 outage). Two
+consequences, both wired through machinery that already existed:
 
 - **No round or attempt is consumed.** The review round marker (`worker-pr.py round-record`) and
   the worker attempt receipt (`worker-issue.py record-attempt`) are both written *before* the model

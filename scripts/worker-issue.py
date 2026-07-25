@@ -810,6 +810,20 @@ def _self_test():
     assert simulate_attempts(["success"])[0] == 1
     # DOCUMENTED #596 DECISION: rate-limit is non-chargeable, exactly like auth.
     assert simulate_attempts(["rate-limit"])[0] == 0
+    # #614's HOST-SIDE credential pre-flight classes. This is the task-side half of the #604/#614
+    # allow-list gap the retro-review found: `void-attempt` reads the RAW class, and model-health's
+    # fold onto auth/transient happens LATER in the model_health job — so until the drift lock in
+    # worker-pr.CREDENTIAL_OUTAGE_EXIT_CLASSES these CHARGED an attempt (and, on a final attempt,
+    # parked the issue) for a failure that happened before the model container existed.
+    for preflight_class in ("credential-remint-required", "credential-refresh-transient"):
+        pf_charged, pf_outs, pf_bodies = simulate_attempts([preflight_class])
+        assert pf_charged == 0, (preflight_class, pf_charged)
+        assert pf_outs == ["true"], (preflight_class, pf_outs)
+        assert any(f"exit-class={preflight_class}" in b for b in pf_bodies), pf_bodies
+    # The budget consequence, end to end: three host-side pre-flight failures against
+    # max_attempts=3 leave the attempt budget UNSPENT instead of exhausting it.
+    assert simulate_attempts(["credential-remint-required"] * 3)[0] == 0
+    assert simulate_attempts(["credential-refresh-transient"] * 3)[0] == 0
     # ...but an UNATTRIBUTABLE failure still charges, so the bounded-crash accounting survives.
     assert simulate_attempts(["unknown"])[0] == 1
     assert simulate_attempts(["setup"])[0] == 1
