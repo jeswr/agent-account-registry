@@ -135,11 +135,27 @@ LABELS = {
 
 
 class GroomError(RuntimeError):
-    """A concise fail-closed error which never contains credential or response bodies."""
+    """A concise fail-closed error which never contains credentials or response bodies.
+
+    ONE deliberate exception (issue #644): a BOUNDED, credential-MASKED `gh` diagnostic, produced
+    only by _gh_failure_detail. Three hours of `parked PR redraft failed for sparq-org/sparq#3427`
+    carried no cause at all, so no reader could tell a permission refusal from a GitHub-side
+    restriction. Tool stderr is not a response body — it is the operator's only witness.
+    """
 
 
 class GroomConflict(GroomError):
     """A retryable contents-API compare-and-swap conflict."""
+
+
+class RedraftUnavailable(GroomError):
+    """A parked-PR redraft failure that is NOT a property of the pull request (issue #644).
+
+    A missing `gh` binary, or no App token for the PR's owner, is a property of the RUN: every
+    remaining candidate fails identically, so this must never be reported as one PR's deferral.
+    It still does not abort the sweep — dead-lease reclaim runs — it forces the run's exit status
+    non-zero at the very end (defuse_exit_failure, precedence rule 1).
+    """
 
 
 @dataclass(frozen=True)
@@ -1181,9 +1197,41 @@ def _collect_defuse_prs(
     return candidates
 
 
+# Issue #644 defect 1: `gh` writes its failure cause to stderr and groom CAPTURED then DISCARDED
+# it, so every failing run said only "parked PR redraft failed for <repo>#<n>". Surface the cause,
+# but keep this module's contract (see GroomError): BOUNDED — a runaway body must not flood the
+# operator log — and credential-MASKED, because the target App token is in this subprocess's env
+# and some `gh` failures echo their own invocation back.
+GH_DETAIL_LIMIT = 400
+# Belt-and-braces on top of the exact-token replacement below: any GitHub credential SHAPE is
+# masked, so a token this call does not own (an ambient GH_TOKEN, a nested gh diagnostic) cannot
+# reach the log either.
+_TOKEN_SHAPE = re.compile(r"(?:gh[pousra]|github_pat)_[A-Za-z0-9_]{8,}")
+
+
+def _gh_failure_detail(result: Any, token: str) -> str:
+    """The masked, bounded, single-line cause of a failed `gh` call — never the token itself."""
+    text = " ".join(
+        part.strip()
+        for part in (getattr(result, "stderr", "") or "", getattr(result, "stdout", "") or "")
+        if part.strip()
+    )
+    text = " ".join(text.split())
+    if token:
+        text = text.replace(token, "***")
+    text = _TOKEN_SHAPE.sub("***", text)
+    if not text:
+        return f"gh exited {result.returncode} with no output"
+    if len(text) > GH_DETAIL_LIMIT:
+        text = text[:GH_DETAIL_LIMIT] + "…"
+    return f"gh exited {result.returncode}: {text}"
+
+
 def _redraft_pr(repo: str, number: int, token: str) -> None:
     if not token:
-        raise GroomError(f"target token is unavailable for parked PR {repo}#{number}")
+        raise RedraftUnavailable(
+            f"target token is unavailable for parked PR {repo}#{number}"
+        )
     env = dict(os.environ)
     env["GH_TOKEN"] = token
     try:
@@ -1195,9 +1243,58 @@ def _redraft_pr(repo: str, number: int, token: str) -> None:
             env=env,
         )
     except FileNotFoundError as exc:
-        raise GroomError("gh is unavailable for parked PR defuse") from exc
+        raise RedraftUnavailable("gh is unavailable for parked PR defuse") from exc
     if result.returncode != 0:
-        raise GroomError(f"parked PR redraft failed for {repo}#{number}")
+        raise GroomError(
+            f"parked PR redraft failed for {repo}#{number}: "
+            f"{_gh_failure_detail(result, token)}"
+        )
+
+
+@dataclass(frozen=True)
+class DefuseOutcome:
+    """What one defuse phase did, and whether its failures were per-PR or systemic (issue #644)."""
+
+    changed: int = 0  # PRs converted to draft AND audited
+    attempted: int = 0  # PRs whose redraft was actually attempted (revalidated, still safe-class)
+    deferred: tuple[str, ...] = ()  # per-PR deferrals, "<repo>#<n>: <cause>"
+    unavailable: tuple[str, ...] = ()  # NON-per-PR failures (no gh, no owner token)
+
+
+def defuse_exit_failure(outcome: DefuseOutcome) -> str | None:
+    """The systemic reason the run must exit non-zero, or None to leave its status green.
+
+    PRECEDENCE RULE (issue #644). The sibling defect class here is exit-zero-swallows-failure, so
+    the direction matters: making a failure per-PR must never buy silence.
+
+      1. A NON-per-PR failure DOMINATES. No `gh`, or no App token for the owner, is a property of
+         the run, not of the PR, so the status goes non-zero even if every other candidate
+         redrafted fine.
+      2. Otherwise, if candidates WERE attempted and NONE completed, the per-PR reading is no
+         longer credible — a whole-phase failure is systemic in effect — so the status goes
+         non-zero and names every deferral.
+      3. Otherwise a deferral ALONGSIDE at least one completed defuse is exactly what it claims to
+         be: one PR's problem, ALERT-logged and retried next sweep. The status stays green.
+      4. In every case this is decided AFTER the sweep has done its work. The exit status is the
+         REPORT, never the control flow — that inversion is the #644 defect itself, where one
+         un-redraftable PR raised past dead-lease reclaim, stuck-issue repair and the stale-PR
+         hand-off. Callers therefore evaluate this last, after _release_claims.
+
+    Deferrals from the PRE-redraft revalidation (an unreadable merge latch) are deliberately NOT
+    counted: those are reads that already fail closed per PR by design and predate this issue, so
+    counting them would change an unrelated path's status semantics.
+    """
+    if outcome.unavailable:
+        return (
+            "parked PR defuse is unavailable for the whole run: "
+            + "; ".join(outcome.unavailable)
+        )
+    if outcome.attempted and not outcome.changed:
+        return (
+            f"every parked PR defuse failed ({outcome.attempted} attempted, 0 completed): "
+            + "; ".join(outcome.deferred)
+        )
+    return None
 
 
 def _execute_defuse_actions(
@@ -1206,9 +1303,21 @@ def _execute_defuse_actions(
     tokens: dict[str, str],
     now: int,
     stale_seconds: int,
-) -> int:
-    """Revalidate and redraft bounded safe-class actions, then write one audit comment."""
+) -> DefuseOutcome:
+    """Revalidate and redraft bounded safe-class actions, then write one audit comment.
+
+    EVERY per-PR failure mode degrades to "defuse deferred" for THAT PR and continues — including
+    the redraft and its audit comment (issue #644). Candidates are processed lowest-number-first,
+    so an un-redraftable one used to be a PERMANENT head-of-line block: its uncaught GroomError
+    raised past dead-lease reclaim, stuck-issue repair and the stale-PR hand-off, and groom failed
+    on every run for hours. A PR that cannot be converted to draft is not a reason to stop
+    reclaiming dead leases. The failures are RECORDED, not swallowed: defuse_exit_failure decides
+    the run's exit status from this outcome once the sweep has finished.
+    """
     changed = 0
+    attempted = 0
+    deferred: list[str] = []
+    unavailable: list[str] = []
     for action in actions:
         if action.mode != "defuse":
             continue
@@ -1238,7 +1347,7 @@ def _execute_defuse_actions(
             )
             continue
         owner = action.repo.split("/", 1)[0]
-        _redraft_pr(action.repo, action.number, tokens.get(owner, ""))
+        attempted += 1
         body = (
             "> 🤖 SPARQ agent\n\n"
             f"This pull request remained ready-for-review while terminally parked and had no "
@@ -1247,14 +1356,35 @@ def _execute_defuse_actions(
             "Marking it ready for review resumes it.\n\n"
             f"{DEFUSE_PR_MARKER}"
         )
-        api.request(
-            "POST",
-            f"/repos/{action.repo}/issues/{action.number}/comments",
-            {"body": body},
-        )
+        # The mutation pair sits INSIDE the same per-PR resilience block as the revalidation above
+        # (issue #644 defect 2). RedraftUnavailable is caught FIRST — it is a subclass, and it is
+        # the not-a-property-of-this-PR case, so it is recorded separately and reds the run.
+        try:
+            _redraft_pr(action.repo, action.number, tokens.get(owner, ""))
+            api.request(
+                "POST",
+                f"/repos/{action.repo}/issues/{action.number}/comments",
+                {"body": body},
+            )
+        except RedraftUnavailable as exc:
+            print(
+                f"ALERT PR {action.repo}#{action.number}: {exc} — defuse deferred "
+                "(not a property of this PR; this run fails after the sweep completes)"
+            )
+            unavailable.append(f"{action.repo}#{action.number}: {exc}")
+            continue
+        except GroomError as exc:
+            print(f"ALERT PR {action.repo}#{action.number}: {exc} — defuse deferred")
+            deferred.append(f"{action.repo}#{action.number}: {exc}")
+            continue
         print(f"WRITE defuse parked PR repo={action.repo} pr={action.number}")
         changed += 1
-    return changed
+    return DefuseOutcome(
+        changed=changed,
+        attempted=attempted,
+        deferred=tuple(deferred),
+        unavailable=tuple(unavailable),
+    )
 
 
 # A single newest-100 worker-run page is NOT enough to correlate every live lease (issue #173):
@@ -1990,7 +2120,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         elif changed:
             deferred += 1
 
-    defused_count = _execute_defuse_actions(
+    defuse_outcome = _execute_defuse_actions(
         pull_actions, groomable, target_tokens, now, defuse_stale_seconds
     )
 
@@ -2096,8 +2226,16 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     reclaimed = _release_claims(registry_api, registry_repo, dead_claims)
     print(
         f"SUMMARY reclaimed={reclaimed} reset={reset} deferred={deferred} "
-        f"stale_prs={stale_count} defused_prs={defused_count}"
+        f"stale_prs={stale_count} defused_prs={defuse_outcome.changed} "
+        f"defuse_deferred={len(defuse_outcome.deferred) + len(defuse_outcome.unavailable)}"
     )
+    # Issue #644 precedence rule 4: the sweep's WORK — dead-lease reclaim above included — always
+    # completes first, and a systemic defuse failure is reported by the exit status HERE, at the
+    # end. A single un-redraftable PR alongside a completed defuse stays a per-PR ALERT (rule 3)
+    # and leaves this green; it does not, and must not, buy silence for a whole-phase failure.
+    systemic_defuse_failure = defuse_exit_failure(defuse_outcome)
+    if systemic_defuse_failure is not None:
+        raise GroomError(systemic_defuse_failure)
     return reclaimed, reset, deferred, stale_count
 
 
@@ -2502,9 +2640,15 @@ def _self_test() -> int:
         subprocess.run = real_subprocess_run
     check(
         "#548 tripwire (a): stale needs:user non-draft PR is redrafted with its target token",
-        (defused, defuse_commands),
+        (defused.changed, defuse_commands),
         (1, [(["gh", "pr", "ready", "1", "-R", "owner/repo", "--undo"],
               "owner-target-token")]),
+    )
+    check(
+        "#644: an all-clean defuse phase is attempted, completed, and leaves the run green",
+        (defused.attempted, defused.deferred, defused.unavailable,
+         defuse_exit_failure(defused)),
+        (1, (), (), None),
     )
     check(
         "#548 tripwire (a): defuse writes one loud audit comment with resume instructions",
@@ -2530,6 +2674,248 @@ def _self_test() -> int:
         "#548 tripwire (f): auto-defuses are bounded to ten per sweep",
         (MAX_AUTO_DEFUSES_PER_TICK, len(bound_actions)),
         (10, 10),
+    )
+
+    # ---- issue #644: an un-redraftable PR must not abort the sweep, and must say WHY ------------
+    # Live incident: sparq-org/sparq#3427 (open, non-draft, needs:user, quiet since 01:41:36Z)
+    # became a defuse candidate at 07:41:36Z, and groom then failed on EVERY run — the redraft's
+    # GroomError was raised from OUTSIDE the per-PR resilience block, and because candidates are
+    # processed lowest-number-first it was a permanent head-of-line block: nothing after the defuse
+    # phase ran, dead-lease reclaim included. The failure also discarded `gh`'s stderr, so three
+    # hours of identical failures carried zero cause. This fixture drives BOTH defects from the
+    # LIVE functions (no fixture text is mutated to make them red).
+    redraft_stderr = (
+        "GraphQL: refusing to allow a GitHub App to create or update workflow "
+        "`.github/workflows/codeql.yml` without `workflows` permission (convertPullRequestToDraft)"
+    )
+
+    class _RedraftAPI:
+        """A defuse-phase API whose latch reads always succeed, so only the redraft can fail."""
+
+        def __init__(self):
+            self.comments: list[str] = []
+            self.pulls = {21: _defuse_pull(21), 22: _defuse_pull(22)}
+            self.comment_failures: set[int] = set()
+
+        def request(self, method, path, body=None, allow_404=False, **_kwargs):
+            if method == "GET":
+                return self.pulls.get(int(path.rsplit("/", 1)[1]))
+            if path == "/graphql":
+                return {"data": {"repository": {"pullRequest": {
+                    "mergeQueueEntry": None, "autoMergeRequest": None}}}}
+            number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
+            if number in self.comment_failures:
+                raise GroomError("issue comment write failed")
+            self.comments.append(path)
+            return {}
+
+    def _redraft_actions(api: _RedraftAPI) -> list[PullAction]:
+        return [
+            PullAction(
+                repo="owner/repo",
+                number=number,
+                reason="terminally parked and quiet",
+                mode="defuse",
+                head_sha=api.pulls[number]["head"]["sha"],
+                updated_at=api.pulls[number]["updated_at"],
+            )
+            for number in sorted(api.pulls)
+        ]
+
+    def _run_defuse(
+        api: _RedraftAPI,
+        failing: set[int],
+        tokens: dict[str, str] | None = None,
+        stderr: str = redraft_stderr,
+        gh_missing: bool = False,
+    ) -> tuple[DefuseOutcome | None, bool, list[int]]:
+        """Run the real defuse phase against `api`; report whether it ABORTED (the #644 defect)."""
+        drafted: list[int] = []
+
+        class _Result:
+            def __init__(self, number):
+                self.returncode = 1 if number in failing else 0
+                self.stdout = ""
+                self.stderr = stderr if number in failing else ""
+
+        def _fake_run(args, **_kwargs):
+            if gh_missing:
+                raise FileNotFoundError("gh")
+            number = int(args[3])
+            if number not in failing:
+                drafted.append(number)
+            return _Result(number)
+
+        real_run = subprocess.run
+        subprocess.run = _fake_run
+        try:
+            return _execute_defuse_actions(
+                _redraft_actions(api),
+                {"owner/repo": api},
+                {"owner": "owner-target-token"} if tokens is None else tokens,
+                defuse_now,
+                defuse_stale_seconds,
+            ), False, drafted
+        except GroomError:
+            # Reached ONLY if a per-PR failure escapes the block — i.e. the defect is back.
+            return None, True, drafted
+        finally:
+            subprocess.run = real_run
+
+    # (1) THE DEFECT: the LOWEST-numbered candidate cannot be redrafted. The sweep must process the
+    # remaining candidate anyway. Moving the _redraft_pr call back outside the per-PR
+    # `except GroomError -> defuse deferred -> continue` block reds this check.
+    head_of_line_api = _RedraftAPI()
+    head_of_line, aborted, drafted = _run_defuse(head_of_line_api, failing={21})
+    check(
+        "#644: an un-redraftable LOWEST-numbered PR must NOT abort the defuse phase (the "
+        "_redraft_pr call must sit INSIDE the per-PR `except GroomError -> deferred -> continue`)",
+        aborted,
+        False,
+    )
+    check(
+        "#644: the later candidate is still redrafted and audited after the head-of-line failure",
+        (drafted, head_of_line_api.comments, head_of_line.changed if head_of_line else -1),
+        ([22], ["/repos/owner/repo/issues/22/comments"], 1),
+    )
+    check(
+        "#644: the FAILED candidate gets no audit comment and is recorded as one deferral",
+        (
+            "/repos/owner/repo/issues/21/comments" in head_of_line_api.comments
+            if head_of_line else True,
+            len(head_of_line.deferred) if head_of_line else -1,
+            head_of_line.deferred[0].startswith("owner/repo#21: ") if head_of_line else False,
+        ),
+        (False, 1, True),
+    )
+    # (2) THE DISCARDED CAUSE: `gh`'s stderr must reach the reported error, verbatim enough to
+    # identify the refusal. Dropping _gh_failure_detail (or its result.stderr read) reds this.
+    check(
+        "#644: a redraft failure REPORTS gh's stderr (the discarded-cause defect: 'workflows "
+        "permission' must be visible in the deferral, not just 'redraft failed')",
+        (
+            "without `workflows` permission" in head_of_line.deferred[0]
+            if head_of_line and head_of_line.deferred else False,
+            "gh exited 1" in head_of_line.deferred[0]
+            if head_of_line and head_of_line.deferred else False,
+        ),
+        (True, True),
+    )
+    masked_api = _RedraftAPI()
+    masked, _aborted, _drafted = _run_defuse(
+        masked_api,
+        failing={21},
+        stderr="gh: authentication failed for token owner-target-token (ghs_abcdefgh12345678)",
+    )
+    check(
+        "#644: the reported gh stderr is credential-MASKED (neither the target token nor any "
+        "token-shaped string may reach the operator log)",
+        (
+            "owner-target-token" in masked.deferred[0] if masked and masked.deferred else True,
+            "ghs_abcdefgh12345678" in masked.deferred[0] if masked and masked.deferred else True,
+            masked.deferred[0].count("***") if masked and masked.deferred else -1,
+        ),
+        (False, False, 2),
+    )
+    check(
+        "#644: an empty gh stderr still reports the exit code rather than nothing",
+        _gh_failure_detail(
+            type("_R", (), {"returncode": 3, "stdout": "", "stderr": ""})(), ""
+        ),
+        "gh exited 3 with no output",
+    )
+    bounded = _gh_failure_detail(
+        type("_R", (), {"returncode": 1, "stdout": "", "stderr": "x" * 5000})(), ""
+    )
+    check(
+        "#644: the reported gh output is bounded (a runaway body must not flood the log)",
+        (len(bounded) <= GH_DETAIL_LIMIT + 40, bounded.endswith("…")),
+        (True, True),
+    )
+    # (3) EXIT-STATUS DISCRIMINATION, both directions. This is the exit-zero-swallows-failure
+    # guard: per-PR deferral must not make a whole-phase failure silently green.
+    check(
+        "#644 precedence rule 3: ONE deferred candidate alongside a completed defuse leaves the "
+        "run GREEN (a single un-redraftable PR only defers itself)",
+        defuse_exit_failure(head_of_line) if head_of_line else "aborted",
+        None,
+    )
+    all_failed_api = _RedraftAPI()
+    all_failed, _aborted, all_drafted = _run_defuse(all_failed_api, failing={21, 22})
+    all_failed_reason = defuse_exit_failure(all_failed) if all_failed else None
+    check(
+        "#644 precedence rule 2: EVERY candidate failing is systemic — the run exits NON-zero and "
+        "names the deferrals, never a silent green",
+        (
+            all_drafted,
+            all_failed.changed if all_failed else -1,
+            all_failed.attempted if all_failed else -1,
+            all_failed_reason is not None,
+            "every parked PR defuse failed (2 attempted, 0 completed)" in (all_failed_reason or ""),
+            "owner/repo#21" in (all_failed_reason or "")
+            and "owner/repo#22" in (all_failed_reason or ""),
+        ),
+        ([], 0, 2, True, True, True),
+    )
+    no_token_api = _RedraftAPI()
+    no_token, _aborted, _no_token_drafted = _run_defuse(no_token_api, failing=set(), tokens={})
+    no_token_reason = defuse_exit_failure(no_token) if no_token else None
+    check(
+        "#644 precedence rule 1: a NON-per-PR failure (no owner token) is systemic even though it "
+        "was raised per PR — and it never aborts the phase",
+        (
+            len(no_token.unavailable) if no_token else -1,
+            no_token.deferred if no_token else "aborted",
+            no_token_reason is not None,
+            "unavailable for the whole run" in (no_token_reason or ""),
+        ),
+        (2, (), True, True),
+    )
+    gh_missing_api = _RedraftAPI()
+    gh_missing, _aborted, _gh_drafted = _run_defuse(
+        gh_missing_api, failing=set(), gh_missing=True
+    )
+    check(
+        "#644 precedence rule 1: a missing `gh` binary is systemic, not one PR's deferral",
+        (
+            len(gh_missing.unavailable) if gh_missing else -1,
+            defuse_exit_failure(gh_missing) is not None if gh_missing else False,
+        ),
+        (2, True),
+    )
+    # Rule 1 DOMINATES rule 3: one owner unavailable must red the run even when another candidate
+    # completed. (Both candidates share an owner here, so force the split with a mixed outcome.)
+    mixed = DefuseOutcome(
+        changed=1, attempted=2, deferred=(), unavailable=("owner/repo#21: no token",)
+    )
+    check(
+        "#644 precedence rule 1 DOMINATES rule 3: a completed defuse does not excuse a non-per-PR "
+        "failure",
+        defuse_exit_failure(mixed) is not None,
+        True,
+    )
+    # A failed AUDIT COMMENT is also per-PR (same head-of-line shape), and because the phase then
+    # completed nothing, rule 2 keeps the run loud rather than silently green.
+    audit_api = _RedraftAPI()
+    audit_api.comment_failures = {21, 22}
+    audit, audit_aborted, audit_drafted = _run_defuse(audit_api, failing=set())
+    check(
+        "#644: a failed audit comment defers that PR instead of aborting the sweep, and an "
+        "all-failed phase still exits non-zero",
+        (
+            audit_aborted,
+            audit_drafted,
+            audit.changed if audit else -1,
+            len(audit.deferred) if audit else -1,
+            defuse_exit_failure(audit) is not None if audit else False,
+        ),
+        (False, [21, 22], 0, 2, True),
+    )
+    check(
+        "#644: a phase with NO attempted candidate is green (an unreadable latch already defers "
+        "per PR by design; that unrelated path's status semantics are unchanged)",
+        defuse_exit_failure(DefuseOutcome()),
+        None,
     )
 
     # [FABLE-5] Deadlock regression (live PRs #3472/#3470): a stale DRAFT worker PR with a VALID
@@ -3806,6 +4192,11 @@ def _self_test() -> int:
                 return terminal_sweep_env["fresh_issues"].get(number)
             if method == "GET":
                 return terminal_sweep_env.get("gets", {}).get(path)
+            if path == "/graphql":
+                # Both live merge latches absent, so a defuse candidate stays safe-class and the
+                # ONLY thing that can fail in the phase is the redraft itself (issue #644).
+                return {"data": {"repository": {"pullRequest": {
+                    "mergeQueueEntry": None, "autoMergeRequest": None}}}}
             terminal_sweep_env["writes"].append((method, path))
             return {}
 
@@ -3813,7 +4204,7 @@ def _self_test() -> int:
             if path == "/repos/owner/repo/issues?state=open":
                 return terminal_sweep_env["planned_issues"]
             if path == "/repos/owner/repo/pulls?state=open":
-                return []
+                return terminal_sweep_env.get("pulls", [])
             return []
 
     terminal_sweep_releases: list[set[str]] = []
@@ -3909,6 +4300,93 @@ def _self_test() -> int:
             f"reap cap reached — 5 deferred" in cap_log.getvalue(),
             True,
         )
+
+        # ---- issue #644 END-TO-END: the sweep must SURVIVE an un-redraftable parked PR ----------
+        # The live failure: an uncaught redraft GroomError raised out of run_sweep BEFORE
+        # _release_claims, so groom leaked leases on every run for hours while reporting only
+        # "parked PR redraft failed for sparq-org/sparq#3427". Here the ONLY defuse candidate
+        # cannot be redrafted AND a dead lease is waiting. Reclaim must still happen, the cause
+        # must be in the log, and — because NO candidate completed — the run must still end
+        # non-zero (precedence rule 2), not silently green.
+        terminal_sweep_leases[:] = [{
+            **base,
+            "claim_id": "f" * 32,
+            "holder": "owner/repo#7@777.1",
+            "issued_at": 1,
+            "expires_at": 2,
+        }]
+        stuck_pr = {
+            "number": 21,
+            "state": "open",
+            "draft": False,
+            "labels": [{"name": "needs:user"}],
+            "updated_at": datetime.fromtimestamp(
+                now - DEFAULT_STALE_HOURS * 3600 - 600, timezone.utc
+            ).isoformat(),
+            "head": {"sha": "c" * 40, "ref": "ci/codeql-nonblocking-retroactive"},
+            "user": {"login": "jeswr"},
+            "body": "a human PR touching .github/workflows/**",
+            "auto_merge": None,
+        }
+        terminal_sweep_env.update(
+            planned_issues=[],
+            fresh_issues={},
+            pulls=[stuck_pr],
+            gets={"/repos/owner/repo/pulls/21": stuck_pr},
+            writes=[],
+        )
+        terminal_sweep_releases.clear()
+
+        class _StuckRedraft:
+            returncode = 1
+            stdout = ""
+            stderr = (
+                "GraphQL: refusing to allow a GitHub App to create or update workflow "
+                "`.github/workflows/codeql.yml` without `workflows` permission"
+            )
+
+        stuck_log = io.StringIO()
+        saved_stdout = sys.stdout
+        real_run = subprocess.run
+        subprocess.run = lambda *_a, **_k: _StuckRedraft()
+        sys.stdout = stuck_log
+        stuck_error = ""
+        try:
+            _stuck_summary = _terminal_sweep()
+        except GroomError as exc:
+            stuck_error = str(exc)
+        finally:
+            sys.stdout = saved_stdout
+            subprocess.run = real_run
+        stuck_output = stuck_log.getvalue()
+        check(
+            "MUTATION #644: dead-lease reclaim STILL RUNS when the only parked PR cannot be "
+            "redrafted (move _redraft_pr back outside the per-PR except block and run_sweep "
+            "raises before _release_claims, leaking the lease)",
+            terminal_sweep_releases,
+            [{"f" * 32}],
+        )
+        check(
+            "#644: the sweep reaches its SUMMARY and reports the deferral instead of aborting",
+            (
+                "ALERT PR owner/repo#21:" in stuck_output,
+                "defuse deferred" in stuck_output,
+                "SUMMARY reclaimed=1" in stuck_output,
+                "defused_prs=0 defuse_deferred=1" in stuck_output,
+            ),
+            (True, True, True, True),
+        )
+        check(
+            "#644: the un-redraftable PR's gh stderr reaches the log, and the run still exits "
+            "NON-zero naming the whole-phase failure (no exit-zero swallowing)",
+            (
+                "without `workflows` permission" in stuck_output,
+                "every parked PR defuse failed (1 attempted, 0 completed)" in stuck_error,
+                "owner/repo#21" in stuck_error,
+            ),
+            (True, True, True),
+        )
+        terminal_sweep_env.update(pulls=[], gets={})
     finally:
         globals().update(terminal_sweep_saved)
 
