@@ -7,6 +7,7 @@ dispatch-claim.py
 dispatch-plan.py
 dispatch-secrets-guard.py
 gh_retry.py
+grant-account.py
 groom-alert.py
 groom.py
 ledger-invariant.py
