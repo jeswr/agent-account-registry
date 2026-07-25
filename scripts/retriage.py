@@ -211,9 +211,15 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING, rotation=0):
 
     So the window now rotates: the board is ordered by ISSUE NUMBER — immutable, so the ordering is
     stable across runs and the windows really do partition it — and the start offset advances by
-    `cap` per `rotation` (the workflow passes its run number). Every issue is therefore visited
-    within ceil(total/cap) runs with NO persistent cursor state to keep. Within the run the board is
-    handed over oldest-updated first, which is a fairness ORDER only, never a decision input.
+    `cap` per `rotation` (the workflow passes its run number), with NO persistent cursor state to
+    keep. Within the run the board is handed over oldest-updated first, which is a fairness ORDER
+    only, never a decision input.
+
+    WHAT THE ROTATION DOES AND DOES NOT GUARANTEE (#605 review round 2). For a board of UNCHANGED
+    MEMBERSHIP every issue is visited within ceil(total/cap) runs. Issue numbers are immutable, but
+    board membership is not: closing, reopening or relabelling a LOWER-numbered issue between runs
+    shifts every later offset, so an untouched issue can be revisited later than that bound — the
+    guarantee is progress and no permanent head-of-line starvation, not a hard per-issue deadline.
     """
     if not isinstance(pages, list):
         raise SweepError("snapshot payload is not a list of pages")
@@ -248,8 +254,14 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING, rotation=0):
                 raise SweepError(f"issue #{number} carries a malformed label")
             names.append({"name": name})
         issues.append({"number": number,
-                       "author": {"login": login if isinstance(login, str) else ""},
+                       # TRANSPORT ONLY, and deliberately tolerant: a missing body normalizes to
+                       # "" rather than raising. That is honest now (#605 review round 2) BECAUSE
+                       # `_apply_cli` re-reads the body LIVE before it decides anything — the
+                       # snapshot's copy is never a decision input, so this tolerance cannot become
+                       # a fail-open hold bypass. The "every malformed snapshot fails closed" claim
+                       # is scoped to what IS a decision input: pages, entries, numbers, labels.
                        "body": item.get("body") or "",
+                       "author": {"login": login if isinstance(login, str) else ""},
                        "labels": names,
                        "updatedAt": str(item.get("updated_at") or "")})
     # Stable ordering for the partition: the issue NUMBER never changes, so consecutive rotations
@@ -285,17 +297,94 @@ def apply_decision(current, decision, edit, view, read_state=None, warn=None):
     return static_triage.apply_triage(current, result, edit, view, warn, read_state=read_state)
 
 
+def workflow_step_script(text, step_id):
+    """The EXECUTABLE `run:` script of the ONE workflow step whose `id:` is `step_id`, dedented.
+
+    #605 review round 2, finding 2: the sweep's pagination ceiling, completeness proof, page-shape
+    guard and truncation break are all SHELL guards, and the assertions on them were whole-file
+    substring searches — `"--paginate" not in executable`, `re.search(r"exit\\s+1", executable)`,
+    `-lt 100`. None of those protect the behaviour they name: another `exit 1` later in the file
+    satisfies the ceiling check, `if false` satisfies it too, and `got=0` keeps the `-lt 100`
+    substring while stopping after page 1 and applying a TRUNCATED board. `bash -n` and actionlint
+    cannot see any of it. So the body is extracted and RUN. Raises SweepError when it cannot resolve
+    its target or the recovered script is empty — an assertion that cannot find its step must fail,
+    never pass vacuously."""
+    lines = text.split("\n")
+    marks = [index for index, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
+    if len(marks) != 1:
+        raise SweepError(f"expected exactly one workflow step with `id: {step_id}`, "
+                         f"found {len(marks)} — refusing to assert vacuously")
+    starts = [index for index in range(marks[0], -1, -1) if lines[index].lstrip().startswith("- ")]
+    if not starts:
+        raise SweepError(f"step `id: {step_id}` has no enclosing `- ` sequence entry")
+    indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+    end = len(lines)
+    for index in range(starts[0] + 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        here = len(line) - len(line.lstrip())
+        if here < indent or (here == indent and line.lstrip().startswith("- ")):
+            end = index
+            break
+    block = lines[starts[0]:end]
+    heads = [index for index, line in enumerate(block) if line.strip() in {"run: |", "run: |-"}]
+    if len(heads) != 1:
+        raise SweepError(f"step `id: {step_id}` has {len(heads)} block `run:` scripts, expected 1")
+    head = heads[0]
+    script_indent = len(block[head]) - len(block[head].lstrip())
+    body = []
+    for line in block[head + 1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= script_indent:
+            break
+        body.append(line[script_indent + 2:] if line.strip() else "")
+    script = "\n".join(body)
+    if not script.strip():
+        raise SweepError(f"step `id: {step_id}` extracted to an empty `run:` script")
+    return script
+
+
+def read_live_body(repo, number):
+    """The issue's LIVE body text, through the shared bounded-retry READ layer.
+
+    #605 review round 2 (a fail-OPEN race): `_apply_cli` refreshed only `labels` from the live
+    read, while the `body` that decides the `<!-- orchestration:hold -->` park still came from the
+    board snapshot taken BEFORE pagination. A hold added between the list read and the apply was
+    therefore ignored and the issue could still be promoted or repaired — on a deliberately
+    load-bearing park policy, and against a docstring claiming planning happened against the live
+    read. An unreadable issue RAISES: the caller must fail closed, never silently fall back to the
+    stale snapshot value (that fallback IS the defect).
+
+    A module-level function on purpose — the self-test substitutes it to drive the live-vs-snapshot
+    divergence through the REAL entrypoint."""
+    document = json.loads(static_triage._gh_read(          # noqa: SLF001 — the one shared read layer
+        ["issue", "view", str(number), "-R", repo, "--json", "body"]))
+    body = document.get("body")
+    return body if isinstance(body, str) else ""
+
+
 def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_labels):
-    """`--apply`: re-read the LIVE labels, plan against them, and mutate fail-closed.
+    """`--apply`: re-read the LIVE labels AND the LIVE body, plan against them, mutate fail-closed.
 
     Planning against the live read (not the possibly-stale board snapshot the sweep passed on
     stdin) means a gate added since the list read — needs:design, trust:untrusted, a concurrent
-    promotion — is honoured. Reads go through gh_retry; the mutation is single-attempt + fail-loud.
+    promotion, an `<!-- orchestration:hold -->` marker added to the BODY — is honoured. Reads go
+    through gh_retry; the mutation is single-attempt + fail-loud. Nothing from the stdin snapshot
+    reaches a decision: the snapshot supplies only the author/number the shell already read.
     """
     read_state, view, edit, warn = static_triage.live_gh(repo, number, title="retriage")
     live, _revision = read_state()
     fresh = dict(issue)
     fresh["labels"] = sorted(live)
+    # The hold marker lives in the BODY, so the body is refreshed too or the hold is checked
+    # against pre-pagination state (#605 review round 2). Fail CLOSED on an unreadable body: a
+    # park we cannot verify must stop the write, not be assumed absent.
+    try:
+        fresh["body"] = read_live_body(repo, number)
+    except (RuntimeError, ValueError, OSError) as exc:
+        print(f"::error title=retriage #{number}::cannot read the live issue body, so the "
+              f"orchestration hold cannot be honoured — refusing to act (fail closed): {exc}")
+        return 1
     known = list(known_labels) if known_labels else static_triage.repo_label_set(repo)
     decision = plan(fresh, maintainer, app_bot, permission, known_labels=known)
     print(json.dumps(decision, sort_keys=True))
@@ -718,21 +807,32 @@ def _self_test():
     apply_argv = next((argv for argv in argvs if "--apply" in argv), [])
     stale = {"author": {"login": "owner"}, "body": "", "labels": [{"name": "stale:snapshot"}]}
 
-    def run_apply_argv(gh, stdin_doc=None):
-        """Drive main(apply_argv) end-to-end against a fake GitHub. Returns (exit code, spied)."""
+    def run_apply_argv(gh, stdin_doc=None, live_body="", body_error=None):
+        """Drive main(apply_argv) end-to-end against a fake GitHub. Returns (exit code, spied).
+
+        `live_body` is what the LIVE issue body read returns — distinct from the stdin snapshot's
+        body, which is how the #605 round-2 fail-open hold race is exercised. `body_error` makes
+        that read fail, which must stop the write."""
         seen = {}
         saved_plan = globals()["plan"]
+        saved_body = globals()["read_live_body"]
         saved_live_gh, saved_labels = static_triage.live_gh, static_triage.repo_label_set
         saved_stdin, saved_stdout = sys.stdin, sys.stdout
 
         def spy_plan(issue_doc, maintainer, app_bot, permission,
                      classify=static_triage.triage, known_labels=None):
             seen.update(known_labels=known_labels, maintainer=maintainer, permission=permission,
-                        labels=list(issue_doc.get("labels", ())))
+                        labels=list(issue_doc.get("labels", ())), body=issue_doc.get("body"))
             return saved_plan(issue_doc, maintainer, app_bot, permission, classify, known_labels)
+
+        def fake_body(repo, number):
+            if body_error is not None:
+                raise RuntimeError(body_error)
+            return live_body
 
         try:
             globals()["plan"] = spy_plan
+            globals()["read_live_body"] = fake_body
             static_triage.live_gh = lambda repo, number, title="triage": (
                 gh.read_state, gh.view, gh.edit, lambda _message: None)
             static_triage.repo_label_set = lambda repo: (_ for _ in ()).throw(
@@ -745,6 +845,7 @@ def _self_test():
                 code = exc.code
         finally:
             globals()["plan"] = saved_plan
+            globals()["read_live_body"] = saved_body
             static_triage.live_gh, static_triage.repo_label_set = saved_live_gh, saved_labels
             sys.stdin, sys.stdout = saved_stdin, saved_stdout
         return code, seen
@@ -811,6 +912,43 @@ def _self_test():
                     roles_of(gh.labels)) == (False, False, True, set())))
 
     # -------------------------------------------------------------------------------------------
+    # [#605 review ROUND 2, finding 1(ii)] THE REPAIR LANE, THROUGH THE REAL ENTRYPOINT. Every
+    # repair check above calls plan()/apply_decision() DIRECTLY — so removing `"repair"` from
+    # WRITING_ACTIONS made `_apply_cli` `return 0` WITHOUT WRITING and the entire suite stayed
+    # green, silently stranding exactly the role-less `status:ready` issues #586 exists to rescue.
+    # (The comment above claimed "the two remaining lanes are driven through the REAL entrypoint";
+    # only repark was. It is true as of this check.)
+    repaired = FakeGh({"status:ready", "priority:P2", "area:dispatch"}, known)
+    code, _seen = run_apply_argv(repaired)
+    checks.append(("[#605 r2 f1] the workflow-shaped ARGV REPAIRS a role-less status:ready issue",
+                   (code, roles_of(repaired.labels), "status:ready" in repaired.labels,
+                    repaired.calls[:1]) == (0, {"role:impl"}, True, [(["role:impl"], [])])))
+
+    # [#605 review ROUND 2, finding 3] THE ORCHESTRATION HOLD IS READ LIVE, NOT FROM THE SNAPSHOT.
+    # `_apply_cli` refreshed only `labels`; the `body` that decides the hold still came from the
+    # board snapshot taken BEFORE pagination, so a `<!-- orchestration:hold -->` added between the
+    # list read and the apply was ignored and the issue was promoted or repaired anyway — a
+    # fail-OPEN race on a deliberately load-bearing park, against a docstring claiming the opposite.
+    # The `--apply` fixture pinned the permissive shape (`"body": ""`), so nothing exercised it.
+    # Three rows, because only the SET pins the source of the body rather than its value.
+    held = FakeGh(start, known)
+    code, seen = run_apply_argv(held, live_body=f"prose\n{HOLD_MARKER}\n")
+    checks.append(("[#605 r2 f3] a hold added AFTER the board snapshot stops the write (no mutation)",
+                   (code, held.calls, held.labels == set(start), seen.get("body"))
+                   == (0, [], True, f"prose\n{HOLD_MARKER}\n")))
+    lifted = FakeGh(start, known)
+    code, _seen = run_apply_argv(
+        lifted, stdin_doc={"author": {"login": "owner"}, "body": f"stale\n{HOLD_MARKER}\n",
+                           "labels": [{"name": "stale:snapshot"}]}, live_body="")
+    checks.append(("[#605 r2 f3] ...and a hold LIFTED since the snapshot no longer blocks the write",
+                   (code, roles_of(lifted.labels), "status:ready" in lifted.labels)
+                   == (0, {"role:impl"}, True)))
+    unreadable = FakeGh(start, known)
+    code, _seen = run_apply_argv(unreadable, body_error="gh issue view failed: HTTP 503")
+    checks.append(("[#605 r2 f3] an UNREADABLE live body REFUSES to act; it never assumes 'no hold'",
+                   (code, unreadable.calls, unreadable.labels == set(start)) == (1, [], True)))
+
+    # -------------------------------------------------------------------------------------------
     # [PR #595 findings 3 + 6] STATIC WORKFLOW CONTRACT. The sweep must mutate ONLY through the
     # fail-closed applier, route every READ through the shared bounded-retry layer (gh_retry —
     # mutations stay single-attempt/fail-loud per its hard scope rule), and never short-circuit out
@@ -848,6 +986,12 @@ def _self_test():
     # [#605 review finding 2] the fetch itself must be bounded, and must PROVE it read the whole
     # board: `--paginate --slurp` pulled every page before any ceiling applied, and a board missing
     # its last page was indistinguishable from a short one.
+    #
+    # THESE THREE ARE STATIC SHAPE CHECKS ONLY, and #605 review round 2 was right that on their own
+    # they are vacuous: another `exit 1` later in the file satisfies the ceiling check, `if false`
+    # or an enormous `max_pages` satisfies it too, and `got=0` keeps the `-lt 100` substring while
+    # truncating the board after page 1. They are kept as cheap drift detection; the guards they
+    # NAME are covered by the EXECUTED step body further down ("[#605 r2 f2] ...").
     checks.append(("[#605 f2] the board fetch is page-bounded — no unbounded --paginate remains",
                    "--paginate" not in executable and "max_pages=" in executable))
     checks.append(("[#605 f2] a board too large for that ceiling fails the step CLOSED",
@@ -865,6 +1009,158 @@ def _self_test():
     checks.append(("[#605 f1] the capped window ROTATES per run (never a fixed head)",
                    "--rotation" in snapshot_argv
                    and "GITHUB_RUN_NUMBER" in executable))
+
+    # -------------------------------------------------------------------------------------------
+    # [#605 review ROUND 2, finding 1(i)] --rotation IS FORWARDED — proved through main().
+    # Deleting `rotation=args.rotation` from main()'s snapshot() call left every direct rotation
+    # check AND every workflow-text check above green while production silently reverted to
+    # rotation=0, reinstating the head-of-line BLOCKER. So the workflow's OWN `--snapshot` argv is
+    # replayed through the real entrypoint for two different run numbers: the windows must differ
+    # from each other and must equal what snapshot() returns for that rotation.
+    # -------------------------------------------------------------------------------------------
+    def run_snapshot_argv(pages, run_number):
+        argv = next((candidate for candidate in static_triage.workflow_argvs(
+            workflow, "retriage.py",
+            {"GITHUB_RUN_NUMBER": str(run_number), "REPO": "o/r", "tmp": "/nonexistent"})
+            if "--snapshot" in candidate), None)
+        if argv is None:
+            # Fail CLOSED and legibly: a workflow that no longer invokes `--snapshot` at all (a step
+            # body replaced by `true`) must turn this check red, not raise StopIteration.
+            raise SweepError("retriage.yml no longer invokes `retriage.py --snapshot` — refusing")
+        saved = (sys.stdin, sys.stdout, sys.stderr)
+        sys.stdin, sys.stdout, sys.stderr = (io.StringIO(json.dumps(pages)), io.StringIO(),
+                                             io.StringIO())
+        try:
+            code = main(argv)
+            emitted = [json.loads(line) for line in sys.stdout.getvalue().splitlines() if line]
+            noise = sys.stderr.getvalue()
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = saved
+        return code, argv, [issue["number"] for issue in emitted], noise
+
+    rot_board = [[api(number, "status:untriaged") for number in range(1, 201)]]
+    code_a, rot_argv, window_a, warning = run_snapshot_argv(rot_board, 0)
+    code_b, _argv, window_b, _noise = run_snapshot_argv(rot_board, 1)
+    rot_cap = int(rot_argv[rot_argv.index("--cap") + 1])
+    checks.append(("[#605 r2 f1] the workflow's own --snapshot argv is replayable (no shell tokens)",
+                   (code_a, code_b, [token for token in rot_argv if token in {"<", ">"}])
+                   == (0, 0, [])))
+    checks.append((f"[#605 r2 f1] main() FORWARDS --rotation: run 0 and run 1 walk different "
+                   f"windows of {rot_cap}",
+                   (len(window_a), len(window_b), window_a != window_b) == (rot_cap, rot_cap, True)))
+    checks.append(("[#605 r2 f1] ...and each replayed window equals snapshot(rotation=n) exactly",
+                   (window_a, window_b)
+                   == (sorted(issue["number"] for issue in
+                              snapshot(rot_board, cap=rot_cap, rotation=0)[0]),
+                       sorted(issue["number"] for issue in
+                              snapshot(rot_board, cap=rot_cap, rotation=1)[0]))))
+    checks.append(("[#605 r2 f1] the cap warning states the bound's UNCHANGED-BOARD condition",
+                   "UNCHANGED board" in warning and "not a per-issue deadline" in warning))
+
+    # -------------------------------------------------------------------------------------------
+    # [#605 review ROUND 2, finding 2] THE SHELL PAGINATION GUARDS ARE EXECUTED. The step body is
+    # extracted from the workflow and run against a stubbed `gh_retry` (canned board pages) and a
+    # stubbed applier, so the REQUEST ceiling, the page-shape guard and the short-page completeness
+    # break are asserted by OUTCOME. Every row below dies on the mutations round 2 named: deleting
+    # the ceiling's own `exit 1`, `if false`, an enormous `max_pages`, `got=0`, and reverting the
+    # page-type guard to the bare `jq 'length'` that scored 2 on `{"message":"Not Found"}`.
+    # -------------------------------------------------------------------------------------------
+    import subprocess
+    import tempfile
+    sweep_script = workflow_step_script(open(workflow, encoding="utf-8").read(), "sweep")
+    GH_RETRY_STUB = '''import json, os, sys
+args = sys.argv[1:]
+if not args or args[0] != "read":
+    sys.exit(f"stub gh_retry refuses a non-read call: {args}")
+rest = args[1:]
+if rest[:1] == ["label"]:
+    print("role:impl,role:docs,status:ready,status:untriaged,priority:P2,area:dispatch")
+    sys.exit(0)
+if rest[:1] != ["api"]:
+    sys.exit(f"stub gh_retry saw an unexpected call: {args}")
+target = rest[1]
+if "/collaborators/" in target:
+    print("write")
+    sys.exit(0)
+if os.environ["STUB_PAYLOAD"] == "object":
+    print(json.dumps({"message": "Not Found"}))
+    sys.exit(0)
+label = target.split("labels=")[1].split("&")[0]
+page = int(target.split("&page=")[1])   # NOT "page=" — `per_page=100` matches that first
+base = 1000000 if label.endswith("ready") else 0
+count = 100 if page <= int(os.environ["STUB_FULL_PAGES"]) else 7
+print(json.dumps([{"number": base + page * 1000 + index, "user": {"login": "owner"},
+                   "body": "", "labels": [{"name": label}],
+                   "updated_at": "2026-07-01T00:00:00Z"} for index in range(count)]))
+'''
+    RETRIAGE_STUB = '''import os, subprocess, sys
+if "--snapshot" in sys.argv:
+    sys.exit(subprocess.run([sys.executable, os.environ["STUB_REAL_RETRIAGE"], *sys.argv[1:]],
+                            check=False).returncode)
+with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
+    handle.write("apply\\n")
+'''
+
+    def run_sweep_step(full_pages=2, payload="array", run_number=3):
+        """Execute the REAL sweep step body. Returns (exit code, log text, page-file names,
+        window line count, applier invocation count)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, "repo")
+            os.makedirs(os.path.join(root, "scripts"))
+            for name, source in (("gh_retry.py", GH_RETRY_STUB), ("retriage.py", RETRIAGE_STUB)):
+                with open(os.path.join(root, "scripts", name), "w", encoding="utf-8") as handle:
+                    handle.write(source)
+            temp = os.path.join(directory, "runner-temp")
+            os.makedirs(temp)
+            log = os.path.join(directory, "apply.log")
+            environment = dict(os.environ, RUNNER_TEMP=temp, REPO="o/r",
+                               MAINTAINER_LOGIN="owner", APP_BOT_LOGIN="app[bot]",
+                               GITHUB_RUN_NUMBER=str(run_number),
+                               STUB_FULL_PAGES=str(full_pages), STUB_PAYLOAD=payload,
+                               STUB_APPLY_LOG=log,
+                               STUB_REAL_RETRIAGE=os.path.abspath(__file__))
+            completed = subprocess.run(["bash", "-c", sweep_script], cwd=root, env=environment,
+                                       capture_output=True, text=True, timeout=600, check=False)
+            sweep_temp = os.path.join(temp, "retriage")
+            pages = sorted(name for name in (os.listdir(sweep_temp)
+                                             if os.path.isdir(sweep_temp) else [])
+                           if name.startswith("page-"))
+            window_path = os.path.join(sweep_temp, "issues.jsonl")
+            window = 0
+            if os.path.isfile(window_path):
+                with open(window_path, encoding="utf-8") as handle:
+                    window = sum(1 for line in handle if line.strip())
+            applies = 0
+            if os.path.isfile(log):
+                with open(log, encoding="utf-8") as handle:
+                    applies = sum(1 for line in handle if line.strip())
+            return (completed.returncode, completed.stdout + completed.stderr, pages, window,
+                    applies)
+
+    # 2 full pages + a short third page per lane = 207 issues per lane, 414 in all, cap 80.
+    # `got=0` (the truncation mutation) fetches ONE page per lane and applies a truncated board:
+    # the page-file list and the reported board total both change, so this row dies on it.
+    code, log, pages, window, applies = run_sweep_step(full_pages=2)
+    checks.append(("[#605 r2 f2] the step reads until a SHORT page arrives, on BOTH lanes",
+                   (code, pages) == (0, ["page-ready-1.json", "page-ready-2.json",
+                                         "page-ready-3.json", "page-untriaged-1.json",
+                                         "page-untriaged-2.json", "page-untriaged-3.json"])))
+    checks.append(("[#605 r2 f2] ...and the COMPLETE board reaches the snapshot (414 = 2x(200+7))",
+                   "414 board issue(s)" in log))
+    checks.append(("[#605 r2 f2] ...and the capped window is what the applier is actually fed",
+                   (window, applies) == (80, 80)))
+    # The REQUEST ceiling: 25 full pages against max_pages=20. Deleting the ceiling's own `exit 1`,
+    # or `if false`, or a raised max_pages all let the loop run to the short page and exit 0.
+    code, log, pages, _window, applies = run_sweep_step(full_pages=25)
+    checks.append(("[#605 r2 f2] a board past the REQUEST ceiling fails the step CLOSED at page 20",
+                   (code != 0, "larger than 20 pages" in log,
+                    len([name for name in pages if name.startswith("page-untriaged-")]), applies)
+                   == (True, True, 20, 0)))
+    # The page-SHAPE guard: `jq 'length'` alone returns 2 for {"message": "Not Found"}, which is
+    # `-lt 100`, so an error document used to break the loop and be swept as a complete board.
+    code, log, _pages, _window, applies = run_sweep_step(payload="object")
+    checks.append(("[#605 r2 f2] a non-array page payload fails the step CLOSED, never sweeps",
+                   (code != 0, "not a JSON array" in log, applies) == (True, True, 0)))
 
     ok = all(result for _, result in checks)
     for name, result in checks:
@@ -921,10 +1217,15 @@ def main(argv=None):
             # deferred forever. State what the rotation actually guarantees, in runs.
             total = len(issues) + dropped
             runs = -(-total // args.cap)
+            # ...and #605 review ROUND 2: "covered within N runs" was still unqualified. Issue
+            # numbers are immutable but board MEMBERSHIP is not, so a lower-numbered issue that
+            # closes/reopens/gains a swept label between runs shifts every later offset. State the
+            # bound with the condition it actually holds under.
             print(f"::warning::retriage sweep cap {args.cap} reached — {dropped} of {total} board "
                   f"issue(s) are outside THIS run's window; the window rotates by {args.cap} per "
-                  f"run (--rotation {args.rotation}), so the whole board is covered within {runs} "
-                  "runs", file=sys.stderr)
+                  f"run (--rotation {args.rotation}), so for an UNCHANGED board the whole of it is "
+                  f"covered within {runs} runs (membership changes shift the offsets, so that is a "
+                  "no-starvation bound, not a per-issue deadline)", file=sys.stderr)
         for issue in issues:
             print(json.dumps(issue, sort_keys=True))
         return 0

@@ -515,7 +515,12 @@ def load_sibling(filename, name):
 # "unrecognized arguments", yet the enrolled suite was GREEN because every self-test called plan()
 # DIRECTLY. The fix is not just the missing option — it is deriving the argument list under test
 # from the WORKFLOW FILE, so a future workflow/CLI drift cannot hide behind a direct-call test.
-_SHELL_STOP = re.compile(r"<<<|<<|\||>|;|&&|\)")
+# A bare `<` stdin redirect ends the argv too (#605 review round 2). It was missing, so
+# `retriage.py --snapshot ... < pages.json > issues.jsonl` yielded an argv carrying the literal
+# tokens `<` and the path — harmless for a "which flags are passed" assertion, fatal for a self-test
+# that wants to REPLAY the workflow's own argv through main(). `<<<`/`<<` stay listed first so the
+# heredoc forms still win at the same position.
+_SHELL_STOP = re.compile(r"<<<|<<|<|\||>|;|&&|\)")
 
 
 def workflow_argvs(workflow_path, script, subst=None):

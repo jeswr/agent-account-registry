@@ -61,6 +61,11 @@ jobs:
       # single-attempt + fail-loud inside the applier (gh_retry's hard scope rule).
       # scripts/retriage.py --self-test statically asserts all of this against this file.
       - name: Sweep the untriaged and status:ready boards (at most 80 issues)
+        # `id:` so retriage.py's self-test can EXTRACT and EXECUTE this exact step body against a
+        # stubbed `gh_retry`/applier (#605 review round 2): the pagination ceiling, the
+        # completeness proof, the page-shape guard and the truncation break are SHELL guards, and
+        # every one of them survived the previous purely-textual assertions.
+        id: sweep
         run: |
           set -euo pipefail
           tmp="$RUNNER_TEMP/retriage"
@@ -91,7 +96,16 @@ jobs:
               out="$tmp/page-$lane-$page.json"
               gh_read api "repos/$REPO/issues?state=open&labels=$label&per_page=100&page=$page" \
                 > "$out"
-              got=$(jq 'length' "$out")   # a non-array payload fails here, under set -e
+              # #605 review round 2: the previous claim here — "a non-array payload fails here,
+              # under set -e" — was simply FALSE. `jq 'length'` accepts objects, strings and null
+              # (2 / 9 / 0 respectively), so an error document like {"message":"Not Found"} scored
+              # 2, compared `-lt 100`, broke out of the loop and was swept as a complete board.
+              # The type IS the guard now, and it is asserted by an executed self-test row.
+              if ! jq -e 'type == "array"' "$out" > /dev/null; then
+                echo "::error::the $label board page $page is not a JSON array — refusing to sweep a board this run could not read (fail closed)"
+                exit 1
+              fi
+              got=$(jq 'length' "$out")
               if [ "$got" -lt 100 ]; then
                 break
               fi
