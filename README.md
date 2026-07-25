@@ -13,6 +13,14 @@ account to use; the registry applies per-account limits, a cross-codebase concur
 fallback chains, and prompt-cache affinity, and hands back a claim. When the worker finishes it
 releases the claim.
 
+## Registry self-test suite
+
+`scripts/selftest-suite.txt` is the authoritative self-test manifest and is checked in both
+directions against scripts that advertise a self-test entrypoint. Enroll a new self-testing script
+in that manifest in the same PR. Retiring a script or manifest entry requires two PRs: first add its
+filename to `scripts/selftest-retirements.txt` on the base branch, then remove the script and its
+manifest entry in a later PR. The gate refuses an unapproved same-PR retirement.
+
 ## One issue per account
 
 Each model account is a GitHub **issue** in this repo. The issue **body** is structured YAML
@@ -153,8 +161,56 @@ title (GitHub does not enforce unique titles).
   the interactive session refreshes (this broke the canary once). If you prefer a Console API key,
   that also works: `credential_format: anthropic-api-key` (value is the `sk-ant-api…` key).
 - **OpenAI** (codex/GPT models): the codex CLI OAuth from `~/.codex/auth.json`
-  (`credential_format: codex-auth-json`). (This one does rotate — used only as a cross-provider
-  fallback.)
+  (`credential_format: codex-auth-json`). Its access token expires and its **refresh token is
+  ONE-TIME-USE with server-side replay detection** (`refresh_token_reused`), so the worker refreshes
+  it HOST-SIDE before the model container starts and writes the rotated credential back to the secret
+  (issue #596; the container only ever sees a fresh access token, never the refresh token). Two
+  operational consequences:
+  - **Give the registry its OWN codex login.** Refresh chains are per-authorization, not per-account.
+    If the stored secret and an interactive `~/.codex` login share one chain, whichever refreshes
+    second is killed with `refresh_token_reused` — so run the device-code login once *for the
+    registry* and enrol that credential rather than copying a box's live `~/.codex/auth.json`.
+  - **`REGISTRY_SECRETS_PAT` must be present** for the account to self-heal indefinitely. Without it
+    the write-back warns and skips, the rotated refresh token is lost, and the account needs a
+    re-mint the next time its access token expires.
+  - **The write-back is reachable from the pre-flight's FAILURE path.** The exchange consumes the
+    one-time-use grant early inside the credential-prepare step, so the write-back step is keyed to
+    `always()` plus the account selection — never to that step succeeding. Any later failure in
+    prepare (the no-leak assertion, the tamper baseline, the pinned CLI install, the `$GITHUB_ENV`
+    export) would otherwise discard a grant the provider had already rotated, leaving the account
+    permanently unable to authenticate. `worker-prep.sh` writes the durable material, the credential
+    format, and the rotation marker at the moment the rotation happens, so a write-back reached with
+    no mount and no exported environment still knows what to persist and how to validate it;
+    `dispatch-secrets-guard.rotation_writeback_reachable_verdict` asserts that reachability in both
+    worker lanes, and the obligation is **universal, not existential**: the step's `if:` must evaluate
+    TRUE on every path where a rotation may already have happened, and may reference only facts settled
+    *before* the pre-flight (`always()`, the dry-run input, the claim outputs, the account selection
+    step). Anything else — the prepare step's own outcome, the model step's outcome, a prepare output,
+    `success()` — is refused by name. An existential "there is *some* world where it runs" check
+    accepted all of those, which is how a model-step guard could have been reintroduced. Each lane's
+    call site is also required to be a **reachable** command, so commenting the `run:` out is a red
+    tick rather than a silently discarded grant.
+  - **A grant is re-sent only when the previous attempt provably did not deliver it.**
+    `_post_token_endpoint` drives the exchange through `http.client` with an explicit `connect()`, so
+    the pre-send / post-send boundary is a property of the code's STRUCTURE rather than a guess from
+    the exception's type (`ssl.SSLError` is an `OSError` raised from *both* the handshake and the
+    response read, and urllib's `URLError` conflates connect with send — no type test can be sound in
+    both directions). A fault raised strictly before the request write — malformed URL, DNS failure,
+    refused connection, connect timeout, failed TLS handshake — is `STATUS_NOT_SENT` and keeps its
+    bounded retry; a fault raised at or after the write — send/response timeout, reset, broken pipe, a
+    TLS fault from `response.read()`, a truncated body — is `STATUS_INDETERMINATE`, classed
+    `credential-remint-required`, and raises on the spot.
+    The two questions are deliberately separate. `classify_refresh_failure` answers "is a LATER
+    attempt worth making?", which is why 429 and 5xx stay `credential-refresh-transient`: a later
+    attempt re-reads the stored secret, and a grant the provider did consume then fails closed with
+    `invalid_grant`. `_RESEND_SAFE_STATUSES` answers the narrower "may THIS run POST the same grant
+    again?" and admits only `STATUS_NOT_SENT` plus a documented 429 throttle. A **2xx with an unusable
+    body** (truncated, unparseable, or missing `access_token`) is the strongest available evidence that
+    the rotation *did* commit, so it raises instead of retrying.
+  - **The remint class carries two causes, and the operator message says so.** `worker-prep.sh`'s
+    `::error::` line for `credential-remint-required` must not assert the grant "is dead": the class
+    covers both a provider-confirmed dead grant and an indeterminate outcome whose fate is unknown and
+    which was deliberately not re-sent.
 - On this work box, pre-provisioned Anthropic setup-tokens already exist as files
   `~/.claude-acctN-token` (one per account). Read the file; do not echo it.
 
@@ -302,6 +358,90 @@ from the `data/model-health.json` records the worker/review outcome jobs already
   `::warning::`), never the exemption — the backoff is an optimization and must not reintroduce
   fail-closed starvation.
 
+**Exemption is NOT reachability** ([issue #639](https://github.com/jeswr/agent-account-registry/issues/639)).
+Being exempt from the quota probe means *no usage token is required*; it never meant *the account is
+reachable*, and reading it that way is what kept handing a `credential-remint-required` account
+(#596 / alert #622) to the allocator every tick. Every exempt entry therefore **carries** a
+three-valued `reachability`, derived by `model-health.credential_states` from the same 48 h health
+window as the backoff:
+
+| value | evidence | dispatch | public page |
+| --- | --- | --- | --- |
+| `live` | a `success` record in the window | eligible | `available` |
+| `unproven` | no decisive record (also: no salt, unreadable ledger) | eligible, **bounded** | `available` |
+| `dead` | ≥ `CREDENTIAL_DEAD_MIN` consecutive `auth` rejections, no later success | **ineligible** | `unavailable` |
+| absent / unrecognised | the producer never stated it | **ineligible** | `unknown` |
+
+`usage_eligible` allowlists only `{live, unproven}`, so an unstated or unrecognised value fails
+CLOSED; `usage-alert.classify` and the dashboard's `_quota_state` apply the same allowlist, so
+monitoring, the public page and dispatch cannot disagree. `dead` carries **no TTL** — unlike the
+#596 cooldown it is evidence, not a hold — and clears the instant a `success` is recorded, which is
+why it does not overturn that decision for the interleaved failure pattern it was calibrated on.
+`unproven` still admits because there is no independent liveness probe for an exempt provider
+(`account-whoami.yml` is manual-dispatch and disabled on a public repo), so refusing it would
+self-latch: no dispatch ⇒ no records ⇒ unproven forever. What it costs is bounded to
+`CREDENTIAL_DEAD_MIN` trial dispatches per health window, after which the evidence turns `dead`.
+`prune` preserves a dead run's tail against the `MAX_RECORDS` cap, so a flood of unrelated records
+cannot silently readmit the account.
+
+**The probe must PROVE its materialization** (same issue). `dispatch.yml`'s probe — the lane that
+spends real capacity — now applies the ledgergate the dashboard lane got in #219/#612: the ACCT_*
+materialization step carries **no** `continue-on-error`, the probe step **parses** the token subset
+(a substring test accepts `{"ACCT01_TOKEN":""}` and a truncated `{"ACCT01_TOKEN":`), it records an
+outcome sidecar (`usage-probe.json`, schema `account-usage-probe/v1`) that `usage-alert.py` reads
+fail-closed, and the exempt branch runs **after** that proof — so an unusable subset yields an
+**empty** usage map and the wholesale-outage alert actually fires, instead of a non-empty map of
+exempt accounts nothing was measuring.
+
+### Credential-outage exits are not declines (issue #596)
+
+A model launch that dies on the **worker account's credential or capacity** — exit class `auth`,
+`rate-limit`, `session-limit`, `billing`, or either of `worker-prep.sh`'s host-side credential
+pre-flight classes `credential-remint-required` / `credential-refresh-transient` — is a **credential
+outage**, not a model decline. The model never read the task or the diff, so there is no judgment to
+charge for.
+
+The set is held by **two locks with distinct scopes** — stated precisely, because #629's "the class is
+closed" was an overstatement of the first one:
+
+1. **The consumer lock**, bidirectional between the two *constants*. A set-equality assertion in
+   `worker-pr.py --self-test` requires `CREDENTIAL_OUTAGE_EXIT_CLASSES` to equal every raw exit class
+   whose fold target is one of `model-health.py`'s outage decision classes, so a class can never be
+   non-chargeable on one side only (the drift that made the two pre-flight classes chargeable for the
+   whole acct01 outage). Its non-vacuity anchor is a required-**subset** check, so a legitimate third
+   `credential-*` class does not misfire it.
+2. **The emitter lock**, producer → consumer. The consumer lock alone says nothing about the
+   *producers*: `broker-refresh.py` could start emitting a new raw class with it still green (folding
+   to `unknown`, and therefore CHARGED — fail-safe, but the same shape of drift).
+   `worker-pr._emitted_credential_exit_classes` parses `broker-refresh.py` with `ast` and requires
+   every `CLASS_* = "credential-…"` constant it can emit to be a key of the fold map.
+
+Neither lock claims the vocabulary is closed against a *new* emitter script this derivation does not
+read; what they close are the two directions that actually caused #604 and #614. Two consequences,
+both wired through machinery that already existed:
+
+- **No round or attempt is consumed.** The review round marker (`worker-pr.py round-record`) and
+  the worker attempt receipt (`worker-issue.py record-attempt`) are both written *before* the model
+  launches, for bounded-crash accounting. On a credential-outage exit the run now records a **void**
+  for its own `(round, run)` / run key (`round-void` / `void-attempt`, gated by the single shared
+  predicate `worker-pr.is_credential_outage`), and `count_rounds` / `count_attempts` subtract it —
+  so `decide_budget` and the deferred-retry budget see that **no round happened**. `setup` and
+  `unknown` are deliberately **still charged**: an unattributable failure must keep exhausting the
+  budget, or a deterministic crash loop becomes unbounded.
+- **No ladder advances.** The repeated-decline escalation (`DECLINE_ESCALATION_MIN`) and the
+  capped-account discriminator (`NO_CHANGE_LIMIT_MIN`) both key strictly on `no_change`, so `auth`
+  records can never reach them — and `make_record` refuses to attach the no-change evidence fields
+  to an `auth` record at all.
+
+After `AUTH_COOLDOWN_MIN` (**2**) consecutive `auth` outcomes for one account with no interleaved
+success, `model-health.auth_cooldowns` puts that account into a **bounded credential cooldown** —
+delivered through the *same* `account_backoffs` → `backoff_until` overlay described above, for
+`AUTH_COOLDOWN_SECONDS` (**15 min**, single-step, never doubling) — and raises the `ops-alert`
+condition `account-auth-cooldown`, naming the **salted fingerprint only** plus the required
+maintainer action (re-mint the setup-token). It is deliberately a **cooldown, not a disable**: the
+account may be the fleet's only cross-provider review account, and zero reviews is worse than a
+partial success rate.
+
 ## Security posture
 
 - Tokens: only in GitHub secrets (encrypted at rest, masked in logs), and only in the
@@ -316,6 +456,22 @@ from the `data/model-health.json` records the worker/review outcome jobs already
   "Environments" permission, whose read half covers the env public-key read. Store it with
   `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`).
 - `pat-validity` (weekly cron): probes `REGISTRY_SECRETS_PAT` ahead of use — `GET /user`, the `dispatch-secrets` environment secrets public-key read, then an authoritative `gh secret set --env dispatch-secrets` on the disposable `REGISTRY_PAT_PROBE_CANARY` secret (the public-key read alone needs only read access, so it would bless a read-only PAT that onboarding's env write still breaks on; a repo-scope canary would re-trip the secrets-guard weekly) — and upserts one rolling `from:agent` alert issue on invalid/insufficient-scope. Calendar expiry is caught before onboarding stalls on it, and a transient network blip never false-alarms — consecutive network-unknowns are counted in a repository variable (silent state: below the threshold no issue is touched, since GitHub creates every issue open and even a create-then-close would notify) and page via a separate rolling issue once a small threshold is crossed (issue #207), so a permanently-stalled probe cannot leave the PAT silently unverified.
+- **The exfil gate contract is decided, and fails closed when it cannot be.**
+  `dispatch-secrets-guard.guard_gate_verdict` proves that a failing `secrets-guard` prevents every
+  secret-consuming job in `dispatch.yml` from running. Two properties carry the weight, and both are
+  *parses*, not text searches:
+  - **Polarity.** A job-level `if:` is decided by exhaustive satisfiability over a propositional
+    abstraction, and the guard requirement may be pinned FALSE only when it is a genuinely parsed
+    **comparison**. A function call's quoted string ARGUMENTS are not conditions — recognising the
+    comparison inside a string literal is how the gate was defeatable in one line — and any atom the
+    grammar cannot fully parse (indexing, arithmetic, a `!` whose precedence differs from GitHub's,
+    a bare string used as a condition) is reported UNDECIDED, which the gate treats as admitting: an
+    unreadable gate is not a proven gate.
+  - **Execution.** The guard must actually RUN both verifier invocations. Reachability is decided by
+    parsing the step's shell body — comments and here-document bodies removed, `&&`/`||`
+    short-circuits and `if`/`while`/`case` constructs treated as unreachable — so a commented-out or
+    short-circuited invocation is a refusal that names the fact. The text of a command is not its
+    execution.
 - Account metadata + selection logic: only in this private repo.
 - Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap CAS/ledger
   writes or mutation-confirmations (their conflict/fail-loud semantics are caller-owned — a replayed
@@ -326,13 +482,35 @@ from the `data/model-health.json` records the worker/review outcome jobs already
 
 You don't paste tokens manually. Instead:
 
-1. Open a **"set up new account"** issue (there's a template) and add the **`set-up-account`** label.
+1. Open a **"set up new account"** issue (there's a template), label it with **one
+   `grant:<owner>/<repo>` label per repository the account is authorized for**, then add the
+   **`set-up-account`** label. Each target must be an `enabled = true` row of `policy/repos.toml`:
+   `account_pool` is the credential-authorization boundary, so an account is granted ONLY to the
+   repositories the request names (#579), and a request that names none is **refused before any
+   login** instead of being granted to every repository.
 2. The `set-up-account` workflow (trust-gated to the maintainer) runs the provider's device/OAuth
    login and **comments a sign-in URL + one-time code** on the issue.
 3. Sign in with the account you want to register. The broker captures the resulting token, stores it
-   as the account **secret** (`ACCTNN_TOKEN`) in this registry's `dispatch-secrets` environment,
-   registers the account issue, and closes the request. **The token is never printed** — only
-   written to a mode-600 file and set as a secret.
+   as the account **secret** (`ACCTNN_TOKEN`) in this registry's `dispatch-secrets` environment, and
+   registers the account issue **`status:pending`** — not yet allocatable. The request issue stays
+   **open** until the grant PR in step 4 merges (it is closed by `activate`, not here).
+   **The token is never printed** — only written to a mode-600 file and set as a secret.
+4. The grant lands as a **checked `account-pool/<handle>` PR** that edits only the granted rows
+   (`scripts/grant-account.py`, self-tested), and the labels are **re-read live** immediately before
+   that write — a target removed during the sign-in window fails closed. The authorized set is
+   recorded on the account issue as `grant_targets:`; on merge, `activate` re-proves that every
+   recorded target lists the handle **exactly once**, that no other row lists it at all, and — against
+   the merged commit's first parent — that **every other row and field is byte-identical**, before the
+   account becomes `status:available` and the request is closed. The PR's **own complete merge-base
+   diff** is proved separately (position by position, and refused if the API truncated it), because
+   under a multi-commit rebase the first parent is a commit of the same PR.
+   If the handle is somehow already in the policy pool, activation additionally requires **every
+   authorized row to be traced to a merged, row-scoped `account-pool/<handle>` PR** that provably
+   added the handle to that row: matching shape is not proof that a grant was ever reviewed. That
+   bound is deliberately stated as what it is — each row was *at some point* established by a checked
+   PR; it does not prove the row's current bytes are the ones that PR wrote, since an unchecked later
+   edit could have removed and re-added the handle. Closing that would need a per-row history walk of
+   the policy document and is not attempted.
 
 Providers: **OpenAI** via `codex login --device-auth` (native device flow); **Anthropic** via
 `claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_SECRETS_PAT` (a

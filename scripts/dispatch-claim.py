@@ -282,6 +282,10 @@ def _lease_ttl(mode):
 REVIEW_TTL = _lease_ttl("review")   # 10+10+25+10+15 = 70m (was 20m — shorter than the 25m run job)
 FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly the run job, no slack)
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
+# "not probed yet" sentinel for the per-PR readmission-cutoff memo (#555 recurrence gap): the
+# cutoff's own falsy value (None = no proven human gesture) is a MEANINGFUL result, so it cannot
+# double as the not-yet-read marker.
+_UNPROBED = object()
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -1886,18 +1890,27 @@ def _run_target_helper(script_dir, repo, script, args):
 
 
 def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="question",
-                   bot_login=""):
+                   bot_login="", head_sha="", attempt_key=""):
     """Stop the loop for a PR. `park_class` picks the label PAIR (park_policy.py ownership):
     "question" (default) -> the human-owned pair (review:needs-user on the PR, needs:user on
     the source issue) for genuine human questions; "capacity" -> the machine-owned soft-hold
     pair (review:parked on the PR, status:parked on the source issue) for capacity/decline/
     budget-driven stops — veto-gated, receipted per readmission window, and escalating to the
     question class after PARK_ESCALATION_GENERATIONS consumed windows (worker-pr needs_user
-    owns all of that; `bot_login` feeds its receipt parser's trust filter)."""
+    owns all of that; `bot_login` feeds its receipt parser's trust filter).
+
+    `head_sha` + `attempt_key` are the capacity park's ATTEMPT FINGERPRINT (#555 recurrence
+    gap; park_policy.park_fingerprint): the live head plus a MONOTONE counter of work
+    attempted. EVERY capacity park on this path supplies them, so an exhaustion re-derived
+    from unchanged per-PR state is skipped quietly instead of consuming the readmission window
+    a human just granted (the live sparq #3488 7-minute bounce). Question-class parks are
+    unconditional human holds and pass neither."""
     args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason,
             "--park-class", park_class]
     if bot_login:
         args += ["--bot-login", bot_login]
+    if head_sha and attempt_key:
+        args += ["--head-sha", head_sha, "--attempt-key", attempt_key]
     if isinstance(issue, int) and issue > 0:
         args += ["--issue", str(issue)]
     _run_target_helper(script_dir, repo, "worker-pr.py", args)
@@ -2095,6 +2108,133 @@ def _read_model_health_window(model_health, registry_repo, now, api=None):
         print("::error::dispatch decline escalation: validated model-health ledger is "
               f"unreadable ({exc}); NO task escalation will fire")
         return None
+
+
+def _capacity_recovery_probe(model_health, health_window, now):
+    """The recovery-evidence probe park_policy.capacity_park_admission calls with the canonical
+    stamp of the latest park application: model-health's per-account cause-recovery predicate over
+    the SAME validated health window the decline ladder and #604's auth cooldowns read (never a
+    parallel store). An unreadable window (None) or an unparseable park stamp yields no evidence,
+    which the admission reads as STAY PARKED."""
+    def probe(parked_at):
+        if health_window is None or not parked_at:
+            return None
+        parked_epoch = int(_park_policy.parse_ts(parked_at).timestamp())
+        return model_health.capacity_recovery_evidence(health_window, parked_epoch, now)
+
+    return probe
+
+
+def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_login, script_dir,
+                            worker_pr, evidence_probe, comments_fn=None, timeline_fn=None,
+                            post_comment=None, clear_labels=None, log=print):
+    """AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause has demonstrably
+    cleared (registry #614) — the sweep that closes the structural stall: a MACHINE-owned park
+    could only ever be cleared by a HUMAN, so a capacity outage stranded every PR it parked even
+    after the outage ended. Live evidence 2026-07-25: acct01 (the fleet's only cross-provider
+    review account) failed every review with exit-class=auth (#596) and capacity-parked registry
+    PRs #587/#590/#585/#593 + issues #574/#577/#582/#572 and 6 sparq PRs; the credential fix
+    restores capacity but recovers NONE of those parks without a hand-unlabel of each one.
+
+    Runs over the LIVE pull listing CLAIM already fetched, and only ever touches a MACHINE park:
+    a PR carrying a human-owned hold on either surface, or whose LATEST park application was made
+    by a proven human, is skipped by park_policy.capacity_park_admission itself. Ordering is
+    RECEIPT-FIRST like every other park write (#610 round-4 finding 2): the durable
+    AUTO_READMIT_MARKER receipt is posted BEFORE any label is cleared, so a crash between them
+    leaves receipt-no-label — which the receipt-driven proof gate admits and this sweep converges
+    on the next tick — never label-no-receipt, which would erase the re-admission from every proof
+    surface and re-strand the PR. Every failure is PER-PR: one unreadable PR never stops the rest.
+
+    Returns the number of PRs re-admitted this tick."""
+    comments_fn = comments_fn or _pr_comments
+    timeline_fn = timeline_fn or _issue_timeline_events
+    post_comment = post_comment or _run_gh_target_comment
+    if clear_labels is None:
+        def clear_labels(pr_number, issue_number):
+            # The SAME label writes a human readmission gesture triggers on the CLAIM path:
+            # review:parked -> review:needs on the PR, and status:parked cleared on the source
+            # issue. Both helpers are idempotent, so converging a crashed strip is safe.
+            _run_target_helper(script_dir, repo, "worker-pr.py", [
+                "review-state", "set", "--repo", repo, "--pr", str(pr_number),
+                "--state", "needs"])
+            if issue_number:
+                _run_target_helper(script_dir, repo, "worker-issue.py", [
+                    "status", "--repo", repo, "--issue", str(issue_number),
+                    "--status", "readmitted"])
+
+    rows = []
+    for page in pull_pages if isinstance(pull_pages, list) else []:
+        if isinstance(page, list):
+            rows.extend(row for row in page if isinstance(row, dict))
+    readmitted = 0
+    for row in sorted(rows, key=lambda row: row.get("number") or 0):
+        number = row.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        if row.get("state") != "open":
+            continue
+        head = row.get("head") or {}
+        if (head.get("repo") or {}).get("full_name") != repo \
+                or not HEAD_REF_RE.match(str(head.get("ref", ""))):
+            continue                      # not a same-repo worker branch — never ours to re-admit
+        login = str((row.get("user") or {}).get("login", ""))
+        if not bot_login or login != bot_login:
+            continue                      # only the trusted App bot's own worker PRs
+        try:
+            # EVERYTHING that can fail on hostile/degraded data lives inside the per-PR try: a
+            # malformed label list, an unreadable comments page, or a failed timeline read must
+            # skip THIS PR (its park simply stands) and never abort the sweep — the whole tick's
+            # claim runs under this call.
+            labels = set(_labels(row))
+            record = provenance.get(number)
+            issue_number = record.get("issue") if isinstance(record, dict) else None
+            if not isinstance(issue_number, int) or isinstance(issue_number, bool) \
+                    or issue_number <= 0:
+                issue_number = None
+            source_labels = set(issue_labels.get(issue_number, []) if issue_number else [])
+            if MACHINE_PARK_PR_LABEL not in labels and "status:parked" not in source_labels:
+                continue                  # no live machine park — nothing to re-admit
+            holds = sorted((HUMAN_HOLD_PR_LABELS & labels)
+                           | {label for label in source_labels
+                              if isinstance(label, str) and label.startswith("needs:")})
+            comments = comments_fn(repo, number)
+            # ONE timeline read per surface per PR: the admission consults the timelines several
+            # times (the human cutoff, the park applications, the ownership probe) and every read
+            # must see the SAME view anyway — a mid-decision change would mix two worlds.
+            timelines = {}
+
+            def cached_timeline(_repo, timeline_number, _cache=timelines):
+                if timeline_number not in _cache:
+                    _cache[timeline_number] = timeline_fn(_repo, timeline_number)
+                return _cache[timeline_number]
+
+            action, evidence, detail = _park_policy.capacity_park_admission(
+                repo, number, issue_number, cached_timeline,
+                is_human=lambda probe_login: _target_is_human_maintainer(repo, probe_login),
+                consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
+                auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
+                auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
+                auto_evidence=evidence_probe, live_holds=holds, log=log)
+            if action == "auto-mint":
+                # RECEIPT FIRST, then the labels (see the docstring).
+                post_comment(repo, number, worker_pr.auto_readmission_receipt(
+                    evidence["key"], evidence["at"]))
+                clear_labels(number, issue_number)
+                readmitted += 1
+                log(f"auto-readmit {repo}#{number}: machine capacity park cleared — {detail}")
+            elif action == "auto-receipt":
+                clear_labels(number, issue_number)
+                readmitted += 1
+                log(f"auto-readmit {repo}#{number}: converging an already-receipted automatic "
+                    f"re-admission — {detail}")
+            else:
+                log(f"park stands {repo}#{number}: {detail}"
+                    + (" (a human readmission gesture is proven; the CLAIM proof gate owns it)"
+                       if action == "human" else ""))
+        except (DispatchError, worker_pr.WorkerPrError) as exc:
+            log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
+                "park stands")
+    return readmitted
 
 
 def _issue_no_change_outcomes(model_health, records, issue):
@@ -2307,6 +2447,48 @@ def _chain_probe_exempt(chain, routing):
     return True
 
 
+def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, repo, number):
+    """The MISSED-FIX-dispatch budget as (charged, lifetime) counts — the #555 RECURRENCE fix
+    for the second exhaustion branch.
+
+    THE BUG: `missed` markers are durable per-round state that nothing resets, and the
+    MISSED_FIX_LIMIT capacity park read the LIFETIME count. #555 windowed the ROUND budget by
+    the human-readmission cutoff but left this counter unwindowed — so a re-admitted PR
+    re-derived "N consecutive fix dispatches missed for round R" from the very same markers on
+    the very next tick, with an UNCHANGED head and no work attempted, and (with a gen-1 receipt
+    already standing) the ladder went straight to its question-class terminal. That is the
+    observed bounce: sparq PR #3488 re-admitted 2026-07-22T16:36:56Z, re-escalated 16:44:10Z;
+    PR #3472 re-escalated seconds later with byte-identical boilerplate, five days after the
+    last commit or review round on either PR. This counter is the purest case of it: it needs
+    NO head advance and NO review round to grow — it grows purely from allocator starvation,
+    identically across every PR in a sweep.
+
+    THE FIX: the LIMIT decision charges only markers recorded at or after `cutoff` (the same
+    readmission window the round budget uses — one timeline read per PR per tick), so a human
+    readmission grants real dispatch capacity. The LIFETIME count is still returned: it is the
+    monotone axis of the park's attempt fingerprint (a window-relative count resets and would
+    read as "unchanged" across two genuinely distinct windows).
+
+    `cutoff_fn` is the PR's memoized readmission-cutoff getter, called ONLY once the LIFETIME
+    count has reached the limit — below it the decision is the same either way, exactly like the
+    round budget's `rounds >= max_rounds` gate — so no extra timeline read is spent on the
+    common case."""
+    lifetime = len(worker_pr.marker_runs(comments, bot_login, "missed", round_number))
+    if lifetime < MISSED_FIX_LIMIT:
+        return lifetime, lifetime
+    cutoff = cutoff_fn()
+    if not cutoff:
+        return lifetime, lifetime
+    charged = len(worker_pr.marker_runs_since(
+        comments, bot_login, "missed", round_number, cutoff))
+    if charged != lifetime:
+        print(f"readmission window open for {repo}#{number}: a park label was cleared at "
+              f"{cutoff} (a human unlabel or a proven automatic re-admission); the missed-fix "
+              f"budget for round {round_number} charges {charged} of {lifetime} recorded "
+              f"miss(es)")
+    return charged, lifetime
+
+
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
                            defer_reasons, lanes=None, ledger_root="", fix_dispatch=None):
@@ -2458,13 +2640,25 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # state can re-enumerate, but it can never mint budget or strip the park.
                 # Round-4 finding 2 pairs this with RECEIPT-FIRST park writers: a crash
                 # mid-park leaves receipt-no-label, which this gate still catches.
-                if not _park_policy.capacity_park_readmitted(
+                # The proof admits on EITHER authority (registry #614): an unconsumed
+                # proven-human readmission gesture (unchanged), or a bot-authored AUTOMATIC
+                # re-admission receipt that is newer than every park application — the durable
+                # gesture the readmission sweep left behind when it proved the starvation cause
+                # had cleared. Nothing is MINTED here (auto_evidence is not passed): this gate
+                # only reads proof, so re-admission still requires the sweep's evidence-gated,
+                # receipted decision.
+                park_action, _park_evidence, park_detail = \
+                    _park_policy.capacity_park_admission(
                         repo, number, issue_number, _issue_timeline_events,
                         is_human=lambda login: _target_is_human_maintainer(repo, login),
-                        consumed=park_receipts):
+                        consumed=park_receipts,
+                        auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
+                        auto_marker_count=worker_pr.auto_readmission_marker_count(
+                            comments, bot_login),
+                        live_holds=sorted(HUMAN_HOLD_PR_LABELS & set(labels)))
+                if not park_action:
                     print(f"defer review {repo}#{number}: machine capacity park stands "
-                          "(durable receipts/label; no unconsumed proven-human readmission "
-                          "gesture)")
+                          f"(durable receipts/label; {park_detail})")
                     continue
                 if MACHINE_PARK_PR_LABEL in labels:
                     # Proven gesture: converge the stale PR-side park back into the loop (the
@@ -2474,8 +2668,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "review-state", "set", "--repo", repo, "--pr", str(number),
                         "--state", "needs"])
-                    print(f"re-admit review {repo}#{number}: human readmission gesture "
-                          "proven; review:parked converged to review:needs")
+                    print(f"re-admit review {repo}#{number}: {park_detail}; review:parked "
+                          "converged to review:needs")
             if opened_sha != head_sha:
                 compare = _gh_json(["api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"])
                 if compare.get("status") not in {"identical", "ahead"}:
@@ -2604,16 +2798,39 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # stays the global count everywhere else: round numbering, the pending-fix lookup,
             # the latest-progress read and the pin round all keep marker/verdict identity.
             # Probed only at/above the base budget: below it decide_budget continues either way.
+            # LAZY + MEMOIZED (#555 recurrence gap): the SAME cutoff also windows the missed-fix
+            # marker budget further down, and both call sites must agree on one readmission
+            # window per PR per tick — so the timeline is read at most once, and only when a
+            # park decision actually hangs on it.
+            # [registry #614] The window is the LATER of the human gesture and any AUTOMATIC
+            # re-admission receipt on this PR. Clearing a machine park WITHOUT granting a budget
+            # window would leave the PR enumerable but permanently un-dispatchable: the missed-fix
+            # marker budget grows purely from allocator starvation, so an outage pins it and every
+            # later tick would re-derive the SAME exhausted lifetime count and quietly re-defer
+            # forever. An automatic re-admission therefore grants exactly the window a human
+            # gesture grants — bounded by the same two things that bound the re-admission itself
+            # (fresh unconsumed recovery evidence, and park_policy.AUTO_READMISSION_MAX).
+            readmission_cutoff = _UNPROBED
+
+            def _readmission_cutoff(_repo=repo, _number=number, _issue=issue_number):
+                nonlocal readmission_cutoff
+                if readmission_cutoff is _UNPROBED:
+                    readmission_cutoff = _park_policy.effective_readmission_cutoff(
+                        _park_policy.readmission_cutoff(
+                            _repo, _number, _issue, _issue_timeline_events,
+                            is_human=lambda login: _target_is_human_maintainer(_repo, login)),
+                        worker_pr.auto_readmission_stamps(comments, bot_login))
+                return readmission_cutoff
+
             budget_rounds = rounds
             if rounds >= max_rounds:
-                cutoff = _park_policy.readmission_cutoff(
-                    repo, number, issue_number, _issue_timeline_events,
-                    is_human=lambda login: _target_is_human_maintainer(repo, login))
+                cutoff = _readmission_cutoff()
                 if cutoff:
                     budget_rounds = worker_pr.count_rounds_since(comments, bot_login, cutoff)
                     if budget_rounds != rounds:
-                        print(f"readmission window open for {repo}#{number}: a human "
-                              f"unlabeled a park label at {cutoff}; the round budget charges "
+                        print(f"readmission window open for {repo}#{number}: a park label "
+                              f"was cleared at {cutoff} (a human unlabel or a proven "
+                              f"automatic re-admission); the round budget charges "
                               f"{budget_rounds} of {rounds} recorded round(s)")
             impl_provider = record["impl_provider"]
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
@@ -2664,6 +2881,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # receipt trust filter). `budget_rounds` is the charged count —
                 # post-readmission when a human unlabeled a park label (sparq#2804/PR#3442),
                 # the full history otherwise.
+                #
+                # The park's ATTEMPT FINGERPRINT (#555 recurrence gap) is the live head plus
+                # the GLOBAL round count `rounds` — deliberately NOT the window-relative
+                # `budget_rounds`, which resets on every readmission and would therefore read
+                # as "unchanged" across two genuinely distinct windows.
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the review round budget is exhausted at {budget_rounds} "
                                f"round(s) "
@@ -2671,7 +2893,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "with no extension left — the top fix tier has run, the latest "
                                "verdict does not grade the PR improving, and no pushed fix at "
                                "or above the pinned floor awaits re-review; a human must "
-                               "decide", park_class="capacity", bot_login=bot_login)
+                               "decide", park_class="capacity", bot_login=bot_login,
+                               head_sha=head_sha, attempt_key=f"rounds={rounds}")
                 continue
             if budget["action"] == "extend-model-pin" and budget["pin"]:
                 # Converge the durable pin marker (normally recorded by the review outcome; this
@@ -2731,14 +2954,21 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # ping-pong therefore always terminates in review:needs-user.
                 mode, role = "fix", "fix"
                 round_number = max(rounds, 1)
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
-                if len(missed) >= MISSED_FIX_LIMIT:
+                missed, missed_total = _missed_fix_budget(
+                    worker_pr, comments, bot_login, round_number, _readmission_cutoff,
+                    repo, number)
+                if missed >= MISSED_FIX_LIMIT:
                     # Missed dispatches ARE capacity starvation (the allocator found no slot
-                    # every tick) -> the machine-owned park, never a fake human question.
+                    # every tick) -> the machine-owned park, never a fake human question. The
+                    # charge is WINDOWED by the readmission cutoff (#555 recurrence gap) so a
+                    # human unpark grants real dispatch capacity; the fingerprint carries the
+                    # LIFETIME count, which is monotone across windows.
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   f"{len(missed)} consecutive fix dispatches missed for round "
+                                   f"{missed} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR",
-                                   park_class="capacity", bot_login=bot_login)
+                                   park_class="capacity", bot_login=bot_login,
+                                   head_sha=head_sha,
+                                   attempt_key=f"missed{round_number}={missed_total}")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
@@ -2748,13 +2978,18 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # corresponds to the clean synthetic round-0 budget posture; the trusted verdict
                 # record is still required below before a verdict-seeded fixer may run.
                 round_number = max(rounds, 1)
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
-                if len(missed) >= MISSED_FIX_LIMIT:
-                    # Same capacity-starvation classification as the repair-state branch above.
+                missed, missed_total = _missed_fix_budget(
+                    worker_pr, comments, bot_login, round_number, _readmission_cutoff,
+                    repo, number)
+                if missed >= MISSED_FIX_LIMIT:
+                    # Same capacity-starvation classification — and the same readmission
+                    # windowing + attempt fingerprint — as the repair-state branch above.
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   f"{len(missed)} consecutive fix dispatches missed for round "
+                                   f"{missed} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR",
-                                   park_class="capacity", bot_login=bot_login)
+                                   park_class="capacity", bot_login=bot_login,
+                                   head_sha=head_sha,
+                                   attempt_key=f"missed{round_number}={missed_total}")
                     continue
                 verdict_file = record_file_path(ledger_root, registry_root,
                                                 worker_pr.verdict_path(repo, number, round_number))
@@ -3297,9 +3532,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # labels, and the local provenance checkouts BEFORE anything launches; an item
         # whose crate re-reads busy (a parked draft went ready, a new worker PR opened)
         # defers to the next tick instead of racing a PR that can now merge into it.
+        # ONE live view per repo per tick, shared by the busy revalidation and the capacity-park
+        # readmission sweep below (they must not disagree about the live hold/linkage state, and
+        # the issue listing is a paginated API read worth spending once).
+        live_issue_labels = _live_issue_labels(repo)
+        claim_provenance = _claim_provenance_map(repo, registry_root, ledger_root)
         live_dispatchable = revalidate_items_against_live_pulls(
-            repository["items"], repo, pull_pages, _live_issue_labels(repo),
-            _claim_provenance_map(repo, registry_root, ledger_root),
+            repository["items"], repo, pull_pages, live_issue_labels, claim_provenance,
             # [round-5 P1] the cross-lane lease partition reads the ledger-branch checkout;
             # an unreadable ledger view yields None and the partition fails toward exclusion.
             leases=_ledger_leases(ledger_root), now=int(time.time()))
@@ -3311,6 +3550,29 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         _apply_disarm_items(
             [entry for entry in plan["disarm_items"] if entry["repo"] == repo],
             repo, script_dir, bot_login, lanes["disarm"])
+
+        # [registry #614] AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause
+        # has demonstrably cleared. It runs on the LIVE listing because PLAN's pure walk excludes
+        # every parked PR outright (nothing downstream can see them), and it re-admits by doing
+        # exactly what a human gesture does — receipt FIRST, then clear the machine label(s) — so
+        # the PR re-enters the ordinary enumeration next tick with a real budget window. Skipped
+        # without the App bot login or the target token: the receipts are bot-authored and the
+        # label writes need that token, and a re-admission that cannot be receipted must not
+        # happen. An unreadable health window re-admits NOTHING (fail closed).
+        if bot_login and _target_token(repo):
+            if not health_window_loaded:
+                health_window = _read_model_health_window(
+                    model_health, registry_repo, int(time.time()))
+                health_window_loaded = True
+            if health_window is None:
+                print(f"::warning::auto-readmit skipped for {repo}: the model-health window is "
+                      "unreadable, so no capacity park can prove its cause cleared — every park "
+                      "stands (fail closed)")
+            else:
+                _readmit_capacity_parks(
+                    repo, pull_pages, live_issue_labels, claim_provenance, bot_login,
+                    script_dir, worker_pr,
+                    _capacity_recovery_probe(model_health, health_window, int(time.time())))
 
         for item in repository["items"]:
             number = item["number"]
@@ -3878,6 +4140,19 @@ def _review_fix_workflow_values():
     ttl_review = re.search(r'prefix="review:";[^\n]*\bttl=(\d+)', claim_span)
     ttl_fix = re.search(r'prefix="fix:";[^\n]*\bttl=(\d+)', claim_span)
     assert ttl_review and ttl_fix, "claim job local review/fix ttl= literals not found"
+    # Issue #560 lane-hand-over wiring, pinned to the WORKFLOW (the python halves cannot see it):
+    # the `run` job must EXPORT stage-verdict's staged/stale_reason, the `outcome` job must ADMIT
+    # the staged-nothing path (its old `if` skipped the whole job, which is why review:changes was
+    # never cleared), it must INVOKE worker-pr.py fix-lane-defer, and the `release` job that frees
+    # the `fix:<repo>#<pr>` claim must stay UNCONDITIONAL and independent of the outcome job.
+    release_span = spans.get("release")
+    assert release_span is not None, "review-fix.yml is missing the release job"
+    outcome_span = spans.get("outcome")
+    assert outcome_span is not None, "review-fix.yml is missing the outcome job"
+    release_if = re.search(r"(?m)^    if: (.+)$", release_span)
+    release_needs = re.search(r"(?m)^    needs: (.+)$", release_span)
+    outcome_if = re.search(r"(?m)^    if: (.+)$", outcome_span)
+    assert release_if and release_needs and outcome_if, "review-fix.yml if/needs not parsable"
     return {
         "resolve_s": _fixed_minutes("resolve") * 60,
         "claim_s": _fixed_minutes("claim") * 60,
@@ -3886,7 +4161,82 @@ def _review_fix_workflow_values():
         "run_fix_s": int(run_m.group(2)) * 60,
         "local_review_ttl": int(ttl_review.group(1)),
         "local_fix_ttl": int(ttl_fix.group(1)),
+        "run_exports_staged": "verdict_staged: ${{ steps.stage-verdict.outputs.staged }}"
+                              in run_span,
+        "run_exports_stale_reason":
+            "verdict_stale_reason: ${{ steps.stage-verdict.outputs.stale_reason }}" in run_span,
+        "outcome_if": outcome_if.group(1),
+        "outcome_hands_over": "worker-pr.py fix-lane-defer" in outcome_span,
+        # Round-2 finding 1: the hand-over must also be told WHICH head the verdict was not bound
+        # to, or it can only flip the label and the spin relocates into the review lane's
+        # already_done exit. The CLI makes --head-sha required, so a workflow that stops passing it
+        # fails the step loudly — but pin the wiring statically too, since a red step every tick is
+        # still a regression this gate should catch before merge.
+        "outcome_passes_head_sha": bool(re.search(
+            r"fix-lane-defer(?:[^\n]|\n)*?--head-sha \"\$\{\{ needs\.resolve\.outputs\.head_sha "
+            r"\}\}\"", outcome_span)),
+        "release_if": release_if.group(1),
+        "release_needs": release_needs.group(1),
     }
+
+
+# The `already_done` idempotence predicate embedded in review-fix.yml's resolve step, addressed by
+# LINE-ANCHORED regexes rather than by exact indentation-bearing literals (#584 follow-up finding 3).
+_RF_ALREADY_DONE_ANCHOR = r"(?m)^[ \t]*already_done = False$"
+_RF_ALREADY_DONE_END = r"(?m)^[ \t]*#[ \t]*REGISTRY provenance"
+
+
+def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None):
+    """Extract a python block VERBATIM out of a review-fix.yml step's `run:` script so a
+    cross-script self-test can execute the WORKFLOW's real predicate instead of a re-implemented
+    copy that can silently drift from it.
+
+    PARSED, not text-sliced (#584 follow-up finding 3). The previous implementation sliced the raw
+    file with two `str.index()` calls on indentation-bearing literals ("          already_done =
+    False\\n"), so ANY reflow of that YAML — re-indenting the job, changing the block-scalar style,
+    moving the step — killed the REQUIRED `gate` check with a bare `ValueError: substring not found`
+    that named neither the file, the anchor, nor what to update. Loading the YAML makes block-scalar
+    indentation the parser's problem (a `run:` scalar comes back already de-indented, so a reflow
+    that preserves the script is invisible here) and EVERY failure mode now raises an ACTIONABLE
+    AssertionError naming the anchor and the edit that fixes it.
+
+    PyYAML is already a hard dependency of the enrolled self-test suite (resolve-conflicts.py's
+    validate_syntax_blob imports it, and its --self-test exercises that path), and pr-gate.yml
+    installs it version+hash-locked BEFORE running the suite — so this adds no new gate dependency.
+
+    `source` (the workflow text) exists so the self-test can feed a REFLOWED copy through and prove
+    the extraction survives it."""
+    import yaml  # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
+    if source is None:
+        path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
+        assert path.is_file(), f"review-fix.yml not found for the {what} pin: {path}"
+        source = path.read_text(encoding="utf-8")
+    try:
+        document = yaml.safe_load(source)
+    except yaml.YAMLError as exc:
+        raise AssertionError(
+            f"review-fix.yml does not parse as YAML, so the {what} pin cannot be derived: "
+            f"{exc}") from None
+    steps = (((document or {}).get("jobs") or {}).get(job) or {}).get("steps")
+    assert isinstance(steps, list), (
+        f"review-fix.yml exposes no jobs.{job}.steps list, so the {what} pin cannot be derived — "
+        f"if the `{job}` job was renamed, re-point the `job=` argument in dispatch-claim.py")
+    matches = [step["run"] for step in steps
+               if isinstance(step, dict) and isinstance(step.get("run"), str)
+               and re.search(anchor, step["run"])]
+    assert len(matches) == 1, (
+        f"expected EXACTLY ONE `run:` step in review-fix.yml's `{job}` job to match the {what} "
+        f"anchor {anchor!r}; found {len(matches)}. The workflow's {what} was moved, renamed or "
+        f"rewritten — re-point the anchor constant in dispatch-claim.py so this cross-script pin "
+        f"keeps EXECUTING the workflow's real code instead of failing on a text address.")
+    run = matches[0]
+    begin = re.search(anchor, run)
+    end = re.search(end_anchor, run[begin.start():])
+    assert end, (
+        f"review-fix.yml's {what} block starts at {anchor!r} but no longer ends at "
+        f"{end_anchor!r} — re-point the end-anchor constant in dispatch-claim.py so the extracted "
+        f"block still stops before the code that follows it.")
+    return textwrap.dedent(run[begin.start():begin.start() + end.start()])
 
 
 def _self_test():
@@ -3946,6 +4296,32 @@ def _self_test():
     # would hold the same account for different windows.
     assert _wf["local_review_ttl"] == REVIEW_TTL, _wf["local_review_ttl"]
     assert _wf["local_fix_ttl"] == FIX_TTL, _wf["local_fix_ttl"]
+    # Issue #560 lane-hand-over wiring (see _review_fix_workflow_values). Without these the fix
+    # lane silently re-acquires the SAME deferred PR every dispatch tick: the enumerator's bucket
+    # is the review:changes label, and only this wiring clears it.
+    assert _wf["run_exports_staged"], "review-fix.yml run job must export verdict_staged (#560)"
+    assert _wf["run_exports_stale_reason"], (
+        "review-fix.yml run job must export verdict_stale_reason (#560)")
+    assert "needs.run.outputs.verdict_stale_reason != ''" in _wf["outcome_if"], (
+        "review-fix.yml outcome job must ADMIT the staged-nothing fix path (#560): "
+        f"{_wf['outcome_if']}")
+    assert _wf["outcome_hands_over"], (
+        "review-fix.yml outcome job must invoke worker-pr.py fix-lane-defer (#560)")
+    assert _wf["outcome_passes_head_sha"], (
+        "review-fix.yml outcome job must pass --head-sha to fix-lane-defer (#560 round-2 finding "
+        "1): without the disproved head the stale reviewed-sha assertion cannot be retracted and "
+        "the hand-over only RELOCATES the spin into the review lane's already_done exit")
+    # The claim/lease release must not depend on the hand-over: it frees `fix:<repo>#<pr>` on
+    # EVERY path (always() + acquired) from a job that does not `needs:` the outcome job, so a
+    # deferred fix never holds the per-PR single-flight lease into the next tick.
+    assert "always()" in _wf["release_if"] \
+        and "needs.claim.outputs.acquired == 'true'" in _wf["release_if"], _wf["release_if"]
+    assert "outcome" not in _wf["release_needs"], (
+        "review-fix.yml release must not depend on the outcome job (#560 lease release): "
+        f"{_wf['release_needs']}")
+    print("  ok   #560: review-fix.yml exports the defer reason, admits the staged-nothing "
+          "outcome path, invokes fix-lane-defer, and still releases the fix lease "
+          "unconditionally")
 
     # #500 round-2: execute the REAL dispatch() call site for every decline-escalation tripwire.
     # The round-1 helper-only checks could stay green if dispatch stopped calling the helper; this
@@ -4201,6 +4577,29 @@ def _self_test():
     assert [call[0] for call in forged["api_calls"]] == ["POST"], forged
     assert len(forged["helper_calls"]) == 1 and forged["claim_calls"] == 0, forged
     print("  ok   decline tripwire (e): bot marker is idempotent; third-party forgery is ignored")
+
+    # (f) [registry #596] `auth` is NOT a decline. A whole window of credential-outage outcomes for
+    # the SAME issue — more than DECLINE_ESCALATION_MIN of them — must perform NO escalation: no
+    # marker, no impl->research reroute, no park, and the ordinary deferred claim stays live.
+    # This is the ladder half of #596: acct01's hourly-expiring codex token produced runs of `auth` outcomes
+    # that must never read as "the model gave up on this task".
+    auth_records = [
+        model_health.make_record("openai", "a" * 16, "codex", "auth", f"600{i}.1",
+                                 decline_now - 60 + (i * 10))
+        for i in range(DECLINE_ESCALATION_MIN + 3)
+    ]
+    assert len(auth_records) > DECLINE_ESCALATION_MIN, auth_records
+    assert {r["exit_class"] for r in auth_records} == {model_health.CLASS_AUTH}, auth_records
+    trip_f = run_decline_tripwire(auth_records)
+    assert trip_f["api_calls"] == [] and trip_f["helper_calls"] == [], trip_f
+    assert trip_f["claim_calls"] == 1, trip_f
+    assert DECLINE_ESCALATION_MARKER not in trip_f["output"], trip_f["output"]
+    # The evidence selector itself is the guard: auth rows never enter the decline window, while a
+    # genuine no_change pair still does (so the ladder is not disabled, only made honest).
+    assert _issue_no_change_outcomes(model_health, auth_records, 500) == [], auth_records
+    assert len(_issue_no_change_outcomes(
+        model_health, auth_records + [no_change_a, no_change_b], 500)) == 2
+    print("  ok   decline tripwire (f): a run of auth outcomes never advances the decline ladder")
 
     fixture = {
         "schema": SCHEMA,
@@ -4936,6 +5335,240 @@ def _self_test():
         repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
                     login="human", labels=["review:changes"])],
         provenance, [], issue_labels, now) == []
+
+    # ---- issue #560 OWNERSHIP TRANSFER (cross-script, end-to-end, across every CI state) -----
+    # The FIX lane spun on unbound legacy verdicts: the fixer refused to stage a verdict that is
+    # not bound to the live head, deferred "to a fresh review", and left review:changes on the
+    # PR — so THIS enumerator re-admitted it as needs-fix on every ~8min dispatch tick while the
+    # review lane (keyed on review:needs) never saw it. Live 2026-07-24: sparq#3523/#3542/#3572/
+    # #3573/#3608 burned ~35 fix runs/hour that way until the labels were flipped by hand.
+    #
+    # ROUND-2 FINDING 1: a LABEL FLIP ALONE ONLY RELOCATES THAT SPIN. The production state is a
+    # COMPLETED request-changes review, so the PR body carries `sparq-reviewed-sha == head` (the
+    # marker is bound LAST in review-fix.yml's outcome job). A DRAFTED PR whose marker matches the
+    # live head is NOT re-emitted as needs-review by the block above; what happens instead depends
+    # entirely on CI — green becomes `stranded` (whose review dispatch then exits `already_done`
+    # with no work done: the same successful spin one lane over), red becomes needs-ci-fix (the fix
+    # lane again), and pending/unknown matches nothing at all, leaving NO lane owning the PR.
+    #
+    # So assert OWNERSHIP, not a label: drive the REAL post-defer PR state (labels AND reviewed-sha
+    # marker) out of worker-pr.py's projections and require, for EVERY CI state, exactly ONE item
+    # owned by the REVIEW lane. Every fixture carries the marker. The label-only counterfactual is
+    # asserted right below it, so none of this is vacuous: deleting either half of the hand-over —
+    # the label transition or the marker retraction — flips these red.
+    _worker_pr = _load_module(
+        "registry_worker_pr", Path(__file__).resolve().with_name("worker-pr.py"))
+    _bound_body = f"desc\n\n<!-- sparq-reviewed-sha:{sha_a} -->\n"
+
+    def _ci_states():
+        """The four CI postures the ownership proof must hold over. `None` is the UNKNOWN posture
+        (no snapshot at all — a degraded/absent check-run read); a stale head_sha collapses to the
+        same thing inside the enumerator."""
+        base = {"head_sha": sha_a, "conflicting": False, "armed": False, "failing_legs": []}
+        return {
+            "green": {41: {**base, "gate": "success"}},
+            "red": {41: {**base, "gate": "failure", "failing_legs": ["workspace clippy"]}},
+            "pending": {41: {**base, "gate": "pending"}},
+            "unknown": None,
+        }
+
+    # ---- #584 FOLLOW-UP FINDING 3: the `already_done` predicate is PARSED out of review-fix.yml,
+    # not text-sliced. Extract it ONCE (the old code re-sliced the raw file inside the reason loop).
+    _ad_src = _review_fix_step_python(
+        _RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END, "already_done idempotence predicate")
+    assert "already_done = False" in _ad_src and "sparq-reviewed-sha" in _ad_src, _ad_src
+    _spun = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                 labels=[_worker_pr.FIX_LANE_PR_LABEL], body=_bound_body)
+    for _ci, _status in _ci_states().items():
+        assert [item["state"] for item in enumerate_review_items(
+            repo, [_spun], provenance, [], issue_labels, now, pr_status=_status)] == \
+            ["needs-fix"], ("pre-defer lane", _ci)
+    for _reason in _worker_pr.FIX_LANE_DEFER_REASONS:
+        _action = _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL})
+        _after = sorted(_worker_pr.fix_lane_defer_labels(
+            {_worker_pr.FIX_LANE_PR_LABEL}, _action))
+        _marker = _worker_pr.fix_lane_defer_marker_action(_action, sha_a, sha_a)
+        # The hand-over removed the fix lane's admission label AND retracted the stale marker.
+        assert _worker_pr.FIX_LANE_PR_LABEL not in _after, (_reason, _after)
+        assert _marker == "invalidate", (_reason, _marker)
+        _handed_sha = _worker_pr.UNBOUND_REVIEWED_SHA
+        _handed = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=_after,
+                       body=f"desc\n\n<!-- sparq-reviewed-sha:{_handed_sha} -->\n")
+        for _ci, _status in _ci_states().items():
+            _items = enumerate_review_items(repo, [_handed], provenance, [], issue_labels, now,
+                                            pr_status=_status)
+            _states = [item["state"] for item in _items]
+            # EXACTLY ONE lane owns the PR, and it is the REVIEW lane — the only lane that can
+            # mint the head-bound verdict the fixer refuses to run without. No CI state may leave
+            # the PR ownerless, and none may hand it back to the fix lane.
+            assert _states == ["needs-review"], (_reason, _ci, _after, _states)
+            assert _review_item_lane(_states[0]) == "review", (_reason, _ci, _states)
+            assert "needs-fix" not in _states, (_reason, _ci, _after, _states)
+        # The review lane then provably TAKES ownership at review-fix.yml's own admission
+        # boundary: execute the ACTUAL `already_done` predicate embedded in its resolve step
+        # against the post-defer body. A retained marker would make it skip without working.
+        # (Extracted via the PARSED helper — #584 follow-up finding 3 — so a reflow of that YAML
+        # can no longer red this REQUIRED gate with a bare `ValueError: substring not found`.)
+        for _body, _want in ((_bound_body, True), (_handed["body"], False)):
+            _ns = {"re": re, "mode": "review", "head_sha": sha_a, "pull": {"body": _body}}
+            exec(_ad_src, _ns)  # noqa: S102 — repository-owned workflow source
+            assert _ns["already_done"] is _want, (_reason, _want, _body)
+    # NON-VACUITY / counterfactual: the round-1 fix (flip the label, KEEP the marker) does NOT
+    # transfer ownership. It only moves the spin — green strands (whose review dispatch exits
+    # already_done), red returns to the fix lane, and pending/unknown owns nothing at all.
+    _label_only = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                       labels=[_worker_pr.REVIEW_LANE_PR_LABEL], body=_bound_body)
+    _relocated = {_ci: [item["state"] for item in enumerate_review_items(
+        repo, [_label_only], provenance, [], issue_labels, now, pr_status=_status)]
+        for _ci, _status in _ci_states().items()}
+    assert _relocated == {"green": ["stranded"], "red": ["needs-ci-fix"],
+                          "pending": [], "unknown": []}, _relocated
+    # A hold/park defers WITHOUT a lane change or a marker write (the park itself already excludes
+    # the PR from both lanes, so the spin cannot recur): review:parked keeps it out entirely.
+    _parked_after = sorted(_worker_pr.fix_lane_defer_labels(
+        {_worker_pr.FIX_LANE_PR_LABEL}, "hold"))
+    assert _parked_after == [_worker_pr.FIX_LANE_PR_LABEL], _parked_after
+    assert _worker_pr.fix_lane_defer_marker_action("hold", sha_a, sha_a) == "keep"
+    for _ci, _status in _ci_states().items():
+        assert enumerate_review_items(
+            repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, body=_bound_body,
+                        labels=_parked_after + [MACHINE_PARK_PR_LABEL])],
+            provenance, [], issue_labels, now, pr_status=_status) == [], _ci
+    # ...and finding 2's abort leaves the parked PR byte-identical on BOTH axes: the park is never
+    # converted into review:needs-user and the marker is never touched.
+    _aborted = sorted(_worker_pr.fix_lane_defer_labels(
+        {_worker_pr.FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL},
+        _worker_pr.FIX_LANE_ABORT_ACTION))
+    assert _aborted == [_worker_pr.FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL], _aborted
+    assert "review:needs-user" not in _aborted, _aborted
+    assert _worker_pr.fix_lane_defer_marker_action(
+        _worker_pr.FIX_LANE_ABORT_ACTION, sha_a, sha_a) == "keep"
+    print("  ok   #560: the unbound-verdict defer transfers OWNERSHIP to the review lane in every "
+          "CI state (label flip + stale reviewed-sha retraction; no needs-fix re-admission, no "
+          "already_done skip, no ownerless posture) and a park aborts it untouched")
+
+    # ---- #584 FOLLOW-UP FINDING 1, CROSS-SCRIPT: THE HAND-OVER MUST NOT DISARM A PASSED PR. ------
+    # The fix lane does NOT only admit review:changes: GAP-A emits `needs-ci-fix` from a
+    # concluded-RED gate on the current head alone, review-state-AGNOSTIC. So a NON-DRAFT,
+    # review:pass, ARMED PR with a red gate is routed into the FIX lane, stage-verdict finds no
+    # head-bound FIX verdict and defers — and the pre-fix hand-over retracted the reviewed-sha
+    # marker on it (action "noop": review:changes was never live). enumerate_disarm_items reads
+    # `marker != head` on an ARMED PR as a safety violation, so the very next tick would
+    # disable-auto + dequeue + REDRAFT a passed, armed, ready PR. LIVE at the time of this fix:
+    # sparq#2521 (review:pass + trust-surface, non-draft, --auto armed, `docs-quality quick-gates`
+    # genuinely failing) was the ONLY review:pass PR in the sparq repo and sat on exactly this path.
+    # The hand-over's REAL projection over this namespace drives the fixture — nothing here is
+    # hard-coded to the fixed behaviour, so a regression in worker-pr.py reaches the consequence
+    # assertion below instead of being caught by a restatement of the fix.
+    _pass_labels = {_worker_pr.PASS_LANE_PR_LABEL}
+    _pass_decided = _worker_pr.fix_lane_defer_action(_pass_labels)
+    _pass_after = sorted(_worker_pr.fix_lane_defer_labels(_pass_labels, _pass_decided))
+    _pass_marker = _worker_pr.fix_lane_defer_marker_action(_pass_decided, sha_a, sha_a)
+    _pass_body_sha = (_worker_pr.UNBOUND_REVIEWED_SHA if _pass_marker == "invalidate" else sha_a)
+
+    def _armed_pass_pull(reviewed, labels=None):
+        """The live sparq#2521 posture: non-draft, review:pass, auto-merge armed, marker `reviewed`."""
+        return pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                    labels=_pass_after if labels is None else labels,
+                    body=f"desc\n\n<!-- sparq-reviewed-sha:{reviewed} -->\n")
+
+    _armed_status = {41: {"head_sha": sha_a, "conflicting": False, "armed": True,
+                          "gate": "failure", "failing_legs": ["docs-quality quick-gates"]}}
+    # THE CONSEQUENCE, through the real projection: the post-hand-over PR must NOT be emitted for
+    # disarm. If the hand-over retracts this PR's marker, `_pass_body_sha` becomes `none` and the
+    # safety net fires — disable-auto + dequeue + REDRAFT on a passed, armed, ready PR.
+    _pass_disarm = enumerate_disarm_items(repo, [_armed_pass_pull(_pass_body_sha)], _armed_status,
+                                          provenance, bot_login=bot)
+    assert _pass_disarm == [], (
+        "the fix-lane hand-over's own projection would DISARM + REDRAFT a passed armed PR "
+        f"(marker action {_pass_marker!r} -> reviewed_sha {_pass_body_sha!r}): {_pass_disarm}")
+    assert _pass_decided == _worker_pr.FIX_LANE_PASS_ACTION, _pass_decided
+    assert _pass_after == [_worker_pr.PASS_LANE_PR_LABEL], _pass_after
+    assert _pass_marker == "keep", _pass_marker
+    # NON-VACUITY: the SAME enumerator DOES emit the PR once the marker is retracted, so the
+    # assertion above is a live property of this fixture and not a quiet no-op. This is also the
+    # exact pre-fix behaviour — the old projection took `noop` on this namespace and `noop`
+    # retracts — so the counterfactual is the history, not a straw man.
+    _would_disarm = enumerate_disarm_items(
+        repo, [_armed_pass_pull(_worker_pr.UNBOUND_REVIEWED_SHA)], _armed_status, provenance,
+        bot_login=bot)
+    assert [(item["pr_number"], item["reviewed_sha"]) for item in _would_disarm] == \
+        [(41, _worker_pr.UNBOUND_REVIEWED_SHA)], _would_disarm
+    assert _worker_pr.fix_lane_defer_marker_action("noop", sha_a, sha_a) == "invalidate"
+    # The route in: GAP-A admits this PR to the FIX lane on the red gate ALONE, with no review:changes
+    # anywhere — which is why the hand-over ever ran on it. (Asserted so a future enumerator change
+    # that stops routing passed PRs into the fix lane makes this whole block visibly moot instead of
+    # quietly vacuous.)
+    _pass_admission = [item["state"] for item in enumerate_review_items(
+        repo, [_armed_pass_pull(sha_a)], provenance, [], issue_labels, now,
+        pr_status=_armed_status)]
+    assert _pass_admission == ["needs-ci-fix"], _pass_admission
+    assert _review_item_lane("needs-ci-fix") == "fix", "needs-ci-fix must be a FIX-lane state"
+    # The DISCRIMINATION: the normal review:changes namespace still retracts (asserted above as
+    # _marker == "invalidate"), so the guard is scoped to the pass and did not disable the fix.
+    assert _worker_pr.fix_lane_defer_marker_action(
+        _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL}), sha_a, sha_a) == \
+        "invalidate"
+    print("  ok   #584 f1: the lane hand-over stands down on review:pass — the marker survives, so "
+          "enumerate_disarm_items does NOT disarm+redraft a passed armed PR (the retracted-marker "
+          "counterfactual does), while review:changes still retracts")
+
+    # ---- #584 FOLLOW-UP FINDING 3: A REFLOW OF review-fix.yml MUST NOT RED THIS GATE WITH A BARE
+    # `ValueError: substring not found`. The old extraction addressed the block by two exact
+    # indentation-bearing literals via str.index(). Round-trip the workflow through the YAML parser
+    # to produce a REFLOWED-BUT-EQUIVALENT document (a different serialisation entirely — the old
+    # slice literal is gone from the text) and require the SAME block back. ----
+    import yaml as _yaml  # already a hard self-test-suite dependency (resolve-conflicts.py)
+    _rf_text = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                / "review-fix.yml").read_text(encoding="utf-8")
+    _rf_reflowed = _yaml.safe_dump(_yaml.safe_load(_rf_text), default_flow_style=False, width=4096)
+    assert "          already_done = False\n" not in _rf_reflowed, \
+        "the reflow fixture is vacuous — the old text-slice literal survived it"
+    assert _review_fix_step_python(
+        _RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END, "already_done idempotence predicate",
+        source=_rf_reflowed) == _ad_src, "a reflowed-but-equivalent workflow changed the extraction"
+    # ...and when the anchor is GENUINELY gone the failure is an ACTIONABLE AssertionError naming
+    # the anchor and the edit — never a bare ValueError, and never a silent skip.
+    _rf_broken = _rf_text.replace("already_done = False", "already_done = bool(0)")
+    _rf_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate", source=_rf_broken)
+    except AssertionError as _exc:
+        _rf_error = ("actionable", str(_exc))
+    except ValueError as _exc:                       # the pre-fix failure mode
+        _rf_error = ("bare-valueerror", str(_exc))
+    assert _rf_error is not None, "a missing anchor must FAIL, never pass silently"
+    assert _rf_error[0] == "actionable", _rf_error
+    assert "already_done" in _rf_error[1] and "re-point the anchor" in _rf_error[1] \
+        and "review-fix.yml" in _rf_error[1], _rf_error
+    # A second matching step (an ambiguous address) is just as loud as none.
+    _rf_dupe = _rf_text.replace("          already_done = False\n",
+                                "          already_done = False\n          already_done = False\n")
+    _rf_dupe_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate", source=_rf_dupe)
+        _rf_dupe_extract = "extracted"
+    except AssertionError as _exc:
+        _rf_dupe_error, _rf_dupe_extract = str(_exc), "raised"
+    # Two anchors inside ONE step is still one matching step, so extraction succeeds — the
+    # ambiguity that must be loud is two matching STEPS.
+    assert _rf_dupe_extract == "extracted", _rf_dupe_error
+    _rf_two_steps = _yaml.safe_load(_rf_text)
+    _rf_two_steps["jobs"]["resolve"]["steps"].append(
+        {"name": "a copy of the predicate", "run": _ad_src})
+    _rf_two_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate",
+                                source=_yaml.safe_dump(_rf_two_steps, width=4096))
+    except AssertionError as _exc:
+        _rf_two_error = str(_exc)
+    assert _rf_two_error and "found 2" in _rf_two_error, _rf_two_error
+    print("  ok   #584 f3: review-fix.yml's already_done predicate is PARSED (a reflowed-equivalent "
+          "workflow yields the identical block) and every missing/ambiguous anchor raises an "
+          "actionable AssertionError instead of a bare ValueError")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
@@ -5902,6 +6535,119 @@ def _self_test():
             # (2) wrote a LEGACY round-7 verdict; the ledger-first resolution tests below
             # depend on the legacy round-7 copy being absent — remove the fixture residue.
             (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 7)).unlink()
+
+            # ---- #555 RECURRENCE GAP: the MISSED-FIX exhaustion branch must honour the
+            # readmission window and be IDEMPOTENT against an unchanged head.
+            #
+            # THE DEFECT (live): sparq PR #3488 was re-admitted 2026-07-22T16:36:56Z and
+            # re-escalated at 16:44:10Z — ~7 minutes later, UNCHANGED head, no work attempted;
+            # re-admitted again 19:37:39Z and re-escalated 2026-07-23T09:48:39Z. PR #3472
+            # re-escalated seven seconds after #3488's with byte-identical boilerplate, five
+            # days after the last commit or review round on either PR. `missed` markers are
+            # durable per-round state that NOTHING resets and this branch read the LIFETIME
+            # count — so the very next tick after any re-admission re-derived the same
+            # exhaustion and (with a gen-1 receipt standing) went straight to the ladder's
+            # question-class terminal. It needs no head advance and no review round to fire,
+            # which is exactly why it hit every PR in a sweep identically. ----
+            def stamped_missed(count, created, round_n, start=1):
+                return [dict(bot_comment(
+                    f"x {wiring_worker_pr.MARKER_KINDS['missed']} round={round_n} "
+                    f"run={i}.1 -->"), created_at=created)
+                    for i in range(start, start + count)]
+
+            def needs_user_flag(flag):
+                return [args[args.index(flag) + 1] for script, args in helper_calls
+                        if script == "worker-pr.py" and args[0] == "needs-user"
+                        and flag in args]
+
+            def label_event(kind, label, ts, login):
+                return {"event": kind, "label": {"name": label},
+                        "created_at": ts, "actor": {"login": login}}
+
+            # rounds=2 keeps the ROUND budget (base 3) out of the way, so the missed-fix branch
+            # is the one under test; round_number = max(rounds, 1) = 2.
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
+            write_verdict(2, None)
+            burned_misses = stamped_rounds(2, "2026-07-22T05:00:00Z") + stamped_missed(
+                MISSED_FIX_LIMIT, "2026-07-22T05:30:00Z", 2)
+            # (baseline, unchanged behaviour) no readmission gesture => the lifetime count
+            # parks, and the park carries its attempt fingerprint (live head + LIFETIME count).
+            fake["comments"] = burned_misses
+            fake.pop("timeline", None)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert [f"{MISSED_FIX_LIMIT} consecutive fix dispatches missed for round 2"
+                    in reason for reason in needs_user_reasons()] == [True], helper_calls
+            assert needs_user_flag("--head-sha") == [sha_a], helper_calls
+            assert needs_user_flag("--attempt-key") == [
+                f"missed2={MISSED_FIX_LIMIT}"], helper_calls
+            # (e) THE 7-MINUTE BOUNCE, reproduced: the maintainer re-admits (a proven-human
+            # unlabel of the machine park at the observed 16:36:56Z) and the sweep ticks again
+            # with an UNCHANGED head and NO new work attempted. Pre-fix the lifetime count
+            # re-derived the same exhaustion and re-escalated. It must now grant REAL capacity:
+            # zero chargeable misses in the window => NO park, and the fix chain is offered
+            # again (the trailing record-marker is the allocator saying "no slot", which is a
+            # fresh miss inside the new window — not an escalation).
+            fake["timeline"] = {41: [label_event("labeled", "review:parked",
+                                                "2026-07-22T16:00:00Z",
+                                                "sparq-orchestrator[bot]"),
+                                     label_event("unlabeled", "review:parked",
+                                                "2026-07-22T16:36:56Z", "jeswr")], 7: []}
+            alloc = FakeAllocator()
+            bounce_log = io.StringIO()
+            with contextlib.redirect_stdout(bounce_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert needs_user_reasons() == [], helper_calls
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert "the missed-fix budget for round 2 charges 0 of " \
+                f"{MISSED_FIX_LIMIT}" in bounce_log.getvalue(), bounce_log.getvalue()
+            # (c) a re-admission grants a FRESH allowance, not an unbounded one: once the
+            # WINDOW itself accumulates MISSED_FIX_LIMIT misses the park fires again — charged
+            # on the window (6), fingerprinted on the LIFETIME count (12, monotone across
+            # windows so two genuinely distinct windows can never read as "unchanged").
+            fake["comments"] = burned_misses + stamped_missed(
+                MISSED_FIX_LIMIT, "2026-07-23T10:00:00Z", 2, start=MISSED_FIX_LIMIT + 1)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert [f"{MISSED_FIX_LIMIT} consecutive fix dispatches missed for round 2"
+                    in reason for reason in needs_user_reasons()] == [True], helper_calls
+            assert needs_user_flag("--attempt-key") == [
+                f"missed2={MISSED_FIX_LIMIT * 2}"], helper_calls
+            # (3'/5') a BOT unlabel opens no window and a timeline read failure keeps the FULL
+            # count — the missed-fix budget fails in the SAME conservative direction as the
+            # round budget (never a fresh allowance on unproven data).
+            fake["comments"] = burned_misses
+            fake["timeline"] = {41: [label_event("unlabeled", "review:parked",
+                                                "2026-07-22T16:36:56Z",
+                                                "sparq-orchestrator[bot]")], 7: []}
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [] and needs_user_reasons(), (alloc.chains, helper_calls)
+            fake["timeline_error"] = True
+            alloc = FakeAllocator()
+            missed_probe_log = io.StringIO()
+            with contextlib.redirect_stdout(missed_probe_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [] and needs_user_reasons(), (alloc.chains, helper_calls)
+            assert "timeline read failed" in missed_probe_log.getvalue(), \
+                missed_probe_log.getvalue()
+            fake.pop("timeline_error", None)
+            # The ROUND-budget park on this same path also carries its fingerprint (live head +
+            # the GLOBAL round count — never the window-relative charge, which resets).
+            fake["comments"] = burned_era
+            fake.pop("timeline", None)
+            write_verdict(5, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            assert (needs_user_flag("--head-sha"), needs_user_flag("--attempt-key")) == (
+                [sha_a], ["rounds=5"]), helper_calls
+            (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 2)).unlink()
 
             # ---- finding A CLAIM glue: a review:parked item that PLAN re-admitted on label
             # STATE must re-prove the human gesture on the label TIMELINES here. No gesture
@@ -7179,6 +7925,157 @@ def _self_test():
     assert capacity_park_proof_required(["review:parked"], {"none"}) is True
     assert capacity_park_proof_required(["review:needs"], set()) is False
     assert capacity_park_proof_required([], set()) is False
+
+    # ---- [registry #614] the AUTOMATIC re-admission sweep: a MACHINE capacity park whose
+    # starvation cause has demonstrably cleared re-admits ITSELF, receipt-first. THE DEFECT it
+    # closes: only a HUMAN could clear a MACHINE-owned park, so the acct01 auth outage (#596)
+    # parked PRs that the credential fix could not recover — each needed a hand-unlabel. ----
+    model_health_mod = _load_module(
+        "registry_model_health_readmit", Path(__file__).resolve().parent / "model-health.py")
+    worker_pr_mod = _load_module(
+        "registry_worker_pr_readmit", Path(__file__).resolve().parent / "worker-pr.py")
+    readmit_bot = "sparq-orchestrator[bot]"
+    readmit_salt = "s3cret"
+    readmit_account = model_health_mod.account_hash("acct01", readmit_salt)
+    readmit_now = 1_800_000
+    park_epoch = readmit_now - 3600                 # the park landed an hour ago
+    park_stamp = model_health_mod._iso_z(park_epoch)
+
+    def health_record(cls, dt, run):
+        return model_health_mod.make_record("openai", readmit_account, "sol", cls, run,
+                                            readmit_now + dt)
+
+    # The live shape: the sole review account failed `auth` before the park, then recorded a
+    # SUCCESSFUL run after it (the credential fix landed).
+    recovered_window = [health_record("auth", -4000, "6001.1"),
+                        health_record("auth", -3800, "6002.1"),
+                        health_record(model_health_mod.SUCCESS, -600, "6003.1")]
+    still_broken_window = recovered_window[:2]
+    parked_row = {
+        "number": 41, "state": "open", "draft": True,
+        "user": {"login": readmit_bot},
+        "head": {"sha": "a" * 40, "ref": "sparq-agent/issue-7-abc",
+                 "repo": {"full_name": "example/repo"}},
+        "labels": [{"name": MACHINE_PARK_PR_LABEL}],
+    }
+    park_timeline = {
+        41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+              "created_at": park_stamp, "actor": {"login": readmit_bot},
+              "performed_via_github_app": None}],
+        7: [],
+    }
+
+    def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None):
+        """Run the sweep with every GitHub seam injected; returns (count, posted, cleared)."""
+        posted, cleared = [], []
+        count = _readmit_capacity_parks(
+            "example/repo", rows if rows is not None else [[parked_row]],
+            labels if labels is not None else {7: ["status:in-progress-review"]},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, window, readmit_now),
+            comments_fn=lambda _repo, _number: list(comments),
+            timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
+            post_comment=lambda _repo, number, body: posted.append((number, body)),
+            clear_labels=lambda pr, issue: cleared.append((pr, issue)),
+            log=lambda _line: None)
+        return count, posted, cleared
+
+    # A(a): the machine park + a post-park success on the failing account => re-admitted ONCE,
+    # RECEIPT FIRST, and the receipt names the evidence the admission consumed.
+    prev_target_probe = globals()["_target_is_human_maintainer"]
+    globals()["_target_is_human_maintainer"] = lambda _repo, login: login == "jeswr"
+    try:
+        count, posted, cleared = readmit_sweep(recovered_window)
+        assert count == 1 and cleared == [(41, 7)], (count, cleared)
+        assert len(posted) == 1 and posted[0][0] == 41, posted
+        receipt_body = posted[0][1]
+        assert worker_pr_mod.AUTO_READMIT_MARKER in receipt_body, receipt_body
+        assert f"openai/{readmit_account}/6003.1" in receipt_body, receipt_body
+        assert "acct01" not in receipt_body, receipt_body
+        print("  ok   auto-readmit (a): proven cause-recovery re-admits a machine park, "
+              "receipt-first")
+        # A(b): the SAME evidence, now receipted, never re-admits again — and because the receipt
+        # is not superseded by a NEWER park it converges the label strip idempotently instead.
+        receipted = [{"user": {"login": readmit_bot}, "body": receipt_body}]
+        count, posted, cleared = readmit_sweep(recovered_window, comments=receipted)
+        assert count == 1 and posted == [] and cleared == [(41, 7)], (count, posted, cleared)
+        print("  ok   auto-readmit (b): a receipted re-admission consumes NO new evidence "
+              "(converge only)")
+        # ... and once a NEWER park application supersedes that receipt, the same evidence is
+        # refused outright: a fresh park needs a fresh outage-and-recovery pair.
+        superseded = {41: park_timeline[41] + [
+            {"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+             "created_at": model_health_mod._iso_z(readmit_now - 60),
+             "actor": {"login": readmit_bot}, "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(recovered_window, comments=receipted,
+                                              timeline=superseded)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (b): the SAME evidence cannot re-earn a re-admission after a "
+              "NEW park")
+        # A(c): no post-park success => the park stands, nothing is written.
+        count, posted, cleared = readmit_sweep(still_broken_window)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (c): no proven recovery => the park stands, no mutation")
+        # A(d): an unreadable health window => the park stands (the probe yields no evidence).
+        count, posted, cleared = readmit_sweep(None)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        # ... as does a malformed record inside the window.
+        poisoned = recovered_window + [dict(recovered_window[-1], exit_class="totally-new")]
+        count, posted, cleared = readmit_sweep(poisoned)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (d): an unreadable/ambiguous health record => the park stands")
+        # A(e): a HUMAN-owned hold on EITHER surface is never auto-re-admitted.
+        human_pr = dict(parked_row, labels=[{"name": MACHINE_PARK_PR_LABEL},
+                                            {"name": "review:needs-user"}])
+        count, posted, cleared = readmit_sweep(recovered_window, rows=[[human_pr]])
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(
+            recovered_window, labels={7: ["status:parked", "needs:user"]})
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a human-owned hold on either surface is never "
+              "auto-re-admitted")
+        # A(e'): a park the MAINTAINER applied is human-owned — only a human clears it.
+        human_park = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                            "created_at": park_stamp, "actor": {"login": "jeswr"},
+                            "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(recovered_window, timeline=human_park)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a MAINTAINER-applied park is never auto-re-admitted")
+        # A(g): the per-PR cap terminates — AUTO_READMISSION_MAX markers (well-formed or not)
+        # refuse the next re-admission even with fresh evidence.
+        capped = [{"user": {"login": readmit_bot},
+                   "body": f"x {worker_pr_mod.AUTO_READMIT_MARKER} evidence=openai/x/{i} "
+                           f"at=zzz -->"}
+                  for i in range(_park_policy.AUTO_READMISSION_MAX)]
+        count, posted, cleared = readmit_sweep(recovered_window, comments=capped)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (g): the per-PR automatic cap terminates the loop")
+        # Trust boundary: a NON-bot PR, a fork head, and a PR with no live machine park are all
+        # invisible to the sweep.
+        for invisible in (dict(parked_row, user={"login": "drive-by"}),
+                          dict(parked_row, head={**parked_row["head"],
+                                                 "repo": {"full_name": "fork/repo"}}),
+                          dict(parked_row, labels=[{"name": "review:needs"}]),
+                          dict(parked_row, state="closed")):
+            count, posted, cleared = readmit_sweep(recovered_window, rows=[[invisible]],
+                                                   labels={7: []})
+            assert (count, posted, cleared) == (0, [], []), (invisible, count, posted, cleared)
+        print("  ok   auto-readmit: non-bot / fork / unparked / closed PRs are invisible")
+        # A per-PR failure never stops the sweep: an unreadable comments read skips ONE PR.
+        def boom_comments(_repo, _number):
+            raise DispatchError("comments unavailable")
+
+        skipped = _readmit_capacity_parks(
+            "example/repo", [[parked_row]], {7: []}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            worker_pr_mod, _capacity_recovery_probe(model_health_mod, recovered_window,
+                                                    readmit_now),
+            comments_fn=boom_comments,
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None)
+        assert skipped == 0, skipped
+        print("  ok   auto-readmit: an unreadable PR skips only itself (per-PR resilience)")
+    finally:
+        globals()["_target_is_human_maintainer"] = prev_target_probe
 
     # ---- round-3 Opus finding: a maintainer probe-CALL failure emits the distinct loud
     # ::warning:: diagnostic (and still fails toward not-human); a genuine not-a-maintainer

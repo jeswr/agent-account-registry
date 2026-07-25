@@ -645,6 +645,10 @@ jobs:
       exhausted: ${{ steps.budget.outputs.exhausted }}
       trust_outcome: ${{ steps.trust.outcome }}
       attempt_number: ${{ steps.attempt.outputs.number }}
+      # [registry #596] 'true' when THIS run's attempt receipt was voided as a credential outage.
+      # final_state must not park the issue on the "final allowed attempt produced no PR" arm when
+      # the attempt was never spent — that arm reads attempt_number, which the void cannot lower.
+      attempt_voided: ${{ steps.attempt-void.outputs.voided }}
     concurrency:
       group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
       cancel-in-progress: false
@@ -911,6 +915,9 @@ jobs:
           WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
           WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
           WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+          # Provider refresh tokens are ONE-TIME-USE (issue #596): a dry run must not consume the
+          # account's stored grant, so it materializes the mount without exchanging anything.
+          WORKER_PREFLIGHT_REFRESH: ${{ inputs.dry_run && 'skip' || 'refresh' }}
         run: bash registry/scripts/worker-prep.sh
 
       - name: Confirm dry-run boundary
@@ -974,7 +981,10 @@ jobs:
           if [[ "$MODEL_OUTCOME" == "success" ]]; then
             cls=success
           elif [[ "$MODEL_OUTCOME" == "skipped" ]]; then
-            cls=unknown   # pre-launch abort: no CLI ever ran
+            # Pre-launch abort: no CLI ever ran. worker-prep's host-side credential pre-flight
+            # (issue #596) nonetheless classifies its own failures into WORKER_EXIT_CLASS before the
+            # model step can run, so prefer that over a blanket `unknown`.
+            cls="${WORKER_EXIT_CLASS:-unknown}"
           else
             # failure OR cancellation/timeout: use the host-observed class when worker-live.sh
             # got far enough to write one; otherwise unknown.
@@ -987,6 +997,32 @@ jobs:
             echo "reset_hint=${WORKER_RESET_HINT:-}"
             echo "outcome_attempt=${GITHUB_RUN_ATTEMPT:-}"
           } >> "$GITHUB_OUTPUT"
+
+      # [registry #596] A CREDENTIAL-OUTAGE launch failure must NOT consume an attempt from the
+      # bounded deferred-retry budget. The attempt receipt above is the LAST gate before the model
+      # launches, so a launch that died on the worker account's credential (acct01's codex OAuth
+      # access token expires hourly while the fleet stores a static snapshot of it) burned a full
+      # attempt without the model ever running — and enough of those parked the issue
+      # (status:parked) exactly as if the model had declined the task, which inverts the park policy.
+      #
+      # It runs HERE rather than in `final_state` because the next dispatch tick re-reads the attempt
+      # budget from these durable receipts. The class gate lives in worker-pr.is_credential_outage
+      # (pure + self-tested), NOT in this `if:` — `setup`/`unknown`/timeouts stay CHARGED, keeping the
+      # bounded-crash accounting intact. The app-token-live token is the one record-attempt already
+      # used; no new capability, and this step precedes the target-code cargo gate below.
+      - name: Void the worker attempt on a credential-outage exit (never a decline)
+        id: attempt-void
+        if: ${{ always() && !inputs.dry_run && steps.attempt.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          EXIT_CLASS: ${{ steps.exit-class.outputs.class }}
+        run: |
+          python3 registry/scripts/worker-issue.py void-attempt \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --exit-class "$EXIT_CLASS"
 
       # TTL guard (audit-2026-07-17): App installation tokens live 60 minutes and app-token-live is
       # minted BEFORE the heavy checkout + toolchain + model run, so with worker_timeout_minutes=90
@@ -1015,7 +1051,26 @@ jobs:
 
       - name: Write back a rotated full account credential
         id: writeback
-        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' && steps.model.outcome != 'skipped' }}
+        # NO model-step guard (issue #596): rotation now happens in worker-prep's HOST-SIDE
+        # pre-flight, before the model step exists. Provider refresh tokens are one-time-use, so
+        # dropping this step because the model never launched would strand a consumed grant in the
+        # secret and kill the NEXT run on this account.
+        #
+        # NO PREPARE-STEP GUARD EITHER (retro-review of #614). `steps.prepare.outcome == 'success'`
+        # made this compensating action reachable ONLY from the success path — the same class as
+        # #604's root cause, where the round-void job was gated on the very verdict a credential
+        # outage prevents. The pre-flight consumes the ONE-TIME-USE refresh token EARLY inside
+        # prepare, and prepare then keeps going: materialize the minimal mount, assert no refresh
+        # material leaked, copy the tamper baseline, npm-install the pinned CLI, export $GITHUB_ENV.
+        # ANY failure in that window skipped this step, so the OLD grant was spent, the NEW grant
+        # died with the runner, and the account was PERMANENTLY dead until an interactive re-mint.
+        # The condition is now keyed to `always()` plus the ACCOUNT SELECTION (which identifies the
+        # secret to write and precedes the pre-flight), and worker-live.sh's rotation MARKER — the
+        # host-side "a rotation was obtained" receipt — decides whether there is anything to
+        # persist. With no marker this step is a no-op: it reports rotated=false and exits 0.
+        # Asserted by dispatch-secrets-guard.rotation_writeback_reachable_verdict, so restoring a
+        # success-only guard is a red tick rather than a silent regression.
+        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.selected.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
@@ -1223,6 +1278,7 @@ jobs:
           EXHAUSTED: ${{ needs.worker.outputs.exhausted }}
           TRUST_OUTCOME: ${{ needs.worker.outputs.trust_outcome }}
           ATTEMPT_NUMBER: ${{ needs.worker.outputs.attempt_number }}
+          ATTEMPT_VOIDED: ${{ needs.worker.outputs.attempt_voided }}
           MAX_ATTEMPTS: ${{ needs.resolve.outputs.max_attempts }}
           PR_URL: ${{ needs.worker.outputs.pr_url }}
         run: |
@@ -1238,10 +1294,19 @@ jobs:
             # PR is approved cross-provider and armed); the review loop owns it from here.
             status=in-progress-review
           elif [[ "$ACQUIRED" == true && "$TRUST_OUTCOME" == success \
+                  && "$ATTEMPT_VOIDED" != true \
                   && "$ATTEMPT_NUMBER" =~ ^[1-9][0-9]*$ \
                   && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ \
                   && "$ATTEMPT_NUMBER" -ge "$MAX_ATTEMPTS" ]]; then
             # Final allowed attempt ran without publishing a PR: the same budget-driven park.
+            #
+            # [registry #596] ...unless the attempt was VOIDED as a credential outage. This arm reads
+            # ATTEMPT_NUMBER, which the void cannot retroactively lower, so without this guard a
+            # final-attempt `auth` failure still parked the issue — the exact "credential rot
+            # silently converts into a park" inversion the void exists to stop. The park POLICY is
+            # untouched: an unvoided final attempt parks exactly as before, and the issue falls
+            # through to `deferred` so the next tick re-derives the (now un-charged) budget and
+            # re-dispatches.
             status=parked
           fi
           # FAIL LOUD on a failed write (issue #127): the old in-job step swallowed this as a

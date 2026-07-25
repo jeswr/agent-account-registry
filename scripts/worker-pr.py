@@ -17,9 +17,12 @@ Trust posture (locked decisions, review blueprint):
 """
 
 import argparse
+import ast
 import base64
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -55,6 +58,13 @@ LABEL_COLOURS = {
 # wins; park_policy.READMISSION_LABELS). Kept in REVIEW_LABELS so set_review_state's
 # mutually-exclusive namespace machinery converges it like any other review state.
 MACHINE_PARK_PR_LABEL = "review:parked"
+# The MACHINE-owned SOURCE-ISSUE twin of the park (park_policy.py invariant 2). Named here so the
+# write side can apply the SAME "ONE park predicate" dispatch-claim.enumerate_review_items applies
+# — capacity-parked iff EITHER machine label is live. live_human_holds only ever saw the PR-side
+# label, so a half-cleared pair (issue-side park alive, PR-side write veto-suppressed) read as "no
+# park" to every mutation path while the enumerator still treated the PR as parked.
+MACHINE_PARK_ISSUE_LABEL = "status:parked"
+MACHINE_PARK_LABELS = (MACHINE_PARK_PR_LABEL, MACHINE_PARK_ISSUE_LABEL)
 # Run-keyed durable markers (bot comments). Each carries the round + the workflow run key so a
 # re-run of the same phase is idempotent (mirror worker-issue record_attempt) and stop conditions
 # are computed from ordered, run-keyed markers — never raw comment counts.
@@ -70,6 +80,77 @@ ROUND_MARKER = "<!-- sparq-review-round:v1"
 # other durable marker: a model cannot forge one to un-charge rounds (post_findings defangs the
 # whole `<!-- sparq-` namespace in republished verdict text).
 ROUND_VOID_MARKER = "<!-- sparq-review-void:v1"
+# [registry #596] CREDENTIAL-OUTAGE exit classes: the SECOND void reason, alongside the #162
+# stale-head one above.
+#
+# WHY: the round marker is recorded BEFORE the model launches (bounded-crash accounting), and the
+# `outcome` job that would void it is gated on a validated verdict. So when a model launch dies on
+# the ACCOUNT's credential — acct01's codex OAuth access token expires hourly and the fleet stores
+# a static snapshot of it (registry #596) — the round stays CHARGED even though no review ever
+# happened. Observed live: `worker-live: model-exit-class=auth` on review-fix runs, 5 × auth against
+# 5 × success in one window for account fingerprint dc2d7519, then 2 more auth (+1 rate) in the
+# next. Each of those burns a review round, so a pure CREDENTIAL OUTAGE walks the PR through the
+# bounded round budget and into a capacity park exactly as if the reviewer had given up. That is the
+# inversion the #555 park policy exists to prevent: the park semantics are untouched here — we only
+# stop charging rounds nobody spent.
+#
+# WHICH classes. Exactly the classes worker-live.sh attributed to the PROVIDER, i.e. the raw
+# {auth, billing, session-limit, rate-limit} — the same set model-health.py folds into its
+# LAUNCH_FAIL_CLASSES ({auth, billing, limit, transient}). Both the raw worker-live spellings and
+# the folded decision-class names are accepted so either producer can be wired in. In every one of
+# them the CLI never reached the model, so there is no model judgment to charge a round for.
+#
+# `rate` (rate-limit) DECISION — deliberate, per #596: rate-limit is treated EXACTLY like auth
+# (non-chargeable). Reasoning: the round budget bounds how many times the MODEL gets to look at a
+# PR, and a 429/529/overloaded launch failure means it never looked. It is provider-side capacity,
+# not a decline, and it is already handled as a retryable condition by the reactive per-account
+# backoff (model-health.account_backoffs) — charging a round for it would make provider capacity
+# shortage indistinguishable from model non-productivity, which is the same category error as
+# charging for `auth`. `session-limit` and `billing` follow for the identical reason.
+#
+# DELIBERATELY EXCLUDED: `setup` (a runner/tooling fault) and `unknown` (a timeout, cancellation,
+# pre-launch abort, or unrecognised nonzero exit the host could NOT attribute to the provider).
+# Those keep the bounded-crash accounting the #162 comment above describes intact: a deterministic
+# crash must still exhaust the round budget and escalate, or a re-claim/re-crash loop becomes
+# unbounded. `unknown` in particular is the fail-safe fold target for every novel class, so making
+# it non-chargeable would silently un-charge everything.
+#
+# THE SET IS LOCKED TO model-health's FOLD MAP, not maintained by hand (retro-review of #604/#614).
+# #604 shipped this constant against worker-live.sh's five raw classes; #614 then added TWO MORE raw
+# classes on the same night — `credential-remint-required` and `credential-refresh-transient`, which
+# worker-prep.sh's HOST-SIDE credential pre-flight emits BEFORE any model runs — and folded them onto
+# auth / transient in model-health._EXIT_CLASS_MAP. The fold made the intent unambiguous, but the
+# fold happens in the model_health job, which runs AFTER `void-attempt`/`round-void` have already
+# read the RAW class: so a host-side credential pre-flight failure — the purest possible credential
+# outage, no model involved at all — was CHARGED a review round and could park the issue. Exactly the
+# inversion this constant exists to prevent, live throughout the acct01 outage (#596, alert #622).
+#
+# WHAT THE LOCK ACTUALLY GUARANTEES (corrected by the POST-MERGE RETRO-REVIEW OF #629 — #629's own
+# claim that "the CLASS is closed" was OVERSTATED and is restated here honestly). Two locks, with
+# distinct scopes:
+#   1. THE CONSUMER LOCK, bidirectional between the two CONSTANTS: the set-equality assertion in
+#      _self_test derives {raw class : its fold target is an outage decision class} from
+#      model-health._EXIT_CLASS_MAP and requires it to EQUAL this set (same shape as #595's
+#      `SEC_KEYWORDS == routing.toml match_labels` posture lock). A class added to the fold map alone,
+#      or un-charged here alone, is a red tick.
+#   2. THE EMITTER LOCK, producer -> consumer: #629 had NOTHING tying either constant to the PRODUCERS,
+#      so `broker-refresh.py` / `worker-prep.sh` could start emitting a new raw exit class with lock 1
+#      still green — it would fold to `unknown` and be CHARGED (fail-SAFE, but the same shape of
+#      drift). _emitted_credential_exit_classes now derives every credential class broker-refresh.py
+#      can emit, by PARSING its source, and requires each to be a key of the fold map.
+# Neither lock claims that the vocabulary is closed against a producer this derivation cannot read
+# (a brand-new emitter script would need its own derivation); what they close is the two directions
+# that actually caused #604 and #614.
+CREDENTIAL_OUTAGE_EXIT_CLASSES = frozenset({
+    # raw worker-live.sh classes
+    "auth", "billing", "session-limit", "rate-limit",
+    # raw worker-prep.sh HOST-SIDE credential pre-flight classes (#614). A dead stored grant and an
+    # unreachable token endpoint are both "the CLI never reached the model" — the strongest members
+    # of this set, since the model container was never even started.
+    "credential-remint-required", "credential-refresh-transient",
+    # model-health.py folded decision classes (the same conditions after the fold)
+    "limit", "transient",
+})
 MARKER_KINDS = {
     "nochange": "<!-- sparq-fix-nochange:v1",
     "gatefail": "<!-- sparq-fix-gatefail:v1",
@@ -96,7 +177,32 @@ PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
 # through readmission windows forever. Bot-authored + reserved-namespace like every other
 # durable marker (post_findings defangs the whole `<!-- sparq-` namespace in republished
 # verdict text).
+#
+# The receipt ALSO records the park's ATTEMPT FINGERPRINT (#555 recurrence gap) —
+# `head=<sha> attempt=<monotone-counter>`, park_policy.park_fingerprint — so a later
+# exhaustion that re-derives from the SAME per-PR state (unchanged head, no new round /
+# missed / nochange / gatefail marker) is recognised as a re-emission and skipped QUIETLY
+# instead of consuming the fresh readmission window and jumping the ladder straight to its
+# terminal. Both fields are OPTIONAL in the reader: a legacy (#555-era) receipt carries no
+# fingerprint, claims no idempotence, and is re-parked exactly once — which then records one.
 PARK_GENERATION_MARKER = "<!-- sparq-park-generation:v1"
+# The AUTOMATIC-READMISSION receipt (registry #614) — the SECOND member of the park-receipt
+# family, EXTENDING #610's generation receipts rather than replacing them. It is deliberately a
+# DISTINCT marker: the generation receipts ARE the escalation ladder's counter (len(receipts) ==
+# consumed budget windows), so folding automatic re-admissions into them would silently corrupt
+# the ladder. Fields: `evidence=<recovery-event key> at=<canonical recovery stamp>`.
+#
+# It records that the MACHINE re-admitted a machine capacity park on PROVEN cause-recovery
+# (park_policy invariant 3 / capacity_park_admission), and it carries the two properties the
+# whole bound rests on:
+#   - the evidence key is CONSUMED EXACTLY ONCE per PR: the same recovery event can never earn a
+#     second automatic re-admission, and a later park needs a NEW outage-and-recovery pair; and
+#   - the receipt COUNT is the per-PR cap counter (park_policy.AUTO_READMISSION_MAX), counted over
+#     MARKERS so a corrupt receipt cannot buy an extra re-admission.
+# It is also the durable GESTURE the receipt-driven CLAIM proof gate reads: the machine's own
+# re-admission has to be provable after the labels are gone, exactly like a human's unlabel.
+# Bot-authored + reserved-namespace like every other durable marker.
+AUTO_READMIT_MARKER = "<!-- sparq-auto-readmit:v1"
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
 # it cannot collide with a real cutoff).
@@ -122,6 +228,12 @@ ESCALATION_LADDERS = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna"
 PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
+# The UNBOUND marker value (the value worker-live.sh seeds into every fresh worker PR body). The
+# marker is an ASSERTION — "a review of THIS head completed end-to-end, so its outcome artifacts
+# (the head-bound registry verdict record) exist" — and `none` is the honest way to say no such
+# review exists for the live head. Writing it is how a lane hand-over RETRACTS a marker the
+# registry itself has just disproved (issue #560 round-2 finding 1).
+UNBOUND_REVIEWED_SHA = "none"
 # Reserved bot-marker namespace (issue #137). EVERY durable control marker this script writes and
 # later parses back out of BOT-AUTHORED comments — the review-round budget, per-round fix-outcome
 # counters, fix-model / model-pin escalation records, the progress grade, and the reviewed-sha
@@ -240,6 +352,16 @@ def _bot_comments(comments, bot_login):
     bot = bot_login.casefold()
     return [c for c in comments
             if str(c.get("user", {}).get("login", "")).casefold() == bot]
+
+
+def is_credential_outage(exit_class):
+    """PURE: True when a worker-live.sh exit class is a CREDENTIAL/CAPACITY OUTAGE and therefore
+    must not be charged against the review round budget (registry #596 — full rationale on
+    CREDENTIAL_OUTAGE_EXIT_CLASSES). Case/whitespace tolerant because the value crosses a workflow
+    output; `success`, `setup`, `unknown`, `no_change`, an empty value, and every unrecognised class
+    are FALSE — the fail direction is toward CHARGING, so a novel class can never silently
+    un-charge a round."""
+    return str(exit_class or "").strip().lower() in CREDENTIAL_OUTAGE_EXIT_CLASSES
 
 
 def _round_voids(comments, bot_login):
@@ -361,9 +483,40 @@ def park_generation_cutoffs(comments, bot_login, log=print):
     space-form source cutoff ("cutoff=2026-07-23 10:30:00Z -->") — invisible to the old
     `cutoff=(\\S+) -->` read, which made gen-1 repeat forever and gen-2 unreachable — is
     recovered onto the same canonical key."""
-    pattern = re.escape(PARK_GENERATION_MARKER) + r" gen=([0-9]+) cutoff=(.+?) -->"
+    return {record["window"] for record in park_generation_records(comments, bot_login, log)}
+
+
+def park_generation_fingerprints(comments, bot_login, log=print):
+    """The set of ATTEMPT FINGERPRINTS (park_policy.park_fingerprint — "<head-sha>/<attempt
+    counter>") already bound to a receipted capacity park (#555 recurrence gap). A due
+    exhaustion whose fingerprint is in this set re-derived from per-PR state that has not
+    moved since a park was already recorded — nothing was attempted, so the ladder skips it
+    QUIETLY instead of consuming the readmission window (park_ladder_decision "unchanged").
+
+    Legacy (#555-era) receipts carry no `head=`/`attempt=` fields and contribute NOTHING here:
+    absent identity proves nothing, so the first park after this change is always emitted (and
+    records a fingerprint for every tick after it)."""
+    return {record["fingerprint"]
+            for record in park_generation_records(comments, bot_login, log)
+            if record["fingerprint"]}
+
+
+def park_generation_records(comments, bot_login, log=print):
+    """Every well-formed bot-authored park-generation receipt as
+    {"window": key, "generation": int|None, "fingerprint": str|None} — the ONE receipt parser
+    park_generation_cutoffs (the escalation-ladder counter) and
+    park_generation_fingerprints (the unchanged-head idempotence key) both derive from, so
+    the two views can never disagree about which receipts are well-formed.
+
+    Malformed-field direction (round-3 finding 4, extended to the fingerprint fields): a
+    malformed CUTOFF drops the whole receipt (it can neither count as a consumed window nor
+    dedupe one — escalation is delayed, never fabricated); a malformed/absent FINGERPRINT
+    keeps the receipt but claims no idempotence (the park is re-emitted once, which records a
+    good fingerprint). Neither direction can fabricate a suppression."""
+    pattern = (re.escape(PARK_GENERATION_MARKER)
+               + r" gen=([0-9]+) cutoff=(.+?)(?: head=(\S+))?(?: attempt=(\S+))? -->")
     policy = _park_policy()
-    cutoffs = set()
+    records = []
     for comment in _bot_comments(comments, bot_login):
         for match in re.finditer(pattern, str(comment.get("body", ""))):
             cutoff = match.group(2)
@@ -374,8 +527,81 @@ def park_generation_cutoffs(comments, bot_login, log=print):
                         "receipts")
                     continue
                 cutoff = policy.canonical_ts(cutoff)
-            cutoffs.add(cutoff)
-    return cutoffs
+            records.append({
+                "window": cutoff,
+                "generation": int(match.group(1)),
+                "fingerprint": policy.park_fingerprint(match.group(3), match.group(4)),
+            })
+    return records
+
+
+def auto_readmission_records(comments, bot_login, log=print):
+    """Every WELL-FORMED bot-authored AUTOMATIC-readmission receipt (AUTO_READMIT_MARKER) as
+    {"key": evidence key, "at": canonical recovery stamp} — the durable record of each machine
+    re-admission of a machine capacity park (registry #614; park_policy.capacity_park_admission).
+
+    Bot-authored only, like every marker parser: a forged receipt must be able neither to
+    fabricate a re-admission nor to consume an evidence key the pipeline has not used.
+
+    Malformed-field direction: a receipt whose `at` is not a strict ISO-8601 stamp is dropped with
+    a loud log — it can prove no re-admission, so the park STAYS parked (the conservative
+    direction). It still counts toward the per-PR cap via auto_readmission_marker_count, so a
+    corrupt receipt can never buy an extra automatic re-admission."""
+    pattern = re.escape(AUTO_READMIT_MARKER) + r" evidence=(\S+) at=(\S+) -->"
+    policy = _park_policy()
+    records = []
+    for comment in _bot_comments(comments, bot_login):
+        for match in re.finditer(pattern, str(comment.get("body", ""))):
+            key, stamp = match.group(1), match.group(2)
+            if not policy.valid_timestamp(stamp):
+                log(f"::warning::malformed automatic-readmission receipt stamp {stamp!r} "
+                    "treated as absent — it can prove no re-admission (the park stands), and it "
+                    "still counts toward the automatic-readmission cap")
+                continue
+            records.append({"key": key, "at": policy.canonical_ts(stamp)})
+    return records
+
+
+def auto_readmission_marker_count(comments, bot_login):
+    """How many bot-authored AUTO_READMIT_MARKER receipts a PR carries, WELL-FORMED OR NOT — the
+    per-PR automatic-readmission cap counter (park_policy.AUTO_READMISSION_MAX). Counting markers
+    rather than parsed records is the load-bearing choice: a receipt with a corrupt field is still
+    proof that an automatic re-admission was granted, so it must spend cap budget."""
+    return sum(len(re.findall(re.escape(AUTO_READMIT_MARKER), str(comment.get("body", ""))))
+               for comment in _bot_comments(comments, bot_login))
+
+
+def auto_readmission_stamps(comments, bot_login, log=print):
+    """The canonical stamps of every well-formed automatic-readmission receipt — the budget
+    windows park_policy.effective_readmission_cutoff composes with the human cutoff so an
+    automatically re-admitted PR gets the SAME real capacity a human gesture grants."""
+    return [record["at"] for record in auto_readmission_records(comments, bot_login, log)]
+
+
+def auto_readmission_receipt(evidence_key, recovered_at):
+    """The receipt BODY a caller posts (RECEIPT-FIRST) before clearing any machine park label.
+
+    One writer, one format, one place the invariant is stated — see AUTO_READMIT_MARKER."""
+    policy = _park_policy()
+    if not policy.valid_timestamp(recovered_at):
+        raise WorkerPrError("automatic-readmission receipt needs a strict ISO-8601 recovery stamp")
+    stamp = policy.canonical_ts(recovered_at)
+    if not isinstance(evidence_key, str) or not policy.safe_receipt_part(evidence_key):
+        raise WorkerPrError("automatic-readmission receipt evidence key is unsafe")
+    return (f"> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: the "
+            f"starvation cause that parked it has demonstrably CLEARED.\n\n"
+            f"A worker account that was failing when this park landed recorded a SUCCESSFUL run "
+            f"at `{stamp}`, strictly after the park application (evidence `{evidence_key}` — "
+            f"provider/account-fingerprint/run from the model-health window; no raw handle). The "
+            f"machine park label(s) are being removed and the review loop re-admitted with a real "
+            f"budget window.\n\n"
+            f"This consumes that recovery evidence EXACTLY ONCE: the same evidence can never "
+            f"re-admit this PR again, a later park needs a NEW outage-and-recovery pair, and at "
+            f"most {policy.AUTO_READMISSION_MAX} automatic re-admissions are ever granted to one "
+            f"PR — past that the loop stops and asks a human. A human hold "
+            f"(`{'` / `'.join(HUMAN_OWNED_LABELS)}`) and a human-applied park are never "
+            f"touched by this path.\n\n"
+            f"{AUTO_READMIT_MARKER} evidence={evidence_key} at={stamp} -->")
 
 
 def marker_runs(comments, bot_login, kind, round_n):
@@ -388,6 +614,70 @@ def marker_runs(comments, bot_login, kind, round_n):
                 str(comment.get("body", ""))):
             if int(match.group(1)) == round_n:
                 runs.add(match.group(2))
+    return runs
+
+
+def marker_runs_since(comments, bot_login, kind, round_n, since, log=print):
+    """marker_runs WINDOWED by the human-readmission cutoff (#555 recurrence gap) — the
+    distinct run keys for `kind` at `round_n` recorded at or AFTER `since`.
+
+    THE BUG THIS CLOSES: the per-round marker counts are durable per-PR state that NOTHING
+    resets, and the capacity park keyed on them read the LIFETIME count. #555 gave the ROUND
+    budget a readmission window but left this counter unwindowed, so a re-admitted PR
+    re-derived "N consecutive fix dispatches missed for round R" from the very same markers on
+    the very next tick — with an unchanged head, no work attempted, and (because a gen-1
+    receipt already stood) a straight jump to the gen-2 question-class terminal. That is the
+    observed bounce: sparq PR #3488 re-admitted
+    2026-07-22T16:36:56Z, re-escalated 16:44:10Z; PR #3472 re-escalated seconds later with
+    byte-identical boilerplate, five days after the last commit or review round on either PR.
+    A re-admission must grant REAL capacity: the markers burned before the human said "keep
+    trying" are not chargeable against the post-readmission budget.
+
+    Fail direction — identical to count_rounds_since (toward the OLD conservative full
+    count, never a fresh budget on unproven data): a falsy or UNPARSEABLE `since` (logged
+    loudly) means no window and the plain marker_runs applies; a marker whose comment has no
+    created_at, or an unparseable one (logged), is CHARGED; an instant tie with the cutoff is
+    CHARGED. Ordering is over PARSED aware datetimes (park_policy.parse_ts), never raw
+    strings.
+
+    Consumed today by dispatch-claim's MISSED_FIX_LIMIT budget (`missed`). fix_outcome's
+    nochange/gatefail limits still charge the LIFETIME count deliberately: each of those
+    markers records a fix that actually RAN, so its park is work genuinely consumed (and the
+    attempt fingerprint keeps it from re-emitting on a no-work tick) — windowing them is a
+    separate policy change, kept out of this diff because the auth-class round-charging work
+    lands on that same path."""
+    if not since:
+        return marker_runs(comments, bot_login, kind, round_n)
+    parse_ts = _park_policy().parse_ts
+    try:
+        since_instant = parse_ts(since)
+    except ValueError:
+        log(f"::warning::readmission cutoff {since!r} is not a parseable timestamp — the "
+            f"{kind} marker budget keeps the FULL historical count (never a fresh budget on "
+            "unproven data)")
+        return marker_runs(comments, bot_login, kind, round_n)
+    prefix = MARKER_KINDS[kind]
+    runs = set()
+    for comment in _bot_comments(comments, bot_login):
+        matched = {match.group(2)
+                   for match in re.finditer(
+                       re.escape(prefix) + r" round=([1-9][0-9]*) run=(\S+) -->",
+                       str(comment.get("body", "")))
+                   if int(match.group(1)) == round_n}
+        if not matched:
+            continue  # nothing chargeable in this comment — its timestamp is irrelevant
+        created = comment.get("created_at")
+        if isinstance(created, str) and created:
+            try:
+                created_instant = parse_ts(created)
+            except ValueError:
+                log(f"::warning::{kind} marker carries a malformed created_at {created!r} "
+                    "— CHARGED against the post-readmission budget (unprovable time can "
+                    "never authorize exhausted work)")
+            else:
+                if created_instant < since_instant:
+                    continue
+        runs.update(matched)
     return runs
 
 
@@ -1064,6 +1354,61 @@ def _comment(repo, pr_number, body):
     )
 
 
+def _load_model_health():
+    """The shared model-access-health module (model-health.py: the raw-exit-class -> decision-class
+    fold and LAUNCH_FAIL_CLASSES). Loaded lazily, self-test only: it is imported purely so the
+    CREDENTIAL_OUTAGE_EXIT_CLASSES drift lock can DERIVE the outage classes from the fold map that
+    owns them instead of restating them by hand. Nothing on the live path imports it — the class
+    gate stays a pure, dependency-free predicate."""
+    path = Path(__file__).resolve().with_name("model-health.py")
+    spec = importlib.util.spec_from_file_location("registry_model_health", path)
+    if spec is None or spec.loader is None:
+        raise WorkerPrError("cannot load model-health.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _emitted_credential_exit_classes():
+    """The credential exit classes broker-refresh.py can EMIT, read from its source with `ast`.
+
+    THE PRODUCER SIDE of the drift lock (post-merge retro-review of #629). The set-equality lock in
+    _self_test ties CREDENTIAL_OUTAGE_EXIT_CLASSES to model-health._EXIT_CLASS_MAP — two CONSUMERS of
+    the class vocabulary — and nothing tied either to the producer, so `worker-prep.sh` /
+    `broker-refresh.py` could start emitting a new raw class with the lock still green (it would fold
+    to `unknown` and be CHARGED: fail-safe, but the same shape of drift, which is why calling the class
+    "closed" was overstated). This derivation closes it.
+
+    broker-refresh.py is PARSED, never imported — the same precedent as
+    dispatch-secrets-guard.trust_surface_from_worker_pr: reading a constant must not execute a
+    privileged module. Every module-level `CLASS_* = "credential-…"` assignment counts, because those
+    constants are exactly what `worker-prep.sh` writes into the exit-class file. Raises
+    WorkerPrError when the source cannot be read or the derivation resolves EMPTY, so a derivation
+    fault names ITSELF instead of passing as "no drift".
+    """
+    path = Path(__file__).resolve().with_name("broker-refresh.py")
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError) as error:
+        raise WorkerPrError(f"cannot derive broker-refresh.py's exit classes: {error}") from error
+    emitted = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        value = node.value.value
+        if not isinstance(value, str) or not value.startswith("credential-"):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id.startswith("CLASS_"):
+                emitted.append(value)
+    if not emitted:
+        raise WorkerPrError(
+            "derived ZERO credential exit classes from broker-refresh.py — this is a DERIVATION "
+            "failure (the constants were renamed or moved), NOT a finding that the producer emits "
+            "nothing; fix the derivation (fail closed)")
+    return tuple(sorted(set(emitted)))
+
+
 def _load_worker_issue():
     path = Path(__file__).resolve().parent / "worker-issue.py"
     spec = importlib.util.spec_from_file_location("registry_worker_issue", path)
@@ -1087,8 +1432,13 @@ def _live_review_labels(repo, pr_number):
     return {label["name"] for label in labels} & set(REVIEW_LABELS)
 
 
-def set_review_state(repo, pr_number, state):
+def set_review_state(repo, pr_number, state, abort_on_machine_park=False, live_review=None):
     """Apply the mutually-exclusive review:* label for `state` and drop the OTHER review:* labels.
+
+    Returns WHAT ACTUALLY HAPPENED so a caller can log honestly instead of asserting its intent:
+    "applied" (the requested state landed), "refused-hold" (a live human hold vetoed it),
+    "converged" (an ambiguous namespace resolved to review:needs-user instead of `state`), or
+    "park-abort" (`abort_on_machine_park` and a live machine park won — nothing was written).
 
     Issue #138 — a review-state stamp must NEVER erase a human terminal hold. Re-read the LIVE
     review labels immediately before mutating and:
@@ -1117,19 +1467,57 @@ def set_review_state(repo, pr_number, state):
     the whole outcome step down to this primitive. To keep that window fail-closed, the removes
     delete only the stale labels OBSERVED in the validated snapshot: a review:needs-user (or any
     review:* label) that lands AFTER the live read is never in `live_review`, so it is never
-    deleted — it survives to be converged on the next read instead of being silently erased."""
+    deleted — it survives to be converged on the next read instead of being silently erased.
+
+    `abort_on_machine_park=True` (issue #555 park semantics, #560 round-2 finding 2) makes the
+    MACHINE capacity park WIN over this transition instead of being resolved away by the ambiguity
+    rule above. A machine park is a review:* label, so {review:changes, review:parked} is an
+    "ambiguous namespace" to the guard above and would converge to review:needs-user — DELETING the
+    park and converting a capacity hold into a HUMAN-owned terminal hold, the exact inversion #555
+    exists to prevent. An opt-in caller (a machine LANE hand-over, which is not itself a park and
+    has no business adjudicating one) asks instead for the transition to stand down. Critically the
+    check rides the SAME validated `live_review` read that drives the removes below, so a park
+    landing in a caller's own probe-to-call gap is still caught: this closes the window rather than
+    moving it. Park-as-the-requested-state (`state="parked"`) is exempt — it is not a transition
+    away from the park.
+
+    `live_review` lets a caller that has ALREADY taken a validated `_live_review_labels` snapshot —
+    and has already made its own abort decision on THAT snapshot — hand it in instead of forcing a
+    second read here (#584 follow-up finding 2). Without it a multi-write caller has TWO guard
+    windows: its own pre-write re-read, and this primitive's independent read AFTER the caller's
+    earlier writes have landed — so an abort decided in here is not mutation-free for that caller.
+    Riding the caller's snapshot keeps the "guard rides the same read that drives the removes"
+    property (the removes still delete only labels OBSERVED in it, so anything landing later
+    survives to be converged on the next read) while moving every abort decision ahead of every
+    write. A malformed handed-in snapshot fails closed rather than being trusted."""
     label = f"review:{state}"
     if label not in REVIEW_LABELS:
         raise WorkerPrError(f"unknown review state {state}")
-    live_review = _live_review_labels(repo, pr_number)
+    if live_review is None:
+        live_review = _live_review_labels(repo, pr_number)
+    elif not isinstance(live_review, (set, frozenset)) or any(
+            not isinstance(name, str) for name in live_review):
+        raise WorkerPrError(
+            "set_review_state was handed a malformed live_review snapshot; refusing to mutate "
+            "(fail closed)")
+    else:
+        live_review = set(live_review) & set(REVIEW_LABELS)
+    if (abort_on_machine_park and MACHINE_PARK_PR_LABEL in live_review
+            and label != MACHINE_PARK_PR_LABEL):
+        print(f"review state '{state}' ABORTED: {MACHINE_PARK_PR_LABEL} is a live MACHINE "
+              "capacity park and this caller asked for the park to WIN (issue #555) — no label "
+              "mutation applied; the park is untouched and still owns the PR")
+        return "park-abort"
     if "review:needs-user" in live_review and label != "review:needs-user":
         print(f"review state '{state}' REFUSED: review:needs-user is a live human hold "
               "(issue #138) — no label mutation applied")
-        return
+        return "refused-hold"
+    converged = False
     if len(live_review) > 1 and label != "review:needs-user":
         print(f"ambiguous live review labels {sorted(live_review)} — converging to the "
               f"fail-closed human hold review:needs-user instead of '{state}' (issue #138)")
         label, state = "review:needs-user", "needs-user"
+        converged = True
     _ensure_label(repo, label)
     _gh_json(
         ["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels", "--input", "-"],
@@ -1139,6 +1527,7 @@ def set_review_state(repo, pr_number, state):
         if other != label:
             _remove_label(repo, pr_number, other)
     print(f"PR review state: {state}")
+    return "converged" if converged else "applied"
 
 
 def get_review_state(repo, pr_number):
@@ -1175,22 +1564,55 @@ def record_round(repo, pr_number, round_n, run_key, bot_login, head_sha):
     print(f"review round recorded: {round_n} @ {head_sha[:12]}")
 
 
-def record_round_void(repo, pr_number, round_n, run_key, bot_login):
-    """Void a stale-deferred review round (issue #162): the review outcome could not apply to the
-    live head (it moved off the reviewed commit), so the pre-model round marker for THIS (round,
-    run) must not be charged as a substantive round. Keyed to the same (round, run) the round
-    marker used; idempotent. count_rounds subtracts voided attempts, so the round number is reused
-    by the next valid re-review instead of silently consuming the global round budget."""
+STALE_HEAD_VOID_REASON = ("the live head moved off the reviewed commit before the outcome could "
+                          "apply, so it is not charged against the round budget (issue #162)")
+
+
+def record_round_void(repo, pr_number, round_n, run_key, bot_login,
+                      reason=STALE_HEAD_VOID_REASON):
+    """Void a review round that was recorded but never substantively spent. Keyed to the same
+    (round, run) the pre-model round marker used; idempotent. count_rounds subtracts voided
+    attempts, so the round number is reused by the next valid re-review instead of silently
+    consuming the global round budget.
+
+    Two void reasons exist, and the MARKER is identical for both (it is what count_rounds reads);
+    only the human-readable `reason` sentence differs:
+      * stale head (issue #162, the default) — the review outcome could not apply to the live head;
+      * credential outage (registry #596) — the model launch itself died on the account credential
+        (auth / rate-limit / session-limit / billing), so no review happened at all."""
     comments = _paginated_comments(repo, pr_number)
     marker = f"{ROUND_VOID_MARKER} n={round_n} run={run_key} -->"
     if any(marker in str(c.get("body", "")) for c in _bot_comments(comments, bot_login)):
         print(f"review round already voided: {round_n} (run {run_key})")
         return
     _comment(repo, pr_number,
-             f"> 🤖 SPARQ agent — review round {round_n} was voided: the live head moved off the "
-             "reviewed commit before the outcome could apply, so it is not charged against the "
-             f"round budget (issue #162).\n\n{marker}")
+             f"> 🤖 SPARQ agent — review round {round_n} was voided: {reason}.\n\n{marker}")
     print(f"review round voided: {round_n} (run {run_key})")
+
+
+def void_round_on_outage(repo, pr_number, round_n, run_key, bot_login, exit_class):
+    """Void the pre-model round marker when THIS run's model launch died on a credential/capacity
+    outage (registry #596). Called from the `run` job right after the exit class is captured —
+    NOT from `outcome`, which is skipped entirely when no verdict was produced (its job-level `if`
+    requires verdict_ok/fix_done success), which is precisely why an `auth` exit used to leave the
+    round charged forever.
+
+    Returns True iff a void was recorded (or already existed). A non-outage class is a NO-OP: the
+    round stays charged, so nothing about the ordinary bounded-crash / stale-head accounting moves.
+    Writes an output (`voided`) so the workflow can surface the decision."""
+    outage = is_credential_outage(exit_class)
+    _write_outputs({"voided": "true" if outage else "false"})
+    if not outage:
+        print(f"exit class {str(exit_class or '')!r} is not a credential outage — review round "
+              f"{round_n} stays CHARGED against the round budget")
+        return False
+    record_round_void(
+        repo, pr_number, round_n, run_key, bot_login,
+        reason=("the model launch failed on the worker account's credential/capacity "
+                f"(`exit-class={str(exit_class).strip().lower()}`) before any review ran, so it is "
+                "NOT charged against the round budget and is NOT a reviewer decline "
+                "(registry #596)"))
+    return True
 
 
 def record_marker(repo, pr_number, kind, round_n, run_key, bot_login):
@@ -1869,12 +2291,14 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
         detail = ("unbound legacy record" if bound is None
                   else f"reviewed {bound[:12]} != live head {expected_sha[:12]}")
         print(f"verdict NOT staged for the fixer ({detail}); deferring to a fresh review")
+        print(_FIX_LANE_DEFER_NOTICE)
         return
     if not envelope_identity_matches(record, expected_repo, expected_pr, expected_round):
         _write_outputs({"staged": False, "stale_reason": "identity-mismatch"})
         print("verdict NOT staged for the fixer (envelope repo/pr/round does not name "
               f"{expected_repo}#{expected_pr} round {expected_round}); "
               "deferring to a fresh review")
+        print(_FIX_LANE_DEFER_NOTICE)
         return
     path = Path(out_file)
     path.write_text(json.dumps(envelope_verdict(record), indent=1, sort_keys=True) + "\n",
@@ -1884,9 +2308,440 @@ def stage_verdict_for_fix(record_file, out_file, expected_sha, expected_repo, ex
     print(f"verdict staged for the fixer (bound to {expected_sha[:12]})")
 
 
+# ---- issue #560: the defer-to-fresh-review LANE TRANSITION ---------------------------------------
+# dispatch-claim.enumerate_review_items buckets a worker PR into a lane by ONE label:
+# `review:changes` -> the FIX lane (item state `needs-fix`), `review:needs` -> the REVIEW lane
+# (`needs-review`). When stage_verdict_for_fix defers above it stages NOTHING, review-fix.yml skips
+# the fix step, and the run produces no fix, no push, and no new verdict — so before this transition
+# existed the PR kept `review:changes` and the FIX lane re-admitted it on EVERY dispatch tick while
+# the REVIEW lane, which keys on `review:needs`, never saw it. That is a permanent wrong-lane spin,
+# not a retry: nothing in the fix lane can ever mint the head-bound verdict the fixer refuses to run
+# without. LIVE 2026-07-24: from 08:02Z sparq#3523/#3542/#3572/#3573/#3608 each launched a fix run
+# per ~8min tick, every one completing "success" on `verdict NOT staged for the fixer (unbound legacy
+# record); deferring to a fresh review` (e.g. run 30082079950 at 09:19Z) — ~35 wasted runs/hour
+# across five PRs (each burning an account claim + a runner) until the orchestrator flipped the five
+# labels by hand.
+#
+# The defer therefore HANDS THE PR TO THE REVIEW LANE — the only lane that can produce a verdict
+# bound to the current head. The transition is applied by review-fix.yml's `outcome` job (the job
+# that runs no target code and owns every PR label mutation), keyed off the `stale_reason` this
+# defer branch emits.
+#
+# ROUND-2 FINDING 1 — a LABEL ALONE ONLY RELOCATES THE SPIN; the hand-over must transfer OWNERSHIP.
+# The production state #560 targets is a COMPLETED request-changes review: it bound
+# `sparq-reviewed-sha == head` (review-fix.yml's outcome job binds the marker LAST) and only THEN
+# recorded a verdict the fixer later refuses. Flipping the label alone leaves a DRAFTED PR carrying
+# review:needs AND a marker matching the live head, and enumerate_review_items' drafted no-repeat
+# guard (`if not draft or not reviewed_match`) then does NOT emit needs-review. What it does instead
+# depends on CI: a concluded-RED gate becomes needs-ci-fix (the fix lane again, no verdict minted); a
+# concluded-GREEN gate becomes `stranded` — which dispatches a REVIEW run whose resolve step sees the
+# same matching marker, sets `already_done=true`, RELEASES the claim and exits "success" with no work
+# done, i.e. the identical successful spin one lane over; and a PENDING/UNKNOWN gate matches nothing
+# at all, leaving the PR with NO owning lane.
+#
+# The hand-over therefore also RETRACTS the marker. The marker is an ASSERTION — "a review of this
+# exact head completed end-to-end" — whose whole operational meaning is "its outcome artifacts
+# exist, so do not spend a reviewer slot on this head again". A `stale_reason` defer is the
+# REGISTRY's own proof that the artifact that assertion promises does not exist for this head (no
+# envelope at all, an envelope bound to a different sha, or an envelope naming another repo/PR/
+# round). So the marker is FALSE, and it is exactly the false part that suppresses re-review.
+# Writing `none` restores the marker's invariant (marker == head IFF a head-bound verdict record
+# exists) and is the honest state: no consumable review exists for this head.
+#
+# Why retract rather than teach the review lane "marker matches but no bound verdict => re-review":
+# enumerate_review_items is a PURE function of the pulls listing + provenance + leases + CI status.
+# It has no registry access and does not even receive the round number, so verdict-record existence
+# is not derivable there; threading a per-PR registry read into the enumerator would add an unbounded
+# number of reads per dispatch tick AND would have to be duplicated in review-fix.yml's resolve
+# `already_done` check — two places re-deriving a fact this defer already holds. Retraction writes
+# the fact ONCE, at the moment it is proven, into the single field every consumer already reads.
+#
+# The retraction is TARGETED and ORDERED:
+#   * targeted — the marker is cleared only when it equals the head the defer disproved. A marker
+#     naming some OTHER sha is either already stale to the enumerator (so re-review is already
+#     admitted) or belongs to a NEWER completed review that this defer has said nothing about, and
+#     clobbering that would burn a genuine reviewer slot.
+#   * marker BEFORE label — the crash-safe order. Crashing after the retraction leaves
+#     {review:changes, marker=none}: the fix lane re-admits and the idempotent defer simply retries,
+#     i.e. the pre-fix behaviour, no worse. Crashing after a label flip that had NOT yet retracted
+#     leaves {review:needs, marker==head} on a draft — precisely the no-owner / already_done state
+#     above. Same discipline as the receipt-first park ladder.
+#
+# #584 FOLLOW-UP FINDING 1 — A `review:pass` PR IS NOT THE FIX LANE'S TO HAND OVER. The retraction
+# above is scoped only by "does the marker name the disproved head", NOT by which lane owns the PR.
+# But the fix lane admits a PR on FIVE states, and only `needs-fix` keys on review:changes:
+# enumerate_review_items also emits `needs-ci-fix` purely from a concluded-RED gate on the current
+# head (GAP-A), which is REVIEW-STATE-AGNOSTIC — a NON-DRAFT `review:pass` PR with a red gate is
+# routed straight into the fix lane. stage-verdict then finds no head-bound verdict record (a pass
+# verdict is not a fix verdict) and defers, and the hand-over used to compute action="noop"
+# (review:changes was never live) and RETRACT the marker anyway.
+#
+# That retraction is the single most destructive write in the pipeline. `sparq-reviewed-sha` is what
+# BINDS the auto-merge latch to reviewed content, so dispatch-claim.enumerate_disarm_items treats
+# `marker != head` on an ARMED PR as a safety violation and CLAIM runs `worker-pr.py disarm --when
+# mismatch` — disable-auto + dequeue + REDRAFT. So the hand-over would take the one state the
+# pipeline is scarcest in (a passed, armed, ready PR) and destroy it: unlatched, re-drafted, and
+# with its verdict binding erased, all on a lane transition it had no business performing. There is
+# nothing to hand to the review lane either — the review lane's job is producing a verdict, and the
+# pass IS the verdict.
+#
+# So `review:pass` is a hand-over STAND-DOWN, on the same footing as a hold: NO marker write, NO
+# lane label write, no comment. Re-read immediately before the write like every other hold surface,
+# because the arm path can bind review:pass while a fix run is in flight. This is deliberately
+# scoped by the PASS label rather than by the admission state (`needs-ci-fix` never reaches this
+# code — the outcome job only knows the stale_reason), and it deliberately stands down on the
+# AMBIGUOUS {review:changes, review:pass} pair too: that pair no valid flow produces, and the
+# pre-fix behaviour there was to converge it to review:needs-user — deleting the pass AND retracting
+# the marker. Failing toward LEAVING THE PR ALONE is the only safe direction when the cost of being
+# wrong is a destroyed arm; the stand-down is logged loudly so the ambiguity is visible rather than
+# silently self-healed.
+FIX_LANE_PR_LABEL = "review:changes"
+REVIEW_LANE_PR_LABEL = "review:needs"
+# The PASSED review state. A live review:pass makes the hand-over stand down entirely (finding 1):
+# the review lane has nothing to produce for a PR that already passed, and retracting its
+# reviewed-sha marker would make enumerate_disarm_items disarm + redraft an armed, passed PR.
+PASS_LANE_PR_LABEL = "review:pass"
+# The hand-over ABORTED because a machine park / human hold / review:pass was live at the RE-READ
+# taken immediately before the write (round-2 finding 2; #584 follow-up finding 1). Distinct from
+# "hold"/"pass-hold" (the guard was already visible on the FIRST read) so the log and the `action`
+# output can say which actually happened.
+FIX_LANE_ABORT_ACTION = "abort-park"
+# The hand-over STOOD DOWN because the PR carries the PASSED review state (#584 follow-up finding 1).
+# Distinct from "hold" and from the abort so the log, the `action` output and the telemetry can say
+# which of the three mutation-free outcomes actually happened.
+FIX_LANE_PASS_ACTION = "pass-hold"
+# Every action that mutates NOTHING on either surface — no label write, no marker write, no comment.
+# `hold` and `pass-hold` are decided from the first reads; FIX_LANE_ABORT_ACTION is decided from the
+# pre-write re-read. All three are decided BEFORE the first write, which is what lets every
+# "mutates nothing" claim in this module be literally true (#584 follow-up finding 2).
+FIX_LANE_QUIET_ACTIONS = ("hold", FIX_LANE_PASS_ACTION, FIX_LANE_ABORT_ACTION)
+# Every action that still performs at least one write.
+FIX_LANE_WRITING_ACTIONS = ("noop", "drop-fix-label", "transition")
+# Every PR-side label whose presence at the pre-write re-read stands the hand-over down: the machine
+# capacity park and the human terminal hold (#555 / #138), plus the PASSED state (#584 follow-up
+# finding 1 — retracting a passed PR's reviewed-sha marker disarms and re-drafts it).
+FIX_LANE_ABORT_ON_LABELS = (set(MACHINE_PARK_LABELS) | set(HUMAN_OWNED_LABELS)
+                            | {PASS_LANE_PR_LABEL})
+# Every `stale_reason` stage_verdict_for_fix can emit on a defer (staged=false). All three mean the
+# same thing for lane ownership — no verdict is bound to the live head — so all three hand over.
+FIX_LANE_DEFER_REASONS = ("unbound", "head-moved", "identity-mismatch")
+_FIX_LANE_DEFER_NOTICE = (
+    f"fix lane releasing this PR: the outcome job applies the {FIX_LANE_PR_LABEL} -> "
+    f"{REVIEW_LANE_PR_LABEL} lane transition AND retracts the stale reviewed-sha assertion for "
+    "this head (issue #560), so fix-enumeration stops re-admitting this PR on every dispatch tick "
+    "and the review lane provably owns producing the fresh head-bound verdict — unless a live "
+    f"hold, capacity park or {PASS_LANE_PR_LABEL} owns the PR, in which case the hand-over stands "
+    "down and mutates NOTHING")
+
+
+def fix_lane_defer_action(live_review, holds=()):
+    """PURE (issue #560): what the defer-to-fresh-review hand-over must do, given the LIVE
+    `review:*` label set and the LIVE hold set — the union of live_human_holds (the PR's own
+    needs:user / review:needs-user / review:parked, else the source issue's needs:*) and
+    live_machine_parks (the ONE park predicate over BOTH surfaces: review:parked on the PR OR
+    status:parked on the source issue, which live_human_holds' short-circuit could not see).
+
+    - "hold" — a human hold OR the #555 MACHINE capacity park is live: mutate NOTHING. A lane
+      transition is not a park and must never displace one; a park already excludes the PR from
+      BOTH lanes (enumerate_review_items rejects review:parked and every human hold outright), so
+      there is no spin to close and nothing to hand over.
+    - "pass-hold" — `review:pass` is live: mutate NOTHING (#584 follow-up finding 1). The fix lane
+      admits a PR on a concluded-RED gate alone (`needs-ci-fix`, review-state-AGNOSTIC), so a
+      non-draft passed PR reaches this defer with no review:changes anywhere — and the pre-fix code
+      fell through to "noop", which still RETRACTS the reviewed-sha marker. On an ARMED PR that
+      retraction is a disarm trigger (enumerate_disarm_items: marker != head => disable-auto +
+      redraft), so the hand-over would destroy the passed arm it was never asked to touch. A passed
+      PR also has nothing to hand to the review lane: the pass IS the verdict. Stands down on the
+      ambiguous {review:changes, review:pass} pair too — fail toward leaving the PR alone.
+    - "noop" — `review:changes` is not live: already handed over (a re-run of this step, or a
+      concurrent claim that got there first). Idempotent by construction.
+    - "drop-fix-label" — `review:needs` is ALREADY live beside `review:changes` (a review outcome
+      landed while this fix run was in flight, or a crash between set_review_state's add and its
+      removes). The review lane already owns the PR, so the hand-over completes by removing ONLY
+      the stale FIX-lane label. That is monotone (it adds nothing) and reaches the same single
+      clean state without escalating a machine lane hand-over into a human question — the
+      resolution is not a guess here, because the defer itself is authoritative that the fix lane
+      must not own this PR.
+    - "transition" — the normal case: set_review_state(.., "needs"). Its own issue #138 machinery
+      then applies unchanged (a live review:needs-user refuses the write; any OTHER ambiguous split
+      converges to the fail-closed human hold rather than a guessed clean value) — this function
+      deliberately does not second-guess it.
+    """
+    if holds:
+        return "hold"
+    live = set(live_review)
+    if PASS_LANE_PR_LABEL in live:
+        return FIX_LANE_PASS_ACTION
+    if FIX_LANE_PR_LABEL not in live:
+        return "noop"
+    if live == {FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL}:
+        return "drop-fix-label"
+    return "transition"
+
+
+def fix_lane_defer_labels(live_review, action):
+    """PURE (issue #560): the `review:*` label set the transition LEAVES BEHIND. Exists so the
+    SPIN-CLOSURE property can be asserted end-to-end without touching GitHub: dispatch-claim.py's
+    --self-test imports this, projects the post-defer label set, and feeds it straight back into
+    enumerate_review_items to prove the fix lane no longer re-admits the PR. worker-pr.py's own
+    --self-test pins this projection to the IMPERATIVE path (the stubbed mutation must produce
+    exactly this set), so the two can never drift."""
+    live = set(live_review)
+    if action in ("noop", *FIX_LANE_QUIET_ACTIONS):
+        return frozenset(live)
+    if action == "drop-fix-label":
+        return frozenset(live - {FIX_LANE_PR_LABEL})
+    if action == "transition":
+        # set_review_state(.., abort_on_machine_park=True): a single clean review:changes becomes
+        # review:needs; a live MACHINE park makes the park WIN and writes nothing (round-2 finding
+        # 2 — the pre-fix code let {review:changes, review:parked} converge to review:needs-user,
+        # DELETING a machine park and inventing a human hold); any OTHER ambiguous namespace still
+        # converges to the fail-closed human hold (issue #138).
+        if live & set(MACHINE_PARK_LABELS):
+            return frozenset(live)
+        if live == {FIX_LANE_PR_LABEL}:
+            return frozenset({REVIEW_LANE_PR_LABEL})
+        return frozenset({"review:needs-user"})
+    raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
+
+
+def fix_lane_defer_marker_action(action, live_marker, proven_head):
+    """PURE (issue #560 round-2 finding 1): whether the hand-over must RETRACT the reviewed-sha
+    marker, given the decided `action`, the marker value read live off the PR body, and
+    `proven_head` — the head sha stage-verdict proved has NO head-bound verdict record.
+
+    - "keep" on every FIX_LANE_QUIET_ACTION (`hold`, `pass-hold`, and the pre-write abort): a park,
+      a human hold or a PASSED review owns the PR, and a lane hand-over mutates NOTHING on either
+      surface for any of them. All three are decided BEFORE the first write (#584 follow-up finding
+      2 — the abort used to be adjudicated a second time INSIDE set_review_state, i.e. after this
+      marker write had already landed, so "mutates nothing" was not true of that path).
+    - "keep" when the live marker does not name `proven_head`: either it is already stale to
+      enumerate_review_items (so re-review is already admitted and there is nothing to fix) or it
+      belongs to a NEWER completed review this defer has said nothing about — retracting that would
+      throw away a genuine reviewer slot.
+    - "invalidate" otherwise: the marker asserts that a review of `proven_head` completed
+      end-to-end, and the defer is the registry's own proof that the head-bound verdict record that
+      assertion promises does not exist. The assertion is false; writing UNBOUND_REVIEWED_SHA
+      retracts it so the review lane re-admits the head instead of exiting `already_done`."""
+    if action in FIX_LANE_QUIET_ACTIONS:
+        return "keep"
+    if action not in FIX_LANE_WRITING_ACTIONS:
+        raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
+    if live_marker != proven_head:
+        return "keep"
+    return "invalidate"
+
+
+def fix_lane_defer_abort(action, recheck_review, recheck_holds):
+    """PURE (issue #560 round-2 finding 2): given the `action` decided from the FIRST reads and the
+    label/hold state RE-READ immediately before the first write, must the hand-over ABORT?
+
+    This is the hand-over's SOLE stand-down adjudicator, and it runs before the first write (#584
+    follow-up finding 2). Previously a second adjudication happened inside set_review_state's own
+    independent read — i.e. AFTER the reviewed-sha retraction had been written — so that abort path
+    left a trace while three comments claimed it mutated nothing. set_review_state now rides the
+    very `recheck_review` snapshot passed to this predicate, so no guard survives past the first
+    write and every abort is genuinely mutation-free.
+
+    #555 splits ownership: `review:parked`/`status:parked` is the MACHINE capacity hold,
+    `review:needs-user`/`needs:user` the HUMAN terminal hold. A hold landing between this
+    function's caller's initial probe and its write used to be resolved AWAY: the park is a
+    `review:*` label, so {review:changes, review:parked} looked merely "ambiguous" to
+    set_review_state, which converged it to review:needs-user — DELETING a machine capacity park
+    and converting it into a human-owned terminal hold, the precise inversion #555 exists to
+    prevent, while the caller logged a successful review-lane hand-over. THE PARK WINS: a lane
+    transition is not a park adjudication, so it stands down and writes nothing at all.
+
+    A `review:pass` that lands in the same window aborts identically (#584 follow-up finding 1): the
+    arm path binds review:pass while a fix run is in flight, and retracting a passed PR's
+    reviewed-sha marker is what disarms and re-drafts it. The PASS WINS for exactly the reason the
+    park does — the hand-over is not the adjudicator of either.
+
+    True for any live guard (machine park, human hold, or the passed state) on any action that would
+    still WRITE — including `noop`, which writes no label but does retract the reviewed-sha marker.
+    Only the FIX_LANE_QUIET_ACTIONS, which mutate nothing at all, have nothing to abort."""
+    if action in FIX_LANE_QUIET_ACTIONS:
+        return False
+    if action not in FIX_LANE_WRITING_ACTIONS:
+        raise WorkerPrError(f"unknown fix-lane defer action {action!r}")
+    return bool((set(recheck_review) & FIX_LANE_ABORT_ON_LABELS) | set(recheck_holds))
+
+
+def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
+    """Issue #560: hand a deferred PR from the FIX lane to the REVIEW lane, transferring OWNERSHIP.
+
+    Called from review-fix.yml's `outcome` job when stage-verdict refused to seed the fixer
+    (`staged=false`) because no recorded verdict is bound to the live head. `proven_head` is that
+    head — the sha stage-verdict proved has NO head-bound verdict record.
+
+    Two writes, in this order, both through the SHARED primitives (set_reviewed_sha /
+    set_review_state / _remove_label) — never a raw label or body API call — so the issue #138 hold
+    guard, the #158 marker CAS loop and the #555 park ownership split all keep applying underneath:
+
+    1. RETRACT the reviewed-sha marker when it names `proven_head` (round-2 finding 1). Without this
+       the label flip only MOVES the spin: a drafted PR whose marker matches the live head is not
+       re-emitted as needs-review, and review-fix.yml's resolve step would exit `already_done` on a
+       green gate (successful run, no work) or nothing would own the PR at all on a pending gate.
+    2. Apply the lane label per fix_lane_defer_action.
+
+    NEITHER write happens at all when a GUARD owns the PR. Three mutation-free outcomes exist and
+    ALL THREE are decided before the first write (#584 follow-up finding 2 — the abort used to be
+    adjudicated a second time inside set_review_state's own read, i.e. after the marker retraction
+    had already landed):
+
+    - `hold` — a live human hold / machine capacity park on the FIRST reads (#555 / #138).
+    - `pass-hold` — a live `review:pass` on the FIRST reads (#584 follow-up finding 1). The fix lane
+      admits on a red gate alone (`needs-ci-fix`), so a passed, non-draft, ARMED PR reaches this
+      code; retracting its reviewed-sha marker is precisely what makes enumerate_disarm_items
+      disarm + redraft it. Nothing is handed to the review lane because the pass IS the verdict.
+    - `abort-park` — any of those guards appears at the pre-write RE-READ of BOTH hold surfaces and
+      the review namespace. This is the SOLE remaining adjudication point: the transition hands its
+      validated `recheck_review` snapshot into set_review_state (with abort_on_machine_park), so
+      that primitive takes no independent read and no guard can fire after a write. The residual
+      TOCTOU is unchanged in kind (issue #294): a guard landing after that snapshot is never
+      DELETED, because the removes only drop labels observed in it, so it survives to be converged
+      or excluded on the next read.
+
+    Marker first is the crash-safe order (see the module comment above). The `action`/`marker`/
+    `applied` outputs and every log line report what ACTUALLY happened, not the intent.
+
+    Fails closed on an unrecognised `stale_reason` or a malformed `proven_head` (nothing is read or
+    written on inputs this code does not understand) and is idempotent under the concurrent-claim
+    semantics: a re-run, or a tick that already handed over, writes nothing (the marker retraction
+    is a no-op once the marker is already `none` — set_reviewed_sha issues no PATCH at all).
+
+    The LEASE is deliberately not touched here. The per-PR fix lease is the claim itself, keyed
+    `fix:<repo>#<pr>` (select-and-claim holder prefix; the exact key enumerate_review_items
+    single-flights on), and review-fix.yml's `release` job releases it by claim id on EVERY path
+    (`if: always() && needs.claim.outputs.acquired == 'true'`, a job that does not depend on the
+    outcome job) — so the fix claim is already freed before the next dispatch tick reads the
+    ledger. dispatch-claim.py's --self-test pins that unconditional release statically."""
+    if stale_reason not in FIX_LANE_DEFER_REASONS:
+        raise WorkerPrError(
+            f"unknown verdict defer reason {stale_reason!r} (expected one of "
+            f"{', '.join(FIX_LANE_DEFER_REASONS)}); refusing to touch any label")
+    if not re.fullmatch(r"[0-9a-f]{40}", proven_head or ""):
+        raise WorkerPrError(
+            "fix-lane defer requires the 40-hex --head-sha the verdict was NOT bound to; "
+            "without it the reviewed-sha assertion cannot be retracted and the hand-over would "
+            "only relocate the spin (refusing to touch anything)")
+    holds = live_human_holds(repo, pr_number, issue)
+    parks = live_machine_parks(repo, pr_number, issue)
+    live_review = _live_review_labels(repo, pr_number)
+    decided = fix_lane_defer_action(live_review, sorted(set(holds) | set(parks)))
+    action = decided
+    if action == "hold":
+        print(f"fix-lane defer ({stale_reason}): live hold(s) "
+              f"{sorted(set(holds) | set(parks))} own {repo}#{pr_number} — NO lane transition and "
+              "NO marker retraction. A machine lane hand-over never displaces a human hold or the "
+              "capacity park (issue #555), and a park already excludes the PR from both lanes.")
+        _write_outputs({"action": action, "decided": decided, "marker": "keep",
+                        "applied": "none"})
+        return
+    if action == FIX_LANE_PASS_ACTION:
+        # #584 follow-up finding 1. NOT a hand-over candidate at all: the review lane's product is a
+        # verdict and this PR already has one. Retracting its reviewed-sha marker would make
+        # enumerate_disarm_items read `marker != head` on an ARMED PR as a safety violation and
+        # disable-auto + dequeue + REDRAFT it — destroying a passed, armed, ready PR on a lane
+        # transition. Mutate NOTHING and say so.
+        ambiguous = FIX_LANE_PR_LABEL in set(live_review)
+        print(f"{'::warning::' if ambiguous else ''}fix-lane defer ({stale_reason}): "
+              f"{PASS_LANE_PR_LABEL} is live on {repo}#{pr_number} (review namespace "
+              f"{sorted(live_review)}) — NO lane transition and NO marker retraction. A passed PR "
+              "has nothing to hand to the review lane (the pass IS the verdict), and retracting its "
+              "reviewed-sha marker would disarm and re-draft it (enumerate_disarm_items reads "
+              "marker != head on an armed PR as a safety violation). Nothing was written."
+              + (f" The namespace is AMBIGUOUS ({FIX_LANE_PR_LABEL} beside {PASS_LANE_PR_LABEL}): "
+                 "no valid flow produces that pair, so it is left exactly as it is for a human to "
+                 "resolve rather than converged into a state that deletes the pass."
+                 if ambiguous else ""))
+        _write_outputs({"action": action, "decided": decided, "marker": "keep",
+                        "applied": "none"})
+        return
+    # ---- THE GUARD WINS: re-read BOTH hold surfaces AND the review namespace immediately before the
+    # first write (round-2 finding 2). This is the hand-over's SOLE remaining adjudication point —
+    # `recheck_review` is handed straight into set_review_state below, so that primitive takes no
+    # independent read of its own and no guard can fire AFTER a write (#584 follow-up finding 2).
+    recheck_holds = live_human_holds(repo, pr_number, issue)
+    recheck_parks = live_machine_parks(repo, pr_number, issue)
+    recheck_review = _live_review_labels(repo, pr_number)
+    landed = sorted(set(recheck_holds) | set(recheck_parks)
+                    | (set(recheck_review) & FIX_LANE_ABORT_ON_LABELS))
+    if fix_lane_defer_abort(action, recheck_review,
+                            sorted(set(recheck_holds) | set(recheck_parks))):
+        print(f"fix-lane defer ({stale_reason}): ABORTED the '{action}' hand-over for "
+              f"{repo}#{pr_number} — guard(s) {landed} landed after the decision read. NOTHING "
+              "was written: the park/hold/pass WINS over a lane transition (issue #555, #584 "
+              "follow-up finding 1) and is left exactly as it is. No review-lane hand-over "
+              "happened, no reviewed-sha retraction, and no review:needs-user was synthesised; the "
+              "PR is re-derived once the guard clears.")
+        _write_outputs({"action": FIX_LANE_ABORT_ACTION, "decided": decided, "marker": "keep",
+                        "applied": "none"})
+        return
+    # ---- 1. retract the reviewed-sha assertion the registry just disproved (round-2 finding 1).
+    live_marker = reviewed_sha_of(
+        _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"]).get("body") or "")
+    marker_action = fix_lane_defer_marker_action(action, live_marker, proven_head)
+    if marker_action == "invalidate":
+        print(f"fix-lane defer ({stale_reason}): the reviewed-sha marker asserts "
+              f"{proven_head[:12]} was reviewed end-to-end, but no verdict record is bound to that "
+              f"head — retracting the assertion to '{UNBOUND_REVIEWED_SHA}' so the review lane "
+              "re-admits this head instead of exiting already_done with no work done")
+        set_reviewed_sha(repo, pr_number, UNBOUND_REVIEWED_SHA)
+    else:
+        print(f"fix-lane defer ({stale_reason}): reviewed-sha marker "
+              f"{live_marker or 'absent'!r} does not name the disproved head "
+              f"{proven_head[:12]} — left untouched (it is either already stale to review "
+              "enumeration or bound to a newer completed review)")
+    # ---- 2. apply the lane label.
+    applied = "none"
+    if action == "noop":
+        print(f"fix-lane defer ({stale_reason}): {FIX_LANE_PR_LABEL} is not live on "
+              f"{repo}#{pr_number} — no lane label to flip (idempotent)")
+    elif action == "drop-fix-label":
+        _remove_label(repo, pr_number, FIX_LANE_PR_LABEL)
+        applied = "applied"
+        print(f"fix-lane defer ({stale_reason}): {REVIEW_LANE_PR_LABEL} already owns "
+              f"{repo}#{pr_number}; dropped the stale {FIX_LANE_PR_LABEL} so fix-enumeration "
+              "stops re-admitting it")
+    else:
+        # Ride the SAME validated snapshot the abort predicate above cleared (#584 follow-up finding
+        # 2): set_review_state takes no read of its own, so its guards cannot re-adjudicate AFTER
+        # the marker write and turn a "mutates nothing" abort into a half-applied hand-over.
+        applied = set_review_state(repo, pr_number, "needs", abort_on_machine_park=True,
+                                   live_review=recheck_review)
+        if applied in ("park-abort", "refused-hold"):
+            # UNREACHABLE BY CONSTRUCTION: fix_lane_defer_abort already rejected every machine park,
+            # human hold and pass label in `recheck_review`, and that is the only snapshot
+            # set_review_state now sees. Kept as fail-closed reporting in case the predicate and the
+            # primitive ever drift — and it states honestly that only the LABEL write stood down;
+            # the marker retraction above had already landed, so this is NOT a mutation-free abort.
+            action = FIX_LANE_ABORT_ACTION
+            print(f"::warning::fix-lane defer ({stale_reason}): set_review_state returned "
+                  f"'{applied}' for {repo}#{pr_number} on the very snapshot {sorted(recheck_review)} "
+                  "the pre-write abort predicate had cleared — the two guards have DRIFTED. No lane "
+                  "transition was applied and the park/hold is untouched (issue #555), but the "
+                  "reviewed-sha retraction above was already written, so this is NOT a "
+                  "mutation-free abort.")
+        elif applied == "converged":
+            print(f"fix-lane defer ({stale_reason}): {repo}#{pr_number} was NOT handed to the "
+                  f"review lane — an ambiguous live review namespace converged to the fail-closed "
+                  f"human hold review:needs-user (issue #138) instead of {REVIEW_LANE_PR_LABEL}")
+        else:
+            print(f"fix-lane defer ({stale_reason}): handed {repo}#{pr_number} to the review lane "
+                  f"({FIX_LANE_PR_LABEL} -> {REVIEW_LANE_PR_LABEL}) so a fresh head-bound verdict "
+                  "is produced; the fix lane no longer re-admits it every tick")
+    # `action` is what happened to the LABELS (the decision, or the abort that displaced it);
+    # `marker` what happened to the reviewed-sha assertion; `decided` the pre-write decision the
+    # marker projection is a function of. Honest reporting, not intent.
+    _write_outputs({"action": action, "decided": decided, "marker": marker_action,
+                    "applied": applied})
+
+
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
-               maintainer=None, park_class="question", bot_login=""):
+               maintainer=None, park_class="question", bot_login="", head_sha="",
+               attempt_key=""):
     """Loop stop: park labels on BOTH surfaces, an explanatory comment, and an ops-alert-style
     registry ping. The PR stays DRAFT.
 
@@ -1918,7 +2773,20 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     proof surface. `bot_login` is required for every capacity park (the receipt parser's
     trust filter). worker-issue's
     set_status and the review:parked write here both enforce the sticky human-unpark veto
-    (strict maintainer probe) before writing."""
+    (strict maintainer probe) before writing.
+
+    IDEMPOTENCE AGAINST AN UNCHANGED HEAD (#555 recurrence gap). `head_sha` + `attempt_key`
+    form the park's ATTEMPT FINGERPRINT (park_policy.park_fingerprint): the live head SHA plus
+    a MONOTONE counter of work attempted (the global round number for the round budget, the
+    lifetime per-round missed/nochange/gatefail marker count for the marker budgets). It is
+    written into the receipt and compared against every earlier receipt: an exhaustion that
+    re-derives the SAME fingerprint attempted NOTHING since the park already on record, so it
+    is skipped QUIETLY — no label, no comment, and NO generation consumed. Without this axis a
+    human readmission mints a fresh window key that the very next unchanged-state tick
+    consumes, driving the ladder to its question-class terminal minutes after the readmission
+    and making the whole readmission mechanism (and any human unpark) inert — the live
+    sparq #3488 / #3472 bounce. Omitting either component (unknown head, no counter) claims no
+    idempotence and behaves exactly as before."""
     handle = maintainer or os.environ.get("MAINTAINER_HANDLE", "jeswr")
     if park_class == "capacity":
         policy = _park_policy()
@@ -1927,11 +2795,26 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             raise WorkerPrError(
                 "capacity park requires --bot-login (the durable generation receipts "
                 "cannot be parsed without the trust filter)")
-        cutoff = policy.readmission_cutoff(repo, pr_number, issue, _issue_timeline,
-                                           is_human=probe,
-                                           on_unreadable=policy.WINDOW_UNREADABLE)
-        receipts = park_generation_cutoffs(_paginated_comments(repo, pr_number), bot_login)
-        action, window_key, generation = policy.park_ladder_decision(cutoff, receipts)
+        comments = _paginated_comments(repo, pr_number)
+        # The ladder's window is the LATER of the proven-human readmission gesture and any
+        # AUTOMATIC re-admission receipt (registry #614): an automatic re-admission grants the
+        # same real budget window a human gesture grants, so a PR that was automatically
+        # re-admitted and then exhausted its budget AGAIN consumes a FRESH generation and still
+        # reaches the PARK_ESCALATION_GENERATIONS question-class terminal — it just gets there
+        # having actually retried. Without this the re-park would dedupe against the
+        # pre-recovery window forever and never escalate to a human. WINDOW_UNREADABLE still wins
+        # outright (the ladder must FREEZE on an unproven timeline).
+        cutoff = policy.effective_readmission_cutoff(
+            policy.readmission_cutoff(repo, pr_number, issue, _issue_timeline, is_human=probe,
+                                      on_unreadable=policy.WINDOW_UNREADABLE),
+            auto_readmission_stamps(comments, bot_login))
+        records = park_generation_records(comments, bot_login)
+        receipts = {record["window"] for record in records}
+        fingerprint = policy.park_fingerprint(head_sha, attempt_key)
+        action, window_key, generation = policy.park_ladder_decision(
+            cutoff, receipts, fingerprint=fingerprint,
+            consumed_fingerprints={record["fingerprint"] for record in records
+                                   if record["fingerprint"]})
         if action == "freeze":
             print(f"capacity park frozen for {repo}#{pr_number}: the label timeline is "
                   "unreadable — no receipt, no label, no comment this run (the escalation "
@@ -1941,8 +2824,21 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             print(f"capacity park already receipted for window {window_key}; awaiting a "
                   "fresh human gesture — no label/comment churn")
             return
+        if action == "unchanged":
+            # #555 recurrence gap: the exhaustion re-derived from per-PR state that has NOT
+            # moved since an already-receipted park (same head, same attempt counter) —
+            # nothing was attempted, so re-emitting the terminal verdict would be pure noise
+            # AND would burn the fresh readmission window that a human just granted. Skip
+            # quietly; the earlier park's receipt still stands, and the next tick that
+            # actually attempts something gets a new fingerprint and parks normally.
+            print(f"capacity park skipped for {repo}#{pr_number}: nothing new was attempted "
+                  f"since the receipted park at the same fingerprint ({fingerprint}) — "
+                  f"window {window_key} stays UNCONSUMED (no label/comment churn)")
+            return
         generation_marker = (f"\n\n{PARK_GENERATION_MARKER} gen={generation} "
-                             f"cutoff={window_key} -->")
+                             f"cutoff={window_key}"
+                             f"{f' head={head_sha} attempt={attempt_key}' if fingerprint else ''}"
+                             " -->")
         if action == "terminal":
             # Bounded escalation: PARK_ESCALATION_GENERATIONS windows consumed — repeated
             # post-readmission failure IS a human question now. The terminal label write is
@@ -2095,6 +2991,46 @@ def live_human_holds(repo, pr_number, issue=None, live=None):
             "source issue hold state is unreadable; refusing to mutate (fail closed)")
     return sorted({label["name"] for label in probe["labels"]
                    if label["name"].startswith("needs:")})
+
+
+def live_machine_parks(repo, pr_number, issue=None, live=None):
+    """The LIVE MACHINE capacity park across BOTH surfaces — dispatch-claim's ONE park predicate
+    ("capacity-parked iff EITHER machine label is live") applied on the WRITE side.
+
+    live_human_holds short-circuits: it returns the PR's own hold labels and only falls through to
+    the source issue when the PR carries none, and on the issue it looks at `needs:*` only. So a
+    HALF-CLEARED park pair — `status:parked` still live on the source issue while the PR-side
+    `review:parked` write was veto-suppressed or triage-dismissed — reads as "no hold" to every
+    mutation path even though enumerate_review_items still excludes the PR as parked. Any caller
+    that must let a park WIN has to probe both surfaces unconditionally, which is what this does.
+
+    Returns the sorted list of live machine park labels (a subset of MACHINE_PARK_LABELS), else [].
+    FAIL CLOSED on ambiguity exactly like live_human_holds: a malformed PR read, a malformed/hostile
+    label payload, or an unreadable source-issue probe RAISES, so the caller mutates nothing."""
+    if live is None:
+        live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    if not isinstance(live, dict):
+        raise WorkerPrError("live PR park state is unreadable; refusing to mutate (fail closed)")
+    raw_labels = live.get("labels")
+    if not isinstance(raw_labels, list) or any(
+            not isinstance(label, dict) or not isinstance(label.get("name"), str)
+            for label in raw_labels):
+        raise WorkerPrError(
+            "live PR label payload is malformed; refusing to mutate (fail closed)")
+    parks = {label["name"] for label in raw_labels} & {MACHINE_PARK_PR_LABEL}
+    source_issue = issue
+    if not source_issue:
+        ref_match = WORKER_HEAD_RE.fullmatch(str((live.get("head") or {}).get("ref", "")))
+        source_issue = int(ref_match.group(1)) if ref_match else None
+    if source_issue:
+        probe = _gh_json(["api", f"repos/{repo}/issues/{source_issue}"])
+        if not isinstance(probe, dict) or not isinstance(probe.get("labels"), list) or any(
+                not isinstance(label, dict) or not isinstance(label.get("name"), str)
+                for label in probe["labels"]):
+            raise WorkerPrError(
+                "source issue park state is unreadable; refusing to mutate (fail closed)")
+        parks |= ({label["name"] for label in probe["labels"]} & {MACHINE_PARK_ISSUE_LABEL})
+    return sorted(parks)
 
 
 # Issue #153: a synthetic audit hit for the LIVE label-derived security posture. The path-based
@@ -2986,6 +3922,11 @@ def review_outcome(args):
         set_review_state(args.repo, args.pr, "changes")
     elif decision == "needs-user":
         approved = document["verdict"] == "approve" and not has_blockers
+        # The capacity park's attempt fingerprint (#555 recurrence gap): the reviewed head —
+        # revalidated as the LIVE head above — plus the GLOBAL round number, which is monotone
+        # across readmission windows (post-readmission rounds keep global numbering) so it can
+        # never collide with an earlier window's park the way the window-relative charge could.
+        attempt_key = f"rounds={args.round}"
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
             reason, park_class = "the reviewer flagged possible prompt injection", "question"
@@ -3002,7 +3943,8 @@ def review_outcome(args):
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
-                   bot_login=args.bot_login)
+                   bot_login=args.bot_login, head_sha=args.reviewed_sha,
+                   attempt_key=attempt_key)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
         # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
@@ -3080,9 +4022,16 @@ def fix_outcome(args):
         # (park_policy.py defect 1: capacity parks must not masquerade as human questions).
         park_class = "question" if injection else "capacity"
         alert_repo, alert_token = _alert_route()
+        # Attempt fingerprint (#555 recurrence gap): a no-change fix and a failed local gate
+        # both leave the head WHERE IT WAS, so the head alone could never distinguish "the
+        # fixer just declined again" (real consumed work — must be chargeable, so the
+        # escalation bound still terminates) from "nothing was attempted". The LIFETIME
+        # per-round marker count supplies that monotone axis.
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
-                   bot_login=args.bot_login)
+                   bot_login=args.bot_login, head_sha=args.reviewed_sha,
+                   attempt_key=(f"nochange{args.round}={nochange_runs}" if not made_changes
+                                else f"gatefail{args.round}={gatefail_runs}"))
     else:
         print("fix outcome: staying in review:changes (retried next sweep tick)")
 
@@ -3168,6 +4117,144 @@ def _self_test():
     check("round-7 f1: the overflow receipt cutoff logs loudly",
           any("malformed park-generation receipt cutoff" in line for line in receipt_logs),
           True)
+    # ---- #555 recurrence gap: receipts also bind the park's ATTEMPT FINGERPRINT
+    # (head=<sha> attempt=<monotone counter>) so an exhaustion re-derived from unchanged
+    # per-PR state is recognisable as a re-emission. Both fields are OPTIONAL: a legacy
+    # (#555-era) receipt still parses its window key and simply claims no idempotence. ----
+    fp_head = "e" * 40
+    fp_receipts = [
+        {"user": {"login": bot},
+         "body": (f"x {PARK_GENERATION_MARKER} gen=1 cutoff=none "
+                  f"head={fp_head} attempt=rounds=5 -->")},
+        {"user": {"login": bot},
+         "body": (f"x {PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T09:00:00Z "
+                  f"head={fp_head} attempt=missed3=6 -->")},
+        {"user": {"login": "mallory"},
+         "body": (f"x {PARK_GENERATION_MARKER} gen=9 cutoff=2026-07-23T12:00:00Z "
+                  f"head={'f' * 40} attempt=rounds=99 -->")},
+    ]
+    check("fingerprinted receipts still yield the window keys the LADDER counts",
+          park_generation_cutoffs(fp_receipts, bot),
+          {PARK_WINDOW_NONE, "2026-07-23T09:00:00Z"})
+    check("fingerprinted receipts round-trip the (head, attempt) identity — bot-authored only",
+          park_generation_fingerprints(fp_receipts, bot),
+          {f"{fp_head}/rounds=5", f"{fp_head}/missed3=6"})
+    check("a LEGACY receipt (no head/attempt) contributes no fingerprint — claims no "
+          "idempotence, so the first park after this change always lands",
+          park_generation_fingerprints(receipts, bot), set())
+    check("the single receipt parser keeps both views consistent (windows + fingerprints)",
+          [(record["window"], record["generation"], record["fingerprint"])
+           for record in park_generation_records(fp_receipts, bot)],
+          [(PARK_WINDOW_NONE, 1, f"{fp_head}/rounds=5"),
+           ("2026-07-23T09:00:00Z", 2, f"{fp_head}/missed3=6")])
+
+    # ---- [registry #614] the AUTOMATIC-readmission receipt: the second member of the
+    # park-receipt family. It records that the MACHINE cleared a machine capacity park on proven
+    # cause-recovery, and it is the durable gesture the CLAIM proof gate reads after the labels
+    # are gone. It must NEVER leak into the generation ladder's counter. ----
+    auto_key = "openai/dc2d7519aaaa0001/6041.1"
+    auto_receipt_comments = [
+        {"user": {"login": bot},
+         "body": auto_readmission_receipt(auto_key, "2026-07-25T03:10:00Z")},
+    ]
+    check("the automatic-readmission receipt round-trips through its own reader",
+          auto_readmission_records(auto_receipt_comments, bot),
+          [{"key": auto_key, "at": "2026-07-25T03:10:00Z"}])
+    check("the receipt states the consume-exactly-once invariant and the cap",
+          ("EXACTLY ONCE" in auto_receipt_comments[0]["body"]
+           and "NEW outage-and-recovery pair" in auto_receipt_comments[0]["body"]
+           and f"most {_park_policy().AUTO_READMISSION_MAX} automatic"
+           in auto_receipt_comments[0]["body"]), True)
+    check("the receipt carries the SPARQ agent self-identification",
+          auto_receipt_comments[0]["body"].startswith("> 🤖 SPARQ agent"), True)
+    check("an automatic receipt NEVER counts as a consumed park-generation window (the ladder "
+          "counter is untouched)",
+          (park_generation_cutoffs(auto_receipt_comments, bot),
+           park_generation_fingerprints(auto_receipt_comments, bot)), (set(), set()))
+    check("a park-generation receipt is not an automatic re-admission either",
+          auto_readmission_records(fp_receipts, bot), [])
+    # A THIRD-PARTY comment can neither fabricate a re-admission nor spend cap budget.
+    forged = [{"user": {"login": "drive-by"},
+               "body": auto_readmission_receipt(auto_key, "2026-07-25T03:10:00Z")}]
+    check("a forged (non-bot) automatic receipt is invisible",
+          (auto_readmission_records(forged, bot), auto_readmission_marker_count(forged, bot)),
+          ([], 0))
+    # A malformed stamp proves NO re-admission (park stands) but STILL spends cap budget, so a
+    # corrupt receipt can never buy an extra automatic re-admission.
+    auto_logs = []
+    corrupt_auto = [{"user": {"login": bot},
+                     "body": f"x {AUTO_READMIT_MARKER} evidence={auto_key} at=zzz -->"}]
+    check("a malformed automatic receipt proves nothing",
+          auto_readmission_records(corrupt_auto, bot, log=auto_logs.append), [])
+    check("the malformed automatic receipt is logged loudly",
+          any("malformed automatic-readmission receipt stamp" in line for line in auto_logs),
+          True)
+    check("a malformed automatic receipt STILL counts toward the per-PR cap",
+          auto_readmission_marker_count(corrupt_auto, bot), 1)
+    check("the cap counter counts every marker across comments",
+          auto_readmission_marker_count(auto_receipt_comments + corrupt_auto, bot), 2)
+    check("legacy spellings canonicalize onto one window identity",
+          auto_readmission_stamps(
+              [{"user": {"login": bot},
+                "body": f"x {AUTO_READMIT_MARKER} evidence={auto_key} "
+                        f"at=2026-07-25T04:10:00+00:00 -->"}], bot),
+          ["2026-07-25T04:10:00Z"])
+    for unsafe_key, unsafe_stamp in ((f"{auto_key} -->", "2026-07-25T03:10:00Z"),
+                                     ("openai/a b/1", "2026-07-25T03:10:00Z"),
+                                     ("", "2026-07-25T03:10:00Z"),
+                                     (None, "2026-07-25T03:10:00Z"),
+                                     (auto_key, "yesterday"),
+                                     (auto_key, "2026-07-25T03:10:00")):
+        try:
+            auto_readmission_receipt(unsafe_key, unsafe_stamp)
+            check(f"the receipt writer refuses ({unsafe_key!r}, {unsafe_stamp!r})",
+                  "no error", "WorkerPrError")
+        except WorkerPrError:
+            check(f"the receipt writer refuses ({unsafe_key!r}, {unsafe_stamp!r})",
+                  "raised", "raised")
+
+    # ---- marker_runs_since (#555 recurrence gap): the missed/nochange/gatefail marker
+    # budgets are windowed by the readmission cutoff exactly like the round budget. The
+    # unwindowed LIFETIME read is what re-derived "N consecutive fix dispatches missed" on the
+    # tick after a readmission with an unchanged head (the sparq #3488 / #3472 bounce). ----
+    ms_cut = "2026-07-23T09:18:19Z"
+
+    def missed_at(run, created):
+        return {"user": {"login": bot}, "created_at": created,
+                "body": f"x {MARKER_KINDS['missed']} round=3 run={run} -->"}
+
+    burned_misses = [missed_at(f"{i}.1", "2026-07-22T05:00:00Z") for i in range(1, 7)]
+    fresh_misses = [missed_at(f"{i}.1", "2026-07-23T10:00:00Z") for i in range(7, 9)]
+    check("misses burned BEFORE the readmission are not chargeable after it",
+          len(marker_runs_since(burned_misses, bot, "missed", 3, ms_cut)), 0)
+    check("misses after the readmission charge normally",
+          len(marker_runs_since(burned_misses + fresh_misses, bot, "missed", 3, ms_cut)), 2)
+    check("no cutoff => the plain lifetime count (behaviour unchanged)",
+          len(marker_runs_since(burned_misses + fresh_misses, bot, "missed", 3, None)), 8)
+    check("an instant TIE with the cutoff is CHARGED (fail toward the old count)",
+          len(marker_runs_since([missed_at("9.1", ms_cut)], bot, "missed", 3, ms_cut)), 1)
+    check("a marker comment with NO created_at is CHARGED",
+          len(marker_runs_since(
+              [{"user": {"login": bot},
+                "body": f"x {MARKER_KINDS['missed']} round=3 run=9.1 -->"}],
+              bot, "missed", 3, ms_cut)), 1)
+    ms_logs = []
+    check("a marker comment with a MALFORMED created_at is CHARGED, loudly",
+          (len(marker_runs_since([missed_at("9.1", "zzz-not-a-timestamp")], bot, "missed", 3,
+                                 ms_cut, log=ms_logs.append)),
+           any("malformed created_at" in line for line in ms_logs)),
+          (1, True))
+    ms_logs.clear()
+    check("an UNPARSEABLE cutoff keeps the FULL historical count, loudly (never a fresh "
+          "budget on unproven data)",
+          (len(marker_runs_since(burned_misses, bot, "missed", 3, "not-a-timestamp",
+                                 log=ms_logs.append)),
+           any("is not a parseable timestamp" in line for line in ms_logs)),
+          (6, True))
+    check("the window never leaks across ROUNDS or the bot trust filter",
+          (len(marker_runs_since(fresh_misses, bot, "missed", 2, ms_cut)),
+           len(marker_runs_since(fresh_misses, "mallory", "missed", 3, ms_cut))),
+          (0, 0))
 
     # Issue #162: round markers bind the reviewed head sha, and a stale-deferred round is VOIDED
     # (subtracted) so head churn never burns the global round budget.
@@ -3234,6 +4321,180 @@ def _self_test():
     check("defanged void does not cancel a round",
           count_rounds([sha_bound[1],
                         {"user": {"login": bot}, "body": defanged_void}], bot), 2)
+
+    # ---- [registry #596] a CREDENTIAL-OUTAGE exit class does not consume the round budget -------
+    # Live defect this pins: the round marker is written BEFORE the model launches, and the
+    # `outcome` job that would void it is skipped whenever no verdict was produced — so an
+    # `exit-class=auth` launch failure (acct01's hourly-expiring codex access token, fingerprint
+    # dc2d7519: 5 auth vs 5 success in one window, then 2 more) charged a full review round and
+    # walked the PR toward a capacity park exactly as if the reviewer had declined.
+    for outage_class in ("auth", "AUTH", " auth ", "rate-limit", "session-limit", "billing",
+                         "limit", "transient",
+                         # #614's host-side credential pre-flight classes. worker-prep.sh emits
+                         # these BEFORE any model container starts, so charging a review round for
+                         # one is charging for a review that could not physically have happened.
+                         "credential-remint-required", "credential-refresh-transient",
+                         "CREDENTIAL-REMINT-REQUIRED", " credential-refresh-transient "):
+        check(f"exit class {outage_class!r} is a credential outage",
+              is_credential_outage(outage_class), True)
+
+    # ---- THE DRIFT LOCK (retro-review of #604/#614): the two class sets CANNOT diverge again -----
+    # #604 wrote this set by hand from worker-live.sh's classes; #614 added two raw classes to
+    # model-health's fold map the same night and nothing tied the two files together, so for the
+    # whole acct01 outage a host-side credential pre-flight failure was CHARGED. Derive the outage
+    # classes from the fold map that OWNS them — every raw key whose fold TARGET is one of
+    # model-health's outage decision classes (LAUNCH_FAIL_CLASSES) — and require SET EQUALITY with
+    # CREDENTIAL_OUTAGE_EXIT_CLASSES. Same posture-lock shape as #595's `SEC_KEYWORDS ==
+    # routing.toml match_labels`. Consequences, both directions:
+    #   * a new raw class folded onto auth/billing/limit/transient and NOT added here -> RED
+    #     (it would otherwise be charged, i.e. the #604/#614 defect verbatim);
+    #   * a class un-charged here that model-health does NOT fold to an outage class -> RED
+    #     (it would otherwise silently un-charge a chargeable failure).
+    _mh = _load_model_health()
+    _mh_outage_raw = frozenset(raw for raw, folded in _mh._EXIT_CLASS_MAP.items()
+                               if folded in _mh.LAUNCH_FAIL_CLASSES)
+    check("DRIFT LOCK: CREDENTIAL_OUTAGE_EXIT_CLASSES == every raw exit class model-health folds "
+          "onto an outage decision class (a new class cannot be added on one side only)",
+          sorted(CREDENTIAL_OUTAGE_EXIT_CLASSES), sorted(_mh_outage_raw))
+    # Non-vacuity of the lock itself: the derivation must actually SEE #614's two classes (a fold
+    # map that stopped carrying them would make the equality above trivially satisfiable by
+    # deleting them from both sides).
+    #
+    # A REQUIRED-SUBSET assertion, not an exact equality (post-merge retro-review of #629): the old
+    # form was `sorted(c for c in _mh_outage_raw if c.startswith("credential-")) == [the two current
+    # names]`, an exact equality over EVERY FUTURE `credential-*` class, so a legitimate, correctly
+    # synchronised THIRD credential class would have redded this line for no reason. What must hold is
+    # that the two #614 classes are still THERE — that is the non-vacuity property — not that no other
+    # credential class may ever exist.
+    check("DRIFT LOCK: the derivation still covers #614's host-side pre-flight classes (required "
+          "SUBSET: a legitimate third `credential-*` class must not red this)",
+          sorted({"credential-refresh-transient", "credential-remint-required"} - _mh_outage_raw),
+          [])
+    check("DRIFT LOCK: the non-vacuity anchor is a SUBSET check, so it survives a new class but "
+          "still fails when one of #614's own is dropped",
+          sorted({"credential-refresh-transient", "credential-remint-required"}
+                 - (_mh_outage_raw | {"credential-brand-new-class"})),
+          [])
+    for _dropped in ("credential-refresh-transient", "credential-remint-required"):
+        check(f"DRIFT LOCK: dropping {_dropped!r} from the fold map would red the anchor "
+              "(the subset check is NOT vacuous)",
+              sorted({"credential-refresh-transient", "credential-remint-required"}
+                     - (_mh_outage_raw - {_dropped})),
+              [_dropped])
+    # ---- THE EMITTER SIDE OF THE CONTRACT (post-merge retro-review of #629) ----------------------
+    # The lock above is bidirectional BETWEEN THE TWO CONSTANTS and says nothing about the PRODUCERS:
+    # worker-prep.sh / broker-refresh.py could start emitting a new raw exit class, the equality would
+    # stay green, model-health would fold it to `unknown`, and it would be CHARGED. That is the
+    # fail-SAFE direction, so it is not a security hole — but it is the same SHAPE of drift, which is
+    # why "#629 closes the CLASS" was overstated. Closed here: every credential class broker-refresh.py
+    # can emit is derived from its source by `ast` (the module is PARSED, never imported — same
+    # precedent as dispatch-secrets-guard.trust_surface_from_worker_pr) and required to be a KEY of the
+    # fold map. A producer can no longer introduce a raw class alone.
+    _emitted = _emitted_credential_exit_classes()
+    check("EMITTER LOCK: broker-refresh.py's CLASS_* constants are readable from source (a derivation "
+          "that resolves EMPTY must name ITSELF, never pass as 'no drift')",
+          bool(_emitted) and all(isinstance(name, str) and name for name in _emitted), True)
+    check("EMITTER LOCK: every credential exit class broker-refresh.py can emit is a KEY of "
+          "model-health._EXIT_CLASS_MAP (a producer cannot add a raw class on its own)",
+          sorted(name for name in _emitted if name not in _mh._EXIT_CLASS_MAP), [])
+    check("EMITTER LOCK: ...and every one of them is also non-chargeable through the REAL predicate",
+          sorted(name for name in _emitted if not is_credential_outage(name)), [])
+    check("EMITTER LOCK: the derivation SEES both of #614's classes (anchor against a parse that "
+          "silently stopped matching)",
+          sorted({"credential-refresh-transient", "credential-remint-required"} - set(_emitted)), [])
+    check("EMITTER LOCK: a hypothetical new producer class that is NOT in the fold map is DETECTED "
+          "(the check is not vacuous)",
+          sorted(name for name in tuple(_emitted) + ("credential-not-in-the-fold-map",)
+                 if name not in _mh._EXIT_CLASS_MAP),
+          ["credential-not-in-the-fold-map"])
+    # ...and every derived class is non-chargeable through the REAL predicate, not just the set.
+    for _derived in sorted(_mh_outage_raw):
+        check(f"DRIFT LOCK: is_credential_outage({_derived!r}) — derived from the fold map",
+              is_credential_outage(_derived), True)
+
+    # The fail direction is toward CHARGING: anything the host could not attribute to the provider
+    # (including the fail-safe `unknown` fold target) keeps the bounded-crash accounting.
+    for charged_class in ("success", "no_change", "setup", "unknown", "other", "zero-dispatch",
+                         "", None, "auth-ish", "authorization",
+                         # near-misses on #614's spellings must NOT be un-charged
+                         "credential", "credential-remint", "remint-required"):
+        check(f"exit class {charged_class!r} is NOT a credential outage",
+              is_credential_outage(charged_class), False)
+
+    def simulate_rounds(exit_classes):
+        """Replay one review run per exit class on a single PR through the REAL control path, with
+        the REAL round numbering dispatch uses (dispatch-claim: round_number = count_rounds + 1, so
+        a voided round number is reused by the next run): record_round (pre-model, unconditional)
+        then void_round_on_outage (post-model, class-gated).
+        Returns (chargeable_rounds, voided_outputs, comment_bodies)."""
+        store, outputs = [], []
+        saved = (globals()["_paginated_comments"], globals()["_comment"],
+                 globals()["_write_outputs"])
+        globals()["_paginated_comments"] = lambda repo, pr: list(store)
+        globals()["_comment"] = lambda repo, pr, body: store.append(
+            {"user": {"login": bot}, "body": body})
+        globals()["_write_outputs"] = lambda values: outputs.append(values.get("voided"))
+        try:
+            for index, cls in enumerate(exit_classes, start=1):
+                run_key = f"{9000 + index}.1"
+                round_n = count_rounds(list(store), bot) + 1
+                record_round("o/r", 9, round_n, run_key, bot, f"{index:040x}")
+                void_round_on_outage("o/r", 9, round_n, run_key, bot, cls)
+        finally:
+            (globals()["_paginated_comments"], globals()["_comment"],
+             globals()["_write_outputs"]) = saved
+        return count_rounds(list(store), bot), outputs, [c["body"] for c in store]
+
+    auth_only = simulate_rounds(["auth"])
+    check("an auth-class run charges NO round", auth_only[0], 0)
+    check("an auth-class run reports voided=true", auth_only[1], ["true"])
+    check("the auth void names the credential outage, not the stale head",
+          any("exit-class=auth" in body and "registry #596" in body for body in auth_only[2]),
+          True)
+    check("the auth void does NOT claim the head moved",
+          any("live head moved off" in body for body in auth_only[2]), False)
+    # A genuine reviewer no-change DOES charge — this is what keeps the budget/decline ladder real.
+    check("a no_change run charges its round", simulate_rounds(["no_change"])[0], 1)
+    check("a successful review charges its round", simulate_rounds(["success"])[0], 1)
+    # DOCUMENTED #596 DECISION: `rate` (rate-limit) is non-chargeable, exactly like auth — the
+    # model never looked at the PR, so there is no judgment to charge a round for.
+    check("a rate-limit run charges NO round (documented #596 decision)",
+          simulate_rounds(["rate-limit"])[0], 0)
+    # #614's HOST-SIDE pre-flight classes, end to end through the real control path. These were
+    # CHARGED for the whole acct01 outage: worker-prep.sh failed before the container even started,
+    # and the round was billed to a model that was never launched.
+    for _preflight_class in ("credential-remint-required", "credential-refresh-transient"):
+        _pf = simulate_rounds([_preflight_class])
+        check(f"a {_preflight_class} run charges NO round (host-side pre-flight, no model ran)",
+              _pf[0], 0)
+        check(f"a {_preflight_class} run reports voided=true", _pf[1], ["true"])
+    # ...and the same mixed-window shape as auth: only the real decline is charged.
+    _pf_mixed = simulate_rounds(["credential-remint-required", "no_change",
+                                 "credential-refresh-transient"])
+    check("mixed pre-flight/no_change/pre-flight charges exactly one round", _pf_mixed[0], 1)
+    check("3 credential-remint-required runs leave decide_budget at continue (no budget park)",
+          decide_budget(simulate_rounds(["credential-remint-required"] * 3)[0], [], None, "openai",
+                        base_rounds=3)["action"],
+          "continue")
+    # ...while an UNATTRIBUTABLE failure still charges, preserving the bounded-crash accounting.
+    check("an unknown-class run still charges its round (bounded-crash accounting intact)",
+          simulate_rounds(["unknown"])[0], 1)
+    check("a setup-class run still charges its round", simulate_rounds(["setup"])[0], 1)
+    # The mixed sequence from the live window: two credential outages around one real decline
+    # charge EXACTLY ONE round.
+    mixed = simulate_rounds(["auth", "no_change", "auth"])
+    check("mixed auth/no_change/auth charges exactly one round", mixed[0], 1)
+    check("mixed sequence voided only the two outage runs", mixed[1], ["true", "false", "true"])
+    # Budget consequence, end to end: with base_rounds=3 a three-run auth outage must still read
+    # `continue`, where charging them would have hit exhaustion and started the park ladder.
+    check("3 auth runs leave decide_budget at continue (no budget park)",
+          decide_budget(simulate_rounds(["auth", "auth", "auth"])[0], [], None, "openai",
+                        base_rounds=3)["action"],
+          "continue")
+    check("3 no_change runs DO exhaust the base budget (the ladder still works)",
+          decide_budget(simulate_rounds(["no_change", "no_change", "no_change"])[0], [], None,
+                        "openai", base_rounds=3)["action"] != "continue",
+          True)
 
     # ---- count_rounds_since (the round-budget human-readmission window, sparq#2804/#3442):
     # only rounds recorded at/after the human's needs:user unlabel are charged to the budget ----
@@ -3490,6 +4751,40 @@ def _self_test():
         check("the away transition still removes only the stale label it observed",
               srs_state["removed"], ["review:needs"])
         srs_globals["_gh_json"] = srs_gh
+
+        # ---- #555 / #560 round-2 finding 2: the MACHINE capacity park must WIN over an opt-in
+        # caller's transition. review:parked IS a review:* label, so {review:changes,
+        # review:parked} looks merely "ambiguous" to the #138 rule and converges to
+        # review:needs-user — DELETING a machine capacity park and inventing a HUMAN-owned
+        # terminal hold, the inversion #555 exists to prevent. Pin BOTH sides: the default
+        # (unchanged) behaviour, and the opt-in that stands the transition down instead. The guard
+        # rides the SAME validated read that drives the removes, so a park landing in a caller's
+        # probe-to-call gap is caught here rather than one layer later.
+        srs_state["live"] = [{"name": "review:changes"}, {"name": MACHINE_PARK_PR_LABEL}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        srs_park = set_review_state("o/r", 5, "needs", abort_on_machine_park=True)
+        check("a live machine park WINS over an opt-in transition (nothing written)",
+              (srs_park, srs_state["posted"], srs_state["removed"]), ("park-abort", [], []))
+        srs_state["live"] = [{"name": "review:changes"}, {"name": MACHINE_PARK_PR_LABEL}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        srs_default = set_review_state("o/r", 5, "needs")
+        check("without the opt-in the same split still converges (unchanged #138 default)",
+              (srs_default, srs_state["posted"]), ("converged", [["review:needs-user"]]))
+        # Writing the park AS the requested state is not a transition away from it — never aborted.
+        srs_state["live"] = [{"name": "review:changes"}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        check("the park write itself is never park-aborted",
+              (set_review_state("o/r", 5, "parked", abort_on_machine_park=True),
+               srs_state["posted"]), ("applied", [[MACHINE_PARK_PR_LABEL]]))
+        # The returned status is what ACTUALLY happened, so callers can log honestly.
+        srs_state["live"] = [{"name": "review:needs-user"}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        check("set_review_state reports a hold refusal",
+              set_review_state("o/r", 5, "needs"), "refused-hold")
+        srs_state["live"] = [{"name": "review:needs"}]
+        srs_state["posted"], srs_state["removed"] = [], []
+        check("set_review_state reports a clean apply",
+              set_review_state("o/r", 5, "changes"), "applied")
 
         # A malformed live label payload fails closed (RAISES) instead of reading as no-hold.
         malformed_failed_closed = False
@@ -4369,6 +5664,98 @@ def _self_test():
         needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
         check("(i) an unreadable timeline freezes the ladder (no receipt/label/comment)",
               (park_route_calls, park_route_comments), ([], []))
+        wiring_globals["_issue_timeline"] = (
+            lambda repo, number: park_route_state["timelines"].get(number, []))
+
+        # ---- (k) #555 RECURRENCE GAP end-to-end: the park must be IDEMPOTENT against an
+        # unchanged head, and a re-admission must grant REAL budget. Live evidence: sparq PR
+        # #3488 was re-admitted 2026-07-22T16:36:56Z and re-escalated at 16:44:10Z — ~7
+        # minutes later, with an UNCHANGED head and no work attempted; PR #3472 re-escalated
+        # seven seconds after it with byte-identical boilerplate, five days after the last
+        # commit or review round on either PR. #555 fixed the park CLASSIFICATION and gave
+        # the budget a readmission WINDOW, but the ladder keyed only on the window: the human
+        # gesture minted a brand-new window key that the very next unchanged-state tick
+        # consumed, driving the ladder straight to its question-class terminal — so the
+        # readmission gesture (and any human unpark) accomplished nothing. ----
+        old_head, new_head = "1" * 40, "2" * 40
+        park_route_state["timelines"] = {41: [], 7: []}
+        park_route_state["comments"] = []
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot,
+                   head_sha=old_head, attempt_key="rounds=5")
+        check("(k) the FIRST park lands and RECEIPTS its attempt fingerprint",
+              (park_route_calls,
+               f"gen=1 cutoff={PARK_WINDOW_NONE} head={old_head} attempt=rounds=5 -->"
+               in park_route_comments[-1]),
+              ([("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")], True))
+        # ... the park's labels become timeline events and its receipt a durable bot comment.
+        park_route_state["timelines"][41] = [labeled("review:parked",
+                                                     "2026-07-22T16:00:00Z")]
+        park_route_state["timelines"][7] = [labeled("status:parked", "2026-07-22T16:00:00Z")]
+        park_route_state["comments"] = [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        # (a) THE BOUNCE: the maintainer re-admits (unlabels review:parked at the observed
+        # 16:36:56Z) and the very next tick re-derives the SAME exhaustion from the SAME
+        # state — unchanged head, no new round. Pre-fix this consumed the fresh window and
+        # emitted the gen-2 question-class terminal at 16:44:10Z. It must now be a QUIET skip:
+        # no label churn, no comment, and the window left UNCONSUMED.
+        park_route_state["timelines"][41] = park_route_state["timelines"][41] + [
+            unlabel("review:parked", "2026-07-22T16:36:56Z")]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        import contextlib
+        import io
+        bounce_log = io.StringIO()
+        with contextlib.redirect_stdout(bounce_log):
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha=old_head, attempt_key="rounds=5")
+        check("(a) unchanged head + an already-recorded park => NO re-emission (no label "
+              "churn, no comment) — the #3488 16:36:56Z->16:44:10Z bounce",
+              (park_route_calls, park_route_comments), ([], []))
+        check("(a) the quiet skip is LOGGED and names the unconsumed window",
+              ("capacity park skipped" in bounce_log.getvalue()
+               and "stays UNCONSUMED" in bounce_log.getvalue()), True)
+        check("(a) the readmission window is still UNCONSUMED (no second receipt)",
+              len(park_generation_cutoffs(park_route_state["comments"], bot)), 1)
+        # (b) the head ADVANCED (a fix was pushed and re-reviewed) and the WINDOWED budget is
+        # genuinely exhausted again => the park re-emits exactly once, consuming the window.
+        # At PARK_ESCALATION_GENERATIONS this is the question-class terminal.
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot, head_sha=new_head, attempt_key="rounds=8")
+        check("(b) an ADVANCED head + a genuinely exhausted budget re-emits the park once — "
+              "here the gen-2 question-class TERMINAL (receipt first)",
+              (park_route_calls,
+               "readmitted and exhausted its budget again" in park_route_comments[-1]),
+              ([("receipt",), ("pr-state", "needs-user"),
+                ("issue-status", 7, "needs-user")], True))
+        check("(b) the re-emitted receipt binds the FRESH window and the new fingerprint",
+              (f"gen=2 cutoff=2026-07-22T16:36:56Z head={new_head} attempt=rounds=8 -->"
+               in park_route_comments[-1]), True)
+        # (d) the bound still terminates: the consumed window's receipt makes every later
+        # unchanged-state tick quiet, and the ladder has reached its terminal generation.
+        park_route_state["comments"] = park_route_state["comments"] + [
+            {"user": {"login": bot}, "body": park_route_comments[-1]}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot, head_sha=new_head, attempt_key="rounds=8")
+        check("(d) after the consumed window the loop TERMINATES quietly (bounded escalation "
+              "intact)", (park_route_calls, park_route_comments), ([], []))
+        check("(d) exactly PARK_ESCALATION_GENERATIONS windows were consumed — the bound was "
+              "spent on work actually attempted, never on the bounce",
+              len(park_generation_cutoffs(park_route_state["comments"], bot)),
+              _park_policy().PARK_ESCALATION_GENERATIONS)
+        # A capacity park with NO fingerprint (unknown head) is unchanged from #555: it can
+        # never be suppressed, so a drifted caller degrades to churn, never to a lost park.
+        park_route_state["comments"] = []
+        park_route_calls.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot,
+                   head_sha="", attempt_key="rounds=5")
+        check("(k) an unknown fingerprint parks exactly as before (no `head=` in the receipt)",
+              (bool(park_route_calls), "head=" in park_route_comments[-1]), (True, False))
     finally:
         wiring_globals.update(real_park_route)
 
@@ -5350,6 +6737,12 @@ def _self_test():
             stage_verdict_for_fix(str(_rec), str(_out), "a" * 40, "o/r", 41, 3)
             check("stage-verdict unwraps a matching record",
                   (_stage_out.get("staged"), json.loads(_out.read_text())), (True, _env_doc))
+            # Issue #560: a BOUND verdict proceeds to the fixer normally — staged=true and NO
+            # stale_reason, so review-fix.yml's `outcome` job never reaches the lane hand-over
+            # step (its `if` requires verdict_staged == 'false' AND a non-empty reason) and the
+            # PR keeps review:changes for the fix it is about to receive.
+            check("#560: a bound verdict emits no defer reason (fix proceeds, no relabel)",
+                  ("stale_reason" in _stage_out, _stage_out.get("staged")), (False, True))
             _out.unlink()
             _stage_out.clear()
             stage_verdict_for_fix(str(_rec), str(_out), "b" * 40, "o/r", 41, 3)
@@ -5394,6 +6787,516 @@ def _self_test():
                           ("raised", _out.exists()), ("raised", False))
         finally:
             globals()["_write_outputs"] = _real_wo
+
+    # ---- issue #560: the defer-to-fresh-review LANE TRANSITION -------------------------------
+    # The fix lane SPUN because an unbound/stale-verdict defer left review:changes on the PR:
+    # fix-enumeration re-admitted it every ~8min dispatch tick (live 2026-07-24 — sparq#3523/
+    # #3542/#3572/#3573/#3608, ~35 wasted runs/hour) while review-enumeration, which keys on
+    # review:needs, never saw it. Assert the pure decision, the pure post-state projection, and
+    # that the IMPERATIVE path applies exactly that projection through the shared label
+    # primitives. The end-to-end SPIN-CLOSURE property (a subsequent enumeration pass no longer
+    # emits needs-fix) is asserted in dispatch-claim.py's --self-test against this same
+    # projection, so neither half can drift from the other.
+    check("#560: every stage-verdict defer reason is a legal hand-over reason",
+          sorted(FIX_LANE_DEFER_REASONS), ["head-moved", "identity-mismatch", "unbound"])
+    check("#560: a clean review:changes hands over to the review lane",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL}), "transition")
+    check("#560: review:needs already live -> drop only the stale fix-lane label",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL}), "drop-fix-label")
+    check("#560: no review:changes -> idempotent no-op",
+          fix_lane_defer_action({REVIEW_LANE_PR_LABEL}), "noop")
+    check("#560: an empty review namespace -> idempotent no-op",
+          fix_lane_defer_action(set()), "noop")
+    check("#560: the hand-over leaves exactly review:needs",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "transition")),
+          {REVIEW_LANE_PR_LABEL})
+    check("#560: the drop leaves exactly review:needs",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL},
+                                    "drop-fix-label")),
+          {REVIEW_LANE_PR_LABEL})
+    # An ambiguous namespace that is NOT the review:needs pair still converges to the fail-closed
+    # human hold: set_review_state's issue #138 policy is honoured, never second-guessed.
+    check("#560: an ambiguous split still converges to the human hold",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, "review:pass"}, "transition")),
+          {"review:needs-user"})
+    try:
+        fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "invent")
+        check("#560: an unknown projection action fails closed", "no error", "raised")
+    except WorkerPrError:
+        check("#560: an unknown projection action fails closed", "raised", "raised")
+    # #555 park ownership + #138 human holds: a MACHINE lane hand-over never displaces either.
+    for _hold in (MACHINE_PARK_PR_LABEL, "review:needs-user", "needs:user"):
+        check(f"#560: a live {_hold} keeps the hand-over out",
+              fix_lane_defer_action({FIX_LANE_PR_LABEL}, holds=[_hold]), "hold")
+        check(f"#560: a live {_hold} leaves the label set untouched",
+              set(fix_lane_defer_labels({FIX_LANE_PR_LABEL}, "hold")), {FIX_LANE_PR_LABEL})
+
+    # ROUND-2 FINDING 2 (#555 park semantics under a RACE), at the pure level: a machine park that
+    # is live when the transition projects must leave the namespace ALONE — never converge it to
+    # review:needs-user, which would DELETE the park and invent a human-owned terminal hold.
+    check("#560 f2: a park in the live namespace makes the transition a no-write",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL}, "transition")),
+          {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL})
+    check("#560 f2: the abort action leaves every label untouched",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL},
+                                    FIX_LANE_ABORT_ACTION)),
+          {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL})
+    for _writing in ("transition", "drop-fix-label", "noop"):
+        for _landed in (MACHINE_PARK_PR_LABEL, "review:needs-user"):
+            check(f"#560 f2: a {_landed} at the re-read aborts '{_writing}'",
+                  fix_lane_defer_abort(_writing, {FIX_LANE_PR_LABEL, _landed}, []), True)
+        for _landed in (MACHINE_PARK_ISSUE_LABEL, "needs:user"):
+            check(f"#560 f2: a source-issue {_landed} at the re-read aborts '{_writing}'",
+                  fix_lane_defer_abort(_writing, {FIX_LANE_PR_LABEL}, [_landed]), True)
+        check(f"#560 f2: a clean re-read does NOT abort '{_writing}'",
+              fix_lane_defer_abort(_writing, {FIX_LANE_PR_LABEL}, []), False)
+    check("#560 f2: nothing to abort once the decision was already 'hold'",
+          fix_lane_defer_abort("hold", {MACHINE_PARK_PR_LABEL}, [MACHINE_PARK_PR_LABEL]), False)
+    try:
+        fix_lane_defer_abort("invent", set(), [])
+        check("#560 f2: an unknown action fails closed in the abort predicate",
+              "no error", "raised")
+    except WorkerPrError:
+        check("#560 f2: an unknown action fails closed in the abort predicate",
+              "raised", "raised")
+    check("#560 f2: ONE park predicate covers BOTH surfaces",
+          sorted(MACHINE_PARK_LABELS), ["review:parked", "status:parked"])
+
+    # ROUND-2 FINDING 1 (the spin was RELOCATED, not closed), at the pure level: the hand-over must
+    # RETRACT the reviewed-sha assertion for the head the registry just disproved, and must leave a
+    # marker naming any OTHER sha alone (already stale to the enumerator, or a newer real review).
+    _f1_head, _f1_other = "a" * 40, "b" * 40
+    for _writing in ("transition", "drop-fix-label", "noop"):
+        check(f"#560 f1: '{_writing}' retracts a marker naming the disproved head",
+              fix_lane_defer_marker_action(_writing, _f1_head, _f1_head), "invalidate")
+        check(f"#560 f1: '{_writing}' keeps a marker naming another head",
+              fix_lane_defer_marker_action(_writing, _f1_other, _f1_head), "keep")
+        check(f"#560 f1: '{_writing}' keeps an already-unbound marker",
+              fix_lane_defer_marker_action(_writing, UNBOUND_REVIEWED_SHA, _f1_head), "keep")
+        check(f"#560 f1: '{_writing}' keeps an absent marker",
+              fix_lane_defer_marker_action(_writing, None, _f1_head), "keep")
+    for _quiet in FIX_LANE_QUIET_ACTIONS:
+        check(f"#560 f1: '{_quiet}' never touches the marker",
+              fix_lane_defer_marker_action(_quiet, _f1_head, _f1_head), "keep")
+    try:
+        fix_lane_defer_marker_action("invent", _f1_head, _f1_head)
+        check("#560 f1: an unknown action fails closed in the marker projection",
+              "no error", "raised")
+    except WorkerPrError:
+        check("#560 f1: an unknown action fails closed in the marker projection",
+              "raised", "raised")
+
+    # ---- #584 FOLLOW-UP FINDING 1: a review:pass PR IS NOT THE FIX LANE'S TO HAND OVER ----------
+    # The fix lane admits on FIVE states and only `needs-fix` keys on review:changes;
+    # enumerate_review_items also emits `needs-ci-fix` from a concluded-RED gate alone (GAP-A,
+    # review-state-AGNOSTIC), so a NON-DRAFT review:pass PR with a red gate is routed into the fix
+    # lane, stage-verdict finds no head-bound FIX verdict and defers. Pre-fix the hand-over computed
+    # "noop" (review:changes was never live) and retracted the marker anyway — and a retracted marker
+    # on an ARMED PR is a disarm trigger (dispatch-claim.enumerate_disarm_items: marker != head =>
+    # disable-auto + dequeue + REDRAFT), so the hand-over destroyed a passed, armed, ready PR.
+    # LIVE at the time of this fix: sparq#2521 (review:pass + trust-surface, non-draft, --auto
+    # armed, `docs-quality quick-gates` genuinely failing under newest-run resolution) was the ONLY
+    # review:pass PR in the sparq repo and sat on exactly this path.
+    check("#584 f1: a clean review:pass stands the hand-over down",
+          fix_lane_defer_action({PASS_LANE_PR_LABEL}), FIX_LANE_PASS_ACTION)
+    check("#584 f1: review:pass beside review:changes stands down too (fail toward leaving alone)",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}), FIX_LANE_PASS_ACTION)
+    check("#584 f1: the stand-down leaves the review namespace untouched",
+          set(fix_lane_defer_labels({PASS_LANE_PR_LABEL}, FIX_LANE_PASS_ACTION)),
+          {PASS_LANE_PR_LABEL})
+    check("#584 f1: ...including the ambiguous pair (the pass is never converged away)",
+          set(fix_lane_defer_labels({FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL},
+                                    FIX_LANE_PASS_ACTION)),
+          {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL})
+    check("#584 f1: the stand-down NEVER retracts the reviewed-sha marker",
+          fix_lane_defer_marker_action(FIX_LANE_PASS_ACTION, _f1_head, _f1_head), "keep")
+    check("#584 f1: nothing left to abort once the decision is the pass stand-down",
+          fix_lane_defer_abort(FIX_LANE_PASS_ACTION, {PASS_LANE_PR_LABEL}, []), False)
+    # ...and re-read AT WRITE TIME like every other guard surface: the arm path can bind review:pass
+    # while a fix run is in flight, so a pass appearing only at the pre-write re-read must ABORT.
+    for _writing in FIX_LANE_WRITING_ACTIONS:
+        check(f"#584 f1: a review:pass at the pre-write re-read aborts '{_writing}'",
+              fix_lane_defer_abort(_writing, {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}, []), True)
+    # DISCRIMINATION, not either half alone: the normal review:changes case still hands over and
+    # still retracts. If the pass guard were widened to every namespace, this pair flips red.
+    check("#584 f1: the NORMAL review:changes case still transitions",
+          fix_lane_defer_action({FIX_LANE_PR_LABEL}), "transition")
+    check("#584 f1: ...and still retracts the disproved marker",
+          fix_lane_defer_marker_action(fix_lane_defer_action({FIX_LANE_PR_LABEL}),
+                                       _f1_head, _f1_head), "invalidate")
+    check("#584 f1: the quiet (zero-write) actions are exactly hold/pass-hold/abort",
+          sorted(FIX_LANE_QUIET_ACTIONS), ["abort-park", "hold", "pass-hold"])
+    check("#584 f1: every writing action is disjoint from the quiet ones",
+          sorted(set(FIX_LANE_WRITING_ACTIONS) & set(FIX_LANE_QUIET_ACTIONS)), [])
+    check("#584 f1: the pre-write abort label set covers park + human hold + pass",
+          sorted(FIX_LANE_ABORT_ON_LABELS),
+          ["needs:user", "review:needs-user", "review:parked", "review:pass", "status:parked"])
+
+    # ---- The IMPERATIVE path over a FAITHFUL stubbed GitHub surface: the PR body (which IS the
+    # reviewed-sha store), the PR labels, and the SOURCE ISSUE labels. Nothing touches the network,
+    # but the REAL live_human_holds / live_machine_parks probes, the REAL set_reviewed_sha CAS loop
+    # and the REAL set_review_state all execute, and the stub APPLIES every write so a later read
+    # observes it. `inject` lands a label at an exact (path, nth-read) so a park can be made to
+    # arrive inside a specific window.
+    fld_globals = globals()
+    fld_real = {name: fld_globals[name] for name in
+                ("_gh_json", "_ensure_label", "_remove_label", "_write_outputs",
+                 "live_human_holds", "live_machine_parks", "_live_review_labels")}
+    try:
+        fld = {"labels": set(), "issue_labels": set(), "body": "", "posted": [], "removed": [],
+               "patched": [], "output": {}, "counts": {}, "inject": None,
+               "inject_label": MACHINE_PARK_PR_LABEL, "malformed": False, "ops": []}
+        _fld_pr = "repos/o/r/pulls/5"
+        _fld_pr_labels = "repos/o/r/issues/5/labels"
+        _fld_issue = "repos/o/r/issues/7"
+        # `ops` records, IN ORDER, every raw API read (`read:<path>#n`), every GUARD PROBE — the
+        # three functions whose result can stand the hand-over down (`guard:<name>`) — and every
+        # write. That makes the structural property behind "an aborted hand-over mutates NOTHING"
+        # (#584 follow-up finding 2) directly assertable: NO GUARD PROBE may run after the FIRST
+        # write, so no stand-down can be decided once something has been written. Pre-fix,
+        # set_review_state ran its own _live_review_labels probe AFTER the reviewed-sha PATCH.
+        # (set_reviewed_sha's CAS read-back and _ensure_label's repo-label existence probe are raw
+        # reads, not guard probes — they decide nothing about standing down.)
+        _fld_guard_paths = (_fld_pr, _fld_pr_labels, _fld_issue)
+
+        def fld_gh(args, **kwargs):
+            if "-X" in args and "POST" in args:            # the label ADD
+                names = list(kwargs.get("input_doc", {}).get("labels") or [])
+                fld["posted"].append(names)
+                fld["ops"].append(f"write:label-add:{','.join(names)}")
+                fld["labels"] |= set(names)
+                return {}
+            if "-X" in args and "PATCH" in args:           # the PR-body (reviewed-sha) write
+                fld["body"] = kwargs.get("input_doc", {}).get("body") or ""
+                fld["patched"].append(fld["body"])
+                fld["ops"].append("write:body")
+                return {}
+            path = args[1] if len(args) > 1 else ""
+            fld["counts"][path] = fld["counts"].get(path, 0) + 1
+            if path in _fld_guard_paths:
+                fld["ops"].append(f"read:{path}#{fld['counts'][path]}")
+            if fld["inject"] == (path, fld["counts"][path]):
+                fld["labels"].add(fld["inject_label"])     # a park lands INSIDE this window
+            if path == _fld_pr_labels:
+                return "nope" if fld["malformed"] else [
+                    {"name": name} for name in sorted(fld["labels"])]
+            if path == _fld_pr:
+                return {"state": "open", "draft": True, "body": fld["body"],
+                        "head": {"ref": "sparq-agent/issue-7-1-1", "sha": _f1_head},
+                        "user": {"login": "sparq[bot]"},
+                        "labels": [{"name": name} for name in sorted(fld["labels"])]}
+            if path == _fld_issue:
+                return {"labels": [{"name": name} for name in sorted(fld["issue_labels"])]}
+            raise AssertionError(f"unstubbed gh read {args}")
+
+        def fld_remove(repo, pr, other):
+            fld["removed"].append(other)
+            fld["ops"].append(f"write:label-remove:{other}")
+            fld["labels"].discard(other)
+
+        def fld_guard(name):
+            """Wrap a GUARD PROBE so `ops` records that a stand-down input was read. The REAL
+            implementation still runs (and still fails closed on malformed payloads)."""
+            real = fld_real[name]
+
+            def probe(*args, **kwargs):
+                fld["ops"].append(f"guard:{name}")
+                return real(*args, **kwargs)
+            return probe
+
+        fld_globals["_gh_json"] = fld_gh
+        fld_globals["_ensure_label"] = lambda repo, label: None
+        fld_globals["_remove_label"] = fld_remove
+        fld_globals["_write_outputs"] = lambda values: fld["output"].update(values)
+        for _probe_name in ("live_human_holds", "live_machine_parks", "_live_review_labels"):
+            fld_globals[_probe_name] = fld_guard(_probe_name)
+
+        def fld_reset(live, issue_labels=(), marker=None, inject=None,
+                      inject_label=MACHINE_PARK_PR_LABEL, malformed=False):
+            fld["labels"] = set(live)
+            fld["issue_labels"] = set(issue_labels)
+            fld["body"] = ("desc\n\n<!-- sparq-reviewed-sha:"
+                           f"{_f1_head if marker is None else marker} -->\n")
+            fld["posted"], fld["removed"], fld["patched"] = [], [], []
+            fld["output"], fld["counts"], fld["ops"] = {}, {}, []
+            fld["inject"], fld["inject_label"] = inject, inject_label
+            fld["malformed"] = malformed
+
+        def run_defer(live, reason="unbound", **kwargs):
+            fld_reset(live, **kwargs)
+            fix_lane_defer("o/r", 5, reason, _f1_head, issue=7)
+            ops = list(fld["ops"])
+            writes = [op for op in ops if op.startswith("write:")]
+            # #584 follow-up finding 2, asserted on EVERY fixture rather than one: once the first
+            # write has landed, NO GUARD PROBE runs again. That is the structural fact that makes
+            # "an aborted hand-over mutates NOTHING" true — a stand-down that can only be decided
+            # before the first write cannot leave a trace. Pre-fix, set_review_state ran its OWN
+            # _live_review_labels probe after the reviewed-sha PATCH and aborted on it.
+            if writes:
+                _after = ops[ops.index(writes[0]) + 1:]
+                assert not [op for op in _after if op.startswith("guard:")], (
+                    "a GUARD PROBE ran AFTER the first write, so an abort decided there would not "
+                    f"be mutation-free: {ops}")
+            # ...and the property that structure exists to guarantee, also on EVERY fixture: an
+            # ABORT never coexists with a write. Pre-fix, the reviewed-sha PATCH had already landed
+            # when set_review_state's own park read aborted, so `abort-park` was reported with
+            # ['write:body'] behind it — the state three comments called mutation-free.
+            assert not (fld["output"].get("action") == FIX_LANE_ABORT_ACTION and writes), (
+                "an ABORTED fix-lane hand-over performed writes, so the abort is NOT "
+                f"mutation-free: {writes} (ops: {ops})")
+            return {
+                "action": fld["output"].get("action"),
+                "decided": fld["output"].get("decided"),
+                "marker": fld["output"].get("marker"),
+                "applied": fld["output"].get("applied"),
+                "labels": set(fld["labels"]) & set(REVIEW_LABELS),
+                "reviewed_sha": reviewed_sha_of(fld["body"]),
+                "posted": [list(names) for names in fld["posted"]],
+                "removed": list(fld["removed"]),
+                "body_writes": len(fld["patched"]),
+                "ops": ops,
+                "writes": writes,
+            }
+
+        # THE round-1 regression: an unbound-record defer must REMOVE review:changes and ADD
+        # review:needs. Leaving review:changes behind IS the live spin.
+        _r = run_defer({FIX_LANE_PR_LABEL}, "unbound")
+        check("#560: an unbound-record defer flips review:changes -> review:needs",
+              (_r["action"], _r["labels"]), ("transition", {REVIEW_LANE_PR_LABEL}))
+        # ...and THE round-2 finding-1 regression, in the SAME run: the stale reviewed-sha
+        # assertion for the disproved head is retracted, so the review lane can actually re-admit
+        # the head instead of exiting already_done. A label-only flip leaves this at _f1_head.
+        check("#560 f1: the hand-over retracts the disproved reviewed-sha assertion",
+              (_r["marker"], _r["reviewed_sha"], _r["body_writes"]),
+              ("invalidate", UNBOUND_REVIEWED_SHA, 1))
+        # The stubbed mutation must equal BOTH pure projections for every reason/namespace pair, so
+        # dispatch-claim's ownership test is asserting the real post-defer PR state.
+        for _live in ({FIX_LANE_PR_LABEL},
+                      {FIX_LANE_PR_LABEL, REVIEW_LANE_PR_LABEL},
+                      {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL},
+                      {PASS_LANE_PR_LABEL},
+                      {REVIEW_LANE_PR_LABEL},
+                      set()):
+            for _reason in FIX_LANE_DEFER_REASONS:
+                _r = run_defer(_live, _reason)
+                check(f"#560: the applied labels match the projection "
+                      f"({sorted(_live)} / {_reason})",
+                      _r["labels"], set(fix_lane_defer_labels(_live, _r["action"])))
+                # The marker half is derived from the projection too, so a namespace that must NOT
+                # be retracted (review:pass — #584 follow-up finding 1) keeps its original binding
+                # instead of being asserted against a hard-coded 'none'.
+                _want_marker = fix_lane_defer_marker_action(_r["decided"], _f1_head, _f1_head)
+                check(f"#560: the applied marker matches the projection "
+                      f"({sorted(_live)} / {_reason})",
+                      (_r["marker"], _r["reviewed_sha"]),
+                      (_want_marker,
+                       UNBOUND_REVIEWED_SHA if _want_marker == "invalidate" else _f1_head))
+        # ---- #584 FOLLOW-UP FINDING 1, THE REPRODUCTION, over the real imperative path. A
+        # review:pass PR whose marker names the disproved head must come out COMPLETELY UNTOUCHED:
+        # no label write, no body write, no comment — because the retraction would disarm+redraft it.
+        # The DISCRIMINATION is the test: the review:changes twin immediately below runs the same
+        # code and MUST still retract, so a guard that swallowed every namespace fails here.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r_pass = run_defer({PASS_LANE_PR_LABEL}, "unbound")
+        check("#584 f1: a review:pass PR is left COMPLETELY untouched by the hand-over",
+              (_r_pass["action"], _r_pass["decided"], _r_pass["labels"], _r_pass["writes"],
+               _r_pass["marker"], _r_pass["reviewed_sha"]),
+              (FIX_LANE_PASS_ACTION, FIX_LANE_PASS_ACTION, {PASS_LANE_PR_LABEL}, [],
+               "keep", _f1_head))
+        check("#584 f1: ...and the stand-down is logged honestly (never a hand-over claim)",
+              (f"{PASS_LANE_PR_LABEL} is live" in _log.getvalue()
+               and "would disarm and re-draft it" in _log.getvalue()
+               and "handed o/r#5 to the review lane" not in _log.getvalue()), True)
+        # THE DISCRIMINATION: identical fixture, review:changes instead of review:pass -> the marker
+        # IS retracted and the lane IS flipped. Only the namespace differs.
+        _r_changes = run_defer({FIX_LANE_PR_LABEL}, "unbound")
+        check("#584 f1: DISCRIMINATION — the review:changes twin still retracts and transitions",
+              (_r_changes["action"], _r_changes["marker"], _r_changes["reviewed_sha"],
+               _r_changes["labels"], _r_changes["body_writes"]),
+              ("transition", "invalidate", UNBOUND_REVIEWED_SHA, {REVIEW_LANE_PR_LABEL}, 1))
+        check("#584 f1: ...so the pass fixture and the changes fixture really do differ",
+              (_r_pass["reviewed_sha"] != _r_changes["reviewed_sha"],
+               _r_pass["writes"] == [] and _r_changes["writes"] != []), (True, True))
+        # The AMBIGUOUS pair no valid flow produces: pre-fix it converged to review:needs-user,
+        # DELETING the pass AND retracting the marker. Now nothing is written at all.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}, "unbound")
+        check("#584 f1: the ambiguous {changes, pass} pair is left alone, not converged",
+              (_r["action"], _r["labels"], _r["writes"], _r["reviewed_sha"]),
+              (FIX_LANE_PASS_ACTION, {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}, [], _f1_head))
+        check("#584 f1: ...and the ambiguity is surfaced as a warning, not silently self-healed",
+              ("::warning::" in _log.getvalue()
+               and "AMBIGUOUS" in _log.getvalue()
+               and "review:needs-user" not in _r["labels"]), True)
+        # A review:pass that lands only at the PRE-WRITE re-read (the arm binding it while this fix
+        # run is in flight) must abort with zero writes, exactly like a park landing there.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr_labels, 2),
+                           inject_label=PASS_LANE_PR_LABEL)
+        check("#584 f1: a review:pass at the pre-write re-read ABORTS with zero writes",
+              (_r["action"], _r["decided"], _r["labels"], _r["writes"], _r["marker"],
+               _r["reviewed_sha"]),
+              (FIX_LANE_ABORT_ACTION, "transition",
+               {FIX_LANE_PR_LABEL, PASS_LANE_PR_LABEL}, [], "keep", _f1_head))
+        check("#584 f1: ...and names the pass in the abort log",
+              (f"guard(s) ['{PASS_LANE_PR_LABEL}']" in _log.getvalue()
+               and "WINS over a lane transition" in _log.getvalue()), True)
+
+        # A marker bound to a DIFFERENT sha belongs to a newer completed review — never clobbered.
+        _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", marker=_f1_other)
+        check("#560 f1: a marker naming another head survives the hand-over",
+              (_r["marker"], _r["reviewed_sha"], _r["body_writes"], _r["labels"]),
+              ("keep", _f1_other, 0, {REVIEW_LANE_PR_LABEL}))
+        # A live hold mutates NOTHING on EITHER surface — no label write, no body write. Both
+        # machine park labels count, on either surface (the ONE park predicate).
+        for _hold, _where in ((MACHINE_PARK_PR_LABEL, "pr"), ("review:needs-user", "pr"),
+                              ("needs:user", "issue"), (MACHINE_PARK_ISSUE_LABEL, "issue")):
+            _r = run_defer({FIX_LANE_PR_LABEL} | ({_hold} if _where == "pr" else set()),
+                           "unbound", issue_labels=() if _where == "pr" else (_hold,))
+            check(f"#560: a live {_hold} on the {_where} blocks every write",
+                  (_r["action"], _r["posted"], _r["removed"], _r["body_writes"],
+                   _r["marker"], _r["reviewed_sha"]),
+                  ("hold", [], [], 0, "keep", _f1_head))
+        # Idempotence: replaying the defer on a FULLY handed-over PR writes nothing at all.
+        _r = run_defer({REVIEW_LANE_PR_LABEL}, "unbound", marker=UNBOUND_REVIEWED_SHA)
+        check("#560: replaying the defer after a complete hand-over writes nothing",
+              (_r["action"], _r["posted"], _r["removed"], _r["body_writes"], _r["labels"],
+               _r["reviewed_sha"]),
+              ("noop", [], [], 0, {REVIEW_LANE_PR_LABEL}, UNBOUND_REVIEWED_SHA))
+        # ...but a HALF-done hand-over (marker-first crash order: label flipped, marker still
+        # bound — or an external relabel) is COMPLETED, not skipped. That state is exactly the
+        # no-owner posture finding 1 describes, so the replay must still retract the marker.
+        _r = run_defer({REVIEW_LANE_PR_LABEL}, "unbound")
+        check("#560 f1: a label-only hand-over is completed by the marker retraction",
+              (_r["action"], _r["posted"], _r["removed"], _r["marker"], _r["reviewed_sha"]),
+              ("noop", [], [], "invalidate", UNBOUND_REVIEWED_SHA))
+
+        # ---- ROUND-2 FINDING 2, THE RACE. #555 splits ownership: review:parked/status:parked is
+        # the MACHINE capacity hold. Pre-fix, a park landing after live_human_holds() but before
+        # the transition made set_review_state see {review:changes, review:parked} — merely
+        # "ambiguous" — and converge it to review:needs-user, DELETING the machine park and
+        # synthesising a HUMAN-owned terminal hold, while the caller logged a successful
+        # review-lane hand-over. Drive the park in at each window and require: park preserved,
+        # NO review:needs-user, transition aborted, and an honest log.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr, 2))
+        check("#560 f2: a park landing after the hold probe is seen by the park probe (hold)",
+              (_r["action"], _r["labels"], _r["posted"], _r["removed"], _r["body_writes"]),
+              ("hold", {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL}, [], [], 0))
+        check("#560 f2: ...and no review:needs-user is synthesised",
+              "review:needs-user" in _r["labels"], False)
+        # The window the finding names: the park is invisible to ALL THREE decision reads and only
+        # appears at the pre-write RE-READ. The hand-over must ABORT, not transition.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr, 3))
+        check("#560 f2: a park at the pre-write re-read ABORTS the hand-over",
+              (_r["action"], _r["decided"], _r["labels"], _r["posted"], _r["removed"],
+               _r["body_writes"], _r["marker"], _r["reviewed_sha"]),
+              (FIX_LANE_ABORT_ACTION, "transition",
+               {FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL}, [], [], 0, "keep", _f1_head))
+        check("#560 f2: the aborted hand-over never creates review:needs-user",
+              "review:needs-user" in _r["labels"], False)
+        check("#560 f2: the abort is logged HONESTLY (no hand-over claim)",
+              ("ABORTED" in _log.getvalue()
+               and "WINS over a lane transition" in _log.getvalue()
+               and "handed o/r#5 to the review lane" not in _log.getvalue()), True)
+        # ---- #584 FOLLOW-UP FINDING 2: THE ABORT PATH PERFORMS ZERO WRITES. Three code comments
+        # asserted the abort "mutates NOTHING", but the marker retraction was written BEFORE the
+        # second adjudication (set_review_state's own independent park read), so an abort decided
+        # there left the reviewed-sha marker retracted — a trace, and on an armed PR a disarm
+        # trigger. Assert on the recorded WRITE LIST being empty, not just on the final label state:
+        # a label-state assertion passes even when a body PATCH landed.
+        for _landed, _where, _at in ((MACHINE_PARK_PR_LABEL, "pr label", (_fld_pr_labels, 2)),
+                                     ("review:needs-user", "pr label", (_fld_pr_labels, 2)),
+                                     (PASS_LANE_PR_LABEL, "pr label", (_fld_pr_labels, 2)),
+                                     (MACHINE_PARK_PR_LABEL, "hold probe", (_fld_pr, 3)),
+                                     ("review:needs-user", "hold probe", (_fld_pr, 3))):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=_at, inject_label=_landed)
+            check(f"#584 f2: an abort on {_landed} at the {_where} re-read writes NOTHING "
+                  f"(empty write list)",
+                  (_r["action"], _r["writes"], _r["body_writes"], _r["reviewed_sha"]),
+                  (FIX_LANE_ABORT_ACTION, [], 0, _f1_head))
+        # ...and the structural reason it is mutation-free: the transition rides the pre-write
+        # snapshot, so set_review_state takes NO read of its own and there is no adjudication point
+        # left after the first write. run_defer asserts "no guard read after the first write" on
+        # every fixture; pin the read budget explicitly too, so re-introducing that second read
+        # (which is what made the abort leave a trace) trips this immediately.
+        _r = run_defer({FIX_LANE_PR_LABEL}, "unbound")
+        check("#584 f2: exactly SIX guard probes run, all of them before any write",
+              ([op for op in _r["ops"] if op.startswith("guard:")],
+               _r["ops"].index("write:body")
+               > max(index for index, op in enumerate(_r["ops"]) if op.startswith("guard:"))),
+              (["guard:live_human_holds", "guard:live_machine_parks", "guard:_live_review_labels",
+                "guard:live_human_holds", "guard:live_machine_parks", "guard:_live_review_labels"],
+               True))
+        check("#584 f2: the write order is marker-then-label (crash-safe direction preserved)",
+              _r["writes"],
+              ["write:body", f"write:label-add:{REVIEW_LANE_PR_LABEL}",
+               f"write:label-remove:{FIX_LANE_PR_LABEL}"])
+        # THE RESIDUAL, stated honestly (issue #294 is not closed here): a park landing AFTER the
+        # pre-write snapshot — inside the marker write itself — is no longer adjudicated, because the
+        # only remaining adjudication point is ahead of every write. The hand-over therefore COMPLETES
+        # rather than aborting, and that is the safe direction: the removes drop only labels OBSERVED
+        # in the snapshot, so the late park is never DELETED — it survives beside review:needs, keeps
+        # the PR excluded from BOTH lanes, and no review:needs-user is invented. Pre-fix this window
+        # produced `abort-park` with the reviewed-sha PATCH already written, i.e. an "abort" that had
+        # mutated the one field that disarms a PR. This fixture is what turns that trade explicit:
+        # under a mutant that restores set_review_state's own read, run_defer's invariant above fires
+        # with the non-empty write list.
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr, 5))
+        check("#584 f2: a park landing INSIDE the write window is never deleted (park survives)",
+              (_r["action"], _r["labels"], _r["reviewed_sha"], _r["removed"]),
+              ("transition", {REVIEW_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL},
+               UNBOUND_REVIEWED_SHA, [FIX_LANE_PR_LABEL]))
+        check("#584 f2: ...and no human hold is synthesised in that window either",
+              "review:needs-user" in _r["labels"], False)
+        # A HUMAN hold landing in the same window aborts identically (never a silent unpark).
+        _log = io.StringIO()
+        with contextlib.redirect_stdout(_log):
+            _r = run_defer({FIX_LANE_PR_LABEL}, "unbound", inject=(_fld_pr, 3),
+                           inject_label="review:needs-user")
+        check("#560 f2: a human hold at the pre-write re-read aborts too",
+              (_r["action"], _r["posted"], _r["removed"], _r["body_writes"]),
+              (FIX_LANE_ABORT_ACTION, [], [], 0))
+
+        # An unrecognised reason fails closed: raises BEFORE any read or write.
+        fld_reset({FIX_LANE_PR_LABEL})
+        try:
+            fix_lane_defer("o/r", 5, "made-up-reason", _f1_head, issue=7)
+            check("#560: an unknown defer reason fails closed", "no error", "raised")
+        except WorkerPrError:
+            check("#560: an unknown defer reason fails closed",
+                  ("raised", fld["posted"], fld["removed"], fld["patched"], fld["counts"]),
+                  ("raised", [], [], [], {}))
+        # A missing/malformed --head-sha fails closed the same way: without it the reviewed-sha
+        # assertion cannot be retracted and the hand-over would only RELOCATE the spin.
+        for _bad in (None, "", "nope", "A" * 40, "a" * 39):
+            fld_reset({FIX_LANE_PR_LABEL})
+            try:
+                fix_lane_defer("o/r", 5, "unbound", _bad, issue=7)
+                check(f"#560 f1: --head-sha {_bad!r} fails closed", "no error", "raised")
+            except WorkerPrError:
+                check(f"#560 f1: --head-sha {_bad!r} fails closed",
+                      ("raised", fld["posted"], fld["removed"], fld["patched"], fld["counts"]),
+                      ("raised", [], [], [], {}))
+        # A malformed live label payload fails closed (never "no labels" -> no hand-over).
+        fld_reset({FIX_LANE_PR_LABEL}, malformed=True)
+        try:
+            fix_lane_defer("o/r", 5, "unbound", _f1_head, issue=7)
+            check("#560: a malformed live label payload fails closed", "no error", "raised")
+        except WorkerPrError:
+            check("#560: a malformed live label payload fails closed",
+                  ("raised", fld["posted"], fld["removed"], fld["patched"]),
+                  ("raised", [], [], []))
+    finally:
+        fld_globals.update(fld_real)
 
     # Privacy (locked decision 22a): salted hash is 16-hex, deterministic, salt-sensitive, and
     # never the raw handle; missing salt fails closed.
@@ -6062,6 +7965,18 @@ def main():
     # marker — --head-sha is required and must be a 40-hex commit id.
     rrec.add_argument("--head-sha", required=True)
 
+    # [registry #596] Void this run's round marker when the model launch died on the account
+    # credential (auth / rate-limit / session-limit / billing). The CLASS GATE lives in
+    # is_credential_outage (pure + self-tested), NOT in a workflow `if:` expression, so the
+    # non-chargeable rule is testable and cannot drift between the two workflows that call it.
+    rvoid = subparsers.add_parser("round-void", parents=[common])
+    rvoid.add_argument("--round", required=True, type=int)
+    rvoid.add_argument("--run-key", required=True)
+    rvoid.add_argument("--bot-login", required=True)
+    rvoid.add_argument("--exit-class", required=True,
+                       help="worker-live.sh exit class for THIS run; only a credential-outage "
+                            "class voids the round (every other value is a no-op)")
+
     rchk = subparsers.add_parser("round-check", parents=[common])
     rchk.add_argument("--max-rounds", required=True, type=int)
     rchk.add_argument("--bot-login", required=True)
@@ -6146,6 +8061,23 @@ def main():
     svrec.add_argument("--pr", required=True, type=int)
     svrec.add_argument("--round", required=True, type=int)
 
+    # Issue #560: stage-verdict deferred (staged=false), so the fix lane must release the PR to the
+    # REVIEW lane — otherwise fix-enumeration re-claims it every dispatch tick forever.
+    fldefer = subparsers.add_parser("fix-lane-defer", parents=[common])
+    fldefer.add_argument("--stale-reason", required=True,
+                         choices=FIX_LANE_DEFER_REASONS,
+                         help="the stage-verdict stale_reason that caused the defer")
+    # REQUIRED (round-2 finding 1): the head stage-verdict proved has no head-bound verdict record.
+    # Without it the stale reviewed-sha assertion cannot be retracted and the hand-over would only
+    # RELOCATE the spin into the review lane's already_done exit, so a missing value must fail the
+    # step loudly rather than silently degrade to a label-only flip.
+    fldefer.add_argument("--head-sha", required=True,
+                         help="the 40-hex head the deferred verdict was NOT bound to; its stale "
+                              "reviewed-sha assertion is retracted so the review lane re-admits it")
+    fldefer.add_argument("--issue", type=int,
+                         help="the source issue (its needs:*/status:parked labels are part of the "
+                              "hold surface)")
+
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
@@ -6155,6 +8087,13 @@ def main():
     # Required for capacity parks once a readmission window exists (the generation-receipt
     # parser's bot trust filter); the question class never needs it.
     nuser.add_argument("--bot-login", default="")
+    # The capacity park's ATTEMPT FINGERPRINT (#555 recurrence gap; park_policy.park_
+    # fingerprint): the live head SHA plus a MONOTONE counter of work attempted. Supplied
+    # together they make the park idempotent against an unchanged head — a re-derivation that
+    # attempted nothing is skipped quietly instead of consuming the readmission window a human
+    # just granted. Optional: omitting either claims no idempotence (pre-fix behaviour).
+    nuser.add_argument("--head-sha", default="")
+    nuser.add_argument("--attempt-key", default="")
 
     dis = subparsers.add_parser("disarm", parents=[common])
     dis.add_argument("--when", choices=("mismatch", "always"), required=True)
@@ -6247,6 +8186,9 @@ def main():
         elif args.command == "round-record":
             record_round(args.repo, args.pr, args.round, args.run_key, args.bot_login,
                          args.head_sha)
+        elif args.command == "round-void":
+            void_round_on_outage(args.repo, args.pr, args.round, args.run_key, args.bot_login,
+                                 args.exit_class)
         elif args.command == "round-check":
             check_round(args.repo, args.pr, args.max_rounds, args.bot_login)
         elif args.command == "record-marker":
@@ -6290,11 +8232,15 @@ def main():
         elif args.command == "stage-verdict":
             stage_verdict_for_fix(args.record_file, args.out_file, args.expected_sha,
                                   args.target_repo, args.pr, args.round)
+        elif args.command == "fix-lane-defer":
+            fix_lane_defer(args.repo, args.pr, args.stale_reason, args.head_sha,
+                           issue=args.issue)
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
                        alert_repo=alert_repo, alert_token=alert_token,
-                       park_class=args.park_class, bot_login=args.bot_login)
+                       park_class=args.park_class, bot_login=args.bot_login,
+                       head_sha=args.head_sha, attempt_key=args.attempt_key)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
                    preserve_review_state=args.preserve_review_state)

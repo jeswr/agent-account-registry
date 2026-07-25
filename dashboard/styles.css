@@ -58,6 +58,10 @@ h2 { margin-bottom: 0; font-size: clamp(1.35rem, 2vw, 1.75rem); letter-spacing: 
   color: #ffe0a1;
   font-size: .9rem;
 }
+/* The banner can carry SEVERAL independent degradations at once (stale generation + usage-probe
+   verdict — issue #580); each is its own line, with no stray margin on the first/last. */
+.warning-line { margin: 0; }
+.warning-line + .warning-line { margin-top: 8px; }
 
 main > section { padding-top: 42px; }
 .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
@@ -74,6 +78,10 @@ main > section { padding-top: 42px; }
 .summary-label { margin-bottom: 13px; color: var(--muted); font-size: .72rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
 .summary-value { margin: 0; font-size: 1.65rem; font-weight: 750; letter-spacing: -.04em; }
 .summary-meta { margin: 7px 0 0; color: var(--muted); font-size: .78rem; line-height: 1.4; }
+/* Issue #219: an unmeasured usage probe is a degradation, not a neutral fact — the card must not
+   read like the healthy ones sitting beside it. */
+.summary-card.degraded { border-color: rgba(243, 189, 88, .38); }
+.summary-card.degraded .summary-value, .summary-card.degraded .summary-meta { color: var(--warn); }
 .provider-lines { display: grid; gap: 6px; margin-top: 1px; }
 .provider-line { display: flex; justify-content: space-between; gap: 12px; font-size: .86rem; }
 .provider-line span:first-child { color: var(--muted); text-transform: capitalize; }
