@@ -1293,7 +1293,8 @@ if [ "$STUB_MODE" = fresh ]; then exit 0; fi
 printf '5\n'
 '''
 
-    def run_reconcile(mode, secret_ref="ACCT07_TOKEN", registry_pat="sentinel-registry-pat"):
+    def run_reconcile(mode, secret_ref="ACCT07_TOKEN", registry_pat="sentinel-registry-pat",
+                      grant_targets="jeswr/agent-account-registry"):
         """rc + GITHUB_OUTPUT text from executing the real reconcile shell hermetically."""
         if reconcile_script is None:
             return None, ""
@@ -1312,7 +1313,11 @@ printf '5\n'
                          "credential_format: claude-oauth-token\n"
                          "max_concurrent_workers: 1\n"
                          f"secret_ref: {secret_ref}\n"
-                         "request_issue: 42\n")
+                         "request_issue: 42\n"
+                         # #579: the broker stamps the AUTHORIZED target repositories onto every
+                         # account record, and reconcile refuses to resume a record whose grant
+                         # cannot be read (an unprovable grant must never re-enter the pipeline).
+                         + (f"grant_targets: {grant_targets}\n" if grant_targets else ""))
             output_path = os.path.join(tmp, "github-output")
             open(output_path, "w", encoding="utf-8").close()
             env = dict(os.environ,
@@ -1325,8 +1330,12 @@ printf '5\n'
                        GITHUB_OUTPUT=output_path,
                        STUB_MODE=mode,
                        STUB_BODY_FILE=body_file)
-            proc = subprocess.run(["bash", "-c", reconcile_script],
-                                  env=env, capture_output=True, text=True)
+            # cwd = the repository root: the extracted reconcile body loads
+            # scripts/grant-account.py by the same relative path every workflow step uses (#579),
+            # so the harness must not depend on the caller's working directory.
+            proc = subprocess.run(["bash", "-c", reconcile_script], cwd=os.path.abspath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)),
+                env=env, capture_output=True, text=True)
             with open(output_path, encoding="utf-8") as fh:
                 return proc.returncode, fh.read()
 
@@ -1352,6 +1361,22 @@ printf '5\n'
     rc_nopat, out_nopat = run_reconcile("secret-exists", registry_pat="")
     chk("reconcile: REGISTRY_SECRETS_PAT empty -> refuse (existence cannot be proven)",
         (rc_nopat != 0, "resume=true" in out_nopat), (True, False))
+    # #579 GRANT-SCOPE contract, same executable harness: a resumed enrollment re-enters at
+    # validate -> account_pool PR, so its AUTHORIZED target repositories must be readable from the
+    # bound account record. A record with no `grant_targets:` line — or an unparseable one — can
+    # never prove which rows its grant may touch, so resume is refused rather than granted with an
+    # unknown (and formerly every-repository) scope.
+    rc_resume_targets, out_resume_targets = run_reconcile("secret-exists")
+    chk("reconcile: a readable grant_targets record publishes the resumed target set",
+        (rc_resume_targets, 'targets=["jeswr/agent-account-registry"]' in out_resume_targets),
+        (0, True))
+    rc_nogrant, out_nogrant = run_reconcile("secret-exists", grant_targets="")
+    chk("[#579] reconcile: account record with NO grant_targets line -> refuse (an unprovable "
+        "grant is never resumed; validate/policy-PR/activation unreachable)",
+        (rc_nogrant != 0, "resume=true" in out_nogrant), (True, False))
+    rc_badgrant, out_badgrant = run_reconcile("secret-exists", grant_targets="not-a-repository")
+    chk("[#579] reconcile: account record with a MALFORMED grant_targets entry -> refuse",
+        (rc_badgrant != 0, "resume=true" in out_badgrant), (True, False))
 
     # Pure scope verdict — accept AND reject directions.
     chk("scope: only github_token -> ok",

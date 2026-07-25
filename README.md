@@ -363,13 +363,24 @@ partial success rate.
 
 You don't paste tokens manually. Instead:
 
-1. Open a **"set up new account"** issue (there's a template) and add the **`set-up-account`** label.
+1. Open a **"set up new account"** issue (there's a template), label it with **one
+   `grant:<owner>/<repo>` label per repository the account is authorized for**, then add the
+   **`set-up-account`** label. Each target must be an `enabled = true` row of `policy/repos.toml`:
+   `account_pool` is the credential-authorization boundary, so an account is granted ONLY to the
+   repositories the request names (#579), and a request that names none is **refused before any
+   login** instead of being granted to every repository.
 2. The `set-up-account` workflow (trust-gated to the maintainer) runs the provider's device/OAuth
    login and **comments a sign-in URL + one-time code** on the issue.
 3. Sign in with the account you want to register. The broker captures the resulting token, stores it
    as the account **secret** (`ACCTNN_TOKEN`) in this registry's `dispatch-secrets` environment,
    registers the account issue, and closes the request. **The token is never printed** — only
    written to a mode-600 file and set as a secret.
+4. The grant lands as a **checked `account-pool/<handle>` PR** that edits only the granted rows
+   (`scripts/grant-account.py`, self-tested), and the labels are **re-read live** immediately before
+   that write — a target removed during the sign-in window fails closed. The authorized set is
+   recorded on the account issue as `grant_targets:`; on merge, `activate` re-proves that every
+   recorded target lists the handle **exactly once** and no other row lists it at all before the
+   account becomes `status:available`.
 
 Providers: **OpenAI** via `codex login --device-auth` (native device flow); **Anthropic** via
 `claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_SECRETS_PAT` (a
