@@ -282,6 +282,10 @@ def _lease_ttl(mode):
 REVIEW_TTL = _lease_ttl("review")   # 10+10+25+10+15 = 70m (was 20m — shorter than the 25m run job)
 FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly the run job, no slack)
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
+# "not probed yet" sentinel for the per-PR readmission-cutoff memo (#555 recurrence gap): the
+# cutoff's own falsy value (None = no proven human gesture) is a MEANINGFUL result, so it cannot
+# double as the not-yet-read marker.
+_UNPROBED = object()
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -1886,18 +1890,27 @@ def _run_target_helper(script_dir, repo, script, args):
 
 
 def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="question",
-                   bot_login=""):
+                   bot_login="", head_sha="", attempt_key=""):
     """Stop the loop for a PR. `park_class` picks the label PAIR (park_policy.py ownership):
     "question" (default) -> the human-owned pair (review:needs-user on the PR, needs:user on
     the source issue) for genuine human questions; "capacity" -> the machine-owned soft-hold
     pair (review:parked on the PR, status:parked on the source issue) for capacity/decline/
     budget-driven stops — veto-gated, receipted per readmission window, and escalating to the
     question class after PARK_ESCALATION_GENERATIONS consumed windows (worker-pr needs_user
-    owns all of that; `bot_login` feeds its receipt parser's trust filter)."""
+    owns all of that; `bot_login` feeds its receipt parser's trust filter).
+
+    `head_sha` + `attempt_key` are the capacity park's ATTEMPT FINGERPRINT (#555 recurrence
+    gap; park_policy.park_fingerprint): the live head plus a MONOTONE counter of work
+    attempted. EVERY capacity park on this path supplies them, so an exhaustion re-derived
+    from unchanged per-PR state is skipped quietly instead of consuming the readmission window
+    a human just granted (the live sparq #3488 7-minute bounce). Question-class parks are
+    unconditional human holds and pass neither."""
     args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason,
             "--park-class", park_class]
     if bot_login:
         args += ["--bot-login", bot_login]
+    if head_sha and attempt_key:
+        args += ["--head-sha", head_sha, "--attempt-key", attempt_key]
     if isinstance(issue, int) and issue > 0:
         args += ["--issue", str(issue)]
     _run_target_helper(script_dir, repo, "worker-pr.py", args)
@@ -2307,6 +2320,47 @@ def _chain_probe_exempt(chain, routing):
     return True
 
 
+def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, repo, number):
+    """The MISSED-FIX-dispatch budget as (charged, lifetime) counts — the #555 RECURRENCE fix
+    for the second exhaustion branch.
+
+    THE BUG: `missed` markers are durable per-round state that nothing resets, and the
+    MISSED_FIX_LIMIT capacity park read the LIFETIME count. #555 windowed the ROUND budget by
+    the human-readmission cutoff but left this counter unwindowed — so a re-admitted PR
+    re-derived "N consecutive fix dispatches missed for round R" from the very same markers on
+    the very next tick, with an UNCHANGED head and no work attempted, and (with a gen-1 receipt
+    already standing) the ladder went straight to its question-class terminal. That is the
+    observed bounce: sparq PR #3488 re-admitted 2026-07-22T16:36:56Z, re-escalated 16:44:10Z;
+    PR #3472 re-escalated seconds later with byte-identical boilerplate, five days after the
+    last commit or review round on either PR. This counter is the purest case of it: it needs
+    NO head advance and NO review round to grow — it grows purely from allocator starvation,
+    identically across every PR in a sweep.
+
+    THE FIX: the LIMIT decision charges only markers recorded at or after `cutoff` (the same
+    readmission window the round budget uses — one timeline read per PR per tick), so a human
+    readmission grants real dispatch capacity. The LIFETIME count is still returned: it is the
+    monotone axis of the park's attempt fingerprint (a window-relative count resets and would
+    read as "unchanged" across two genuinely distinct windows).
+
+    `cutoff_fn` is the PR's memoized readmission-cutoff getter, called ONLY once the LIFETIME
+    count has reached the limit — below it the decision is the same either way, exactly like the
+    round budget's `rounds >= max_rounds` gate — so no extra timeline read is spent on the
+    common case."""
+    lifetime = len(worker_pr.marker_runs(comments, bot_login, "missed", round_number))
+    if lifetime < MISSED_FIX_LIMIT:
+        return lifetime, lifetime
+    cutoff = cutoff_fn()
+    if not cutoff:
+        return lifetime, lifetime
+    charged = len(worker_pr.marker_runs_since(
+        comments, bot_login, "missed", round_number, cutoff))
+    if charged != lifetime:
+        print(f"readmission window open for {repo}#{number}: a human unlabeled a park label "
+              f"at {cutoff}; the missed-fix budget for round {round_number} charges {charged} "
+              f"of {lifetime} recorded miss(es)")
+    return charged, lifetime
+
+
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
                            defer_reasons, lanes=None, ledger_root="", fix_dispatch=None):
@@ -2604,11 +2658,23 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # stays the global count everywhere else: round numbering, the pending-fix lookup,
             # the latest-progress read and the pin round all keep marker/verdict identity.
             # Probed only at/above the base budget: below it decide_budget continues either way.
+            # LAZY + MEMOIZED (#555 recurrence gap): the SAME cutoff also windows the missed-fix
+            # marker budget further down, and both call sites must agree on one readmission
+            # window per PR per tick — so the timeline is read at most once, and only when a
+            # park decision actually hangs on it.
+            readmission_cutoff = _UNPROBED
+
+            def _readmission_cutoff(_repo=repo, _number=number, _issue=issue_number):
+                nonlocal readmission_cutoff
+                if readmission_cutoff is _UNPROBED:
+                    readmission_cutoff = _park_policy.readmission_cutoff(
+                        _repo, _number, _issue, _issue_timeline_events,
+                        is_human=lambda login: _target_is_human_maintainer(_repo, login))
+                return readmission_cutoff
+
             budget_rounds = rounds
             if rounds >= max_rounds:
-                cutoff = _park_policy.readmission_cutoff(
-                    repo, number, issue_number, _issue_timeline_events,
-                    is_human=lambda login: _target_is_human_maintainer(repo, login))
+                cutoff = _readmission_cutoff()
                 if cutoff:
                     budget_rounds = worker_pr.count_rounds_since(comments, bot_login, cutoff)
                     if budget_rounds != rounds:
@@ -2664,6 +2730,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # receipt trust filter). `budget_rounds` is the charged count —
                 # post-readmission when a human unlabeled a park label (sparq#2804/PR#3442),
                 # the full history otherwise.
+                #
+                # The park's ATTEMPT FINGERPRINT (#555 recurrence gap) is the live head plus
+                # the GLOBAL round count `rounds` — deliberately NOT the window-relative
+                # `budget_rounds`, which resets on every readmission and would therefore read
+                # as "unchanged" across two genuinely distinct windows.
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the review round budget is exhausted at {budget_rounds} "
                                f"round(s) "
@@ -2671,7 +2742,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "with no extension left — the top fix tier has run, the latest "
                                "verdict does not grade the PR improving, and no pushed fix at "
                                "or above the pinned floor awaits re-review; a human must "
-                               "decide", park_class="capacity", bot_login=bot_login)
+                               "decide", park_class="capacity", bot_login=bot_login,
+                               head_sha=head_sha, attempt_key=f"rounds={rounds}")
                 continue
             if budget["action"] == "extend-model-pin" and budget["pin"]:
                 # Converge the durable pin marker (normally recorded by the review outcome; this
@@ -2731,14 +2803,21 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # ping-pong therefore always terminates in review:needs-user.
                 mode, role = "fix", "fix"
                 round_number = max(rounds, 1)
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
-                if len(missed) >= MISSED_FIX_LIMIT:
+                missed, missed_total = _missed_fix_budget(
+                    worker_pr, comments, bot_login, round_number, _readmission_cutoff,
+                    repo, number)
+                if missed >= MISSED_FIX_LIMIT:
                     # Missed dispatches ARE capacity starvation (the allocator found no slot
-                    # every tick) -> the machine-owned park, never a fake human question.
+                    # every tick) -> the machine-owned park, never a fake human question. The
+                    # charge is WINDOWED by the readmission cutoff (#555 recurrence gap) so a
+                    # human unpark grants real dispatch capacity; the fingerprint carries the
+                    # LIFETIME count, which is monotone across windows.
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   f"{len(missed)} consecutive fix dispatches missed for round "
+                                   f"{missed} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR",
-                                   park_class="capacity", bot_login=bot_login)
+                                   park_class="capacity", bot_login=bot_login,
+                                   head_sha=head_sha,
+                                   attempt_key=f"missed{round_number}={missed_total}")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
@@ -2748,13 +2827,18 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # corresponds to the clean synthetic round-0 budget posture; the trusted verdict
                 # record is still required below before a verdict-seeded fixer may run.
                 round_number = max(rounds, 1)
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
-                if len(missed) >= MISSED_FIX_LIMIT:
-                    # Same capacity-starvation classification as the repair-state branch above.
+                missed, missed_total = _missed_fix_budget(
+                    worker_pr, comments, bot_login, round_number, _readmission_cutoff,
+                    repo, number)
+                if missed >= MISSED_FIX_LIMIT:
+                    # Same capacity-starvation classification — and the same readmission
+                    # windowing + attempt fingerprint — as the repair-state branch above.
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   f"{len(missed)} consecutive fix dispatches missed for round "
+                                   f"{missed} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR",
-                                   park_class="capacity", bot_login=bot_login)
+                                   park_class="capacity", bot_login=bot_login,
+                                   head_sha=head_sha,
+                                   attempt_key=f"missed{round_number}={missed_total}")
                     continue
                 verdict_file = record_file_path(ledger_root, registry_root,
                                                 worker_pr.verdict_path(repo, number, round_number))
@@ -6089,6 +6173,119 @@ def _self_test():
             # (2) wrote a LEGACY round-7 verdict; the ledger-first resolution tests below
             # depend on the legacy round-7 copy being absent — remove the fixture residue.
             (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 7)).unlink()
+
+            # ---- #555 RECURRENCE GAP: the MISSED-FIX exhaustion branch must honour the
+            # readmission window and be IDEMPOTENT against an unchanged head.
+            #
+            # THE DEFECT (live): sparq PR #3488 was re-admitted 2026-07-22T16:36:56Z and
+            # re-escalated at 16:44:10Z — ~7 minutes later, UNCHANGED head, no work attempted;
+            # re-admitted again 19:37:39Z and re-escalated 2026-07-23T09:48:39Z. PR #3472
+            # re-escalated seven seconds after #3488's with byte-identical boilerplate, five
+            # days after the last commit or review round on either PR. `missed` markers are
+            # durable per-round state that NOTHING resets and this branch read the LIFETIME
+            # count — so the very next tick after any re-admission re-derived the same
+            # exhaustion and (with a gen-1 receipt standing) went straight to the ladder's
+            # question-class terminal. It needs no head advance and no review round to fire,
+            # which is exactly why it hit every PR in a sweep identically. ----
+            def stamped_missed(count, created, round_n, start=1):
+                return [dict(bot_comment(
+                    f"x {wiring_worker_pr.MARKER_KINDS['missed']} round={round_n} "
+                    f"run={i}.1 -->"), created_at=created)
+                    for i in range(start, start + count)]
+
+            def needs_user_flag(flag):
+                return [args[args.index(flag) + 1] for script, args in helper_calls
+                        if script == "worker-pr.py" and args[0] == "needs-user"
+                        and flag in args]
+
+            def label_event(kind, label, ts, login):
+                return {"event": kind, "label": {"name": label},
+                        "created_at": ts, "actor": {"login": login}}
+
+            # rounds=2 keeps the ROUND budget (base 3) out of the way, so the missed-fix branch
+            # is the one under test; round_number = max(rounds, 1) = 2.
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
+            write_verdict(2, None)
+            burned_misses = stamped_rounds(2, "2026-07-22T05:00:00Z") + stamped_missed(
+                MISSED_FIX_LIMIT, "2026-07-22T05:30:00Z", 2)
+            # (baseline, unchanged behaviour) no readmission gesture => the lifetime count
+            # parks, and the park carries its attempt fingerprint (live head + LIFETIME count).
+            fake["comments"] = burned_misses
+            fake.pop("timeline", None)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert [f"{MISSED_FIX_LIMIT} consecutive fix dispatches missed for round 2"
+                    in reason for reason in needs_user_reasons()] == [True], helper_calls
+            assert needs_user_flag("--head-sha") == [sha_a], helper_calls
+            assert needs_user_flag("--attempt-key") == [
+                f"missed2={MISSED_FIX_LIMIT}"], helper_calls
+            # (e) THE 7-MINUTE BOUNCE, reproduced: the maintainer re-admits (a proven-human
+            # unlabel of the machine park at the observed 16:36:56Z) and the sweep ticks again
+            # with an UNCHANGED head and NO new work attempted. Pre-fix the lifetime count
+            # re-derived the same exhaustion and re-escalated. It must now grant REAL capacity:
+            # zero chargeable misses in the window => NO park, and the fix chain is offered
+            # again (the trailing record-marker is the allocator saying "no slot", which is a
+            # fresh miss inside the new window — not an escalation).
+            fake["timeline"] = {41: [label_event("labeled", "review:parked",
+                                                "2026-07-22T16:00:00Z",
+                                                "sparq-orchestrator[bot]"),
+                                     label_event("unlabeled", "review:parked",
+                                                "2026-07-22T16:36:56Z", "jeswr")], 7: []}
+            alloc = FakeAllocator()
+            bounce_log = io.StringIO()
+            with contextlib.redirect_stdout(bounce_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert needs_user_reasons() == [], helper_calls
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert "the missed-fix budget for round 2 charges 0 of " \
+                f"{MISSED_FIX_LIMIT}" in bounce_log.getvalue(), bounce_log.getvalue()
+            # (c) a re-admission grants a FRESH allowance, not an unbounded one: once the
+            # WINDOW itself accumulates MISSED_FIX_LIMIT misses the park fires again — charged
+            # on the window (6), fingerprinted on the LIFETIME count (12, monotone across
+            # windows so two genuinely distinct windows can never read as "unchanged").
+            fake["comments"] = burned_misses + stamped_missed(
+                MISSED_FIX_LIMIT, "2026-07-23T10:00:00Z", 2, start=MISSED_FIX_LIMIT + 1)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert [f"{MISSED_FIX_LIMIT} consecutive fix dispatches missed for round 2"
+                    in reason for reason in needs_user_reasons()] == [True], helper_calls
+            assert needs_user_flag("--attempt-key") == [
+                f"missed2={MISSED_FIX_LIMIT * 2}"], helper_calls
+            # (3'/5') a BOT unlabel opens no window and a timeline read failure keeps the FULL
+            # count — the missed-fix budget fails in the SAME conservative direction as the
+            # round budget (never a fresh allowance on unproven data).
+            fake["comments"] = burned_misses
+            fake["timeline"] = {41: [label_event("unlabeled", "review:parked",
+                                                "2026-07-22T16:36:56Z",
+                                                "sparq-orchestrator[bot]")], 7: []}
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [] and needs_user_reasons(), (alloc.chains, helper_calls)
+            fake["timeline_error"] = True
+            alloc = FakeAllocator()
+            missed_probe_log = io.StringIO()
+            with contextlib.redirect_stdout(missed_probe_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [] and needs_user_reasons(), (alloc.chains, helper_calls)
+            assert "timeline read failed" in missed_probe_log.getvalue(), \
+                missed_probe_log.getvalue()
+            fake.pop("timeline_error", None)
+            # The ROUND-budget park on this same path also carries its fingerprint (live head +
+            # the GLOBAL round count — never the window-relative charge, which resets).
+            fake["comments"] = burned_era
+            fake.pop("timeline", None)
+            write_verdict(5, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            assert (needs_user_flag("--head-sha"), needs_user_flag("--attempt-key")) == (
+                [sha_a], ["rounds=5"]), helper_calls
+            (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 2)).unlink()
 
             # ---- finding A CLAIM glue: a review:parked item that PLAN re-admitted on label
             # STATE must re-prove the human gesture on the label TIMELINES here. No gesture
