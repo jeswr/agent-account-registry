@@ -934,7 +934,17 @@ jobs:
       # in-memory state and are re-expanded into the re-check from there, so on-disk tampering
       # after capture flips the digest comparison and publish fails closed. No continue-on-error:
       # a failed snapshot dies HERE, before any model spend.
-      - name: Pin trust-gate verifier outside the model-writable tree
+      #
+      # [review r1] The WHOLE verifier trust root is pinned, not just the nested gate program: the
+      # DRIVER that performs the live author/body/label/claim checks and decides whether to invoke
+      # that gate lives in the registry checkout, which the gate's target-controlled build scripts
+      # can rewrite just as easily (`../registry/...` from the target working directory). An
+      # exit-zero impostor there would make the re-check "succeed" and publish with no
+      # re-attestation at all, so the driver is snapshotted and digest-bound on the same terms.
+      # Its reverify path imports only the standard library; the lazily-loaded sibling policy
+      # modules are deliberately NOT copied, so any future reverify code path that reaches for one
+      # dies on a missing import (fail-closed) instead of silently loading a rewritable copy.
+      - name: Pin trust-gate verifier + reverify driver outside the model-writable tree
         id: pin-trust-gate
         if: ${{ !inputs.dry_run && steps.trust.outcome == 'success' }}
         run: |
@@ -945,6 +955,12 @@ jobs:
           sha="$(sha256sum "$dst" | cut -d' ' -f1)"
           [[ "$sha" =~ ^[0-9a-f]{64}$ ]]
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          driver_src="$GITHUB_WORKSPACE/registry/scripts/worker-issue.py"
+          driver_dst="$RUNNER_TEMP/trust-verifier/worker-issue.py"
+          install -D -m 0444 "$driver_src" "$driver_dst"
+          driver_sha="$(sha256sum "$driver_dst" | cut -d' ' -f1)"
+          [[ "$driver_sha" =~ ^[0-9a-f]{64}$ ]]
+          echo "driver_sha256=$driver_sha" >> "$GITHUB_OUTPUT"
 
       - name: Prepare isolated selected-account environment
         id: prepare
@@ -1194,6 +1210,9 @@ jobs:
       # the target tree, so it executes the verifier snapshot `pin-trust-gate` captured pre-model —
       # never the target tree's copy, which by now is candidate-change-controlled. --forbid-gate-root
       # makes that a fail-closed RUNTIME assertion (symlinks and `..` are resolved), not a convention.
+      # BOTH halves of that root are pinned (review r1): the driver executed here is the snapshot
+      # too, never the checkout copy the gate's target-controlled build scripts could have replaced
+      # with an exit-zero impostor while the digest-checked gate program sat untouched beside it.
       - name: Re-verify live trust immediately before publish (drift → abort, no state change)
         id: republish-trust
         if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' && steps.pin-trust-gate.outcome == 'success' }}
@@ -1207,15 +1226,26 @@ jobs:
           # a $RUNNER_TEMP env lookup) and is re-bound to the digest recorded in the pin step's
           # in-memory output before it is executed. Wrong digest → abort → publish stays gated off.
           verifier='${{ runner.temp }}/trust-verifier/trust-gate.py'
+          driver='${{ runner.temp }}/trust-verifier/worker-issue.py'
+          pinned='${{ runner.temp }}/trust-verifier'
           expected='${{ steps.pin-trust-gate.outputs.sha256 }}'
-          [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::pinned verifier digest missing'; exit 1; }
-          printf '%s  %s\n' "$expected" "$verifier" | sha256sum --check --strict --quiet -
+          driver_expected='${{ steps.pin-trust-gate.outputs.driver_sha256 }}'
+          [[ "$expected" =~ ^[0-9a-f]{64}$ && "$driver_expected" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo '::error::pinned verifier digest missing'; exit 1; }
+          printf '%s  %s\n%s  %s\n' "$expected" "$verifier" "$driver_expected" "$driver" \
+            | sha256sum --check --strict --quiet -
+          # Nothing may be PLANTED beside the pinned pair either: python puts the executed script's
+          # own directory first on sys.path, so a stdlib-shadowing module dropped in here (json.py,
+          # argparse.py) would hijack the digest-checked driver without altering a single byte of
+          # it. The snapshot holds exactly the two files above and nothing else.
+          [[ "$(find "$pinned" -mindepth 1 | wc -l)" -eq 2 ]] \
+            || { echo '::error::pinned verifier directory was modified'; exit 1; }
           # The forbidden root is the github.workspace EXPRESSION for the same reason the verifier
           # path is: a $GITHUB_ENV append by the gate's target-controlled build scripts must not be
           # able to redirect it. The digest check above is the PRIMARY binding on which bytes run;
           # this is the structural assertion layered on top of it.
           forbidden='${{ github.workspace }}/target'
-          python3 registry/scripts/worker-issue.py reverify \
+          python3 "$driver" reverify \
             --repo "${{ inputs.target_repo }}" \
             --issue "${{ inputs.issue_number }}" \
             --expected-author "${{ needs.resolve.outputs.issue_author }}" \

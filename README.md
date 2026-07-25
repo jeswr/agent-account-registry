@@ -374,10 +374,14 @@ partial success rate.
   status-label / trust-gate revalidation in the fresh publisher immediately before
   `Commit, push, and open DRAFT target pull request` — a maintainer who closes, rewrites, or
   human-parks the issue mid-run is never published over. Three properties make it sound: the
-  verifier is a **pre-model snapshot** taken from the SHA-pinned checkout into `RUNNER_TEMP`
-  (outside every model-container mount) and re-bound to its recorded sha256, so the candidate
-  change can never authorize its own publication — `reverify --forbid-gate-root` refuses at runtime
-  if the gate path resolves into the model-mutable tree; the re-check runs in `--mode pre-publish`,
+  verifier is a **pre-model snapshot** — the trust-gate program *and* the `worker-issue.py` driver
+  that runs the live checks and decides whether to invoke it, since the local gate executes
+  target-controlled cargo build scripts on the runner and could otherwise rewrite either — taken
+  from the SHA-pinned checkouts into `RUNNER_TEMP` (outside every model-container mount) and
+  re-bound to their recorded sha256s, with nothing else permitted in the snapshot directory, so the
+  candidate change can never authorize its own publication — `reverify --forbid-gate-root` refuses
+  at runtime if the gate path resolves into the model-mutable tree; the re-check runs in
+  `--mode pre-publish`,
   which accepts **this run's own** `status:in-progress` claim (dispatch mode's `status:ready`
   demand would refuse every real run) and nothing else; and ownership is a genuine
   compare-and-swap — the run-key-bound claim receipt is posted **before** the shared
