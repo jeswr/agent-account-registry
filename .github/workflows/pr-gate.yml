@@ -1,4 +1,4 @@
-# [OPUS-4.8] B1: the registry's own required PR gate. The onboarded review lane arms a PR with
+# The registry's own required PR gate. The onboarded review lane arms a PR with
 # the sha-bound enablePullRequestAutoMerge mutation (allow_auto_merge is enabled live on the
 # repo; never `gh pr merge --auto`, which direct-merges — sol r4 on #334); that latch only merges when
 # a REQUIRED status check named `gate` is green. This workflow IS that check — a `pull_request`
@@ -41,6 +41,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Set up Python (pinned)
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
@@ -77,29 +78,26 @@ jobs:
       - name: Run the full registry self-test suite
         run: |
           set -euo pipefail
-          # Every self-testing pipeline script — the same FULL suite worker-live.sh's
-          # registry-selftest gate runs. A missing self-test fails the gate (fail closed).
-          suite="policy-resolve.py route-resolve.py ready-issues.py curate-frontier.py dispatch-plan.py \
-          plan-snapshot.py resolve-conflicts.py triage.py park_policy.py gh_retry.py \
-          dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
-          account-usage.py usage-alert.py model-health.py plan-alert.py groom-alert.py pat-validity.py broker-refresh.py \
-          backfill-provenance.py dashboard-gen.py trust-gate.py dispatch-secrets-guard.py"
+          base_manifest="$RUNNER_TEMP/base-selftest-suite.txt"
+          base_retirements="$RUNNER_TEMP/base-selftest-retirements.txt"
+          # Bootstrap only: the introducing PR's base has no shared manifest yet, so its current
+          # complete manifest is the protected baseline. Every later PR reads the base-branch copy.
+          if ! git show '${{ github.event.pull_request.base.sha }}:scripts/selftest-suite.txt' > "$base_manifest" 2>/dev/null; then
+            cp scripts/selftest-suite.txt "$base_manifest"
+          fi
+          if ! git show '${{ github.event.pull_request.base.sha }}:scripts/selftest-retirements.txt' > "$base_retirements" 2>/dev/null; then
+            : > "$base_retirements"
+          fi
+          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")
           for s in $suite; do
-            # An enrolled script that is MISSING is a hard failure (sol r3 on #227): the
-            # silent [[ -f ]] skip would keep this gate green after deleting a security
-            # script — the exact class the trust-gate outage exposed.
-            if [[ ! -f "scripts/$s" ]]; then
-              echo "::error::enrolled self-test script scripts/$s is missing"; exit 1
-            fi
-            if [[ -f "scripts/$s" ]]; then
-              echo "== self-test $s =="
-              python3 "scripts/$s" --self-test
-            fi
+            echo "== self-test $s =="
+            case "$s" in
+              *.py) python3 "scripts/$s" --self-test ;;
+              migrate-secrets.sh) bash "scripts/$s" --self-test ;;
+              *.sh) bash "scripts/$s" self-test ;;
+              *) echo "::error::unsupported self-test suite entry: $s"; exit 1 ;;
+            esac
           done
-          echo "== self-test worker-live.sh =="
-          bash scripts/worker-live.sh self-test
-          echo "== self-test migrate-secrets.sh =="
-          bash scripts/migrate-secrets.sh --self-test
 
       - name: bash -n every shell script
         run: |
