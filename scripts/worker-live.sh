@@ -229,6 +229,28 @@ _credential_mount_args() {
   printf '%s\n' --mount "type=bind,src=$credential_path,dst=/home/worker/$rel,readonly"
 }
 
+# LAUNCH MARKER (issue #569). Records the one fact the downstream model-health job cannot recover
+# for itself: a provider CLI process was ACTUALLY EXECUTED. It is written at the invocation
+# boundary — the last statement before the container exec, after the image build, the credential
+# mount, and every argv assertion — because ANY earlier derivation leaves a
+# cancel-after-step-before-launch window. In that window nothing contacted a provider, yet a health
+# record was still admitted as `unknown`, and `unknown` counts toward the persistent-transient
+# provider alert (model-health.py PERSISTENCE_CLASSES): a run of budget/trust/prep aborts could
+# page a provider outage that never happened. Deriving it from `record-attempt` completing (round 1
+# of PR #422) or from `model-prep` completing (round 2) both re-open exactly that window.
+# Keep this call ADJACENT to the exec; anything inserted between them widens the window again.
+#
+# The channel is $GITHUB_OUTPUT (a step output) rather than $GITHUB_ENV or a later always() step,
+# because a job killed by its `worker_timeout_minutes` timeout or cancelled stops even an in-job
+# always() step from running (see the `worker` job outputs in worker.yml) — the same reason
+# pr_url/exhausted are surfaced as step outputs there. A started-but-unreported attempt therefore
+# still carries the marker, and the downstream job defaults its lost class to `unknown` instead of
+# dropping the genuine timeout.
+_mark_model_launched() {
+  [[ -n ${GITHUB_OUTPUT:-} ]] || return 0
+  printf 'launched=true\n' >> "$GITHUB_OUTPUT"
+}
+
 # mutation_mode:
 #   allow — today's implementation tooling (claude Bash/Edit/Write; codex unchanged).
 #   deny  — reviewer posture: claude is restricted to Read/Glob/Grep. codex KEEPS
@@ -355,6 +377,7 @@ _run_headless_harness() {
         local -a credential_env=()
         [[ -n ${CLAUDE_CODE_OAUTH_TOKEN:-} ]] && credential_env+=(--env CLAUDE_CODE_OAUTH_TOKEN)
         [[ -n ${ANTHROPIC_API_KEY:-} ]] && credential_env+=(--env ANTHROPIC_API_KEY)
+        _mark_model_launched   # invocation boundary — nothing may be inserted below this line
         "${container[@]}" "${credential_env[@]}" "$image" \
           /opt/model-cli/node_modules/.bin/claude -p \
           --model "$provider_model" \
@@ -379,6 +402,7 @@ _run_headless_harness() {
         # (the configuration the proven drain runs).
         local -a model_args=()
         mapfile -t model_args < <(_provider_model_args "$harness" "$provider_model")
+        _mark_model_launched   # invocation boundary — nothing may be inserted below this line
         "${container[@]}" "$image" /opt/model-cli/node_modules/.bin/codex exec \
           "${model_args[@]}" \
           --dangerously-bypass-approvals-and-sandbox \
@@ -2098,11 +2122,16 @@ def relay(record_args):
 
 
 # Pin the three workflow producers too: worker + review/fix relay account-scoped classes through
-# the selected real provider, while dispatcher claim abort is fleet-scoped.
-for name in ("worker.yml", "review-fix.yml"):
+# the selected real provider, while dispatcher claim abort is fleet-scoped. The class argument is
+# pinned PER FILE, not loosened to a wildcard: [issue #569] worker.yml alone defaults a class LOST
+# to a mid-CLI kill (its launch marker admitted the record, but the in-job exit-class step never
+# ran) to `unknown`, while review-fix.yml has no launch marker and still relays the bare value.
+# Both forms stay env-var-only — the default is a shell literal, never a ${{ }} expansion (#199).
+for name, class_arg in (("worker.yml", r'"\$\{EXIT_CLASS:-unknown\}"'),
+                        ("review-fix.yml", r'"\$EXIT_CLASS"')):
     workflow = (workflow_dir / name).read_text(encoding="utf-8")
     if re.search(r'--provider "\$PROVIDER"\s+\\\s+--model-alias "\$MODEL_ALIAS"\s+\\\s+'
-                 r'--exit-class "\$EXIT_CLASS"', workflow) is None:
+                 r'--exit-class ' + class_arg, workflow) is None:
         raise AssertionError(f"{name} health relay lost its real-provider/class mapping")
 dispatch = (workflow_dir / "dispatch.yml").read_text(encoding="utf-8")
 if re.search(r'--provider fleet\s+\\\s+--exit-class claim-abort', dispatch) is None:
@@ -3417,6 +3446,132 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcapg/std
         2>/dev/null | grep -c '^::add-mask::fake-pat-value$' || true)" "2:2"
   chk "(g) the sentinel grep is NON-VACUOUS (it finds the durable file it is meant to guard)" \
     "$(grep -lc 'ROTATED-SENTINEL' "$wbroot/.credential-durable" 2>/dev/null | wc -l | tr -d ' ')" "1"
+
+  # --- [issue #569] LAUNCH MARKER — the model-health admission boundary, proven BEHAVIOURALLY on
+  # BOTH sides by really running _run_headless_harness against a stub `docker` and really killing it
+  # with SIGTERM (what a cancellation / a `worker_timeout_minutes` kill delivers). A static
+  # YAML-wiring grep cannot tell "marker written before the CLI process starts" from "marker written
+  # after it returns" — and that distinction IS the defect, so it has to be executed:
+  #   (A) killed AFTER prep but BEFORE the CLI  => NO marker => model_health records nothing
+  #       (the fabricated `unknown` that used to page a provider outage nothing ever caused).
+  #   (B) killed MID-CLI                        => marker PRESENT and exit class LOST => the
+  #       downstream job's `${EXIT_CLASS:-unknown}` retains the genuine timeout.
+  # Moving _mark_model_launched earlier turns (A) red; moving it after the container returns turns
+  # (B) red. The `.in-run` / `.in-build` phase markers keep each case honest about WHERE it died. ---
+  _launch_fixture() {
+    local root=$1 build_body=$2 run_body=$3
+    rm -rf -- "$root"
+    mkdir -p "$root/home/.codex" "$root/bin" "$root/cwd/.claude/agents"
+    printf 'credential-fixture\n' > "$root/home/.codex/auth.json"
+    printf 'task prompt\n' > "$root/prompt.txt"
+    printf 'routed agent brief\n' > "$root/cwd/.claude/agents/registry-impl.md"
+    # `exec sleep` keeps the stub's own pid ($$, recorded in the phase marker) as the sleeping
+    # process, so the case can reap it instead of orphaning it for the rest of the suite.
+    cat > "$root/bin/docker" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  build) $build_body ;;
+  run)   $run_body ;;
+esac
+STUB
+    chmod +x "$root/bin/docker"
+  }
+  # Wait (bounded) for the harness to reach a phase, so neither case depends on a fixed sleep.
+  _await_phase() {
+    local path=$1 i=0
+    while [[ ! -s "$path" ]] && (( i < 200 )); do sleep 0.05; i=$((i + 1)); done
+    [[ -s "$path" ]]
+  }
+  # Run the REAL harness in the background against the fixture, SIGTERM it once it reaches
+  # $phase_marker, and reap the stub. Returns nothing; the case asserts over $out / $envf.
+  _kill_launch_at() {
+    local root=$1 phase_marker=$2 out=$3 envf=$4 log=$5
+    : > "$out"; : > "$envf"
+    (
+      cd "$root/cwd" || exit 1
+      export PATH="$root/bin:$PATH"
+      export WORKER_ROOT="$root" WORKER_HARNESS=codex WORKER_AGENT=registry-impl \
+             WORKER_PROVIDER_MODEL='' WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+             WORKER_CREDENTIAL_PATH="$root/home/.codex/auth.json" \
+             TARGET_DIR="$root/target" GITHUB_OUTPUT="$out" GITHUB_ENV="$envf"
+      unset WORKER_OUTPUT_DIR
+      _run_headless_harness "$root/prompt.txt" allow
+    ) > "$log" 2>&1 &
+    local harness_pid=$!
+    _await_phase "$phase_marker" || true
+    kill -TERM "$harness_pid" 2>/dev/null || true
+    wait "$harness_pid" 2>/dev/null || true
+    [[ -s "$phase_marker" ]] && kill -TERM "$(cat "$phase_marker")" 2>/dev/null
+    return 0
+  }
+
+  # (A) cancelled after prep, before the provider CLI: the image build is still in flight.
+  local lroot_a="$tmp/launch-precli"
+  _launch_fixture "$lroot_a" \
+    'printf "%s\n" "$$" > "'"$lroot_a"'/.in-build"; exec sleep 10' \
+    'printf "%s\n" "$$" > "'"$lroot_a"'/.in-run"; exec sleep 10'
+  _kill_launch_at "$lroot_a" "$lroot_a/.in-build" \
+    "$tmp/launch-a.out" "$tmp/launch-a.env" "$tmp/launch-a.log"
+  chk "(A) the kill really landed in the PRE-LAUNCH phase (non-vacuous)" \
+    "$([[ -s "$lroot_a/.in-build" ]] && printf reached || printf 'never-built')" "reached"
+  chk "(A) no provider CLI was ever executed" \
+    "$([[ -e "$lroot_a/.in-run" ]] && printf ran || printf 'no-cli')" "no-cli"
+  chk "(A) cancel before the CLI writes NO launch marker => model_health records nothing" \
+    "$(grep -c '^launched=' "$tmp/launch-a.out" || true)" "0"
+
+  # (B) killed MID-CLI: the container is running, so the class can never be written.
+  local lroot_b="$tmp/launch-midcli"
+  _launch_fixture "$lroot_b" \
+    'exit 0' \
+    'printf "%s\n" "$$" > "'"$lroot_b"'/.in-run"; exec sleep 10'
+  _kill_launch_at "$lroot_b" "$lroot_b/.in-run" \
+    "$tmp/launch-b.out" "$tmp/launch-b.env" "$tmp/launch-b.log"
+  chk "(B) the kill really landed MID-CLI (non-vacuous)" \
+    "$([[ -s "$lroot_b/.in-run" ]] && printf ran || printf 'never-ran')" "ran"
+  chk "(B) a started attempt carries the launch marker => the record is RETAINED" \
+    "$(grep -c '^launched=true$' "$tmp/launch-b.out" || true)" "1"
+  chk "(B) the exit class is genuinely LOST to the kill (so the downstream default is load-bearing)" \
+    "$(grep -c 'WORKER_EXIT_CLASS' "$tmp/launch-b.env" || true)" "0"
+
+  # A COMPLETED launch must still mark itself — otherwise (B) could pass with a marker written only
+  # on some kill-specific path, and every ordinary failed run would silently stop being recorded.
+  local lroot_c="$tmp/launch-complete" lc_rc=0
+  _launch_fixture "$lroot_c" 'exit 0' 'exit 7'
+  (
+    cd "$lroot_c/cwd" || exit 1
+    export PATH="$lroot_c/bin:$PATH"
+    export WORKER_ROOT="$lroot_c" WORKER_HARNESS=codex WORKER_AGENT=registry-impl \
+           WORKER_PROVIDER_MODEL='' WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_CREDENTIAL_PATH="$lroot_c/home/.codex/auth.json" \
+           TARGET_DIR="$lroot_c/target" GITHUB_OUTPUT="$tmp/launch-c.out" \
+           GITHUB_ENV="$tmp/launch-c.env"
+    unset WORKER_OUTPUT_DIR
+    _run_headless_harness "$lroot_c/prompt.txt" allow
+  ) > "$tmp/launch-c.log" 2>&1 || lc_rc=$?
+  chk "(C) a CLI that ran and exited non-zero still fails the harness" \
+    "$([[ "$lc_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "(C) a completed launch is marked, and carries its host-observed class" \
+    "$(grep -c '^launched=true$' "$tmp/launch-c.out" || true):$(grep -c '^WORKER_EXIT_CLASS=' "$tmp/launch-c.env" || true)" \
+    "1:1"
+
+  # --- [issue #569] the workflow half of the contract: the marker, not exit_class, admits the
+  # record; the lost class defaults to `unknown`; and master's env-var-only argument passing for the
+  # record step (issue #199 template-injection hardening) is preserved. ---
+  local wf569="$SCRIPT_DIR/../.github/workflows/worker.yml"
+  chk "the worker job exports the launch marker as a job output" \
+    "$(grep -Fc 'model_started: ${{ steps.model.outputs.launched }}' "$wf569" || true)" "1"
+  chk "model_health is admitted by the launch marker" \
+    "$(grep -Fc "needs.worker.outputs.model_started == 'true'" "$wf569" || true)" "1"
+  chk "model_health is NO LONGER gated on a non-empty exit_class alone" \
+    "$(grep -Fc "&& needs.worker.outputs.exit_class != '' }}" "$wf569" || true)" "0"
+  chk "the exit-class step branches on the marker, not on the model step being skipped" \
+    "$(_workflow_step_if "$wf569" exit-class | grep -c 'always()' || true):$(grep -Fc '"$MODEL_LAUNCHED" == "true"' "$wf569" || true)" \
+    "1:1"
+  chk "a started-but-unreported attempt defaults to unknown in the recorder" \
+    "$(grep -Fc -e '--exit-class "${EXIT_CLASS:-unknown}"' "$wf569" || true)" "1"
+  chk "the recorder still passes every value by ENV, never by expression interpolation (#199)" \
+    "$(awk '/^          python3 registry\/scripts\/model-health.py record/,/--run-id/' "$wf569" \
+      | grep -c '\${{' || true)" "0"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
