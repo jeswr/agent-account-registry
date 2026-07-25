@@ -578,6 +578,17 @@ def set_status(repo, issue, status):
                         "status:parked"}),
         "parked": ({"status:parked", "status:deferred"},
                    {"status:ready", "status:in-progress", "status:in-progress-review"}),
+        # `readmitted`: the SOURCE-ISSUE half of re-admitting a MACHINE capacity park on a
+        # PR-backed issue (registry #614 — the automatic cause-recovery path writes exactly what a
+        # human's unlabel gesture leads CLAIM to write). It CLEARS status:parked/status:deferred
+        # and restores the in-progress-review posture the open worker PR is actually in. It applies
+        # NO park label, so it is not veto-gated: the sticky human-unpark veto guards park
+        # APPLICATION, and clearing a machine park points the same way a human unpark does.
+        # Deliberately NOT `retry`, whose status:ready is the IMPLEMENTATION-dispatch posture —
+        # wrong for an issue whose worker PR is already open and cycling through review.
+        "readmitted": ({"status:in-progress-review"},
+                       {"status:parked", "status:deferred", "status:ready",
+                        "status:in-progress"}),
         "complete": (set(), {"status:in-progress", "status:in-progress-review",
                              "status:deferred", "status:parked"}),
     }
@@ -1084,6 +1095,21 @@ def _self_test():
         assert posts == [["status:ready"]], posts
         assert any(path.endswith("labels/status:parked") for path in deletes), deletes
         assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
+        # (x-vi-b) [registry #614] `readmitted`: the source-issue half of re-admitting a MACHINE
+        # capacity park on a PR-BACKED issue. It clears status:parked/status:deferred and restores
+        # in-progress-review — NOT status:ready, which would put the issue back in the
+        # IMPLEMENTATION-dispatch lane while its worker PR is open. It applies no park label, so
+        # a standing human unlabel cannot suppress it (clearing a park points the same way).
+        posts.clear(); deletes.clear()
+        timeline[:] = [
+            park_event("labeled", "status:parked", "2026-07-25T02:19:49Z", "sparq[bot]"),
+            park_event("unlabeled", "status:parked", "2026-07-25T05:00:00Z", "jeswr"),
+        ]
+        set_status("o/r", 9, "readmitted")
+        assert posts == [["status:in-progress-review"]], posts
+        assert any(path.endswith("labels/status:parked") for path in deletes), deletes
+        assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
+        assert all("status:ready" not in labels for labels in posts), posts
         # (x-vii) STRICT human probe (park-policy hygiene finding): an unlabel by an actor the
         # collaborator probe cannot confirm as a maintainer mints NO veto — the park proceeds.
         posts.clear(); deletes.clear()
@@ -1269,7 +1295,8 @@ def main():
 
     status = subparsers.add_parser("status", parents=[common])
     status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
-                                             "deferred", "needs-user", "parked", "complete"),
+                                             "deferred", "needs-user", "parked", "readmitted",
+                                             "complete"),
                         required=True)
 
     receipt = subparsers.add_parser("claim-receipt", parents=[common])

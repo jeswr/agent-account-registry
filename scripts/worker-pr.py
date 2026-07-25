@@ -154,6 +154,23 @@ PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
 # terminal. Both fields are OPTIONAL in the reader: a legacy (#555-era) receipt carries no
 # fingerprint, claims no idempotence, and is re-parked exactly once — which then records one.
 PARK_GENERATION_MARKER = "<!-- sparq-park-generation:v1"
+# The AUTOMATIC-READMISSION receipt (registry #614) — the SECOND member of the park-receipt
+# family, EXTENDING #610's generation receipts rather than replacing them. It is deliberately a
+# DISTINCT marker: the generation receipts ARE the escalation ladder's counter (len(receipts) ==
+# consumed budget windows), so folding automatic re-admissions into them would silently corrupt
+# the ladder. Fields: `evidence=<recovery-event key> at=<canonical recovery stamp>`.
+#
+# It records that the MACHINE re-admitted a machine capacity park on PROVEN cause-recovery
+# (park_policy invariant 3 / capacity_park_admission), and it carries the two properties the
+# whole bound rests on:
+#   - the evidence key is CONSUMED EXACTLY ONCE per PR: the same recovery event can never earn a
+#     second automatic re-admission, and a later park needs a NEW outage-and-recovery pair; and
+#   - the receipt COUNT is the per-PR cap counter (park_policy.AUTO_READMISSION_MAX), counted over
+#     MARKERS so a corrupt receipt cannot buy an extra re-admission.
+# It is also the durable GESTURE the receipt-driven CLAIM proof gate reads: the machine's own
+# re-admission has to be provable after the labels are gone, exactly like a human's unlabel.
+# Bot-authored + reserved-namespace like every other durable marker.
+AUTO_READMIT_MARKER = "<!-- sparq-auto-readmit:v1"
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
 # it cannot collide with a real cutoff).
@@ -484,6 +501,75 @@ def park_generation_records(comments, bot_login, log=print):
                 "fingerprint": policy.park_fingerprint(match.group(3), match.group(4)),
             })
     return records
+
+
+def auto_readmission_records(comments, bot_login, log=print):
+    """Every WELL-FORMED bot-authored AUTOMATIC-readmission receipt (AUTO_READMIT_MARKER) as
+    {"key": evidence key, "at": canonical recovery stamp} — the durable record of each machine
+    re-admission of a machine capacity park (registry #614; park_policy.capacity_park_admission).
+
+    Bot-authored only, like every marker parser: a forged receipt must be able neither to
+    fabricate a re-admission nor to consume an evidence key the pipeline has not used.
+
+    Malformed-field direction: a receipt whose `at` is not a strict ISO-8601 stamp is dropped with
+    a loud log — it can prove no re-admission, so the park STAYS parked (the conservative
+    direction). It still counts toward the per-PR cap via auto_readmission_marker_count, so a
+    corrupt receipt can never buy an extra automatic re-admission."""
+    pattern = re.escape(AUTO_READMIT_MARKER) + r" evidence=(\S+) at=(\S+) -->"
+    policy = _park_policy()
+    records = []
+    for comment in _bot_comments(comments, bot_login):
+        for match in re.finditer(pattern, str(comment.get("body", ""))):
+            key, stamp = match.group(1), match.group(2)
+            if not policy.valid_timestamp(stamp):
+                log(f"::warning::malformed automatic-readmission receipt stamp {stamp!r} "
+                    "treated as absent — it can prove no re-admission (the park stands), and it "
+                    "still counts toward the automatic-readmission cap")
+                continue
+            records.append({"key": key, "at": policy.canonical_ts(stamp)})
+    return records
+
+
+def auto_readmission_marker_count(comments, bot_login):
+    """How many bot-authored AUTO_READMIT_MARKER receipts a PR carries, WELL-FORMED OR NOT — the
+    per-PR automatic-readmission cap counter (park_policy.AUTO_READMISSION_MAX). Counting markers
+    rather than parsed records is the load-bearing choice: a receipt with a corrupt field is still
+    proof that an automatic re-admission was granted, so it must spend cap budget."""
+    return sum(len(re.findall(re.escape(AUTO_READMIT_MARKER), str(comment.get("body", ""))))
+               for comment in _bot_comments(comments, bot_login))
+
+
+def auto_readmission_stamps(comments, bot_login, log=print):
+    """The canonical stamps of every well-formed automatic-readmission receipt — the budget
+    windows park_policy.effective_readmission_cutoff composes with the human cutoff so an
+    automatically re-admitted PR gets the SAME real capacity a human gesture grants."""
+    return [record["at"] for record in auto_readmission_records(comments, bot_login, log)]
+
+
+def auto_readmission_receipt(evidence_key, recovered_at):
+    """The receipt BODY a caller posts (RECEIPT-FIRST) before clearing any machine park label.
+
+    One writer, one format, one place the invariant is stated — see AUTO_READMIT_MARKER."""
+    policy = _park_policy()
+    if not policy.valid_timestamp(recovered_at):
+        raise WorkerPrError("automatic-readmission receipt needs a strict ISO-8601 recovery stamp")
+    stamp = policy.canonical_ts(recovered_at)
+    if not isinstance(evidence_key, str) or not policy.safe_receipt_part(evidence_key):
+        raise WorkerPrError("automatic-readmission receipt evidence key is unsafe")
+    return (f"> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: the "
+            f"starvation cause that parked it has demonstrably CLEARED.\n\n"
+            f"A worker account that was failing when this park landed recorded a SUCCESSFUL run "
+            f"at `{stamp}`, strictly after the park application (evidence `{evidence_key}` — "
+            f"provider/account-fingerprint/run from the model-health window; no raw handle). The "
+            f"machine park label(s) are being removed and the review loop re-admitted with a real "
+            f"budget window.\n\n"
+            f"This consumes that recovery evidence EXACTLY ONCE: the same evidence can never "
+            f"re-admit this PR again, a later park needs a NEW outage-and-recovery pair, and at "
+            f"most {policy.AUTO_READMISSION_MAX} automatic re-admissions are ever granted to one "
+            f"PR — past that the loop stops and asks a human. A human hold "
+            f"(`{'` / `'.join(HUMAN_OWNED_LABELS)}`) and a human-applied park are never "
+            f"touched by this path.\n\n"
+            f"{AUTO_READMIT_MARKER} evidence={evidence_key} at={stamp} -->")
 
 
 def marker_runs(comments, bot_login, kind, round_n):
@@ -2622,10 +2708,20 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             raise WorkerPrError(
                 "capacity park requires --bot-login (the durable generation receipts "
                 "cannot be parsed without the trust filter)")
-        cutoff = policy.readmission_cutoff(repo, pr_number, issue, _issue_timeline,
-                                           is_human=probe,
-                                           on_unreadable=policy.WINDOW_UNREADABLE)
-        records = park_generation_records(_paginated_comments(repo, pr_number), bot_login)
+        comments = _paginated_comments(repo, pr_number)
+        # The ladder's window is the LATER of the proven-human readmission gesture and any
+        # AUTOMATIC re-admission receipt (registry #614): an automatic re-admission grants the
+        # same real budget window a human gesture grants, so a PR that was automatically
+        # re-admitted and then exhausted its budget AGAIN consumes a FRESH generation and still
+        # reaches the PARK_ESCALATION_GENERATIONS question-class terminal — it just gets there
+        # having actually retried. Without this the re-park would dedupe against the
+        # pre-recovery window forever and never escalate to a human. WINDOW_UNREADABLE still wins
+        # outright (the ladder must FREEZE on an unproven timeline).
+        cutoff = policy.effective_readmission_cutoff(
+            policy.readmission_cutoff(repo, pr_number, issue, _issue_timeline, is_human=probe,
+                                      on_unreadable=policy.WINDOW_UNREADABLE),
+            auto_readmission_stamps(comments, bot_login))
+        records = park_generation_records(comments, bot_login)
         receipts = {record["window"] for record in records}
         fingerprint = policy.park_fingerprint(head_sha, attempt_key)
         action, window_key, generation = policy.park_ladder_decision(
@@ -3964,6 +4060,71 @@ def _self_test():
            for record in park_generation_records(fp_receipts, bot)],
           [(PARK_WINDOW_NONE, 1, f"{fp_head}/rounds=5"),
            ("2026-07-23T09:00:00Z", 2, f"{fp_head}/missed3=6")])
+
+    # ---- [registry #614] the AUTOMATIC-readmission receipt: the second member of the
+    # park-receipt family. It records that the MACHINE cleared a machine capacity park on proven
+    # cause-recovery, and it is the durable gesture the CLAIM proof gate reads after the labels
+    # are gone. It must NEVER leak into the generation ladder's counter. ----
+    auto_key = "openai/dc2d7519aaaa0001/6041.1"
+    auto_receipt_comments = [
+        {"user": {"login": bot},
+         "body": auto_readmission_receipt(auto_key, "2026-07-25T03:10:00Z")},
+    ]
+    check("the automatic-readmission receipt round-trips through its own reader",
+          auto_readmission_records(auto_receipt_comments, bot),
+          [{"key": auto_key, "at": "2026-07-25T03:10:00Z"}])
+    check("the receipt states the consume-exactly-once invariant and the cap",
+          ("EXACTLY ONCE" in auto_receipt_comments[0]["body"]
+           and "NEW outage-and-recovery pair" in auto_receipt_comments[0]["body"]
+           and f"most {_park_policy().AUTO_READMISSION_MAX} automatic"
+           in auto_receipt_comments[0]["body"]), True)
+    check("the receipt carries the SPARQ agent self-identification",
+          auto_receipt_comments[0]["body"].startswith("> 🤖 SPARQ agent"), True)
+    check("an automatic receipt NEVER counts as a consumed park-generation window (the ladder "
+          "counter is untouched)",
+          (park_generation_cutoffs(auto_receipt_comments, bot),
+           park_generation_fingerprints(auto_receipt_comments, bot)), (set(), set()))
+    check("a park-generation receipt is not an automatic re-admission either",
+          auto_readmission_records(fp_receipts, bot), [])
+    # A THIRD-PARTY comment can neither fabricate a re-admission nor spend cap budget.
+    forged = [{"user": {"login": "drive-by"},
+               "body": auto_readmission_receipt(auto_key, "2026-07-25T03:10:00Z")}]
+    check("a forged (non-bot) automatic receipt is invisible",
+          (auto_readmission_records(forged, bot), auto_readmission_marker_count(forged, bot)),
+          ([], 0))
+    # A malformed stamp proves NO re-admission (park stands) but STILL spends cap budget, so a
+    # corrupt receipt can never buy an extra automatic re-admission.
+    auto_logs = []
+    corrupt_auto = [{"user": {"login": bot},
+                     "body": f"x {AUTO_READMIT_MARKER} evidence={auto_key} at=zzz -->"}]
+    check("a malformed automatic receipt proves nothing",
+          auto_readmission_records(corrupt_auto, bot, log=auto_logs.append), [])
+    check("the malformed automatic receipt is logged loudly",
+          any("malformed automatic-readmission receipt stamp" in line for line in auto_logs),
+          True)
+    check("a malformed automatic receipt STILL counts toward the per-PR cap",
+          auto_readmission_marker_count(corrupt_auto, bot), 1)
+    check("the cap counter counts every marker across comments",
+          auto_readmission_marker_count(auto_receipt_comments + corrupt_auto, bot), 2)
+    check("legacy spellings canonicalize onto one window identity",
+          auto_readmission_stamps(
+              [{"user": {"login": bot},
+                "body": f"x {AUTO_READMIT_MARKER} evidence={auto_key} "
+                        f"at=2026-07-25T04:10:00+00:00 -->"}], bot),
+          ["2026-07-25T04:10:00Z"])
+    for unsafe_key, unsafe_stamp in ((f"{auto_key} -->", "2026-07-25T03:10:00Z"),
+                                     ("openai/a b/1", "2026-07-25T03:10:00Z"),
+                                     ("", "2026-07-25T03:10:00Z"),
+                                     (None, "2026-07-25T03:10:00Z"),
+                                     (auto_key, "yesterday"),
+                                     (auto_key, "2026-07-25T03:10:00")):
+        try:
+            auto_readmission_receipt(unsafe_key, unsafe_stamp)
+            check(f"the receipt writer refuses ({unsafe_key!r}, {unsafe_stamp!r})",
+                  "no error", "WorkerPrError")
+        except WorkerPrError:
+            check(f"the receipt writer refuses ({unsafe_key!r}, {unsafe_stamp!r})",
+                  "raised", "raised")
 
     # ---- marker_runs_since (#555 recurrence gap): the missed/nochange/gatefail marker
     # budgets are windowed by the readmission cutoff exactly like the round budget. The

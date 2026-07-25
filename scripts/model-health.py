@@ -682,6 +682,92 @@ def auth_cooldowns(records, now):
     return {acct: cd for acct, cd in state.items() if cd["backoff_until"] > now}
 
 
+def _iso_z(ts):
+    """One decision-logic timestamp spelling for the park surface: compact ISO-8601 Z-form UTC
+    (park_policy.canonical_ts's canonical spelling), so a recovery stamp orders and dedupes
+    against park/receipt window keys with no spelling ambiguity."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts)))
+
+
+def capacity_recovery_evidence(records, parked_at, now):
+    """POSITIVE per-account evidence that the STARVATION CAUSE of a machine capacity park has
+    CLEARED — the automatic-readmission gate of park_policy.capacity_park_admission (registry
+    #614). PURE, and derived from the SAME rolling health window as auth_cooldowns /
+    account_backoffs: there is no parallel health store.
+
+    The predicate, exactly (an account qualifies iff ALL of these hold):
+      1. its NEWEST record at or before `parked_at` (epoch seconds of the park application) is a
+         LAUNCH-FAIL class — auth/billing/limit/transient — i.e. that account WAS failing when the
+         park landed, with no interleaved success between the failure and the park. This is what
+         makes the evidence specific to the park's cause instead of "the fleet looks healthy now";
+      2. it has recorded a `success` strictly after BOTH `parked_at` and its own LAST launch
+         failure in the window — the earliest such run is the recovery event. Requiring the
+         success to out-date the last failure is what keeps a FLAPPING account from claiming
+         recovery: the cause must have cleared and STAYED cleared, not merely blinked green once;
+         and
+      3. it is NOT in an ACTIVE auth cooldown right now (#604's auth_cooldowns): a credential the
+         allocator is still holding back has demonstrably NOT recovered. This deliberately
+         OVERLAPS condition 2 (a live cooldown implies a recent auth failure) — both are required,
+         neither is relied on alone, and both are cheap.
+    The earliest qualifying recovery across accounts wins (ties broken by account fingerprint) so
+    the answer is deterministic for a given window.
+
+    Returns None — "no proven recovery, stay parked" — for EVERY ambiguity: no records, an
+    absent/non-finite `parked_at` (a park whose application instant is unknown can never be
+    out-dated by anything), or ANY record that fails the shared _validate_record contract (an
+    unreadable window is never read optimistically). Records stamped implausibly far in the
+    FUTURE are skipped exactly as elsewhere, so a forged-future `success` cannot spring a park.
+
+    The returned `key` is the RECOVERY EVENT's durable identity — provider/account/run — which the
+    caller receipts on the PR; park_policy consumes it exactly once and can never re-earn a
+    re-admission from it. It carries no raw handle (the account is the salted hash, locked
+    decision 22a) and only park-receipt-safe characters."""
+    if not isinstance(records, list) or not records:
+        return None
+    if (not isinstance(parked_at, (int, float)) or isinstance(parked_at, bool)
+            or parked_at != parked_at or parked_at in (float("inf"), float("-inf"))):
+        return None
+    for record in records:
+        try:
+            _validate_record(record)
+        except ValueError:
+            return None
+    cooldowns = auth_cooldowns(records, now)
+    window = [record for record in sorted(records, key=lambda r: r["ts"])
+              if record["ts"] <= now + FUTURE_SKEW_SECONDS]  # future-forged stamps prove nothing
+    cause, last_fail = {}, {}
+    for record in window:
+        account = record["account"]
+        if record["ts"] <= parked_at:
+            cause[account] = record      # newest record at/before the park application
+        if record["exit_class"] in LAUNCH_FAIL_CLASSES:
+            last_fail[account] = record["ts"]
+    recovery = {}
+    for record in window:
+        account = record["account"]
+        if (record["exit_class"] == SUCCESS and account not in recovery
+                and record["ts"] > parked_at
+                and record["ts"] > last_fail.get(account, float("-inf"))):
+            recovery[account] = record   # earliest success after the park AND the last failure
+    candidates = [
+        (record["ts"], account, record)
+        for account, record in recovery.items()
+        if account in cause
+        and cause[account]["exit_class"] in LAUNCH_FAIL_CLASSES
+        and account not in cooldowns
+    ]
+    if not candidates:
+        return None
+    ts, account, record = min(candidates)
+    return {
+        "key": f"{record['provider']}/{account}/{record.get('run_id') or int(ts)}",
+        "recovered_at": _iso_z(ts),
+        "provider": record["provider"],
+        "account": account,
+        "cause": cause[account]["exit_class"],
+    }
+
+
 def account_backoffs(records, now):
     """Reactive per-account backoff for probe-exempt providers (maintainer decision 2026-07-17,
     registry issue #29), DERIVED purely from the pruned health window. Walks records in ts order:
@@ -2444,6 +2530,105 @@ def _self_test():
         bool(_no_change_limit_view(
             [rec("openai", "codex01", CLASS_NO_CHANGE, dt=i * 10, run=f"n{i}", issue=500 + i)
              for i in range(NO_CHANGE_LIMIT_MIN)], now + 60)[1]), True)
+
+    # ---- [registry #614] capacity_recovery_evidence: the CAUSE-RECOVERY gate that lets a
+    # MACHINE capacity park re-admit itself. Derived from THIS window (no parallel health store);
+    # every ambiguity yields None, which park_policy reads as "stay parked". ------------------
+    parked = now + 100            # the park application instant, epoch seconds
+    outage_then_fix = [rec("openai", "codex01", "auth", dt=0, run="6001.1"),
+                       rec("openai", "codex01", "auth", dt=50, run="6002.1"),
+                       rec("openai", "codex01", SUCCESS, dt=200, run="6003.1")]
+    evidence = capacity_recovery_evidence(outage_then_fix, parked, now + 300)
+    chk("the failing-then-recovered account is proven recovery evidence",
+        (evidence or {}).get("key"), f"openai/{ah}/6003.1")
+    chk("the evidence names the recovery instant in canonical Z-form and the cleared cause",
+        ((evidence or {}).get("recovered_at"), (evidence or {}).get("cause")),
+        (_iso_z(now + 200), CLASS_AUTH))
+    chk("the evidence key carries NO raw handle (locked decision 22a)",
+        "codex01" in (evidence or {}).get("key", ""), False)
+    chk("the evidence key is park-receipt safe (no whitespace, no marker terminator)",
+        bool(re.fullmatch(r"[A-Za-z0-9._=/:-]{1,120}", (evidence or {}).get("key", ""))), True)
+    # (c) NO post-park success => no evidence (the cause has not demonstrably cleared).
+    chk("an account still failing after the park yields NO evidence",
+        capacity_recovery_evidence(outage_then_fix[:2], parked, now + 300), None)
+    chk("a success BEFORE the park proves nothing (it predates the starvation)",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", "auth", dt=0, run="a1"),
+             rec("openai", "codex01", SUCCESS, dt=50, run="s1")], parked, now + 300), None)
+    chk("a success exactly AT the park instant is not STRICTLY after it",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", "auth", dt=0, run="a1"),
+             rec("openai", "codex01", SUCCESS, dt=100, run="s1")], parked, now + 300), None)
+    # SPECIFICITY: a success from an account that was NOT failing when the park landed is not
+    # evidence about this park's cause — otherwise "the fleet looks healthy" would clear any park.
+    chk("a healthy account's success is not evidence about the park's cause",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", SUCCESS, dt=0, run="s0"),
+             rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300), None)
+    chk("an account with no record at all before the park proves nothing",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300), None)
+    chk("a success that FOLLOWS a success on the failing account still counts once the "
+        "pre-park record is a launch failure",
+        (capacity_recovery_evidence(outage_then_fix + [
+            rec("openai", "codex01", SUCCESS, dt=260, run="6004.1")], parked,
+            now + 300) or {}).get("key"), f"openai/{ah}/6003.1")
+    # #604 INTEGRATION: an account the auth cooldown is still holding back has NOT recovered.
+    cooling = [rec("openai", "codex01", "auth", dt=0, run="a1"),
+               rec("openai", "codex01", SUCCESS, dt=200, run="s1"),
+               rec("openai", "codex01", "auth", dt=250, run="a2"),
+               rec("openai", "codex01", "auth", dt=260, run="a3")]
+    chk("an ACTIVE auth cooldown (#604) blocks the recovery claim",
+        (bool(auth_cooldowns(cooling, now + 300)),
+         capacity_recovery_evidence(cooling, parked, now + 300)), (True, None))
+    chk("a FLAPPING account proves nothing even once the cooldown expires: the success must "
+        "out-date the LAST failure, not merely blink green once",
+        capacity_recovery_evidence(cooling, parked,
+                                   now + 260 + AUTH_COOLDOWN_SECONDS + 1), None)
+    chk("... and a success AFTER that flap does prove recovery (cause cleared and stayed clear)",
+        (capacity_recovery_evidence(
+            cooling + [rec("openai", "codex01", SUCCESS, dt=400, run="s2")], parked,
+            now + 500) or {}).get("key"), f"openai/{ah}/s2")
+    # (d) an UNREADABLE / ambiguous window yields None — never an optimistic read.
+    chk("a malformed record anywhere in the window => NO evidence (stay parked)",
+        capacity_recovery_evidence(
+            outage_then_fix + [{"ts": "nope", "provider": "openai", "account": ah,
+                                "exit_class": SUCCESS, "run_id": "x", "model_alias": ""}],
+            parked, now + 300), None)
+    chk("a hand-forged unknown exit_class anywhere => NO evidence",
+        capacity_recovery_evidence(
+            outage_then_fix + [dict(rec("openai", "codex01", SUCCESS, dt=210, run="s9"),
+                                    exit_class="totally-new")], parked, now + 300), None)
+    chk("an unreadable window (None / not a list / empty) => NO evidence",
+        [capacity_recovery_evidence(bad, parked, now + 300)
+         for bad in (None, {}, [], "records")], [None] * 4)
+    chk("an unknown park instant can never be out-dated => NO evidence",
+        [capacity_recovery_evidence(outage_then_fix, bad, now + 300)
+         for bad in (None, "2026-07-25T02:19:49Z", float("nan"), float("inf"), True)],
+        [None] * 5)
+    # A forged-FUTURE success cannot spring a park (same skew rule as every other walk).
+    chk("a future-forged success is not recovery evidence",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", "auth", dt=0, run="a1"),
+             rec("openai", "codex01", SUCCESS, dt=FUTURE_SKEW_SECONDS + 3600, run="s1")],
+            parked, now + 300), None)
+    # DETERMINISM: the EARLIEST qualifying recovery wins, across accounts.
+    two_recoveries = [rec("openai", "codex01", "auth", dt=0, run="a1"),
+                      rec("openai", "codex02", "auth", dt=10, run="b1"),
+                      rec("openai", "codex02", SUCCESS, dt=150, run="b2"),
+                      rec("openai", "codex01", SUCCESS, dt=200, run="a2")]
+    chk("the earliest qualifying recovery wins deterministically",
+        (capacity_recovery_evidence(two_recoveries, parked, now + 300) or {}).get("key"),
+        f"openai/{other_h}/b2")
+    chk("every launch-fail class can be the cleared cause (auth/billing/limit/transient)",
+        [bool(capacity_recovery_evidence(
+            [rec("openai", "codex01", cls, dt=0, run="f1"),
+             rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300))
+         for cls in sorted(LAUNCH_FAIL_CLASSES)], [True] * len(LAUNCH_FAIL_CLASSES))
+    chk("a SETUP failure (runner fault, not provider access) is not a starvation cause",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", CLASS_SETUP, dt=0, run="f1"),
+             rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300), None)
 
     # ---- prune / window bound ---------------------------------------------------------------
     many = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=i) for i in range(MAX_RECORDS + 50)]
