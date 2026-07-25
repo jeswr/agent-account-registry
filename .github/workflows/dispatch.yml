@@ -642,7 +642,7 @@ jobs:
 
           snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
           document = {
-              "schema": "registry-dispatch-plan/v4",
+              "schema": "registry-dispatch-plan/v5",
               "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "repositories": intermediate["repositories"],
               "review_items": review_items,
@@ -658,7 +658,7 @@ jobs:
           if set(document) != {"schema", "generated_at", "repositories", "review_items",
                                "disarm_items", "snapshot_skips"}:
               raise SystemExit("plan schema top-level fields are invalid")
-          if document["schema"] != "registry-dispatch-plan/v4":
+          if document["schema"] != "registry-dispatch-plan/v5":
               raise SystemExit("plan schema version is invalid")
           expected_item_fields = {"number", "priority", "package", "role", "model_chain",
                                   "agent", "escalate", "labels", "author", "body_sha", "deferred"}
@@ -668,7 +668,11 @@ jobs:
               for item in repository["items"]:
                   if set(item) != expected_item_fields:
                       raise SystemExit("plan item fields are invalid")
-          expected_review_fields = {"pr_number", "head_sha", "state", "impl_provider", "repo",
+          # [issue #657] v5 adds trust_class + review_provider to every review item: the
+          # self-declared class dispatches TWO reviews per PR (one per provider), so the review
+          # SIDE is no longer derivable from impl_provider alone.
+          expected_review_fields = {"pr_number", "head_sha", "state", "impl_provider",
+                                    "trust_class", "review_provider", "repo",
                                     "package", "security", "context"}
           for item in document["review_items"]:
               if set(item) != expected_review_fields:
