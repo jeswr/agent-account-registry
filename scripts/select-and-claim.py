@@ -17,6 +17,7 @@ and heartbeat are keyed by the unique claim_id.
 """
 import argparse
 import base64
+import datetime
 import hashlib
 import importlib.util
 import json
@@ -227,6 +228,205 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
     return True
 
 
+# ---- WINDOW ACCOUNTING + PROJECTED-BURN WIND-DOWN (issue #676) -----------------------------------
+# [OPUS-5] The half that makes RAISING concurrency safe. The point-in-time gate above is a CLIFF: an
+# account at (1 - margin) utilisation admits a full complement of workers, all of which then die
+# together when the window runs dry mid-run. That is precisely the mass-failure a higher ceiling
+# would amplify, so the ceiling raise and this wind-down MUST ship together.
+#
+# WHAT IS REALLY OBSERVED vs WHAT IS A PROXY — stated plainly, because the difference matters:
+#   * REAL: `5h_util` / `5h_reset` are verbatim `anthropic-ratelimit-unified-5h-*` response headers
+#     (account-usage._assemble_usage). Utilisation and the reset instant are PROVIDER-REPORTED
+#     facts, not anything we count locally. Nothing in this repo increments a usage counter, and
+#     this code deliberately does not invent one.
+#   * PROXY: the BURN RATE. The provider publishes no consumption-per-unit-time figure and this
+#     repo persists no usage time-series (the probe snapshot is ephemeral runner state — see
+#     account-usage.py §4), so a rate must be inferred. We infer it from the window's GEOMETRY:
+#     assume the window that ends at `5h_reset` began WINDOW_SECONDS earlier, so
+#     elapsed = WINDOW_SECONDS - (reset - now), and mean_rate = util / elapsed. That is exact for a
+#     TUMBLING window and an approximation for a ROLLING one (a rolling window's oldest usage ages
+#     out continuously, so the true instantaneous rate can differ). It is also a MEAN, so a bursty
+#     account is under-estimated early in the window.
+#     => It is labelled a proxy everywhere it is used, and it is only ever allowed to REDUCE
+#     concurrency, never to grant more than the point-in-time gate already would.
+#
+# FAIL DIRECTION. A window-state read that fails must never read as "plenty of headroom". But
+# failing to a FLAT ZERO on an absent `5h_reset` would be an outage, not caution — the reset header
+# is optional and legitimately absent, so a fleet-wide blackout would be one missing header away.
+# The resolution is a two-factor taper whose UNCONDITIONAL factor needs no reset at all:
+#   utilisation factor  — needs only `5h_util`/`7d_util` (always present; `_valid_base_usage`
+#                         omits the account otherwise). Always applied.
+#   projection factor   — needs a parseable reset. UNAVAILABLE => omitted, and the utilisation
+#                         factor alone governs.
+# Both are monotone TIGHTENINGS of the existing binary gate — neither can ever admit an account
+# that `usage_eligible` rejects, and neither can grant more slots than the static cap. So the
+# degraded path (no reset) is strictly safer than today's behaviour while never being a blackout.
+WINDOW_SECONDS = {"5h": 5 * 3600, "7d": 7 * 86400}
+# Utilisation taper: full cap until the wind-down band opens, then linear to ZERO at the admission
+# ceiling (1 - margin). Reaching zero AT the ceiling — not at 1.0 — is what "stop before the limit
+# rather than at it" means: the last worker is admitted with a whole safety margin still unspent.
+WINDDOWN_BAND = 0.25
+# Projection taper, in RUN-LENGTHS of remaining headroom. At/below ZERO_RUNS the account takes no
+# new work: one further run is projected to consume the rest of the window, so dispatching it would
+# knowingly start an agent that cannot finish.
+WINDDOWN_ZERO_RUNS = 1.0
+WINDDOWN_FULL_RUNS = 2.0
+
+
+def _parse_reset(value):
+    """A reset stamp -> absolute epoch seconds, or None when it is not interpretable.
+
+    `5h_reset` is a verbatim provider header string that nothing has ever parsed (it was read and
+    discarded), so its concrete form is not something this repo has pinned down. Accept the two
+    shapes the unified rate-limit headers are documented to use — epoch seconds (possibly as a
+    numeric string) and an RFC-3339/ISO-8601 instant — and refuse everything else rather than
+    guessing. A refusal costs only the projection factor; the utilisation factor still governs.
+    """
+    if isinstance(value, bool):        # bool is an int subclass — never a timestamp
+        return None
+    number = _usage_num(value)
+    if number is not None and math.isfinite(number):
+        return number
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):      # datetime.fromisoformat rejects a literal Z before 3.11
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:          # a naive stamp is UTC by provider convention
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def window_burn_rate(u, prefix, now):
+    """PROXY mean utilisation-per-second so far in the account's current `prefix` window.
+
+    None when it cannot be derived (no parseable reset, a reset that has already passed, a window
+    that looks un-started, or a non-finite utilisation). Callers treat None as "no projection
+    available" and fall back to the utilisation taper — never to unlimited headroom.
+    """
+    util, reset_raw = _usage_window(u, prefix)
+    if util is None or not (0.0 <= util <= 1.0):
+        return None
+    span = WINDOW_SECONDS.get(prefix)
+    reset = _parse_reset(reset_raw)
+    if span is None or reset is None:
+        return None
+    # Two DISTINCT ways the elapsed-time inference becomes meaningless. They are kept as separate
+    # guards because they reject different inputs and each must be independently killable by a test
+    # — an earlier single `0 < remaining <= span` condition folded them together, and its upper half
+    # was then an equivalent mutant (remaining > span IS elapsed < 0), i.e. an untestable branch.
+    remaining = reset - now
+    if remaining <= 0.0:
+        return None                    # stale snapshot: the reset instant has already passed
+    elapsed = span - remaining
+    if elapsed <= 0.0:
+        return None                    # reset further out than the window itself -> clock skew,
+        #                                misread header, or a window that has only just turned over
+    return util / elapsed
+
+
+def seconds_to_admission_floor(u, prefix, now, margin):
+    """Projected seconds until utilisation reaches the (1 - margin) admission ceiling, at the PROXY
+    burn rate. 0.0 when already at/over it; None when no rate is derivable."""
+    rate = window_burn_rate(u, prefix, now)
+    if rate is None:
+        return None
+    util, _ = _usage_window(u, prefix)
+    remaining_headroom = (1.0 - margin) - util
+    if remaining_headroom <= 0.0:
+        return 0.0
+    if rate <= 0.0:
+        return math.inf                # nothing burned yet in this window
+    return remaining_headroom / rate
+
+
+def _taper(value, zero_at, full_at):
+    """Linear ramp: <= zero_at -> 0.0, >= full_at -> 1.0, linear between. Fail-closed on junk."""
+    if value is None or not isinstance(value, float) and not isinstance(value, int):
+        return 0.0
+    value = float(value)
+    if math.isnan(value):
+        return 0.0
+    if value >= full_at:
+        return 1.0
+    if value <= zero_at:
+        return 0.0
+    return (value - zero_at) / (full_at - zero_at)
+
+
+def utilisation_factor(u, margin=SAFETY_MARGIN):
+    """Concurrency multiplier in [0,1] from POINT-IN-TIME utilisation alone — the unconditional
+    factor that needs no reset header. Full until the wind-down band opens, ZERO at the (1 - margin)
+    admission ceiling. Takes the WORST of every base window so a tapped 7d bucket winds an account
+    down even while its 5h bucket looks fresh."""
+    ceiling = 1.0 - margin
+    factor = 1.0
+    for prefix in ("5h", "7d"):
+        util, _ = _usage_window(u, prefix)
+        if util is None or not (0.0 <= util <= 1.0):
+            return 0.0                 # malformed/unknown -> no grant (matches usage_eligible)
+        # Headroom measured from the ceiling, expressed as a fraction of the wind-down band.
+        factor = min(factor, _taper(ceiling - util, 0.0, WINDDOWN_BAND))
+    return factor
+
+
+def projection_factor(u, now, run_seconds, margin=SAFETY_MARGIN):
+    """Concurrency multiplier in [0,1] from PROJECTED burn. None when no window yields a usable
+    projection (the caller then relies on `utilisation_factor` alone). Expressed in RUN-LENGTHS:
+    an account with less than one further run of projected headroom takes no new work."""
+    if run_seconds is None or run_seconds <= 0:
+        return None
+    factors = []
+    for prefix in ("5h", "7d"):
+        seconds = seconds_to_admission_floor(u, prefix, now, margin)
+        if seconds is None:
+            continue
+        factors.append(_taper(seconds / run_seconds, WINDDOWN_ZERO_RUNS, WINDDOWN_FULL_RUNS))
+    return min(factors) if factors else None
+
+
+def winddown_factor(u, now=None, run_seconds=None, margin=SAFETY_MARGIN):
+    """The account's concurrency multiplier in [0,1] — the MINIMUM of every applicable factor.
+
+    Probe-EXEMPT entries (openai/codex) publish no windows at all, so there is nothing to wind down:
+    they return 1.0 and stay governed by the reactive `backoff_until` gate in `usage_eligible`.
+    """
+    if not isinstance(u, dict):
+        return 0.0                     # no probe data -> no grant (fail-closed, as everywhere)
+    if u.get("exempt") is True:
+        return 1.0                     # non-metered provider: reactive backoff is its only control
+    if now is None:
+        now = time.time()
+    factor = utilisation_factor(u, margin)
+    projected = projection_factor(u, now, run_seconds, margin)
+    return factor if projected is None else min(factor, projected)
+
+
+def adaptive_slots(account, u, now=None, run_seconds=None, margin=SAFETY_MARGIN):
+    """The number of worker slots this account may be granted RIGHT NOW, after the wind-down taper.
+
+    Never exceeds the account's static `max_concurrent_workers`; reaches 0 strictly BEFORE the
+    window limit. A positive factor always grants at least one slot so a healthy-but-warming
+    account keeps flowing instead of rounding to zero.
+    """
+    try:
+        cap = int(account.get("max_concurrent_workers", 4))
+    except (TypeError, ValueError, OverflowError):
+        return 0                       # malformed catalog value -> no grant (never an exception)
+    if cap <= 0:
+        return 0
+    return cap  # MUTANT
+
+
 def _weekly_reset(u):
     """Whole-account weekly reset used for provider-wide use-it-or-lose-it draining."""
     _, reset = _usage_window(u, "7d")
@@ -299,14 +499,23 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
 
 
 def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, margin=SAFETY_MARGIN,
-                        now=None):
+                        now=None, run_seconds=None):
     """How many workers may run right now = sum of per-account slots over accounts eligible to START
     (available, optionally serving `model_chain`, and `usage_eligible`). Starts HIGH when many accounts
     have headroom and BACKS OFF automatically as utilisation climbs (ineligible accounts drop out), so
     credits aren't spent on workers that would half-finish. `absolute_cap` is an optional hard ceiling.
     Returns 0 when `usage` is empty/None (probe unavailable) — the caller should then fall back to the
     static policy `max_concurrent`; a returned 0 WITH a non-empty usage map means every account is
-    genuinely tapped out and nothing should dispatch."""
+    genuinely tapped out and nothing should dispatch.
+
+    [OPUS-5 issue #676] Each eligible account now contributes its WIND-DOWN-TAPERED slot count
+    (`adaptive_slots`) rather than its flat static cap, so the fleet sheds concurrency smoothly as
+    accounts approach their quota windows instead of running at full width into a cliff. Passing
+    `run_seconds` (the expected worker wall-clock) additionally enables the projected-burn factor,
+    which stops dispatching to an account that could not FINISH another run inside its remaining
+    window. The taper can only ever REDUCE this total: an account still has to clear the binary
+    `usage_eligible` gate first, and its grant is capped by its static `max_concurrent_workers`.
+    """
     if not usage:
         return 0
     total = 0
@@ -321,14 +530,14 @@ def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, ma
             continue
         u = usage.get(a["handle"])
         if any(usage_eligible(u, margin, model=m, now=now) for m in servable):
-            total += int(a.get("max_concurrent_workers", 4))
+            total += adaptive_slots(a, u, now=now, run_seconds=run_seconds, margin=margin)
     if absolute_cap is not None:
         total = min(total, absolute_cap)
     return total
 
 
 def available_account_slots(accounts, leases, model_chain, now, account_pool=None, usage=None,
-                            margin=SAFETY_MARGIN):
+                            margin=SAFETY_MARGIN, run_seconds=None):
     """Return the live remaining worker slots able to serve ``model_chain``.
 
     This is the account-slot bound used by the review/fix dispatcher.  Unlike the historical
@@ -361,6 +570,12 @@ def available_account_slots(accounts, leases, model_chain, now, account_pool=Non
             cap = int(account.get("max_concurrent_workers", 4))
         except (TypeError, ValueError, OverflowError):
             continue
+        # [OPUS-5 issue #676] The review/fix lane's bound winds down with the quota window too —
+        # otherwise raising the review-lane ceiling reintroduces the cliff on the very lane the
+        # throughput goal loads hardest. `usage=None` (the deliberate static path) is untapered.
+        if usage is not None:
+            cap = min(cap, adaptive_slots(account, usage.get(handle), now=now,
+                                          run_seconds=run_seconds, margin=margin))
         slots += max(0, cap - active_for(live, handle))
     return slots
 
@@ -1908,6 +2123,136 @@ def _self_test():
           dynamic_concurrency(U, None, ["fable"]), 0)
     # backward compat: usage=None keeps the original cache-affinity selection.
     check("usage=None backward compatible", choose_account(A, [], ["fable"], "pkg", "impl", now), "acct02")
+
+    # ---- [OPUS-5 issue #676] WINDOW ACCOUNTING + PROJECTED-BURN WIND-DOWN ------------------------
+    # Every check below is written to DIE if the guard it names is deleted or inverted. The
+    # utilisation ramp, the projection ramp, the fail-closed reads and BOTH call sites
+    # (dynamic_concurrency / available_account_slots) are asserted separately, because a taper that
+    # is computed but never consumed is exactly the vacuous guard this suite exists to catch.
+    W_NOW = 1_800_000_000
+    W_ACCT = {"handle": "w", "models": ["opus5"], "max_concurrent_workers": 4, "available": True}
+
+    def w_usage(util5, reset=None, util7=0.0):
+        entry = {"status": "allowed", "5h_util": str(util5), "7d_util": str(util7)}
+        if reset is not None:
+            entry["5h_reset"] = reset
+        return entry
+
+    # -- reset parsing: the projection factor is only as good as this, and a stamp it cannot read
+    # must degrade to "no projection", never to "infinite headroom".
+    check("_parse_reset reads epoch seconds", _parse_reset(1_800_000_123), 1_800_000_123.0)
+    check("_parse_reset reads a numeric string", _parse_reset(" 1800000123 "), 1_800_000_123.0)
+    check("_parse_reset reads RFC-3339 with Z",
+          _parse_reset("2027-01-15T12:00:00Z"),
+          datetime.datetime(2027, 1, 15, 12, 0, tzinfo=datetime.timezone.utc).timestamp())
+    check("_parse_reset treats a naive stamp as UTC",
+          _parse_reset("2027-01-15T12:00:00"), _parse_reset("2027-01-15T12:00:00Z"))
+    check("_parse_reset refuses junk", _parse_reset("next tuesday"), None)
+    check("_parse_reset refuses a bool (int subclass, never a timestamp)", _parse_reset(True), None)
+    check("_parse_reset refuses None/empty", (_parse_reset(None), _parse_reset("  ")), (None, None))
+
+    # -- burn rate is a PROXY derived from window geometry; every un-derivable shape returns None
+    # (which the caller reads as "no projection"), and NONE of them may read as headroom.
+    half_spent = w_usage(0.25, reset=W_NOW + 2.5 * 3600)      # 25% used, 2.5h into a 5h window
+    check("window_burn_rate derives util/elapsed from the window geometry",
+          round(window_burn_rate(half_spent, "5h", W_NOW) * 3600, 6), 0.1)  # 10%/h
+    check("window_burn_rate: unparseable reset -> None (no projection, not free headroom)",
+          window_burn_rate(w_usage(0.25, reset="whenever"), "5h", W_NOW), None)
+    check("window_burn_rate: absent reset -> None", window_burn_rate(w_usage(0.25), "5h", W_NOW), None)
+    check("window_burn_rate: reset already past -> None (stale snapshot)",
+          window_burn_rate(w_usage(0.25, reset=W_NOW - 1), "5h", W_NOW), None)
+    check("window_burn_rate: reset further out than the whole window -> None (clock skew)",
+          window_burn_rate(w_usage(0.25, reset=W_NOW + 6 * 3600), "5h", W_NOW), None)
+    check("seconds_to_admission_floor projects the (1-margin) ceiling, not 100%",
+          round(seconds_to_admission_floor(half_spent, "5h", W_NOW, 0.15) / 3600, 4), 6.0)
+    check("seconds_to_admission_floor: already past the ceiling -> 0.0",
+          seconds_to_admission_floor(w_usage(0.90, reset=W_NOW + 2.5 * 3600), "5h", W_NOW, 0.15), 0.0)
+
+    # -- THE WIND-DOWN THRESHOLD. Full width below the band, strictly decreasing across it, and
+    # ZERO at the (1-margin) admission ceiling while usage_eligible still says True — that gap IS
+    # "stop before the limit rather than at it". Deleting WINDDOWN_BAND (or widening it to cover
+    # everything) breaks the monotone ramp assertion; setting the zero point to 1.0 breaks the
+    # "zero while still eligible" assertion.
+    ramp = [adaptive_slots(W_ACCT, w_usage(u), now=W_NOW, margin=0.15)
+            for u in (0.0, 0.30, 0.60, 0.65, 0.70, 0.80, 0.85)]
+    check("wind-down ramp: full cap below the band, then monotonically down to zero",
+          ramp, [4, 4, 4, 3, 2, 1, 0])
+    check("wind-down reaches ZERO strictly BEFORE the point-in-time gate closes",
+          (usage_eligible(w_usage(0.85), 0.15), adaptive_slots(W_ACCT, w_usage(0.85),
+                                                              now=W_NOW, margin=0.15)),
+          (True, 0))
+    check("wind-down band tracks the margin (a laxer margin winds down later)",
+          (adaptive_slots(W_ACCT, w_usage(0.85), now=W_NOW, margin=0.05),
+           adaptive_slots(W_ACCT, w_usage(0.95), now=W_NOW, margin=0.05)), (2, 0))
+    check("wind-down takes the WORST base window (a tapped 7d winds down a fresh 5h)",
+          adaptive_slots(W_ACCT, w_usage(0.0, util7=0.84), now=W_NOW, margin=0.15), 1)
+
+    # -- THE PROJECTION GUARD. Same utilisation, same margin: only the BURN RATE differs. A 90-min
+    # worker is refused when the window cannot outlast it and admitted when it can. Making the
+    # projection a no-op (returning None/1.0 unconditionally) collapses these two to the same value.
+    fast_burn = w_usage(0.30, reset=W_NOW + 4.75 * 3600)   # 30% in the first 15 min
+    slow_burn = w_usage(0.30, reset=W_NOW + 3.00 * 3600)   # 30% over 2 h
+    check("projected burn REFUSES an account that cannot finish another run in its window",
+          adaptive_slots(W_ACCT, fast_burn, now=W_NOW, run_seconds=5400, margin=0.15), 0)
+    check("projected burn ADMITS the same utilisation at a survivable rate",
+          adaptive_slots(W_ACCT, slow_burn, now=W_NOW, run_seconds=5400, margin=0.15), 4)
+    check("the ONLY difference between them is the projection (identical without run_seconds)",
+          (adaptive_slots(W_ACCT, fast_burn, now=W_NOW, margin=0.15),
+           adaptive_slots(W_ACCT, slow_burn, now=W_NOW, margin=0.15)), (4, 4))
+    check("a LONGER run is refused where a shorter one is admitted (run-length scaling)",
+          (adaptive_slots(W_ACCT, slow_burn, now=W_NOW, run_seconds=1800, margin=0.15),
+           adaptive_slots(W_ACCT, slow_burn, now=W_NOW, run_seconds=5400 * 4, margin=0.15)), (4, 0))
+    check("projection_factor is None (not 1.0) when no window can be projected",
+          projection_factor(w_usage(0.30), W_NOW, 5400, 0.15), None)
+    check("projection never GRANTS above the utilisation taper (it can only tighten)",
+          adaptive_slots(W_ACCT, w_usage(0.80, reset=W_NOW + 3 * 3600), now=W_NOW,
+                         run_seconds=60, margin=0.15), 1)
+
+    # -- FAIL DIRECTION. An unreadable window must not read as headroom. Missing reset degrades to
+    # the utilisation taper (safe, non-blackout); malformed/absent UTILISATION grants nothing.
+    check("missing reset degrades to the utilisation taper, NOT to full headroom",
+          (adaptive_slots(W_ACCT, w_usage(0.70), now=W_NOW, run_seconds=5400, margin=0.15),
+           adaptive_slots(W_ACCT, w_usage(0.0), now=W_NOW, run_seconds=5400, margin=0.15)), (2, 4))
+    check("malformed utilisation grants ZERO slots (fail-closed)",
+          [adaptive_slots(W_ACCT, w_usage(bad), now=W_NOW, margin=0.15)
+           for bad in ("nan", "-0.5", "1.5", "not-a-number")], [0, 0, 0, 0])
+    check("a non-dict usage entry grants ZERO slots", winddown_factor(None, now=W_NOW), 0.0)
+    check("an absent usage entry grants ZERO slots", winddown_factor({}, now=W_NOW), 0.0)
+    check("a malformed max_concurrent_workers grants ZERO (never raises)",
+          adaptive_slots({"handle": "w", "max_concurrent_workers": "lots"}, w_usage(0.0), now=W_NOW), 0)
+    check("a positive factor always grants at least one slot (no silent round-to-zero)",
+          adaptive_slots({"handle": "w", "max_concurrent_workers": 1}, w_usage(0.84),
+                         now=W_NOW, margin=0.15), 1)
+    check("probe-EXEMPT accounts publish no windows and are never wound down",
+          winddown_factor({"exempt": True, "reachability": "live"}, now=W_NOW, run_seconds=5400), 1.0)
+
+    # -- CALL SITE 1: dynamic_concurrency must CONSUME the taper. Two accounts, both eligible, both
+    # cap=4: a fresh one and a nearly-tapped one. Summing flat caps gives 8; summing adaptive_slots
+    # gives 4+1. Reverting that one line to `int(a.get("max_concurrent_workers", 4))` makes this red.
+    W_POOL = [{"handle": "fresh", "models": ["opus5"], "max_concurrent_workers": 4, "available": True},
+              {"handle": "tapped", "models": ["opus5"], "max_concurrent_workers": 4, "available": True}]
+    W_USAGE = {"fresh": w_usage(0.0), "tapped": w_usage(0.80)}
+    check("dynamic_concurrency SUMS THE TAPERED grant, not the flat static cap",
+          dynamic_concurrency(W_POOL, W_USAGE, ["opus5"], margin=0.15, now=W_NOW), 5)
+    check("dynamic_concurrency winds the whole pool down as utilisation climbs",
+          [dynamic_concurrency(W_POOL, {h: w_usage(u) for h in W_USAGE}, ["opus5"],
+                               margin=0.15, now=W_NOW) for u in (0.0, 0.70, 0.84, 0.85)],
+          [8, 4, 2, 0])
+    check("dynamic_concurrency applies the PROJECTION at its call site too",
+          (dynamic_concurrency(W_POOL, {h: fast_burn for h in W_USAGE}, ["opus5"],
+                               margin=0.15, now=W_NOW, run_seconds=5400),
+           dynamic_concurrency(W_POOL, {h: slow_burn for h in W_USAGE}, ["opus5"],
+                               margin=0.15, now=W_NOW, run_seconds=5400)), (0, 8))
+
+    # -- CALL SITE 2: available_account_slots (the review/fix lane bound) must taper as well, and
+    # must keep subtracting live leases. Deleting the taper block there makes the first check 8.
+    check("available_account_slots applies the wind-down taper",
+          available_account_slots(W_POOL, [], ["opus5"], W_NOW, usage=W_USAGE, margin=0.15), 5)
+    check("available_account_slots still subtracts live leases under the taper",
+          available_account_slots(W_POOL, [make_lease("fresh", "h", "p", "r", "opus5", W_NOW, 3600)],
+                                  ["opus5"], W_NOW, usage=W_USAGE, margin=0.15), 4)
+    check("available_account_slots leaves the deliberate static path (usage=None) untapered",
+          available_account_slots(W_POOL, [], ["opus5"], W_NOW, usage=None), 8)
 
     # ---- [FABLE-5] fable sub-quota (7d_oi) gate ----
     fable_ok = {**fresh, "fable_ok": True, "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 9000}

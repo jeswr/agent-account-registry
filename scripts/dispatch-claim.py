@@ -3809,9 +3809,15 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     catalog_cache["accounts"] = allocator.read_accounts(registry_repo)
                 pool = set(resolved["account_pool"])
                 pool_accounts = [a for a in catalog_cache["accounts"] if a["handle"] in pool]
+                # [OPUS-5 issue #676] `run_seconds` turns on the PROJECTED-BURN half of the
+                # wind-down: an account is refused new work once its window is projected to run dry
+                # before a worker of this length could finish. The worker TIMEOUT is deliberately
+                # used as the run-length estimate — it is the wall-clock upper bound the dispatcher
+                # actually guarantees, so it errs toward refusing, which is the safe direction.
                 effective_cap = allocator.dynamic_concurrency(
                     pool_accounts, usage, model_chain=resolved["model_chain"],
-                    absolute_cap=resolved["max_concurrent"], margin=margin)
+                    absolute_cap=resolved["max_concurrent"], margin=margin,
+                    run_seconds=resolved["worker_timeout_minutes"] * 60)
                 if escalate_starved(resolved.get("escalate"), usage, effective_cap):
                     # Issue #116: a SINGLE zero-headroom usage snapshot is TRANSIENT, pipeline-owned
                     # rate-limit exhaustion — not a semantic routing failure. Promoting it straight

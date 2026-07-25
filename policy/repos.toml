@@ -95,7 +95,16 @@ routing = "orchestration/routing.toml"
 # and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
 # provenance records or salted fingerprints.
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
+# [OPUS-5 issue #676] DELIBERATELY UNCHANGED at 40, and that is a finding rather than an omission.
+# 40 already equals the whole measured pool (7 anthropic x 4 = 28, plus acct01's 12 codex slots), so
+# it is not the binding limiter and raising it would be a placebo. On the 2026-07-25 snapshot sparq
+# had 1118 open issues but only 10 DRAINABLE (`ready_candidates`) and a frontier of 7 — the limiter
+# is TRIAGE STARVATION (issues never reaching status:ready + priority + role), which no concurrency
+# knob can fix. package_width is set anyway because sparq's backlog does cluster (bench had 3
+# candidates on that snapshot); it takes effect only once the sparq-side readiness engine carries
+# the parameter — until then the dispatch call site falls back to the narrow frontier with a warning.
 max_concurrent = 40
+package_width = 2
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
 arm_auto_merge = true         # arming now actually happens — ONLY in the review-fix approve path
@@ -140,7 +149,25 @@ routing = "orchestration/routing.toml"   # THIS repo's own routing (self-managed
 # and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
 # provenance records or salted fingerprints.
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
-max_concurrent = 3            # SMALL: the trust plane drains slowly + conservatively
+# [OPUS-5 issue #676] 3 -> 8, TOGETHER WITH package_width below. Measured, not guessed:
+#   * The binding limiter here was NEVER this number. On the 2026-07-25 snapshot the registry had
+#     285 open issues -> 12 DRAINABLE (`ready_candidates`) -> a frontier of 3 (`compute_ready`),
+#     because those 12 clustered into only 3 distinct areas (review-loop 5, dispatch 5, workflows 2)
+#     and the frontier admits one issue per area. max_concurrent was 3 and the frontier was 3, so
+#     raising max_concurrent ALONE would have changed precisely nothing.
+#   * package_width = 2 widens that frontier to 6 on the same snapshot; 8 leaves headroom for a tick
+#     whose backlog spreads over more areas, without pretending the frontier is wider than it is.
+#   * Pool capacity is nowhere near binding: the 7 available in-pool anthropic accounts carry
+#     max_concurrent_workers = 4 each = 28 slots (acct01 adds 12 codex slots on top). 8 is a
+#     quarter of the anthropic pool — deliberately conservative for the trust plane.
+#   * Safe to raise ONLY because the wind-down half ships with it: dynamic_concurrency now sums the
+#     window-tapered per-account grant, so a higher static ceiling can no longer push a full
+#     complement of workers into a window that is about to run dry.
+max_concurrent = 8
+# In-flight issues permitted per `area:` package. 1 = the historical serialization. 2 trades some
+# merge-conflict risk (same-area agents tend to edit the same large script) for real concurrency;
+# the repo runs a conflict resolver, and the GLOBAL cross-cutting partition is never widened.
+package_width = 2
 worker_timeout_minutes = 30   # python self-tests + actionlint are fast (no cargo build)
 gate_profile = "registry-selftest"  # python --self-test suite + bash -n + actionlint (see worker-live.sh)
 arm_auto_merge = true         # allow_auto_merge is enabled live (B1); the FINAL arm click on a
