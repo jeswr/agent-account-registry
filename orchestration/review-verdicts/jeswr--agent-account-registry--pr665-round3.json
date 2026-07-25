@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ec1c2f26a3ecb614c9bb250eb46a876956aef21a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_mark_model_launched` still appends `launched=true` before the shell invokes `docker run`. If cancellation lands after the append but before Docker starts the container command, `_run_headless_harness` cannot publish `startup_failed=true` because the run never completes. The downstream gate then sees `model_started=true`, admits the record, and defaults the missing class to `unknown`, fabricating provider-health data for a CLI that never ran. The new reserved-status retraction fixes completed Docker startup failures only. Case E is a static adjacency assertion and does not cover this cancellation boundary; the diff itself acknowledges the residual window rather than closing the prior finding.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Use a host-visible handshake whose meaning is tied to the container-side provider invocation, and gate provider-health admission on that signal. Add a non-vacuous cancellation test that pauses exactly after the current pre-Docker append but before the container/provider command begins, kills the harness, and asserts that neither a launch-admission signal nor a provider-health-admissible class remains.",
+    "severity": "major",
+    "title": "Pre-Docker launch marker still admits a cancelled non-attempt"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 major remains unresolved. The new `startup_failed` retraction correctly suppresses completed Docker startup failures that return 125/126/127, and case D non-vacuously exercises that improvement. However, `_mark_model_launched` is still emitted before the host invokes `docker run`. Cancellation after that append but before Docker starts the container therefore leaves `model_started=true`, no retraction, and no exit class; `model_health` admits the event and records the fallback `unknown` even though no provider CLI ran. Case E only checks that the next source statement is the container command; it neither eliminates nor behaviorally tests the acknowledged cancellation window. Because the same false provider-health admission identified in round 2 remains, the verdict is request_changes and progress is stagnant. No reviewer-directed injection was detected.",
+  "verdict": "request_changes"
+ }
+}
