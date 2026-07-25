@@ -45,6 +45,7 @@
 """Row-scoped account_pool grants + their exact, per-target postconditions (one shared helper)."""
 
 import argparse
+import importlib.util
 import os
 import pathlib
 import re
@@ -384,6 +385,91 @@ def verify_membership(policy_text, handle, targets):
     return resolved
 
 
+# The ONE head-branch namespace a brokered account_pool grant may travel on. `activate` keys off it
+# (`startsWith(head.ref, 'account-pool/')`), and merged_grant_prs below uses it as the PROVENANCE
+# carrier: a grant that never travelled on this branch was never reviewed as a grant.
+GRANT_BRANCH_PREFIX = "account-pool/"
+
+
+def grant_branch(handle):
+    """The one head-branch name a brokered grant for `handle` may travel on."""
+    return f"{GRANT_BRANCH_PREFIX}{_require_handle(handle)}"
+
+
+def merged_grant_prs(pulls, handle, base="master"):
+    """The MERGED grant pull requests for `handle`, sorted — the PROVENANCE of an ALREADY-PRESENT
+    account_pool membership (#616 cross-provider review finding 1).
+
+    verify_membership proves the SHAPE of a policy document: the handle occurs exactly once in each
+    authorized row and in no other row. It cannot prove HOW or WHY the handle got there. So on the
+    "already present in master, no PR needed" no-op path, membership alone would let a handle that
+    was pre-seeded into the policy by ANY other means — a hand edit, a leftover row from a retired
+    account, an unrelated merged PR — skip the CHECKED `account-pool/<handle>` PR entirely and
+    activate a freshly captured credential inline, with no review of the grant at all. That is the
+    two-phase design (#185) silently bypassed, and it contradicts this module's own claim that a
+    pre-existing entry can never be reported as a successful grant.
+
+    So the no-op path must additionally prove the membership came from a merged grant PR: at least
+    one entry of `pulls` that is MERGED, whose base is `base`, and whose head ref is EXACTLY this
+    handle's grant branch. No such PR, an unreadable listing, only an open or closed-unmerged one, a
+    different handle's branch, or a different base are all refusals — the safe direction is to leave
+    the account `status:pending` for a human rather than activate an unproven grant."""
+    branch = grant_branch(handle)
+    if not isinstance(pulls, (list, tuple)):
+        raise GrantError(
+            f"the pull-request listing for {branch} is unavailable, so it cannot be proven that "
+            f"{handle} was granted by a merged, checked account_pool PR — refusing (fail closed)")
+    numbers = []
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            raise GrantError(f"unreadable pull-request entry {pull!r} — refusing")
+        head, into = pull.get("head"), pull.get("base")
+        head_ref = head.get("ref") if isinstance(head, dict) else None
+        base_ref = into.get("ref") if isinstance(into, dict) else None
+        if head_ref != branch or base_ref != base:
+            continue
+        if not pull.get("merged_at"):
+            continue
+        number = pull.get("number")
+        if not isinstance(number, int):
+            raise GrantError(f"a merged pull request on {branch} carries no readable number "
+                             "— refusing")
+        numbers.append(number)
+    if not numbers:
+        raise GrantError(
+            f"{handle} is already listed in the policy account_pool, but NO merged pull request "
+            f"from `{branch}` into `{base}` accounts for it — the membership was not established by "
+            "a checked grant PR, so this enrollment cannot report it as its own successful grant "
+            "(fail closed)")
+    return sorted(set(numbers))
+
+
+def require_grant_pr_scope(number, files, path):
+    """The merged grant PR `number` proven to have changed the policy document `path` AND NOTHING
+    ELSE (the file-level companion of merged_grant_prs).
+
+    Without it the provenance check degrades to "some merged PR used that branch name": a branch
+    named `account-pool/<handle>` whose merged diff never touched the policy — or touched a workflow
+    as well — would stand in for a reviewed grant. A brokered grant PR is a single contents PUT to
+    exactly this one path, and the documented manual-recovery PR edits only the granted rows, so
+    anything else is a refusal."""
+    if not isinstance(files, (list, tuple)) or not files:
+        raise GrantError(
+            f"the changed-file listing for merged PR #{number} is unavailable or empty, so it "
+            f"cannot be proven that the grant it carries edited {path} — refusing (fail closed)")
+    names = []
+    for entry in files:
+        if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
+            raise GrantError(f"unreadable changed-file entry {entry!r} on PR #{number} — refusing")
+        names.append(entry["filename"])
+    if sorted(set(names)) != [path]:
+        raise GrantError(
+            f"merged PR #{number} changed {sorted(set(names))}, not exactly [{path!r}] — a grant "
+            "PR edits the policy document and nothing else, so this PR does not prove the "
+            "account_pool membership is a reviewed grant (fail closed)")
+    return number
+
+
 def format_record_line(targets):
     """The `grant_targets: ...` line stamped into the account issue body (the record the `activate`
     job re-proves against the merged policy). Every entry is shape-validated first, so the line can
@@ -433,6 +519,61 @@ def _legacy_global_append(policy_text, handle):
         separator = ", " if entries.strip() else ""
         return f'{match.group(1)}{entries}{separator}"{handle}"{match.group(3)}'
     return _LEGACY_GLOBAL_PATTERN.subn(append, policy_text)[0]
+
+
+# ---------------------------------------------------------------------------------------------
+# WIRING ASSERTIONS: reading the workflow as TEXT without letting a comment stand in for a call.
+#
+# #616 cross-provider review findings 3 + 4 (the TEST-VACUITY class). The self-test below asserts
+# that the privileged workflow actually CALLS these guards, and it used to do that with whole-file
+# substring checks — `"authorize(" in workflow`, `"format_record_line(" in workflow`. Every one of
+# those is satisfiable by a PROSE COMMENT or by an unrelated call site in a different step, so
+# deleting the guard from the privileged step left the assertion green: the live-authorization
+# re-proof (invariant 5) had NO mutation-effective coverage at all. These two helpers make a wiring
+# assertion mean what it says — the comment lines are removed, and the assertion is scoped to the
+# ONE step that must make the call. Both fail LOUDLY (GrantError) when they cannot resolve their
+# target, so a renamed step id can never silently turn an assertion vacuous.
+def strip_yaml_comments(text):
+    """`text` with every whole-line `#` comment removed (YAML comments and, inside `run:` blocks,
+    shell/python comments alike). A claim in prose must never satisfy an assertion about code."""
+    if not isinstance(text, str):
+        raise GrantError("cannot strip comments from a non-text document — refusing")
+    return "\n".join(line for line in text.split("\n") if not line.lstrip().startswith("#"))
+
+
+def workflow_step(text, step_id):
+    """The full YAML text of the ONE workflow step whose `id:` is `step_id`, comments stripped.
+
+    Located by the step's `id:` and bounded by the surrounding sequence indentation, so a call in a
+    NEIGHBOURING step (or in a header comment) cannot satisfy an assertion about this one. Raises
+    GrantError when no such step exists or the extracted body is empty — a wiring assertion that
+    cannot find its step must fail, never pass vacuously."""
+    if not isinstance(text, str):
+        raise GrantError("cannot extract a step from a non-text workflow — refusing")
+    lines = text.split("\n")
+    marks = [index for index, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
+    if len(marks) != 1:
+        raise GrantError(
+            f"expected exactly one workflow step with `id: {step_id}`, found {len(marks)} — "
+            "refusing to assert against a step that cannot be located (fail closed)")
+    starts = [index for index in range(marks[0], -1, -1) if lines[index].lstrip().startswith("- ")]
+    if not starts:
+        raise GrantError(f"step `id: {step_id}` has no enclosing `- ` sequence entry — refusing")
+    start = starts[0]
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        here = len(line) - len(line.lstrip())
+        if here < indent or (here == indent and line.lstrip().startswith("- ")):
+            end = index
+            break
+    body = strip_yaml_comments("\n".join(lines[start:end]))
+    if not body.strip():
+        raise GrantError(f"step `id: {step_id}` extracted to an empty body — refusing")
+    return body
 
 
 FIXTURE = '''# a policy comment that must survive every grant byte-identical
@@ -661,12 +802,93 @@ def _self_test():
                   needle="line entry 'nonsense'"), True)
     check("recording an empty target set refuses",
           refuses(format_record_line, [], needle="empty target set"), True)
-    check("the record key is one select-and-claim._parse_account ignores (unknown keys only)",
-          RECORD_KEY not in {"models", "max_concurrent_workers", "secret_ref", "provider",
-                             "harness", "credential_format"}, True)
+
+    # ---- #616 finding 1: SHAPE IS NOT PROVENANCE (the no-op path's merged-grant-PR proof) ------
+    check("the grant branch namespace has ONE spelling", grant_branch("acct07"),
+          "account-pool/acct07")
+    check("an unsafe handle cannot even name a grant branch",
+          refuses(grant_branch, "acct01; rm -rf /", needle="unsafe account handle"), True)
+    merged_pr = {"number": 41, "merged_at": "2026-07-25T00:00:00Z",
+                 "head": {"ref": "account-pool/acct07"}, "base": {"ref": "master"}}
+    check("a merged account-pool PR accounts for the membership",
+          merged_grant_prs([merged_pr], "acct07"), [41])
+    check("several merged grant PRs are all reported, sorted and deduped",
+          merged_grant_prs([{**merged_pr, "number": 55}, merged_pr, merged_pr], "acct07"),
+          [41, 55])
+    check("[#616] NO account-pool PR at all refuses (a pre-seeded pool entry is NOT a grant)",
+          refuses(merged_grant_prs, [], "acct07", needle="NO merged pull request"), True)
+    check("[#616] an OPEN / closed-unmerged account-pool PR refuses",
+          refuses(merged_grant_prs, [{**merged_pr, "merged_at": None}], "acct07",
+                  needle="NO merged pull request"), True)
+    check("[#616] a merged PR on ANOTHER handle's grant branch refuses",
+          refuses(merged_grant_prs, [{**merged_pr, "head": {"ref": "account-pool/acct08"}}],
+                  "acct07", needle="NO merged pull request"), True)
+    check("[#616] a merged PR into a base other than master refuses",
+          refuses(merged_grant_prs, [{**merged_pr, "base": {"ref": "ledger"}}], "acct07",
+                  needle="NO merged pull request"), True)
+    check("[#616] an unreadable PR listing refuses (a failed read is never a proven negative)",
+          refuses(merged_grant_prs, None, "acct07",
+                  needle="listing for account-pool/acct07 is unavailable"), True)
+    check("[#616] an unreadable PR entry refuses",
+          refuses(merged_grant_prs, ["not-a-pull"], "acct07",
+                  needle="unreadable pull-request entry"), True)
+    check("the provenance PR must have changed the policy document",
+          require_grant_pr_scope(41, [{"filename": "policy/repos.toml"}], "policy/repos.toml"), 41)
+    check("[#616] a merged grant-branch PR that never touched the policy refuses",
+          refuses(require_grant_pr_scope, 41, [{"filename": "README.md"}], "policy/repos.toml",
+                  needle="not exactly"), True)
+    check("[#616] a merged grant PR that ALSO changed another file refuses",
+          refuses(require_grant_pr_scope, 41,
+                  [{"filename": "policy/repos.toml"},
+                   {"filename": ".github/workflows/worker.yml"}],
+                  "policy/repos.toml", needle="not exactly"), True)
+    check("[#616] an empty/unreadable changed-file listing refuses",
+          (refuses(require_grant_pr_scope, 41, [], "policy/repos.toml",
+                   needle="unavailable or empty"),
+           refuses(require_grant_pr_scope, 41, None, "policy/repos.toml",
+                   needle="unavailable or empty")), (True, True))
 
     # ---- the LIVE documents: this repo's real policy + the wiring in the real workflow --------
     root = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    # #616 finding 4: the schema-compatibility claim is proved by the REAL parser, not against a
+    # key set the test wrote itself. The register step validates the exact bytes it is about to
+    # persist through select-and-claim's guard, and the credential is captured and stored BEFORE
+    # that write — so a record the allocator rejects strands an irreversible capture. Import the
+    # actual module and prove (a) a body carrying the grant_targets line still validates, and
+    # (b) the key is genuinely IGNORED rather than mis-parsed into a schema field.
+    claim_spec = importlib.util.spec_from_file_location(
+        "registry_select_and_claim", str(root / "scripts/select-and-claim.py"))
+    claim = importlib.util.module_from_spec(claim_spec)
+    claim_spec.loader.exec_module(claim)
+    record_body = (
+        "provider: openai\nharness: codex\nmodels: [sol, luna, terra]\n"
+        "credential_format: codex-auth-json\nmax_concurrent_workers: 1\n"
+        "secret_ref: ACCT07_TOKEN\nrequest_issue: 7\n"
+        f"{format_record_line(['o/target', 'o/second'])}\n"
+        "notes: registered via set-up-account broker; pending account_pool PR merge\n")
+    def real_parser(fn, *args):
+        """One real-parser verdict, with any REJECTION turned into a legible failing VALUE.
+
+        A rejection is exactly the outcome this pair of checks exists to catch, so it must show up
+        as a red assertion with the reason in it — never as a traceback that takes the whole suite
+        down without naming the record key at fault. (Broad on purpose: the exception becomes a
+        loud failure, never an empty-data pass.)"""
+        try:
+            return fn(*args)
+        except Exception as exc:  # noqa: BLE001 - any rejection IS the failure signal
+            return f"REJECTED by the real parser: {type(exc).__name__}: {exc}"
+
+    check("[#616] the REAL allocator schema guard accepts a record carrying the grant record line",
+          real_parser(claim.account_record_schema_errors, "acct07", record_body), [])
+    parsed = real_parser(claim.validate_account_record, "acct07", record_body)
+    check("[#616] the REAL parser IGNORES the grant record key (it collides with no schema field)",
+          parsed if isinstance(parsed, str) else
+          (RECORD_KEY in parsed, parsed["models"], parsed["secret_ref"], parsed["provider"],
+           parsed["credential_format"], parsed["max_concurrent_workers"]),
+          (False, ["sol", "luna", "terra"], "ACCT07_TOKEN", "openai", "codex-auth-json", 1))
+    check("[#616] and the stamped line is still readable back out of that same record body",
+          parse_record_line(record_body), ["o/second", "o/target"])
     live_policy = (root / "policy/repos.toml").read_text(encoding="utf-8")
     live_enabled = enabled_targets(live_policy)
     check("the REAL policy/repos.toml parses and has enabled rows", bool(live_enabled), True)
@@ -681,26 +903,56 @@ def _self_test():
               refuses(verify_grant, live_policy, _legacy_global_append(live_policy, "acct99"),
                       "acct99", [first], needle="NON-TARGET row"), True)
 
+    # #616 findings 3 + 4 (TEST VACUITY on the wiring). Every assertion below used to be a
+    # WHOLE-FILE substring check, and every one of those was satisfiable by a prose comment or by
+    # the same call in a DIFFERENT step: deleting the post-login `grant.authorize(...)` from the
+    # privileged write step left "the login job re-proves authorization live" green, because the
+    # pre-login step calls it too — so invariant 5, the entire point of the ~13-minute sign-in
+    # window, had no mutation-effective coverage. The workflow is therefore read comment-stripped
+    # and PER STEP from here down: each guard is asserted against the one step that must call it.
     workflow = (root / ".github/workflows/set-up-account.yml").read_text(encoding="utf-8")
-    check("set-up-account.yml loads this helper", "scripts/grant-account.py" in workflow, True)
-    check("[#579] set-up-account.yml no longer regex-substitutes account_pool globally",
-          bool(_LEGACY_GLOBAL_PATTERN.search(workflow)) or ".subn(" in workflow, False)
+    executable = strip_yaml_comments(workflow)
+    preflight = workflow_step(workflow, "grant")            # pre-login authorization preflight
+    write = workflow_step(workflow, "policy_pr")            # the privileged policy write
+    register = workflow_step(workflow, "register")          # the account record stamp
+    activated = workflow_step(workflow, "activate_merged")  # the post-merge activation proof
+    check("the step extractor bounds exactly ONE step (it is not returning the whole file)",
+          ("Authorize the target repositories" in preflight,
+           "Open a checked account_pool PR" in preflight,
+           "Open a checked account_pool PR" in write,
+           "Authorize the target repositories" in write),
+          (True, False, True, False))
+    check("the extracted step body is comment-stripped, so prose cannot satisfy a wiring check",
+          [line for line in write.split("\n") if line.lstrip().startswith("#")], [])
+    check("an absent/renamed step id fails LOUDLY instead of asserting vacuously",
+          refuses(workflow_step, workflow, "no_such_step", needle="found 0"), True)
+    check("set-up-account.yml loads this helper",
+          "scripts/grant-account.py" in executable, True)
+    check("[#579] the pre-login preflight authorizes from the request's own grant labels",
+          "grant.authorize" in preflight, True)
+    check("[#579/#616] the PRIVILEGED WRITE STEP re-proves authorization live against the snapshot",
+          ("grant.authorize" in write, "snapshot" in write), (True, True))
+    check("the write step renders the row-scoped edit and verifies it exactly",
+          ("grant.render_grant" in write, "grant.verify_grant" in write), (True, True))
+    check("[#616] the no-op path proves membership AND merged-grant-PR provenance",
+          ("grant.verify_membership" in write, "grant.merged_grant_prs" in write,
+           "grant.require_grant_pr_scope" in write), (True, True, True))
+    check("[#616] the ACTIVATE step re-proves the record, membership AND the two-document scope",
+          ("grant.parse_record_line" in activated, "grant.verify_membership" in activated,
+           "grant.verify_grant" in activated), (True, True, True))
+    check("[#579] the account record stamp happens in the REGISTER step",
+          "grant.format_record_line" in register, True)
+    check("[#579] the policy write never substitutes over the document",
+          bool(_LEGACY_GLOBAL_PATTERN.search(write)) or ".subn(" in write or "re.sub(" in write,
+          False)
     check("[#579] set-up-account.yml no longer carries an existential pool check",
-          "any(handle in" in workflow, False)
-    check("the login job re-proves authorization live before the write",
-          "authorize(" in workflow, True)
-    check("the login job verifies the proposed edit exactly",
-          "grant.verify_grant" in workflow, True)
-    check("the no-op path and the activate job both verify membership exactly",
-          workflow.count("grant.verify_membership") >= 2, True)
-    check("the account record stamps the target set", "format_record_line(" in workflow, True)
-    check("the activate job reads the recorded target set", "parse_record_line(" in workflow, True)
+          "any(handle in" in executable, False)
     check("untrusted issue labels cross into the shell as JSON data, not interpolation",
-          "${{ toJSON(github.event.issue.labels.*.name) }}" in workflow
-          and "${{ join(github.event.issue.labels" not in workflow, True)
+          "${{ toJSON(github.event.issue.labels.*.name) }}" in executable
+          and "${{ join(github.event.issue.labels" not in executable, True)
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
-    check("the request form documents the grant label",
-          GRANT_LABEL_PREFIX in template, True)
+    check("the request form documents the grant label (in the form itself, not a comment)",
+          GRANT_LABEL_PREFIX in strip_yaml_comments(template), True)
 
     print("grant-account self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

@@ -372,15 +372,19 @@ You don't paste tokens manually. Instead:
 2. The `set-up-account` workflow (trust-gated to the maintainer) runs the provider's device/OAuth
    login and **comments a sign-in URL + one-time code** on the issue.
 3. Sign in with the account you want to register. The broker captures the resulting token, stores it
-   as the account **secret** (`ACCTNN_TOKEN`) in this registry's `dispatch-secrets` environment,
-   registers the account issue, and closes the request. **The token is never printed** — only
-   written to a mode-600 file and set as a secret.
+   as the account **secret** (`ACCTNN_TOKEN`) in this registry's `dispatch-secrets` environment, and
+   registers the account issue **`status:pending`** — not yet allocatable. The request issue stays
+   **open** until the grant PR in step 4 merges (it is closed by `activate`, not here).
+   **The token is never printed** — only written to a mode-600 file and set as a secret.
 4. The grant lands as a **checked `account-pool/<handle>` PR** that edits only the granted rows
    (`scripts/grant-account.py`, self-tested), and the labels are **re-read live** immediately before
    that write — a target removed during the sign-in window fails closed. The authorized set is
    recorded on the account issue as `grant_targets:`; on merge, `activate` re-proves that every
-   recorded target lists the handle **exactly once** and no other row lists it at all before the
-   account becomes `status:available`.
+   recorded target lists the handle **exactly once**, that no other row lists it at all, and — against
+   the merged commit's first parent — that **every other row and field is byte-identical**, before the
+   account becomes `status:available` and the request is closed. If the handle is somehow already in
+   the policy pool, activation additionally requires a **merged `account-pool/<handle>` PR** to
+   account for it: matching shape is not proof that a grant was ever reviewed.
 
 Providers: **OpenAI** via `codex login --device-auth` (native device flow); **Anthropic** via
 `claude setup-token` (run in the clean Actions runner). Needs `secrets.REGISTRY_SECRETS_PAT` (a
