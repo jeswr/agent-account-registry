@@ -630,14 +630,21 @@ jobs:
       # The sanitized session-limit reset time worker-live.sh extracts (review defect #9); empty
       # for every other class. Feeds the provider-capped alert's "earliest known reset".
       reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
-      # [registry #569] 'true' iff a provider CLI process was actually EXECUTED. worker-live.sh
-      # writes it here at the invocation boundary itself (_mark_model_launched), so it is the ONLY
+      # [registry #569] 'true' iff the provider container invocation was ENTERED. worker-live.sh
+      # writes it at the invocation boundary itself (_mark_model_launched), so it is the ONLY
       # signal that survives a kill mid-CLI — the in-job exit-class step below does not run when
       # the job is cancelled or hits worker_timeout_minutes. `model_health` gates on THIS, not on a
       # non-empty exit_class: a pre-launch abort must record nothing (an `unknown` that no provider
       # ever saw still counts toward the persistent-transient alert), while a started attempt whose
       # class was lost to the kill must still be recorded.
       model_started: ${{ steps.model.outputs.launched }}
+      # [registry #569 review r2] 'true' iff `docker run` itself failed BEFORE the container command
+      # executed (its reserved 125/126/127 statuses: daemon/mount/runtime fault, or the pinned CLI
+      # path not invocable). Such a run COMPLETES, so this retraction is host-observed and needs no
+      # in-container handshake — and it proves NO provider CLI ever started. It is the second half of
+      # the admission gate below: a runner-infrastructure fault is not account health, and recording
+      # it would fabricate the same persistence-counting `unknown` #569 exists to remove.
+      model_startup_failed: ${{ steps.model.outputs.startup_failed }}
       # THIS job's run attempt, stamped beside the class (review round 1 of #425): the recorder's
       # idempotency key must track the attempt that PRODUCED the outcome, not the recorder's own.
       # A recorder-only retry replays this preserved output (same attempt -> dedup no-op); a full
@@ -998,16 +1005,21 @@ jobs:
         env:
           MODEL_OUTCOME: ${{ steps.model.outcome }}
           MODEL_LAUNCHED: ${{ steps.model.outputs.launched }}
+          MODEL_STARTUP_FAILED: ${{ steps.model.outputs.startup_failed }}
         run: |
           set -uo pipefail
           if [[ "$MODEL_OUTCOME" == "success" ]]; then
             cls=success
-          elif [[ "$MODEL_LAUNCHED" == "true" ]]; then
+          elif [[ "$MODEL_LAUNCHED" == "true" && "$MODEL_STARTUP_FAILED" != "true" ]]; then
             # A provider CLI DID run. Use the host-observed class when worker-live.sh got far
             # enough to write one; an attempt that started and died unattributably is `unknown`.
             cls="${WORKER_EXIT_CLASS:-unknown}"
           else
-            # No CLI ever ran. Record ONLY a genuine pre-launch class; never invent one.
+            # No CLI ever ran — a pre-launch abort, or a docker startup failure that retracted its
+            # launch marker (review r2 of #569). Record ONLY a genuine pre-launch class (worker-prep's
+            # credential pre-flight, #596); never invent one. The `unknown` default MUST stay out of
+            # this arm: it would flow into exit_class and re-admit the record through model_health's
+            # `exit_class != ''` arm, undoing the retraction.
             cls="${WORKER_EXIT_CLASS:-}"
           fi
           # outcome_attempt: the attempt that produced this outcome — the recorder's dedup key
@@ -1462,7 +1474,12 @@ jobs:
     # credential pre-flight produces before the model step can run (issue #596): those are
     # host-observed account-health facts, not fabrications. A non-attempt with no class at all
     # matches NEITHER arm and records nothing — the fabricated-`unknown` path this closes.
-    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && (needs.worker.outputs.model_started == 'true' || needs.worker.outputs.exit_class != '') }}
+    #
+    # [review r2 of #569] The marker arm is ANDed with `model_startup_failed != 'true'`: a `docker
+    # run` that died before exec'ing the container command entered the invocation (so the marker is
+    # set) but ran no provider CLI, and a runner-infrastructure fault is not account health. Its
+    # exit_class is suppressed host-side too, so it matches neither arm.
+    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && ((needs.worker.outputs.model_started == 'true' && needs.worker.outputs.model_startup_failed != 'true') || needs.worker.outputs.exit_class != '') }}
     needs: [resolve, claim, worker]
     runs-on: ubuntu-latest
     timeout-minutes: 10

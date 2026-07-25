@@ -229,11 +229,14 @@ _credential_mount_args() {
   printf '%s\n' --mount "type=bind,src=$credential_path,dst=/home/worker/$rel,readonly"
 }
 
-# LAUNCH MARKER (issue #569). Records the one fact the downstream model-health job cannot recover
-# for itself: a provider CLI process was ACTUALLY EXECUTED. It is written at the invocation
-# boundary — the last statement before the container exec, after the image build, the credential
-# mount, and every argv assertion — because ANY earlier derivation leaves a
-# cancel-after-step-before-launch window. In that window nothing contacted a provider, yet a health
+# LAUNCH MARKER (issue #569), the PRE-run half of the model-health admission gate. Records the one
+# fact the downstream job cannot recover for itself: the provider container invocation was ENTERED.
+# Admission is this marker AND NOT the post-run `startup_failed` retraction below — see there for
+# why "entered" is the strongest thing a single host-side pre-exec signal can honestly claim.
+#
+# It is written at the invocation boundary — the last statement before the container exec, after the
+# image build, the credential mount, and every argv assertion — because ANY earlier derivation leaves
+# a cancel-after-step-before-launch window. In that window nothing contacted a provider, yet a health
 # record was still admitted as `unknown`, and `unknown` counts toward the persistent-transient
 # provider alert (model-health.py PERSISTENCE_CLASSES): a run of budget/trust/prep aborts could
 # page a provider outage that never happened. Deriving it from `record-attempt` completing (round 1
@@ -247,24 +250,42 @@ _credential_mount_args() {
 # still carries the marker, and the downstream job defaults its lost class to `unknown` instead of
 # dropping the genuine timeout.
 #
-# RESIDUAL WINDOW, stated honestly (review round 1 of PR #665). A HOST-side marker cannot be exact.
-# Two paths still set it without a provider CLI having run:
-#   1. a cancel landing between this append and the kernel starting docker — irreducible for a
-#      host-side signal, and now bounded by ONE printf instead of by the whole multi-minute
-#      prep/build phase the rejected earlier derivations covered;
-#   2. a `docker run` that fails before exec'ing the container command (daemon down, mount/runtime
-#      fault, missing entrypoint). This is NOT the fabrication this change closes and is NOT new:
-#      such a run COMPLETES, so the host classifier below sets WORKER_EXIT_CLASS and the record
-#      carries that host-observed class — byte-identical to the behaviour before this change, which
-#      admitted it through the `exit_class != ''` gate. Self-test case (D) pins that parity; giving
-#      docker's own startup faults a non-provider class is tracked separately, out of this scope.
-# Relocating the marker into a container-side handshake does NOT close window 1 — it only moves the
-# gap to between the wrapper's write and its own exec — while placing a trust-plane signal inside
-# the model-writable HOME mount, where an untrusted model could delete it to hide its own auth
-# failures from account health. That trade is a net loss for the trust surface; rejected.
+# RESIDUAL WINDOW, stated honestly (review rounds 1 and 2 of PR #665). A host-side PRE-exec marker
+# cannot be exact, so exactly ONE gap remains between "invocation entered" and "provider CLI
+# running": a cancel landing between this append and the kernel starting docker. That is irreducible
+# for a host-side signal, and it is bounded to ONE printf — self-test case (E) pins the container
+# invocation as the very next statement, so the gap can never grow back into the multi-minute
+# prep/build phase the rejected earlier derivations covered. The OTHER path that used to set this
+# marker with no provider CLI running — a `docker run` that fails before exec'ing the container
+# command — is a COMPLETED run, so it is now observed and retracted host-side; see
+# _mark_model_startup_failed.
+# Relocating the marker into a container-side handshake does NOT close the remaining gap — it only
+# moves it to between the wrapper's write and its own exec — while placing a trust-plane signal
+# inside the model-writable HOME mount, where an untrusted model could delete it to hide its own auth
+# failures from account health (admission would then fail OPEN toward silence). That trade is a net
+# loss for the trust surface; rejected. The concrete, host-observable half is closed instead.
 _mark_model_launched() {
   [[ -n ${GITHUB_OUTPUT:-} ]] || return 0
   printf 'launched=true\n' >> "$GITHUB_OUTPUT"
+}
+
+# STARTUP-FAILURE RETRACTION (review round 2 of PR #665), the POST-run half of the admission gate.
+# `docker run` reserves three exit statuses for "the container command NEVER executed": 125 (the
+# docker CLI/daemon itself failed — daemon down, bad mount, runtime fault), 126 (the pinned command
+# is not invocable) and 127 (it does not exist); every other status comes FROM the container command.
+# Such a run COMPLETES, so the host observes it directly and needs no in-container handshake — and it
+# proves no provider CLI process ever started. That outcome is a runner-infrastructure fault, NOT
+# account health: admitting it would persist precisely the fabricated `unknown` (a PERSISTENCE_CLASSES
+# member, so it feeds the persistent-transient provider alert) that issue #569 exists to remove. So
+# the host both publishes this retraction AND suppresses the provider exit class entirely; the
+# failure still surfaces through the ::error:: line, the job's red status, and the charged attempt.
+# A SEPARATE key rather than a second `launched=` line: $GITHUB_OUTPUT is append-only and
+# last-key-wins is not a documented contract to hang a trust gate on.
+# Any mis-attribution is fail-closed against fabrication: a provider CLI that itself exited 125/126/
+# 127 (no known claude/codex path does) would drop ONE health record rather than invent one.
+_mark_model_startup_failed() {
+  [[ -n ${GITHUB_OUTPUT:-} ]] || return 0
+  printf 'startup_failed=true\n' >> "$GITHUB_OUTPUT"
 }
 
 # mutation_mode:
@@ -432,6 +453,15 @@ _run_headless_harness() {
   esac
   harness_wall_seconds=$(( $(date +%s) - harness_started_at ))
   _extract_usage_telemetry "$model_log" "$harness" "$worker_root" "$harness_wall_seconds" || true
+  # [issue #569 review r2] Docker's reserved statuses mean the container command never executed, so
+  # NO provider CLI ran: retract the launch marker and emit NO provider exit class. The class must be
+  # suppressed too, or model_health's `exit_class != ''` arm would re-admit the very record the
+  # retraction removes. `die` below still fails the run.
+  if [[ "$rc" -eq 125 || "$rc" -eq 126 || "$rc" -eq 127 ]]; then
+    _mark_model_startup_failed
+    printf '::error::worker-live: docker-startup-failure rc=%s — no provider CLI executed; not recorded as account health (raw output withheld to protect credentials)\n' "$rc"
+    die "docker could not start the $harness model container (output withheld to protect credentials)"
+  fi
   if [[ "$rc" -ne 0 ]]; then
     # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
     # model output/credential) so failures are debuggable without leaking secrets.
@@ -3472,8 +3502,14 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcapg/std
   #       (the fabricated `unknown` that used to page a provider outage nothing ever caused).
   #   (B) killed MID-CLI                        => marker PRESENT and exit class LOST => the
   #       downstream job's `${EXIT_CLASS:-unknown}` retains the genuine timeout.
+  #   (C) CLI ran and exited non-zero           => marker PRESENT and a host-observed class written.
+  #   (D) `docker run` died at STARTUP          => marker RETRACTED and NO class => nothing admitted
+  #       (review round 2: a runner-infrastructure fault is not provider health).
+  #   (E) the handshake boundary itself         => nothing may sit between the marker and the exec.
   # Moving _mark_model_launched earlier turns (A) red; moving it after the container returns turns
-  # (B) red. The `.in-run` / `.in-build` phase markers keep each case honest about WHERE it died. ---
+  # (B) red; dropping the reserved-status retraction turns (D) red; treating EVERY failure as a
+  # startup failure turns (C) red. The `.in-run` / `.in-build` phase markers keep each case honest
+  # about WHERE it died. ---
   _launch_fixture() {
     local root=$1 build_body=$2 run_body=$3
     rm -rf -- "$root"
@@ -3520,6 +3556,23 @@ STUB
     [[ -s "$phase_marker" ]] && kill -TERM "$(cat "$phase_marker")" 2>/dev/null
     return 0
   }
+  # Run the REAL harness to COMPLETION against the fixture (no kill); echoes the harness exit status
+  # so each completed-run case asserts over $out / $envf / $log plus that status.
+  _run_launch_to_completion() {
+    local root=$1 out=$2 envf=$3 log=$4 rc=0
+    : > "$out"; : > "$envf"
+    (
+      cd "$root/cwd" || exit 1
+      export PATH="$root/bin:$PATH"
+      export WORKER_ROOT="$root" WORKER_HARNESS=codex WORKER_AGENT=registry-impl \
+             WORKER_PROVIDER_MODEL='' WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+             WORKER_CREDENTIAL_PATH="$root/home/.codex/auth.json" \
+             TARGET_DIR="$root/target" GITHUB_OUTPUT="$out" GITHUB_ENV="$envf"
+      unset WORKER_OUTPUT_DIR
+      _run_headless_harness "$root/prompt.txt" allow
+    ) > "$log" 2>&1 || rc=$?
+    printf '%s\n' "$rc"
+  }
 
   # (A) cancelled after prep, before the provider CLI: the image build is still in flight.
   local lroot_a="$tmp/launch-precli"
@@ -3553,56 +3606,69 @@ STUB
   # on some kill-specific path, and every ordinary failed run would silently stop being recorded.
   local lroot_c="$tmp/launch-complete" lc_rc=0
   _launch_fixture "$lroot_c" 'exit 0' 'exit 7'
-  (
-    cd "$lroot_c/cwd" || exit 1
-    export PATH="$lroot_c/bin:$PATH"
-    export WORKER_ROOT="$lroot_c" WORKER_HARNESS=codex WORKER_AGENT=registry-impl \
-           WORKER_PROVIDER_MODEL='' WORKER_CREDENTIAL_FORMAT=codex-auth-json \
-           WORKER_CREDENTIAL_PATH="$lroot_c/home/.codex/auth.json" \
-           TARGET_DIR="$lroot_c/target" GITHUB_OUTPUT="$tmp/launch-c.out" \
-           GITHUB_ENV="$tmp/launch-c.env"
-    unset WORKER_OUTPUT_DIR
-    _run_headless_harness "$lroot_c/prompt.txt" allow
-  ) > "$tmp/launch-c.log" 2>&1 || lc_rc=$?
+  lc_rc=$(_run_launch_to_completion "$lroot_c" \
+    "$tmp/launch-c.out" "$tmp/launch-c.env" "$tmp/launch-c.log")
   chk "(C) a CLI that ran and exited non-zero still fails the harness" \
     "$([[ "$lc_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
   chk "(C) a completed launch is marked, and carries its host-observed class" \
     "$(grep -c '^launched=true$' "$tmp/launch-c.out" || true):$(grep -c '^WORKER_EXIT_CLASS=' "$tmp/launch-c.env" || true)" \
     "1:1"
+  # The POSITIVE control for (D): a status that came FROM the container command must NOT be retracted.
+  # Without this, "retract everything nonzero" would silently stop recording every real provider
+  # failure — the opposite fabrication.
+  chk "(C) a genuine CLI failure is NOT retracted as a startup failure" \
+    "$(grep -c '^startup_failed=' "$tmp/launch-c.out" || true)" "0"
 
-  # (D) `docker run` FAILS AT STARTUP — daemon unavailable / mount or runtime fault / missing
-  # entrypoint — so the marker is set but no provider CLI ever executed (review round 1 of PR #665).
-  # The point of this case is that such a run COMPLETES: the host classifier therefore writes a real
-  # WORKER_EXIT_CLASS, so the recorder consumes a HOST-OBSERVED class and never reaches the
-  # `${EXIT_CLASS:-unknown}` default that case (B) exercises. That is byte-identical to the pre-#569
-  # behaviour, which admitted this record through the `exit_class != ''` gate — this change neither
-  # adds nor removes it. The class is `unknown` because docker's own daemon error matches no
-  # provider signal; pinning it EXACTLY keeps the case load-bearing (dropping the classification, or
-  # later giving docker's startup faults their own non-provider class, both turn this red on
-  # purpose). The `.cli-started` marker the stub never writes is what proves no CLI ran.
-  local lroot_d="$tmp/launch-dockerfail" ld_rc=0
-  _launch_fixture "$lroot_d" 'exit 0' \
-    'printf "docker: Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n" >&2
-     printf "%s\n" "$$" > "'"$lroot_d"'/.docker-startup-failed"; exit 125'
-  (
-    cd "$lroot_d/cwd" || exit 1
-    export PATH="$lroot_d/bin:$PATH"
-    export WORKER_ROOT="$lroot_d" WORKER_HARNESS=codex WORKER_AGENT=registry-impl \
-           WORKER_PROVIDER_MODEL='' WORKER_CREDENTIAL_FORMAT=codex-auth-json \
-           WORKER_CREDENTIAL_PATH="$lroot_d/home/.codex/auth.json" \
-           TARGET_DIR="$lroot_d/target" GITHUB_OUTPUT="$tmp/launch-d.out" \
-           GITHUB_ENV="$tmp/launch-d.env"
-    unset WORKER_OUTPUT_DIR
-    _run_headless_harness "$lroot_d/prompt.txt" allow
-  ) > "$tmp/launch-d.log" 2>&1 || ld_rc=$?
-  chk "(D) docker really died at STARTUP with no provider CLI executed (non-vacuous)" \
-    "$([[ -s "$lroot_d/.docker-startup-failed" ]] && printf 'startup-failed' || printf 'never-run'):$([[ -e "$lroot_d/.cli-started" ]] && printf ran || printf 'no-cli')" \
-    "startup-failed:no-cli"
-  chk "(D) a docker startup failure still fails the harness" \
-    "$([[ "$ld_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
-  chk "(D) it is HOST-CLASSIFIED (master parity), so the recorder never uses the lost-class default" \
-    "$(grep -c '^launched=true$' "$tmp/launch-d.out" || true):$(grep -c '^WORKER_EXIT_CLASS=unknown$' "$tmp/launch-d.env" || true)" \
-    "1:1"
+  # (D) `docker run` FAILS AT STARTUP — daemon unavailable / mount or runtime fault / the pinned CLI
+  # path not invocable — so the invocation was entered but NO provider CLI process ever ran (review
+  # round 2 of PR #665). Such a run COMPLETES, so the host sees docker's reserved status directly and
+  # must produce NOTHING model_health can admit: the retraction marker AND no provider exit class.
+  # Both halves are load-bearing — leaving the class behind would re-admit the record through the
+  # `exit_class != ''` arm, so the fabricated `unknown` (a PERSISTENCE_CLASSES member feeding the
+  # persistent-transient provider alert) would survive the retraction. Each status is driven with
+  # REAL docker wording, and the 127 case's text ("no such file") is one the provider classifier's
+  # own `setup` regex WOULD match: it therefore proves the suppression happens BEFORE classification
+  # rather than merely failing to match. The maintainer still gets a diagnostic line + a failed run.
+  local dcase dcode dmsg lroot_d ld_rc
+  for dcase in \
+    '125|docker: Cannot connect to the Docker daemon at unix:///var/run/docker.sock.' \
+    '127|docker: Error response from daemon: failed to create task: exec: no such file or directory'
+  do
+    dcode=${dcase%%|*}; dmsg=${dcase#*|}
+    lroot_d="$tmp/launch-dockerfail-$dcode"
+    _launch_fixture "$lroot_d" 'exit 0' \
+      'printf "%s\n" "'"$dmsg"'" >&2
+       printf "%s\n" "$$" > "'"$lroot_d"'/.docker-startup-failed"; exit '"$dcode"
+    ld_rc=$(_run_launch_to_completion "$lroot_d" \
+      "$tmp/launch-d$dcode.out" "$tmp/launch-d$dcode.env" "$tmp/launch-d$dcode.log")
+    chk "(D/$dcode) docker really ran and died with its reserved status (non-vacuous)" \
+      "$([[ -s "$lroot_d/.docker-startup-failed" ]] && printf 'startup-failed' || printf 'never-run')" \
+      "startup-failed"
+    chk "(D/$dcode) a docker startup failure still FAILS the harness" \
+      "$([[ "$ld_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+    chk "(D/$dcode) the launch is RETRACTED and NO provider class is produced => nothing admitted" \
+      "$(grep -c '^startup_failed=true$' "$tmp/launch-d$dcode.out" || true):$(grep -c '^WORKER_EXIT_CLASS=' "$tmp/launch-d$dcode.env" || true)" \
+      "1:0"
+    chk "(D/$dcode) it is reported as an INFRASTRUCTURE fault, never as a provider exit class" \
+      "$(grep -c 'docker-startup-failure rc=' "$tmp/launch-d$dcode.log" || true):$(grep -c 'model-exit-class=' "$tmp/launch-d$dcode.log" || true)" \
+      "1:0"
+  done
+
+  # (E) THE HANDSHAKE BOUNDARY. The one residual window a host-side marker cannot close is the gap
+  # between the marker append and the kernel starting docker, so that gap must contain NOTHING: the
+  # container invocation has to be the very next statement at BOTH call sites (claude + codex). This
+  # is the assertion that keeps the "nothing may be inserted below this line" comment enforceable —
+  # inserting any statement (or dropping a call site) turns it red, which is exactly how the earlier
+  # rejected derivations from `record-attempt`/`model-prep` completing would have failed.
+  local launch_boundary
+  launch_boundary=$(awk '
+    /^[[:space:]]+_mark_model_launched([[:space:]]|$)/ { want = 1; next }
+    want && /^[[:space:]]*$/ { next }
+    want { if ($0 ~ /^[[:space:]]*"\$\{container\[@\]\}"/) ok++; else bad++; want = 0 }
+    END { printf "%d:%d", ok + 0, bad + 0 }
+  ' "$SCRIPT_DIR/worker-live.sh")
+  chk "(E) every launch-marker call site is IMMEDIATELY followed by the container invocation" \
+    "$launch_boundary" "2:0"
 
   # --- [issue #569] the workflow half of the contract: the marker, not exit_class, admits the
   # record; the lost class defaults to `unknown`; and master's env-var-only argument passing for the
@@ -3616,6 +3682,17 @@ STUB
     "$(grep -Fc "&& needs.worker.outputs.exit_class != '' }}" "$wf569" || true)" "0"
   chk "the exit-class step branches on the marker, not on the model step being skipped" \
     "$(_workflow_step_if "$wf569" exit-class | grep -c 'always()' || true):$(grep -Fc '"$MODEL_LAUNCHED" == "true"' "$wf569" || true)" \
+    "1:1"
+  # The workflow half of the (D) retraction: the marker alone must NOT admit a record, and the
+  # `unknown` default must NOT be reachable on a retracted launch (it would flow into exit_class and
+  # re-admit through the second arm). Dropping either conjunct turns one of these red.
+  chk "the worker job exports the startup-failure retraction as a job output" \
+    "$(grep -Fc 'model_startup_failed: ${{ steps.model.outputs.startup_failed }}' "$wf569" || true)" "1"
+  chk "model_health ANDs the retraction into the launch-marker arm (review r2 of #569)" \
+    "$(grep -Fc "(needs.worker.outputs.model_started == 'true' && needs.worker.outputs.model_startup_failed != 'true')" "$wf569" || true)" \
+    "1"
+  chk "the exit-class step keeps the unknown default OFF the retracted-launch path" \
+    "$(grep -Fc '"$MODEL_LAUNCHED" == "true" && "$MODEL_STARTUP_FAILED" != "true"' "$wf569" || true):$(grep -Fc 'MODEL_STARTUP_FAILED: ${{ steps.model.outputs.startup_failed }}' "$wf569" || true)" \
     "1:1"
   chk "a started-but-unreported attempt defaults to unknown in the recorder" \
     "$(grep -Fc -e '--exit-class "${EXIT_CLASS:-unknown}"' "$wf569" || true)" "1"
