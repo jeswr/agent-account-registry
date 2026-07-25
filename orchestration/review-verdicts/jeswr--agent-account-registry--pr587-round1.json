@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 587,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "40dd306a7800ef1d0b1a2c8be684b74065973104",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "broker() first changes OpenAI last_refresh to 1970 or Anthropic expiresAt to 0, and refresh_via_cli() snapshots that modified file as `before`. assert_refresh_happened() therefore accepts an unchanged original token when the CLI merely rewrites/restores the original metadata: any OpenAI timestamp after 1970 or any positive Anthropic expiry is considered advancement. That does not prove a provider refresh and can mint the same dead access token. The existing unchanged tests only cover a CLI that performs no write at all, so they miss this false-positive path.",
+    "file": "scripts/broker-refresh.py",
+    "fix_hint": "Retain the original credential as the proof baseline and require evidence that cannot be manufactured by undoing force_stale (prefer a changed access token, with a valid future expiry). Add tests where the fake CLI writes the exact original credential back after seeing the stale copy; both providers must reject it.",
+    "severity": "blocker",
+    "title": "Refresh proof compares against the artificial stale value, not the original credential"
+   },
+   {
+    "body": "jwt_exp() accepts every positive exp, and Anthropic extraction accepts every numeric expiresAt, including values already expired. Consequently extract_access_token() and broker() can emit a capability explicitly advertising a dead token. This compounds the weak refresh proof: an unchanged expired token can pass when only the stale metadata advances. The tests use future timestamps but contain no assertion that past expiries fail closed.",
+    "file": "scripts/broker-refresh.py",
+    "fix_hint": "Validate both provider expiries against the current epoch (with only a deliberate, documented clock-skew margin) before minting. Add non-vacuous tests asserting that an OpenAI JWT with a past exp and an Anthropic credential with a past expiresAt each raise, including through broker().",
+    "severity": "major",
+    "title": "Token expiry is parsed but never required to be in the future"
+   }
+  ],
+  "progress": null,
+  "summary": "The change improves field validation and avoids reporting OpenAI last_refresh as token expiry, but its central refresh proof is unsound. Because the proof compares the CLI output against the deliberately corrupted isolated copy, restoring the original unchanged credential can look like an advanced expiry. In addition, extraction accepts expiries that are already in the past. Together these paths can still mint and hand a dead token to a worker, contrary to the stated fail-closed goal. The hermetic tests do not exercise either adversarial case.",
+  "verdict": "request_changes"
+ }
+}
