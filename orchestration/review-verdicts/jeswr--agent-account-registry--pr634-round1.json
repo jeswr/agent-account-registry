@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 634,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "84a7cf6b6e1eb5cf4314eb4ff2573f9954ded08f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "tasks_from_plan retains only a 12-character head prefix inside `id`; the task schema has no full expected SHA. `revalidate()` checks only open/merged/draft state and never compares `live[\"head\"][\"sha\"]` with the planned head. After a force-push or new commit, an old review/fix/disarm row can therefore revalidate as `ok` and, once a kind is enabled, be routed as live work for a different head. This directly contradicts the stated invariant that superseded rows are dropped and leaves the future launch path without exact head binding.",
+    "file": "scripts/task-queue.py",
+    "fix_hint": "Store the full planned head SHA as a validated required task field and require an exact match against the live PR head SHA in `revalidate()` for every PR kind. Add mutation-sensitive self-tests showing an equal SHA passes and a one-character-different/new SHA is dropped. Preserve any disarm-specific reviewed-SHA binding needed by the existing claim path.",
+    "severity": "blocker",
+    "title": "Revalidation does not bind a queued task to the live PR head"
+   },
+   {
+    "body": "Every executable-disabled task takes the hold branch and calls `--requeue`. That operation increments `attempts`, while the next compact drops rows at five attempts. Thus a healthy task that was never launched is classified as repeatedly failed and deleted after five drain selections. This does not \"keep its place\" as the workflow claims, destroys queue continuity during Phase A, and produces a false attempts-exhausted signal; a later PLAN tick merely recreates the row with its history reset.",
+    "file": ".github/workflows/drain.yml",
+    "fix_hint": "Introduce a distinct hold/release operation that changes visibility/backoff without incrementing failure attempts, and use it for kinds still owned by push dispatch. Add an end-to-end self-test that repeatedly holds a row across more than `max_attempts` drain cycles and proves it remains queued with attempts unchanged.",
+    "severity": "major",
+    "title": "Phase-A holds consume the failure budget and are compacted as exhausted"
+   },
+   {
+    "body": "`tasks_from_plan()` uses `plan.get(\"review_items\") or []` and the same pattern for `disarm_items`. A hostile or truncated artifact missing either required collection, or supplying a falsey wrong type such as `{}`, is accepted as an empty collection and can complete successfully with no queued work. This violates the function's documented fail-loud contract and turns malformed input into indistinguishable \"no work\" state.",
+    "file": "scripts/task-queue.py",
+    "fix_hint": "Require the expected PLAN schema and both emission keys, require each value to be a list, and reject missing, null, or wrong-typed values before projection. Add explicit self-tests for a missing key, null, empty object, string, and valid empty list; only the valid empty list should succeed.",
+    "severity": "major",
+    "title": "Malformed PLANs can silently project to an empty queue"
+   }
+  ],
+  "progress": null,
+  "summary": "The Phase-A workflow is launch-disabled, but the queue substrate is not sound enough for the promised Phase-B conversion. Most importantly, queued PR work is not bound to the live head SHA during revalidation, despite comments and IDs claiming that stale heads are dropped. The hold path also counts ordinary Phase-A holds as failed attempts and eventually deletes them, and PLAN projection silently accepts missing emission arrays. These are substantive fail-closed and queue-correctness defects.",
+  "verdict": "request_changes"
+ }
+}
