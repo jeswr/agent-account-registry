@@ -17,6 +17,7 @@ Trust posture (locked decisions, review blueprint):
 """
 
 import argparse
+import ast
 import base64
 import contextlib
 import hashlib
@@ -113,10 +114,41 @@ ROUND_VOID_MARKER = "<!-- sparq-review-void:v1"
 # crash must still exhaust the round budget and escalate, or a re-claim/re-crash loop becomes
 # unbounded. `unknown` in particular is the fail-safe fold target for every novel class, so making
 # it non-chargeable would silently un-charge everything.
+#
+# THE SET IS LOCKED TO model-health's FOLD MAP, not maintained by hand (retro-review of #604/#614).
+# #604 shipped this constant against worker-live.sh's five raw classes; #614 then added TWO MORE raw
+# classes on the same night — `credential-remint-required` and `credential-refresh-transient`, which
+# worker-prep.sh's HOST-SIDE credential pre-flight emits BEFORE any model runs — and folded them onto
+# auth / transient in model-health._EXIT_CLASS_MAP. The fold made the intent unambiguous, but the
+# fold happens in the model_health job, which runs AFTER `void-attempt`/`round-void` have already
+# read the RAW class: so a host-side credential pre-flight failure — the purest possible credential
+# outage, no model involved at all — was CHARGED a review round and could park the issue. Exactly the
+# inversion this constant exists to prevent, live throughout the acct01 outage (#596, alert #622).
+#
+# WHAT THE LOCK ACTUALLY GUARANTEES (corrected by the POST-MERGE RETRO-REVIEW OF #629 — #629's own
+# claim that "the CLASS is closed" was OVERSTATED and is restated here honestly). Two locks, with
+# distinct scopes:
+#   1. THE CONSUMER LOCK, bidirectional between the two CONSTANTS: the set-equality assertion in
+#      _self_test derives {raw class : its fold target is an outage decision class} from
+#      model-health._EXIT_CLASS_MAP and requires it to EQUAL this set (same shape as #595's
+#      `SEC_KEYWORDS == routing.toml match_labels` posture lock). A class added to the fold map alone,
+#      or un-charged here alone, is a red tick.
+#   2. THE EMITTER LOCK, producer -> consumer: #629 had NOTHING tying either constant to the PRODUCERS,
+#      so `broker-refresh.py` / `worker-prep.sh` could start emitting a new raw exit class with lock 1
+#      still green — it would fold to `unknown` and be CHARGED (fail-SAFE, but the same shape of
+#      drift). _emitted_credential_exit_classes now derives every credential class broker-refresh.py
+#      can emit, by PARSING its source, and requires each to be a key of the fold map.
+# Neither lock claims that the vocabulary is closed against a producer this derivation cannot read
+# (a brand-new emitter script would need its own derivation); what they close is the two directions
+# that actually caused #604 and #614.
 CREDENTIAL_OUTAGE_EXIT_CLASSES = frozenset({
     # raw worker-live.sh classes
     "auth", "billing", "session-limit", "rate-limit",
-    # model-health.py folded decision classes (same four conditions)
+    # raw worker-prep.sh HOST-SIDE credential pre-flight classes (#614). A dead stored grant and an
+    # unreachable token endpoint are both "the CLI never reached the model" — the strongest members
+    # of this set, since the model container was never even started.
+    "credential-remint-required", "credential-refresh-transient",
+    # model-health.py folded decision classes (the same conditions after the fold)
     "limit", "transient",
 })
 MARKER_KINDS = {
@@ -1320,6 +1352,61 @@ def _comment(repo, pr_number, body):
         ["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments", "--input", "-"],
         input_doc={"body": _redact_public_text(body)},
     )
+
+
+def _load_model_health():
+    """The shared model-access-health module (model-health.py: the raw-exit-class -> decision-class
+    fold and LAUNCH_FAIL_CLASSES). Loaded lazily, self-test only: it is imported purely so the
+    CREDENTIAL_OUTAGE_EXIT_CLASSES drift lock can DERIVE the outage classes from the fold map that
+    owns them instead of restating them by hand. Nothing on the live path imports it — the class
+    gate stays a pure, dependency-free predicate."""
+    path = Path(__file__).resolve().with_name("model-health.py")
+    spec = importlib.util.spec_from_file_location("registry_model_health", path)
+    if spec is None or spec.loader is None:
+        raise WorkerPrError("cannot load model-health.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _emitted_credential_exit_classes():
+    """The credential exit classes broker-refresh.py can EMIT, read from its source with `ast`.
+
+    THE PRODUCER SIDE of the drift lock (post-merge retro-review of #629). The set-equality lock in
+    _self_test ties CREDENTIAL_OUTAGE_EXIT_CLASSES to model-health._EXIT_CLASS_MAP — two CONSUMERS of
+    the class vocabulary — and nothing tied either to the producer, so `worker-prep.sh` /
+    `broker-refresh.py` could start emitting a new raw class with the lock still green (it would fold
+    to `unknown` and be CHARGED: fail-safe, but the same shape of drift, which is why calling the class
+    "closed" was overstated). This derivation closes it.
+
+    broker-refresh.py is PARSED, never imported — the same precedent as
+    dispatch-secrets-guard.trust_surface_from_worker_pr: reading a constant must not execute a
+    privileged module. Every module-level `CLASS_* = "credential-…"` assignment counts, because those
+    constants are exactly what `worker-prep.sh` writes into the exit-class file. Raises
+    WorkerPrError when the source cannot be read or the derivation resolves EMPTY, so a derivation
+    fault names ITSELF instead of passing as "no drift".
+    """
+    path = Path(__file__).resolve().with_name("broker-refresh.py")
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError) as error:
+        raise WorkerPrError(f"cannot derive broker-refresh.py's exit classes: {error}") from error
+    emitted = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        value = node.value.value
+        if not isinstance(value, str) or not value.startswith("credential-"):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id.startswith("CLASS_"):
+                emitted.append(value)
+    if not emitted:
+        raise WorkerPrError(
+            "derived ZERO credential exit classes from broker-refresh.py — this is a DERIVATION "
+            "failure (the constants were renamed or moved), NOT a finding that the producer emits "
+            "nothing; fix the derivation (fail closed)")
+    return tuple(sorted(set(emitted)))
 
 
 def _load_worker_issue():
@@ -4242,13 +4329,95 @@ def _self_test():
     # dc2d7519: 5 auth vs 5 success in one window, then 2 more) charged a full review round and
     # walked the PR toward a capacity park exactly as if the reviewer had declined.
     for outage_class in ("auth", "AUTH", " auth ", "rate-limit", "session-limit", "billing",
-                         "limit", "transient"):
+                         "limit", "transient",
+                         # #614's host-side credential pre-flight classes. worker-prep.sh emits
+                         # these BEFORE any model container starts, so charging a review round for
+                         # one is charging for a review that could not physically have happened.
+                         "credential-remint-required", "credential-refresh-transient",
+                         "CREDENTIAL-REMINT-REQUIRED", " credential-refresh-transient "):
         check(f"exit class {outage_class!r} is a credential outage",
               is_credential_outage(outage_class), True)
+
+    # ---- THE DRIFT LOCK (retro-review of #604/#614): the two class sets CANNOT diverge again -----
+    # #604 wrote this set by hand from worker-live.sh's classes; #614 added two raw classes to
+    # model-health's fold map the same night and nothing tied the two files together, so for the
+    # whole acct01 outage a host-side credential pre-flight failure was CHARGED. Derive the outage
+    # classes from the fold map that OWNS them — every raw key whose fold TARGET is one of
+    # model-health's outage decision classes (LAUNCH_FAIL_CLASSES) — and require SET EQUALITY with
+    # CREDENTIAL_OUTAGE_EXIT_CLASSES. Same posture-lock shape as #595's `SEC_KEYWORDS ==
+    # routing.toml match_labels`. Consequences, both directions:
+    #   * a new raw class folded onto auth/billing/limit/transient and NOT added here -> RED
+    #     (it would otherwise be charged, i.e. the #604/#614 defect verbatim);
+    #   * a class un-charged here that model-health does NOT fold to an outage class -> RED
+    #     (it would otherwise silently un-charge a chargeable failure).
+    _mh = _load_model_health()
+    _mh_outage_raw = frozenset(raw for raw, folded in _mh._EXIT_CLASS_MAP.items()
+                               if folded in _mh.LAUNCH_FAIL_CLASSES)
+    check("DRIFT LOCK: CREDENTIAL_OUTAGE_EXIT_CLASSES == every raw exit class model-health folds "
+          "onto an outage decision class (a new class cannot be added on one side only)",
+          sorted(CREDENTIAL_OUTAGE_EXIT_CLASSES), sorted(_mh_outage_raw))
+    # Non-vacuity of the lock itself: the derivation must actually SEE #614's two classes (a fold
+    # map that stopped carrying them would make the equality above trivially satisfiable by
+    # deleting them from both sides).
+    #
+    # A REQUIRED-SUBSET assertion, not an exact equality (post-merge retro-review of #629): the old
+    # form was `sorted(c for c in _mh_outage_raw if c.startswith("credential-")) == [the two current
+    # names]`, an exact equality over EVERY FUTURE `credential-*` class, so a legitimate, correctly
+    # synchronised THIRD credential class would have redded this line for no reason. What must hold is
+    # that the two #614 classes are still THERE — that is the non-vacuity property — not that no other
+    # credential class may ever exist.
+    check("DRIFT LOCK: the derivation still covers #614's host-side pre-flight classes (required "
+          "SUBSET: a legitimate third `credential-*` class must not red this)",
+          sorted({"credential-refresh-transient", "credential-remint-required"} - _mh_outage_raw),
+          [])
+    check("DRIFT LOCK: the non-vacuity anchor is a SUBSET check, so it survives a new class but "
+          "still fails when one of #614's own is dropped",
+          sorted({"credential-refresh-transient", "credential-remint-required"}
+                 - (_mh_outage_raw | {"credential-brand-new-class"})),
+          [])
+    for _dropped in ("credential-refresh-transient", "credential-remint-required"):
+        check(f"DRIFT LOCK: dropping {_dropped!r} from the fold map would red the anchor "
+              "(the subset check is NOT vacuous)",
+              sorted({"credential-refresh-transient", "credential-remint-required"}
+                     - (_mh_outage_raw - {_dropped})),
+              [_dropped])
+    # ---- THE EMITTER SIDE OF THE CONTRACT (post-merge retro-review of #629) ----------------------
+    # The lock above is bidirectional BETWEEN THE TWO CONSTANTS and says nothing about the PRODUCERS:
+    # worker-prep.sh / broker-refresh.py could start emitting a new raw exit class, the equality would
+    # stay green, model-health would fold it to `unknown`, and it would be CHARGED. That is the
+    # fail-SAFE direction, so it is not a security hole — but it is the same SHAPE of drift, which is
+    # why "#629 closes the CLASS" was overstated. Closed here: every credential class broker-refresh.py
+    # can emit is derived from its source by `ast` (the module is PARSED, never imported — same
+    # precedent as dispatch-secrets-guard.trust_surface_from_worker_pr) and required to be a KEY of the
+    # fold map. A producer can no longer introduce a raw class alone.
+    _emitted = _emitted_credential_exit_classes()
+    check("EMITTER LOCK: broker-refresh.py's CLASS_* constants are readable from source (a derivation "
+          "that resolves EMPTY must name ITSELF, never pass as 'no drift')",
+          bool(_emitted) and all(isinstance(name, str) and name for name in _emitted), True)
+    check("EMITTER LOCK: every credential exit class broker-refresh.py can emit is a KEY of "
+          "model-health._EXIT_CLASS_MAP (a producer cannot add a raw class on its own)",
+          sorted(name for name in _emitted if name not in _mh._EXIT_CLASS_MAP), [])
+    check("EMITTER LOCK: ...and every one of them is also non-chargeable through the REAL predicate",
+          sorted(name for name in _emitted if not is_credential_outage(name)), [])
+    check("EMITTER LOCK: the derivation SEES both of #614's classes (anchor against a parse that "
+          "silently stopped matching)",
+          sorted({"credential-refresh-transient", "credential-remint-required"} - set(_emitted)), [])
+    check("EMITTER LOCK: a hypothetical new producer class that is NOT in the fold map is DETECTED "
+          "(the check is not vacuous)",
+          sorted(name for name in tuple(_emitted) + ("credential-not-in-the-fold-map",)
+                 if name not in _mh._EXIT_CLASS_MAP),
+          ["credential-not-in-the-fold-map"])
+    # ...and every derived class is non-chargeable through the REAL predicate, not just the set.
+    for _derived in sorted(_mh_outage_raw):
+        check(f"DRIFT LOCK: is_credential_outage({_derived!r}) — derived from the fold map",
+              is_credential_outage(_derived), True)
+
     # The fail direction is toward CHARGING: anything the host could not attribute to the provider
     # (including the fail-safe `unknown` fold target) keeps the bounded-crash accounting.
     for charged_class in ("success", "no_change", "setup", "unknown", "other", "zero-dispatch",
-                         "", None, "auth-ish", "authorization"):
+                         "", None, "auth-ish", "authorization",
+                         # near-misses on #614's spellings must NOT be un-charged
+                         "credential", "credential-remint", "remint-required"):
         check(f"exit class {charged_class!r} is NOT a credential outage",
               is_credential_outage(charged_class), False)
 
@@ -4291,6 +4460,22 @@ def _self_test():
     # model never looked at the PR, so there is no judgment to charge a round for.
     check("a rate-limit run charges NO round (documented #596 decision)",
           simulate_rounds(["rate-limit"])[0], 0)
+    # #614's HOST-SIDE pre-flight classes, end to end through the real control path. These were
+    # CHARGED for the whole acct01 outage: worker-prep.sh failed before the container even started,
+    # and the round was billed to a model that was never launched.
+    for _preflight_class in ("credential-remint-required", "credential-refresh-transient"):
+        _pf = simulate_rounds([_preflight_class])
+        check(f"a {_preflight_class} run charges NO round (host-side pre-flight, no model ran)",
+              _pf[0], 0)
+        check(f"a {_preflight_class} run reports voided=true", _pf[1], ["true"])
+    # ...and the same mixed-window shape as auth: only the real decline is charged.
+    _pf_mixed = simulate_rounds(["credential-remint-required", "no_change",
+                                 "credential-refresh-transient"])
+    check("mixed pre-flight/no_change/pre-flight charges exactly one round", _pf_mixed[0], 1)
+    check("3 credential-remint-required runs leave decide_budget at continue (no budget park)",
+          decide_budget(simulate_rounds(["credential-remint-required"] * 3)[0], [], None, "openai",
+                        base_rounds=3)["action"],
+          "continue")
     # ...while an UNATTRIBUTABLE failure still charges, preserving the bounded-crash accounting.
     check("an unknown-class run still charges its round (bounded-crash accounting intact)",
           simulate_rounds(["unknown"])[0], 1)

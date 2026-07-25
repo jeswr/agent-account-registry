@@ -362,7 +362,9 @@ def prune(records, now):
     minimal three source observations, and a live AUTH COOLDOWN (registry #596) retains the
     AUTH_COOLDOWN_MIN tail of its consecutive `auth` run. Earlier ordinary backoff records cannot
     affect the derived state (a success resets them), so re-deriving backoff_until on the pruned
-    window is exact.
+    window is exact. A PROVEN-DEAD credential (registry #639, `credential_states`) retains the same
+    auth-run tail even though its cooldown has long expired — that evidence is the ONLY thing keeping
+    a dead probe-exempt account out of dispatch, so the cap must not be able to erase it.
 
     BOUND CONTRACT (PR #85 finding 1): preserved records spend the MAX_RECORDS budget first and
     the newest non-preserved records fill only the REMAINING budget, so the total is bounded by
@@ -372,10 +374,11 @@ def prune(records, now):
     and a ::warning::
     diagnostic surfaces the overshoot (that many simultaneously backed-off accounts is a
     fleet-wide rate-limit saturation signal the maintainer must see, not a bookkeeping detail).
-    len(preserved) itself is bounded by live_accounts * (BACKOFF_CHAIN_KEEP +
-    NO_CHANGE_LIMIT_MIN - 1 + AUTH_COOLDOWN_MIN), and every backoff expires within
-    BACKOFF_CAP_SECONDS (an auth cooldown within the much shorter AUTH_COOLDOWN_SECONDS), so the
-    overshoot is transient, not unbounded growth."""
+    len(preserved) itself is bounded by held_accounts * (BACKOFF_CHAIN_KEEP +
+    NO_CHANGE_LIMIT_MIN - 1 + max(AUTH_COOLDOWN_MIN, CREDENTIAL_DEAD_MIN)) — `held` being the
+    accounts with a live backoff or a proven-dead credential — and every backoff expires within
+    BACKOFF_CAP_SECONDS (an auth cooldown within the much shorter AUTH_COOLDOWN_SECONDS) while a dead
+    run ages out with WINDOW_SECONDS, so the overshoot is transient, not unbounded growth."""
     kept = [r for r in records if isinstance(r, dict)
             and isinstance(r.get("ts"), int)
             and (now - r["ts"]) <= WINDOW_SECONDS
@@ -385,7 +388,16 @@ def prune(records, now):
         return kept
     preserved = set()
     active = account_backoffs(kept, now)
-    if active:
+    # PROVEN-DEAD CREDENTIAL RETENTION (registry #639), the same argument as the #82 active-backoff
+    # retention one level up: a credential proven dead (credential_states) is held OUT of dispatch by
+    # that evidence alone — its #596 cooldown expired long ago, so nothing in `active` protects its
+    # records. A flood of later unrelated records (a healthy anthropic fleet's successes) would evict
+    # the auth run, the state would silently revert to `unproven`, and the dead account would be
+    # handed to the allocator again. Preserving the run's tail is what makes the ineligibility hold
+    # for the whole window instead of only until the cap fills.
+    dead = {account for account, entry in credential_states(kept, now).items()
+            if entry["state"] == CREDENTIAL_DEAD}
+    if active or dead:
         derived, no_change_evidence = _no_change_limit_view(kept, now)
         chains = {}                 # account -> indices of its current consecutive chain
         auth_runs = {}              # account -> indices of its current consecutive auth run (#596)
@@ -398,22 +410,26 @@ def prune(records, now):
                 chains.setdefault(acct, []).append(index)
             elif cls == CLASS_AUTH:
                 auth_runs.setdefault(acct, []).append(index)
-        for acct in active:
-            chain = chains.get(acct, ())
-            preserved.update(chain[-BACKOFF_CHAIN_KEEP:])
-            # A live AUTH COOLDOWN (registry #596) is derived from `auth` records, which are NOT in
-            # BACKOFF_CLASSES and so appear in no `chain` — without this a flood of later unrelated
-            # records would evict the run and readmit the account mid-cooldown, the exact bug issue
-            # #82 fixed for rate limits. Kept in its own bucket so the limit/transient tail above
-            # (whose length determines the re-derived exponential) is byte-for-byte unchanged.
-            preserved.update(auth_runs.get(acct, ())[-AUTH_COOLDOWN_MIN:])
-            # A derived no_change limit needs all three source observations after pruning; keeping
-            # only the newest (derived) member would erase the discriminator and readmit the capped
-            # account on the next ledger read. Preserve this bounded evidence only when the derived
-            # member is still in the account's live post-success chain.
-            nc_evidence = no_change_evidence.get(acct, set())
-            if any(index in chain for index in nc_evidence):
-                preserved.update(nc_evidence)
+        for acct in set(active) | dead:
+            if acct in active:
+                chain = chains.get(acct, ())
+                preserved.update(chain[-BACKOFF_CHAIN_KEEP:])
+                # A derived no_change limit needs all three source observations after pruning;
+                # keeping only the newest (derived) member would erase the discriminator and readmit
+                # the capped account on the next ledger read. Preserve this bounded evidence only
+                # when the derived member is still in the account's live post-success chain.
+                nc_evidence = no_change_evidence.get(acct, set())
+                if any(index in chain for index in nc_evidence):
+                    preserved.update(nc_evidence)
+            # A live AUTH COOLDOWN (registry #596) — and a PROVEN-DEAD credential (registry #639) —
+            # are derived from `auth` records, which are NOT in BACKOFF_CLASSES and so appear in no
+            # `chain`: without this a flood of later unrelated records would evict the run and
+            # readmit the account mid-cooldown (the exact bug issue #82 fixed for rate limits) or
+            # revert a dead credential to `unproven`. Kept in its own bucket so the limit/transient
+            # tail above (whose length determines the re-derived exponential) is byte-for-byte
+            # unchanged, and sized by whichever consumer needs the longer tail.
+            preserved.update(
+                auth_runs.get(acct, ())[-max(AUTH_COOLDOWN_MIN, CREDENTIAL_DEAD_MIN):])
     budget = MAX_RECORDS - len(preserved)
     if budget < 0:
         # Live backoffs alone exceed the nominal cap: keep them all (correctness over the cap),
@@ -680,6 +696,89 @@ def auth_cooldowns(records, now):
                                "saturated": False,
                                "last_signal": CLASS_AUTH, "last_ts": int(ts)}
     return {acct: cd for acct, cd in state.items() if cd["backoff_until"] > now}
+
+
+# --- CREDENTIAL REACHABILITY (registry #639). auth_cooldowns above answers "hold this account for a
+# short TTL"; this answers the DIFFERENT question the probe-exemption seam needs: "is there evidence
+# this credential can reach its provider at all?"
+#
+# WHY A SECOND PREDICATE AND NOT A LONGER COOLDOWN. The #596 cooldown is deliberately SHORT,
+# single-step and self-clearing because the account it names is the fleet's only cross-provider
+# reviewer and its codex access token expires HOURLY — the observed pattern was INTERLEAVED (5 auth
+# against 5 success in one window), where a ~50% success rate beats sidelining the sole reviewer.
+# That reasoning has a PREMISE: at least one success in the window. When the stored grant itself is
+# dead (`credential-remint-required`, registry #596 / alert #622) the run is MONOTONE — no success at
+# all — so the account produces ZERO verdicts either way, and re-admitting it every 15 minutes buys
+# nothing while spending a runner and a lease per dispatch tick. This predicate bites exactly where
+# the cooldown's premise is false, so it does not overturn that decision — a single success clears it
+# instantly, which is precisely the interleaved case the cooldown was calibrated on.
+#
+# BOUNDED AND SELF-HEALING, not a disable: the state is derived from the same 48 h rolling window as
+# everything else, so once the auth run ages out the account is `unproven` again and gets another
+# CREDENTIAL_DEAD_MIN trial dispatches. Nothing here requires maintainer action to recover, and a
+# `success` record clears it immediately.
+CREDENTIAL_LIVE = "live"          # positive evidence: the credential authenticated in the window
+CREDENTIAL_DEAD = "dead"          # decisive negative: a run of auth rejections, no later success
+CREDENTIAL_UNPROVEN = "unproven"  # no decisive record — asserted by NEITHER side (the absent case)
+# Same threshold as the cooldown, for the same reason (see WHY N=2 above): ONE `auth` is what the
+# hourly expiry boundary looks like and must not condemn a credential; TWO consecutive with no
+# interleaved success is credential rot.
+CREDENTIAL_DEAD_MIN = AUTH_COOLDOWN_MIN
+
+
+def credential_states(records, now):
+    """PURE per-account credential REACHABILITY, derived from the same health window as
+    account_backoffs / auth_cooldowns. Returns ONLY decisive states —
+    {account_hash: {"state": CREDENTIAL_LIVE|CREDENTIAL_DEAD, "consecutive": n, "last_ts": ts}} —
+    so an account ABSENT from the map is CREDENTIAL_UNPROVEN: this function never guesses, and the
+    absence is meaningful to its consumers (account-usage stamps `reachability: unproven`).
+
+    The walk, in ts order, mirrors auth_cooldowns' consecutiveness convention exactly:
+      * a `success` proves reachability -> CREDENTIAL_LIVE, and clears any run;
+      * the CREDENTIAL_DEAD_MIN'th consecutive `auth` (and every one after it) -> CREDENTIAL_DEAD;
+      * a SINGLE `auth` after a success clears the LIVE claim without asserting DEAD (unproven) —
+        the credential's fate is genuinely unknown at that point (it is what an expiry boundary
+        looks like), and laundering it back to `live` would be the false claim this predicate
+        exists to prevent;
+      * any other class (limit/transient/setup/billing/unknown) neither counts toward the run nor
+        clears it and leaves the state untouched: a rate limit says nothing about whether the
+        credential is valid.
+
+    Unlike auth_cooldowns this carries NO TTL: it is an evidence question, not a hold duration. The
+    window itself is the bound (mh.prune's WINDOW_SECONDS), and prune preserves a dead run's tail
+    against the MAX_RECORDS cap so a flood of unrelated records cannot silently readmit it."""
+    runs, state = {}, {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        acct, cls, ts = record.get("account"), record.get("exit_class"), record.get("ts")
+        if not isinstance(acct, str) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            continue
+        if ts != ts or ts in (float("inf"), float("-inf")) or ts > now + FUTURE_SKEW_SECONDS:
+            continue                    # non-finite / future-forged stamp: skip fail-open
+        if cls == SUCCESS:
+            runs.pop(acct, None)
+            state[acct] = {"state": CREDENTIAL_LIVE, "consecutive": 0, "last_ts": int(ts)}
+        elif cls == CLASS_AUTH:
+            run = runs.get(acct, 0) + 1
+            runs[acct] = run
+            if run >= CREDENTIAL_DEAD_MIN:
+                state[acct] = {"state": CREDENTIAL_DEAD, "consecutive": run, "last_ts": int(ts)}
+            else:
+                # Below the threshold the evidence is INCONCLUSIVE: drop any prior `live` claim
+                # rather than keep asserting reachability off a superseded success.
+                state.pop(acct, None)
+    return state
+
+
+def credential_state(states, account):
+    """The three-valued reachability for ONE account hash: the decisive state from
+    `credential_states`, or CREDENTIAL_UNPROVEN when it has no decisive record. One helper so no
+    consumer has to re-implement "absent means unproven" (and drift into "absent means fine")."""
+    entry = states.get(account) if isinstance(states, dict) else None
+    if isinstance(entry, dict) and entry.get("state") in (CREDENTIAL_LIVE, CREDENTIAL_DEAD):
+        return entry["state"]
+    return CREDENTIAL_UNPROVEN
 
 
 def _iso_z(ts):
@@ -2475,6 +2574,73 @@ def _self_test():
         (len(auth_window) <= MAX_RECORDS,
          auth_cooldowns(auth_window, now + 200).get(ah, {}).get("last_signal")),
         (True, CLASS_AUTH))
+    # ---- [registry #639] CREDENTIAL REACHABILITY: the evidence question the probe-exemption seam
+    # needs, distinct from the bounded #596 hold. "Exempt from the quota probe" must never imply
+    # "reachable", so this predicate must be able to say DEAD — and must never say `live` off
+    # anything but a success. --------------------------------------------------------------------
+    chk("no records at all -> UNPROVEN (never a reachability claim in either direction)",
+        (credential_states([], now), credential_state(credential_states([], now), ah)),
+        ({}, CREDENTIAL_UNPROVEN))
+    chk("a success PROVES reachability (live)",
+        credential_state(credential_states([rec("openai", "codex01", SUCCESS, dt=0)], now + 60), ah),
+        CREDENTIAL_LIVE)
+    chk(f"a SINGLE auth is inconclusive, not dead (N={CREDENTIAL_DEAD_MIN})",
+        credential_state(credential_states(one_auth, now + 60), ah), CREDENTIAL_UNPROVEN)
+    # THE behavioural heart of #639: a monotone auth run is a DEAD credential, with no TTL.
+    chk(f"{CREDENTIAL_DEAD_MIN} consecutive auth outcomes prove the credential DEAD",
+        (credential_state(credential_states(two_auth, now + 120), ah),
+         credential_states(two_auth, now + 120)[ah]["consecutive"]),
+        (CREDENTIAL_DEAD, 2))
+    # ...and unlike the #596 cooldown it does NOT expire on its own: re-admitting a credential that
+    # has produced only rejections buys zero verdicts and spends a runner + a lease every tick.
+    chk("the dead state does NOT expire with the cooldown TTL (the #596 hold does)",
+        (credential_state(credential_states(two_auth, now + 60 + AUTH_COOLDOWN_SECONDS + 1), ah),
+         auth_cooldowns(two_auth, now + 60 + AUTH_COOLDOWN_SECONDS + 1)),
+        (CREDENTIAL_DEAD, {}))
+    # Recovery is automatic and immediate on positive evidence — this is what keeps the predicate
+    # compatible with #596's "NOT a disable" decision for the INTERLEAVED pattern it was calibrated
+    # on (5 auth against 5 success in one window).
+    chk("a later success clears DEAD instantly (interleaved pattern stays live)",
+        credential_state(credential_states(
+            two_auth + [rec("openai", "codex01", SUCCESS, dt=90, run="s2")], now + 120), ah),
+        CREDENTIAL_LIVE)
+    chk("an auth AFTER a success drops the live claim without asserting dead",
+        credential_state(credential_states(
+            [rec("openai", "codex01", SUCCESS, dt=0, run="s1"),
+             rec("openai", "codex01", "auth", dt=30, run="a1")], now + 60), ah),
+        CREDENTIAL_UNPROVEN)
+    # A rate limit says NOTHING about credential validity, in either direction.
+    chk("limit/transient records neither prove nor disprove reachability",
+        credential_state(credential_states(
+            [rec("openai", "codex01", "rate-limit", dt=0, run="r1"),
+             rec("openai", "codex01", "rate-limit", dt=10, run="r2")], now + 20), ah),
+        CREDENTIAL_UNPROVEN)
+    chk("an interleaved rate-limit does not break a dead auth run",
+        credential_state(credential_states(
+            [rec("openai", "codex01", "auth", dt=0, run="a1"),
+             rec("openai", "codex01", "rate-limit", dt=10, run="r1"),
+             rec("openai", "codex01", "auth", dt=20, run="a2")], now + 30), ah),
+        CREDENTIAL_DEAD)
+    chk("dead is PER-ACCOUNT (another account's rejections never condemn this one)",
+        credential_state(credential_states(two_acct, now + 120), other_h), CREDENTIAL_UNPROVEN)
+    chk("a future-forged auth stamp is skipped fail-open (cannot fabricate DEAD)",
+        credential_state(credential_states(
+            [{"account": ah, "exit_class": CLASS_AUTH, "ts": now + FUTURE_SKEW_SECONDS + 60},
+             {"account": ah, "exit_class": CLASS_AUTH, "ts": now + FUTURE_SKEW_SECONDS + 61}],
+            now), ah),
+        CREDENTIAL_UNPROVEN)
+    # prune must not let the MAX_RECORDS cap erase the evidence: the dead run is the ONLY thing
+    # holding the account out, and its #596 cooldown has already expired here (unlike the live-
+    # cooldown row above, whose `active` entry is what used to protect these records).
+    dead_flood = two_auth + [rec("anthropic", f"d{i:03d}", SUCCESS, dt=100 + i)
+                             for i in range(MAX_RECORDS + 5)]
+    dead_now = now + 60 + AUTH_COOLDOWN_SECONDS + 1
+    dead_window = prune(dead_flood, dead_now)
+    chk("prune retains a PROVEN-DEAD run under a 200+ record flood (no silent readmission)",
+        (len(dead_window) <= MAX_RECORDS,
+         auth_cooldowns(dead_window, dead_now),
+         credential_state(credential_states(dead_window, dead_now), ah)),
+        (True, {}, CREDENTIAL_DEAD))
     # ---- the ops alert: ONE alert per (condition, provider), naming FINGERPRINTS only -----------
     openai_fleet = {"openai": {ah}}
     auth_actions = classify_records(two_auth, openai_fleet, now + 120)

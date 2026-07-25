@@ -1189,7 +1189,14 @@ jobs:
       - name: Write back a rotated full account credential
         # NO model-step guard (issue #596): see worker.yml — a host-side rotation must be
         # persisted even when the model step never ran, or the consumed grant strands the account.
-        if: ${{ always() && steps.prepare.outcome == 'success' }}
+        #
+        # NO PREPARE-STEP GUARD EITHER (retro-review of #614): see the long note on the same step in
+        # worker.yml. `steps.prepare.outcome == 'success'` made the write-back reachable only from
+        # the success path of the very step that CONSUMES the one-time-use grant, so a failure after
+        # the provider committed the rotation killed the account permanently. Keyed instead to the
+        # account SELECTION; worker-live.sh's rotation marker decides whether anything needs
+        # persisting, and with no marker this is a rotated=false no-op.
+        if: ${{ always() && steps.selected.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}

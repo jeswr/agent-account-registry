@@ -174,6 +174,10 @@ jobs:
           done < "$RUNNER_TEMP/dispatch-targets/repos.txt"
 
       - name: Build ready + deferred issue rows and snapshot pull requests (target planner code)
+        # `id:` so dispatch-plan.py's self-test can locate this step and EXECUTE the roleless-report
+        # block below (#597 review round 2): its two `if` conditions are workflow python that no
+        # test ran, so flipping either one restored silent invisibility with every assertion green.
+        id: readiness
         env:
           TARGET_ROOT: ${{ runner.temp }}/dispatch-targets
         run: |
@@ -332,6 +336,38 @@ jobs:
                       and trusted(details[row["number"]][0], repo_trusted_bots))
               ]
               ready = dispatch.compute_ready(ready_input)
+              # Issue #225: a `status:ready` issue carrying NO role:* label is dropped by the
+              # readiness engine (has_role) BEFORE any plan row exists — it shows up in no plan,
+              # no diagnostic, and never drains. 117 accumulated before a human noticed. Report
+              # the count on EVERY tick, printed even when zero (the same always-printed shape as
+              # the review-enumeration exclusion line at PLAN completion below), over the FULL
+              # readiness_input so the number is the honest backlog, not the post-trust subset.
+              # Advisory only: PLAN never guesses a role (fail-closed) and the plan document is
+              # unchanged. A target whose planner predates roleless_ready says so out loud rather
+              # than reporting a fabricated zero.
+              # >>> roleless-report — EXECUTED by scripts/dispatch-plan.py --self-test. #597 review
+              # round 2 (MAJOR): the four assertions on this block were whole-file substring
+              # searches, so `if roleless_fn is None:` -> `is not None:` (every target then reports
+              # "planner has no roleless_ready()" and enumeration never runs) and `if roleless:` ->
+              # `if not roleless:` (reports zero precisely when invisible issues exist) BOTH left
+              # the assertion tuple green while fully restoring the bug this PR exists to prevent.
+              # These sentinels delimit the block the self-test extracts and runs against a stub
+              # planner; removing either one makes that extraction FAIL CLOSED. Keep the block
+              # self-contained: `dispatch`, `readiness_input` and `repo` are its only inputs.
+              roleless_fn = getattr(dispatch, "roleless_ready", None)
+              if roleless_fn is None:
+                  print(f"::warning::{repo}: target planner has no roleless_ready() — "
+                        "ready-but-roleless issues are NOT counted for this target")
+              else:
+                  roleless = roleless_fn(readiness_input)
+                  if roleless:
+                      shown = ", ".join(f"#{number}" for number in roleless[:20])
+                      more = f" (+{len(roleless) - 20} more)" if len(roleless) > 20 else ""
+                      print(f"::warning::{repo}: {len(roleless)} status:ready issue(s) carry no "
+                            f"role:* label and are INVISIBLE to dispatch: {shown}{more}")
+                  else:
+                      print(f"{repo}: ready-but-roleless issues: 0")
+              # <<< roleless-report
               # Deferred-retry candidates (registry decision: a status:deferred issue with no
               # live lease and no linked open PR is retryable). The ready-engine gate is reused
               # by SWAPPING deferred->ready only for readiness computation; the emitted item
@@ -735,6 +771,17 @@ jobs:
           # "outside the human-arm trust surface", while the SAME self-test passed in the
           # full-checkout pr-gate. Both files are READ here, never imported or executed: the
           # surface constant is extracted with `ast`, so nothing in worker-pr.py runs in this job.
+          # scripts/grant-account.py is a TRANSITIVE input (the 2026-07-25 dispatch halt): the
+          # self-test EXECUTES set-up-account.yml's reconcile `run:` body, and #616 made that body
+          # load grant-account.py by repository-relative path to derive a resumed enrollment's
+          # authorized target set. Absent from this list the load raised FileNotFoundError, the body
+          # took its (correct) `grant cannot be proven` refusal branch, and the guard's
+          # credential-existence assertions failed for a reason that had nothing to do with the
+          # contract — which, now that #621 rightly made this guard GATING, skipped CLAIM on every
+          # tick. The guard now DERIVES this dependency from the executed body's own text
+          # (executed_body_inputs_declared_verdict), so the next step that loads a script goes red in
+          # pr-gate instead of halting dispatch. It is read by the EXECUTED BODY, never by the guard
+          # module itself.
           # KEEP THIS LIST IN SYNC — SELF_TEST_LIVE_INPUTS in scripts/dispatch-secrets-guard.py is
           # asserted against this very block every tick, so a new live-file dependency that is not
           # added here goes RED instead of silently degrading a check to vacuous.
@@ -742,9 +789,34 @@ jobs:
             scripts/dispatch-secrets-guard.py
             scripts/worker-live.sh
             scripts/worker-pr.py
+            scripts/grant-account.py
             policy/repos.toml
             .github/workflows/
           sparse-checkout-cone-mode: false
+
+      # The guard's static workflow-shape assertions PARSE the workflow YAML rather than pattern-match
+      # it (retro-review of #621: five permissive misparses came from regex-over-YAML, and two
+      # mutations of the gate wiring left the whole suite green). PyYAML is therefore a hard
+      # requirement of `--self-test` here, exactly as it already is in pr-gate.yml. Probe FIRST: when
+      # the runner image already provides it this step is a no-op and the guard keeps ZERO network
+      # dependency on PyPI. Only when it is absent do we install — version + sha256 locked to the
+      # identical pins pr-gate uses, because a REQUIRED fail-closed control must never depend on a
+      # mutable release.
+      - name: Ensure PyYAML for the guard's workflow-parse assertions
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/guard-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/guard-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
 
       - name: Verify empty repo-scope secrets + default-branch-only environment policy
         env:
@@ -917,8 +989,19 @@ jobs:
 
       # Least-exposure filter (audit-2026-07-17): only this tiny inline step ever sees the full
       # secrets map; the probe step below receives ONLY the ACCT_* worker-token subset via a file.
+      #
+      # NO `continue-on-error` HERE (registry #639, the ledgergate #612 applied to the dashboard job
+      # and this one did not). This is the PRODUCER of the only measurement input dispatch has, and
+      # this is the lane that SPENDS capacity: a laundered failure here used to leave no ACCT_* file,
+      # `_load_secrets` returned `{}` for an unreadable one, every metered account was fail-closed
+      # omitted, and the probe-EXEMPT accounts were still emitted — so the map stayed NON-EMPTY, no
+      # wholesale-outage detector fired, and dispatch launched workers against an unmeasured fleet.
+      # The filter is a pure local transform of `toJSON(secrets)`; it fails only on a real defect, and
+      # a real defect must stop the tick loudly rather than degrade it silently.
+      # `id:` so account-usage.py's --self-test can EXTRACT and EXECUTE this exact body and assert
+      # this step carries no truthy `continue-on-error` (both are invisible to actionlint).
       - name: Materialize the ACCT_* worker-token subset for the probe
-        continue-on-error: true
+        id: acct-secrets
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}
         run: |
@@ -942,11 +1025,22 @@ jobs:
           PY
 
       - name: Probe live account usage (usage-aware dispatch; tokens never printed)
+        # `id:` so account-usage.py's --self-test can EXTRACT and EXECUTE this exact step body
+        # (registry #639, mirroring #612 round 2 finding 4): `bash -n` and actionlint cannot see shell
+        # polarity, so dropping a `!` below — a nonzero probe left classified `ok` — survives the
+        # whole suite unless the body is actually run.
+        id: usage-probe
         continue-on-error: true   # a probe failure must never block dispatch — it falls back to the static cap
         env:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
+          # A failed materialization leaves NO ACCT_* file, and account-usage._load_secrets returns
+          # {} for an unreadable one — the probe would then exit 0 having silently measured nothing.
+          # The filter's own outcome therefore gates the status (registry #639; the materialization is
+          # no longer continue-on-error, so in production this can only read `success` — it is kept
+          # because RESTORING `continue-on-error: true` must not silently re-open the laundering).
+          SECRETS_STEP_OUTCOME: ${{ steps.acct-secrets.outcome }}
           # Reactive backoff for probe-exempt providers (decision 2026-07-17, registry issue #29):
           # the salt maps catalog handles to the salted hashes in data/model-health.json so active
           # rate-limit backoffs land on the exempt usage entries. This job runs registry code only
@@ -956,14 +1050,106 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -uo pipefail
-          python3 registry/scripts/account-usage.py --self-test
-          python3 registry/scripts/account-usage.py > "$RUNNER_TEMP/usage.json" 2> "$RUNNER_TEMP/usage-probe.stderr" || printf '{}' > "$RUNNER_TEMP/usage.json"
+          # LEDGERGATE (registry #639), the discipline #612 applied to the published page and not to
+          # this lane. The old body was `... || printf '{}' > usage.json`: a failure was LAUNDERED into
+          # an empty-but-valid document with nothing recording that measurement had not happened.
+          # The outcome now travels with the snapshot as `usage-probe.json`, and it is derived from
+          # POSITIVE checks on the inputs rather than inferred from a neighbour's exit status.
+          outcome=ok
+          detail=probe-succeeded
+          if [ "${SECRETS_STEP_OUTCOME}" != "success" ]; then
+            outcome=failed
+            detail=secret-materialization-failed
+          fi
+          # A `success` step outcome does not prove the filter WROTE anything: a materialization body
+          # replaced by `true` reports success and leaves no file, _load_secrets returns {} for an
+          # unreadable one, and the probe then exits 0 having measured nothing. So the subset file is
+          # checked POSITIVELY, not merely inferred.
+          if [ "$outcome" = ok ] && [ ! -s "${SECRETS_FILE}" ]; then
+            outcome=failed
+            detail=secret-file-missing
+          fi
+          # ...and a subset with no USABLE token is measurement-equivalent to no file: every
+          # non-exempt account is fail-closed omitted for want of a token.
+          #
+          # #612 review round 4 (MAJOR), restated here because this lane spends real capacity: the
+          # substring test `grep -q '"ACCT'` proves NEITHER valid JSON NOR a non-empty token —
+          # `{"ACCT01_TOKEN":""}` and the truncated `{"ACCT01_TOKEN":` both pass it, and _load_secrets
+          # then yields an empty token or (on JSONDecodeError) `{}`. A substring cannot express "at
+          # least one ACCT*_TOKEN key whose value is a non-empty string", so the subset is PARSED.
+          # The predicate is account-usage._usable_secret_refs, unit-tested there, and this body's
+          # verdicts are asserted against dashboard.yml's for the identical fixture set so the two
+          # lanes cannot drift.
+          #
+          # The no-token-bytes-in-the-log constraint is kept BY CONSTRUCTION: the validator's only
+          # stdout is one of the three fixed words ok/empty/malformed, that stdout is captured into a
+          # variable and never echoed, every failure is caught so there is no traceback to echo a
+          # fragment of the document, and its stderr is discarded anyway.
+          #
+          # SCOPING (as #612 recommended): an all-exempt fleet (openai/codex only — issue #29) needs
+          # no token at all, so a zero-usable-token subset would be a legitimate steady state and this
+          # guard would degrade dispatch unnecessarily. The catalog is anthropic-majority by
+          # construction (every non-exempt account needs a token), so today that configuration does
+          # not exist; account-usage.py's own gate is conditioned on the catalog containing >=1
+          # non-exempt account, and if that configuration ever becomes real, condition this guard the
+          # same way rather than weakening it.
+          subset_state=$(python3 -c '
+          import json
+          import re
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as handle:
+                  document = json.load(handle)
+          except Exception:
+              print("malformed")
+              sys.exit(0)
+          if not isinstance(document, dict):
+              print("malformed")
+              sys.exit(0)
+          usable = [key for key, value in document.items()
+                    if re.fullmatch(r"ACCT[A-Z0-9]+_TOKEN", str(key))
+                    and isinstance(value, str) and value.strip()]
+          print("ok" if usable else "empty")
+          ' "${SECRETS_FILE}" 2>/dev/null) || subset_state=malformed
+          if [ "$outcome" = ok ] && [ "$subset_state" != ok ]; then
+            outcome=failed
+            detail=secret-subset-empty
+            if [ "$subset_state" != empty ]; then
+              # Unparseable, truncated, or not a JSON object at all. Distinguished from `empty`
+              # because it is a different production defect (a broken filter, a truncated write)
+              # and both tokens are fixed literals — neither can carry document bytes.
+              detail=secret-subset-malformed
+            fi
+          fi
+          if [ "$outcome" = ok ] && ! python3 registry/scripts/account-usage.py --self-test; then
+            outcome=failed
+            detail=probe-self-test-failed
+          fi
+          if [ "$outcome" = ok ] && ! python3 registry/scripts/account-usage.py \
+              > "$RUNNER_TEMP/usage.json" 2> "$RUNNER_TEMP/usage-probe.stderr"; then
+            outcome=failed
+            detail=probe-exited-nonzero
+          fi
+          if [ "$outcome" != ok ]; then
+            # The same empty snapshot as before — but now it arrives LABELLED as unmeasured, so
+            # usage-alert raises the wholesale-probe-failure alert with the CAUSE instead of inferring
+            # "no data", and no consumer can read it as a fleet-wide "available".
+            printf '{}' > "$RUNNER_TEMP/usage.json"
+          fi
+          # `outcome`/`detail` are step-local literals from the fixed sets above — never
+          # attacker-influenced text — so this printf cannot emit malformed JSON. Same schema and
+          # vocabulary as dashboard.yml's sidecar (issue #219), one contract, two producers.
+          printf '{"schema":"account-usage-probe/v1","outcome":"%s","detail":"%s","attempted_at":%s}\n' \
+            "$outcome" "$detail" "$(date -u +%s)" > "$RUNNER_TEMP/usage-probe.json"
           # Privacy (locked decision 22b): the public log never carries account counts; a wholesale
           # probe failure is surfaced by the fail-loud usage-alert step below, not by this line.
           # Only explicitly ::warning::-prefixed diagnostics (sanitized by construction — no
-          # handles/counts) are re-surfaced from stderr; everything else stays discarded.
-          grep -a '^::warning::' "$RUNNER_TEMP/usage-probe.stderr" || true
-          echo 'usage-probe: snapshot written'
+          # handles/counts) are re-surfaced from stderr; everything else stays discarded. The file may
+          # not exist when the probe never ran (a refused materialization), hence the guard.
+          [ -f "$RUNNER_TEMP/usage-probe.stderr" ] && \
+            { grep -a '^::warning::' "$RUNNER_TEMP/usage-probe.stderr" || true; }
+          echo "usage-probe: snapshot written (outcome=${outcome} detail=${detail})"
 
       # Capacity model (2026-07-17): persist the live anthropic-ratelimit-unified-* LIMIT headers
       # into the account issues' front-matter so per-account tier limits stop being "TBD".
@@ -1188,10 +1374,20 @@ jobs:
       - name: Alert maintainer if worker accounts are unavailable
         if: always()
         continue-on-error: true
+        # `id:` so account-usage.py's --self-test can assert the probe-status wiring against THIS step
+        # (registry #639): the sidecar has exactly one consumer in this job, so DELETING the env line
+        # below silently reverts the alert to inferring an outage from an empty map — which is the
+        # inference the sidecar exists to replace, and no test that only runs the scripts can see it.
+        id: usage-alert
         env:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           WORKER_USAGE_FILE: ${{ runner.temp }}/usage.json
+          # The probe's persisted outcome (registry #639). `probe_empty = not usage` cannot tell "the
+          # fleet is idle" from "nothing was measured", and it MISSES a partial failure entirely; the
+          # sidecar states the outcome and the CAUSE. Fail-closed when the variable is set: an absent
+          # or stale sidecar is treated as UNMEASURED (degraded), never as a healthy probe.
+          USAGE_PROBE_STATUS_FILE: ${{ runner.temp }}/usage-probe.json
           POLICY_FILE: registry/policy/repos.toml
           MAINTAINER_HANDLE: jeswr
           # Privacy routing (locked decision 22c, issue #107): the per-account alert body enumerates
