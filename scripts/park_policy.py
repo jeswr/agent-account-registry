@@ -74,6 +74,31 @@
 #        AUTO_READMISSION_MAX automatic re-admissions may ever be granted to one PR — past the cap
 #        the loop stops trying and says so LOUDLY, because a flapping account is a genuine human
 #        question.
+#
+# 4. A PARK RETRACTS THE AUTO-MERGE LATCH (issue #684; the safety half of the #683 pair). A park
+#    label is the scheduler's RELEASE VALVE: once #683 lands, `dispatch-claim.busy_packages_of_
+#    pulls` frees a parked PR's crate partitions on the `parked` label ALONE, so the partition can
+#    hand that crate to a sibling immediately. A parked PR that is still ARMED — GitHub auto-merge
+#    LATCHED, or already a MERGE-QUEUE member — would then merge into a crate a sibling now owns.
+#    Neither park writer used to disarm: `worker-pr.needs_user` only ASSUMED "it remains a DRAFT",
+#    groom's age-park labels stale NON-draft PRs, and `dispatch-claim.enumerate_disarm_items`
+#    retracts a latch only on an armed-SHA MISMATCH — a parked PR whose head still equals its
+#    reviewed-sha marker is the valid arm=false-policy terminal, keeps its latch, and merges on
+#    green CI. So EVERY park writer routes its PR label write through `disarm_before_park`, which:
+#    - reads the AUTHORITATIVE latch state (GraphQL `mergeQueueEntry` + `autoMergeRequest`; REST
+#      `auto_merge` lags and must never be the deciding read — see worker-pr `_merge_latch_state`),
+#    - retracts BOTH latch forms (dequeue first, then disable-auto),
+#    - RE-READS and requires both forms provably absent, and only THEN applies the park.
+#    ORDERING IS THE SAFETY PROPERTY, not an implementation detail: the disarm runs BEFORE the
+#    label becomes visible, so a failure leaves the PR UNPARKED-AND-ARMED — the prior, known state,
+#    in which the PR still reserves its crates and nothing can collide — never PARKED-AND-ARMED,
+#    which is the new hazard. The park is a CALLBACK into this helper rather than a separate step
+#    for the same reason registry #604 exists: a compensating action that lives in its own
+#    workflow step is reachable only from the path whose `if:` selects it (there, the `outcome`
+#    job was gated on `verdict_ok == 'success'`, so an `auth` exit skipped it entirely and the
+#    charge stood forever). Here there is no path that applies the label without passing through
+#    the disarm, on the success path or any failure path, because applying the label IS calling
+#    through it.
 """Machine/human park-label ownership + the sticky human-unpark veto (one shared helper)."""
 
 import argparse
@@ -1093,6 +1118,134 @@ def probe_maintainer(repo, login, read_permission, log=print):
             f"({type(exc).__name__}) — treating as not-human")
         return False
     return permission in HUMAN_MAINTAINER_PERMISSIONS
+
+
+# ---- invariant 4: disarm-on-park (issue #684) -------------------------------------------------
+
+# The two GitHub-side auto-merge latch forms, in the ONLY safe retraction order. `dequeue` first:
+# a merge-queue entry is the latch that is already executing, and worker-pr's disarm() has pinned
+# "dequeue precedes the auto-merge disable" since issue #69 — disabling auto-merge on a queued PR
+# does NOT remove it from the queue, so the reverse order can leave a PR that merges anyway.
+PARK_DISARM_DEQUEUE = "dequeue"
+PARK_DISARM_DISABLE_AUTO = "disable-auto"
+
+
+class ParkDisarmError(RuntimeError):
+    """The auto-merge latch could not be PROVEN retracted, so the park label was NOT applied.
+
+    Deliberately its own class, not the caller's error type: the caller must be able to tell
+    "I did not park because the latch survived" (leave the PR unparked-and-armed, alert, retry
+    next tick) apart from every other park failure."""
+
+
+def park_disarm_actions(queued, auto_merge_enabled):
+    """PURE (issue #684). The ordered latch-retraction actions a park must complete before its
+    label lands, given the AUTHORITATIVE live latch state.
+
+    Both inputs must be proven booleans. Anything else — None from a failed read, a string, an
+    int, a missing field defaulted by a caller — raises: an unproven latch state is not evidence
+    of an absent latch, and the whole point of this helper is that "no actions" must mean
+    "provably nothing latched", never "I could not tell". Fail direction is therefore toward
+    RAISING (the caller does not park), matching every other fail-closed guard in this module.
+
+    An empty result is the IDEMPOTENT no-op: disarming an unarmed PR is not an error, and the
+    overwhelmingly common park (a drafted worker PR that was never armed) costs one read and no
+    mutations."""
+    if isinstance(queued, bool) and isinstance(auto_merge_enabled, bool):
+        actions = []
+        if queued:
+            actions.append(PARK_DISARM_DEQUEUE)
+        if auto_merge_enabled:
+            actions.append(PARK_DISARM_DISABLE_AUTO)
+        return tuple(actions)
+    raise ParkDisarmError(
+        "merge-latch state is not a proven (queued, auto_merge) boolean pair — "
+        "refusing to treat an unreadable latch as an absent one")
+
+
+def disarm_before_park(repo, number, latch_state, retract, park, log=print):
+    """Retract PR `repo#number`'s auto-merge latch, PROVE it is gone, and only then call `park`.
+
+    THE ORDERING IS THE POINT (module invariant 4). `park` is a zero-argument callback that
+    applies the park label(s); it is invoked by this function and nowhere else on any park path,
+    so there is no arrangement of workflow `if:` conditions, exception handlers, or early returns
+    that can make a label land while a latch survives. If anything here fails, `park` is NEVER
+    called and ParkDisarmError propagates: the PR is left UNPARKED-AND-ARMED, which is the prior,
+    known-safe state (an unparked PR still reserves its crate partitions, so no sibling can be
+    handed the crate underneath it). The forbidden state is PARKED-AND-ARMED, which is exactly
+    what a label-first ordering produces the moment the disarm fails.
+
+    Injected I/O so the ordering is testable without a network:
+    - `latch_state()` -> ``(node_id, queued, auto_merge_enabled)`` from ONE authoritative read.
+      It is called TWICE on the mutating path: once to decide, once to PROVE. Any exception is
+      re-raised as ParkDisarmError (an unreadable latch never parks).
+    - `retract(action, node_id)` performs one action from `park_disarm_actions`.
+    - `park()` applies the label(s). Its own failures are the caller's, and are NOT converted.
+
+    THE PROOF RE-READ IS LOAD-BEARING IN BOTH DIRECTIONS, and it is why individual `retract`
+    failures are collected rather than raised immediately:
+    - a retraction that RAISED but whose latch is provably gone is an idempotent success (the
+      latch can disappear between the deciding read and the mutation — GitHub then rejects the
+      disable on an already-unarmed PR; this is registry #487's already-unarmed defer loop), and
+    - a retraction that REPORTED SUCCESS while the latch survives still aborts the park. A
+      merge-queue entry that has already begun merging is the real case: `dequeuePullRequest` can
+      return without removing an entry the queue is mid-flight on. That PR cannot be disarmed, and
+      the honest response is to say so LOUDLY and not park it, rather than to park it and leave
+      the crate released under a merge that is already happening.
+
+    Returns the tuple of actions actually performed (``()`` for the idempotent unarmed no-op)."""
+    node_id, queued, auto_merge_enabled = _park_latch_read(repo, number, latch_state, "state")
+    actions = park_disarm_actions(queued, auto_merge_enabled)
+    if not actions:
+        log(f"park disarm no-op for {repo}#{number}: no live auto-merge latch "
+            f"(idempotent — an unarmed PR needs no retraction)")
+        park()
+        return ()
+    failures = []
+    for action in actions:
+        try:
+            retract(action, node_id)
+            log(f"park disarm {action} issued for {repo}#{number}")
+        except Exception as exc:  # noqa: BLE001 — the PROOF re-read below adjudicates, not this
+            failures.append(f"{action}: {' '.join(str(exc).split())[:120]}")
+    _, still_queued, still_auto_merge = _park_latch_read(repo, number, latch_state, "proof")
+    if not isinstance(still_queued, bool) or not isinstance(still_auto_merge, bool):
+        raise ParkDisarmError(
+            f"park disarm for {repo}#{number} could not PROVE the latch is gone: the "
+            "re-read returned an unusable latch state — NOT parking (the PR stays "
+            "unparked-and-armed, still reserving its crates)")
+    if still_queued or still_auto_merge:
+        surviving = ",".join(
+            name for name, live in (("merge-queue", still_queued),
+                                    ("auto-merge", still_auto_merge)) if live)
+        raise ParkDisarmError(
+            f"park disarm for {repo}#{number} FAILED: {surviving} latch still live after "
+            f"{','.join(actions)}"
+            + (f" ({'; '.join(failures)})" if failures else
+               " (the retraction reported success — a merge-queue entry already mid-merge "
+               "cannot be dequeued)")
+            + " — NOT parking (the PR stays unparked-and-armed, still reserving its crates)")
+    if failures:
+        log(f"park disarm for {repo}#{number} converged idempotently despite "
+            f"{'; '.join(failures)} — the proof re-read shows both latch forms absent")
+    park()
+    return actions
+
+
+def _park_latch_read(repo, number, latch_state, phase):
+    """One `latch_state()` call, shape-validated, with every failure folded into
+    ParkDisarmError. Split out so the DECIDING read and the PROOF read cannot drift apart."""
+    try:
+        state = latch_state()
+    except Exception as exc:  # noqa: BLE001 — any unreadable latch must abort the park
+        raise ParkDisarmError(
+            f"park disarm {phase} read for {repo}#{number} failed "
+            f"({type(exc).__name__}: {' '.join(str(exc).split())[:120]}) — NOT parking") from exc
+    if not isinstance(state, (tuple, list)) or len(state) != 3:
+        raise ParkDisarmError(
+            f"park disarm {phase} read for {repo}#{number} returned a malformed latch state "
+            "— NOT parking")
+    return state[0], state[1], state[2]
 
 
 def _self_test():
@@ -2120,6 +2273,116 @@ def _self_test():
     check("deny wins even when the injection flag is the NEWEST comment",
           reclassify_legacy_park(
               [bot_comment(budget_prose), bot_comment(injection_prose)], bot)[0], None)
+
+    # ---- invariant 4 / issue #684: disarm-on-park. A park label is #683's crate-release
+    # valve, so the latch MUST be provably gone BEFORE the label becomes visible ----
+    check("issue-684: an unarmed PR needs no retraction (idempotent no-op)",
+          park_disarm_actions(False, False), ())
+    check("issue-684: a latched auto-merge retracts", park_disarm_actions(False, True),
+          ("disable-auto",))
+    check("issue-684: a merge-queue member dequeues", park_disarm_actions(True, False),
+          ("dequeue",))
+    check("issue-684: both latch forms retract, dequeue FIRST",
+          park_disarm_actions(True, True), ("dequeue", "disable-auto"))
+    for label, bad in (("None (a failed read)", None), ("a string", "false"),
+                       ("an int", 0), ("a missing field", ())):
+        try:
+            park_disarm_actions(bad, False)
+        except ParkDisarmError:
+            raised = True
+        else:
+            raised = False
+        check(f"issue-684: an unproven latch state ({label}) raises, never reads as unarmed",
+              raised, True)
+
+    # The ordering harness: ONE journal records the disarm mutations and the park label write in
+    # the order they actually happen, so "the park landed before the disarm" is a red test rather
+    # than a code-reading exercise.
+    journal = []
+    latch = {"queued": False, "auto": False, "reads": 0, "raise_on": 0, "shape": None}
+    disarm_logs = []
+
+    def fake_latch():
+        latch["reads"] += 1
+        journal.append(f"latch-read#{latch['reads']}")
+        if latch["reads"] == latch["raise_on"]:
+            raise RuntimeError("graphql unavailable")
+        if latch["shape"] is not None:
+            return latch["shape"]
+        return ("PR_node", latch["queued"], latch["auto"])
+
+    def fake_retract(action, node_id):
+        # The live world settles BEFORE the call reports: `sticky_*` models a latch that
+        # survives the mutation, and `fail` models the API rejecting the call. The two are
+        # independent on purpose — #487's race is exactly "rejected AND already gone".
+        journal.append(f"retract:{action}:{node_id}")
+        if action == PARK_DISARM_DEQUEUE and not latch.get("sticky_queue"):
+            latch["queued"] = False
+        if action == PARK_DISARM_DISABLE_AUTO and not latch.get("sticky_auto"):
+            latch["auto"] = False
+        if action in latch.get("fail", ()):
+            raise RuntimeError("mutation rejected")
+
+    def fake_park():
+        journal.append("PARK-LABEL")
+
+    def run_park(**state):
+        journal.clear()
+        disarm_logs.clear()
+        latch.clear()
+        latch.update({"queued": False, "auto": False, "reads": 0, "raise_on": 0,
+                      "shape": None, "fail": (), "sticky_queue": False, "sticky_auto": False})
+        latch.update(state)
+        try:
+            performed = disarm_before_park("o/r", 41, fake_latch, fake_retract, fake_park,
+                                           log=disarm_logs.append)
+        except ParkDisarmError as exc:
+            return ("raised", " ".join(str(exc).split()))
+        return ("returned", performed)
+
+    check("issue-684: an unarmed park costs one read, no mutation, and parks",
+          (run_park(), journal), (("returned", ()), ["latch-read#1", "PARK-LABEL"]))
+    # THE ordering assertion. Red if the label write is hoisted above the retraction, and red
+    # if the proof re-read is dropped from between them.
+    check("issue-684: the latch is retracted and PROVEN gone BEFORE the park label lands",
+          (run_park(auto=True), journal),
+          (("returned", ("disable-auto",)),
+           ["latch-read#1", "retract:disable-auto:PR_node", "latch-read#2", "PARK-LABEL"]))
+    check("issue-684: a queued park dequeues before disabling auto-merge, then parks",
+          (run_park(queued=True, auto=True), journal),
+          (("returned", ("dequeue", "disable-auto")),
+           ["latch-read#1", "retract:dequeue:PR_node", "retract:disable-auto:PR_node",
+            "latch-read#2", "PARK-LABEL"]))
+    # FAILURE PATH — the whole hazard. A latch that survives must leave the PR
+    # unparked-and-armed: no PARK-LABEL in the journal, and a loud, named error.
+    outcome = run_park(queued=True, sticky_queue=True)
+    check("issue-684: a merge-queue entry that cannot be dequeued does NOT park",
+          ("PARK-LABEL" in journal, outcome[0]), (False, "raised"))
+    check("issue-684: the un-dequeueable park REPORTS the surviving latch loudly",
+          ("merge-queue latch still live" in outcome[1]
+           and "NOT parking" in outcome[1]
+           and "already mid-merge cannot be dequeued" in outcome[1]), True)
+    outcome = run_park(auto=True, sticky_auto=True, fail=("disable-auto",))
+    check("issue-684: a FAILED retraction whose latch survives does NOT park",
+          ("PARK-LABEL" in journal, outcome[0], "auto-merge latch still live" in outcome[1]),
+          (False, "raised", True))
+    # #487's already-unarmed race: the mutation rejects an already-off latch. The PROOF re-read
+    # — not the mutation's exit code — decides, so this converges and DOES park.
+    outcome = run_park(auto=True, fail=("disable-auto",), sticky_auto=False)
+    check("issue-684: a raced already-unarmed retraction converges idempotently and parks",
+          ("PARK-LABEL" in journal, outcome), (True, ("returned", ("disable-auto",))))
+    check("issue-684: the idempotent convergence is stated, never silent",
+          any("converged idempotently" in line for line in disarm_logs), True)
+    # An unreadable latch is not an absent latch — on EITHER read.
+    outcome = run_park(auto=True, raise_on=1)
+    check("issue-684: an unreadable DECIDING read does not park",
+          ("PARK-LABEL" in journal, "state read" in outcome[1]), (False, True))
+    outcome = run_park(auto=True, raise_on=2)
+    check("issue-684: an unreadable PROOF read does not park",
+          ("PARK-LABEL" in journal, "proof read" in outcome[1]), (False, True))
+    outcome = run_park(shape=("PR_node", True))
+    check("issue-684: a malformed latch tuple does not park",
+          ("PARK-LABEL" in journal, "malformed latch state" in outcome[1]), (False, True))
 
     print("park-policy self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
