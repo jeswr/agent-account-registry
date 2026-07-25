@@ -771,6 +771,17 @@ jobs:
           # "outside the human-arm trust surface", while the SAME self-test passed in the
           # full-checkout pr-gate. Both files are READ here, never imported or executed: the
           # surface constant is extracted with `ast`, so nothing in worker-pr.py runs in this job.
+          # scripts/grant-account.py is a TRANSITIVE input (the 2026-07-25 dispatch halt): the
+          # self-test EXECUTES set-up-account.yml's reconcile `run:` body, and #616 made that body
+          # load grant-account.py by repository-relative path to derive a resumed enrollment's
+          # authorized target set. Absent from this list the load raised FileNotFoundError, the body
+          # took its (correct) `grant cannot be proven` refusal branch, and the guard's
+          # credential-existence assertions failed for a reason that had nothing to do with the
+          # contract — which, now that #621 rightly made this guard GATING, skipped CLAIM on every
+          # tick. The guard now DERIVES this dependency from the executed body's own text
+          # (executed_body_inputs_declared_verdict), so the next step that loads a script goes red in
+          # pr-gate instead of halting dispatch. It is read by the EXECUTED BODY, never by the guard
+          # module itself.
           # KEEP THIS LIST IN SYNC — SELF_TEST_LIVE_INPUTS in scripts/dispatch-secrets-guard.py is
           # asserted against this very block every tick, so a new live-file dependency that is not
           # added here goes RED instead of silently degrading a check to vacuous.
@@ -778,6 +789,7 @@ jobs:
             scripts/dispatch-secrets-guard.py
             scripts/worker-live.sh
             scripts/worker-pr.py
+            scripts/grant-account.py
             policy/repos.toml
             .github/workflows/
           sparse-checkout-cone-mode: false

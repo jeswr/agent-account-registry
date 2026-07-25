@@ -122,6 +122,19 @@
 # empty surface refuses by NAMING the derivation instead of emitting a script list that reads as a
 # policy finding.
 #
+# TRANSITIVE live inputs (2026-07-25 — the class recurred, and this time it HALTED DISPATCH). Pinning
+# two HAND-MAINTAINED lists to each other cannot catch a dependency that joins neither. This
+# self-test EXECUTES set-up-account.yml's reconcile `run:` body, and #616 made that body load
+# scripts/grant-account.py by repository-relative path; both lists stayed mutually consistent, the
+# coverage assertion stayed green, and on every tick the file was simply absent from the sparse
+# checkout — so the body's load raised FileNotFoundError, it took its (correct) "grant cannot be
+# proven" refusal branch, and two credential-existence assertions failed for a reason that had
+# nothing to do with the contract they name. #621 had (rightly) made this guard GATING, so CLAIM was
+# skipped on every tick: no workers, no reviews, no fixes. executed_body_file_dependencies now
+# DERIVES the executed body's file set from its own text and requires it both DECLARED (caught in
+# pr-gate's full checkout) and PRESENT (named on a dispatch tick), so the next step that starts
+# loading a script goes red at review time instead of halting the fleet.
+#
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
 import itertools
@@ -1177,6 +1190,13 @@ SELF_TEST_LIVE_INPUTS = (
     # visible where the coverage assertion is, per this constant's whole reason for existing.
     ".github/workflows/worker.yml",
     ".github/workflows/review-fix.yml",
+    # TRANSITIVE input (the 2026-07-25 dispatch halt): the reconcile harness below EXECUTES the real
+    # reconcile `run:` body, and #616 made that body load scripts/grant-account.py by repository
+    # -relative path to derive the resumed grant's authorized target set. A file the executed body
+    # opens is a live input of --self-test exactly as much as a document this module reads directly.
+    # DERIVED as well as listed: executed_body_inputs_declared_verdict re-derives this entry from
+    # the body's own text, so the next step that starts loading a script cannot repeat the omission.
+    "scripts/grant-account.py",
 )
 
 
@@ -1245,6 +1265,111 @@ def sparse_checkout_covers_verdict(workflow_text, job_name, required_paths):
             + ", ".join(sorted(missing)) + " — the check that reads each one would degrade to "
             "vacuous (or to a MISLEADING verdict) on every dispatch tick while passing in the "
             "full-checkout pr-gate; add them to the sparse-checkout list")
+    return True, "ok"
+
+
+# TRANSITIVE LIVE INPUTS OF AN *EXECUTED* WORKFLOW BODY (the 2026-07-25 dispatch halt).
+#
+# SELF_TEST_LIVE_INPUTS above is a HAND-MAINTAINED list, and that is exactly how issue #618
+# defect 2 came back. This self-test does not merely READ set-up-account.yml — it EXTRACTS the
+# reconcile step's `run:` body and RUNS it (that executability is the whole point: eight mutants of
+# the credential-existence contract are killed by executing the body rather than pattern-matching
+# it). So every file that body opens is a live input of `--self-test` just as much as a document
+# this module opens itself, and the guard job runs under a SPARSE checkout.
+#
+# #616 added `spec_from_file_location(..., "scripts/grant-account.py")` to that body — the derivation
+# of a resumed enrollment's authorized target set — without extending SELF_TEST_LIVE_INPUTS or
+# dispatch.yml's sparse-checkout list. Both hand-maintained lists therefore stayed mutually
+# consistent and sparse_checkout_covers_verdict stayed GREEN, while on every dispatch tick the file
+# was simply absent: the body's load raised FileNotFoundError, the body took its `grant cannot be
+# proven` refusal branch and exited 1 — the CORRECT production direction, but a FALSE self-test
+# failure — and #621's (correct) removal of `continue-on-error` turned that into a full dispatch
+# halt with CLAIM skipped on every tick.
+#
+# The fix is to stop trusting a list where a derivation is available: the two verdicts below read
+# the dependency set out of the executed body's own text and require it to be (a) DECLARED in
+# SELF_TEST_LIVE_INPUTS — which sparse_checkout_covers_verdict then pins to the sparse-checkout
+# list, so the pr-gate full checkout catches the omission at review time — and (b) actually PRESENT
+# in whatever checkout the self-test is running in, which NAMES the absent file on a dispatch tick
+# instead of letting a security-contract assertion report a refusal it did not cause.
+REPO_FILE_ROOTS = (
+    "scripts/", "policy/", "data/", "orchestration/", "containers/", "dashboard/", "research/",
+    ".github/",
+)
+
+# A repository-relative file reference in EXECUTED body text: an optional `./`, one of the roots
+# above, then a path ending in an extension. The left boundary rejects an API path or a ref that
+# merely CONTAINS a root name (`repos/$REPO/scripts/x.py`, `git/refs/data/y.json`) and a
+# parent-relative escape (`../scripts/x.py` addresses nothing inside this checkout) — neither is a
+# checked-out file. `./scripts/x.py` IS one, and normalize_repo_path folds it to the bare path.
+_BODY_FILE_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])((?:\./)*(?:"
+    + "|".join(re.escape(root) for root in REPO_FILE_ROOTS)
+    + r")[A-Za-z0-9._/-]*\.[A-Za-z0-9]+)")
+
+
+def executed_body_file_dependencies(body_text):
+    """Pure: the sorted repository-relative files an EXECUTED workflow `run:` body loads.
+
+    Comments are stripped first, through the same quote-aware stripper every other shell-text check
+    here runs (round 19). That cuts both ways deliberately: a path named only in PROSE is not a
+    dependency and must not be able to force an unrelated file into the checkout list, and — the
+    direction that matters — a real load cannot hide behind a comment tail either."""
+    if not isinstance(body_text, str):
+        return ()
+    # Python heredocs embedded in the body comment with `#` too, and the stripper's word-start rule
+    # removes those identically, so one pass covers the whole executed text.
+    stripped = strip_shell_comments(body_text)
+    return tuple(sorted({normalize_repo_path(match.group(1))
+                         for match in _BODY_FILE_RE.finditer(stripped)}))
+
+
+def _declared_covers(path, declared):
+    """Pure: is `path` covered by a declared entry, exactly or by a directory-prefix entry."""
+    return any(path.startswith(entry) if entry.endswith("/") else path == entry
+               for entry in declared)
+
+
+def executed_body_inputs_declared_verdict(body_text, declared_inputs):
+    """Pure: (ok, reason). Every file the executed body loads must be DECLARED as a self-test live
+    input. An unextractable body is a refusal (fail closed): a dependency set that cannot be derived
+    is precisely the state that halted dispatch."""
+    if not isinstance(body_text, str) or not body_text.strip():
+        return False, ("the executed reconcile body could not be extracted, so the files it loads "
+                       "cannot be derived — refusing (an underived transitive dependency is the "
+                       "exact gap that halted dispatch on 2026-07-25)")
+    declared = tuple(normalize_repo_path(entry) for entry in declared_inputs)
+    missing = [path for path in executed_body_file_dependencies(body_text)
+               if not _declared_covers(path, declared)]
+    if missing:
+        return False, (
+            "the reconcile body this self-test EXECUTES loads " + ", ".join(missing)
+            + ", which is NOT declared in SELF_TEST_LIVE_INPUTS. Under the guard job's SPARSE "
+            "checkout that file is absent, the body's load fails, and the credential-existence "
+            "assertions report a refusal they did not cause — a FALSE guard failure that skips "
+            "CLAIM on every tick (the 2026-07-25 halt). Add each path to SELF_TEST_LIVE_INPUTS "
+            "and to the guard job's sparse-checkout list in dispatch.yml")
+    return True, "ok"
+
+
+def executed_body_inputs_present_verdict(body_text, repo_root):
+    """(ok, reason). The same derived set, resolved against the checkout this self-test is ACTUALLY
+    running in — the assertion that NAMES the defect on a dispatch tick. The executed body loads by
+    repository-relative path from the repository root, so a derived dependency that is not on disk
+    makes the body refuse for a reason unrelated to the contract under test, and the reader of the
+    failing run sees a security-contract assertion fail instead of a missing file."""
+    if not isinstance(body_text, str) or not body_text.strip():
+        return False, ("the executed reconcile body could not be extracted, so the presence of the "
+                       "files it loads cannot be proven — refusing")
+    absent = [path for path in executed_body_file_dependencies(body_text)
+              if not os.path.exists(os.path.join(repo_root, path))]
+    if absent:
+        return False, (
+            "the reconcile body this self-test EXECUTES loads " + ", ".join(absent)
+            + ", which is ABSENT from this checkout — every assertion that runs the body will "
+            "refuse for that reason and NOT for the credential/grant contract it names. This is "
+            "the 2026-07-25 dispatch halt verbatim: add the path to the guard job's "
+            "sparse-checkout list in dispatch.yml (and to SELF_TEST_LIVE_INPUTS)")
     return True, "ok"
 
 
@@ -3042,6 +3167,58 @@ def _self_test():
     chk("workflow: reconcile run-block located and extracted (a reshaped step fails closed here)",
         reconcile_script is not None, True)
 
+    # TRANSITIVE-INPUT CONTRACT (the 2026-07-25 dispatch halt). These four assertions come BEFORE the
+    # harness runs, so a missing dependency is NAMED instead of surfacing as a credential-contract
+    # failure the dependency did not cause. See executed_body_file_dependencies above for the full
+    # #616 x #621 composition story.
+    reconcile_deps = executed_body_file_dependencies(reconcile_script or "")
+    chk("reconcile harness: the executed body's file dependencies are DERIVED, not assumed — the "
+        "derivation is non-vacuous (an empty set would make both coverage assertions below silently "
+        "pass on any omission)",
+        (len(reconcile_deps) >= 1, "scripts/grant-account.py" in reconcile_deps), (True, True))
+    chk("reconcile harness (LIVE): every file the executed reconcile body loads is DECLARED as a "
+        "self-test live input (sparse_checkout_covers_verdict then pins it to the checkout list)",
+        executed_body_inputs_declared_verdict(reconcile_script or "", SELF_TEST_LIVE_INPUTS),
+        (True, "ok"))
+    chk("reconcile harness (LIVE): every file the executed reconcile body loads is PRESENT in THIS "
+        "checkout — the assertion that names the halt cause on a dispatch tick",
+        executed_body_inputs_present_verdict(
+            reconcile_script or "",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)),
+        (True, "ok"))
+    undeclared = executed_body_inputs_declared_verdict(
+        reconcile_script or "", tuple(entry for entry in SELF_TEST_LIVE_INPUTS
+                                      if entry != "scripts/grant-account.py"))
+    chk("reconcile harness: dropping the #616 dependency from the declared inputs -> REFUSE, path "
+        "NAMED (this is the assertion whose absence let the halt land)",
+        (undeclared[0], "scripts/grant-account.py" in undeclared[1]), (False, True))
+    # Pure accept/reject directions for the derivation itself, on synthetic bodies.
+    chk("executed-body derivation: a load in CODE is a dependency (`./` folded); an API path, a ref "
+        "that merely contains a root name, and a parent-relative escape are NOT",
+        executed_body_file_dependencies(
+            'python3 -c \'open("scripts/grant-account.py")\'\n'
+            'gh api "repos/$REPO/scripts/decoy.py"\n'
+            'git update-ref "refs/data/decoy.json" HEAD\n'
+            'cat ../scripts/outside-decoy.py\n'
+            'cat ./policy/repos.toml\n'),
+        ("policy/repos.toml", "scripts/grant-account.py"))
+    chk("executed-body derivation: a path named only in a COMMENT is not a dependency (prose must "
+        "never satisfy — nor manufacture — an assertion about code)",
+        executed_body_file_dependencies('# loads scripts/never-loaded.py\ntrue\n'), ())
+    chk("executed-body derivation: a real load does NOT hide behind a comment tail on the same line",
+        executed_body_file_dependencies(
+            'python3 scripts/really-loaded.py # scripts/decoy.py\n'),
+        ("scripts/really-loaded.py",))
+    chk("executed-body contract: an unextractable body -> REFUSE, both directions (fail closed)",
+        (executed_body_inputs_declared_verdict(None, SELF_TEST_LIVE_INPUTS)[0],
+         executed_body_inputs_present_verdict("", ".")[0]), (False, False))
+    chk("executed-body presence: a derived dependency absent from the checkout -> REFUSE, path NAMED",
+        (executed_body_inputs_present_verdict(
+            'python3 scripts/definitely-not-in-this-repo.py\n', ".")[0],
+         "scripts/definitely-not-in-this-repo.py" in executed_body_inputs_present_verdict(
+             'python3 scripts/definitely-not-in-this-repo.py\n', ".")[1]),
+        (False, True))
+
     gh_stub = r'''#!/usr/bin/env bash
 # Hermetic gh stub for the reconcile harness: keyed on EXACT argv so a reshaped reconcile
 # step fails LOUDLY (exit 64) instead of silently passing. STUB_MODE selects the probe fate.
@@ -3075,6 +3252,12 @@ cat > /dev/null 2>/dev/null || true
 if [ "$STUB_MODE" = fresh ]; then exit 0; fi
 printf '5\n'
 '''
+
+    # The halted run's log showed only `(1, False, False, False)` — the harness discarded the body's
+    # diagnostics, so the FileNotFoundError that actually caused the refusal never reached the log
+    # and the failure read as a credential-contract regression. The body's stderr/stdout is kept and
+    # printed on any UNEXPECTED refusal below, so the next such failure is triageable in one look.
+    reconcile_diag = {}
 
     def run_reconcile(mode, secret_ref="ACCT07_TOKEN", registry_pat="sentinel-registry-pat",
                       grant_targets="jeswr/agent-account-registry"):
@@ -3119,6 +3302,8 @@ printf '5\n'
             proc = subprocess.run(["bash", "-c", reconcile_script], cwd=os.path.abspath(
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)),
                 env=env, capture_output=True, text=True)
+            reconcile_diag[(mode, secret_ref, bool(registry_pat), grant_targets)] = (
+                proc.stderr or "") + (proc.stdout or "")
             with open(output_path, encoding="utf-8") as fh:
                 return proc.returncode, fh.read()
 
@@ -3160,6 +3345,30 @@ printf '5\n'
     rc_badgrant, out_badgrant = run_reconcile("secret-exists", grant_targets="not-a-repository")
     chk("[#579] reconcile: account record with a MALFORMED grant_targets entry -> refuse",
         (rc_badgrant != 0, "resume=true" in out_badgrant), (True, False))
+
+    # COMPOSITION PIN (#616 x #621 — the 2026-07-25 halt, so it cannot recur silently). #616 made
+    # grant verification materially stricter and #621 made this guard actually gating; neither is
+    # wrong, but nothing pinned that a LEGITIMATELY PROVABLE resume is still GRANTED under the
+    # stricter contract. It is, and the target set it publishes must be the LIVE
+    # scripts/grant-account.py parser's own output — sorted and de-duplicated, not a pass-through of
+    # the record line — which is only true if the executed body really loads and runs that parser.
+    # A stubbed, bypassed, or absent parser fails here, as does a parser that stops normalizing.
+    rc_multi, out_multi = run_reconcile("secret-exists",
+                                       grant_targets="o/beta, o/alpha, o/alpha")
+    chk("[#616 x #621 composition] reconcile: a legitimately-provable resume is GRANTED under the "
+        "stricter grant contract, publishing the LIVE parser's sorted + de-duplicated target set",
+        (rc_multi, "resume=true" in out_multi,
+         'targets=["o/alpha", "o/beta"]' in out_multi), (0, True, True))
+    # Any refusal on a path that must be GRANTED is a harness/checkout defect rather than a contract
+    # finding, so surface the body's own diagnostics instead of leaving a bare tuple in the log.
+    for key, expected_zero in ((("secret-exists", "ACCT07_TOKEN", True,
+                                 "jeswr/agent-account-registry"), rc_resume),
+                               (("secret-exists", "ACCT07_TOKEN", True,
+                                 "o/beta, o/alpha, o/alpha"), rc_multi)):
+        if expected_zero not in (0, None) and key in reconcile_diag:
+            print("  DIAG the reconcile body refused on a MUST-GRANT path; its own output was:")
+            for line in reconcile_diag[key].strip().splitlines()[-6:]:
+                print(f"  DIAG   {line}")
 
     # Pure scope verdict — accept AND reject directions.
     chk("scope: only github_token -> ok",
