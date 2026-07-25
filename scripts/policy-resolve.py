@@ -15,6 +15,7 @@ disabled, malformed, or ambiguously labelled repositories/roles fail closed.
 """
 import argparse
 import copy
+import re
 import pathlib
 import json
 from pathlib import Path, PurePosixPath
@@ -95,6 +96,10 @@ OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_ro
 # Each entry is permanent — set-up-account's slot-allocation union counts acctNN issues in ANY
 # state, so a retired name can never be legitimately re-enrolled, and a reappearance in a pool is
 # always an error rather than a re-enrolment.
+# The canonical account-handle form. Same shape as grant-account.HANDLE_RE — deliberately
+# duplicated rather than imported, since these scripts are invoked standalone.
+ACCOUNT_HANDLE_RE = re.compile(r"acct[0-9a-z]{2,}")
+
 RETIRED_ACCOUNTS = frozenset({
     "acct03",  # amydouglas1@hotmail.com — cancelled 2026-07-25
     "acct06",  # jwrightwho — expired 2026-07-25
@@ -141,6 +146,25 @@ def _policy_row(target_repo, policy_doc):
     if (not isinstance(pool, list) or not pool
             or any(not isinstance(account, str) or not account.strip() for account in pool)):
         raise PolicyError(f"account_pool for {target_repo!r} must be a non-empty string list")
+    # CANONICAL FORM IS AN INVARIANT, enforced here at the boundary rather than normalised at
+    # each comparison site. Cross-provider review round 3 on #660: the retirement guard below
+    # intersected the RAW values while this validation only required `.strip()` to be non-empty,
+    # so `" acct03"` passed as a legal handle AND evaded the retirement intersection. The
+    # consequence went further than a bypass — select-and-claim STRIPS before matching, so the
+    # padded entry became eligible, a CAS lease was created, the raw post-claim comparison then
+    # failed before publishing `acquired`, and the release job (gated on `acquired == 'true'`)
+    # never ran: the lease LEAKED until its 4200/6300s TTL.
+    #
+    # Rejecting non-canonical handles fixes the whole family at once. Normalising instead would
+    # leave every present and future comparison site obliged to remember, and one that forgets
+    # reintroduces exactly this bug. Pattern matches grant-account.HANDLE_RE.
+    noncanonical = [a for a in pool if ACCOUNT_HANDLE_RE.fullmatch(a) is None]
+    if noncanonical:
+        raise PolicyError(
+            f"account_pool for {target_repo!r} contains non-canonical handle(s) "
+            f"{noncanonical!r} — handles must match {ACCOUNT_HANDLE_RE.pattern} exactly, with "
+            f"no surrounding whitespace or case variation, so that every downstream comparison "
+            f"(retirement, claim, secret lookup) operates on the same value")
     if len(set(pool)) != len(pool):
         raise PolicyError(f"account_pool for {target_repo!r} contains duplicates")
     # A RETIRED slot must never reappear in a pool. Retirement removes the account from
@@ -496,6 +520,36 @@ agent = "docs-agent"
     check("the retired registry holds the known retirements (emptying it must not silently "
           "disable every check below)",
           sorted(RETIRED_ACCOUNTS), ["acct03", "acct06"])
+    # NON-CANONICAL handles are refused outright (#660 review r3). Padding is the case that
+    # bit us: `" acct03"` was a legal handle to the old validation AND invisible to the raw
+    # retirement intersection, and downstream select-and-claim strips before matching, so it
+    # became claimable and leaked a CAS lease to its TTL. Every variant that could reach a
+    # different value at a different comparison site is pinned here.
+    for bad in (" acct03", "acct03 ", "\tacct03", "acct03\n", "ACCT03", "Acct03",
+                " acct02", "acct02 ", "ACCT02", "acct 02", "acct03;acct01"):
+        rejects(f"non-canonical handle {bad!r} is refused", "non-canonical",
+                lambda h=bad: resolve("sparq-org/sparq", "impl",
+                                      _policy_with_pool(["acct01", h]), routing))
+    # "" is refused too, but by the EARLIER non-empty check with a different message — asserted
+    # separately so this does not read as a gap in the canonical-handle check.
+    rejects("an empty handle is refused (by the non-empty guard, not the shape guard)",
+            "non-empty string list",
+            lambda: resolve("sparq-org/sparq", "impl", _policy_with_pool(["acct01", ""]), routing))
+    check("a canonical pool is still accepted (the handle check is a shape check, not a "
+          "blanket refusal)",
+          resolve("sparq-org/sparq", "impl",
+                  _policy_with_pool(["acct01", "acct2css"]), routing)["account_pool"],
+          ["acct01", "acct2css"])
+    # The shipped config must itself be canonical, or the retirement intersection below is
+    # comparing against values that may not be what downstream sees.
+    check("every account in the SHIPPED policy/repos.toml is canonical",
+          sorted({a for row in tomllib.loads(
+                      pathlib.Path(__file__).resolve().parent.parent
+                      .joinpath("policy/repos.toml").read_text(encoding="utf-8"))["repos"].values()
+                  for a in row.get("account_pool", [])
+                  if ACCOUNT_HANDLE_RE.fullmatch(a) is None}),
+          [])
+
     for retired_slot in sorted(RETIRED_ACCOUNTS):
         rejects(f"a RETIRED slot ({retired_slot}) in an account_pool is refused", "RETIRED",
                 lambda slot=retired_slot: resolve(
