@@ -139,8 +139,20 @@ INFRA_SURFACE_LABELS = ("area:ci", "area:workflows")
 # whatever they match. Every value MUST be a role configured in orchestration/routing.toml, else
 # the row this enables is rejected by the planner (route-resolve.RoleResolutionError).
 # The first three groups are REDUNDANT today — an earlier lane short-circuits before the fallback
-# is reached — and are listed anyway so this table is the one complete registry-area map, and so a
-# future narrowing of SEC_KEYWORDS/UI/INFRA cannot silently reopen the roleless hole. `_self_test`
+# is reached — and are listed anyway so a future narrowing of SEC_KEYWORDS/UI/INFRA cannot silently
+# reopen the roleless hole.
+# WHAT "COMPLETE" DOES AND DOES NOT MEAN (#597 review round 2). The first form of this comment
+# called the table "the one complete registry-area map"; nothing established that, and nothing in
+# this repository can — the authoritative `area:*` inventory is the live repo's label set, which a
+# pure self-test cannot read. So the claim is scoped to what IS verified: every area named by an
+# AUTHORITATIVE in-repo source (SEC_KEYWORDS — asserted identical to routing.toml's trust-surface
+# match_labels — plus UI_SURFACE_LABELS and INFRA_SURFACE_LABELS) is a key here with the role that
+# source implies, cross-checked both ways by `_self_test`. That covers 8 of the 10 rows. The two
+# residual rows (`usage`, `docs`) are reachable ONLY through this table and have no other source, so
+# for them the pinned literal in `_self_test` IS the contract. An area outside the table fails
+# closed either way (see _area_default), so an unlisted surface is never silently mis-routed — it
+# simply is not derivable, which is the safe direction.
+# `_self_test`
 # asserts each entry AGREES with the lane that actually wins, so the redundancy can never drift, and
 # (#597 review finding 3) pins this map — keys and values — to an INDEPENDENT literal plus a
 # per-area lane attribution, so neither an added/removed row nor a re-pointed value can pass by
@@ -687,6 +699,41 @@ def _self_test():
             return "infra"
         return "fallback"
 
+    # #597 review round 2: "the one complete registry-area map" was unsubstantiated — no
+    # authoritative `area:*` inventory was compared, so the pinned literal above only proved the
+    # table equals itself-as-written. There IS no in-repo inventory of every live label (the
+    # authoritative source is the repo's label set, unreadable from a pure self-test), so the claim
+    # is scoped in the table's comment AND the strongest available cross-reference is asserted here:
+    # every area named by an authoritative in-repo source must be a KEY of the table carrying the
+    # role that source implies, and — the other direction — the table must not claim a trust-plane
+    # default for an area the trust-surface source does not name. SEC_KEYWORDS is itself asserted
+    # IDENTICAL to routing.toml's trust-surface match_labels elsewhere in this suite, so this chains
+    # to a real config file rather than to a duplicated expectation.
+    # Keyed on the AREA, never on the role STRING: TRUST_PLANE_ROLE is currently the same literal
+    # as the generic impl role (see the constant's own comment), so `value == TRUST_PLANE_ROLE`
+    # cannot discriminate `area:usage` -> impl from a trust-plane row.
+    _REGISTRY_TRUST_AREAS = ("dispatch", "worker", "set-up-account", "review-loop", "groom")
+    chk("[#597 r2] every trust-surface AREA keyword is a mapped key, on the trust-plane role",
+        (sorted(set(_REGISTRY_TRUST_AREAS) - set(SEC_KEYWORDS)),
+         {area: AREA_ROLE_DEFAULT.get(area, "UNMAPPED") for area in _REGISTRY_TRUST_AREAS}),
+        ([], {area: TRUST_PLANE_ROLE for area in _REGISTRY_TRUST_AREAS}))
+    # ...and the OTHER direction, which is what actually detects drift: the partition of
+    # SEC_KEYWORDS into registry AREAS vs crypto/domain keywords is pinned, so adding a new
+    # trust-surface registry area to SEC_KEYWORDS (or to routing.toml, which SEC_KEYWORDS is
+    # asserted identical to) turns this red until it is given a row above.
+    chk("[#597 r2] SEC_KEYWORDS' non-area half is pinned, so a NEW trust area cannot slip past",
+        sorted(set(SEC_KEYWORDS) - set(_REGISTRY_TRUST_AREAS)),
+        ["auth", "crypto", "e2ee", "mpc", "security", "zk"])
+    chk("[#597 r2] every UI/INFRA surface LABEL is a mapped area with that lane's role",
+        {label[len("area:"):]: AREA_ROLE_DEFAULT.get(label[len("area:"):], "UNMAPPED")
+         for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS if label.startswith("area:")},
+        {"dashboard": "site", "ci": "ci", "workflows": "ci"})
+    chk("[#597 r2] ...and only `usage`/`docs` rest on the pinned literal alone",
+        sorted(set(AREA_ROLE_DEFAULT)
+               - set(_REGISTRY_TRUST_AREAS)
+               - {label[len("area:"):] for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS
+                  if label.startswith("area:")}),
+        ["docs", "usage"])
     chk("[#225] exactly which areas REACH the fallback (the rest short-circuit earlier)",
         {area: _lane(area) for area in sorted(AREA_ROLE_DEFAULT)},
         {"ci": "infra", "dashboard": "ui", "dispatch": "trust", "docs": "fallback",

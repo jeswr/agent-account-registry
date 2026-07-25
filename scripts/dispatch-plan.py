@@ -292,6 +292,22 @@ def _self_test():
     quiet = _captured(_print_roleless, [])
     chk("[#225] the roleless report is printed even at ZERO (never a silent healthy tick)",
         ("ready-but-roleless issues: 0" in quiet, quiet.strip() != ""), (True, True))
+    # #597 review round 2 (F-class): the zero line claimed "every status:ready issue is
+    # enumerable", but roleless_ready() excludes gated/busy/blocked/epic/closed rows — this suite's
+    # own fixture #22 (status:ready + area:groom + needs:design, roleless) is a counterexample
+    # sitting behind that printed zero. Pin the SCOPED wording so the over-claim cannot come back,
+    # and pin the fixture that disproves the old one.
+    chk("[#597 r2] the zero line scopes its claim to the missing-role class only",
+        ("every status:ready issue is enumerable" in quiet,
+         "missing a role:* label" in quiet, "excluded by design" in quiet),
+        (False, True, True))
+    chk("[#597 r2] ...and #22 (status:ready + needs:design, roleless) is that counterexample",
+        (roleless_ready([iss(22, R + ["priority:P1", "area:groom", "needs:design"])]),
+         [i["number"] for i in compute_ready(
+             [iss(22, R + ["priority:P1", "area:groom", "needs:design"])])]),
+        ([], []))
+    chk("[#597 r2] the remediation line does not claim a role alone is always sufficient",
+        ("priority:P0..P4" in loud, "role:* label" in loud), (True, True))
 
     # ...and through main() --dry-run itself, so "the planner can compute it" can never stand in for
     # "the plan EMITS it". The two live reads (`gh` issue fetch, routing.toml) are the only things
@@ -323,12 +339,108 @@ def _self_test():
     with open(workflow, encoding="utf-8") as fh:
         executable = "\n".join(line for line in fh.read().splitlines()
                                if not line.lstrip().startswith("#"))
+    # STATIC SHAPE ONLY, and #597 review round 2 was right that on its own it is vacuous: every
+    # searched substring survives flipping `if roleless_fn is None:` to `is not None:` or
+    # `if roleless:` to `if not roleless:`, each of which fully restores silent invisibility. Kept
+    # as cheap drift detection; the block's BEHAVIOUR is covered by the executed rows below.
     chk("[#225] the PLAN job calls the planner's roleless enumeration and reports it LOUDLY",
         ('getattr(dispatch, "roleless_ready"' in executable,
          "roleless_fn(readiness_input)" in executable,
          "are INVISIBLE to dispatch" in executable,
          "ready-but-roleless issues: 0" in executable),
         (True, True, True, True))
+
+    # ------------------------------------------------------------------------------------------
+    # [#597 review ROUND 2, MAJOR] THE WORKFLOW BLOCK IS EXECUTED, not pattern-matched. It is the
+    # SCHEDULED path — main() is not — and its two `if` conditions are workflow python that no test
+    # ran: `if roleless_fn is None:` -> `is not None:` makes every target report "planner has no
+    # roleless_ready()" so enumeration never runs, and `if roleless:` -> `if not roleless:` reports
+    # zero precisely when invisible issues exist. Both left all four substring assertions green.
+    # The block is extracted between its sentinels (fail-closed if either is gone), dedented, and
+    # run against a stub planner in a controlled namespace, so each row below dies on a one-token
+    # flip. Its only inputs are `dispatch`, `readiness_input` and `repo`.
+    # ------------------------------------------------------------------------------------------
+    def _workflow_block(path, step_id, marker):
+        """The dedented python between `# >>> <marker>` and `# <<< <marker>` inside the ONE
+        workflow step whose `id:` is `step_id`. Raises on anything it cannot resolve uniquely — an
+        assertion that cannot find its target must fail, never pass vacuously."""
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().split("\n")
+        ids = [i for i, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
+        if len(ids) != 1:
+            raise AssertionError(f"expected one workflow step `id: {step_id}`, found {len(ids)}")
+        starts = [i for i in range(ids[0], -1, -1) if lines[i].lstrip().startswith("- ")]
+        indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+        end = len(lines)
+        for i in range(starts[0] + 1, len(lines)):
+            if not lines[i].strip():
+                continue
+            here = len(lines[i]) - len(lines[i].lstrip())
+            if here < indent or (here == indent and lines[i].lstrip().startswith("- ")):
+                end = i
+                break
+        block = lines[starts[0]:end]
+        opens = [i for i, line in enumerate(block) if line.strip().startswith(f"# >>> {marker}")]
+        closes = [i for i, line in enumerate(block) if line.strip() == f"# <<< {marker}"]
+        if len(opens) != 1 or len(closes) != 1 or closes[0] <= opens[0]:
+            raise AssertionError(
+                f"step `id: {step_id}` must contain exactly one `# >>> {marker}` ... "
+                f"`# <<< {marker}` pair, found {len(opens)}/{len(closes)} — refusing")
+        body = [line for line in block[opens[0] + 1:closes[0]]
+                if line.strip() and not line.lstrip().startswith("#")]
+        if not body:
+            raise AssertionError(f"the `{marker}` block extracted to nothing — refusing")
+        pad = min(len(line) - len(line.lstrip()) for line in body)
+        source = "\n".join(line[pad:] for line in body)
+        compile(source, f"<{marker}>", "exec")   # a block that will not compile is a defect here
+        return source
+
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    roleless_block = _workflow_block(
+        os.path.join(_root, ".github", "workflows", "dispatch.yml"), "readiness",
+        "roleless-report")
+
+    class _StubPlanner:
+        """Stands in for the target's `dispatch` module. `enumerate_roleless=False` models a target
+        whose planner PREDATES roleless_ready (the compatibility branch)."""
+
+        def __init__(self, result, enumerate_roleless=True):
+            self.seen = []
+            if enumerate_roleless:
+                self.roleless_ready = self._roleless
+            self._result = result
+
+        def _roleless(self, issues):
+            self.seen.append(list(issues))
+            return list(self._result)
+
+    def _run_block(result, enumerate_roleless=True):
+        planner = _StubPlanner(result, enumerate_roleless)
+        namespace = {"dispatch": planner, "readiness_input": [{"number": 20}, {"number": 26}],
+                     "repo": "o/t"}
+        text = _captured(lambda: exec(roleless_block, namespace))  # noqa: S102 — workflow block
+        return text, planner.seen
+
+    _loudly, _seen = _run_block([20, 26])
+    chk("[#597 r2] the EXECUTED workflow block enumerates and warns when issues are invisible",
+        ("::warning::o/t: 2 status:ready issue(s) carry no role:* label and are INVISIBLE to "
+         "dispatch: #20, #26" in _loudly,
+         _seen == [[{"number": 20}, {"number": 26}]]),
+        (True, True))
+    _quietly, _seen = _run_block([])
+    chk("[#597 r2] ...and prints the ZERO line — never the warning — when there are none",
+        (_quietly.strip(), "INVISIBLE" in _quietly, _seen != []),
+        ("o/t: ready-but-roleless issues: 0", False, True))
+    _degraded, _seen = _run_block([20], enumerate_roleless=False)
+    chk("[#597 r2] a planner WITHOUT roleless_ready says so, and reports no fabricated zero",
+        ("target planner has no roleless_ready()" in _degraded,
+         "ready-but-roleless issues: 0" in _degraded, _seen),
+        (True, False, []))
+    _truncated, _seen = _run_block(list(range(1, 31)))
+    chk("[#597 r2] a large invisible set is summarized, not truncated silently",
+        ("30 status:ready issue(s)" in _truncated,
+         "#19, #20 (+10 more)" in _truncated, "#21" in _truncated),
+        (True, True, False))
 
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
     # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
@@ -371,14 +483,23 @@ def _print_table(plan):
 def _print_roleless(numbers):
     """ONE aggregate line on EVERY plan — printed even when the count is zero, the same
     always-printed shape as dispatch.yml's review-enumeration exclusion line. A plan showing N
-    rows must never silently coexist with ready issues no enumerator can see (issue #225)."""
+    rows must never silently coexist with ready issues no enumerator can see (issue #225).
+
+    #597 review round 2 (F-class): the zero line used to read "every `status:ready` issue is
+    enumerable", which is FALSE — `roleless_ready()` deliberately excludes gated, busy, blocked,
+    epic and closed issues, so a `status:ready` + `needs:design` issue is un-enumerable AND behind
+    a printed zero. This line reports ONE class (missing `role:*`) and now says so. The remediation
+    is likewise scoped honestly: a role is necessary, not always sufficient."""
     if not numbers:
-        print("ready-but-roleless issues: 0 (every status:ready issue is enumerable).")
+        print("ready-but-roleless issues: 0 (no OPEN status:ready issue is missing a role:* label; "
+              "issues held by needs:*/trust:untrusted, an open blocker, kind:epic or an "
+              "in-progress claim are excluded by design and are NOT covered by this count).")
         return
     print(f"WARNING: {len(numbers)} status:ready issue(s) carry NO role:* label and are INVISIBLE "
           "to dispatch — they can never be planned: "
           + ", ".join(f"#{n}" for n in numbers))
-    print("  fix: give each one a role:* label (scripts/triage.py derives one from its area:*).")
+    print("  fix: give each one a role:* label (scripts/triage.py derives one from its area:*); an "
+          "issue that also lacks a valid priority:P0..P4 needs that too before it can be planned.")
 
 
 def main():

@@ -174,6 +174,10 @@ jobs:
           done < "$RUNNER_TEMP/dispatch-targets/repos.txt"
 
       - name: Build ready + deferred issue rows and snapshot pull requests (target planner code)
+        # `id:` so dispatch-plan.py's self-test can locate this step and EXECUTE the roleless-report
+        # block below (#597 review round 2): its two `if` conditions are workflow python that no
+        # test ran, so flipping either one restored silent invisibility with every assertion green.
+        id: readiness
         env:
           TARGET_ROOT: ${{ runner.temp }}/dispatch-targets
         run: |
@@ -341,6 +345,15 @@ jobs:
               # Advisory only: PLAN never guesses a role (fail-closed) and the plan document is
               # unchanged. A target whose planner predates roleless_ready says so out loud rather
               # than reporting a fabricated zero.
+              # >>> roleless-report — EXECUTED by scripts/dispatch-plan.py --self-test. #597 review
+              # round 2 (MAJOR): the four assertions on this block were whole-file substring
+              # searches, so `if roleless_fn is None:` -> `is not None:` (every target then reports
+              # "planner has no roleless_ready()" and enumeration never runs) and `if roleless:` ->
+              # `if not roleless:` (reports zero precisely when invisible issues exist) BOTH left
+              # the assertion tuple green while fully restoring the bug this PR exists to prevent.
+              # These sentinels delimit the block the self-test extracts and runs against a stub
+              # planner; removing either one makes that extraction FAIL CLOSED. Keep the block
+              # self-contained: `dispatch`, `readiness_input` and `repo` are its only inputs.
               roleless_fn = getattr(dispatch, "roleless_ready", None)
               if roleless_fn is None:
                   print(f"::warning::{repo}: target planner has no roleless_ready() — "
@@ -354,6 +367,7 @@ jobs:
                             f"role:* label and are INVISIBLE to dispatch: {shown}{more}")
                   else:
                       print(f"{repo}: ready-but-roleless issues: 0")
+              # <<< roleless-report
               # Deferred-retry candidates (registry decision: a status:deferred issue with no
               # live lease and no linked open PR is retryable). The ready-engine gate is reused
               # by SWAPPING deferred->ready only for readiness computation; the emitted item
