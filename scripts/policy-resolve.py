@@ -15,6 +15,7 @@ disabled, malformed, or ambiguously labelled repositories/roles fail closed.
 """
 import argparse
 import copy
+import pathlib
 import json
 from pathlib import Path, PurePosixPath
 import sys
@@ -89,6 +90,17 @@ OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_ro
                           "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness"}
 
 
+# Slots whose underlying account is dead and which must never appear in an account_pool again.
+# Retiring an account removes it from policy/repos.toml; this is the guard that keeps it out.
+# Each entry is permanent — set-up-account's slot-allocation union counts acctNN issues in ANY
+# state, so a retired name can never be legitimately re-enrolled, and a reappearance in a pool is
+# always an error rather than a re-enrolment.
+RETIRED_ACCOUNTS = frozenset({
+    "acct03",  # amydouglas1@hotmail.com — cancelled 2026-07-25
+    "acct06",  # jwrightwho — expired 2026-07-25
+})
+
+
 class PolicyError(ValueError):
     """A fail-closed policy or routing error suitable for a concise CLI diagnostic."""
 
@@ -131,6 +143,23 @@ def _policy_row(target_repo, policy_doc):
         raise PolicyError(f"account_pool for {target_repo!r} must be a non-empty string list")
     if len(set(pool)) != len(pool):
         raise PolicyError(f"account_pool for {target_repo!r} contains duplicates")
+    # A RETIRED slot must never reappear in a pool. Retirement removes the account from
+    # policy/repos.toml, but nothing structurally stopped a later edit — or a revert — from
+    # putting it back, at which point dispatch burns claims on a dead credential and the review
+    # lane stalls. Cross-provider review of the acct06 retirement (#660) named exactly this gap:
+    # "the unchanged baseline already contained acct06, so the self-tests evidently do not
+    # enforce its retirement; re-adding it would not be caught."
+    #
+    # This is deliberately a HARD refusal rather than a warning: the failure mode it prevents is
+    # silent, and the slot names are permanently reserved anyway (set-up-account counts acctNN
+    # issues in ANY state, so a retired slot can never be legitimately re-enrolled under the same
+    # name — a reappearance is always a mistake).
+    retired = sorted(set(pool) & RETIRED_ACCOUNTS)
+    if retired:
+        raise PolicyError(
+            f"account_pool for {target_repo!r} names RETIRED account(s) {retired} — "
+            f"these credentials are dead and their slot names are permanently reserved; "
+            f"enrol a NEW slot instead of reusing one")
 
     for field in ("max_concurrent", "worker_timeout_minutes", "max_attempts"):
         if not _positive_int(row[field]):
@@ -452,6 +481,38 @@ agent = "docs-agent"
                               'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                               'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                               'security_paths=["ok", ""]\n')
+    # A RETIRED slot reappearing in a pool must be a HARD refusal (#660 review finding 1: the
+    # retirement was enforced by nothing, so re-adding acct06 would have gone unnoticed). Both
+    # halves are asserted: the retired name is refused, AND the otherwise-identical live pool is
+    # accepted — without the second, the check would also pass if resolve() rejected everything.
+    def _policy_with_pool(pool):
+        doc = copy.deepcopy(policy)
+        doc["repos"]["sparq-org/sparq"]["account_pool"] = pool
+        return doc
+
+    # Pinned explicitly. The loop below iterates OVER the registry, so emptying the registry
+    # would silently reduce it to zero assertions and stay green — found by mutation, and the
+    # same "test derives its cases from the implementation" shape as the #659 r2 finding.
+    check("the retired registry holds the known retirements (emptying it must not silently "
+          "disable every check below)",
+          sorted(RETIRED_ACCOUNTS), ["acct03", "acct06"])
+    for retired_slot in sorted(RETIRED_ACCOUNTS):
+        rejects(f"a RETIRED slot ({retired_slot}) in an account_pool is refused", "RETIRED",
+                lambda slot=retired_slot: resolve(
+                    "sparq-org/sparq", "impl", _policy_with_pool(["acct01", slot]), routing))
+    check("the same pool WITHOUT a retired slot is accepted (the refusal is specific, not a "
+          "blanket rejection)",
+          resolve("sparq-org/sparq", "impl",
+                  _policy_with_pool(["acct01", "acct02"]), routing)["account_pool"],
+          ["acct01", "acct02"])
+    # The guard is worthless if the SHIPPED configuration still names a dead account.
+    _live = tomllib.loads(pathlib.Path(__file__).resolve().parent.parent
+                          .joinpath("policy/repos.toml").read_text(encoding="utf-8"))
+    check("the SHIPPED policy/repos.toml names no retired account",
+          sorted({a for row in _live["repos"].values()
+                  for a in row.get("account_pool", [])} & RETIRED_ACCOUNTS),
+          [])
+
     rejects("security_paths rejects empty entry", "security_paths",
             lambda: resolve("o/r", "impl", bad_paths, routing))
     # trusted_bots (issue #111): validated exact-login allowlist, default empty, surfaced.
